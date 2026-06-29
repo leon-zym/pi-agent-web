@@ -12,3 +12,4 @@ playwright-report/
 test-results/
 tmp/
 .pi-data/
+.pnpm-store/
