@@ -7,9 +7,9 @@ import type {
 	RpcResponse,
 	RpcSessionState,
 } from "@earendil-works/pi-coding-agent";
-import { attachJsonlLineReader } from "./jsonl.ts";
-import type { ResolvedPi } from "./resolver.ts";
-import { RpcError } from "./wire.ts";
+import { attachJsonlLineReader } from "./jsonl";
+import type { ResolvedPi } from "./resolver";
+import { RpcError } from "./wire";
 
 /**
  * Pi RPC child process wrapper (one process per workspace).

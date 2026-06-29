@@ -1,5 +1,5 @@
-import { PiProcess } from "../src/pi-process.ts";
-import { resolvePiRuntime } from "../src/resolver.ts";
+import { PiProcess } from "../src/pi-process";
+import { resolvePiRuntime } from "../src/resolver";
 
 const resolved = await resolvePiRuntime({ baseDir: process.cwd() });
 const proc = new PiProcess({ cwd: "/Users/leonzhang/Code/pi-mono", resolved, readyTimeoutMs: 30000 });

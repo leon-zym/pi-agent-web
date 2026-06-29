@@ -1,11 +1,11 @@
 import fs from "node:fs";
 import { type ServerType, serve } from "@hono/node-server";
-import { loadConfig, type ServerConfig } from "./config.ts";
-import { type ResolvedPi, resolvePiRuntime } from "./resolver.ts";
-import { createApp } from "./routes.ts";
-import { Supervisor } from "./supervisor.ts";
-import { WorkspaceRegistry } from "./workspace-registry.ts";
-import { WsBridge } from "./ws-bridge.ts";
+import { loadConfig, type ServerConfig } from "./config";
+import { type ResolvedPi, resolvePiRuntime } from "./resolver";
+import { createApp } from "./routes";
+import { Supervisor } from "./supervisor";
+import { WorkspaceRegistry } from "./workspace-registry";
+import { WsBridge } from "./ws-bridge";
 
 /**
  * Server bootstrap: config -> runtime resolution -> supervisor + ws bridge ->

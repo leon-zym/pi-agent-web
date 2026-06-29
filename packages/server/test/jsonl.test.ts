@@ -1,6 +1,6 @@
 import { Readable } from "node:stream";
 import { describe, expect, it } from "vitest";
-import { attachJsonlLineReader, collectLines } from "../src/jsonl.ts";
+import { attachJsonlLineReader, collectLines } from "../src/jsonl";
 
 describe("strict JSONL framing", () => {
 	it("splits basic LF lines", () => {

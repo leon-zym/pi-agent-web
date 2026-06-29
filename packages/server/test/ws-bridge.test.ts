@@ -1,7 +1,7 @@
 import { WebSocketServer } from "ws";
 import { afterEach, describe, expect, it } from "vitest";
-import type { Supervisor } from "../src/supervisor.ts";
-import { WsBridge } from "../src/ws-bridge.ts";
+import type { Supervisor } from "../src/supervisor";
+import { WsBridge } from "../src/ws-bridge";
 
 /**
  * Disconnect protection unit test (design spec §2.1 rule 6):

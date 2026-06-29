@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import lockfile from "proper-lockfile";
-import type { AuthStatusEntry } from "./wire.ts";
+import type { AuthStatusEntry } from "./wire";
 
 /**
  * auth.json read/write (design spec §7.1 / §4.1).

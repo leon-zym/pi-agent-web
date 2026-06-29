@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { findChildSessions, scanSessionDir, scanSessionFile } from "../src/session-scan.ts";
+import { findChildSessions, scanSessionDir, scanSessionFile } from "../src/session-scan";
 
 function writeSession(dir: string, fileName: string, lines: string[]): string {
 	const p = path.join(dir, fileName);

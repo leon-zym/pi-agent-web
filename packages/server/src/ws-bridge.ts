@@ -1,8 +1,8 @@
 import type { WebSocket } from "ws";
 import { WebSocketServer } from "ws";
-import type { Supervisor } from "./supervisor.ts";
-import type { WsClientMessage, WsServerMessage } from "./wire.ts";
-import { RpcError } from "./wire.ts";
+import type { Supervisor } from "./supervisor";
+import type { WsClientMessage, WsServerMessage } from "./wire";
+import { RpcError } from "./wire";
 
 /**
  * WebSocket <-> JSONL relay (design spec §4.2).
