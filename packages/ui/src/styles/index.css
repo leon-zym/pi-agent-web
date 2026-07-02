@@ -1,0 +1,207 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+ * Semantic tokens (DESIGN.md). @theme inline maps utilities to runtime CSS
+ * variables so the .dark class swaps the whole palette without rebuilding.
+ */
+@theme inline {
+  --color-base: var(--piw-base);
+  --color-sidebar: var(--piw-sidebar);
+  --color-surface: var(--piw-surface);
+  --color-surface-2: var(--piw-surface-2);
+  --color-hover: var(--piw-hover);
+  --color-border: var(--piw-border);
+  --color-border-strong: var(--piw-border-strong);
+  --color-ink: var(--piw-ink);
+  --color-ink-2: var(--piw-ink-2);
+  --color-ink-3: var(--piw-ink-3);
+  --color-primary: var(--piw-primary);
+  --color-primary-hover: var(--piw-primary-hover);
+  --color-primary-soft: var(--piw-primary-soft);
+  --color-user-bubble: var(--piw-user-bubble);
+  --color-success: var(--piw-success);
+  --color-success-soft: var(--piw-success-soft);
+  --color-warning: var(--piw-warning);
+  --color-warning-soft: var(--piw-warning-soft);
+  --color-danger: var(--piw-danger);
+  --color-danger-soft: var(--piw-danger-soft);
+  --color-terminal: var(--piw-terminal);
+
+  --font-sans: -apple-system, "SF Pro Text", "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+  --font-mono: "SF Mono", "JetBrains Mono", "Fira Code", ui-monospace, "SFMono-Regular", Menlo, monospace;
+
+  --radius-xs: 6px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 22px;
+
+  --shadow-lv1: 0 1px 3px rgba(15, 17, 21, 0.08);
+  --shadow-lv2: 0 4px 16px rgba(15, 17, 21, 0.12), 0 1px 3px rgba(15, 17, 21, 0.06);
+  --shadow-lv3: 0 12px 32px rgba(15, 17, 21, 0.18), 0 2px 6px rgba(15, 17, 21, 0.08);
+}
+
+:root {
+  --piw-base: #ffffff;
+  --piw-sidebar: #f9fafb;
+  --piw-surface: #ffffff;
+  --piw-surface-2: #f4f5f7;
+  --piw-hover: rgba(15, 17, 21, 0.05);
+  --piw-border: rgba(15, 17, 21, 0.09);
+  --piw-border-strong: rgba(15, 17, 21, 0.16);
+  --piw-ink: #0f1115;
+  --piw-ink-2: #4c5058;
+  --piw-ink-3: #878c96;
+  --piw-primary: #4176e6;
+  --piw-primary-hover: #3564c9;
+  --piw-primary-soft: #edf3fe;
+  --piw-user-bubble: #edf3fe;
+  --piw-success: #16a34a;
+  --piw-success-soft: #e8f7ee;
+  --piw-warning: #d97706;
+  --piw-warning-soft: #fdf3e3;
+  --piw-danger: #dc2626;
+  --piw-danger-soft: #fdecec;
+  --piw-terminal: #101418;
+
+  color-scheme: light;
+}
+
+.dark {
+  --piw-base: #151517;
+  --piw-sidebar: #1b1b1c;
+  --piw-surface: #2c2c2e;
+  --piw-surface-2: #222224;
+  --piw-hover: rgba(255, 255, 255, 0.06);
+  --piw-border: rgba(255, 255, 255, 0.08);
+  --piw-border-strong: rgba(255, 255, 255, 0.16);
+  --piw-ink: #f9fafb;
+  --piw-ink-2: #b7bcc4;
+  --piw-ink-3: #7d838c;
+  --piw-primary: #679efe;
+  --piw-primary-hover: #7fabff;
+  --piw-primary-soft: rgba(103, 158, 254, 0.14);
+  --piw-user-bubble: #2c2c2e;
+  --piw-success: #4ade80;
+  --piw-success-soft: rgba(74, 222, 128, 0.12);
+  --piw-warning: #fbbf24;
+  --piw-warning-soft: rgba(251, 191, 36, 0.12);
+  --piw-danger: #ef4444;
+  --piw-danger-soft: rgba(239, 68, 68, 0.12);
+  --piw-terminal: #0d0e10;
+
+  color-scheme: dark;
+}
+
+@layer base {
+  * {
+    border-color: var(--piw-border);
+  }
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    margin: 0;
+    background: var(--piw-base);
+    color: var(--piw-ink);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  button {
+    cursor: pointer;
+  }
+  button:disabled {
+    cursor: default;
+  }
+  /* Press feedback everywhere (DESIGN.md): scale on :active, never on hover. */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]) {
+    transition-property: scale, opacity, background-color, color, border-color;
+    transition-duration: 120ms;
+    transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  button:not(:disabled):active,
+  [role="button"]:not([aria-disabled="true"]):active {
+    scale: 0.96;
+  }
+  ::selection {
+    background: color-mix(in srgb, var(--piw-primary) 22%, transparent);
+  }
+  code,
+  kbd,
+  pre {
+    font-family: var(--font-mono);
+  }
+}
+
+@layer utilities {
+  /* Thin scrollbars only inside explicit scrollports */
+  .scroll-slim {
+    scrollbar-width: thin;
+    scrollbar-color: var(--piw-border-strong) transparent;
+  }
+  .scroll-slim::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .scroll-slim::-webkit-scrollbar-thumb {
+    border-radius: 8px;
+    background: var(--piw-border-strong);
+  }
+  .scroll-slim::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  /* 2.6s streaming sweep for the reasoning row (DESIGN.md signature motion) */
+  .thinking-sweep {
+    position: relative;
+    overflow: hidden;
+  }
+  .thinking-sweep::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(100deg, transparent 30%, color-mix(in srgb, var(--piw-primary) 10%, transparent) 50%, transparent 70%);
+    transform: translateX(-100%);
+    animation: thinking-sweep 2.6s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+    pointer-events: none;
+  }
+  @keyframes thinking-sweep {
+    0% {
+      transform: translateX(-100%);
+    }
+    60%,
+    100% {
+      transform: translateX(100%);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .thinking-sweep::after {
+      animation: none;
+    }
+  }
+  /* Subtle pulse for the running status dot */
+  .pulse-dot {
+    animation: pulse-dot 1.6s ease-in-out infinite;
+  }
+  @keyframes pulse-dot {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.35;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .pulse-dot {
+      animation: none;
+    }
+  }
+}
