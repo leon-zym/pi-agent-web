@@ -1,0 +1,278 @@
+import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import { describe, expect, it } from "vitest";
+import { reduceProjection } from "../src/stores/projection-reducer";
+import { createEmptyProjection } from "../src/types/view-models";
+
+/**
+ * Stream assembler state machine tests (design spec §5.2). Fixtures are the
+ * minimal wire shapes; the reducer only reads the fields it needs.
+ */
+
+const usage = {
+	input: 10,
+	output: 20,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 30,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+function textDelta(
+	contentIndex: number,
+	delta: string,
+): Extract<JsonAgentSessionEvent, { type: "message_update" }> {
+	return {
+		type: "message_update",
+		usage,
+		assistantMessageEvent: { type: "text_delta", contentIndex, delta },
+	} as Extract<JsonAgentSessionEvent, { type: "message_update" }>;
+}
+
+function finalAssistant(
+	text: string,
+	stopReason = "stop",
+	content?: unknown,
+): Extract<JsonAgentSessionEvent, { type: "message_end" }> {
+	return {
+		type: "message_end",
+		message: {
+			role: "assistant",
+			content: content ?? [{ type: "text", text }],
+			api: "openai-completions",
+			provider: "deepseek",
+			model: "m",
+			usage,
+			stopReason,
+			timestamp: 0,
+		},
+	} as Extract<JsonAgentSessionEvent, { type: "message_end" }>;
+}
+
+const ctx = { now: 1000 };
+
+describe("projection reducer", () => {
+	it("assembles a full prompt round trip into one settled turn", () => {
+		let p = createEmptyProjection("s1");
+		p = reduceProjection(p, { type: "agent_start" }, ctx);
+		p = reduceProjection(p, { type: "turn_start" }, ctx);
+		p = reduceProjection(
+			p,
+			{
+				type: "message_start",
+				message: { role: "user", content: [{ type: "text", text: "hi" }], timestamp: 0 },
+			} as never,
+			ctx,
+		);
+		p = reduceProjection(
+			p,
+			{
+				type: "message_end",
+				message: { role: "user", content: [{ type: "text", text: "hi" }], timestamp: 0 },
+			} as never,
+			ctx,
+		);
+
+		expect(p.turns).toHaveLength(1);
+		expect(p.activeTurnId).toBe("turn-1");
+		expect(p.turns[0]?.userMessages[0]?.text).toBe("hi");
+
+		p = reduceProjection(p, { type: "turn_start" }, ctx);
+		p = reduceProjection(p, textDelta(0, "Hel"), ctx);
+		p = reduceProjection(p, textDelta(0, "lo"), ctx);
+		expect(p.turns[0]?.steps[1]?.blocks[0]).toMatchObject({
+			type: "text",
+			markdown: "Hello",
+			isStreaming: true,
+		});
+
+		p = reduceProjection(p, finalAssistant("Hello, world"), ctx);
+		// Final swap keeps the block key and settles the step.
+		expect(p.turns[0]?.steps[1]?.blocks[0]).toMatchObject({
+			type: "text",
+			markdown: "Hello, world",
+			isStreaming: false,
+			key: "turn-1:1:0",
+		});
+
+		p = reduceProjection(p, { type: "turn_end", message: {} as never, toolResults: [] }, ctx);
+		p = reduceProjection(p, { type: "agent_end", messages: [], willRetry: false }, ctx);
+		expect(p.turns[0]?.status).toBe("running"); // agent_end never settles
+		p = reduceProjection(p, { type: "agent_settled" }, ctx);
+		expect(p.turns[0]?.status).toBe("settled");
+		expect(p.activeTurnId).toBeNull();
+		expect(p.replayable).toBe(true);
+	});
+
+	it("keeps the turn running when agent_end reports willRetry", () => {
+		let p = createEmptyProjection("s1");
+		p = reduceProjection(p, { type: "agent_start" }, ctx);
+		p = reduceProjection(p, { type: "agent_end", messages: [], willRetry: true }, ctx);
+		expect(p.turns[0]?.status).toBe("running");
+		expect(p.activeTurnId).toBe("turn-1");
+	});
+
+	it("marks aborted turns and keeps partial text", () => {
+		let p = createEmptyProjection("s1");
+		p = reduceProjection(p, { type: "agent_start" }, ctx);
+		p = reduceProjection(p, { type: "turn_start" }, ctx);
+		p = reduceProjection(p, textDelta(0, "partial"), ctx);
+		p = reduceProjection(p, finalAssistant("partial", "aborted"), ctx);
+		p = reduceProjection(p, { type: "agent_settled" }, ctx);
+		expect(p.turns[0]?.status).toBe("aborted");
+		expect(p.turns[0]?.steps[0]?.blocks[0]).toMatchObject({ markdown: "partial", isStreaming: false });
+	});
+
+	it("marks error turns with the error message", () => {
+		let p = createEmptyProjection("s1");
+		p = reduceProjection(p, { type: "agent_start" }, ctx);
+		p = reduceProjection(p, { type: "turn_start" }, ctx);
+		p = reduceProjection(p, finalAssistant("", "error"), ctx);
+		p = reduceProjection(p, { type: "agent_settled" }, ctx);
+		expect(p.turns[0]?.status).toBe("error");
+	});
+
+	it("tracks tool calls through preparing, running and done states", () => {
+		let p = createEmptyProjection("s1");
+		p = reduceProjection(p, { type: "agent_start" }, ctx);
+		p = reduceProjection(p, { type: "turn_start" }, ctx);
+		p = reduceProjection(
+			p,
+			{
+				type: "message_update",
+				usage,
+				assistantMessageEvent: { type: "toolcall_start", contentIndex: 1 },
+			} as Extract<JsonAgentSessionEvent, { type: "message_update" }>,
+			ctx,
+		);
+		p = reduceProjection(
+			p,
+			{
+				type: "message_update",
+				usage,
+				assistantMessageEvent: {
+					type: "toolcall_end",
+					contentIndex: 1,
+					toolCall: { type: "toolCall", id: "call-1", name: "bash", arguments: { command: "ls" } },
+				},
+			} as Extract<JsonAgentSessionEvent, { type: "message_update" }>,
+			ctx,
+		);
+		const tool = () => p.turns[0]?.steps[0]?.blocks[1];
+		expect(tool()).toMatchObject({
+			type: "tool_call",
+			toolCallId: "call-1",
+			toolName: "bash",
+			status: "preparing",
+		});
+
+		p = reduceProjection(
+			p,
+			{ type: "tool_execution_start", toolCallId: "call-1", toolName: "bash", args: { command: "ls" } },
+			ctx,
+		);
+		expect(tool()).toMatchObject({ status: "running" });
+
+		p = reduceProjection(
+			p,
+			{
+				type: "tool_execution_update",
+				toolCallId: "call-1",
+				toolName: "bash",
+				args: {},
+				partialResult: { output: "file" },
+			},
+			ctx,
+		);
+		expect(tool()).toMatchObject({ partialOutput: "file" });
+
+		p = reduceProjection(
+			p,
+			{
+				type: "tool_execution_end",
+				toolCallId: "call-1",
+				toolName: "bash",
+				result: { output: "file\n" },
+				isError: false,
+			},
+			ctx,
+		);
+		expect(tool()).toMatchObject({ status: "done", result: { output: "file\n" } });
+	});
+
+	it("marks preparing tools skipped when stopReason is length", () => {
+		let p = createEmptyProjection("s1");
+		p = reduceProjection(p, { type: "agent_start" }, ctx);
+		p = reduceProjection(p, { type: "turn_start" }, ctx);
+		p = reduceProjection(
+			p,
+			{
+				type: "message_update",
+				usage,
+				assistantMessageEvent: { type: "toolcall_start", contentIndex: 0 },
+			} as never,
+			ctx,
+		);
+		p = reduceProjection(
+			p,
+			finalAssistant("", "length", [{ type: "toolCall", id: "call-x", name: "x", arguments: {} }]),
+			ctx,
+		);
+		const tool = p.turns[0]?.steps[0]?.blocks[0];
+		expect(tool).toMatchObject({ type: "tool_call", status: "skipped" });
+
+		// A skipped tool never flips back to running.
+		p = reduceProjection(p, { type: "tool_execution_start", toolCallId: "", toolName: "x", args: {} }, ctx);
+		expect(p.turns[0]?.steps[0]?.blocks[0]).toMatchObject({ status: "skipped" });
+	});
+
+	it("attaches tool results to the step and mirrors queue updates", () => {
+		let p = createEmptyProjection("s1");
+		p = reduceProjection(p, { type: "agent_start" }, ctx);
+		p = reduceProjection(p, { type: "turn_start" }, ctx);
+		p = reduceProjection(
+			p,
+			{
+				type: "message_start",
+				message: {
+					role: "toolResult",
+					toolCallId: "call-1",
+					toolName: "bash",
+					content: [{ type: "text", text: "out" }],
+					isError: false,
+					timestamp: 0,
+				},
+			} as never,
+			ctx,
+		);
+		expect(p.turns[0]?.steps[0]?.toolResults[0]).toMatchObject({ toolCallId: "call-1", content: "out" });
+
+		p = reduceProjection(p, { type: "queue_update", steering: ["s1"], followUp: [] }, ctx);
+		expect(p.queue.steering).toEqual(["s1"]);
+	});
+
+	it("labels injected user messages as steer via the injection source resolver", () => {
+		let p = createEmptyProjection("s1");
+		p = reduceProjection(p, { type: "agent_start" }, ctx);
+		p = reduceProjection(p, { type: "turn_start" }, ctx);
+		p = reduceProjection(
+			p,
+			{
+				type: "message_start",
+				message: { role: "user", content: [{ type: "text", text: "steer me" }], timestamp: 0 },
+			} as never,
+			{ now: 2000, resolveInjectionSource: (text) => (text === "steer me" ? "steer" : undefined) },
+		);
+		expect(p.turns[0]?.userMessages[0]?.source).toBe("steer");
+	});
+
+	it("aggregates compaction and retry status rows", () => {
+		let p = createEmptyProjection("s1");
+		p = reduceProjection(p, { type: "compaction_start", reason: "manual" }, ctx);
+		p = reduceProjection(
+			p,
+			{ type: "compaction_end", reason: "manual", result: undefined, aborted: false, willRetry: false },
+			ctx,
+		);
+		expect(p.statusRows.find((r) => r.kind === "compaction")).toMatchObject({ state: "done" });
+	});
+});
