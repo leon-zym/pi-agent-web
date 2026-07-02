@@ -23,9 +23,22 @@ export type WsClientMessage =
 // WebSocket server -> client
 // ============================================================================
 
+/**
+ * extension_error is emitted directly on stdout by rpc-mode.ts (not through
+ * the session event bus), so it is a wire event of its own kind.
+ */
+export interface ExtensionErrorEvent {
+	type: "extension_error";
+	extensionPath: string;
+	event: string;
+	error: string;
+}
+
+export type PiWebSessionEvent = JsonAgentSessionEvent | ExtensionErrorEvent;
+
 export type WsServerMessage =
 	| { type: "response"; workspaceId: string; response: RpcResponse }
-	| { type: "event"; workspaceId: string; sessionId: string; event: JsonAgentSessionEvent }
+	| { type: "event"; workspaceId: string; sessionId: string; event: PiWebSessionEvent }
 	| { type: "extension_ui_request"; workspaceId: string; sessionId: string; request: RpcExtensionUIRequest }
 	| { type: "process_status"; workspaceId: string; state: "starting" | "running" | "crashed"; error?: string }
 	| { type: "session_directory_changed"; workspaceId: string }
