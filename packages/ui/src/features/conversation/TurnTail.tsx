@@ -1,0 +1,107 @@
+import { Check, CircleAlert, Copy, GitFork, OctagonX } from "lucide-react";
+import { useState } from "react";
+import { toast } from "sonner";
+import { formatCost, formatDuration, formatTokens } from "../../lib/format";
+import { forkFromEntry } from "../../lib/session-controller";
+import { useSessionDirectoryStore } from "../../stores/session-directory";
+import type { ProductTurn } from "../../types/view-models";
+
+/**
+ * The single turn-level footer (DSH §9.2): timing, tokens, cost, and error /
+ * aborted markers live here, not on every assistant fragment. Fork acts on
+ * the newest forkable user message of the session (get_fork_messages).
+ */
+export function TurnTail({ turn }: { turn: ProductTurn }) {
+	const [copied, setCopied] = useState(false);
+
+	const copyTurn = async () => {
+		const text = turn.steps
+			.map((step) =>
+				step.blocks
+					.filter((block) => block.type === "text")
+					.map((block) => (block.type === "text" ? block.markdown : ""))
+					.join("\n\n"),
+			)
+			.join("\n\n");
+		await navigator.clipboard.writeText(text);
+		setCopied(true);
+		setTimeout(() => setCopied(false), 1500);
+	};
+
+	const forkLast = async () => {
+		const workspaceId = useSessionDirectoryStore.getState().currentWorkspaceId;
+		if (!workspaceId) return;
+		try {
+			const { expectData } = await import("@pi-agent-web/server/wire");
+			const { useTransportStore } = await import("../../stores/transport");
+			const response = await useTransportStore
+				.getState()
+				.sendCommand(workspaceId, { type: "get_fork_messages" });
+			const { messages } = expectData(response) as { messages: Array<{ entryId: string; text: string }> };
+			const last = messages[messages.length - 1];
+			if (!last) {
+				toast.info("该会话没有可用的分叉消息");
+				return;
+			}
+			await forkFromEntry(last.entryId);
+		} catch (error) {
+			toast.error("分叉失败", { description: error instanceof Error ? error.message : String(error) });
+		}
+	};
+
+	const totalTokens = turn.usage?.totalTokens ?? sumStepTokens(turn);
+	const cost = turn.usage?.cost ?? 0;
+
+	return (
+		<div className="flex min-h-6 items-center gap-2 text-[11px] text-ink-3">
+			{turn.status === "error" && (
+				<span className="inline-flex items-center gap-1 text-danger">
+					<CircleAlert className="size-3.5" />
+					{turn.errorMessage ?? "模型返回错误"}
+				</span>
+			)}
+			{turn.status === "aborted" && (
+				<span className="inline-flex items-center gap-1 text-ink-3">
+					<OctagonX className="size-3.5" />
+					已停止
+				</span>
+			)}
+			{turn.status === "settled" && (
+				<span className="inline-flex items-center gap-1 text-success">
+					<Check className="size-3.5" />
+					完成
+				</span>
+			)}
+			<span className="font-mono tabular-nums">
+				{turn.timing?.durationMs !== undefined ? formatDuration(turn.timing.durationMs) : ""}
+			</span>
+			{totalTokens > 0 && <span className="font-mono tabular-nums">{formatTokens(totalTokens)} tokens</span>}
+			{cost > 0 && <span className="font-mono tabular-nums">{formatCost(cost)}</span>}
+			<span className="flex-1" />
+			<button
+				type="button"
+				className="inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-ink-3 transition-colors hover:bg-hover hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
+				onClick={() => void copyTurn()}
+			>
+				{copied ? <Check className="size-3" /> : <Copy className="size-3" />}
+				{copied ? "已复制" : "复制"}
+			</button>
+			<button
+				type="button"
+				className="inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-ink-3 transition-colors hover:bg-hover hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
+				onClick={() => void forkLast()}
+			>
+				<GitFork className="size-3" />
+				分叉
+			</button>
+		</div>
+	);
+}
+
+function sumStepTokens(turn: ProductTurn): number {
+	let sum = 0;
+	for (const step of turn.steps) {
+		sum += step.usage?.totalTokens ?? 0;
+	}
+	return sum;
+}
