@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import type { WorkspaceSummary } from "./wire";
+import type { WorkspaceSummary } from "./wire.js";
 
 /**
  * Workspace registry (Host-owned; Pi has no Workspace concept, design spec §4.1).

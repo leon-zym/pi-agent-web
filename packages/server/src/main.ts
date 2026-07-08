@@ -1,11 +1,11 @@
 import fs from "node:fs";
 import { type ServerType, serve } from "@hono/node-server";
-import { loadConfig, type ServerConfig } from "./config";
-import { type ResolvedPi, resolvePiRuntime } from "./resolver";
-import { createApp } from "./routes";
-import { Supervisor } from "./supervisor";
-import { WorkspaceRegistry } from "./workspace-registry";
-import { WsBridge } from "./ws-bridge";
+import { loadConfig, type ServerConfig } from "./config.js";
+import { type ResolvedPi, resolvePiRuntime } from "./resolver.js";
+import { createApp } from "./routes.js";
+import { Supervisor } from "./supervisor.js";
+import { WorkspaceRegistry } from "./workspace-registry.js";
+import { WsBridge } from "./ws-bridge.js";
 
 /**
  * Server bootstrap: config -> runtime resolution -> supervisor + ws bridge ->
@@ -148,4 +148,11 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 	}
 
 	return { server, supervisor, bridge, registry, config, runtime, close };
+}
+
+// Run as the main entry (node dist/main.js / tsx src/main.ts).
+import { pathToFileURL } from "node:url";
+const invokedPath = process.argv[1];
+if (invokedPath && import.meta.url === pathToFileURL(invokedPath).href) {
+  void startServer();
 }

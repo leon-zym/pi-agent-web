@@ -2,12 +2,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
-import { readAuthStatus, saveApiKey } from "./auth-storage";
-import type { ServerConfig } from "./config";
-import { getSessionDirForCwd } from "./config";
-import { findChildSessions, scanSessionDir } from "./session-scan";
-import type { Supervisor } from "./supervisor";
-import type { WorkspaceRegistry } from "./workspace-registry";
+import { readAuthStatus, saveApiKey } from "./auth-storage.js";
+import type { ServerConfig } from "./config.js";
+import { getSessionDirForCwd } from "./config.js";
+import { findChildSessions, scanSessionDir } from "./session-scan.js";
+import type { Supervisor } from "./supervisor.js";
+import type { WorkspaceRegistry } from "./workspace-registry.js";
 
 /**
  * REST API (design spec §4.1): workspace/session directory and auth management.

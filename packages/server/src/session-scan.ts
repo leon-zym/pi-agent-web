@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import type { SessionSummary } from "./wire";
+import type { SessionSummary } from "./wire.js";
 
 /**
  * Session directory scanning (design spec §4.1 / §7.1).
