@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import type { ContentBlock, UiToolResult } from "../../types/view-models";
 
 /**
- * Tool presenter registry (DSH report §8.3): a dedicated compact renderer per
+ * Tool presenter registry: a dedicated compact renderer per
  * tool plus a universal fallback so unknown tools never break the chat.
  * Presenters never execute tools; they only format already-captured data.
  */

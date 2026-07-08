@@ -1,4 +1,5 @@
 import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import { tt } from "../lib/i18n";
 import type {
 	AssistantStep,
 	ContentBlock,
@@ -9,7 +10,7 @@ import type {
 } from "../types/view-models";
 
 /**
- * Pure stream assembler reducer (design spec §5.2).
+ * Pure stream assembler reducer.
  *
  * Invariants:
  * - Stable keys everywhere: steps are turnId:index, blocks are stepKey:contentIndex.
@@ -510,7 +511,7 @@ function handleMessageEnd(
 	finalTurn = withLastStep(finalTurn, settledStep);
 
 	if (message.stopReason === "error") {
-		finalTurn = { ...finalTurn, status: "error", errorMessage: message.errorMessage ?? "模型返回错误" };
+		finalTurn = { ...finalTurn, status: "error", errorMessage: message.errorMessage ?? tt("tail.modelError") };
 	} else if (message.stopReason === "aborted") {
 		finalTurn = { ...finalTurn, status: "aborted" };
 	}
@@ -631,7 +632,7 @@ export function reduceProjection(
 				key: "compaction",
 				kind: "compaction",
 				state: event.aborted || event.errorMessage ? "failed" : "done",
-				detail: event.errorMessage ?? (event.result ? "上下文已压缩" : undefined),
+				detail: event.errorMessage ?? (event.result ? tt("system.contextCompacted") : undefined),
 			});
 
 		case "auto_retry_start":
@@ -640,13 +641,11 @@ export function reduceProjection(
 				kind: "retry",
 				state: "waiting",
 				detail:
-					"第 " +
-					event.attempt +
-					"/" +
-					event.maxAttempts +
-					" 次重试，" +
-					Math.round(event.delayMs / 1000) +
-					" 秒后发起",
+					tt("system.retryScheduled", {
+						attempt: event.attempt,
+						max: event.maxAttempts,
+						seconds: Math.round(event.delayMs / 1000),
+					}),
 			});
 
 		case "auto_retry_end":
@@ -654,7 +653,7 @@ export function reduceProjection(
 				key: "retry",
 				kind: "retry",
 				state: "done",
-				detail: event.success ? "自动重试完成" : (event.finalError ?? "自动重试失败"),
+				detail: event.success ? tt("system.retryDone") : (event.finalError ?? tt("system.retryFailed")),
 			});
 
 		case "summarization_retry_scheduled":
@@ -662,7 +661,7 @@ export function reduceProjection(
 				key: "compaction",
 				kind: "compaction",
 				state: "running",
-				detail: "摘要生成失败，" + Math.round(event.delayMs / 1000) + " 秒后重试",
+				detail: tt("system.summaryRetryScheduled", { seconds: Math.round(event.delayMs / 1000) }),
 			});
 
 		case "summarization_retry_attempt_start":
@@ -670,7 +669,7 @@ export function reduceProjection(
 				key: "compaction",
 				kind: "compaction",
 				state: "running",
-				detail: "正在重试摘要生成",
+				detail: tt("system.summaryRetrying"),
 			});
 
 		case "summarization_retry_finished":
@@ -678,7 +677,7 @@ export function reduceProjection(
 				key: "compaction",
 				kind: "compaction",
 				state: "done",
-				detail: "摘要生成完成",
+				detail: tt("system.summaryDone"),
 			});
 
 		case "bash_execution_update":

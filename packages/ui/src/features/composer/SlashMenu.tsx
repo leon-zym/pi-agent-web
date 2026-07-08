@@ -5,6 +5,7 @@ import { cn } from "../../lib/utils";
 import { useComposerStore } from "../../stores/composer";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { useSlashCommandsStore } from "../../stores/slash-commands";
+import { tt } from "../../lib/i18n";
 import type { RpcSlashCommand } from "../../types/pi-types";
 
 interface SlashMenuProps {
@@ -13,9 +14,9 @@ interface SlashMenuProps {
 }
 
 const SOURCE_META = {
-	extension: { label: "扩展", icon: Blocks },
-	prompt: { label: "提示词模板", icon: MessageSquareText },
-	skill: { label: "技能", icon: Sparkles },
+	extension: { label: "slash.extension", icon: Blocks },
+	prompt: { label: "slash.prompt", icon: MessageSquareText },
+	skill: { label: "slash.skill", icon: Sparkles },
 } as const;
 
 function fuzzyScore(query: string, name: string): number {
@@ -33,7 +34,7 @@ function fuzzyScore(query: string, name: string): number {
 }
 
 /**
- * Slash command listbox anchored above the composer (DESIGN.md §6.2.5):
+ * Slash command listbox anchored above the composer:
  * grouped by source, fuzzy candidates, exact-name execution, unknown "/"
  * input is never silently sent as a plain prompt.
  */
@@ -80,7 +81,7 @@ export function SlashMenu({ anchorRef, onExecute }: SlashMenuProps) {
 		return (
 			<div className="absolute right-4 bottom-full left-4 z-50 mb-2 rounded-md border border-border bg-surface p-2 shadow-lv3">
 				<p className="px-2 py-1 text-[13px] text-ink-3">
-					{commands.length === 0 ? "正在加载命令…" : "没有匹配的命令"}
+					{commands.length === 0 ? tt("slash.loadingCommands") : tt("slash.noMatch")}
 				</p>
 			</div>
 		);
@@ -101,7 +102,7 @@ export function SlashMenu({ anchorRef, onExecute }: SlashMenuProps) {
 	return (
 		<div
 			role="listbox"
-			aria-label="命令菜单"
+			aria-label={tt("composer.commandMenu")}
 			className="scroll-slim absolute right-4 bottom-full left-4 z-50 mb-2 max-h-80 overflow-y-auto rounded-md border border-border bg-surface p-1 shadow-lv3"
 		>
 			{[...bySource.entries()].map(([source, items]) => {
@@ -144,7 +145,7 @@ export function SlashMenu({ anchorRef, onExecute }: SlashMenuProps) {
 					</div>
 				);
 			})}
-			<div className="border-t border-border px-2 py-1.5 text-[11px] text-ink-3">回车执行 · 点击插入命令</div>
+			<div className="border-t border-border px-2 py-1.5 text-[11px] text-ink-3">{tt("slash.hint")}</div>
 		</div>
 	);
 }

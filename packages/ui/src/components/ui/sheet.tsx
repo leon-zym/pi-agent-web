@@ -2,6 +2,7 @@ import * as SheetPrimitive from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
 import type * as React from "react";
 import { cn } from "../../lib/utils";
+import { tt } from "../../lib/i18n";
 
 function Sheet({ ...props }: React.ComponentProps<typeof SheetPrimitive.Root>) {
 	return <SheetPrimitive.Root data-slot="sheet" {...props} />;
@@ -41,7 +42,7 @@ function SheetContent({
 				{children}
 				<SheetPrimitive.Close className="absolute right-3.5 top-3.5 rounded-sm text-ink-3 opacity-70 transition-opacity hover:bg-hover hover:text-ink focus:ring-2 focus:ring-primary/40 focus:outline-none disabled:pointer-events-none">
 					<X className="size-4" />
-					<span className="sr-only">关闭</span>
+					<span className="sr-only">{tt("common.close")}</span>
 				</SheetPrimitive.Close>
 			</SheetPrimitive.Content>
 		</SheetPrimitive.Portal>

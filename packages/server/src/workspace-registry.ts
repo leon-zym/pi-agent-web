@@ -4,7 +4,7 @@ import path from "node:path";
 import type { WorkspaceSummary } from "./wire.js";
 
 /**
- * Workspace registry (Host-owned; Pi has no Workspace concept, design spec §4.1).
+ * Workspace registry (Host-owned; Pi has no Workspace concept).
  * Persisted in the Web Server's own data dir (workspaces.json) with atomic writes.
  */
 

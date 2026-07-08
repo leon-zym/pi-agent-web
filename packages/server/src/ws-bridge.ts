@@ -5,7 +5,7 @@ import type { WsClientMessage, WsServerMessage } from "./wire.js";
 import { RpcError } from "./wire.js";
 
 /**
- * WebSocket <-> JSONL relay (design spec §4.2).
+ * WebSocket <-> JSONL relay (wire contract lives in wire.ts).
  *
  * - One full-duplex socket per tab, route /api/v1/ws.
  * - Commands are correlated to the originating connection by command id, so a
@@ -14,7 +14,7 @@ import { RpcError } from "./wire.js";
  *   (session_listen), so tabs are isolated from each other's sessions.
  * - Per (workspaceId, sessionId) connection counting drives the disconnect
  *   protection: when the count drops to zero the supervisor cancels pending
- *   extension dialogs for that session (§2.1 rule 6).
+ *   extension dialogs for that session (disconnect protection).
  */
 
 export interface WorkspaceInfo {

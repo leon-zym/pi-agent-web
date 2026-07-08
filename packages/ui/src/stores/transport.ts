@@ -1,5 +1,6 @@
 import type { RpcCommand, RpcExtensionUIResponse, RpcResponse } from "@earendil-works/pi-coding-agent";
-import type { WsClientMessage, WsServerMessage } from "@pi-agent-web/server";
+import type { WsClientMessage, WsServerMessage } from "@pi-agent-web/server/wire";
+import { tt } from "../lib/i18n";
 import { create } from "zustand";
 
 export type WsState = "connecting" | "online" | "offline";
@@ -119,7 +120,7 @@ function connectSocket(): void {
 			socket = null;
 			for (const [, p] of pending) {
 				clearTimeout(p.timer);
-				p.reject(new Error("WebSocket 连接已断开"));
+				p.reject(new Error(tt("transport.disconnected")));
 			}
 			pending.clear();
 			scheduleReconnect();
@@ -241,18 +242,18 @@ export const useTransportStore = create<TransportState>()((set, get) => ({
 
 	sendCommand: (workspaceId, command, timeoutMs = 60_000) => {
 		if (get().wsState !== "online") {
-			return Promise.reject(new Error("网关未连接，正在重连…"));
+			return Promise.reject(new Error(tt("transport.reconnecting")));
 		}
 		const id = command.id ?? nextCommandId("cmd");
 		const withId = { ...command, id };
 		const delivered = send({ type: "command", workspaceId, command: withId });
 		if (!delivered) {
-			return Promise.reject(new Error("WebSocket 不可用"));
+			return Promise.reject(new Error(tt("transport.unavailable")));
 		}
 		return new Promise<RpcResponse>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				pending.delete(id);
-				reject(new Error("命令超时：" + command.type));
+				reject(new Error(tt("transport.commandTimeout", { command: command.type })));
 			}, timeoutMs);
 			pending.set(id, { resolve, reject, timer });
 		});

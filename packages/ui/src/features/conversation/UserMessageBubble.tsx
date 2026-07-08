@@ -1,13 +1,14 @@
 import { Check, Copy } from "lucide-react";
 import { useState } from "react";
 import { Badge } from "../../components/ui/badge";
+import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import type { UiUserMessage } from "../../types/view-models";
 
 const SOURCE_LABEL: Record<UiUserMessage["source"], string> = {
 	prompt: "",
-	steer: "插队",
-	follow_up: "排队",
+	steer: "status.steer",
+	follow_up: "status.followUp",
 };
 
 /**
@@ -36,13 +37,13 @@ export function UserMessageBubble({ message }: { message: UiUserMessage }) {
 					<img
 						key={index}
 						src={"data:" + image.mimeType + ";base64," + image.data}
-						alt={"附件图片 " + (index + 1)}
+						alt={tt("composer.attachmentImage", { n: index + 1 })}
 						className="mt-2 max-h-64 rounded-md"
 					/>
 				))}
 				<button
 					type="button"
-					aria-label="复制消息"
+					aria-label={tt("userMessage.copyAria")}
 					className={cn(
 						"absolute -bottom-2 -left-2 flex size-6 items-center justify-center rounded-full border border-border bg-surface text-ink-3 opacity-0 shadow-lv1 transition-opacity [@media(hover:hover)]:group-hover:opacity-100",
 					)}
@@ -51,7 +52,7 @@ export function UserMessageBubble({ message }: { message: UiUserMessage }) {
 					{copied ? <Check className="size-3 text-success" /> : <Copy className="size-3" />}
 				</button>
 			</div>
-			{!message.delivered && <span className="text-xs text-ink-3">等待注入</span>}
+			{!message.delivered && <span className="text-xs text-ink-3">{tt("status.waitingInjection")}</span>}
 			{message.source !== "prompt" && (
 				<Badge variant={message.source === "steer" ? "primary" : "default"}>
 					{SOURCE_LABEL[message.source]}

@@ -4,10 +4,11 @@ import { toast } from "sonner";
 import { formatCost, formatDuration, formatTokens } from "../../lib/format";
 import { forkFromEntry } from "../../lib/session-controller";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
+import { tt } from "../../lib/i18n";
 import type { ProductTurn } from "../../types/view-models";
 
 /**
- * The single turn-level footer (DSH §9.2): timing, tokens, cost, and error /
+ * The single turn-level footer: timing, tokens, cost, and error /
  * aborted markers live here, not on every assistant fragment. Fork acts on
  * the newest forkable user message of the session (get_fork_messages).
  */
@@ -40,12 +41,12 @@ export function TurnTail({ turn }: { turn: ProductTurn }) {
 			const { messages } = expectData(response) as { messages: Array<{ entryId: string; text: string }> };
 			const last = messages[messages.length - 1];
 			if (!last) {
-				toast.info("该会话没有可用的分叉消息");
+				toast.info(tt("tail.noForkMessages"));
 				return;
 			}
 			await forkFromEntry(last.entryId);
 		} catch (error) {
-			toast.error("分叉失败", { description: error instanceof Error ? error.message : String(error) });
+			toast.error(tt("tail.forkFailed"), { description: error instanceof Error ? error.message : String(error) });
 		}
 	};
 
@@ -57,20 +58,20 @@ export function TurnTail({ turn }: { turn: ProductTurn }) {
 			{turn.status === "error" && (
 				<span className="inline-flex items-center gap-1 text-danger">
 					<CircleAlert className="size-3.5" />
-					{turn.errorMessage ?? "模型返回错误"}
+					{turn.errorMessage ?? tt("tail.modelError")}
 				</span>
 			)}
 			{turn.status === "aborted" && (
 				<span className="inline-flex items-center gap-1 text-ink-3">
 					<OctagonX className="size-3.5" />
-					已停止
-				</span>
+				{tt("common.stopped")}
+									</span>
 			)}
 			{turn.status === "settled" && (
 				<span className="inline-flex items-center gap-1 text-success">
 					<Check className="size-3.5" />
-					完成
-				</span>
+				{tt("common.done")}
+									</span>
 			)}
 			<span className="font-mono tabular-nums">
 				{turn.timing?.durationMs !== undefined ? formatDuration(turn.timing.durationMs) : ""}
@@ -84,7 +85,7 @@ export function TurnTail({ turn }: { turn: ProductTurn }) {
 				onClick={() => void copyTurn()}
 			>
 				{copied ? <Check className="size-3" /> : <Copy className="size-3" />}
-				{copied ? "已复制" : "复制"}
+				{copied ? tt("common.copied") : tt("common.copy")}
 			</button>
 			<button
 				type="button"
@@ -92,7 +93,7 @@ export function TurnTail({ turn }: { turn: ProductTurn }) {
 				onClick={() => void forkLast()}
 			>
 				<GitFork className="size-3" />
-				分叉
+				{tt("common.fork")}
 			</button>
 		</div>
 	);

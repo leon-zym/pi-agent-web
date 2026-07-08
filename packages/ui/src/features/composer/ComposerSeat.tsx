@@ -1,6 +1,7 @@
 import { ImagePlus, Plus, SendHorizontal, Square, Zap } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
+import { tt, useT } from "../../lib/i18n";
 import { Button } from "../../components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
 import { abortCurrentRun, submitDraft } from "../../lib/session-controller";
@@ -34,10 +35,12 @@ function detectSlashTrigger(text: string, cursorIndex: number): { index: number;
 /**
  * Persistent sticky composer (DESIGN.md): one DOM instance across session
  * switches, floating capsule card, queue dock above, toolbar below.
- * While the agent runs, Enter injects as 插队 (steer), Cmd/Ctrl+Enter queues
- * as 排队 (follow_up); a bare prompt is blocked during streaming.
+ * While the agent runs, Enter injects as steer, Cmd/Ctrl+Enter queues
+ * as follow-up; a bare prompt is blocked during streaming.
  */
 export function ComposerSeat() {
+	const { t } = useT();
+	void t;
 	const draft = useComposerStore((s) => s.draft);
 	const images = useComposerStore((s) => s.images);
 	const queue = useComposerStore((s) => s.queue);
@@ -79,17 +82,17 @@ export function ComposerSeat() {
 
 	const submit = (mode: "prompt" | "steer" | "follow_up") => {
 		if (!hasWorkspace || !hasSession) {
-			toast.error("请先打开工作区并选择会话");
+			toast.error(tt("composer.needWorkspaceSession"));
 			return;
 		}
 		if (draft.trimStart().startsWith("/") && !exactCommandMatch) {
-			toast.error("未知命令：" + (draft.trimStart().split(/\s/, 1)[0] ?? ""), {
-				description: "无法识别的 / 命令不会作为普通消息发送",
+			toast.error(tt("composer.unknownCommand", { command: draft.trimStart().split(/\s/, 1)[0] ?? "" }), {
+				description: tt("composer.unknownCommandDesc"),
 			});
 			return;
 		}
 		if (draft.length > MAX_LENGTH) {
-			toast.error("消息过长");
+			toast.error(tt("composer.tooLong"));
 			return;
 		}
 		setTrigger(null);
@@ -174,12 +177,12 @@ export function ComposerSeat() {
 								<div key={index} className="group relative">
 									<img
 										src={"data:" + image.mimeType + ";base64," + image.data}
-										alt={"附件 " + (index + 1)}
+										alt={tt("composer.attachment", { n: index + 1 })}
 										className="h-16 rounded-md object-cover"
 									/>
 									<button
 										type="button"
-										aria-label="移除附件"
+										aria-label={tt("composer.removeAttachment")}
 										className="absolute -right-1.5 -top-1.5 flex size-5 items-center justify-center rounded-full border border-border bg-surface text-ink-3 shadow-lv1 hover:text-danger"
 										onClick={() => setImages(images.filter((_, i) => i !== index))}
 									>
@@ -198,12 +201,12 @@ export function ComposerSeat() {
 						onCompositionEnd={() => setComposing(false)}
 						placeholder={
 							!hasWorkspace
-								? "在左侧选择一个工作区…"
+								? tt("composer.pickWorkspace")
 								: !hasSession
-									? "选择或新建会话后开始对话…"
+									? tt("composer.pickSession")
 									: running
-										? "输入插队消息，回车注入；Cmd/Ctrl+Enter 排队…"
-										: "输入消息，/ 打开命令菜单…"
+										? tt("composer.steerPlaceholder")
+										: tt("composer.defaultPlaceholder")
 						}
 						rows={1}
 						className="w-full resize-none bg-transparent text-[15px] leading-6 text-ink outline-none placeholder:text-ink-3"
@@ -216,7 +219,7 @@ export function ComposerSeat() {
 							<Button
 								variant="ghost"
 								size="icon"
-								aria-label="命令菜单"
+								aria-label={tt("composer.commandMenu")}
 								onClick={() => {
 									const el = textareaRef.current;
 									if (!el) return;
@@ -234,20 +237,20 @@ export function ComposerSeat() {
 								<Plus className="size-4 text-ink-3" />
 							</Button>
 						</TooltipTrigger>
-						<TooltipContent>命令菜单（/）</TooltipContent>
+						<TooltipContent>{tt("composer.commandMenuSlash")}</TooltipContent>
 					</Tooltip>
 					<Tooltip>
 						<TooltipTrigger asChild>
 							<Button
 								variant="ghost"
 								size="icon"
-								aria-label="添加图片"
+								aria-label={tt("composer.addImage")}
 								onClick={() => document.getElementById("piweb-image-input")?.click()}
 							>
 								<ImagePlus className="size-4 text-ink-3" />
 							</Button>
 						</TooltipTrigger>
-						<TooltipContent>添加图片</TooltipContent>
+						<TooltipContent>{tt("composer.addImage")}</TooltipContent>
 					</Tooltip>
 					<input
 						id="piweb-image-input"
@@ -295,21 +298,21 @@ export function ComposerSeat() {
 								<Button
 									variant="ghost"
 									size="icon"
-									aria-label="停止"
+									aria-label={tt("composer.stop")}
 									className="text-danger"
 									onClick={() => void abortCurrentRun()}
 								>
 									<Square className="size-4 fill-current" />
 								</Button>
 							</TooltipTrigger>
-							<TooltipContent>停止当前运行</TooltipContent>
+							<TooltipContent>{tt("composer.stopCurrent")}</TooltipContent>
 						</Tooltip>
 					)}
 					<Tooltip>
 						<TooltipTrigger asChild>
 							<Button
 								size="icon"
-								aria-label={running ? "插队发送" : "发送"}
+								aria-label={running ? tt("composer.steerSend") : tt("composer.send")}
 								className="size-[34px] rounded-full"
 								disabled={!draft.trim() && images.length === 0 && queueCount === 0}
 								onClick={() =>
@@ -319,14 +322,14 @@ export function ComposerSeat() {
 								<SendHorizontal className="size-4" />
 							</Button>
 						</TooltipTrigger>
-						<TooltipContent>{running ? "发送（插队/排队）" : "发送"}</TooltipContent>
+						<TooltipContent>{running ? tt("composer.sendQueued") : tt("composer.send")}</TooltipContent>
 					</Tooltip>
 				</div>
 			</div>
 			{running && (
 				<p className="mt-1.5 text-center text-[11px] text-ink-3">
-					运行中：回车以「{deliveryMode === "follow_up" ? "排队" : "插队"}」注入，Cmd/Ctrl+Enter 切换为「
-					{deliveryMode === "follow_up" ? "插队" : "排队"}」
+					{tt("composer.runningHint1", { mode: deliveryMode === "follow_up" ? tt("status.followUp") : tt("status.steer") })}
+					{tt("composer.runningHint2", { other: deliveryMode === "follow_up" ? tt("status.steer") : tt("status.followUp") })}
 				</p>
 			)}
 		</div>

@@ -1,5 +1,6 @@
 import { Bot } from "lucide-react";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
+import { tt } from "../../lib/i18n";
 
 /** Quiet empty state: no marketing hero, just orientation (DESIGN.md). */
 export function EmptyHero() {
@@ -12,11 +13,11 @@ export function EmptyHero() {
 				<Bot className="size-6" />
 			</div>
 			<p className="text-base font-medium text-ink">
-				{!hasWorkspace ? "打开一个工作区开始对话" : !hasSession ? "选择或新建一个会话" : "开始你的第一轮对话"}
+				{!hasWorkspace ? tt("hero.pickWorkspace") : !hasSession ? tt("hero.pickSession") : tt("hero.firstTurn")}
 			</p>
 			<p className="max-w-sm text-[13px] leading-relaxed text-ink-3">
-				输入消息发送给 Pi Coding Agent。运行中输入回车会以「插队」方式注入，Cmd/Ctrl + Enter
-				排队到本轮结束后执行。
+				{tt("hero.hint1")}
+				{tt("hero.hint2")}
 			</p>
 		</div>
 	);

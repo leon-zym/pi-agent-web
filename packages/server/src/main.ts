@@ -41,7 +41,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 	const config: ServerConfig = { ...loadConfig(), ...options.config };
 	fs.mkdirSync(config.webDataDir, { recursive: true });
 
-	// Three-tier runtime resolution (design spec §7.2). Boot continues even
+	// Three-tier runtime resolution. Boot continues even
 	// without pi so the UI can explain the situation; workspace opens will fail
 	// with the resolver error until a runtime is available.
 	let runtime: ResolvedPi;
@@ -76,9 +76,11 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 	const app = createApp({ config, registry, supervisor });
 
 	// Production: serve the built SPA (fallback to index.html for client routes).
+	// Only paths outside /api reach this handler; API routes win regardless.
 	const staticDir = options.staticDir;
 	if (staticDir && fs.existsSync(staticDir)) {
 		app.get("/*", async (c) => {
+			if (c.req.path.startsWith("/api/")) return c.json({ error: "not found" }, 404);
 			const urlPath = c.req.path;
 			const filePath = urlPath === "/" ? "index.html" : urlPath.replace(/^\//, "");
 			const candidate = `${staticDir}/${filePath}`;
@@ -126,7 +128,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 		});
 	});
 
-	// Auto-open browser (npx closure, design spec §7.3).
+	// Auto-open browser (npx one-shot flow).
 	if (options.openInBrowser) {
 		const { exec } = await import("node:child_process");
 		const url = `http://${config.host === "0.0.0.0" ? "127.0.0.1" : config.host}:${config.port}`;

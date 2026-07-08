@@ -1,7 +1,7 @@
 import type { ImageContent } from "./pi-types";
 
 /**
- * View models for the conversation projection (design spec §5.1).
+ * View models for the conversation projection.
  * The product layer never renders raw protocol events directly.
  */
 

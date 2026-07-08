@@ -16,6 +16,7 @@ import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
 import { Skeleton } from "../../components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
+import { tt } from "../../lib/i18n";
 import { forkFromEntry } from "../../lib/session-controller";
 import { cn } from "../../lib/utils";
 import { useProjectionStore } from "../../stores/projection";
@@ -24,9 +25,9 @@ import { useTransportStore } from "../../stores/transport";
 import { type RightPanelMode, useViewStore } from "../../stores/view";
 
 const MODES: Array<{ mode: RightPanelMode; label: string; icon: typeof Wrench }> = [
-	{ mode: "inspector", label: "检查", icon: Wrench },
-	{ mode: "tree", label: "分支", icon: GitBranch },
-	{ mode: "debug", label: "事件", icon: Bug },
+	{ mode: "inspector", label: "details.inspector", icon: Wrench },
+	{ mode: "tree", label: "details.tree", icon: GitBranch },
+	{ mode: "debug", label: "details.debug", icon: Bug },
 ];
 
 function useSelectedToolBlock() {
@@ -58,7 +59,7 @@ function InspectorView() {
 	if (!selected) {
 		return (
 			<p className="px-4 py-8 text-center text-[13px] text-ink-3">
-				在对话中点击工具行的「检查」图标，在这里查看完整输出。
+				{tt("details.inspectorEmpty")}
 			</p>
 		);
 	}
@@ -91,27 +92,27 @@ function InspectorView() {
 					}
 				>
 					{block.status === "preparing"
-						? "生成参数"
+						? tt("status.generatingArgs")
 						: block.status === "running"
-							? "执行中"
+							? tt("status.executing")
 							: block.status === "done"
-								? "完成"
+								? tt("common.done")
 								: block.status === "error"
-									? "出错"
-									: "未执行"}
+									? tt("common.error")
+									: tt("status.notExecuted")}
 				</Badge>
 			</div>
 			<div className="scroll-slim min-h-0 flex-1 overflow-y-auto">
 				<div className="px-4 py-3">
-					<p className="mb-1.5 text-[11px] font-medium tracking-wide text-ink-3 uppercase">参数</p>
+					<p className="mb-1.5 text-[11px] font-medium tracking-wide text-ink-3 uppercase">{tt("details.args")}</p>
 					<pre className="scroll-slim max-h-64 overflow-y-auto rounded-md bg-surface-2 p-3 font-mono text-xs leading-[18px] whitespace-pre-wrap break-all text-ink-2">
 						{block.argsText || JSON.stringify(block.args ?? {}, null, 2)}
 					</pre>
 				</div>
 				<div className="px-4 py-3">
-					<p className="mb-1.5 text-[11px] font-medium tracking-wide text-ink-3 uppercase">输出</p>
+					<p className="mb-1.5 text-[11px] font-medium tracking-wide text-ink-3 uppercase">{tt("details.output")}</p>
 					<pre className="scroll-slim max-h-[420px] overflow-y-auto rounded-md bg-surface-2 p-3 font-mono text-xs leading-[18px] whitespace-pre-wrap break-all text-ink-2">
-						{resultText || "（无输出）"}
+						{resultText || tt("common.noOutput")}
 					</pre>
 				</div>
 			</div>
@@ -131,36 +132,36 @@ function entryLabel(entry: SessionEntry): string {
 								.filter((b) => b.type === "text")
 								.map((b) => (b as { text: string }).text)
 								.join(" ");
-				return content.slice(0, 60) || "用户消息";
+				return content.slice(0, 60) || tt("details.userMessage");
 			}
 			if (message.role === "assistant") {
 				const text = message.content
 					.filter((b) => b.type === "text")
 					.map((b) => (b as { text: string }).text)
 					.join(" ");
-				return text.slice(0, 60) || "助手回复";
+				return text.slice(0, 60) || tt("details.assistantReply");
 			}
 			return "role" in message && message.role === "toolResult" && "toolName" in message
-				? String(message.toolName) + " 结果"
-				: "工具结果";
+				? String(message.toolName)
+				: tt("details.toolResult");
 		}
 		case "thinking_level_change":
-			return "思考级别 → " + entry.thinkingLevel;
+			return tt("details.levelChange", { level: entry.thinkingLevel });
 		case "model_change":
-			return "模型 → " + entry.provider + "/" + entry.modelId;
+			return tt("details.modelChange", { provider: entry.provider, model: entry.modelId });
 		case "compaction":
-			return "上下文压缩";
+			return tt("details.compaction");
 		case "branch_summary":
-			return "分支摘要";
+			return tt("details.branchSummary");
 		case "label":
-			return entry.label ?? "标签";
+			return entry.label ?? tt("details.labelEntry");
 		case "session_info":
-			return entry.name ? "重命名 → " + entry.name : "会话信息";
+			return entry.name ? tt("details.renameTo", { name: entry.name }) : tt("details.sessionInfo");
 		case "custom":
 		case "custom_message":
-			return "自定义条目";
+			return tt("details.customEntry");
 		default:
-			return "条目";
+			return tt("details.customEntry");
 	}
 }
 
@@ -219,7 +220,7 @@ function TreeNodeView({
 				</span>
 				{isLeaf && (
 					<Badge variant="primary" className="shrink-0">
-						当前
+						{tt("details.current")}
 					</Badge>
 				)}
 				{isUserMessage && (
@@ -227,14 +228,14 @@ function TreeNodeView({
 						<TooltipTrigger asChild>
 							<button
 								type="button"
-								aria-label="从此处分叉"
+								aria-label={tt("details.forkFromHere")}
 								className="flex size-5 shrink-0 items-center justify-center rounded-sm text-ink-3 opacity-0 group-hover:opacity-100 hover:bg-hover hover:text-primary"
 								onClick={() => onFork(node.entry.id)}
 							>
 								<GitFork className="size-3.5" />
 							</button>
 						</TooltipTrigger>
-						<TooltipContent>从这条消息分叉</TooltipContent>
+						<TooltipContent>{tt("details.forkFromHere")}</TooltipContent>
 					</Tooltip>
 				)}
 			</div>
@@ -290,10 +291,10 @@ function TreeView() {
 		<div className="flex h-full flex-col">
 			<div className="flex flex-none items-center gap-2 border-b border-border px-4 py-3">
 				<GitBranch className="size-4 text-ink-3" />
-				<span className="text-[13px] font-medium text-ink">会话分支树</span>
+				<span className="text-[13px] font-medium text-ink">{tt("details.treeTitle")}</span>
 				<div className="flex-1" />
 				<Button variant="ghost" size="sm" onClick={() => void load()}>
-					刷新
+					{tt("details.refresh")}
 				</Button>
 			</div>
 			<div className="scroll-slim min-h-0 flex-1 overflow-y-auto p-2">
@@ -304,7 +305,7 @@ function TreeView() {
 						<Skeleton className="h-6 w-3/5" />
 					</div>
 				) : tree.length === 0 ? (
-					<p className="px-2 py-6 text-center text-[12px] text-ink-3">当前会话没有条目</p>
+					<p className="px-2 py-6 text-center text-[12px] text-ink-3">{tt("details.treeEmpty")}</p>
 				) : (
 					tree.map((node) => (
 						<TreeNodeView
@@ -333,11 +334,11 @@ function DebugView() {
 		<div className="flex h-full flex-col">
 			<div className="flex flex-none items-center gap-2 border-b border-border px-4 py-3">
 				<Bug className="size-4 text-ink-3" />
-				<span className="text-[13px] font-medium text-ink">原始事件（最近 200 条）</span>
+				<span className="text-[13px] font-medium text-ink">{tt("details.debugTitle")}</span>
 				<input
 					value={filter}
 					onChange={(e) => setFilter(e.target.value)}
-					placeholder="过滤事件类型…"
+					placeholder={tt("details.filterEvents")}
 					className="ml-auto h-6 w-32 rounded-sm border border-border bg-surface px-2 text-xs text-ink outline-none placeholder:text-ink-3"
 				/>
 			</div>
@@ -393,14 +394,14 @@ export function DetailsPanel({ open, onToggle }: { open: boolean; onToggle: () =
 					<TooltipTrigger asChild>
 						<button
 							type="button"
-							aria-label={open ? "收起详情面板" : "展开详情面板"}
+							aria-label={open ? tt("details.collapsePanel") : tt("details.expandPanel")}
 							className="flex size-7 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
 							onClick={onToggle}
 						>
 							{open ? <PanelRightClose className="size-4" /> : <PanelRightOpen className="size-4" />}
 						</button>
 					</TooltipTrigger>
-					<TooltipContent>{open ? "收起" : "展开"}</TooltipContent>
+					<TooltipContent>{open ? tt("details.collapse") : tt("details.expand")}</TooltipContent>
 				</Tooltip>
 			</div>
 			<div className="min-h-0 flex-1">

@@ -14,6 +14,7 @@ import { useProjectionStore } from "../../stores/projection";
 import { useViewStore } from "../../stores/view";
 import type { ContentBlock, UiToolResult } from "../../types/view-models";
 import { getToolPresenter } from "./tool-presenters";
+import { tt } from "../../lib/i18n";
 
 type ToolCallBlock = Extract<ContentBlock, { type: "tool_call" }>;
 
@@ -21,11 +22,11 @@ const STATUS_ICON: Record<
 	ToolCallBlock["status"],
 	{ icon: typeof Wrench; className: string; label: string }
 > = {
-	preparing: { icon: Loader2, className: "text-ink-3 animate-spin", label: "生成参数中" },
-	running: { icon: Loader2, className: "text-primary animate-spin", label: "执行中" },
-	done: { icon: Check, className: "text-success", label: "完成" },
-	error: { icon: CircleAlert, className: "text-danger", label: "出错" },
-	skipped: { icon: SkipForward, className: "text-ink-3", label: "因输出截断未执行" },
+	preparing: { icon: Loader2, className: "text-ink-3 animate-spin", label: "status.preparing" },
+	running: { icon: Loader2, className: "text-primary animate-spin", label: "status.executing" },
+	done: { icon: Check, className: "text-success", label: "common.done" },
+	error: { icon: CircleAlert, className: "text-danger", label: "common.error" },
+	skipped: { icon: SkipForward, className: "text-ink-3", label: "status.skipped" },
 };
 
 function flattenArgs(args: unknown): string {
@@ -100,11 +101,11 @@ export function ToolCallRow({ block, results }: { block: ToolCallBlock; results:
 					<Wrench className="size-3.5 shrink-0 text-ink-3" />
 					<span className="shrink-0 font-mono text-[13px] text-ink">{block.toolName}</span>
 					{summary && <span className="min-w-0 truncate text-[13px] text-ink-3">· {summary}</span>}
-					<span className="sr-only">{status.label}</span>
+					<span className="sr-only">{tt(status.label as never)}</span>
 				</button>
 				<button
 					type="button"
-					aria-label="在详情面板中查看"
+					aria-label={tt("tool.inspectAria")}
 					className="flex size-6 items-center justify-center rounded-sm text-ink-3 opacity-0 transition-opacity hover:bg-hover hover:text-ink group-hover:opacity-100 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-primary/40"
 					onClick={() => {
 						const view = useViewStore.getState();
@@ -115,14 +116,14 @@ export function ToolCallRow({ block, results }: { block: ToolCallBlock; results:
 					<ExternalLink className="size-3.5" />
 				</button>
 				{block.status === "skipped" && (
-					<span className="shrink-0 text-[11px] text-ink-3">因输出截断未执行</span>
+					<span className="shrink-0 text-[11px] text-ink-3">{tt("status.skipped")}</span>
 				)}
 			</div>
 
 			{expanded && (
 				<div className="ml-[22px] flex flex-col gap-2 border-l border-border pl-3">
 					<div className="max-h-[224px] overflow-y-auto scroll-slim rounded-sm bg-surface-2 p-2.5 font-mono text-xs leading-[18px] whitespace-pre-wrap break-all text-ink-2">
-						{isBash ? output || "（无输出）" : flattenArgs(block.args)}
+						{isBash ? output || tt("common.noOutput") : flattenArgs(block.args)}
 					</div>
 					{!isBash && output && (
 						<div className="max-h-[260px] overflow-y-auto scroll-slim rounded-sm bg-surface-2 p-2.5 font-mono text-xs leading-[18px] whitespace-pre-wrap break-all text-ink-2">
@@ -130,13 +131,13 @@ export function ToolCallRow({ block, results }: { block: ToolCallBlock; results:
 						</div>
 					)}
 					{isBash && fullOutputPath && (
-						<span className="text-[11px] text-ink-3">完整日志：{fullOutputPath}</span>
+						<span className="text-[11px] text-ink-3">{tt("tool.fullLog", { path: fullOutputPath })}</span>
 					)}
 					{results.map((result) =>
 						result.isError ? (
 							<div key={result.toolCallId} className="flex items-start gap-1.5 text-[13px] text-danger">
 								<X className="mt-0.5 size-3.5 shrink-0" />
-								<span className="whitespace-pre-wrap break-words">{result.content || "工具执行出错"}</span>
+								<span className="whitespace-pre-wrap break-words">{result.content || tt("tool.executionError")}</span>
 							</div>
 						) : null,
 					)}

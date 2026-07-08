@@ -4,7 +4,7 @@ import { StringDecoder } from "node:string_decoder";
 /**
  * Strict LF-only JSONL line reader.
  *
- * Semantically identical to pi's src/modes/rpc/jsonl.ts (design spec §3.1,
+ * Semantically identical to pi's src/modes/rpc/jsonl.ts (see docs/protocol.md,
  * Appendix B):
  * - Split on LF only; U+2028/U+2029 are legal inside JSON strings, so Node's
  *   readline must never be used.

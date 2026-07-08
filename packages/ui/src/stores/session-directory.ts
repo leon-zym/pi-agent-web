@@ -36,6 +36,12 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 		try {
 			const workspaces = await api.listWorkspaces();
 			set({ workspaces, loadingWorkspaces: false });
+			// First load: auto-open the most recently used workspace so the
+			// workbench is immediately usable.
+			if (!get().currentWorkspaceId && workspaces.length > 0) {
+				const mostRecent = [...workspaces].sort((a, b) => (b.lastOpenedAt ?? 0) - (a.lastOpenedAt ?? 0))[0];
+				if (mostRecent) void get().selectWorkspace(mostRecent.id);
+			}
 		} catch (error) {
 			set({ loadingWorkspaces: false, error: error instanceof Error ? error.message : String(error) });
 		}

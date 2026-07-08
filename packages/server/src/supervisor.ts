@@ -13,19 +13,19 @@ import type { WsServerMessage } from "./wire.js";
 import { RpcError } from "./wire.js";
 
 /**
- * Workspace-granularity process supervisor (design spec §2.1).
+ * Workspace-granularity process supervisor (see docs/architecture.md).
  *
  * - 1 workspace = 1 "pi --mode rpc" child process (cwd = workspace).
  * - In-workspace session switches reuse the process; cross-workspace switches
  *   must restart the process (validated in sendCommand).
- * - Ready handshake + initial get_commands warm-up (§2.1 rule 5).
+ * - Ready handshake + initial get_commands warm-up (no ready frame in the protocol).
  * - Crash detection: supervisor synthesizes process_status "crashed" (the dead
  *   process cannot report itself). Auto-restart up to 3 times within a 30s
- *   window with exponential backoff, then manual restart only (§2.1 rule 4).
+ *   window with exponential backoff, then manual restart only.
  * - Tracks the active sessionId from get_state responses (no ready frame in
  *   the protocol; session boundaries are inferred, Appendix A note).
  * - Keeps pending extension dialogs per (workspaceId, sessionId) so the WS
- *   bridge can cancel them when the last listener disconnects (§2.1 rule 6).
+ *   bridge can cancel them when the last listener disconnects.
  */
 
 export type ProcessState = "starting" | "running" | "crashed";
@@ -174,7 +174,7 @@ export class Supervisor {
 		});
 	}
 
-	/** Send get_commands right after ready so the slash menu has warm candidates (§2.1 rule 5). */
+	/** Send get_commands right after ready so the slash menu has warm candidates. */
 	private warmUpCommands(rt: WorkspaceRuntime): void {
 		const proc = rt.proc;
 		if (!proc?.running) return;
@@ -202,7 +202,7 @@ export class Supervisor {
 
 		if (rt.manuallyStopped) return;
 
-		// Auto-restart: at most maxAutoRestarts within the sliding window (§2.1 rule 4).
+		// Auto-restart: at most maxAutoRestarts within the sliding window.
 		const now = Date.now();
 		rt.crashTimes = rt.crashTimes.filter((t) => now - t < this.opts.restartWindowMs);
 		rt.crashTimes.push(now);
@@ -263,7 +263,7 @@ export class Supervisor {
 	/**
 	 * Send a command to the workspace process.
 	 *
-	 * - Cross-workspace switch_session is rejected up front (§2.1 rule 3): the
+	 * - Cross-workspace switch_session is rejected up front (the process cwd and
 	 *   target session file must live in this process's session dir.
 	 * - After successful session-switching commands, refresh the tracked
 	 *   sessionId (the switch response carries only {cancelled}).
@@ -331,7 +331,7 @@ export class Supervisor {
 
 	/**
 	 * Cancel every pending dialog that was opened under the given session
-	 * (WS disconnect protection, §2.1 rule 6). Idempotent: the agent ignores
+	 * (WS disconnect protection). Idempotent: the agent ignores
 	 * responses for requests that already timed out locally.
 	 */
 	cancelDialogsForSession(workspaceId: string, sessionId: string): number {

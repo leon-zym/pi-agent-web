@@ -4,7 +4,7 @@ import { reduceProjection } from "../src/stores/projection-reducer";
 import { createEmptyProjection } from "../src/types/view-models";
 
 /**
- * Stream assembler state machine tests (design spec §5.2). Fixtures are the
+ * Stream assembler state machine tests. Fixtures are the
  * minimal wire shapes; the reducer only reads the fields it needs.
  */
 

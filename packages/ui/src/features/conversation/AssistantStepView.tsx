@@ -3,6 +3,7 @@ import type { AssistantStep, ContentBlock } from "../../types/view-models";
 import { MarkdownBlock } from "./MarkdownBlock";
 import { ReasoningDisclosure } from "./ReasoningDisclosure";
 import { ToolCallRow } from "./ToolCallRow";
+import { tt } from "../../lib/i18n";
 
 function BlockView({
 	block,
@@ -41,7 +42,7 @@ export function AssistantStepView({ step }: { turnId: string; step: AssistantSte
 		return (
 			<div className="flex items-center gap-2 py-1 text-[13px] text-ink-3">
 				<span className="size-1.5 rounded-full bg-primary pulse-dot" />
-				<span>正在处理…</span>
+				<span>{tt("common.processing")}</span>
 			</div>
 		);
 	}

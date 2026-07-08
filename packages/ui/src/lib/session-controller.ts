@@ -1,6 +1,7 @@
 import type { RpcResponse } from "@earendil-works/pi-coding-agent";
 import type { SessionSummary } from "@pi-agent-web/server/wire";
 import { expectData } from "@pi-agent-web/server/wire";
+import { tt } from "./i18n";
 import { toast } from "sonner";
 import { useComposerStore } from "../stores/composer";
 import { useModelDirectoryStore } from "../stores/model-directory";
@@ -20,7 +21,7 @@ import { api } from "./api";
 
 function workspaceId(): string {
 	const id = useSessionDirectoryStore.getState().currentWorkspaceId;
-	if (!id) throw new Error("尚未打开工作区");
+	if (!id) throw new Error(tt("session.workspaceRequired"));
 	return id;
 }
 
@@ -35,7 +36,7 @@ async function snapshotAfterOpen(wsId: string, sessionId: string): Promise<void>
 		const { messages } = expectData(response) as { messages: never[] };
 		useProjectionStore.getState().rebuildFromMessages(sessionId, messages);
 	} catch (error) {
-		toast.error("加载会话内容失败", { description: error instanceof Error ? error.message : String(error) });
+		toast.error(tt("session.loadFailed"), { description: error instanceof Error ? error.message : String(error) });
 	}
 	void useSlashCommandsStore.getState().refresh(wsId);
 	void useModelDirectoryStore.getState().refresh(wsId);
@@ -55,13 +56,13 @@ export async function openSession(summary: SessionSummary): Promise<void> {
 		const data = expectData(response) as { cancelled: boolean };
 		if (data.cancelled) {
 			directory.setCurrentSession(null);
-			toast.info("会话切换已被扩展取消");
+			toast.info(tt("session.switchCancelled"));
 			return;
 		}
 		await snapshotAfterOpen(wsId, summary.id);
 	} catch (error) {
 		directory.setCurrentSession(null);
-		toast.error("打开会话失败", { description: error instanceof Error ? error.message : String(error) });
+		toast.error(tt("session.openFailed"), { description: error instanceof Error ? error.message : String(error) });
 	}
 }
 
@@ -72,7 +73,7 @@ export async function newSession(): Promise<void> {
 		const response = await useTransportStore.getState().sendCommand(wsId, { type: "new_session" }, 30_000);
 		const data = expectData(response) as { cancelled: boolean };
 		if (data.cancelled) {
-			toast.info("新建会话已被扩展取消");
+			toast.info(tt("session.newCancelled"));
 			return;
 		}
 		const stateResponse = await useTransportStore.getState().sendCommand(wsId, { type: "get_state" });
@@ -94,7 +95,7 @@ export async function newSession(): Promise<void> {
 			}
 		}
 	} catch (error) {
-		toast.error("新建会话失败", { description: error instanceof Error ? error.message : String(error) });
+		toast.error(tt("session.newFailed"), { description: error instanceof Error ? error.message : String(error) });
 	}
 }
 
@@ -106,9 +107,9 @@ export async function deleteSession(summary: SessionSummary): Promise<void> {
 		if (useSessionDirectoryStore.getState().currentSession?.id === summary.id) {
 			useSessionDirectoryStore.getState().setCurrentSession(null);
 		}
-		toast.success("会话已删除");
+		toast.success(tt("session.deleted"));
 	} catch (error) {
-		toast.error("删除会话失败", { description: error instanceof Error ? error.message : String(error) });
+		toast.error(tt("session.deleteFailed"), { description: error instanceof Error ? error.message : String(error) });
 	}
 }
 
@@ -118,7 +119,7 @@ export async function renameSession(summary: SessionSummary, name: string): Prom
 		await useTransportStore.getState().sendCommand(wsId, { type: "set_session_name", name });
 		await useSessionDirectoryStore.getState().reloadSessions();
 	} catch (error) {
-		toast.error("重命名失败", { description: error instanceof Error ? error.message : String(error) });
+		toast.error(tt("session.renameFailed"), { description: error instanceof Error ? error.message : String(error) });
 	}
 }
 
@@ -133,12 +134,12 @@ function isRunning(): boolean {
 
 /**
  * Submit the composer draft. While running, bare prompt is blocked and the
- * delivery mode picks steer (插队) or follow_up (排队) (§6.2.3).
+ * delivery mode picks steer (插队) or follow_up (排队).
  */
 export async function submitDraft(kind: SubmitKind): Promise<void> {
 	const wsId = useSessionDirectoryStore.getState().currentWorkspaceId;
 	if (!wsId) {
-		toast.error("请先打开一个工作区");
+		toast.error(tt("session.needWorkspace"));
 		return;
 	}
 	const composer = useComposerStore.getState();
@@ -165,12 +166,12 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 			response = await transport.sendCommand(wsId, { type: "prompt", message: text, images }, 120_000);
 		}
 		if (response.success === false) {
-			toast.error("发送失败", { description: response.error });
+			toast.error(tt("session.sendFailed"), { description: response.error });
 		} else {
 			composer.clearDraft();
 		}
 	} catch (error) {
-		toast.error("发送失败", { description: error instanceof Error ? error.message : String(error) });
+		toast.error(tt("session.sendFailed"), { description: error instanceof Error ? error.message : String(error) });
 	} finally {
 		composer.setSubmitState("plain");
 	}
@@ -182,7 +183,7 @@ export async function abortCurrentRun(): Promise<void> {
 	try {
 		await useTransportStore.getState().sendCommand(wsId, { type: "abort" }, 60_000);
 	} catch (error) {
-		toast.error("中止失败", { description: error instanceof Error ? error.message : String(error) });
+		toast.error(tt("session.abortFailed"), { description: error instanceof Error ? error.message : String(error) });
 	}
 }
 
@@ -194,10 +195,10 @@ export async function runSlashCommand(wsId: string, fullText: string): Promise<v
 		const response = await useTransportStore
 			.getState()
 			.sendCommand(wsId, { type: "prompt", message: fullText }, 120_000);
-		if (response.success === false) toast.error("命令执行失败", { description: response.error });
+		if (response.success === false) toast.error(tt("session.commandFailed"), { description: response.error });
 		else composer.clearDraft();
 	} catch (error) {
-		toast.error("命令执行失败", { description: error instanceof Error ? error.message : String(error) });
+		toast.error(tt("session.commandFailed"), { description: error instanceof Error ? error.message : String(error) });
 	} finally {
 		composer.setSubmitState("plain");
 	}
@@ -209,7 +210,7 @@ export async function forkFromEntry(entryId: string): Promise<void> {
 		const response = await useTransportStore.getState().sendCommand(wsId, { type: "fork", entryId }, 30_000);
 		const data = expectData(response) as { text: string; cancelled: boolean };
 		if (data.cancelled) {
-			toast.info("分叉已被扩展取消");
+			toast.info(tt("session.forkCancelled"));
 			return;
 		}
 		const stateResponse = await useTransportStore.getState().sendCommand(wsId, { type: "get_state" });
@@ -218,10 +219,10 @@ export async function forkFromEntry(entryId: string): Promise<void> {
 		const forked = useSessionDirectoryStore.getState().sessions.find((s) => s.id === state.sessionId);
 		if (forked) {
 			await openSession(forked);
-			toast.success("已从该消息分叉出新会话");
+			toast.success(tt("session.forked"));
 		}
 	} catch (error) {
-		toast.error("分叉失败", { description: error instanceof Error ? error.message : String(error) });
+		toast.error(tt("session.forkFailed"), { description: error instanceof Error ? error.message : String(error) });
 	}
 }
 

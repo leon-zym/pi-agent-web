@@ -12,11 +12,12 @@ import {
 import { Input } from "../../components/ui/input";
 import { Label } from "../../components/ui/label";
 import { Textarea } from "../../components/ui/textarea";
+import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import { type PendingDialog, useExtensionUiStore } from "../../stores/extension-ui";
 
 /**
- * Extension UI dialogs (design spec §3.3 / §6.2.8): select / confirm / input /
+ * Extension UI dialogs: select / confirm / input /
  * editor requests block the agent, so closing without an answer must send
  * cancelled:true. Dialogs queue and render one at a time.
  */
@@ -104,7 +105,7 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 
 				{request.method === "input" && (
 					<div className="flex flex-col gap-1.5">
-						<Label htmlFor="ext-input">输入</Label>
+						<Label htmlFor="ext-input">{tt("ext.input")}</Label>
 						<Input
 							id="ext-input"
 							autoFocus
@@ -129,15 +130,15 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 				)}
 
 				{"timeout" in request && request.timeout !== undefined && (
-					<p className="text-[12px] text-ink-3">扩展设置了超时，超时后将按默认值自动处理。</p>
+					<p className="text-[12px] text-ink-3">{tt("ext.timeoutHint")}</p>
 				)}
 
 				<DialogFooter>
 					<Button variant="outline" onClick={cancel}>
-						取消
+						{tt("common.cancel")}
 					</Button>
 					<Button onClick={confirm} disabled={request.method === "select" && selected === null}>
-						{request.method === "confirm" ? "确认" : "确定"}
+						{request.method === "confirm" ? tt("common.ok") : tt("common.confirm")}
 					</Button>
 				</DialogFooter>
 			</DialogContent>

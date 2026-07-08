@@ -4,7 +4,7 @@ import { StringDecoder } from "node:string_decoder";
 import type { SessionSummary } from "./wire.js";
 
 /**
- * Session directory scanning (design spec §4.1 / §7.1).
+ * Session directory scanning (see docs/protocol.md for the storage layout).
  *
  * - Only the first-line SessionHeader is authoritative: read with a 4KB buffer
  *   and a 1MB hard cap (session-manager.ts:571-615). Oversized/corrupt files are
@@ -183,7 +183,7 @@ export async function scanSessionDir(sessionDir: string): Promise<SessionSummary
 }
 
 /**
- * Lineage protection (§4.1): find sessions whose header references targetPath
+ * Lineage protection: find sessions whose header references targetPath
  * as parentSession. Used to reject deletion with 409.
  */
 export async function findChildSessions(sessionDir: string, targetAbsolutePath: string): Promise<string[]> {

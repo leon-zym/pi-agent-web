@@ -7,6 +7,7 @@ import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
 import { formatRelativeTime } from "../../lib/format";
+import { tt } from "../../lib/i18n";
 import { deleteSession, renameSession } from "../../lib/session-controller";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { useTransportStore } from "../../stores/transport";
@@ -32,7 +33,7 @@ export function SessionHeader() {
 
 	const title = useMemo(() => {
 		if (!currentSession) return "";
-		return sessionTitle(currentSession.name, currentSession.firstMessage, "未命名会话");
+		return sessionTitle(currentSession.name, currentSession.firstMessage, tt("header.unnamed"));
 	}, [currentSession]);
 
 	const startRename = () => {
@@ -53,15 +54,15 @@ export function SessionHeader() {
 		try {
 			const response = await useTransportStore.getState().sendCommand(workspaceId, { type: "export_html" });
 			const { path } = expectData(response) as { path: string };
-			toast.success("已导出 HTML", {
+			toast.success(tt("header.exported"), {
 				description: path,
 				action: {
-					label: "复制路径",
-					onClick: () => void navigator.clipboard.writeText(path).then(() => toast.success("路径已复制")),
+					label: tt("common.copyPath"),
+					onClick: () => void navigator.clipboard.writeText(path).then(() => toast.success(tt("common.pathCopied"))),
 				},
 			});
 		} catch (error) {
-			toast.error("导出失败", { description: error instanceof Error ? error.message : String(error) });
+			toast.error(tt("header.exportFailed"), { description: error instanceof Error ? error.message : String(error) });
 		}
 	};
 
@@ -69,7 +70,7 @@ export function SessionHeader() {
 		<header className="flex h-12 flex-none items-center gap-2 border-b border-border px-4">
 			<div className="flex min-w-0 flex-1 items-center gap-1.5 text-[13px]">
 				<Folder className="size-3.5 shrink-0 text-ink-3" />
-				<span className="max-w-40 truncate text-ink-3">{workspace?.displayName ?? "未打开工作区"}</span>
+				<span className="max-w-40 truncate text-ink-3">{workspace?.displayName ?? tt("header.noWorkspace")}</span>
 				{currentSession && (
 					<>
 						<ChevronRight className="size-3.5 shrink-0 text-ink-3" />
@@ -90,7 +91,7 @@ export function SessionHeader() {
 									size="icon"
 									className="size-6"
 									onClick={() => void commitRename()}
-									aria-label="确认重命名"
+									aria-label={tt("header.confirmRename")}
 								>
 									<Check className="size-3.5" />
 								</Button>
@@ -99,7 +100,7 @@ export function SessionHeader() {
 									size="icon"
 									className="size-6"
 									onClick={() => setEditing(false)}
-									aria-label="取消重命名"
+									aria-label={tt("header.cancelRename")}
 								>
 									<X className="size-3.5" />
 								</Button>
@@ -143,10 +144,10 @@ export function SessionHeader() {
 								}
 							/>
 							{processStatus?.state === "crashed"
-								? "进程已崩溃"
+								? tt("status.crashed")
 								: processStatus?.state === "starting"
-									? "启动中"
-									: "运行中"}
+									? tt("status.starting")
+									: tt("status.running")}
 						</span>
 					</Badge>
 					<Tooltip>
@@ -154,7 +155,7 @@ export function SessionHeader() {
 							<Button
 								variant="ghost"
 								size="icon"
-								aria-label="分支树"
+								aria-label={tt("header.branchTree")}
 								onClick={() => {
 									setRightPanelMode("tree");
 									setRightPanelOpen(true);
@@ -163,28 +164,28 @@ export function SessionHeader() {
 								<GitBranch className="size-4" />
 							</Button>
 						</TooltipTrigger>
-						<TooltipContent>分支树</TooltipContent>
+						<TooltipContent>{tt("header.branchTree")}</TooltipContent>
 					</Tooltip>
 					<Tooltip>
 						<TooltipTrigger asChild>
-							<Button variant="ghost" size="icon" aria-label="导出 HTML" onClick={() => void exportHtml()}>
+							<Button variant="ghost" size="icon" aria-label={tt("header.exportHtml")} onClick={() => void exportHtml()}>
 								<Download className="size-4" />
 							</Button>
 						</TooltipTrigger>
-						<TooltipContent>导出 HTML</TooltipContent>
+						<TooltipContent>{tt("header.exportHtml")}</TooltipContent>
 					</Tooltip>
 					<Tooltip>
 						<TooltipTrigger asChild>
 							<Button
 								variant="ghost"
 								size="icon"
-								aria-label="删除会话"
+								aria-label={tt("header.deleteSession")}
 								onClick={() => void deleteSession(currentSession)}
 							>
 								<Trash2 className="size-4 text-ink-3" />
 							</Button>
 						</TooltipTrigger>
-						<TooltipContent>删除会话</TooltipContent>
+						<TooltipContent>{tt("header.deleteSession")}</TooltipContent>
 					</Tooltip>
 				</div>
 			)}

@@ -1,0 +1,12 @@
+import { chromium } from "playwright";
+const browser = await chromium.launch();
+const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+page.on("console", (m) => console.log("CONSOLE", m.type(), m.text().slice(0, 200)));
+page.on("pageerror", (e) => console.log("PAGEERROR", e.message.slice(0, 300)));
+await page.goto("http://localhost:5173", { waitUntil: "domcontentloaded" });
+await page.waitForTimeout(3000);
+const html = await page.evaluate(() => document.body.innerHTML.slice(0, 1200));
+console.log("BODY:", html);
+const workspaces = await page.evaluate(() => fetch("/api/v1/workspaces").then((r) => r.json()));
+console.log("WORKSPACES:", JSON.stringify(workspaces));
+await browser.close();

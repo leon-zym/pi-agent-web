@@ -1,11 +1,12 @@
 import { Gauge } from "lucide-react";
 import { useMemo } from "react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
+import { tt } from "../../lib/i18n";
 import { formatCost, formatTokens } from "../../lib/format";
 import { useSessionStatsStore } from "../../stores/session-stats";
 
 /**
- * Context meter (DESIGN.md §6.2.7): get_session_stats().contextUsage with
+ * Context meter: get_session_stats().contextUsage with
  * live message_update usage while streaming. tokens/percent can be null right
  * after compaction: show a placeholder, never a fake 0%.
  */
@@ -38,26 +39,22 @@ export function ContextMeter() {
 
 	const tooltip = [
 		display.kind === "ready"
-			? "上下文 " +
-				formatTokens(display.tokens) +
-				" / " +
-				formatTokens(display.window) +
-				" tokens (" +
-				Math.round(display.percent) +
-				"%)"
-			: "上下文占用计算中…",
-		stats ? "会话累计 " + formatTokens(stats.tokens.total) + " tokens · " + formatCost(totalCost) : null,
-		liveTokens !== null ? "本轮实时 " + formatTokens(liveTokens) + " tokens" : null,
-	]
-		.filter(Boolean)
-		.join("\n");
+			? tt("context.tooltipTokens", {
+					tokens: formatTokens(display.tokens),
+					window: formatTokens(display.window),
+					percent: Math.round(display.percent),
+				})
+			: tt("context.tooltipComputing"),
+		stats ? tt("context.tooltipTotal", { tokens: formatTokens(stats.tokens.total), cost: formatCost(totalCost) }) : null,
+		liveTokens !== null ? tt("context.tooltipLive", { tokens: formatTokens(liveTokens) }) : null,
+	]		.join("\n");
 
 	return (
 		<Tooltip>
 			<TooltipTrigger asChild>
 				<button
 					type="button"
-					aria-label="上下文占用"
+					aria-label={tt("context.aria")}
 					className="flex h-7 items-center gap-1 rounded-sm px-2 text-xs text-ink-3 transition-colors hover:bg-hover hover:text-ink-2 focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
 				>
 					<Gauge className="size-3.5" />
@@ -72,7 +69,7 @@ export function ContextMeter() {
 							<span className="font-mono tabular-nums">{Math.round(display.percent)}%</span>
 						</>
 					) : display.kind === "computing" ? (
-						<span className="font-mono">计算中…</span>
+						<span className="font-mono">{tt("common.computing")}</span>
 					) : null}
 				</button>
 			</TooltipTrigger>

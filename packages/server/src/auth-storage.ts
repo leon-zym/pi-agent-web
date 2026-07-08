@@ -4,7 +4,7 @@ import lockfile from "proper-lockfile";
 import type { AuthStatusEntry } from "./wire.js";
 
 /**
- * auth.json read/write (design spec §7.1 / §4.1).
+ * auth.json read/write (see docs/protocol.md for the storage layout).
  * - File mode 0o600; parent dir 0o700.
  * - Writes use proper-lockfile (same lock semantics as pi's auth-storage.ts)
  *   to avoid corrupting auth.json when a pi process writes concurrently.

@@ -45,6 +45,7 @@ import {
 import { Input } from "../../components/ui/input";
 import { Label } from "../../components/ui/label";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
+import { tt } from "../../lib/i18n";
 import { api } from "../../lib/api";
 import { formatRelativeTime } from "../../lib/format";
 import { deleteSession, newSession, openSession, renameSession } from "../../lib/session-controller";
@@ -59,7 +60,7 @@ type SessionStatus = "idle" | "running" | "error";
 function sessionTitle(session: SessionSummary): string {
 	if (session.name) return session.name;
 	if (session.firstMessage) return session.firstMessage.slice(0, 40);
-	return "空会话";
+	return tt("sidebar.emptySession");
 }
 
 function sessionStatus(session: SessionSummary, isCurrent: boolean): SessionStatus {
@@ -133,27 +134,27 @@ function SessionRow({ session, workspace, current }: SessionRowProps) {
 						<TooltipTrigger asChild>
 							<button
 								type="button"
-								aria-label="重命名会话"
+								aria-label={tt("sidebar.renameSession")}
 								className="flex size-6 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
 								onClick={startRename}
 							>
 								<Pencil className="size-3.5" />
 							</button>
 						</TooltipTrigger>
-						<TooltipContent>重命名</TooltipContent>
+						<TooltipContent>{tt("common.rename")}</TooltipContent>
 					</Tooltip>
 					<Tooltip>
 						<TooltipTrigger asChild>
 							<button
 								type="button"
-								aria-label="删除会话"
+								aria-label={tt("sidebar.deleteSession")}
 								className="flex size-6 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-danger"
 								onClick={() => setDeleteOpen(true)}
 							>
 								<Trash2 className="size-3.5" />
 							</button>
 						</TooltipTrigger>
-						<TooltipContent>删除</TooltipContent>
+						<TooltipContent>{tt("common.delete")}</TooltipContent>
 					</Tooltip>
 				</div>
 			)}
@@ -161,13 +162,13 @@ function SessionRow({ session, workspace, current }: SessionRowProps) {
 			<Dialog open={renameOpen} onOpenChange={setRenameOpen}>
 				<DialogContent className="max-w-sm">
 					<DialogHeader>
-						<DialogTitle>重命名会话</DialogTitle>
-						<DialogDescription>名称会写入会话的 session_info 条目。</DialogDescription>
+						<DialogTitle>{tt("sidebar.renameSession")}</DialogTitle>
+						<DialogDescription>{tt("sidebar.renameDescription")}</DialogDescription>
 					</DialogHeader>
 					<Input
 						autoFocus
 						value={name}
-						placeholder={session.firstMessage ?? "会话名称"}
+						placeholder={session.firstMessage ?? tt("sidebar.sessionNamePlaceholder")}
 						onChange={(event) => setName(event.target.value)}
 						onKeyDown={(event) => {
 							if (event.key === "Enter") commitRename();
@@ -175,10 +176,10 @@ function SessionRow({ session, workspace, current }: SessionRowProps) {
 					/>
 					<DialogFooter>
 						<Button variant="outline" onClick={() => setRenameOpen(false)}>
-							取消
+							{tt("common.cancel")}
 						</Button>
 						<Button onClick={commitRename} disabled={!name.trim()}>
-							保存
+							{tt("common.save")}
 						</Button>
 					</DialogFooter>
 				</DialogContent>
@@ -187,15 +188,15 @@ function SessionRow({ session, workspace, current }: SessionRowProps) {
 			<AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
 				<AlertDialogContent>
 					<AlertDialogHeader>
-						<AlertDialogTitle>删除会话</AlertDialogTitle>
+						<AlertDialogTitle>{tt("sidebar.deleteSession")}</AlertDialogTitle>
 						<AlertDialogDescription>
-							将永久删除「{title}」及其全部消息记录，此操作无法撤销。
+							{tt("sidebar.deleteDescription", { title })}
 						</AlertDialogDescription>
 					</AlertDialogHeader>
 					<AlertDialogFooter>
-						<AlertDialogCancel>取消</AlertDialogCancel>
+						<AlertDialogCancel>{tt("common.cancel")}</AlertDialogCancel>
 						<AlertDialogAction variant="destructive" onClick={() => void deleteSession(session)}>
-							删除
+							{tt("common.delete")}
 						</AlertDialogAction>
 					</AlertDialogFooter>
 				</AlertDialogContent>
@@ -256,7 +257,7 @@ function WorkspaceGroup({ workspace, sessions, defaultExpanded }: WorkspaceGroup
 						<TooltipTrigger asChild>
 							<button
 								type="button"
-								aria-label="新建会话"
+								aria-label={tt("sidebar.newSession")}
 								className="flex size-6 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
 								onClick={() => {
 									if (currentWorkspaceId !== workspace.id)
@@ -270,13 +271,13 @@ function WorkspaceGroup({ workspace, sessions, defaultExpanded }: WorkspaceGroup
 								<Plus className="size-3.5" />
 							</button>
 						</TooltipTrigger>
-						<TooltipContent>新建会话</TooltipContent>
+						<TooltipContent>{tt("sidebar.newSession")}</TooltipContent>
 					</Tooltip>
 					<DropdownMenu>
 						<DropdownMenuTrigger asChild>
 							<button
 								type="button"
-								aria-label="工作区操作"
+								aria-label={tt("sidebar.workspaceActions")}
 								className="flex size-6 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
 							>
 								<Settings className="size-3.5" />
@@ -286,11 +287,11 @@ function WorkspaceGroup({ workspace, sessions, defaultExpanded }: WorkspaceGroup
 							<DropdownMenuItem
 								onClick={() => void useSessionDirectoryStore.getState().selectWorkspace(workspace.id)}
 							>
-								打开工作区
+								{tt("sidebar.openWorkspace")}
 							</DropdownMenuItem>
 							<DropdownMenuSeparator />
 							<DropdownMenuItem variant="destructive" onClick={() => setRemoveOpen(true)}>
-								移除工作区
+								{tt("sidebar.removeWorkspace")}
 							</DropdownMenuItem>
 						</DropdownMenuContent>
 					</DropdownMenu>
@@ -313,7 +314,7 @@ function WorkspaceGroup({ workspace, sessions, defaultExpanded }: WorkspaceGroup
 							className="h-7 rounded-sm pl-2.5 text-left text-[12px] text-ink-3 hover:bg-hover hover:text-ink-2"
 							onClick={() => setExpanded(true)}
 						>
-							展开其余 {more} 个会话
+							{tt("sidebar.expandMore", { count: more })}
 						</button>
 					)}
 				</ul>
@@ -322,18 +323,18 @@ function WorkspaceGroup({ workspace, sessions, defaultExpanded }: WorkspaceGroup
 			<AlertDialog open={removeOpen} onOpenChange={setRemoveOpen}>
 				<AlertDialogContent>
 					<AlertDialogHeader>
-						<AlertDialogTitle>移除工作区</AlertDialogTitle>
+						<AlertDialogTitle>{tt("sidebar.removeWorkspace")}</AlertDialogTitle>
 						<AlertDialogDescription>
-							仅从列表中移除「{workspace.displayName}」，会话文件与进程不受影响。
+							{tt("sidebar.removeWorkspaceDescription", { name: workspace.displayName })}
 						</AlertDialogDescription>
 					</AlertDialogHeader>
 					<AlertDialogFooter>
-						<AlertDialogCancel>取消</AlertDialogCancel>
+						<AlertDialogCancel>{tt("common.cancel")}</AlertDialogCancel>
 						<AlertDialogAction
 							variant="destructive"
 							onClick={() => void useSessionDirectoryStore.getState().removeWorkspace(workspace.id)}
 						>
-							移除
+							{tt("sidebar.removeWorkspace")}
 						</AlertDialogAction>
 					</AlertDialogFooter>
 				</AlertDialogContent>
@@ -353,27 +354,27 @@ function AddWorkspaceDialog({
 	const add = async () => {
 		try {
 			await useSessionDirectoryStore.getState().addWorkspace(path.trim());
-			toast.success("工作区已添加");
+			toast.success(tt("sidebar.workspaceAdded"));
 			setPath("");
 			onOpenChange(false);
 		} catch (error) {
-			toast.error("添加工作区失败", { description: error instanceof Error ? error.message : String(error) });
+			toast.error(tt("sidebar.workspaceAddFailed"), { description: error instanceof Error ? error.message : String(error) });
 		}
 	};
 	return (
 		<Dialog open={open} onOpenChange={onOpenChange}>
 			<DialogContent className="max-w-md">
 				<DialogHeader>
-					<DialogTitle>添加工作区</DialogTitle>
-					<DialogDescription>输入本地项目目录的绝对路径，Pi 进程将以该目录为 cwd 运行。</DialogDescription>
+					<DialogTitle>{tt("sidebar.workspaceDialogTitle")}</DialogTitle>
+					<DialogDescription>{tt("sidebar.workspaceDialogDescription")}</DialogDescription>
 				</DialogHeader>
 				<div className="flex flex-col gap-1.5">
-					<Label htmlFor="workspace-path">目录路径</Label>
+					<Label htmlFor="workspace-path">{tt("sidebar.workspacePathLabel")}</Label>
 					<Input
 						id="workspace-path"
 						autoFocus
 						value={path}
-						placeholder="/Users/you/Code/project"
+						placeholder={tt("sidebar.workspacePathPlaceholder")}
 						onChange={(event) => setPath(event.target.value)}
 						onKeyDown={(event) => {
 							if (event.key === "Enter") void add();
@@ -382,10 +383,10 @@ function AddWorkspaceDialog({
 				</div>
 				<DialogFooter>
 					<Button variant="outline" onClick={() => onOpenChange(false)}>
-						取消
+						{tt("common.cancel")}
 					</Button>
 					<Button onClick={() => void add()} disabled={!path.trim()}>
-						添加
+						{tt("sidebar.addWorkspace")}
 					</Button>
 				</DialogFooter>
 			</DialogContent>
@@ -426,15 +427,15 @@ export function WorkspaceSidebar({ rail }: { rail: boolean }) {
 		if (!currentWorkspaceId) return;
 		try {
 			await api.restartProcess(currentWorkspaceId);
-			toast.success("进程已重启");
+			toast.success(tt("sidebar.restarted"));
 		} catch (error) {
-			toast.error("重启失败", { description: error instanceof Error ? error.message : String(error) });
+			toast.error(tt("sidebar.restartFailed"), { description: error instanceof Error ? error.message : String(error) });
 		}
 	};
 
 	if (rail) {
 		return (
-			<nav aria-label="侧栏" className="flex h-full flex-col items-center gap-1 py-2">
+			<nav aria-label={tt("sidebar.navAria")} className="flex h-full flex-col items-center gap-1 py-2">
 				<div className="mb-2 flex size-9 items-center justify-center rounded-sm bg-primary-soft text-primary">
 					<Bot className="size-5" />
 				</div>
@@ -442,7 +443,7 @@ export function WorkspaceSidebar({ rail }: { rail: boolean }) {
 					<TooltipTrigger asChild>
 						<button
 							type="button"
-							aria-label="新建会话"
+							aria-label={tt("sidebar.newSession")}
 							disabled={!currentWorkspaceId}
 							className="flex size-9 items-center justify-center rounded-sm text-ink-2 hover:bg-hover disabled:opacity-40"
 							onClick={() => void newSession()}
@@ -450,34 +451,34 @@ export function WorkspaceSidebar({ rail }: { rail: boolean }) {
 							<Plus className="size-4" />
 						</button>
 					</TooltipTrigger>
-					<TooltipContent side="right">新建会话</TooltipContent>
+					<TooltipContent side="right">{tt("sidebar.newSession")}</TooltipContent>
 				</Tooltip>
 				<Tooltip>
 					<TooltipTrigger asChild>
 						<button
 							type="button"
-							aria-label="添加工作区"
+							aria-label={tt("sidebar.addWorkspace")}
 							className="flex size-9 items-center justify-center rounded-sm text-ink-2 hover:bg-hover"
 							onClick={() => setAddOpen(true)}
 						>
 							<FolderPlus className="size-4" />
 						</button>
 					</TooltipTrigger>
-					<TooltipContent side="right">添加工作区</TooltipContent>
+					<TooltipContent side="right">{tt("sidebar.addWorkspace")}</TooltipContent>
 				</Tooltip>
 				<div className="flex-1" />
 				<Tooltip>
 					<TooltipTrigger asChild>
 						<button
 							type="button"
-							aria-label="切换主题"
+							aria-label={tt("sidebar.switchTheme")}
 							className="flex size-9 items-center justify-center rounded-sm text-ink-2 hover:bg-hover"
 							onClick={cycleTheme}
 						>
 							<ThemeIcon className="size-4" />
 						</button>
 					</TooltipTrigger>
-					<TooltipContent side="right">切换主题</TooltipContent>
+					<TooltipContent side="right">{tt("sidebar.switchTheme")}</TooltipContent>
 				</Tooltip>
 				<AddWorkspaceDialog open={addOpen} onOpenChange={setAddOpen} />
 			</nav>
@@ -485,25 +486,25 @@ export function WorkspaceSidebar({ rail }: { rail: boolean }) {
 	}
 
 	return (
-		<nav aria-label="侧栏" className="flex h-full flex-col">
+		<nav aria-label={tt("sidebar.navAria")} className="flex h-full flex-col">
 			<div className="flex h-11 flex-none items-center gap-2 px-3">
 				<div className="flex size-7 items-center justify-center rounded-md bg-primary-soft text-primary">
 					<Bot className="size-4" />
 				</div>
-				<span className="text-[13px] font-semibold text-ink">Pi Web</span>
+				<span className="text-[13px] font-semibold text-ink">{tt("sidebar.brand")}</span>
 				<div className="flex-1" />
 				<Tooltip>
 					<TooltipTrigger asChild>
 						<button
 							type="button"
-							aria-label="添加工作区"
+							aria-label={tt("sidebar.addWorkspace")}
 							className="flex size-7 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
 							onClick={() => setAddOpen(true)}
 						>
 							<FolderPlus className="size-4" />
 						</button>
 					</TooltipTrigger>
-					<TooltipContent>添加工作区</TooltipContent>
+					<TooltipContent>{tt("sidebar.addWorkspace")}</TooltipContent>
 				</Tooltip>
 			</div>
 
@@ -515,7 +516,7 @@ export function WorkspaceSidebar({ rail }: { rail: boolean }) {
 					onClick={() => void newSession()}
 				>
 					<Plus className="size-4" />
-					新建会话
+					{tt("sidebar.newSession")}
 				</Button>
 			</div>
 
@@ -525,7 +526,7 @@ export function WorkspaceSidebar({ rail }: { rail: boolean }) {
 					<Input
 						value={searchQuery}
 						onChange={(event) => setSearchQuery(event.target.value)}
-						placeholder="搜索会话…"
+						placeholder={tt("sidebar.searchPlaceholder")}
 						className="h-7 pr-7 pl-8 text-[13px]"
 					/>
 				</div>
@@ -563,14 +564,14 @@ export function WorkspaceSidebar({ rail }: { rail: boolean }) {
 							})}
 						</ul>
 					) : (
-						<p className="px-2 py-4 text-center text-[12px] text-ink-3">没有匹配的会话</p>
+						<p className="px-2 py-4 text-center text-[12px] text-ink-3">{tt("sidebar.noMatch")}</p>
 					)
 				) : workspaces.length === 0 ? (
 					<div className="flex flex-col items-center gap-2 px-3 py-8 text-center">
-						<p className="text-[13px] text-ink-3">尚未添加工作区</p>
+						<p className="text-[13px] text-ink-3">{tt("sidebar.noWorkspaces")}</p>
 						<Button variant="outline" size="sm" onClick={() => setAddOpen(true)}>
 							<FolderPlus className="size-3.5" />
-							添加工作区
+							{tt("sidebar.addWorkspace")}
 						</Button>
 					</div>
 				) : (
@@ -592,7 +593,7 @@ export function WorkspaceSidebar({ rail }: { rail: boolean }) {
 					<TooltipTrigger asChild>
 						<button
 							type="button"
-							aria-label="切换主题"
+							aria-label={tt("sidebar.switchTheme")}
 							className="flex size-7 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
 							onClick={cycleTheme}
 						>
@@ -600,7 +601,7 @@ export function WorkspaceSidebar({ rail }: { rail: boolean }) {
 						</button>
 					</TooltipTrigger>
 					<TooltipContent>
-						主题：{preference === "system" ? "跟随系统" : preference === "light" ? "浅色" : "深色"}
+						{tt("sidebar.theme")}：{preference === "system" ? tt("sidebar.themeSystem") : preference === "light" ? tt("sidebar.themeLight") : tt("sidebar.themeDark")}
 					</TooltipContent>
 				</Tooltip>
 				{currentWorkspaceId && (
@@ -608,7 +609,7 @@ export function WorkspaceSidebar({ rail }: { rail: boolean }) {
 						<TooltipTrigger asChild>
 							<button
 								type="button"
-								aria-label="进程状态"
+								aria-label={tt("sidebar.processNotStarted")}
 								className="flex h-7 flex-1 items-center justify-center gap-1.5 rounded-sm text-[11px] text-ink-3 hover:bg-hover"
 								onClick={() => void restartProcess()}
 							>
@@ -623,17 +624,17 @@ export function WorkspaceSidebar({ rail }: { rail: boolean }) {
 								/>
 								<span className="font-mono">
 									{processStatus?.state === "running"
-										? "pi 运行中"
+										? tt("sidebar.processPi")
 										: processStatus?.state === "starting"
-											? "pi 启动中"
+											? tt("sidebar.processStarting")
 											: processStatus?.state === "crashed"
-												? "pi 已崩溃，点击重启"
-												: "未启动"}
+												? tt("sidebar.processCrashed")
+												: tt("sidebar.processNotStarted")}
 								</span>
 							</button>
 						</TooltipTrigger>
 						<TooltipContent>
-							{processStatus?.state === "crashed" ? processStatus.error : "点击重启进程"}
+							{processStatus?.state === "crashed" ? processStatus.error : tt("status.clickToRestart")}
 						</TooltipContent>
 					</Tooltip>
 				)}
@@ -641,27 +642,27 @@ export function WorkspaceSidebar({ rail }: { rail: boolean }) {
 					<TooltipTrigger asChild>
 						<button
 							type="button"
-							aria-label="设置"
+							aria-label={tt("common.settings")}
 							className="flex size-7 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
 							onClick={() => window.dispatchEvent(new CustomEvent("piweb:open-settings"))}
 						>
 							<Settings className="size-4" />
 						</button>
 					</TooltipTrigger>
-					<TooltipContent>设置</TooltipContent>
+					<TooltipContent>{tt("common.settings")}</TooltipContent>
 				</Tooltip>
 				<Tooltip>
 					<TooltipTrigger asChild>
 						<button
 							type="button"
-							aria-label="重启进程"
+							aria-label={tt("sidebar.restartProcess")}
 							className="flex size-7 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
 							onClick={() => void restartProcess()}
 						>
 							<RotateCw className="size-4" />
 						</button>
 					</TooltipTrigger>
-					<TooltipContent>重启 pi 进程</TooltipContent>
+					<TooltipContent>{tt("sidebar.restartProcess")}</TooltipContent>
 				</Tooltip>
 			</div>
 

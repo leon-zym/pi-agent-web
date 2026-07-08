@@ -12,6 +12,7 @@ import {
 } from "../../components/ui/dialog";
 import { Separator } from "../../components/ui/separator";
 import { Switch } from "../../components/ui/switch";
+import { tt } from "../../lib/i18n";
 import { useTheme } from "../../lib/use-theme";
 import { cn } from "../../lib/utils";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
@@ -57,7 +58,7 @@ function Segmented<T extends string>({
 }
 
 /**
- * Session / appearance settings (design spec §3.2 + §7.1): all toggles write
+ * Session / appearance settings: all toggles write
  * through RPC commands into ~/.pi/agent/settings.json.
  */
 export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
@@ -93,7 +94,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 		try {
 			await useTransportStore.getState().sendCommand(workspaceId, { type: "set_auto_compaction", enabled });
 		} catch (error) {
-			toast.error("设置失败", { description: error instanceof Error ? error.message : String(error) });
+			toast.error(tt("settings.saveFailed"), { description: error instanceof Error ? error.message : String(error) });
 		}
 	};
 
@@ -103,7 +104,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 		try {
 			await useTransportStore.getState().sendCommand(workspaceId, { type: "set_auto_retry", enabled });
 		} catch (error) {
-			toast.error("设置失败", { description: error instanceof Error ? error.message : String(error) });
+			toast.error(tt("settings.saveFailed"), { description: error instanceof Error ? error.message : String(error) });
 		}
 	};
 
@@ -113,7 +114,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 		try {
 			await useTransportStore.getState().sendCommand(workspaceId, { type: "set_steering_mode", mode });
 		} catch (error) {
-			toast.error("设置失败", { description: error instanceof Error ? error.message : String(error) });
+			toast.error(tt("settings.saveFailed"), { description: error instanceof Error ? error.message : String(error) });
 		}
 	};
 
@@ -123,7 +124,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 		try {
 			await useTransportStore.getState().sendCommand(workspaceId, { type: "set_follow_up_mode", mode });
 		} catch (error) {
-			toast.error("设置失败", { description: error instanceof Error ? error.message : String(error) });
+			toast.error(tt("settings.saveFailed"), { description: error instanceof Error ? error.message : String(error) });
 		}
 	};
 
@@ -133,47 +134,47 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 		<Dialog open={open} onOpenChange={onOpenChange}>
 			<DialogContent className="max-w-md">
 				<DialogHeader>
-					<DialogTitle>设置</DialogTitle>
-					<DialogDescription>写入 ~/.pi/agent/settings.json，对当前工作区进程即时生效。</DialogDescription>
+					<DialogTitle>{tt("settings.title")}</DialogTitle>
+					<DialogDescription>{tt("settings.description")}</DialogDescription>
 				</DialogHeader>
 
 				<div className="flex flex-col gap-4">
 					<div>
-						<SectionLabel>会话</SectionLabel>
+						<SectionLabel>{tt("settings.session")}</SectionLabel>
 						<div className="flex flex-col gap-3">
 							<div className="flex items-center justify-between gap-4">
 								<div className="min-w-0">
-									<p className="text-[13px] text-ink">上下文自动压缩</p>
-									<p className="text-[12px] text-ink-3">达到上下文上限时自动总结并压缩</p>
+									<p className="text-[13px] text-ink">{tt("settings.autoCompaction")}</p>
+									<p className="text-[12px] text-ink-3">{tt("settings.autoCompactionDesc")}</p>
 								</div>
 								<Switch
 									checked={state?.autoCompactionEnabled ?? false}
 									disabled={disabled}
 									onCheckedChange={(checked) => void toggleAutoCompaction(checked)}
-									aria-label="上下文自动压缩"
+									aria-label={tt("settings.autoCompaction")}
 								/>
 							</div>
 							<div className="flex items-center justify-between gap-4">
 								<div className="min-w-0">
-									<p className="text-[13px] text-ink">API 故障自动重试</p>
-									<p className="text-[12px] text-ink-3">overloaded / Rate Limit / 5xx 时自动退避重试</p>
+									<p className="text-[13px] text-ink">{tt("settings.autoRetry")}</p>
+									<p className="text-[12px] text-ink-3">{tt("settings.autoRetryDesc")}</p>
 								</div>
 								<Switch
 									checked={autoRetry}
 									disabled={disabled}
 									onCheckedChange={(checked) => void toggleAutoRetry(checked)}
-									aria-label="自动重试"
+									aria-label={tt("settings.autoRetry")}
 								/>
 							</div>
 							<div className="flex items-center justify-between gap-4">
 								<div className="min-w-0">
-									<p className="text-[13px] text-ink">插队消息消费</p>
-									<p className="text-[12px] text-ink-3">每次注入一条或一次性全部注入</p>
+									<p className="text-[13px] text-ink">{tt("settings.steerMode")}</p>
+									<p className="text-[12px] text-ink-3">{tt("settings.steerModeDesc")}</p>
 								</div>
 								<Segmented
 									options={[
-										{ value: "one-at-a-time", label: "一次一条" },
-										{ value: "all", label: "全部" },
+										{ value: "one-at-a-time", label: tt("settings.oneAtATime") },
+										{ value: "all", label: tt("settings.all") },
 									]}
 									value={state?.steeringMode ?? "one-at-a-time"}
 									onChange={(value) => void setSteeringMode(value)}
@@ -181,13 +182,13 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 							</div>
 							<div className="flex items-center justify-between gap-4">
 								<div className="min-w-0">
-									<p className="text-[13px] text-ink">排队消息消费</p>
-									<p className="text-[12px] text-ink-3">同上，作用于排队消息</p>
+									<p className="text-[13px] text-ink">{tt("settings.followUpMode")}</p>
+									<p className="text-[12px] text-ink-3">{tt("settings.followUpModeDesc")}</p>
 								</div>
 								<Segmented
 									options={[
-										{ value: "one-at-a-time", label: "一次一条" },
-										{ value: "all", label: "全部" },
+										{ value: "one-at-a-time", label: tt("settings.oneAtATime") },
+										{ value: "all", label: tt("settings.all") },
 									]}
 									value={state?.followUpMode ?? "one-at-a-time"}
 									onChange={(value) => void setFollowUpMode(value)}
@@ -199,14 +200,14 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 					<Separator />
 
 					<div>
-						<SectionLabel>外观</SectionLabel>
+						<SectionLabel>{tt("settings.appearance")}</SectionLabel>
 						<div className="flex items-center justify-between gap-4">
-							<p className="text-[13px] text-ink">主题</p>
+							<p className="text-[13px] text-ink">{tt("sidebar.theme")}</p>
 							<Segmented
 								options={[
-									{ value: "light", label: "浅色" },
-									{ value: "dark", label: "深色" },
-									{ value: "system", label: "跟随系统" },
+									{ value: "light", label: tt("sidebar.themeLight") },
+									{ value: "dark", label: tt("sidebar.themeDark") },
+									{ value: "system", label: tt("sidebar.themeSystem") },
 								]}
 								value={preference}
 								onChange={setTheme}
@@ -214,12 +215,12 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 						</div>
 					</div>
 
-					{disabled && <p className="text-[12px] text-ink-3">打开工作区后可配置会话选项。</p>}
+					{disabled && <p className="text-[12px] text-ink-3">{tt("settings.openWorkspaceHint")}</p>}
 				</div>
 
 				<div className="flex justify-end">
 					<Button variant="outline" onClick={() => onOpenChange(false)}>
-						关闭
+						{tt("common.close")}
 					</Button>
 				</div>
 			</DialogContent>

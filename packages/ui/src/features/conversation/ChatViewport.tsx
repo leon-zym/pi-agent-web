@@ -4,6 +4,7 @@ import { cn } from "../../lib/utils";
 import { useProjectionStore } from "../../stores/projection";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { EmptyHero } from "./EmptyHero";
+import { tt } from "../../lib/i18n";
 import { StatusRowView } from "./StatusRowView";
 import { TurnView } from "./TurnView";
 
@@ -102,7 +103,7 @@ export function ChatViewport() {
 			>
 				<button
 					type="button"
-					aria-label="回到最新消息"
+					aria-label={tt("chatViewport.backToBottom")}
 					className="flex size-[34px] items-center justify-center rounded-full border border-border bg-surface text-ink-2 shadow-lv2 hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
 					onClick={() => scrollToBottom(true)}
 				>

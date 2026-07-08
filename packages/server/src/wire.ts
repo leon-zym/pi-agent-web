@@ -1,5 +1,5 @@
 /**
- * WebSocket wire contract and REST DTOs (design spec §4).
+ * WebSocket wire contract and REST DTOs.
  * Types depend only on the public type exports of @earendil-works/pi-coding-agent.
  */
 import type {

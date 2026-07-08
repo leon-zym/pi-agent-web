@@ -1,7 +1,7 @@
 import { Loader2 } from "lucide-react";
 import type { StatusRow } from "../../types/view-models";
 
-/** Compact system rows for compaction / auto-retry activity (§5.2). */
+/** Compact system rows for compaction / auto-retry activity. */
 export function StatusRowView({ row }: { row: StatusRow }) {
 	return (
 		<div className="flex items-center gap-2 py-0.5 text-xs text-ink-3">

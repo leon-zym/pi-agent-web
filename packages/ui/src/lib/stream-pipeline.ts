@@ -1,5 +1,6 @@
 import type { WsServerMessage } from "@pi-agent-web/server/wire";
 import { expectData } from "@pi-agent-web/server/wire";
+import { tt } from "./i18n";
 import { toast } from "sonner";
 import { useComposerStore } from "../stores/composer";
 import { useExtensionUiStore } from "../stores/extension-ui";
@@ -75,7 +76,7 @@ function routeEvent(message: Extract<WsServerMessage, { type: "event" }>): void 
 			});
 			break;
 		case "extension_error":
-			toast.error("扩展出错", { description: event.event + ": " + event.error });
+			toast.error(tt("ext.error"), { description: event.event + ": " + event.error });
 			return;
 		case "bash_execution_update":
 			// Consumed by the transport store (bash console); nothing else.
@@ -121,7 +122,7 @@ function routeExtensionUiRequest(message: Extract<WsServerMessage, { type: "exte
 }
 
 /**
- * Reconnect snapshot protocol (design spec §4.2): get_state -> get_messages
+ * Reconnect snapshot protocol: get_state -> get_messages
  * -> get_commands -> model directory -> stats. Live events keep applying.
  */
 async function runReconnectSnapshot(): Promise<void> {

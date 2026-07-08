@@ -1,7 +1,7 @@
 import { useExtensionUiStore } from "../../stores/extension-ui";
 
 /**
- * Aggregated extension status bar (setStatus, design spec §6.2.8): one
+ * Aggregated extension status bar (setStatus): one
  * compact mono strip above the composer. Cleared by setStatus(..., undefined).
  */
 export function ExtensionStatusStrip() {

@@ -4,6 +4,7 @@ import { ConversationColumn } from "../features/conversation/ConversationColumn"
 import { DetailsPanel } from "../features/details/DetailsPanel";
 import { WorkspaceSidebar } from "../features/sidebar/WorkspaceSidebar";
 import { cn } from "../lib/utils";
+import { tt } from "../lib/i18n";
 
 const SIDEBAR_MIN = 264;
 const SIDEBAR_MAX = 420;
@@ -112,7 +113,7 @@ export function AppShell() {
 			{!rail && (
 				<button
 					type="button"
-					aria-label="调整侧栏宽度"
+					aria-label={tt("appShell.sidebarWidth")}
 					className="relative z-10 -ml-px w-1 cursor-col-resize bg-transparent transition-colors hover:bg-primary/30 active:bg-primary/50 focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
 					style={{ marginRight: -4 } as React.CSSProperties}
 					onPointerDown={startDrag("sidebar")}
@@ -136,7 +137,7 @@ export function AppShell() {
 			{detailsWidth > 0 && (
 				<button
 					type="button"
-					aria-label="调整详情面板宽度"
+					aria-label={tt("appShell.detailsWidth")}
 					className="relative z-10 w-1 cursor-col-resize bg-transparent transition-colors hover:bg-primary/30 active:bg-primary/50 focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
 					style={{ marginLeft: -4 } as React.CSSProperties}
 					onPointerDown={startDrag("details")}

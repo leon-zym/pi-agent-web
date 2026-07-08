@@ -1,6 +1,6 @@
 import type { AuthStatusEntry, SessionSummary, WorkspaceSummary } from "@pi-agent-web/server";
 
-/** Minimal REST client for the gateway (design spec §4.1). */
+/** Minimal REST client for the gateway. */
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
 	const response = await fetch(path, {

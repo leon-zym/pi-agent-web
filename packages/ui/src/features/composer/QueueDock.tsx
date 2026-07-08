@@ -2,9 +2,10 @@ import { ArrowUpRight, ListEnd } from "lucide-react";
 import { useMemo } from "react";
 import { Badge } from "../../components/ui/badge";
 import { useComposerStore } from "../../stores/composer";
+import { tt } from "../../lib/i18n";
 
 /**
- * Queue dock above the composer (DESIGN.md §6.2.3): mirrors queue_update.
+ * Queue dock above the composer: mirrors queue_update.
  * One entry renders inline; several collapse into a count summary.
  */
 export function QueueDock() {
@@ -35,13 +36,13 @@ export function QueueDock() {
 						<ListEnd className="size-3.5 shrink-0 text-ink-3" />
 					)}
 					<Badge variant={entry.kind === "steer" ? "primary" : "default"} className="shrink-0">
-						{entry.kind === "steer" ? "插队" : "排队"}
+						{tt(entry.kind === "steer" ? "status.steer" : "status.followUp")}
 					</Badge>
 					<span className="min-w-0 flex-1 truncate">{entry.text}</span>
 				</div>
 			))}
 			{entries.length > 2 && (
-				<div className="px-2.5 text-[11px] text-ink-3">还有 {entries.length - 2} 条排队消息</div>
+				<div className="px-2.5 text-[11px] text-ink-3">{tt("composer.queueCount", { count: entries.length - 2 })}</div>
 			)}
 		</div>
 	);

@@ -18,7 +18,7 @@ import { RpcError } from "./wire.js";
  * Supervisor-oriented additions:
  * - Ready handshake: send get_state{id:"ready-1"} after spawn; the response
  *   means ready (the protocol has no ready frame; the official client blind-
- *   waits 100ms, design spec §2.1 rule 5).
+ *   waits 100ms).
  * - Events / responses / Extension UI frames are routed separately.
  * - Dirty (non-JSON) lines are silently dropped; stderr is collected in a ring.
  * - On exit, reject all pending requests and call onExit (for the Supervisor).
@@ -90,7 +90,7 @@ export class PiProcess {
 		return this.stderrChunks.join("");
 	}
 
-	/** spawn + ready handshake. Kill and throw on timeout (§2.1 rule 5). */
+	/** spawn + ready handshake. Kill and throw on timeout. */
 	start(): Promise<void> {
 		if (this.ready) return this.ready;
 		this.ready = this.doStart();
@@ -115,7 +115,7 @@ export class PiProcess {
 				`failed to start pi process: ${error.message}${this.stderrTail ? `\n${this.stderrTail}` : ""}`,
 			);
 			this.rejectAll(err);
-			// On spawn failure the exit event may never fire: synthesize one (§2.1 rule 4).
+			// On spawn failure the exit event may never fire: synthesize one.
 			if (!this.stopped) this.opts.onExit?.({ code: null, signal: null, stderrTail: this.stderrTail });
 			this.stopped = true;
 		});

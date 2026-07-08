@@ -6,7 +6,7 @@ import { cn } from "../../lib/utils";
 import "highlight.js/styles/github.css";
 
 /**
- * Assistant prose renderer (DSH report §10): only text + streaming props.
+ * Assistant prose renderer: only text + streaming props.
  * Full syntax highlighting runs once the block settles; while streaming we
  * render plain so each delta stays cheap and React keys stay stable.
  */

@@ -10,7 +10,7 @@ import type { Supervisor } from "./supervisor.js";
 import type { WorkspaceRegistry } from "./workspace-registry.js";
 
 /**
- * REST API (design spec §4.1): workspace/session directory and auth management.
+ * REST API: workspace/session directory and auth management.
  * Real-time conversation flows over the WebSocket channel instead.
  */
 
@@ -136,7 +136,7 @@ export function createApp(ctx: AppContext): Hono {
 		}
 		await saveApiKey(config.agentDir, body.provider, body.key);
 		// Running processes snapshot models at startup (15s background refresh in
-		// pi). Tell clients to re-pull the model directory (§7.3 closed loop).
+		// pi). Tell clients to re-pull the model directory (auth refresh loop).
 		supervisor.notifyAuthChanged();
 		return c.json({ ok: true, providers: readAuthStatus(config.agentDir) });
 	});

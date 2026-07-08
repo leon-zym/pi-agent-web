@@ -4,7 +4,7 @@ import path from "node:path";
 /**
  * Web Server configuration.
  *
- * Env contract (matches pi source, design spec §7.1):
+ * Env contract (matches pi source; see docs/protocol.md for the full map):
  * - PI_CODING_AGENT_DIR: overrides the agent config dir (~/.pi/agent)
  * - PI_CODING_AGENT_SESSION_DIR: overrides the session root dir
  * The Web Server only reads these, never hardcodes paths, and passes them
@@ -73,7 +73,7 @@ export function getSessionDirForCwd(cwd: string, sessionRootDir: string): string
 	return path.join(sessionRootDir, encodeSessionDir(cwd));
 }
 
-/** Whether a session path belongs to a workspace process's session dir (§2.1 rule 3 check). */
+/** Whether a session path belongs to a workspace process's session dir (cross-workspace switch guard). */
 export function isSessionInDir(sessionPath: string, sessionDir: string): boolean {
 	const resolvedSession = path.resolve(sessionPath);
 	const resolvedDir = path.resolve(sessionDir);

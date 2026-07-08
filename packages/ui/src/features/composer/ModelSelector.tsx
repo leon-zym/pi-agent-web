@@ -2,24 +2,25 @@ import { Check, ChevronLeft, ChevronsUpDown, Sparkles } from "lucide-react";
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
 import { Popover, PopoverContent, PopoverTrigger } from "../../components/ui/popover";
+import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import { useModelDirectoryStore } from "../../stores/model-directory";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
 
 const LEVEL_LABEL: Record<string, string> = {
-	off: "关闭",
-	minimal: "最小",
-	low: "低",
-	medium: "中",
-	high: "高",
-	xhigh: "超高",
-	max: "最大",
+	off: "model.levelOff",
+	minimal: "model.levelMinimal",
+	low: "model.levelLow",
+	medium: "model.levelMedium",
+	high: "model.levelHigh",
+	xhigh: "model.levelXhigh",
+	max: "model.levelMax",
 };
 
 type Page = "root" | "model" | "effort";
 
 /**
- * Two-level model / thinking menu (DESIGN.md §6.2.6). The host-reported
+ * Two-level model / thinking menu. The host-reported
  * current selection is the only truth; failures keep the previous selection
  * and toast near the composer. Changes apply to the NEXT request.
  */
@@ -50,7 +51,7 @@ export function ModelSelector() {
 			setOpen(false);
 			setPage("root");
 		} catch (error) {
-			toast.error("切换模型失败", { description: error instanceof Error ? error.message : String(error) });
+			toast.error(tt("model.switchFailed"), { description: error instanceof Error ? error.message : String(error) });
 		}
 	};
 
@@ -62,15 +63,15 @@ export function ModelSelector() {
 			setOpen(false);
 			setPage("root");
 		} catch (error) {
-			toast.error("切换思考级别失败", {
+			toast.error(tt("model.effortSwitchFailed"), {
 				description: error instanceof Error ? error.message : String(error),
 			});
 		}
 	};
 
 	const label = [
-		currentModel ? (currentModelObject?.name ?? currentModel.modelId) : "选择模型",
-		supportsThinking && currentLevel ? (LEVEL_LABEL[currentLevel] ?? currentLevel) : null,
+		currentModel ? (currentModelObject?.name ?? currentModel.modelId) : tt("model.select"),
+		supportsThinking && currentLevel ? tt(LEVEL_LABEL[currentLevel] as never) : null,
 	]
 		.filter(Boolean)
 		.join(" · ");
@@ -86,7 +87,7 @@ export function ModelSelector() {
 			<PopoverTrigger asChild>
 				<button
 					type="button"
-					aria-label="模型与思考级别"
+					aria-label={tt("model.menuAria")}
 					className="flex h-7 max-w-52 items-center gap-1 rounded-sm px-2 text-xs text-ink-2 transition-colors hover:bg-hover hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
 				>
 					<span className="min-w-0 truncate">{label}</span>
@@ -98,15 +99,15 @@ export function ModelSelector() {
 					<div className="flex flex-col p-0.5">
 						<MenuItem
 							icon={<Sparkles className="size-4 text-ink-3" />}
-							label="模型"
-							value={currentModel ? (currentModelObject?.name ?? currentModel.modelId) : "未选择"}
+							label={tt("model.label")}
+							value={currentModel ? (currentModelObject?.name ?? currentModel.modelId) : tt("model.none")}
 							onClick={() => setPage("model")}
 						/>
 						{supportsThinking && (
 							<MenuItem
 								icon={<Sparkles className="size-4 text-ink-3" />}
-								label="思考级别"
-								value={currentLevel ? (LEVEL_LABEL[currentLevel] ?? currentLevel) : "—"}
+								label={tt("model.effort")}
+								value={currentLevel ? tt(LEVEL_LABEL[currentLevel] as never) : "—"}
 								onClick={() => setPage("effort")}
 							/>
 						)}
@@ -114,7 +115,7 @@ export function ModelSelector() {
 				)}
 				{page === "model" && (
 					<div className="scroll-slim flex max-h-80 flex-col overflow-y-auto">
-						<PageHeader title="选择模型" onBack={() => setPage("root")} />
+						<PageHeader title={tt("model.select")} onBack={() => setPage("root")} />
 						{Object.entries(byProvider).map(([provider, providerModels]) => (
 							<div key={provider}>
 								<div className="sticky top-0 z-10 bg-surface px-2 py-1 text-[11px] font-medium tracking-wide text-ink-3 uppercase">
@@ -144,7 +145,7 @@ export function ModelSelector() {
 				)}
 				{page === "effort" && (
 					<div className="flex flex-col p-0.5">
-						<PageHeader title="思考级别" onBack={() => setPage("root")} />
+						<PageHeader title={tt("model.effort")} onBack={() => setPage("root")} />
 						{thinkingLevels.map((level) => (
 							<button
 								key={level}
@@ -155,7 +156,7 @@ export function ModelSelector() {
 								)}
 								onClick={() => void selectLevel(level)}
 							>
-								<span className="flex-1">{LEVEL_LABEL[level] ?? level}</span>
+								<span className="flex-1">{tt(LEVEL_LABEL[level] as never)}</span>
 								{currentLevel === level && <Check className="size-4" />}
 							</button>
 						))}
@@ -195,7 +196,7 @@ function PageHeader({ title, onBack }: { title: string; onBack: () => void }) {
 		<div className="flex items-center gap-1 px-1 py-1.5">
 			<button
 				type="button"
-				aria-label="返回"
+				aria-label={tt("model.back")}
 				className="flex size-6 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
 				onClick={onBack}
 			>

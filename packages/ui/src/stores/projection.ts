@@ -45,7 +45,7 @@ export const useProjectionStore = create<ProjectionState>()((set, get) => ({
 	rebuildFromMessages: (sessionId, messages) => {
 		const state = get();
 		const projection = state.projections[sessionId];
-		// Snapshot must never clobber a running turn (design spec §5.3 rule 4).
+		// Snapshot must never clobber a running turn.
 		if (projection && !projection.replayable) return;
 		const next = rebuildProjectionFromMessages(sessionId, messages);
 		const order = state.order.includes(sessionId) ? state.order : [...state.order, sessionId];

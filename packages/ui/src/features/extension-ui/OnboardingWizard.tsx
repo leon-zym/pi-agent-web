@@ -12,10 +12,11 @@ import {
 } from "../../components/ui/dialog";
 import { Input } from "../../components/ui/input";
 import { Label } from "../../components/ui/label";
+import { tt } from "../../lib/i18n";
 import { api } from "../../lib/api";
 
 /**
- * Zero-config onboarding (design spec §7.3): when no provider has a
+ * Zero-config onboarding: when no provider has a
  * configured credential, this wizard collects a provider id + API key and
  * writes them to ~/.pi/agent/auth.json (mode 600) via the gateway.
  * After saving, the model directory is re-pulled (auth_changed broadcast).
@@ -47,13 +48,13 @@ export function OnboardingWizard() {
 		setSaving(true);
 		try {
 			await api.saveApiKey(provider.trim(), key.trim());
-			toast.success("API Key 已保存");
+			toast.success(tt("onboarding.saved"));
 			window.dispatchEvent(new CustomEvent("piweb:auth-changed"));
 			setProvider("");
 			setKey("");
 			setOpen(false);
 		} catch (error) {
-			toast.error("保存失败", { description: error instanceof Error ? error.message : String(error) });
+			toast.error(tt("onboarding.saveFailed"), { description: error instanceof Error ? error.message : String(error) });
 		} finally {
 			setSaving(false);
 		}
@@ -71,9 +72,9 @@ export function OnboardingWizard() {
 					<div className="mb-1 flex size-10 items-center justify-center rounded-lg bg-primary-soft text-primary">
 						<KeyRound className="size-5" />
 					</div>
-					<DialogTitle>配置 Provider API Key</DialogTitle>
+					<DialogTitle>{tt("onboarding.title")}</DialogTitle>
 					<DialogDescription>
-						检测到本地还没有可用的 Provider 凭据。填写你常用的 Provider 与 API Key 后即可开始使用。
+						{tt("onboarding.description")}
 					</DialogDescription>
 				</DialogHeader>
 				<div className="flex flex-col gap-3">
@@ -83,7 +84,7 @@ export function OnboardingWizard() {
 							id="onboarding-provider"
 							autoFocus
 							value={provider}
-							placeholder="例如 deepseek"
+							placeholder={tt("onboarding.providerPlaceholder")}
 							onChange={(event) => setProvider(event.target.value)}
 						/>
 					</div>
@@ -102,12 +103,12 @@ export function OnboardingWizard() {
 						/>
 					</div>
 					<p className="text-[12px] leading-relaxed text-ink-3">
-						密钥仅写入本机 ~/.pi/agent/auth.json（权限 600），不会上传到任何服务器。
+						{tt("onboarding.securityNote")}
 					</p>
 				</div>
 				<DialogFooter>
 					<Button onClick={() => void save()} disabled={!provider.trim() || !key.trim() || saving}>
-						{saving ? "保存中…" : "保存并继续"}
+						{saving ? tt("onboarding.saving") : tt("onboarding.save")}
 					</Button>
 				</DialogFooter>
 			</DialogContent>

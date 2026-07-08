@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { firstLine, lastLine } from "../../lib/format";
 import { cn } from "../../lib/utils";
 import { useViewStore } from "../../stores/view";
+import { tt } from "../../lib/i18n";
 
 export interface ReasoningDisclosureProps {
 	text: string;
@@ -64,9 +65,9 @@ export function ReasoningDisclosure({ text, status, isTail, defaultOpen }: Reaso
 					ref={summaryRef}
 					className={cn("min-w-0 flex-1 truncate text-[13px] leading-6 text-ink-3", "font-mono")}
 				>
-					{summary || (status === "streaming" ? "思考中…" : "已思考")}
+					{summary || (status === "streaming" ? tt("status.thinking") : tt("status.thought"))}
 				</span>
-				<span className="pr-1 text-[11px] text-ink-3/70">{status === "streaming" ? "进行中" : ""}</span>
+				<span className="pr-1 text-[11px] text-ink-3/70">{status === "streaming" ? tt("status.inProgress") : ""}</span>
 			</button>
 			{expanded && (
 				<div className="mt-1.5 ml-[22px] border-l border-border pl-3">

@@ -2,6 +2,7 @@ import type { ProductTurn } from "../../types/view-models";
 import { AssistantStepView } from "./AssistantStepView";
 import { TurnTail } from "./TurnTail";
 import { UserMessageBubble } from "./UserMessageBubble";
+import { tt } from "../../lib/i18n";
 
 /**
  * One product turn: queued/injected user messages, assistant steps, and a
@@ -9,7 +10,7 @@ import { UserMessageBubble } from "./UserMessageBubble";
  */
 export function TurnView({ turn }: { turn: ProductTurn }) {
 	return (
-		<section aria-label="对话轮次" className="flex flex-col gap-4">
+		<section aria-label={tt("turn.sectionAria")} className="flex flex-col gap-4">
 			{turn.userMessages.map((message) => (
 				<UserMessageBubble key={message.entryKey} message={message} />
 			))}

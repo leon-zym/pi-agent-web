@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 
 /**
- * Three-tier Pi runtime resolution (design spec §7.2):
+ * Three-tier Pi runtime resolution (see docs/architecture.md):
  * 1. PI_PATH env var / --pi-path CLI arg (pi-web's own convention; pi source
  *    has no such variable).
  * 2. The global "pi" command on PATH (seamlessly inherits ~/.pi config and
