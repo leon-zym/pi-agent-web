@@ -1,0 +1,89 @@
+# 协议 — Pi RPC 事实地图
+
+本文档是工程内对 Pi Coding Agent RPC 协议**已核实事实**的沉淀（对照 0.84.2 源码逐项验证）。编码时以本文档与 `@earendil-works/pi-coding-agent` 的类型导出为准。
+
+## 传输与分帧
+
+- stdin/stdout 严格 JSONL，**仅按 LF 切分**；U+2028/U+2029 是合法 JSON 字符串内容，禁止 readline；容忍行尾 \r；非 JSON 行静默丢弃。
+- 命令可带可选 `id`；对应 response 回传相同 id。事件帧（`type` 为事件名）不带 id。
+- stdout 三类帧：`response`（命令结果）、`extension_ui_request`（扩展 UI）、事件帧。
+- ⚠ 顺序保证是「写入顺序」而非「因果顺序」：`get_*` 快照 response 可能夹在事件流中间到达。前端以事件流为权威。
+
+## 命令矩阵（要点）
+
+| 命令 | 关键事实 |
+|---|---|
+| `prompt` | 支持 `images`；流式时**必须**带 `streamingBehavior`（否则 `success:false`）；`success:true` 只表示被接受，运行失败走事件流（assistant 消息 `stopReason:"error"`）；`/` 扩展命令流式时也立即执行 |
+| `steer` / `follow_up` | 排队注入（本轮工具完成后 / 完全空闲后）；空闲时发送同样有效；扩展命令被拒绝 |
+| `abort` | 中断生成与工具，响应在完全静止后返回 |
+| `set_model` | 不在快照中返回 `Model not found`；持久化 settings.json 并写 `model_change` 条目 |
+| `set_thinking_level` | 无效级别被静默钳制；事件 `thinking_level_changed` 回显实际值 |
+| `get_available_models` | 返回 `{models}` 包裹；只含已配置认证的 Provider |
+| `get_available_thinking_levels` | 基础集合 off/minimal/low/medium/high；xhigh/max 仅在模型 `thinkingLevelMap` 声明时出现 |
+| `new_session` / `switch_session` / `fork` | 可被扩展取消，返回 `{cancelled}`；fork 只接受 user 消息 entryId |
+| `get_entries` | `since` 游标增量拉取，未命中返回 `success:false`；返回 `{entries, leafId}` |
+| `get_tree` | `{tree, leafId}`；孤儿条目作为根返回 |
+| `get_messages` | 仅内存中当前活动分支（不含被压缩历史；全量历史用 get_entries） |
+| `get_state` | `model` 未选时缺失；`sessionFile` 在 --no-session 时缺失 |
+| `get_session_stats` | `contextUsage.tokens/percent` 刚压缩后可能为 **null** |
+| `bash` | **必须带 id**（关联 `bash_execution_update{id,delta}`）；结果延迟落库（挂起到 agent_end / 下一个 prompt 前） |
+| `get_commands` | `{commands}` 包裹；source ∈ extension/prompt/skill；skill 带 `skill:` 前缀；内置 TUI 命令不在列表 |
+| `set_session_name` | 空字符串报错；写入 `session_info` 条目 |
+
+## 事件流（JsonAgentSessionEvent 关键子集）
+
+| 事件 | 投影消费 |
+|---|---|
+| `agent_start` | 新建 ProductTurn（running） |
+| `turn_start` | 新建 AssistantStep（一轮 = 一次模型响应 + 其工具执行） |
+| `message_start(role)` | user → 用户消息节点；assistant → 内容块种子；toolResult → 工具结果归位（**渲染以它为准**） |
+| `message_update` | 仅含增量（无累积 snapshot）：`text_/thinking_/toolcall_{start,delta,end}` + `usage`；按 contentIndex 局部追加 |
+| `message_end` | 权威最终消息，全量替换但保留 key；stopReason 裁决状态 |
+| `tool_execution_start/update/end` | 两阶段状态；update 的 partialResult 是**累积快照**（覆写） |
+| `turn_end` | Step 结算；`toolResults` 只用于结算统计，不渲染 |
+| `agent_end` | `willRetry:true` 表示自动重试中，**不可结算 Turn** |
+| `agent_settled` | 唯一 Turn 结算信号 |
+| `queue_update` | `{steering[], followUp[]}` → Queue Dock |
+| `compaction_start/end`、`auto_retry_*`、`summarization_retry_*` | 状态行 |
+| `bash_execution_update` | 终端增量输出 |
+| `extension_error` | stdout 直发帧（不在会话事件总线内），Toast 展示 |
+| `thinking_level_changed` / `session_info_changed` / `entry_appended` | 目录/菜单回显 |
+
+⚠ `session_start` / `session_shutdown` 是扩展专用事件，不出现于 stdout；以 `get_state.sessionId` 变化推断会话边界。
+
+## stopReason 语义
+
+- `length`：输出被上限截断，工具调用**不会执行**（Pi 会发 start+end(isError) 错误结果；前端将 preparing 工具标 skipped，永不转 running）。
+- `error`：Turn → error（`errorMessage` 展示）。
+- `aborted`：Turn → aborted（保留 partial，弱化「已停止」标记）。
+- abort/error 可能产生零 delta 的 assistant 消息（message_start+message_end 直连），前端需容忍。
+
+## Extension UI 子协议
+
+- 阻塞对话框 `select/confirm/input/editor`：Agent 原地阻塞等 `extension_ui_response`；`timeout` 存在时 Agent 侧自动降级默认值（select/input/editor → undefined，confirm → false）；`editor` 无 timeout，完全依赖 Host 断连保护。
+- 响应格式：`{value}` / `{confirmed}` / `{cancelled:true}`。
+- 单向通知：`notify`（Toast）、`setStatus`（状态栏）、`setWidget`（仅字符串数组）、`setTitle`、`set_editor_text`。
+- RPC 降级：`custom()` 返回 undefined；working indicator / footer / header / editor 组件均为 no-op；`getEditorText()` 返回 ""。
+
+## 本地存储
+
+| 文件 | 说明 |
+|---|---|
+| `~/.pi/agent/auth.json` | `Record<providerId, Credential>`；权限 600；写入用 proper-lockfile |
+| `~/.pi/agent/settings.json` | 默认模型/思考级别/steering 模式/压缩与重试开关 |
+| `<workspace>/.pi/settings.json` | 项目级覆盖 |
+| `~/.pi/agent/sessions/--<encoded-cwd>--/*.jsonl` | Append-only；首行 SessionHeader（version 3）；文件名 `<ISO时间戳>_<uuidv7>.jsonl` |
+
+编码算法：`"--" + resolvedCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-") + "--"`。
+
+环境变量（网关必须读取并透传子进程）：`PI_CODING_AGENT_DIR`（覆盖 agent 配置目录）、`PI_CODING_AGENT_SESSION_DIR`（覆盖会话根目录）。
+
+## 三层运行时解析
+
+1. `PI_PATH` / `--pi-path`（pi-web 自定义约定，Pi 源码无此变量；可指向可执行文件或安装目录）。
+2. 系统 PATH 中的全局 `pi` 命令（无缝继承配置与扩展）。
+3. 内置兜底：`@earendil-works/pi-coding-agent` 的 `dist/rpc-entry.js`（**必须 rpc-entry**，非 cli.js）+ Homebrew Cellar 布局探测。
+
+## 认证时序闭环
+
+RPC 进程的模型快照在启动时刷新（后台 15s 周期）。Onboarding 保存 Key 后，前端收到 `auth_changed` 广播并轮询重拉模型目录（上限 20s），成功后再 `set_model`，避免命中启动时的空快照。
