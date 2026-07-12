@@ -13,6 +13,7 @@ import path from "node:path";
 
 export const ENV_AGENT_DIR = "PI_CODING_AGENT_DIR";
 export const ENV_SESSION_DIR = "PI_CODING_AGENT_SESSION_DIR";
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 
 export function getAgentDir(env: NodeJS.ProcessEnv = process.env): string {
 	const override = env[ENV_AGENT_DIR];
@@ -47,15 +48,23 @@ export interface ServerConfig {
 	webDataDir: string;
 }
 
+export function assertLoopbackHost(host: string): void {
+	if (!LOOPBACK_HOSTS.has(host)) {
+		throw new Error("PI_WEB_HOST must be one of 127.0.0.1, localhost, or ::1");
+	}
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
 	const port = Number.parseInt(env.PI_WEB_PORT ?? "3000", 10);
-	return {
+	const config = {
 		port: Number.isFinite(port) ? port : 3000,
 		host: env.PI_WEB_HOST ?? "127.0.0.1",
 		agentDir: getAgentDir(env),
 		sessionRootDir: getSessionRootDir(env),
 		webDataDir: getWebDataDir(env),
 	};
+	assertLoopbackHost(config.host);
+	return config;
 }
 
 /**

@@ -25,10 +25,16 @@ if (process.env.PI_WEB_RUN_E2E !== "1") {
 		const address = started.server.address();
 		if (!address || typeof address === "string") throw new Error("server did not expose a TCP address");
 		const base = `http://127.0.0.1:${String(address.port)}`;
+		const bootstrap = await fetch(`${base}/api/v1/bootstrap`, { headers: { Origin: base } });
+		if (!bootstrap.ok) throw new Error(`bootstrap failed: ${String(bootstrap.status)}`);
+		const setCookie = bootstrap.headers.get("set-cookie");
+		if (!setCookie) throw new Error("bootstrap did not set a session cookie");
+		const cookie = setCookie.split(";", 1)[0] ?? "";
+		const authHeaders = { Origin: base, Cookie: cookie };
 
 		const workspaceResponse = await fetch(`${base}/api/v1/workspaces`, {
 			method: "POST",
-			headers: { "Content-Type": "application/json" },
+			headers: { "Content-Type": "application/json", ...authHeaders },
 			body: JSON.stringify({ path: workspacePath }),
 		});
 		if (!workspaceResponse.ok) {
@@ -37,7 +43,9 @@ if (process.env.PI_WEB_RUN_E2E !== "1") {
 		const workspace = (await workspaceResponse.json()) as { id: string };
 
 		const WebSocketCtor = (await import("ws")).default;
-		const ws = new WebSocketCtor(`ws://127.0.0.1:${String(address.port)}/api/v1/ws`);
+		const ws = new WebSocketCtor(`ws://127.0.0.1:${String(address.port)}/api/v1/ws`, {
+			headers: authHeaders,
+		});
 		await new Promise<void>((resolve, reject) => {
 			ws.on("open", resolve);
 			ws.on("error", reject);

@@ -58,6 +58,9 @@ function handleLine(line) {
 				data: { cancelled: false },
 			});
 			return;
+		case "get_last_assistant_text":
+			send({ type: "response", command: command.type, success: true, data: { text: "missing id" } });
+			return;
 		default:
 			send({ type: "response", id: command.id, command: command.type, success: true });
 	}

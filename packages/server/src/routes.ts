@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
+import type { GatewayAccessControl } from "./access-control.js";
 import { readAuthStatus, saveApiKey } from "./auth-storage.js";
 import type { ServerConfig } from "./config.js";
 import { getSessionDirForCwd } from "./config.js";
@@ -15,6 +16,7 @@ import type { WorkspaceRegistry } from "./workspace-registry.js";
  */
 
 export interface AppContext {
+	accessControl: GatewayAccessControl;
 	config: ServerConfig;
 	registry: WorkspaceRegistry;
 	supervisor: Supervisor;
@@ -29,8 +31,23 @@ function safeSessionId(raw: string): string {
 }
 
 export function createApp(ctx: AppContext): Hono {
-	const { config, registry, supervisor } = ctx;
+	const { accessControl, config, registry, supervisor } = ctx;
 	const app = new Hono();
+
+	app.get("/api/v1/bootstrap", (c) => {
+		if (!accessControl.isAllowedOrigin(c.req.raw.headers)) {
+			return c.json({ error: "forbidden origin" }, 403);
+		}
+		c.header("Set-Cookie", accessControl.createSessionCookie());
+		return c.json({ ok: true });
+	});
+
+	app.use("/api/v1/*", async (c, next) => {
+		if (!accessControl.isAuthorized(c.req.raw.headers)) {
+			return c.json({ error: "forbidden" }, 403);
+		}
+		await next();
+	});
 
 	app.get("/api/v1/health", (c) => {
 		return c.json({ ok: true, service: "pi-agent-web", version: "0.1.0" });

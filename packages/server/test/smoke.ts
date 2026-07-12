@@ -26,13 +26,19 @@ try {
 	const address = started.server.address();
 	if (!address || typeof address === "string") throw new Error("server did not expose a TCP address");
 	const base = `http://127.0.0.1:${String(address.port)}`;
+	const bootstrap = await fetch(`${base}/api/v1/bootstrap`, { headers: { Origin: base } });
+	if (!bootstrap.ok) throw new Error(`bootstrap failed: ${String(bootstrap.status)}`);
+	const setCookie = bootstrap.headers.get("set-cookie");
+	if (!setCookie) throw new Error("bootstrap did not set a session cookie");
+	const cookie = setCookie.split(";", 1)[0] ?? "";
+	const authHeaders = { Origin: base, Cookie: cookie };
 
-	const health = await fetch(`${base}/api/v1/health`);
+	const health = await fetch(`${base}/api/v1/health`, { headers: authHeaders });
 	if (!health.ok) throw new Error(`health check failed: ${String(health.status)}`);
 
 	const workspaceResponse = await fetch(`${base}/api/v1/workspaces`, {
 		method: "POST",
-		headers: { "Content-Type": "application/json" },
+		headers: { "Content-Type": "application/json", ...authHeaders },
 		body: JSON.stringify({ path: workspacePath }),
 	});
 	if (!workspaceResponse.ok)
@@ -40,7 +46,7 @@ try {
 	const workspace = (await workspaceResponse.json()) as { id: string };
 
 	const WebSocketCtor = (await import("ws")).default;
-	const ws = new WebSocketCtor(`ws://127.0.0.1:${String(address.port)}/api/v1/ws`);
+	const ws = new WebSocketCtor(`ws://127.0.0.1:${String(address.port)}/api/v1/ws`, { headers: authHeaders });
 	const state = await new Promise<{ sessionId: string }>((resolve, reject) => {
 		const timeout = setTimeout(() => reject(new Error("get_state timed out")), 10_000);
 		ws.once("open", () => {

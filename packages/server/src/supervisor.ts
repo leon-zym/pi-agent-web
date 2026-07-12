@@ -321,11 +321,19 @@ export class Supervisor {
 	}
 
 	/** Forward an extension UI response to the process (fire-and-forget). */
-	sendExtensionUiResponse(workspaceId: string, response: RpcExtensionUIResponse): void {
+	sendExtensionUiResponse(
+		workspaceId: string,
+		response: RpcExtensionUIResponse,
+		sessionId?: string,
+	): boolean {
 		const rt = this.runtimes.get(workspaceId);
-		if (!rt) return;
+		if (!rt) return false;
+		const dialogSessionId = rt.pendingDialogs.get(response.id);
+		if (!dialogSessionId || (sessionId !== undefined && sessionId !== dialogSessionId)) return false;
 		rt.pendingDialogs.delete(response.id);
-		if (rt.proc?.running) rt.proc.sendNoResponse(response);
+		if (!rt.proc?.running) return false;
+		rt.proc.sendNoResponse(response);
+		return true;
 	}
 
 	/**

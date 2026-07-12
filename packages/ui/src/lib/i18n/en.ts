@@ -2,6 +2,7 @@ import type { zhCN } from "./zh-CN";
 
 /** en dictionary: mirrors the zh-CN message id shape exactly. */
 export const en: typeof zhCN = {
+	"bootstrap.failed": "Unable to establish the local workbench session",
 	// Generic
 	"common.cancel": "Cancel",
 	"common.confirm": "OK",

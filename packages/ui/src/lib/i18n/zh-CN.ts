@@ -3,6 +3,7 @@
  * The en dictionary mirrors this shape exactly.
  */
 export const zhCN = {
+	"bootstrap.failed": "无法建立本机工作台会话",
 	// Generic
 	"common.cancel": "取消",
 	"common.confirm": "确定",

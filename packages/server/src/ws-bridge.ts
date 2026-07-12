@@ -1,10 +1,17 @@
-import { RpcError, type WsClientMessage, type WsServerMessage } from "@pi-agent-web/protocol";
+import { randomUUID } from "node:crypto";
+import type { RpcCommand, RpcResponse } from "@earendil-works/pi-coding-agent";
+import {
+	isWsClientMessage,
+	RpcError,
+	type WsClientMessage,
+	type WsServerMessage,
+} from "@pi-agent-web/protocol";
 import type { WebSocket } from "ws";
 import { WebSocketServer } from "ws";
 import type { Supervisor } from "./supervisor.js";
 
 /**
- * WebSocket <-> JSONL relay (wire contract lives in wire.ts).
+ * WebSocket <-> JSONL relay (wire contract lives in @pi-agent-web/protocol).
  *
  * - One full-duplex socket per tab, route /api/v1/ws.
  * - Commands are correlated to the originating connection by command id, so a
@@ -21,11 +28,17 @@ export interface WorkspaceInfo {
 }
 
 interface ConnectionState {
+	connectionId: string;
 	ws: WebSocket;
 	workspaceId?: string;
 	listenedSessionId: string | null;
 	pendingCommands: Set<string>;
 	alive: boolean;
+}
+
+interface RequestMapping {
+	connectionId: string;
+	clientId: string | undefined;
 }
 
 export interface WsBridgeOptions {
@@ -44,6 +57,8 @@ export class WsBridge {
 	private getWorkspace: (workspaceId: string) => WorkspaceInfo | undefined;
 	private connections = new Set<ConnectionState>();
 	private listenCounts = new Map<string, number>();
+	private requestMappings = new Map<string, RequestMapping>();
+	private requestCounter = 0;
 	private heartbeatTimer: NodeJS.Timeout;
 	private log: (level: "info" | "warn" | "error", message: string) => void;
 
@@ -109,6 +124,7 @@ export class WsBridge {
 
 	private handleConnection(ws: WebSocket): void {
 		const conn: ConnectionState = {
+			connectionId: randomUUID(),
 			ws,
 			listenedSessionId: null,
 			pendingCommands: new Set(),
@@ -121,12 +137,20 @@ export class WsBridge {
 			conn.alive = true;
 		});
 
-		ws.on("message", (raw) => {
-			void this.handleClientMessage(conn, raw.toString());
+		ws.on("message", (raw, isBinary) => {
+			if (isBinary) {
+				this.closeForPolicyViolation(conn, "binary WebSocket frames are not supported");
+				return;
+			}
+			void this.handleClientMessage(conn, raw.toString()).catch((error) => {
+				this.log("warn", `ws message handling failed: ${String(error)}`);
+				this.closeForPolicyViolation(conn, "invalid WebSocket message");
+			});
 		});
 
 		ws.on("close", () => {
 			this.connections.delete(conn);
+			this.clearRequestMappings(conn);
 			this.clearListen(conn);
 			this.log("info", `ws disconnected (${this.connections.size} open)`);
 		});
@@ -137,13 +161,18 @@ export class WsBridge {
 	}
 
 	private async handleClientMessage(conn: ConnectionState, raw: string): Promise<void> {
-		let message: WsClientMessage;
+		let rawMessage: unknown;
 		try {
-			message = JSON.parse(raw) as WsClientMessage;
+			rawMessage = JSON.parse(raw);
 		} catch {
-			return; // ignore malformed frames
+			this.closeForPolicyViolation(conn, "invalid JSON");
+			return;
 		}
-		if (!message || typeof message !== "object" || typeof message.type !== "string") return;
+		if (!isWsClientMessage(rawMessage)) {
+			this.closeForPolicyViolation(conn, "invalid client frame");
+			return;
+		}
+		const message: WsClientMessage = rawMessage;
 
 		switch (message.type) {
 			case "session_listen": {
@@ -155,7 +184,15 @@ export class WsBridge {
 				return;
 			}
 			case "extension_ui_response": {
-				this.supervisor.sendExtensionUiResponse(message.workspaceId, message.response);
+				if (conn.workspaceId !== message.workspaceId || conn.listenedSessionId === null) {
+					this.closeForPolicyViolation(conn, "extension response does not match the listen scope");
+					return;
+				}
+				this.supervisor.sendExtensionUiResponse(
+					message.workspaceId,
+					message.response,
+					conn.listenedSessionId,
+				);
 				return;
 			}
 			default:
@@ -184,21 +221,27 @@ export class WsBridge {
 			return;
 		}
 
-		if (command.id) conn.pendingCommands.add(command.id);
+		const internalId = this.nextInternalId(conn);
+		const mapping: RequestMapping = { connectionId: conn.connectionId, clientId: command.id };
+		this.requestMappings.set(internalId, mapping);
+		conn.pendingCommands.add(internalId);
+		const internalCommand = { ...command, id: internalId } as RpcCommand;
 
 		try {
-			const response = await this.supervisor.sendCommand(workspaceId, workspace.cwd, command);
-			if (command.id) conn.pendingCommands.delete(command.id);
-			this.sendTargeted(conn, { type: "response", workspaceId, response });
+			const response = await this.supervisor.sendCommand(workspaceId, workspace.cwd, internalCommand);
+			this.sendTargeted(conn, {
+				type: "response",
+				workspaceId,
+				response: this.restoreClientId(response, mapping),
+			});
 		} catch (error) {
-			if (command.id) conn.pendingCommands.delete(command.id);
 			const messageText =
 				error instanceof RpcError ? error.message : error instanceof Error ? error.message : String(error);
 			this.sendTargeted(conn, {
 				type: "response",
 				workspaceId,
 				response: {
-					id: command.id,
+					...(mapping.clientId ? { id: mapping.clientId } : {}),
 					type: "response",
 					command: command.type,
 					success: false,
@@ -207,6 +250,35 @@ export class WsBridge {
 			});
 			// Process-level failures may still be useful in the log.
 			this.log("warn", `command ${command.type} failed: ${messageText}`);
+		} finally {
+			conn.pendingCommands.delete(internalId);
+			this.requestMappings.delete(internalId);
+		}
+	}
+
+	private nextInternalId(conn: ConnectionState): string {
+		this.requestCounter += 1;
+		return `bridge-${conn.connectionId}-${this.requestCounter.toString(36)}`;
+	}
+
+	private restoreClientId(response: RpcResponse, mapping: RequestMapping): RpcResponse {
+		const { id: _internalId, ...withoutInternalId } = response;
+		return mapping.clientId
+			? ({ ...withoutInternalId, id: mapping.clientId } as RpcResponse)
+			: (withoutInternalId as RpcResponse);
+	}
+
+	private clearRequestMappings(conn: ConnectionState): void {
+		for (const internalId of conn.pendingCommands) {
+			this.requestMappings.delete(internalId);
+		}
+		conn.pendingCommands.clear();
+	}
+
+	private closeForPolicyViolation(conn: ConnectionState, reason: string): void {
+		this.log("warn", `closing ws ${conn.connectionId}: ${reason}`);
+		if (conn.ws.readyState === conn.ws.OPEN || conn.ws.readyState === conn.ws.CONNECTING) {
+			conn.ws.close(1008, "policy violation");
 		}
 	}
 

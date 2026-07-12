@@ -3,9 +3,12 @@ import type { AuthStatusEntry, SessionSummary, WorkspaceSummary } from "@pi-agen
 /** Minimal REST client for the gateway. */
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+	const headers = new Headers(init?.headers);
+	if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
 	const response = await fetch(path, {
-		headers: { "Content-Type": "application/json" },
 		...init,
+		credentials: "include",
+		headers,
 	});
 	if (!response.ok) {
 		let message = `HTTP ${response.status}`;
@@ -21,6 +24,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+	bootstrap: () => request<{ ok: true }>("/api/v1/bootstrap"),
 	listWorkspaces: () => request<WorkspaceSummary[]>("/api/v1/workspaces"),
 	addWorkspace: (path: string) =>
 		request<WorkspaceSummary>("/api/v1/workspaces", { method: "POST", body: JSON.stringify({ path }) }),

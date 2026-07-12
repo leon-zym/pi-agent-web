@@ -192,6 +192,9 @@ export class PiProcess {
 		if (!this.running) {
 			return Promise.reject(new Error("pi process is not running"));
 		}
+		if (this.pending.has(obj.id)) {
+			return Promise.reject(new RpcError(obj.type, `duplicate pending command id: ${obj.id}`));
+		}
 		const timeout = timeoutMs ?? this.opts.commandTimeoutMs;
 		return new Promise<RpcResponse>((resolve, reject) => {
 			const timer = setTimeout(() => {

@@ -1,6 +1,8 @@
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import { type ServerType, serve } from "@hono/node-server";
-import { loadConfig, type ServerConfig } from "./config.js";
+import { createGatewayAccessControl, type GatewayAccessControl } from "./access-control.js";
+import { assertLoopbackHost, loadConfig, type ServerConfig } from "./config.js";
 import { type ResolvedPi, resolvePiRuntime } from "./resolver.js";
 import { createApp } from "./routes.js";
 import { Supervisor } from "./supervisor.js";
@@ -27,6 +29,7 @@ export interface ServerHandle {
 	registry: WorkspaceRegistry;
 	config: ServerConfig;
 	runtime: ResolvedPi;
+	accessControl: GatewayAccessControl;
 	close: () => Promise<void>;
 }
 
@@ -39,7 +42,9 @@ function log(level: "info" | "warn" | "error", message: string): void {
 
 export async function startServer(options: StartServerOptions = {}): Promise<ServerHandle> {
 	const config: ServerConfig = { ...loadConfig(), ...options.config };
+	assertLoopbackHost(config.host);
 	fs.mkdirSync(config.webDataDir, { recursive: true });
+	const accessControl = createGatewayAccessControl(randomBytes(32).toString("base64url"));
 
 	// Three-tier runtime resolution. Boot continues even
 	// without pi so the UI can explain the situation; workspace opens will fail
@@ -82,7 +87,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 		supervisor.registerWorkspace(ws.id, ws.path);
 	}
 
-	const app = createApp({ config, registry, supervisor });
+	const app = createApp({ accessControl, config, registry, supervisor });
 
 	// Production: serve the built SPA (fallback to index.html for client routes).
 	// Only paths outside /api reach this handler; API routes win regardless.
@@ -132,6 +137,21 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 			socket.destroy();
 			return;
 		}
+		if (!accessControl.isAuthorized(req.headers)) {
+			const body = "Forbidden";
+			socket.write(
+				[
+					"HTTP/1.1 403 Forbidden",
+					"Connection: close",
+					"Content-Type: text/plain; charset=utf-8",
+					`Content-Length: ${String(Buffer.byteLength(body))}`,
+					"",
+					body,
+				].join("\r\n"),
+			);
+			socket.destroy();
+			return;
+		}
 		bridge.wss.handleUpgrade(req, socket, head, (ws) => {
 			bridge.wss.emit("connection", ws, req);
 		});
@@ -158,7 +178,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 		});
 	}
 
-	return { server, supervisor, bridge, registry, config, runtime, close };
+	return { server, supervisor, bridge, registry, config, runtime, accessControl, close };
 }
 
 // Run as the main entry (node dist/main.js / tsx src/main.ts).
