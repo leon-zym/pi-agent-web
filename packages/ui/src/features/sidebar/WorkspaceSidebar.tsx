@@ -45,9 +45,9 @@ import {
 import { Input } from "../../components/ui/input";
 import { Label } from "../../components/ui/label";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
-import { tt } from "../../lib/i18n";
 import { api } from "../../lib/api";
 import { formatRelativeTime } from "../../lib/format";
+import { tt } from "../../lib/i18n";
 import { deleteSession, newSession, openSession, renameSession } from "../../lib/session-controller";
 import { useTheme } from "../../lib/use-theme";
 import { cn } from "../../lib/utils";
@@ -85,7 +85,7 @@ interface SessionRowProps {
 	current: boolean;
 }
 
-function SessionRow({ session, workspace, current }: SessionRowProps) {
+function SessionRow({ session, current }: SessionRowProps) {
 	const [renameOpen, setRenameOpen] = useState(false);
 	const [deleteOpen, setDeleteOpen] = useState(false);
 	const [name, setName] = useState(session.name ?? "");
@@ -109,6 +109,7 @@ function SessionRow({ session, workspace, current }: SessionRowProps) {
 		<li
 			role="treeitem"
 			aria-selected={current}
+			tabIndex={-1}
 			className="group relative flex h-8 items-center gap-2 rounded-sm pr-1 hover:bg-hover"
 		>
 			{current && <span className="absolute top-1.5 bottom-1.5 left-0 w-0.5 rounded-full bg-primary" />}
@@ -189,9 +190,7 @@ function SessionRow({ session, workspace, current }: SessionRowProps) {
 				<AlertDialogContent>
 					<AlertDialogHeader>
 						<AlertDialogTitle>{tt("sidebar.deleteSession")}</AlertDialogTitle>
-						<AlertDialogDescription>
-							{tt("sidebar.deleteDescription", { title })}
-						</AlertDialogDescription>
+						<AlertDialogDescription>{tt("sidebar.deleteDescription", { title })}</AlertDialogDescription>
 					</AlertDialogHeader>
 					<AlertDialogFooter>
 						<AlertDialogCancel>{tt("common.cancel")}</AlertDialogCancel>
@@ -299,7 +298,7 @@ function WorkspaceGroup({ workspace, sessions, defaultExpanded }: WorkspaceGroup
 			</div>
 
 			{expanded && (
-				<ul role="tree" className="flex flex-col pl-3">
+				<ul className="flex flex-col pl-3">
 					{visible.map((session) => (
 						<SessionRow
 							key={session.id}
@@ -358,7 +357,9 @@ function AddWorkspaceDialog({
 			setPath("");
 			onOpenChange(false);
 		} catch (error) {
-			toast.error(tt("sidebar.workspaceAddFailed"), { description: error instanceof Error ? error.message : String(error) });
+			toast.error(tt("sidebar.workspaceAddFailed"), {
+				description: error instanceof Error ? error.message : String(error),
+			});
 		}
 	};
 	return (
@@ -429,7 +430,9 @@ export function WorkspaceSidebar({ rail }: { rail: boolean }) {
 			await api.restartProcess(currentWorkspaceId);
 			toast.success(tt("sidebar.restarted"));
 		} catch (error) {
-			toast.error(tt("sidebar.restartFailed"), { description: error instanceof Error ? error.message : String(error) });
+			toast.error(tt("sidebar.restartFailed"), {
+				description: error instanceof Error ? error.message : String(error),
+			});
 		}
 	};
 
@@ -535,7 +538,7 @@ export function WorkspaceSidebar({ rail }: { rail: boolean }) {
 			<div className="scroll-slim min-h-0 flex-1 overflow-y-auto px-2 pb-2">
 				{filtered !== null ? (
 					filtered.length > 0 ? (
-						<ul role="tree" className="flex flex-col">
+						<ul className="flex flex-col">
 							{filtered.map((session) => {
 								const workspace = workspaces.find((w) => w.id === currentWorkspaceId);
 								return (
@@ -601,7 +604,12 @@ export function WorkspaceSidebar({ rail }: { rail: boolean }) {
 						</button>
 					</TooltipTrigger>
 					<TooltipContent>
-						{tt("sidebar.theme")}：{preference === "system" ? tt("sidebar.themeSystem") : preference === "light" ? tt("sidebar.themeLight") : tt("sidebar.themeDark")}
+						{tt("sidebar.theme")}：
+						{preference === "system"
+							? tt("sidebar.themeSystem")
+							: preference === "light"
+								? tt("sidebar.themeLight")
+								: tt("sidebar.themeDark")}
 					</TooltipContent>
 				</Tooltip>
 				{currentWorkspaceId && (

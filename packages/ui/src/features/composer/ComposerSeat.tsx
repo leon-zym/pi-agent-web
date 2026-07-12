@@ -1,9 +1,9 @@
 import { ImagePlus, Plus, SendHorizontal, Square, Zap } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
-import { tt, useT } from "../../lib/i18n";
 import { Button } from "../../components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
+import { tt, useT } from "../../lib/i18n";
 import { abortCurrentRun, submitDraft } from "../../lib/session-controller";
 import { cn } from "../../lib/utils";
 import { useComposerStore } from "../../stores/composer";
@@ -65,7 +65,7 @@ export function ComposerSeat() {
 		const el = textareaRef.current;
 		if (!el) return;
 		el.style.height = "auto";
-		el.style.height = Math.min(el.scrollHeight, 24 * MAX_LINES) + "px";
+		el.style.height = `${Math.min(el.scrollHeight, 24 * MAX_LINES)}px`;
 	};
 
 	useEffect(() => {
@@ -163,7 +163,7 @@ export function ComposerSeat() {
 						const value = draft;
 						const before = value.slice(0, trigger.index);
 						const after = value.slice(trigger.index + 1 + trigger.query.length);
-						setDraft(before + "/" + commandName + " " + after);
+						setDraft(`${before}/${commandName} ${after}`);
 						setTrigger(null);
 						focus();
 					}}
@@ -174,9 +174,9 @@ export function ComposerSeat() {
 					{images.length > 0 && (
 						<div className="mb-2 flex flex-wrap gap-2">
 							{images.map((image, index) => (
-								<div key={index} className="group relative">
+								<div key={`${image.mimeType}:${index}`} className="group relative">
 									<img
-										src={"data:" + image.mimeType + ";base64," + image.data}
+										src={`data:${image.mimeType};base64,${image.data}`}
 										alt={tt("composer.attachment", { n: index + 1 })}
 										className="h-16 rounded-md object-cover"
 									/>
@@ -228,7 +228,7 @@ export function ComposerSeat() {
 									if (at) {
 										setTrigger(at);
 									} else {
-										setDraft(draft + "/");
+										setDraft(`${draft}/`);
 										setTrigger({ index: draft.length, query: "" });
 									}
 									focus();
@@ -328,8 +328,12 @@ export function ComposerSeat() {
 			</div>
 			{running && (
 				<p className="mt-1.5 text-center text-[11px] text-ink-3">
-					{tt("composer.runningHint1", { mode: deliveryMode === "follow_up" ? tt("status.followUp") : tt("status.steer") })}
-					{tt("composer.runningHint2", { other: deliveryMode === "follow_up" ? tt("status.steer") : tt("status.followUp") })}
+					{tt("composer.runningHint1", {
+						mode: deliveryMode === "follow_up" ? tt("status.followUp") : tt("status.steer"),
+					})}
+					{tt("composer.runningHint2", {
+						other: deliveryMode === "follow_up" ? tt("status.steer") : tt("status.followUp"),
+					})}
 				</p>
 			)}
 		</div>

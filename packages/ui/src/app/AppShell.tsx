@@ -3,8 +3,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ConversationColumn } from "../features/conversation/ConversationColumn";
 import { DetailsPanel } from "../features/details/DetailsPanel";
 import { WorkspaceSidebar } from "../features/sidebar/WorkspaceSidebar";
-import { cn } from "../lib/utils";
 import { tt } from "../lib/i18n";
+import { cn } from "../lib/utils";
 
 const SIDEBAR_MIN = 264;
 const SIDEBAR_MAX = 420;
@@ -99,14 +99,12 @@ export function AppShell() {
 		dragging.current = null;
 	};
 
-	const gridColumns = sidebarWidth + "px minmax(0, 1fr) " + detailsWidth + "px";
-
 	return (
-		<div
-			className="grid h-full select-none overflow-hidden bg-base"
-			style={{ gridTemplateColumns: gridColumns }}
-		>
-			<div className="min-w-0 overflow-hidden border-r border-border bg-sidebar">
+		<div className="flex h-full select-none overflow-hidden bg-base">
+			<div
+				className="min-w-0 overflow-hidden border-r border-border bg-sidebar"
+				style={{ width: sidebarWidth, flexShrink: 0 }}
+			>
 				<WorkspaceSidebar rail={rail} />
 			</div>
 
@@ -114,8 +112,7 @@ export function AppShell() {
 				<button
 					type="button"
 					aria-label={tt("appShell.sidebarWidth")}
-					className="relative z-10 -ml-px w-1 cursor-col-resize bg-transparent transition-colors hover:bg-primary/30 active:bg-primary/50 focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
-					style={{ marginRight: -4 } as React.CSSProperties}
+					className="z-10 w-1 shrink-0 cursor-col-resize bg-transparent transition-colors hover:bg-primary/30 active:bg-primary/50 focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
 					onPointerDown={startDrag("sidebar")}
 					onPointerMove={onDrag("sidebar")}
 					onPointerUp={endDrag}
@@ -130,7 +127,7 @@ export function AppShell() {
 				/>
 			)}
 
-			<main className="min-w-0 overflow-hidden">
+			<main className="min-w-0 flex-1 overflow-hidden">
 				<ConversationColumn />
 			</main>
 
@@ -138,8 +135,7 @@ export function AppShell() {
 				<button
 					type="button"
 					aria-label={tt("appShell.detailsWidth")}
-					className="relative z-10 w-1 cursor-col-resize bg-transparent transition-colors hover:bg-primary/30 active:bg-primary/50 focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
-					style={{ marginLeft: -4 } as React.CSSProperties}
+					className="z-10 w-1 shrink-0 cursor-col-resize bg-transparent transition-colors hover:bg-primary/30 active:bg-primary/50 focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
 					onPointerDown={startDrag("details")}
 					onPointerMove={onDrag("details")}
 					onPointerUp={endDrag}
@@ -155,9 +151,16 @@ export function AppShell() {
 			)}
 
 			{/* Details stays mounted at zero width so its subtree state survives. */}
-			<div className={cn("min-w-0 border-l border-border bg-base", detailsWidth === 0 && "hidden")}>
+			<div
+				className={cn(
+					"min-w-0 shrink-0 overflow-hidden border-l border-border bg-base",
+					detailsWidth === 0 && "hidden",
+				)}
+				style={{ width: detailsWidth }}
+			>
 				<DetailsPanel open={detailsWidth > 0} onToggle={() => setDetailsOpen((open) => !open)} />
 			</div>
 		</div>
 	);
 }
+// APP_SHELL_TAIL

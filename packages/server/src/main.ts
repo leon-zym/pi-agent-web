@@ -57,6 +57,9 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 
 	const registry = new WorkspaceRegistry(config.webDataDir);
 
+	// Register every persisted workspace with the supervisor so WS commands can
+	// find it immediately after boot (process spawn stays lazy on demand).
+
 	const supervisor = new Supervisor({
 		resolved: runtime,
 		sessionRootDir: config.sessionRootDir,
@@ -72,6 +75,12 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 		},
 		log,
 	});
+
+	// Register every persisted workspace with the supervisor so WS commands
+	// resolve immediately after boot (process spawn stays lazy on demand).
+	for (const ws of registry.list()) {
+		supervisor.registerWorkspace(ws.id, ws.path);
+	}
 
 	const app = createApp({ config, registry, supervisor });
 
@@ -154,7 +163,8 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 
 // Run as the main entry (node dist/main.js / tsx src/main.ts).
 import { pathToFileURL } from "node:url";
+
 const invokedPath = process.argv[1];
 if (invokedPath && import.meta.url === pathToFileURL(invokedPath).href) {
-  void startServer();
+	void startServer();
 }

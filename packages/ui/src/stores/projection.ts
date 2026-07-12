@@ -113,7 +113,7 @@ export function rebuildProjectionFromMessages(
 	for (const raw of messages) {
 		const message = raw as LiteMessage;
 		if (message.role === "user") {
-			const id = "turn-" + String(projection.turnSeq + 1);
+			const id = `turn-${String(projection.turnSeq + 1)}`;
 			const blocks = Array.isArray(message.content) ? (message.content as LiteBlock[]) : [];
 			const content =
 				typeof message.content === "string"
@@ -129,7 +129,7 @@ export function rebuildProjectionFromMessages(
 				id,
 				userMessages: [
 					{
-						entryKey: id + ":u0",
+						entryKey: `${id}:u0`,
 						text: content,
 						images: images.length > 0 ? images : undefined,
 						source: "prompt",
@@ -148,10 +148,10 @@ export function rebuildProjectionFromMessages(
 		if (!turn) continue;
 
 		if (message.role === "assistant") {
-			const stepKey = turn.id + ":" + String(turn.steps.length);
+			const stepKey = `${turn.id}:${String(turn.steps.length)}`;
 			const blocks = (Array.isArray(message.content) ? (message.content as LiteBlock[]) : []).map(
 				(block, index) => {
-					const key = stepKey + ":" + String(index);
+					const key = `${stepKey}:${String(index)}`;
 					if (block.type === "thinking") {
 						return {
 							type: "thinking" as const,

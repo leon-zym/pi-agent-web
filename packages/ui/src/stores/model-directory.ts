@@ -50,7 +50,9 @@ export const useModelDirectoryStore = create<ModelDirectoryState>()((set, get) =
 			const { levels } = expectData(levelsResponse) as { levels: ThinkingLevel[] };
 			const byProvider: Record<string, ModelLite[]> = {};
 			for (const model of models) {
-				(byProvider[model.provider] ??= []).push(model);
+				const group = byProvider[model.provider] ?? [];
+				group.push(model);
+				byProvider[model.provider] = group;
 			}
 			set({
 				models,

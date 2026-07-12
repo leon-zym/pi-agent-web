@@ -116,7 +116,7 @@ function ensureTurn(
 ): { state: ConversationProjection; turn: ProductTurn } {
 	const existing = activeTurn(state);
 	if (existing) return { state, turn: existing };
-	const id = "turn-" + String(state.turnSeq + 1);
+	const id = `turn-${String(state.turnSeq + 1)}`;
 	const turn: ProductTurn = {
 		id,
 		userMessages: [],
@@ -138,7 +138,7 @@ function ensureTurn(
 
 function ensureStep(turn: ProductTurn, ctx: ReducerContext): { turn: ProductTurn; step: AssistantStep } {
 	const step: AssistantStep = {
-		key: turn.id + ":" + String(turn.steps.length),
+		key: `${turn.id}:${String(turn.steps.length)}`,
 		blocks: [],
 		toolResults: [],
 		isSettled: false,
@@ -156,7 +156,7 @@ function ensureBlock(
 	if (existing && (kind === "tool_call" ? existing.type === "tool_call" : existing.type === kind)) {
 		return { step, block: existing };
 	}
-	const key = step.key + ":" + String(contentIndex);
+	const key = `${step.key}:${String(contentIndex)}`;
 	const block: ContentBlock =
 		kind === "thinking"
 			? { type: "thinking", key, text: "", isStreaming: true }
@@ -345,7 +345,7 @@ function handleMessageStart(
 		const userMessages = [
 			...ensured.turn.userMessages,
 			{
-				entryKey: ensured.turn.id + ":u" + String(ensured.turn.userMessages.length),
+				entryKey: `${ensured.turn.id}:u${String(ensured.turn.userMessages.length)}`,
 				text,
 				images: extractImages(message.content),
 				source,
@@ -360,7 +360,7 @@ function handleMessageStart(
 		const stepped = ensureStep(ensured.turn, ctx);
 		// Seed any already-present content (snapshot replay / zero-delta messages).
 		const seeded = (message.content as ContentBlockLite[]).map((block, index) => {
-			const key = stepped.step.key + ":" + String(index);
+			const key = `${stepped.step.key}:${String(index)}`;
 			if (block.type === "thinking") {
 				return {
 					type: "thinking" as const,
@@ -462,7 +462,7 @@ function handleMessageEnd(
 	const markedLast = finalTurn.steps[finalTurn.steps.length - 1];
 	if (!markedLast) return state;
 	const blocks = (message.content as ContentBlockLite[]).map((block, index) => {
-		const key = markedLast.key + ":" + String(index);
+		const key = `${markedLast.key}:${String(index)}`;
 		const existing = markedLast.blocks[index];
 		if (block.type === "thinking") {
 			return {
@@ -511,7 +511,11 @@ function handleMessageEnd(
 	finalTurn = withLastStep(finalTurn, settledStep);
 
 	if (message.stopReason === "error") {
-		finalTurn = { ...finalTurn, status: "error", errorMessage: message.errorMessage ?? tt("tail.modelError") };
+		finalTurn = {
+			...finalTurn,
+			status: "error",
+			errorMessage: message.errorMessage ?? tt("tail.modelError"),
+		};
 	} else if (message.stopReason === "aborted") {
 		finalTurn = { ...finalTurn, status: "aborted" };
 	}
@@ -640,12 +644,11 @@ export function reduceProjection(
 				key: "retry",
 				kind: "retry",
 				state: "waiting",
-				detail:
-					tt("system.retryScheduled", {
-						attempt: event.attempt,
-						max: event.maxAttempts,
-						seconds: Math.round(event.delayMs / 1000),
-					}),
+				detail: tt("system.retryScheduled", {
+					attempt: event.attempt,
+					max: event.maxAttempts,
+					seconds: Math.round(event.delayMs / 1000),
+				}),
 			});
 
 		case "auto_retry_end":

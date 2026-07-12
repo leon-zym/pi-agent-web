@@ -9,12 +9,12 @@ import {
 	X,
 } from "lucide-react";
 import { useState } from "react";
+import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import { useProjectionStore } from "../../stores/projection";
 import { useViewStore } from "../../stores/view";
 import type { ContentBlock, UiToolResult } from "../../types/view-models";
 import { getToolPresenter } from "./tool-presenters";
-import { tt } from "../../lib/i18n";
 
 type ToolCallBlock = Extract<ContentBlock, { type: "tool_call" }>;
 
@@ -137,7 +137,9 @@ export function ToolCallRow({ block, results }: { block: ToolCallBlock; results:
 						result.isError ? (
 							<div key={result.toolCallId} className="flex items-start gap-1.5 text-[13px] text-danger">
 								<X className="mt-0.5 size-3.5 shrink-0" />
-								<span className="whitespace-pre-wrap break-words">{result.content || tt("tool.executionError")}</span>
+								<span className="whitespace-pre-wrap break-words">
+									{result.content || tt("tool.executionError")}
+								</span>
 							</div>
 						) : null,
 					)}

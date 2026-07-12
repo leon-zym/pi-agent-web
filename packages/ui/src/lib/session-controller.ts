@@ -1,7 +1,6 @@
 import type { RpcResponse } from "@earendil-works/pi-coding-agent";
 import type { SessionSummary } from "@pi-agent-web/server/wire";
 import { expectData } from "@pi-agent-web/server/wire";
-import { tt } from "./i18n";
 import { toast } from "sonner";
 import { useComposerStore } from "../stores/composer";
 import { useModelDirectoryStore } from "../stores/model-directory";
@@ -13,6 +12,7 @@ import { useTransportStore } from "../stores/transport";
 import { useViewStore } from "../stores/view";
 import type { ImageContent } from "../types/pi-types";
 import { api } from "./api";
+import { tt } from "./i18n";
 
 /**
  * Session orchestration: switching, creating, deleting, submitting prompts.
@@ -36,7 +36,9 @@ async function snapshotAfterOpen(wsId: string, sessionId: string): Promise<void>
 		const { messages } = expectData(response) as { messages: never[] };
 		useProjectionStore.getState().rebuildFromMessages(sessionId, messages);
 	} catch (error) {
-		toast.error(tt("session.loadFailed"), { description: error instanceof Error ? error.message : String(error) });
+		toast.error(tt("session.loadFailed"), {
+			description: error instanceof Error ? error.message : String(error),
+		});
 	}
 	void useSlashCommandsStore.getState().refresh(wsId);
 	void useModelDirectoryStore.getState().refresh(wsId);
@@ -62,7 +64,9 @@ export async function openSession(summary: SessionSummary): Promise<void> {
 		await snapshotAfterOpen(wsId, summary.id);
 	} catch (error) {
 		directory.setCurrentSession(null);
-		toast.error(tt("session.openFailed"), { description: error instanceof Error ? error.message : String(error) });
+		toast.error(tt("session.openFailed"), {
+			description: error instanceof Error ? error.message : String(error),
+		});
 	}
 }
 
@@ -95,7 +99,9 @@ export async function newSession(): Promise<void> {
 			}
 		}
 	} catch (error) {
-		toast.error(tt("session.newFailed"), { description: error instanceof Error ? error.message : String(error) });
+		toast.error(tt("session.newFailed"), {
+			description: error instanceof Error ? error.message : String(error),
+		});
 	}
 }
 
@@ -109,17 +115,21 @@ export async function deleteSession(summary: SessionSummary): Promise<void> {
 		}
 		toast.success(tt("session.deleted"));
 	} catch (error) {
-		toast.error(tt("session.deleteFailed"), { description: error instanceof Error ? error.message : String(error) });
+		toast.error(tt("session.deleteFailed"), {
+			description: error instanceof Error ? error.message : String(error),
+		});
 	}
 }
 
-export async function renameSession(summary: SessionSummary, name: string): Promise<void> {
+export async function renameSession(_summary: SessionSummary, name: string): Promise<void> {
 	const wsId = workspaceId();
 	try {
 		await useTransportStore.getState().sendCommand(wsId, { type: "set_session_name", name });
 		await useSessionDirectoryStore.getState().reloadSessions();
 	} catch (error) {
-		toast.error(tt("session.renameFailed"), { description: error instanceof Error ? error.message : String(error) });
+		toast.error(tt("session.renameFailed"), {
+			description: error instanceof Error ? error.message : String(error),
+		});
 	}
 }
 
@@ -171,7 +181,9 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 			composer.clearDraft();
 		}
 	} catch (error) {
-		toast.error(tt("session.sendFailed"), { description: error instanceof Error ? error.message : String(error) });
+		toast.error(tt("session.sendFailed"), {
+			description: error instanceof Error ? error.message : String(error),
+		});
 	} finally {
 		composer.setSubmitState("plain");
 	}
@@ -183,7 +195,9 @@ export async function abortCurrentRun(): Promise<void> {
 	try {
 		await useTransportStore.getState().sendCommand(wsId, { type: "abort" }, 60_000);
 	} catch (error) {
-		toast.error(tt("session.abortFailed"), { description: error instanceof Error ? error.message : String(error) });
+		toast.error(tt("session.abortFailed"), {
+			description: error instanceof Error ? error.message : String(error),
+		});
 	}
 }
 
@@ -198,7 +212,9 @@ export async function runSlashCommand(wsId: string, fullText: string): Promise<v
 		if (response.success === false) toast.error(tt("session.commandFailed"), { description: response.error });
 		else composer.clearDraft();
 	} catch (error) {
-		toast.error(tt("session.commandFailed"), { description: error instanceof Error ? error.message : String(error) });
+		toast.error(tt("session.commandFailed"), {
+			description: error instanceof Error ? error.message : String(error),
+		});
 	} finally {
 		composer.setSubmitState("plain");
 	}
@@ -222,7 +238,9 @@ export async function forkFromEntry(entryId: string): Promise<void> {
 			toast.success(tt("session.forked"));
 		}
 	} catch (error) {
-		toast.error(tt("session.forkFailed"), { description: error instanceof Error ? error.message : String(error) });
+		toast.error(tt("session.forkFailed"), {
+			description: error instanceof Error ? error.message : String(error),
+		});
 	}
 }
 

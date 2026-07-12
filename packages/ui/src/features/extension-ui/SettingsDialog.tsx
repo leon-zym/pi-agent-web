@@ -94,7 +94,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 		try {
 			await useTransportStore.getState().sendCommand(workspaceId, { type: "set_auto_compaction", enabled });
 		} catch (error) {
-			toast.error(tt("settings.saveFailed"), { description: error instanceof Error ? error.message : String(error) });
+			toast.error(tt("settings.saveFailed"), {
+				description: error instanceof Error ? error.message : String(error),
+			});
 		}
 	};
 
@@ -104,7 +106,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 		try {
 			await useTransportStore.getState().sendCommand(workspaceId, { type: "set_auto_retry", enabled });
 		} catch (error) {
-			toast.error(tt("settings.saveFailed"), { description: error instanceof Error ? error.message : String(error) });
+			toast.error(tt("settings.saveFailed"), {
+				description: error instanceof Error ? error.message : String(error),
+			});
 		}
 	};
 
@@ -114,7 +118,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 		try {
 			await useTransportStore.getState().sendCommand(workspaceId, { type: "set_steering_mode", mode });
 		} catch (error) {
-			toast.error(tt("settings.saveFailed"), { description: error instanceof Error ? error.message : String(error) });
+			toast.error(tt("settings.saveFailed"), {
+				description: error instanceof Error ? error.message : String(error),
+			});
 		}
 	};
 
@@ -124,7 +130,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 		try {
 			await useTransportStore.getState().sendCommand(workspaceId, { type: "set_follow_up_mode", mode });
 		} catch (error) {
-			toast.error(tt("settings.saveFailed"), { description: error instanceof Error ? error.message : String(error) });
+			toast.error(tt("settings.saveFailed"), {
+				description: error instanceof Error ? error.message : String(error),
+			});
 		}
 	};
 

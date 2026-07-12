@@ -1,8 +1,8 @@
 import { Gauge } from "lucide-react";
 import { useMemo } from "react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
-import { tt } from "../../lib/i18n";
 import { formatCost, formatTokens } from "../../lib/format";
+import { tt } from "../../lib/i18n";
 import { useSessionStatsStore } from "../../stores/session-stats";
 
 /**
@@ -45,9 +45,11 @@ export function ContextMeter() {
 					percent: Math.round(display.percent),
 				})
 			: tt("context.tooltipComputing"),
-		stats ? tt("context.tooltipTotal", { tokens: formatTokens(stats.tokens.total), cost: formatCost(totalCost) }) : null,
+		stats
+			? tt("context.tooltipTotal", { tokens: formatTokens(stats.tokens.total), cost: formatCost(totalCost) })
+			: null,
 		liveTokens !== null ? tt("context.tooltipLive", { tokens: formatTokens(liveTokens) }) : null,
-	]		.join("\n");
+	].join("\n");
 
 	return (
 		<Tooltip>
@@ -63,7 +65,7 @@ export function ContextMeter() {
 							<span className="h-1 w-10 overflow-hidden rounded-full bg-hover">
 								<span
 									className="block h-full rounded-full bg-primary"
-									style={{ width: Math.min(100, Math.max(2, display.percent)) + "%" }}
+									style={{ width: `${Math.min(100, Math.max(2, display.percent))}%` }}
 								/>
 							</span>
 							<span className="font-mono tabular-nums">{Math.round(display.percent)}%</span>

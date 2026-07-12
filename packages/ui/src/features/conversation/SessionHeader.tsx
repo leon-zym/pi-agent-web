@@ -58,11 +58,14 @@ export function SessionHeader() {
 				description: path,
 				action: {
 					label: tt("common.copyPath"),
-					onClick: () => void navigator.clipboard.writeText(path).then(() => toast.success(tt("common.pathCopied"))),
+					onClick: () =>
+						void navigator.clipboard.writeText(path).then(() => toast.success(tt("common.pathCopied"))),
 				},
 			});
 		} catch (error) {
-			toast.error(tt("header.exportFailed"), { description: error instanceof Error ? error.message : String(error) });
+			toast.error(tt("header.exportFailed"), {
+				description: error instanceof Error ? error.message : String(error),
+			});
 		}
 	};
 
@@ -70,7 +73,9 @@ export function SessionHeader() {
 		<header className="flex h-12 flex-none items-center gap-2 border-b border-border px-4">
 			<div className="flex min-w-0 flex-1 items-center gap-1.5 text-[13px]">
 				<Folder className="size-3.5 shrink-0 text-ink-3" />
-				<span className="max-w-40 truncate text-ink-3">{workspace?.displayName ?? tt("header.noWorkspace")}</span>
+				<span className="max-w-40 truncate text-ink-3">
+					{workspace?.displayName ?? tt("header.noWorkspace")}
+				</span>
 				{currentSession && (
 					<>
 						<ChevronRight className="size-3.5 shrink-0 text-ink-3" />
@@ -168,7 +173,12 @@ export function SessionHeader() {
 					</Tooltip>
 					<Tooltip>
 						<TooltipTrigger asChild>
-							<Button variant="ghost" size="icon" aria-label={tt("header.exportHtml")} onClick={() => void exportHtml()}>
+							<Button
+								variant="ghost"
+								size="icon"
+								aria-label={tt("header.exportHtml")}
+								onClick={() => void exportHtml()}
+							>
 								<Download className="size-4" />
 							</Button>
 						</TooltipTrigger>

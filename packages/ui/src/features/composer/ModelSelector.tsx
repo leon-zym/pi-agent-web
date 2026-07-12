@@ -51,7 +51,9 @@ export function ModelSelector() {
 			setOpen(false);
 			setPage("root");
 		} catch (error) {
-			toast.error(tt("model.switchFailed"), { description: error instanceof Error ? error.message : String(error) });
+			toast.error(tt("model.switchFailed"), {
+				description: error instanceof Error ? error.message : String(error),
+			});
 		}
 	};
 

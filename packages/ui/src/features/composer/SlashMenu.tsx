@@ -1,11 +1,11 @@
 import { Blocks, CornerDownLeft, MessageSquareText, Sparkles } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import { tt } from "../../lib/i18n";
 import { runSlashCommand } from "../../lib/session-controller";
 import { cn } from "../../lib/utils";
 import { useComposerStore } from "../../stores/composer";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { useSlashCommandsStore } from "../../stores/slash-commands";
-import { tt } from "../../lib/i18n";
 import type { RpcSlashCommand } from "../../types/pi-types";
 
 interface SlashMenuProps {
@@ -67,7 +67,7 @@ export function SlashMenu({ anchorRef, onExecute }: SlashMenuProps) {
 		const item = groups[highlight];
 		if (!item) return;
 		const wsId = useSessionDirectoryStore.getState().currentWorkspaceId;
-		if (wsId) void runSlashCommand(wsId, "/" + item.command.name);
+		if (wsId) void runSlashCommand(wsId, `/${item.command.name}`);
 	};
 
 	useEffect(() => {
@@ -119,7 +119,7 @@ export function SlashMenu({ anchorRef, onExecute }: SlashMenuProps) {
 							const selected = index === highlight;
 							return (
 								<div
-									key={command.source + ":" + command.name}
+									key={`${command.source}:${command.name}`}
 									role="option"
 									aria-selected={selected}
 									tabIndex={-1}

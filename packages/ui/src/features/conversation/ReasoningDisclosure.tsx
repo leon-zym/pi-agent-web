@@ -1,9 +1,9 @@
 import { Brain, ChevronRight } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { firstLine, lastLine } from "../../lib/format";
+import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import { useViewStore } from "../../stores/view";
-import { tt } from "../../lib/i18n";
 
 export interface ReasoningDisclosureProps {
 	text: string;
@@ -67,7 +67,9 @@ export function ReasoningDisclosure({ text, status, isTail, defaultOpen }: Reaso
 				>
 					{summary || (status === "streaming" ? tt("status.thinking") : tt("status.thought"))}
 				</span>
-				<span className="pr-1 text-[11px] text-ink-3/70">{status === "streaming" ? tt("status.inProgress") : ""}</span>
+				<span className="pr-1 text-[11px] text-ink-3/70">
+					{status === "streaming" ? tt("status.inProgress") : ""}
+				</span>
 			</button>
 			{expanded && (
 				<div className="mt-1.5 ml-[22px] border-l border-border pl-3">

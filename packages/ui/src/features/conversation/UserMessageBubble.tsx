@@ -5,12 +5,6 @@ import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import type { UiUserMessage } from "../../types/view-models";
 
-const SOURCE_LABEL: Record<UiUserMessage["source"], string> = {
-	prompt: "",
-	steer: "status.steer",
-	follow_up: "status.followUp",
-};
-
 /**
  * Right-aligned light-blue bubble (DESIGN.md): max 525px, 22px radius,
  * queued injections carry a 插队/排队 badge.
@@ -35,8 +29,8 @@ export function UserMessageBubble({ message }: { message: UiUserMessage }) {
 				)}
 				{message.images?.map((image, index) => (
 					<img
-						key={index}
-						src={"data:" + image.mimeType + ";base64," + image.data}
+						key={`${image.mimeType}:${index}`}
+						src={`data:${image.mimeType};base64,${image.data}`}
 						alt={tt("composer.attachmentImage", { n: index + 1 })}
 						className="mt-2 max-h-64 rounded-md"
 					/>
@@ -55,7 +49,7 @@ export function UserMessageBubble({ message }: { message: UiUserMessage }) {
 			{!message.delivered && <span className="text-xs text-ink-3">{tt("status.waitingInjection")}</span>}
 			{message.source !== "prompt" && (
 				<Badge variant={message.source === "steer" ? "primary" : "default"}>
-					{SOURCE_LABEL[message.source]}
+					{message.source === "steer" ? tt("status.steer") : tt("status.followUp")}
 				</Badge>
 			)}
 		</div>

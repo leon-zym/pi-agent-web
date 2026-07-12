@@ -2,9 +2,9 @@ import { Check, CircleAlert, Copy, GitFork, OctagonX } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 import { formatCost, formatDuration, formatTokens } from "../../lib/format";
+import { tt } from "../../lib/i18n";
 import { forkFromEntry } from "../../lib/session-controller";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
-import { tt } from "../../lib/i18n";
 import type { ProductTurn } from "../../types/view-models";
 
 /**
@@ -46,7 +46,9 @@ export function TurnTail({ turn }: { turn: ProductTurn }) {
 			}
 			await forkFromEntry(last.entryId);
 		} catch (error) {
-			toast.error(tt("tail.forkFailed"), { description: error instanceof Error ? error.message : String(error) });
+			toast.error(tt("tail.forkFailed"), {
+				description: error instanceof Error ? error.message : String(error),
+			});
 		}
 	};
 
@@ -64,14 +66,14 @@ export function TurnTail({ turn }: { turn: ProductTurn }) {
 			{turn.status === "aborted" && (
 				<span className="inline-flex items-center gap-1 text-ink-3">
 					<OctagonX className="size-3.5" />
-				{tt("common.stopped")}
-									</span>
+					{tt("common.stopped")}
+				</span>
 			)}
 			{turn.status === "settled" && (
 				<span className="inline-flex items-center gap-1 text-success">
 					<Check className="size-3.5" />
-				{tt("common.done")}
-									</span>
+					{tt("common.done")}
+				</span>
 			)}
 			<span className="font-mono tabular-nums">
 				{turn.timing?.durationMs !== undefined ? formatDuration(turn.timing.durationMs) : ""}

@@ -1,10 +1,10 @@
 import { ArrowDown } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import { useProjectionStore } from "../../stores/projection";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { EmptyHero } from "./EmptyHero";
-import { tt } from "../../lib/i18n";
 import { StatusRowView } from "./StatusRowView";
 import { TurnView } from "./TurnView";
 

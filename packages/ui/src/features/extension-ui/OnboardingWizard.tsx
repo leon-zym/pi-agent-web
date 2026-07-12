@@ -12,8 +12,8 @@ import {
 } from "../../components/ui/dialog";
 import { Input } from "../../components/ui/input";
 import { Label } from "../../components/ui/label";
-import { tt } from "../../lib/i18n";
 import { api } from "../../lib/api";
+import { tt } from "../../lib/i18n";
 
 /**
  * Zero-config onboarding: when no provider has a
@@ -54,7 +54,9 @@ export function OnboardingWizard() {
 			setKey("");
 			setOpen(false);
 		} catch (error) {
-			toast.error(tt("onboarding.saveFailed"), { description: error instanceof Error ? error.message : String(error) });
+			toast.error(tt("onboarding.saveFailed"), {
+				description: error instanceof Error ? error.message : String(error),
+			});
 		} finally {
 			setSaving(false);
 		}
@@ -73,9 +75,7 @@ export function OnboardingWizard() {
 						<KeyRound className="size-5" />
 					</div>
 					<DialogTitle>{tt("onboarding.title")}</DialogTitle>
-					<DialogDescription>
-						{tt("onboarding.description")}
-					</DialogDescription>
+					<DialogDescription>{tt("onboarding.description")}</DialogDescription>
 				</DialogHeader>
 				<div className="flex flex-col gap-3">
 					<div className="flex flex-col gap-1.5">
@@ -102,9 +102,7 @@ export function OnboardingWizard() {
 							}}
 						/>
 					</div>
-					<p className="text-[12px] leading-relaxed text-ink-3">
-						{tt("onboarding.securityNote")}
-					</p>
+					<p className="text-[12px] leading-relaxed text-ink-3">{tt("onboarding.securityNote")}</p>
 				</div>
 				<DialogFooter>
 					<Button onClick={() => void save()} disabled={!provider.trim() || !key.trim() || saving}>

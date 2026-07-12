@@ -1,7 +1,7 @@
 import type { RpcCommand, RpcExtensionUIResponse, RpcResponse } from "@earendil-works/pi-coding-agent";
 import type { WsClientMessage, WsServerMessage } from "@pi-agent-web/server/wire";
-import { tt } from "../lib/i18n";
 import { create } from "zustand";
+import { tt } from "../lib/i18n";
 
 export type WsState = "connecting" | "online" | "offline";
 
@@ -71,12 +71,12 @@ export function emitServerFrame(message: WsServerMessage): void {
 
 export function nextCommandId(prefix: string): string {
 	commandCounter += 1;
-	return "ui-" + prefix + "-" + String(commandCounter) + "-" + Math.random().toString(36).slice(2, 6);
+	return `ui-${prefix}-${String(commandCounter)}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
 function wsUrl(): string {
 	const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-	return protocol + "//" + location.host + "/api/v1/ws";
+	return `${protocol}//${location.host}/api/v1/ws`;
 }
 
 function scheduleReconnect(): void {

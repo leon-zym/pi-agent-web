@@ -8,7 +8,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 		...init,
 	});
 	if (!response.ok) {
-		let message = "HTTP " + response.status;
+		let message = `HTTP ${response.status}`;
 		try {
 			const body = (await response.json()) as { error?: string };
 			if (body?.error) message = body.error;

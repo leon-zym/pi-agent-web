@@ -57,11 +57,7 @@ function useSelectedToolBlock() {
 function InspectorView() {
 	const selected = useSelectedToolBlock();
 	if (!selected) {
-		return (
-			<p className="px-4 py-8 text-center text-[13px] text-ink-3">
-				{tt("details.inspectorEmpty")}
-			</p>
-		);
+		return <p className="px-4 py-8 text-center text-[13px] text-ink-3">{tt("details.inspectorEmpty")}</p>;
 	}
 	const block = selected.block;
 	if (block.type !== "tool_call") return null;
@@ -104,13 +100,17 @@ function InspectorView() {
 			</div>
 			<div className="scroll-slim min-h-0 flex-1 overflow-y-auto">
 				<div className="px-4 py-3">
-					<p className="mb-1.5 text-[11px] font-medium tracking-wide text-ink-3 uppercase">{tt("details.args")}</p>
+					<p className="mb-1.5 text-[11px] font-medium tracking-wide text-ink-3 uppercase">
+						{tt("details.args")}
+					</p>
 					<pre className="scroll-slim max-h-64 overflow-y-auto rounded-md bg-surface-2 p-3 font-mono text-xs leading-[18px] whitespace-pre-wrap break-all text-ink-2">
 						{block.argsText || JSON.stringify(block.args ?? {}, null, 2)}
 					</pre>
 				</div>
 				<div className="px-4 py-3">
-					<p className="mb-1.5 text-[11px] font-medium tracking-wide text-ink-3 uppercase">{tt("details.output")}</p>
+					<p className="mb-1.5 text-[11px] font-medium tracking-wide text-ink-3 uppercase">
+						{tt("details.output")}
+					</p>
 					<pre className="scroll-slim max-h-[420px] overflow-y-auto rounded-md bg-surface-2 p-3 font-mono text-xs leading-[18px] whitespace-pre-wrap break-all text-ink-2">
 						{resultText || tt("common.noOutput")}
 					</pre>
@@ -386,7 +386,7 @@ export function DetailsPanel({ open, onToggle }: { open: boolean; onToggle: () =
 						)}
 					>
 						<Icon className="size-3.5" />
-						{label}
+						{tt(label as never)}
 					</button>
 				))}
 				<div className="flex-1" />

@@ -1,8 +1,8 @@
+import { tt } from "../../lib/i18n";
 import type { ProductTurn } from "../../types/view-models";
 import { AssistantStepView } from "./AssistantStepView";
 import { TurnTail } from "./TurnTail";
 import { UserMessageBubble } from "./UserMessageBubble";
-import { tt } from "../../lib/i18n";
 
 /**
  * One product turn: queued/injected user messages, assistant steps, and a

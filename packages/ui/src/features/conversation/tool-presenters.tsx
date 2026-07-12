@@ -55,7 +55,7 @@ const editPresenter: ToolPresenter = {
 	summarize: (ctx) => {
 		const path = argString(ctx.block.args, ["file_path", "path"]);
 		const description = argString(ctx.block.args, ["description"]);
-		return path ? (description ? path + " · " + description : path) : "edit";
+		return path ? (description ? `${path} · ${description}` : path) : "edit";
 	},
 };
 

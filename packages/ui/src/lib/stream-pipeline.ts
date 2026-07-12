@@ -1,6 +1,5 @@
 import type { WsServerMessage } from "@pi-agent-web/server/wire";
 import { expectData } from "@pi-agent-web/server/wire";
-import { tt } from "./i18n";
 import { toast } from "sonner";
 import { useComposerStore } from "../stores/composer";
 import { useExtensionUiStore } from "../stores/extension-ui";
@@ -10,6 +9,7 @@ import { useSessionDirectoryStore } from "../stores/session-directory";
 import { useSessionStatsStore } from "../stores/session-stats";
 import { useSlashCommandsStore } from "../stores/slash-commands";
 import { emitServerFrame, serverFrameBus, useTransportStore } from "../stores/transport";
+import { tt } from "./i18n";
 
 let initialized = false;
 
@@ -76,7 +76,7 @@ function routeEvent(message: Extract<WsServerMessage, { type: "event" }>): void 
 			});
 			break;
 		case "extension_error":
-			toast.error(tt("ext.error"), { description: event.event + ": " + event.error });
+			toast.error(tt("ext.error"), { description: `${event.event}: ${event.error}` });
 			return;
 		case "bash_execution_update":
 			// Consumed by the transport store (bash console); nothing else.
@@ -111,7 +111,7 @@ function routeExtensionUiRequest(message: Extract<WsServerMessage, { type: "exte
 			extensionUi.applyWidget(request.widgetKey, request.widgetLines, request.widgetPlacement);
 			return;
 		case "setTitle":
-			document.title = request.title + " · Pi Agent Web";
+			document.title = `${request.title} · Pi Agent Web`;
 			return;
 		case "set_editor_text":
 			useComposerStore.getState().setDraft(request.text);

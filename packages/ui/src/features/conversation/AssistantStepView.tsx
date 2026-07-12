@@ -1,9 +1,9 @@
+import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import type { AssistantStep, ContentBlock } from "../../types/view-models";
 import { MarkdownBlock } from "./MarkdownBlock";
 import { ReasoningDisclosure } from "./ReasoningDisclosure";
 import { ToolCallRow } from "./ToolCallRow";
-import { tt } from "../../lib/i18n";
 
 function BlockView({
 	block,

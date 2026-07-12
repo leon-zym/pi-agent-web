@@ -1,6 +1,6 @@
 import { Bot } from "lucide-react";
-import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { tt } from "../../lib/i18n";
+import { useSessionDirectoryStore } from "../../stores/session-directory";
 
 /** Quiet empty state: no marketing hero, just orientation (DESIGN.md). */
 export function EmptyHero() {
@@ -13,7 +13,11 @@ export function EmptyHero() {
 				<Bot className="size-6" />
 			</div>
 			<p className="text-base font-medium text-ink">
-				{!hasWorkspace ? tt("hero.pickWorkspace") : !hasSession ? tt("hero.pickSession") : tt("hero.firstTurn")}
+				{!hasWorkspace
+					? tt("hero.pickWorkspace")
+					: !hasSession
+						? tt("hero.pickSession")
+						: tt("hero.firstTurn")}
 			</p>
 			<p className="max-w-sm text-[13px] leading-relaxed text-ink-3">
 				{tt("hero.hint1")}

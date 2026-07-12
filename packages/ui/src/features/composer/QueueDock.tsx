@@ -1,8 +1,8 @@
 import { ArrowUpRight, ListEnd } from "lucide-react";
 import { useMemo } from "react";
 import { Badge } from "../../components/ui/badge";
-import { useComposerStore } from "../../stores/composer";
 import { tt } from "../../lib/i18n";
+import { useComposerStore } from "../../stores/composer";
 
 /**
  * Queue dock above the composer: mirrors queue_update.
@@ -25,9 +25,9 @@ export function QueueDock() {
 
 	return (
 		<div className="mb-2 flex flex-col gap-1">
-			{visible.map((entry, index) => (
+			{visible.map((entry, _index) => (
 				<div
-					key={entry.kind + ":" + index}
+					key={`${entry.kind}:${entry.text}`}
 					className="flex items-center gap-1.5 rounded-sm border border-border bg-surface-2 px-2.5 py-1.5 text-[13px] text-ink-2"
 				>
 					{entry.kind === "steer" ? (
@@ -42,7 +42,9 @@ export function QueueDock() {
 				</div>
 			))}
 			{entries.length > 2 && (
-				<div className="px-2.5 text-[11px] text-ink-3">{tt("composer.queueCount", { count: entries.length - 2 })}</div>
+				<div className="px-2.5 text-[11px] text-ink-3">
+					{tt("composer.queueCount", { count: entries.length - 2 })}
+				</div>
 			)}
 		</div>
 	);
