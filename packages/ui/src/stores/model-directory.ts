@@ -1,4 +1,4 @@
-import { expectData } from "@pi-agent-web/server/wire";
+import { expectData } from "@pi-agent-web/protocol";
 import { create } from "zustand";
 import type { ModelLite, ThinkingLevel } from "../types/pi-types";
 import { useTransportStore } from "./transport";

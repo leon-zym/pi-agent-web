@@ -1,11 +1,11 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { expectData } from "@pi-agent-web/protocol";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getSessionDirForCwd } from "../src/config";
 import { PiProcess } from "../src/pi-process";
 import { resolvePiRuntime } from "../src/resolver";
-import { expectData } from "../src/wire";
 
 /**
  * Milestone 1 acceptance against the real pi runtime (installed on this

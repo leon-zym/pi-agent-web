@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
+import type { AuthStatusEntry } from "@pi-agent-web/protocol";
 import lockfile from "proper-lockfile";
-import type { AuthStatusEntry } from "./wire.js";
 
 /**
  * auth.json read/write (see docs/protocol.md for the storage layout).

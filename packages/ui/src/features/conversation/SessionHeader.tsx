@@ -1,4 +1,4 @@
-import { expectData } from "@pi-agent-web/server/wire";
+import { expectData } from "@pi-agent-web/protocol";
 import { Check, ChevronRight, Download, Folder, GitBranch, Pencil, Trash2, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import { toast } from "sonner";

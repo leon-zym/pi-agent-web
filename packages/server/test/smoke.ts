@@ -1,66 +1,78 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { startServer } from "../src/main";
+import { startServer } from "../src/main.js";
 
-const tmpData = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-smoke-"));
-const handle = await startServer({
-	config: { port: 3999, webDataDir: tmpData },
-});
+const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-smoke-"));
+const workspacePath = path.join(tempRoot, "workspace");
+const agentDir = path.join(tempRoot, "agent");
+const sessionRootDir = path.join(tempRoot, "sessions");
+const webDataDir = path.join(tempRoot, "web-data");
+const fakePiPath = path.join(import.meta.dirname, "fixtures", "fake-pi.mjs");
+fs.mkdirSync(workspacePath, { recursive: true });
+
+let handle: Awaited<ReturnType<typeof startServer>> | undefined;
 
 try {
-	const base = "http://127.0.0.1:3999";
-	const wsResp = (await (
-		await fetch(`${base}/api/v1/workspaces`, {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ path: "/Users/leonzhang/Code/pi-agent-web" }),
-		})
-	).json()) as { id: string };
-	console.log("workspace registered:", wsResp.id);
-
-	const WebSocket = (await import("ws")).default;
-	const ws = new WebSocket("ws://127.0.0.1:3999/api/v1/ws");
+	const started = await startServer({
+		config: { port: 0, host: "127.0.0.1", agentDir, sessionRootDir, webDataDir },
+		piPath: fakePiPath,
+	});
+	handle = started;
 	await new Promise<void>((resolve, reject) => {
-		ws.on("open", () => resolve());
-		ws.on("error", reject);
+		started.server.once("listening", resolve);
+		started.server.once("error", reject);
 	});
-	console.log("ws open");
+	const address = started.server.address();
+	if (!address || typeof address === "string") throw new Error("server did not expose a TCP address");
+	const base = `http://127.0.0.1:${String(address.port)}`;
 
-	const frames: any[] = [];
-	ws.on("message", (raw) => {
-		const frame = JSON.parse(raw.toString());
-		console.log("FRAME:", JSON.stringify(frame).slice(0, 200));
-		frames.push(frame);
+	const health = await fetch(`${base}/api/v1/health`);
+	if (!health.ok) throw new Error(`health check failed: ${String(health.status)}`);
+
+	const workspaceResponse = await fetch(`${base}/api/v1/workspaces`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ path: workspacePath }),
 	});
+	if (!workspaceResponse.ok)
+		throw new Error(`workspace registration failed: ${String(workspaceResponse.status)}`);
+	const workspace = (await workspaceResponse.json()) as { id: string };
 
-	ws.send(
-		JSON.stringify({
-			type: "command",
-			workspaceId: wsResp.id,
-			command: { id: "smoke-1", type: "get_state" },
-		}),
-	);
-	console.log("sent get_state");
-
-	const deadline = Date.now() + 30000;
-	let state: any;
-	while (Date.now() < deadline && !state) {
-		const resp = frames.find((f) => f.type === "response" && f.response?.id === "smoke-1");
-		if (resp) state = resp.response;
-		if (!state) await new Promise((r) => setTimeout(r, 100));
-	}
-	console.log(
-		"state:",
-		JSON.stringify(state?.data ? { success: state.success, sessionId: state.data.sessionId } : state),
-	);
-
+	const WebSocketCtor = (await import("ws")).default;
+	const ws = new WebSocketCtor(`ws://127.0.0.1:${String(address.port)}/api/v1/ws`);
+	const state = await new Promise<{ sessionId: string }>((resolve, reject) => {
+		const timeout = setTimeout(() => reject(new Error("get_state timed out")), 10_000);
+		ws.once("open", () => {
+			ws.send(
+				JSON.stringify({
+					type: "command",
+					workspaceId: workspace.id,
+					command: { id: "smoke-state", type: "get_state" },
+				}),
+			);
+		});
+		ws.on("message", (raw) => {
+			const frame = JSON.parse(raw.toString()) as {
+				type?: string;
+				response?: { id?: string; success?: boolean; data?: { sessionId?: string } };
+			};
+			if (frame.type !== "response" || frame.response?.id !== "smoke-state") return;
+			clearTimeout(timeout);
+			if (frame.response.success !== true || typeof frame.response.data?.sessionId !== "string") {
+				reject(new Error("get_state returned an invalid response"));
+				return;
+			}
+			resolve({ sessionId: frame.response.data.sessionId });
+		});
+		ws.once("error", reject);
+	});
 	ws.close();
-	console.log("SMOKE OK");
+	console.log(`SMOKE OK: workspace ${workspace.id}, session ${state.sessionId}`);
 } catch (error) {
+	process.exitCode = 1;
 	console.error("SMOKE ERROR:", error);
 } finally {
-	await handle.close();
-	fs.rmSync(tmpData, { recursive: true, force: true });
-	process.exit(0);
+	await handle?.close();
+	fs.rmSync(tempRoot, { recursive: true, force: true });
 }

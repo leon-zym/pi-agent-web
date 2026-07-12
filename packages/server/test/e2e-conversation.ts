@@ -1,164 +1,144 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { startServer } from "../src/main.js";
 
-/**
- * Full-stack conversation smoke: gateway -> supervisor -> real pi process ->
- * real model (deepseek), driven over the WebSocket wire like the UI does.
- */
-const handle = await startServer({ config: { port: 3001 } });
-const base = "http://127.0.0.1:3001";
+if (process.env.PI_WEB_RUN_E2E !== "1") {
+	console.log("E2E skipped: set PI_WEB_RUN_E2E=1 to run against a configured real Pi provider.");
+} else {
+	const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-e2e-"));
+	const workspacePath = path.join(tempRoot, "workspace");
+	const sessionRootDir = path.join(tempRoot, "sessions");
+	const webDataDir = path.join(tempRoot, "web-data");
+	fs.mkdirSync(workspacePath, { recursive: true });
+	let handle: Awaited<ReturnType<typeof startServer>> | undefined;
 
-try {
-	const wsResp = (await (
-		await fetch(base + "/api/v1/workspaces", {
+	try {
+		const started = await startServer({
+			config: { port: 0, host: "127.0.0.1", sessionRootDir, webDataDir },
+		});
+		handle = started;
+		await new Promise<void>((resolve, reject) => {
+			started.server.once("listening", resolve);
+			started.server.once("error", reject);
+		});
+		const address = started.server.address();
+		if (!address || typeof address === "string") throw new Error("server did not expose a TCP address");
+		const base = `http://127.0.0.1:${String(address.port)}`;
+
+		const workspaceResponse = await fetch(`${base}/api/v1/workspaces`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ path: "/Users/leonzhang/Code/pi-agent-web" }),
-		})
-	).json()) as { id: string };
-	const workspaceId = wsResp.id;
-	console.log("workspace:", workspaceId);
-
-	const WebSocketCtor = (await import("ws")).default;
-	const ws = new WebSocketCtor("ws://127.0.0.1:3001/api/v1/ws");
-	await new Promise<void>((resolve, reject) => {
-		ws.on("open", () => resolve());
-		ws.on("error", reject);
-	});
-
-	const pending = new Map<
-		string,
-		{ resolve: (r: { success?: boolean; error?: string; data?: unknown }) => void }
-	>();
-	const events: Array<{ type: string; extra?: string }> = [];
-	ws.on("message", (raw) => {
-		const frame = JSON.parse(raw.toString()) as {
-			type: string;
-			response?: { id?: string; success?: boolean; error?: string; data?: unknown };
-			event?: { type: string };
-			process_status?: { state: string };
-		};
-		if (frame.type === "response" && frame.response?.id) {
-			pending.get(frame.response.id)?.resolve(frame.response);
-			pending.delete(frame.response.id);
-		} else if (frame.type === "event" && frame.event) {
-			const event = frame.event as { type: string; assistantMessageEvent?: { type: string } };
-			events.push({
-				type: event.type,
-				extra: event.type === "message_update" ? event.assistantMessageEvent?.type : undefined,
-			});
-			console.log("EVENT:", event.type, event.assistantMessageEvent?.type ?? "");
-		} else if (frame.type === "process_status") {
-			console.log("process_status:", frame.process_status?.state);
-		}
-	});
-
-	let seq = 0;
-	const command = (payload: Record<string, unknown>) => {
-		seq += 1;
-		const id = "e2e-" + String(seq);
-		const response = new Promise<{ success?: boolean; error?: string; data?: unknown }>((resolve) => {
-			pending.set(id, { resolve });
+			body: JSON.stringify({ path: workspacePath }),
 		});
-		ws.send(JSON.stringify({ type: "command", workspaceId, command: { id, ...payload } }));
-		return response;
-	};
+		if (!workspaceResponse.ok) {
+			throw new Error(`workspace registration failed: ${String(workspaceResponse.status)}`);
+		}
+		const workspace = (await workspaceResponse.json()) as { id: string };
 
-	const expectOk = async (
-		label: string,
-		response: Promise<{ success?: boolean; error?: string; data?: unknown }>,
-	) => {
-		const r = await response;
-		if (r.success === false) throw new Error(label + " failed: " + r.error);
-		console.log(label + " ok");
-		return r;
-	};
+		const WebSocketCtor = (await import("ws")).default;
+		const ws = new WebSocketCtor(`ws://127.0.0.1:${String(address.port)}/api/v1/ws`);
+		await new Promise<void>((resolve, reject) => {
+			ws.on("open", resolve);
+			ws.on("error", reject);
+		});
 
-	// 1. New session
-	await expectOk("new_session", command({ type: "new_session" }));
-	const state1 = await expectOk("get_state", command({ type: "get_state" }));
-	const sessionId = (state1.data as { sessionId: string }).sessionId;
-	console.log("sessionId:", sessionId);
-	// Declare the listen scope so the gateway delivers this session's events.
-	ws.send(JSON.stringify({ type: "session_listen", workspaceId, sessionId }));
-
-	// 2. Pick a fast cheap model, thinking off
-	await expectOk(
-		"set_model",
-		command({ type: "set_model", provider: "deepseek", modelId: "deepseek-v4-flash" }),
-	);
-	await expectOk("set_thinking_level", command({ type: "set_thinking_level", level: "off" }));
-
-	// 3. Real prompt round trip
-	const settled = new Promise<void>((resolve) => {
-		const timer = setInterval(() => {
-			if (events.some((e) => e.type === "agent_settled")) {
-				clearInterval(timer);
-				resolve();
+		const pending = new Map<
+			string,
+			(response: { success?: boolean; error?: string; data?: unknown }) => void
+		>();
+		const events: Array<{ type: string; extra?: string }> = [];
+		ws.on("message", (raw) => {
+			const frame = JSON.parse(raw.toString()) as {
+				type: string;
+				response?: { id?: string; success?: boolean; error?: string; data?: unknown };
+				event?: { type: string; assistantMessageEvent?: { type: string } };
+			};
+			if (frame.type === "response" && frame.response?.id) {
+				pending.get(frame.response.id)?.(frame.response);
+				pending.delete(frame.response.id);
+			} else if (frame.type === "event" && frame.event) {
+				events.push({
+					type: frame.event.type,
+					extra: frame.event.type === "message_update" ? frame.event.assistantMessageEvent?.type : undefined,
+				});
 			}
-		}, 50);
-	});
-	await expectOk("prompt", command({ type: "prompt", message: "用一句话回复：你好，世界" }));
-	await Promise.race([
-		settled,
-		new Promise((_, reject) => setTimeout(() => reject(new Error("prompt timeout")), 120_000)),
-	]);
+		});
 
-	const kinds = new Set(events.map((e) => e.type));
-	console.log("event types seen:", [...kinds].join(", "));
-	const updates = events.filter((e) => e.type === "message_update").length;
-	console.log("message_update count:", updates);
-	const assistantEnd = events.filter((e) => e.type === "message_end").length;
-	console.log("message_end count:", assistantEnd);
+		let sequence = 0;
+		const command = (payload: Record<string, unknown>) => {
+			sequence += 1;
+			const id = `e2e-${String(sequence)}`;
+			const response = new Promise<{ success?: boolean; error?: string; data?: unknown }>((resolve) => {
+				pending.set(id, resolve);
+			});
+			ws.send(JSON.stringify({ type: "command", workspaceId: workspace.id, command: { id, ...payload } }));
+			return response;
+		};
+		const expectOk = async (
+			label: string,
+			response: Promise<{ success?: boolean; error?: string; data?: unknown }>,
+		) => {
+			const result = await response;
+			if (result.success === false) throw new Error(`${label} failed: ${result.error}`);
+			console.log(`${label} ok`);
+			return result;
+		};
 
-	const messages = await expectOk("get_messages", command({ type: "get_messages" }));
-	const list = (messages.data as { messages: Array<{ role: string }> }).messages;
-	console.log("messages roles:", list.map((m) => m.role).join(" -> "));
-	const assistant = list.findLast((m) => m.role === "assistant") as unknown as
-		| { content: Array<{ type: string; text?: string }> }
-		| undefined;
-	const blocks: Array<{ type: string; text?: string }> = assistant?.content ?? [];
-	const text = blocks
-		.filter((b) => b.type === "text")
-		.map((b) => b.text ?? "")
-		.join("");
-	console.log("assistant text:", JSON.stringify(text.slice(0, 120)));
+		await expectOk("new_session", command({ type: "new_session" }));
+		const state = await expectOk("get_state", command({ type: "get_state" }));
+		const sessionId = (state.data as { sessionId: string }).sessionId;
+		ws.send(JSON.stringify({ type: "session_listen", workspaceId: workspace.id, sessionId }));
 
-	// 4. Abort semantics: start a second prompt and abort it quickly.
-	const aborted = new Promise<void>((resolve) => {
-		const timer = setInterval(() => {
-			if (events.some((e) => e.type === "agent_settled")) {
-				clearInterval(timer);
-				resolve();
+		await expectOk(
+			"set_model",
+			command({ type: "set_model", provider: "deepseek", modelId: "deepseek-v4-flash" }),
+		);
+		await expectOk("set_thinking_level", command({ type: "set_thinking_level", level: "off" }));
+
+		const waitForSettled = async (label: string, timeoutMs: number) => {
+			const deadline = Date.now() + timeoutMs;
+			while (!events.some((event) => event.type === "agent_settled")) {
+				if (Date.now() >= deadline) throw new Error(`${label} timeout`);
+				await new Promise((resolve) => setTimeout(resolve, 50));
 			}
-		}, 50);
-	});
-	await expectOk(
-		"prompt2",
-		command({ type: "prompt", message: "请写一篇 2000 字的文章，主题是 Rust 异步编程，先写大纲" }),
-	);
-	await new Promise((r) => setTimeout(r, 1500));
-	await expectOk("abort", command({ type: "abort" }));
-	await Promise.race([
-		aborted,
-		new Promise((_, reject) => setTimeout(() => reject(new Error("abort timeout")), 60_000)),
-	]);
-	console.log("abort settled ok");
+		};
 
-	// 5. Commands + tree + stats
-	const commands = await expectOk("get_commands", command({ type: "get_commands" }));
-	const commandCount = (commands.data as { commands: unknown[] }).commands.length;
-	console.log("slash commands:", commandCount);
-	const tree = await expectOk("get_tree", command({ type: "get_tree" }));
-	console.log("tree nodes:", (tree.data as { tree: unknown[] }).tree.length);
-	const stats = await expectOk("get_session_stats", command({ type: "get_session_stats" }));
-	console.log("stats tokens:", (stats.data as { tokens: { total: number } }).tokens.total);
+		await expectOk(
+			"prompt",
+			command({ type: "prompt", message: "用一句话回复：你好，世界", streamingBehavior: "steer" }),
+		);
+		await waitForSettled("prompt", 120_000);
 
-	console.log("E2E CONVERSATION OK");
-	ws.close();
-} catch (error) {
-	console.error("E2E ERROR:", error);
-	process.exitCode = 1;
-} finally {
-	await handle.close();
-	process.exit(0);
+		const messages = await expectOk("get_messages", command({ type: "get_messages" }));
+		const list = (messages.data as { messages: Array<{ role: string }> }).messages;
+		if (!list.some((message) => message.role === "assistant")) {
+			throw new Error("prompt did not yield an assistant message");
+		}
+
+		events.length = 0;
+		await expectOk(
+			"prompt2",
+			command({
+				type: "prompt",
+				message: "请写一篇 2000 字的文章，主题是 Rust 异步编程，先写大纲",
+				streamingBehavior: "steer",
+			}),
+		);
+		await new Promise((resolve) => setTimeout(resolve, 1500));
+		await expectOk("abort", command({ type: "abort" }));
+		await waitForSettled("abort", 90_000);
+
+		await expectOk("get_commands", command({ type: "get_commands" }));
+		await expectOk("get_tree", command({ type: "get_tree" }));
+		await expectOk("get_session_stats", command({ type: "get_session_stats" }));
+		ws.close();
+		console.log("E2E CONVERSATION OK");
+	} catch (error) {
+		process.exitCode = 1;
+		console.error("E2E ERROR:", error);
+	} finally {
+		await handle?.close();
+		fs.rmSync(tempRoot, { recursive: true, force: true });
+	}
 }

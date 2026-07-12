@@ -33,7 +33,7 @@ export function TurnTail({ turn }: { turn: ProductTurn }) {
 		const workspaceId = useSessionDirectoryStore.getState().currentWorkspaceId;
 		if (!workspaceId) return;
 		try {
-			const { expectData } = await import("@pi-agent-web/server/wire");
+			const { expectData } = await import("@pi-agent-web/protocol");
 			const { useTransportStore } = await import("../../stores/transport");
 			const response = await useTransportStore
 				.getState()

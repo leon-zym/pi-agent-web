@@ -1,5 +1,5 @@
 import type { RpcCommand, RpcExtensionUIResponse, RpcResponse } from "@earendil-works/pi-coding-agent";
-import type { WsClientMessage, WsServerMessage } from "@pi-agent-web/server/wire";
+import type { WsClientMessage, WsServerMessage } from "@pi-agent-web/protocol";
 import { create } from "zustand";
 import { tt } from "../lib/i18n";
 

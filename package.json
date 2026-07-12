@@ -1,21 +1,24 @@
 {
-  "name": "pi-agent-web",
-  "version": "0.1.0",
-  "private": true,
-  "description": "Pi Coding Agent RPC 模式的现代 Web 工作台（Headless Agent Web UI + Supervisor Gateway）",
-  "type": "module",
-  "engines": {
-    "node": ">=22"
-  },
-  "scripts": {
-    "dev": "pnpm --parallel --filter @pi-agent-web/server --filter @pi-agent-web/ui dev",
-    "dev:ui": "pnpm --filter @pi-agent-web/ui dev",
-    "dev:server": "pnpm --filter @pi-agent-web/server dev",
-    "build": "pnpm -r build",
-    "test": "pnpm -r test",
-    "lint": "pnpm -r lint",
-    "typecheck": "pnpm -r typecheck",
-    "start": "pnpm --filter @pi-agent-web/cli start"
-  },
-  "packageManager": "pnpm@11.21.0"
+	"name": "pi-agent-web",
+	"version": "0.1.0",
+	"private": true,
+	"description": "Pi Coding Agent RPC 模式的现代 Web 工作台（Headless Agent Web UI + Supervisor Gateway）",
+	"type": "module",
+	"engines": {
+		"node": ">=22"
+	},
+	"scripts": {
+		"dev": "pnpm --filter @pi-agent-web/protocol build && pnpm --parallel --filter @pi-agent-web/server --filter @pi-agent-web/ui dev",
+		"dev:ui": "pnpm --filter @pi-agent-web/protocol build && pnpm --filter @pi-agent-web/ui dev",
+		"dev:server": "pnpm --filter @pi-agent-web/protocol build && pnpm --filter @pi-agent-web/server dev",
+		"build": "pnpm -r build",
+		"test": "pnpm --filter @pi-agent-web/protocol build && pnpm -r test",
+		"test:smoke": "pnpm --filter @pi-agent-web/server test:smoke",
+		"test:e2e": "pnpm --filter @pi-agent-web/server test:e2e",
+		"lint": "pnpm -r lint",
+		"typecheck": "pnpm --filter @pi-agent-web/protocol build && pnpm -r typecheck",
+		"verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm build",
+		"start": "pnpm --filter @pi-agent-web/cli start"
+	},
+	"packageManager": "pnpm@11.21.0"
 }

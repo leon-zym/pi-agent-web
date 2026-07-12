@@ -1,5 +1,5 @@
 import type { SessionEntry, SessionTreeNode } from "@earendil-works/pi-coding-agent";
-import { expectData } from "@pi-agent-web/server/wire";
+import { expectData } from "@pi-agent-web/protocol";
 import {
 	Bot,
 	Bug,

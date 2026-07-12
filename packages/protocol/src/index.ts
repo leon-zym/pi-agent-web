@@ -1,6 +1,6 @@
 /**
- * WebSocket wire contract and REST DTOs.
- * Types depend only on the public type exports of @earendil-works/pi-coding-agent.
+ * Browser-safe WebSocket and REST DTOs shared by the gateway and UI.
+ * This package deliberately depends only on public Pi protocol type exports.
  */
 import type {
 	JsonAgentSessionEvent,
@@ -24,8 +24,8 @@ export type WsClientMessage =
 // ============================================================================
 
 /**
- * extension_error is emitted directly on stdout by rpc-mode.ts (not through
- * the session event bus), so it is a wire event of its own kind.
+ * extension_error is emitted directly on stdout by rpc-mode.ts, not through
+ * the session event bus, so it is a wire event of its own kind.
  */
 export interface ExtensionErrorEvent {
 	type: "extension_error";
@@ -57,19 +57,19 @@ export interface WorkspaceSummary {
 }
 
 export interface SessionSummary {
-	/** File name (timestamp_uuidv7.jsonl) */
+	/** File name, timestamp_uuidv7.jsonl. */
 	path: string;
-	/** Absolute path */
+	/** Absolute path. */
 	absolutePath: string;
 	id: string;
-	/** Custom name from a session_info entry */
+	/** Custom name from a session_info entry. */
 	name?: string;
 	cwd: string;
 	messageCount: number;
-	/** First user message text snippet (for empty-session placeholder and list subtitle) */
+	/** First user message text snippet, used for empty-session placeholder and list subtitle. */
 	firstMessage?: string;
 	created: string;
-	/** stat.mtime epoch millis (official sort key, not the filename) */
+	/** stat.mtime epoch millis, the official sort key. */
 	modified: number;
 	parentSessionPath?: string;
 }
@@ -84,7 +84,7 @@ export interface AuthStatusEntry {
 // Helpers
 // ============================================================================
 
-/** RPC error response (success:false) */
+/** RPC error response, success:false. */
 export class RpcError extends Error {
 	readonly command: string;
 	constructor(command: string, message: string) {
@@ -94,14 +94,13 @@ export class RpcError extends Error {
 	}
 }
 
-export function isErrorResponse(r: RpcResponse): r is Extract<RpcResponse, { success: false }> {
-	return r.type === "response" && r.success === false;
+export function isErrorResponse(response: RpcResponse): response is Extract<RpcResponse, { success: false }> {
+	return response.type === "response" && response.success === false;
 }
 
 /**
- * Extract data from a success response; throws RpcError on failure.
- * Returns undefined for success responses that carry no data payload
- * (prompt/steer/abort/...). Callers cast to the expected shape.
+ * Extract data from a success response and throw RpcError on a failed response.
+ * Responses without a data payload return undefined.
  */
 export function expectData(response: RpcResponse): unknown {
 	if (response.type !== "response") throw new RpcError("<no-command>", "not a response frame");

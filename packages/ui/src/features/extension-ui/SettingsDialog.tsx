@@ -1,5 +1,5 @@
 import type { RpcSessionState } from "@earendil-works/pi-coding-agent";
-import { expectData } from "@pi-agent-web/server/wire";
+import { expectData } from "@pi-agent-web/protocol";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { Button } from "../../components/ui/button";

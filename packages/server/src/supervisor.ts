@@ -6,11 +6,10 @@ import type {
 	RpcResponse,
 	RpcSessionState,
 } from "@earendil-works/pi-coding-agent";
+import { RpcError, type WsServerMessage } from "@pi-agent-web/protocol";
 import { getSessionDirForCwd, isSessionInDir } from "./config.js";
 import { PiProcess } from "./pi-process.js";
 import type { ResolvedPi } from "./resolver.js";
-import type { WsServerMessage } from "./wire.js";
-import { RpcError } from "./wire.js";
 
 /**
  * Workspace-granularity process supervisor (see docs/architecture.md).

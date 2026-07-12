@@ -1,4 +1,4 @@
-import type { AuthStatusEntry, SessionSummary, WorkspaceSummary } from "@pi-agent-web/server";
+import type { AuthStatusEntry, SessionSummary, WorkspaceSummary } from "@pi-agent-web/protocol";
 
 /** Minimal REST client for the gateway. */
 

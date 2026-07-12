@@ -1,6 +1,5 @@
 import type { RpcResponse } from "@earendil-works/pi-coding-agent";
-import type { SessionSummary } from "@pi-agent-web/server/wire";
-import { expectData } from "@pi-agent-web/server/wire";
+import { expectData, type SessionSummary } from "@pi-agent-web/protocol";
 import { toast } from "sonner";
 import { useComposerStore } from "../stores/composer";
 import { useModelDirectoryStore } from "../stores/model-directory";

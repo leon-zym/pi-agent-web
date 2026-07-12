@@ -7,6 +7,5 @@ export * from "./resolver.js";
 export * from "./routes.js";
 export * from "./session-scan.js";
 export * from "./supervisor.js";
-export * from "./wire.js";
 export * from "./workspace-registry.js";
 export * from "./ws-bridge.js";

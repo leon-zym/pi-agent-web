@@ -1,4 +1,4 @@
-import type { SessionSummary, WorkspaceSummary } from "@pi-agent-web/server";
+import type { SessionSummary, WorkspaceSummary } from "@pi-agent-web/protocol";
 import {
 	Bot,
 	ChevronRight,

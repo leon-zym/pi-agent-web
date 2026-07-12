@@ -1,5 +1,4 @@
-import type { WsServerMessage } from "@pi-agent-web/server/wire";
-import { expectData } from "@pi-agent-web/server/wire";
+import { expectData, type WsServerMessage } from "@pi-agent-web/protocol";
 import { toast } from "sonner";
 import { useComposerStore } from "../stores/composer";
 import { useExtensionUiStore } from "../stores/extension-ui";

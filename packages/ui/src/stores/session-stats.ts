@@ -1,5 +1,5 @@
 import type { SessionStats } from "@earendil-works/pi-coding-agent";
-import { expectData } from "@pi-agent-web/server/wire";
+import { expectData } from "@pi-agent-web/protocol";
 import { create } from "zustand";
 import { useTransportStore } from "./transport";
 

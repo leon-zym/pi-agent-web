@@ -1,8 +1,7 @@
+import { RpcError, type WsClientMessage, type WsServerMessage } from "@pi-agent-web/protocol";
 import type { WebSocket } from "ws";
 import { WebSocketServer } from "ws";
 import type { Supervisor } from "./supervisor.js";
-import type { WsClientMessage, WsServerMessage } from "./wire.js";
-import { RpcError } from "./wire.js";
 
 /**
  * WebSocket <-> JSONL relay (wire contract lives in wire.ts).
