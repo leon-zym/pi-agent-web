@@ -58,6 +58,17 @@ function handleLine(line) {
 				data: { cancelled: false },
 			});
 			return;
+		case "switch_session":
+			sessionFile = command.sessionPath;
+			sessionId = "fake-session-switched";
+			send({
+				type: "response",
+				id: command.id,
+				command: command.type,
+				success: true,
+				data: { cancelled: false },
+			});
+			return;
 		case "get_last_assistant_text":
 			send({ type: "response", command: command.type, success: true, data: { text: "missing id" } });
 			return;

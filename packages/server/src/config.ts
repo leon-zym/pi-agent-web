@@ -86,5 +86,11 @@ export function getSessionDirForCwd(cwd: string, sessionRootDir: string): string
 export function isSessionInDir(sessionPath: string, sessionDir: string): boolean {
 	const resolvedSession = path.resolve(sessionPath);
 	const resolvedDir = path.resolve(sessionDir);
-	return resolvedSession.startsWith(resolvedDir + path.sep) && path.extname(resolvedSession) === ".jsonl";
+	const relative = path.relative(resolvedDir, resolvedSession);
+	return (
+		relative.length > 0 &&
+		!relative.startsWith(`..${path.sep}`) &&
+		relative !== ".." &&
+		path.extname(resolvedSession) === ".jsonl"
+	);
 }

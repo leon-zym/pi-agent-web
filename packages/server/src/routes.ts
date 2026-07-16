@@ -6,7 +6,7 @@ import type { GatewayAccessControl } from "./access-control.js";
 import { readAuthStatus, saveApiKey } from "./auth-storage.js";
 import type { ServerConfig } from "./config.js";
 import { getSessionDirForCwd } from "./config.js";
-import { findChildSessions, scanSessionDir } from "./session-scan.js";
+import { findChildSessions, scanSessionDir, scanSessionFile } from "./session-scan.js";
 import type { Supervisor } from "./supervisor.js";
 import type { WorkspaceRegistry } from "./workspace-registry.js";
 
@@ -62,8 +62,10 @@ export function createApp(ctx: AppContext): Hono {
 		const counts = new Map<string, number>();
 		await Promise.all(
 			records.map(async (ws) => {
-				const sessionDir = getSessionDirForCwd(ws.path, config.sessionRootDir);
-				counts.set(ws.id, (await scanSessionDir(sessionDir)).length);
+				const record = registry.get(ws.id);
+				if (!record) return;
+				const sessionDir = getSessionDirForCwd(record.cwdRealpath, config.sessionRootDir);
+				counts.set(ws.id, (await scanSessionDir(sessionDir, record.cwdRealpath)).length);
 			}),
 		);
 		return c.json(
@@ -81,7 +83,7 @@ export function createApp(ctx: AppContext): Hono {
 		}
 		try {
 			const summary = registry.add(body.path, body.displayName);
-			supervisor.registerWorkspace(summary.id, summary.path);
+			supervisor.registerWorkspace(summary.id, registry.get(summary.id)!.cwdRealpath);
 			return c.json(summary, 201);
 		} catch (error) {
 			throw new HTTPException(400, { message: error instanceof Error ? error.message : String(error) });
@@ -104,8 +106,8 @@ export function createApp(ctx: AppContext): Hono {
 	app.get("/api/v1/workspaces/:workspaceId/sessions", async (c) => {
 		const record = registry.get(c.req.param("workspaceId"));
 		if (!record) throw new HTTPException(404, { message: "workspace not found" });
-		const sessionDir = getSessionDirForCwd(record.path, config.sessionRootDir);
-		const sessions = await scanSessionDir(sessionDir);
+		const sessionDir = getSessionDirForCwd(record.cwdRealpath, config.sessionRootDir);
+		const sessions = await scanSessionDir(sessionDir, record.cwdRealpath);
 		registry.touch(record.id);
 		return c.json({ sessions, sessionDir });
 	});
@@ -115,25 +117,38 @@ export function createApp(ctx: AppContext): Hono {
 		if (!record) throw new HTTPException(404, { message: "workspace not found" });
 
 		const sessionId = safeSessionId(c.req.param("sessionId"));
-		const sessionDir = getSessionDirForCwd(record.path, config.sessionRootDir);
+		const sessionDir = getSessionDirForCwd(record.cwdRealpath, config.sessionRootDir);
 		const targetPath = path.join(sessionDir, sessionId);
-		if (!fs.existsSync(targetPath)) throw new HTTPException(404, { message: "session not found" });
 
-		// Guard: never delete the session a live process currently has loaded.
-		const status = supervisor.getStatus(record.id);
-		if (status?.state === "running" && status.sessionId === sessionId) {
-			throw new HTTPException(409, { message: "session is active in the running process" });
-		}
+		await supervisor.withSessionTransition(record.id, async () => {
+			// Reading the Header here, inside the same mutex as switches/new/fork,
+			// makes the file identity check authoritative at deletion time.
+			const target = await scanSessionFile(targetPath, record.cwdRealpath);
+			if (!target) throw new HTTPException(404, { message: "session not found" });
+			const targetCanonicalPath = await fs.promises.realpath(target.absolutePath);
 
-		// Lineage protection: reject when child sessions reference this file (409).
-		const children = await findChildSessions(sessionDir, path.resolve(targetPath));
-		if (children.length > 0) {
-			throw new HTTPException(409, {
-				message: `session has ${children.length} forked child session(s); delete them first`,
-			});
-		}
+			// Guard: never delete the file a live process currently has loaded. The
+			// header UUID intentionally does not participate in this identity check.
+			const status = supervisor.getStatus(record.id);
+			if (status?.state === "running" && status.sessionFile) {
+				const activeCanonicalPath = await fs.promises
+					.realpath(status.sessionFile)
+					.catch(() => path.resolve(status.sessionFile!));
+				if (activeCanonicalPath === targetCanonicalPath) {
+					throw new HTTPException(409, { message: "session is active in the running process" });
+				}
+			}
 
-		await fs.promises.unlink(targetPath);
+			// Lineage protection: reject when child sessions reference this file (409).
+			const children = await findChildSessions(sessionDir, targetCanonicalPath, record.cwdRealpath);
+			if (children.length > 0) {
+				throw new HTTPException(409, {
+					message: `session has ${children.length} forked child session(s); delete them first`,
+				});
+			}
+
+			await fs.promises.unlink(target.absolutePath);
+		});
 		supervisor.notifySessionDirectoryChanged(record.id);
 		return c.json({ ok: true });
 	});
@@ -165,7 +180,9 @@ export function createApp(ctx: AppContext): Hono {
 	app.get("/api/v1/workspaces/:workspaceId/process", (c) => {
 		const record = registry.get(c.req.param("workspaceId"));
 		if (!record) throw new HTTPException(404, { message: "workspace not found" });
-		return c.json(supervisor.getStatus(record.id) ?? { state: "crashed", sessionId: null });
+		return c.json(
+			supervisor.getStatus(record.id) ?? { state: "crashed", sessionId: null, sessionFile: null },
+		);
 	});
 
 	app.post("/api/v1/workspaces/:workspaceId/process/restart", async (c) => {

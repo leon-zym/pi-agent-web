@@ -76,7 +76,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 		supervisor,
 		getWorkspace: (workspaceId) => {
 			const record = registry.get(workspaceId);
-			return record ? { cwd: record.path } : undefined;
+			return record ? { cwd: record.cwdRealpath } : undefined;
 		},
 		log,
 	});
@@ -84,7 +84,8 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 	// Register every persisted workspace with the supervisor so WS commands
 	// resolve immediately after boot (process spawn stays lazy on demand).
 	for (const ws of registry.list()) {
-		supervisor.registerWorkspace(ws.id, ws.path);
+		const record = registry.get(ws.id);
+		if (record) supervisor.registerWorkspace(ws.id, record.cwdRealpath);
 	}
 
 	const app = createApp({ accessControl, config, registry, supervisor });

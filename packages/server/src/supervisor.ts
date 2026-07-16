@@ -1,3 +1,4 @@
+import path from "node:path";
 import type {
 	JsonAgentSessionEvent,
 	RpcCommand,
@@ -10,6 +11,7 @@ import { RpcError, type WsServerMessage } from "@pi-agent-web/protocol";
 import { getSessionDirForCwd, isSessionInDir } from "./config.js";
 import { PiProcess } from "./pi-process.js";
 import type { ResolvedPi } from "./resolver.js";
+import { scanSessionFile } from "./session-scan.js";
 
 /**
  * Workspace-granularity process supervisor (see docs/architecture.md).
@@ -43,10 +45,12 @@ export interface SupervisorOptions {
 
 interface WorkspaceRuntime {
 	workspaceId: string;
-	cwd: string;
+	cwdRealpath: string;
 	proc: PiProcess | null;
 	status: ProcessState;
 	currentSessionId: string | null;
+	/** Only updated by a successful get_state response. */
+	currentSessionFile: string | null;
 	lastError?: string;
 	crashTimes: number[];
 	restartTimer: NodeJS.Timeout | null;
@@ -54,6 +58,7 @@ interface WorkspaceRuntime {
 	startPromise: Promise<void> | null;
 	generation: number;
 	pendingDialogs: Map<string, string>;
+	transitionTail: Promise<void>;
 }
 
 const DIALOG_METHODS = new Set(["select", "confirm", "input", "editor"]);
@@ -83,43 +88,52 @@ export class Supervisor {
 	// Lifecycle
 	// -------------------------------------------------------------------------
 
-	registerWorkspace(workspaceId: string, cwd: string): void {
+	registerWorkspace(workspaceId: string, cwdRealpath: string): void {
 		const existing = this.runtimes.get(workspaceId);
-		if (existing && existing.cwd === cwd) return;
+		if (existing && existing.cwdRealpath === cwdRealpath) return;
 		// cwd changed (e.g. re-registration): replace runtime state.
-		this.runtimes.set(workspaceId, this.createRuntime(workspaceId, cwd));
+		this.runtimes.set(workspaceId, this.createRuntime(workspaceId, cwdRealpath));
 	}
 
-	private createRuntime(workspaceId: string, cwd: string): WorkspaceRuntime {
+	private createRuntime(workspaceId: string, cwdRealpath: string): WorkspaceRuntime {
 		return {
 			workspaceId,
-			cwd,
+			cwdRealpath,
 			proc: null,
 			status: "crashed",
 			currentSessionId: null,
+			currentSessionFile: null,
 			crashTimes: [],
 			restartTimer: null,
 			manuallyStopped: true,
 			startPromise: null,
 			generation: 0,
 			pendingDialogs: new Map(),
+			transitionTail: Promise.resolve(),
 		};
 	}
 
-	getStatus(workspaceId: string): { state: ProcessState; error?: string; sessionId: string | null } | null {
+	getStatus(
+		workspaceId: string,
+	): { state: ProcessState; error?: string; sessionId: string | null; sessionFile: string | null } | null {
 		const rt = this.runtimes.get(workspaceId);
 		if (!rt) return null;
-		return { state: rt.status, error: rt.lastError, sessionId: rt.currentSessionId };
+		return {
+			state: rt.status,
+			error: rt.lastError,
+			sessionId: rt.currentSessionId,
+			sessionFile: rt.currentSessionFile,
+		};
 	}
 
 	/**
 	 * Ensure a running process for the workspace. Dedupes concurrent calls via
 	 * startPromise. Resolves when ready (or throws after the ready timeout).
 	 */
-	async ensureProcess(workspaceId: string, cwd: string): Promise<void> {
+	async ensureProcess(workspaceId: string, cwdRealpath: string): Promise<void> {
 		let rt = this.runtimes.get(workspaceId);
-		if (!rt || rt.cwd !== cwd) {
-			this.registerWorkspace(workspaceId, cwd);
+		if (!rt || rt.cwdRealpath !== cwdRealpath) {
+			this.registerWorkspace(workspaceId, cwdRealpath);
 			rt = this.runtimes.get(workspaceId)!;
 		}
 		if (rt.proc?.running) return;
@@ -144,17 +158,17 @@ export class Supervisor {
 		this.broadcastStatus(rt, "starting");
 
 		const proc = new PiProcess({
-			cwd: rt.cwd,
+			cwd: rt.cwdRealpath,
 			resolved: this.opts.resolved,
 			env: this.opts.env,
 			readyTimeoutMs: this.opts.readyTimeoutMs,
 			onReady: (initialState) => {
 				if (rt.generation !== generation) return;
-				rt.currentSessionId = initialState?.sessionId ?? null;
+				if (initialState) this.applySessionState(rt, initialState);
 				rt.status = "running";
 				rt.crashTimes = [];
 				this.broadcastStatus(rt, "running");
-				this.log("info", `pi process ready for ${rt.cwd} (session ${rt.currentSessionId})`);
+				this.log("info", `pi process ready for ${rt.cwdRealpath} (session ${rt.currentSessionId})`);
 				this.warmUpCommands(rt);
 			},
 			onEvent: (event) => this.handleEvent(rt, generation, event),
@@ -196,7 +210,7 @@ export class Supervisor {
 				: info.signal
 					? `signal ${info.signal}`
 					: "spawn failed") + (info.stderrTail ? ` — ${info.stderrTail.slice(-300).trim()}` : "");
-		this.log("error", `pi process crashed for ${rt.cwd}: ${rt.lastError}`);
+		this.log("error", `pi process crashed for ${rt.cwdRealpath}: ${rt.lastError}`);
 		this.broadcastStatus(rt, "crashed");
 
 		if (rt.manuallyStopped) return;
@@ -206,11 +220,11 @@ export class Supervisor {
 		rt.crashTimes = rt.crashTimes.filter((t) => now - t < this.opts.restartWindowMs);
 		rt.crashTimes.push(now);
 		if (rt.crashTimes.length > this.opts.maxAutoRestarts) {
-			this.log("warn", `auto-restart budget exhausted for ${rt.cwd}; manual restart required`);
+			this.log("warn", `auto-restart budget exhausted for ${rt.cwdRealpath}; manual restart required`);
 			return;
 		}
 		const backoffMs = 500 * 2 ** (rt.crashTimes.length - 1);
-		this.log("info", `scheduling auto-restart for ${rt.cwd} in ${backoffMs}ms`);
+		this.log("info", `scheduling auto-restart for ${rt.cwdRealpath} in ${backoffMs}ms`);
 		rt.restartTimer = setTimeout(() => {
 			rt.restartTimer = null;
 			if (rt.manuallyStopped) return;
@@ -269,55 +283,88 @@ export class Supervisor {
 	 */
 	async sendCommand(
 		workspaceId: string,
-		cwd: string,
+		cwdRealpath: string,
 		command: RpcCommand,
 		timeoutMs?: number,
 	): Promise<RpcResponse> {
 		const rt = this.runtimes.get(workspaceId);
 		if (!rt) throw new RpcError(command.type, `Workspace not registered: ${workspaceId}`);
-		await this.ensureProcess(workspaceId, cwd);
-		const proc = rt.proc;
-		if (!proc?.running) throw new RpcError(command.type, "pi process is not running");
+		const execute = async (): Promise<RpcResponse> => {
+			await this.ensureProcess(workspaceId, cwdRealpath);
+			const proc = rt.proc;
+			if (!proc?.running) throw new RpcError(command.type, "pi process is not running");
 
-		if (command.type === "switch_session") {
-			const sessionDir = this.resolveSessionDir(rt.cwd);
-			if (!isSessionInDir(command.sessionPath, sessionDir)) {
-				throw new RpcError(
-					"switch_session",
-					"Cross-workspace session switch is not allowed: " +
-						command.sessionPath +
-						" does not belong to " +
-						sessionDir,
-				);
+			if (command.type === "switch_session")
+				await this.assertSessionBelongsToWorkspace(rt, command.sessionPath);
+
+			const response = await proc.send(command, timeoutMs);
+			if (response.type === "response" && response.success === true && response.command === "get_state") {
+				this.applySessionState(rt, response.data as RpcSessionState);
 			}
-		}
+			if (
+				response.type === "response" &&
+				response.success === true &&
+				SESSION_SWITCH_COMMANDS.has(response.command)
+			) {
+				await this.refreshSessionState(rt);
+			}
+			return response;
+		};
 
-		const response = await proc.send(command, timeoutMs);
-		if (
-			response.type === "response" &&
-			response.success === true &&
-			SESSION_SWITCH_COMMANDS.has(response.command)
-		) {
-			void this.refreshSessionId(rt);
-		}
-		return response;
+		return SESSION_SWITCH_COMMANDS.has(command.type) || command.type === "get_state"
+			? this.runSessionTransition(rt, execute)
+			: execute();
 	}
 
-	private async refreshSessionId(rt: WorkspaceRuntime): Promise<void> {
-		const proc = rt.proc;
-		if (!proc?.running) return;
+	/** Serialize session-changing commands and REST session file mutations. */
+	async withSessionTransition<T>(workspaceId: string, operation: () => Promise<T>): Promise<T> {
+		const rt = this.runtimes.get(workspaceId);
+		if (!rt) throw new RpcError("session_transition", `Workspace not registered: ${workspaceId}`);
+		return this.runSessionTransition(rt, operation);
+	}
+
+	private async runSessionTransition<T>(rt: WorkspaceRuntime, operation: () => Promise<T>): Promise<T> {
+		const previous = rt.transitionTail;
+		let release: () => void;
+		rt.transitionTail = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		await previous;
 		try {
-			const response = await proc.send({ id: "session-track-1", type: "get_state" });
-			if (response.type === "response" && response.success === true && response.command === "get_state") {
-				const state = response.data as RpcSessionState;
-				if (state.sessionId !== rt.currentSessionId) {
-					rt.currentSessionId = state.sessionId;
-					this.log("info", `active session changed to ${state.sessionId}`);
-				}
-			}
-		} catch {
-			// Tracking is best-effort; the next get_state will fix it.
+			return await operation();
+		} finally {
+			release!();
 		}
+	}
+
+	private async assertSessionBelongsToWorkspace(rt: WorkspaceRuntime, sessionPath: string): Promise<void> {
+		const sessionDir = this.resolveSessionDir(rt.cwdRealpath);
+		if (!isSessionInDir(sessionPath, sessionDir)) {
+			throw new RpcError(
+				"switch_session",
+				`Cross-workspace session switch is not allowed: ${sessionPath} does not belong to ${sessionDir}`,
+			);
+		}
+		if (!(await scanSessionFile(sessionPath, rt.cwdRealpath))) {
+			throw new RpcError("switch_session", "Session header does not belong to this workspace");
+		}
+	}
+
+	private async refreshSessionState(rt: WorkspaceRuntime): Promise<void> {
+		const proc = rt.proc;
+		if (!proc?.running) throw new RpcError("get_state", "pi process is not running after session transition");
+		const response = await proc.send({ type: "get_state" });
+		if (response.type !== "response" || response.success !== true || response.command !== "get_state") {
+			throw new RpcError("get_state", "Unable to verify active session after session transition");
+		}
+		this.applySessionState(rt, response.data as RpcSessionState);
+	}
+
+	private applySessionState(rt: WorkspaceRuntime, state: RpcSessionState): void {
+		const previousId = rt.currentSessionId;
+		rt.currentSessionId = state.sessionId;
+		rt.currentSessionFile = state.sessionFile ? path.resolve(state.sessionFile) : null;
+		if (previousId !== state.sessionId) this.log("info", `active session changed to ${state.sessionId}`);
 	}
 
 	/** Forward an extension UI response to the process (fire-and-forget). */

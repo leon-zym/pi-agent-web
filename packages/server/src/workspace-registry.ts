@@ -13,15 +13,22 @@ interface RegistryFile {
 	workspaces: WorkspaceRecord[];
 }
 
-interface WorkspaceRecord {
+export interface WorkspaceRecord {
 	id: string;
+	/** Path entered by the user, retained for display and backwards compatibility. */
 	path: string;
+	/** Canonical filesystem identity used for process and session ownership checks. */
+	cwdRealpath: string;
 	displayName?: string;
 	lastOpenedAt: number | null;
 }
 
 export function workspaceIdForPath(p: string): string {
 	return createHash("sha1").update(path.resolve(p)).digest("hex").slice(0, 12);
+}
+
+function resolveWorkspaceRealpath(p: string): string {
+	return fs.realpathSync(path.resolve(p));
 }
 
 export class WorkspaceRegistry {
@@ -37,15 +44,36 @@ export class WorkspaceRegistry {
 		try {
 			const raw = fs.readFileSync(this.filePath, "utf8");
 			const parsed = JSON.parse(raw) as RegistryFile;
+			let changed = false;
 			if (parsed && Array.isArray(parsed.workspaces)) {
 				for (const ws of parsed.workspaces) {
 					if (ws && typeof ws.id === "string" && typeof ws.path === "string") {
-						this.records.set(ws.id, ws);
+						const cwdRealpath =
+							typeof ws.cwdRealpath === "string"
+								? path.resolve(ws.cwdRealpath)
+								: this.resolveExistingPathOrFallback(ws.path);
+						const id = workspaceIdForPath(cwdRealpath);
+						const normalized: WorkspaceRecord = {
+							...ws,
+							id,
+							cwdRealpath,
+						};
+						changed ||= id !== ws.id || cwdRealpath !== ws.cwdRealpath;
+						this.records.set(id, normalized);
 					}
 				}
 			}
+			if (changed) this.persist();
 		} catch {
 			// First run or corrupt file: start from an empty registry.
+		}
+	}
+
+	private resolveExistingPathOrFallback(p: string): string {
+		try {
+			return resolveWorkspaceRealpath(p);
+		} catch {
+			return path.resolve(p);
 		}
 	}
 
@@ -73,9 +101,15 @@ export class WorkspaceRegistry {
 			throw new Error(`Directory is not readable: ${resolved}`);
 		}
 
-		const id = workspaceIdForPath(resolved);
+		const cwdRealpath = resolveWorkspaceRealpath(resolved);
+		const id = workspaceIdForPath(cwdRealpath);
 		const existing = this.records.get(id);
-		const record: WorkspaceRecord = existing ?? { id, path: resolved, lastOpenedAt: null };
+		const record: WorkspaceRecord = existing ?? {
+			id,
+			path: resolved,
+			cwdRealpath,
+			lastOpenedAt: null,
+		};
 		if (displayName !== undefined) record.displayName = displayName;
 		this.records.set(id, record);
 		this.persist();

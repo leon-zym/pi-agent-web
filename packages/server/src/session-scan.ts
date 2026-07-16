@@ -82,7 +82,10 @@ function applyEntry(acc: ScanAccum, entry: unknown): void {
  * Scan a single session file. Returns a SessionSummary or null when the file
  * has no valid header within the scan budget.
  */
-export async function scanSessionFile(filePath: string): Promise<SessionSummary | null> {
+export async function scanSessionFile(
+	filePath: string,
+	expectedCwdRealpath?: string,
+): Promise<SessionSummary | null> {
 	const stat = await fs.promises.stat(filePath);
 	if (!stat.isFile()) return null;
 	if (stat.size === 0) return null;
@@ -115,7 +118,13 @@ export async function scanSessionFile(filePath: string): Promise<SessionSummary 
 				if (!acc.headerParsed) {
 					try {
 						const header = JSON.parse(line) as SessionHeader;
-						if (header && header.type === "session" && typeof header.id === "string") {
+						if (
+							header &&
+							header.type === "session" &&
+							typeof header.id === "string" &&
+							typeof header.timestamp === "string" &&
+							typeof header.cwd === "string"
+						) {
 							acc.header = header;
 						} else {
 							// First line is not a session header: not a session file.
@@ -145,6 +154,13 @@ export async function scanSessionFile(filePath: string): Promise<SessionSummary 
 	}
 
 	if (!acc.header) return null;
+	if (expectedCwdRealpath !== undefined) {
+		try {
+			if ((await fs.promises.realpath(acc.header.cwd)) !== expectedCwdRealpath) return null;
+		} catch {
+			return null;
+		}
+	}
 
 	return {
 		path: path.basename(filePath),
@@ -164,7 +180,10 @@ export async function scanSessionFile(filePath: string): Promise<SessionSummary 
  * List all sessions in a workspace session dir, sorted by modified desc
  * (official ordering: mtime, not filename).
  */
-export async function scanSessionDir(sessionDir: string): Promise<SessionSummary[]> {
+export async function scanSessionDir(
+	sessionDir: string,
+	expectedCwdRealpath?: string,
+): Promise<SessionSummary[]> {
 	let entries: fs.Dirent[];
 	try {
 		entries = await fs.promises.readdir(sessionDir, { withFileTypes: true });
@@ -176,7 +195,7 @@ export async function scanSessionDir(sessionDir: string): Promise<SessionSummary
 		.filter((e) => e.isFile() && e.name.endsWith(".jsonl"))
 		.map((e) => path.join(sessionDir, e.name));
 
-	const summaries = await Promise.all(files.map((f) => scanSessionFile(f)));
+	const summaries = await Promise.all(files.map((f) => scanSessionFile(f, expectedCwdRealpath)));
 	const valid = summaries.filter((s): s is SessionSummary => s !== null);
 	valid.sort((a, b) => b.modified - a.modified);
 	return valid;
@@ -186,11 +205,23 @@ export async function scanSessionDir(sessionDir: string): Promise<SessionSummary
  * Lineage protection: find sessions whose header references targetPath
  * as parentSession. Used to reject deletion with 409.
  */
-export async function findChildSessions(sessionDir: string, targetAbsolutePath: string): Promise<string[]> {
-	const all = await scanSessionDir(sessionDir);
-	return all
-		.filter(
-			(s) => s.parentSessionPath !== undefined && path.resolve(s.parentSessionPath) === targetAbsolutePath,
-		)
-		.map((s) => s.absolutePath);
+export async function findChildSessions(
+	sessionDir: string,
+	targetAbsolutePath: string,
+	expectedCwdRealpath?: string,
+): Promise<string[]> {
+	const all = await scanSessionDir(sessionDir, expectedCwdRealpath);
+	const targetCanonicalPath = await fs.promises
+		.realpath(targetAbsolutePath)
+		.catch(() => path.resolve(targetAbsolutePath));
+	const children = await Promise.all(
+		all.map(async (session) => {
+			if (session.parentSessionPath === undefined) return undefined;
+			const parentCanonicalPath = await fs.promises
+				.realpath(session.parentSessionPath)
+				.catch(() => path.resolve(session.parentSessionPath!));
+			return parentCanonicalPath === targetCanonicalPath ? session.absolutePath : undefined;
+		}),
+	);
+	return children.filter((child): child is string => child !== undefined);
 }
