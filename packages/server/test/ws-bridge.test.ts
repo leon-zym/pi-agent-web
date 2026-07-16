@@ -28,7 +28,11 @@ function makeStub(): StubSupervisor & Record<string, unknown> {
 		response: unknown,
 	) => {
 		stub.responses.push({ workspaceId, response });
+		return "accepted";
 	};
+	(stub as unknown as Record<string, unknown>).claimController = () => true;
+	(stub as unknown as Record<string, unknown>).releaseController = () => true;
+	(stub as unknown as Record<string, unknown>).isController = () => true;
 	(stub as unknown as Record<string, unknown>).sendCommand = async () => ({
 		type: "response",
 		command: "get_state",
@@ -40,7 +44,7 @@ function makeStub(): StubSupervisor & Record<string, unknown> {
 
 async function openClient(port: number): Promise<import("ws").WebSocket> {
 	const WebSocketCtor = (await import("ws")).default;
-	const ws = new WebSocketCtor("ws://127.0.0.1:" + port);
+	const ws = new WebSocketCtor(`ws://127.0.0.1:${port}`);
 	await new Promise<void>((resolve, reject) => {
 		ws.on("open", () => resolve());
 		ws.on("error", reject);
@@ -75,7 +79,7 @@ describe("ws bridge disconnect protection", () => {
 		const port = (wss.address() as { port: number }).port;
 		bridge = new WsBridge({
 			supervisor: stub as unknown as Supervisor,
-			getWorkspace: (id) => ({ cwd: "/tmp/" + id }),
+			getWorkspace: (id) => ({ cwd: `/tmp/${id}` }),
 			heartbeatIntervalMs: 60_000,
 		});
 		// Simulate the upgrade path used in main.ts.
@@ -148,6 +152,7 @@ describe("ws bridge disconnect protection", () => {
 			JSON.stringify({
 				type: "extension_ui_response",
 				workspaceId: "ws1",
+				expectedSessionId: null,
 				response: { type: "extension_ui_response", id: "req-1", confirmed: true },
 			}),
 		);

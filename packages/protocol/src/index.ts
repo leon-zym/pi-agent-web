@@ -15,9 +15,16 @@ import type {
 // ============================================================================
 
 export type WsClientMessage =
-	| { type: "command"; workspaceId: string; command: RpcCommand }
-	| { type: "extension_ui_response"; workspaceId: string; response: RpcExtensionUIResponse }
-	| { type: "session_listen"; workspaceId: string; sessionId: string | null };
+	| { type: "command"; workspaceId: string; expectedSessionId: string | null; command: RpcCommand }
+	| {
+			type: "extension_ui_response";
+			workspaceId: string;
+			expectedSessionId: string | null;
+			response: RpcExtensionUIResponse;
+	  }
+	| { type: "session_listen"; workspaceId: string; sessionId: string | null }
+	| { type: "session_claim"; workspaceId: string }
+	| { type: "session_release"; workspaceId: string };
 
 const MAX_IDENTIFIER_LENGTH = 256;
 const MAX_PATH_LENGTH = 8192;
@@ -36,6 +43,10 @@ function isString(value: unknown, maxLength = MAX_IDENTIFIER_LENGTH): value is s
 
 function isOptionalString(value: unknown, maxLength = MAX_IDENTIFIER_LENGTH): boolean {
 	return value === undefined || isString(value, maxLength);
+}
+
+function isSessionId(value: unknown): value is string | null {
+	return value === null || isString(value);
 }
 
 function hasOnlyKeys(value: UnknownRecord, allowed: readonly string[]): boolean {
@@ -157,14 +168,25 @@ export function isWsClientMessage(value: unknown): value is WsClientMessage {
 
 	switch (value.type) {
 		case "command":
-			return hasOnlyKeys(value, ["type", "workspaceId", "command"]) && isRpcCommand(value.command);
+			return (
+				hasOnlyKeys(value, ["type", "workspaceId", "expectedSessionId", "command"]) &&
+				isSessionId(value.expectedSessionId) &&
+				isRpcCommand(value.command)
+			);
 		case "extension_ui_response":
-			return hasOnlyKeys(value, ["type", "workspaceId", "response"]) && isExtensionUiResponse(value.response);
+			return (
+				hasOnlyKeys(value, ["type", "workspaceId", "expectedSessionId", "response"]) &&
+				isSessionId(value.expectedSessionId) &&
+				isExtensionUiResponse(value.response)
+			);
 		case "session_listen":
 			return (
 				hasOnlyKeys(value, ["type", "workspaceId", "sessionId"]) &&
 				(value.sessionId === null || isString(value.sessionId))
 			);
+		case "session_claim":
+		case "session_release":
+			return hasOnlyKeys(value, ["type", "workspaceId"]);
 		default:
 			return false;
 	}
@@ -192,6 +214,14 @@ export type WsServerMessage =
 	| { type: "event"; workspaceId: string; sessionId: string; event: PiWebSessionEvent }
 	| { type: "extension_ui_request"; workspaceId: string; sessionId: string; request: RpcExtensionUIRequest }
 	| { type: "process_status"; workspaceId: string; state: "starting" | "running" | "crashed"; error?: string }
+	| { type: "lease_status"; workspaceId: string; isController: boolean }
+	| {
+			type: "session_state";
+			workspaceId: string;
+			sessionId: string | null;
+			sessionFile: string | null;
+			epoch: number;
+	  }
 	| { type: "session_directory_changed"; workspaceId: string }
 	| { type: "auth_changed"; workspaceId: string };
 

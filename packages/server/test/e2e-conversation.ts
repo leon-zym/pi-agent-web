@@ -80,7 +80,14 @@ if (process.env.PI_WEB_RUN_E2E !== "1") {
 			const response = new Promise<{ success?: boolean; error?: string; data?: unknown }>((resolve) => {
 				pending.set(id, resolve);
 			});
-			ws.send(JSON.stringify({ type: "command", workspaceId: workspace.id, command: { id, ...payload } }));
+			ws.send(
+				JSON.stringify({
+					type: "command",
+					workspaceId: workspace.id,
+					expectedSessionId: null,
+					command: { id, ...payload },
+				}),
+			);
 			return response;
 		};
 		const expectOk = async (

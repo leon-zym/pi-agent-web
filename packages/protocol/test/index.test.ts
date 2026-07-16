@@ -41,6 +41,7 @@ describe("browser frame guard", () => {
 			isWsClientMessage({
 				type: "command",
 				workspaceId: "workspace-1",
+				expectedSessionId: "session-1",
 				command: { id: "request-1", type: "prompt", message: "hello", streamingBehavior: "steer" },
 			}),
 		).toBe(true);
@@ -48,6 +49,7 @@ describe("browser frame guard", () => {
 			isWsClientMessage({
 				type: "extension_ui_response",
 				workspaceId: "workspace-1",
+				expectedSessionId: "session-1",
 				response: { type: "extension_ui_response", id: "dialog-1", cancelled: true },
 			}),
 		).toBe(true);
@@ -59,6 +61,7 @@ describe("browser frame guard", () => {
 			isWsClientMessage({
 				type: "command",
 				workspaceId: "workspace-1",
+				expectedSessionId: null,
 				command: { id: "request-1", type: "unsupported" },
 			}),
 		).toBe(false);
@@ -66,6 +69,7 @@ describe("browser frame guard", () => {
 			isWsClientMessage({
 				type: "command",
 				workspaceId: "workspace-1",
+				expectedSessionId: null,
 				command: { type: "bash", command: "echo ok" },
 			}),
 		).toBe(false);

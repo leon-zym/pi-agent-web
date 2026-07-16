@@ -69,6 +69,18 @@ function handleLine(line) {
 				data: { cancelled: false },
 			});
 			return;
+		case "prompt":
+			if (command.message === "open-dialog") {
+				send({
+					type: "extension_ui_request",
+					id: "fake-dialog",
+					method: "confirm",
+					title: "Confirm",
+					message: "Fixture dialog",
+				});
+			}
+			send({ type: "response", id: command.id, command: command.type, success: true });
+			return;
 		case "get_last_assistant_text":
 			send({ type: "response", command: command.type, success: true, data: { text: "missing id" } });
 			return;

@@ -54,6 +54,7 @@ try {
 				JSON.stringify({
 					type: "command",
 					workspaceId: workspace.id,
+					expectedSessionId: null,
 					command: { id: "smoke-state", type: "get_state" },
 				}),
 			);

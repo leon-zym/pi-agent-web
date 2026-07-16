@@ -43,14 +43,25 @@ export interface SupervisorOptions {
 	readyTimeoutMs?: number;
 }
 
+export interface SessionControlContext {
+	connectionId: string;
+	expectedSessionId: string | null;
+}
+
+interface WorkspaceSessionState {
+	id: string | null;
+	file: string | null;
+	epoch: number;
+}
+
 interface WorkspaceRuntime {
 	workspaceId: string;
 	cwdRealpath: string;
 	proc: PiProcess | null;
 	status: ProcessState;
-	currentSessionId: string | null;
-	/** Only updated by a successful get_state response. */
-	currentSessionFile: string | null;
+	/** id and file are only updated by successful get_state responses. */
+	session: WorkspaceSessionState;
+	controllerConnectionId: string | null;
 	lastError?: string;
 	crashTimes: number[];
 	restartTimer: NodeJS.Timeout | null;
@@ -63,6 +74,18 @@ interface WorkspaceRuntime {
 
 const DIALOG_METHODS = new Set(["select", "confirm", "input", "editor"]);
 const SESSION_SWITCH_COMMANDS = new Set(["switch_session", "new_session", "fork", "clone"]);
+const READ_ONLY_COMMANDS = new Set([
+	"get_available_models",
+	"get_available_thinking_levels",
+	"get_commands",
+	"get_entries",
+	"get_fork_messages",
+	"get_last_assistant_text",
+	"get_messages",
+	"get_session_stats",
+	"get_state",
+	"get_tree",
+]);
 
 export class Supervisor {
 	private runtimes = new Map<string, WorkspaceRuntime>();
@@ -101,8 +124,8 @@ export class Supervisor {
 			cwdRealpath,
 			proc: null,
 			status: "crashed",
-			currentSessionId: null,
-			currentSessionFile: null,
+			session: { id: null, file: null, epoch: 0 },
+			controllerConnectionId: null,
 			crashTimes: [],
 			restartTimer: null,
 			manuallyStopped: true,
@@ -113,17 +136,41 @@ export class Supervisor {
 		};
 	}
 
-	getStatus(
-		workspaceId: string,
-	): { state: ProcessState; error?: string; sessionId: string | null; sessionFile: string | null } | null {
+	getStatus(workspaceId: string): {
+		state: ProcessState;
+		error?: string;
+		sessionId: string | null;
+		sessionFile: string | null;
+		epoch: number;
+	} | null {
 		const rt = this.runtimes.get(workspaceId);
 		if (!rt) return null;
 		return {
 			state: rt.status,
 			error: rt.lastError,
-			sessionId: rt.currentSessionId,
-			sessionFile: rt.currentSessionFile,
+			sessionId: rt.session.id,
+			sessionFile: rt.session.file,
+			epoch: rt.session.epoch,
 		};
+	}
+
+	claimController(workspaceId: string, connectionId: string): boolean {
+		const rt = this.runtimes.get(workspaceId);
+		if (!rt) return false;
+		if (rt.controllerConnectionId && rt.controllerConnectionId !== connectionId) return false;
+		rt.controllerConnectionId = connectionId;
+		return true;
+	}
+
+	releaseController(workspaceId: string, connectionId: string): boolean {
+		const rt = this.runtimes.get(workspaceId);
+		if (!rt || rt.controllerConnectionId !== connectionId) return false;
+		rt.controllerConnectionId = null;
+		return true;
+	}
+
+	isController(workspaceId: string, connectionId: string): boolean {
+		return this.runtimes.get(workspaceId)?.controllerConnectionId === connectionId;
 	}
 
 	/**
@@ -168,7 +215,7 @@ export class Supervisor {
 				rt.status = "running";
 				rt.crashTimes = [];
 				this.broadcastStatus(rt, "running");
-				this.log("info", `pi process ready for ${rt.cwdRealpath} (session ${rt.currentSessionId})`);
+				this.log("info", `pi process ready for ${rt.cwdRealpath} (session ${rt.session.id})`);
 				this.warmUpCommands(rt);
 			},
 			onEvent: (event) => this.handleEvent(rt, generation, event),
@@ -285,11 +332,13 @@ export class Supervisor {
 		workspaceId: string,
 		cwdRealpath: string,
 		command: RpcCommand,
+		control: SessionControlContext | undefined,
 		timeoutMs?: number,
 	): Promise<RpcResponse> {
 		const rt = this.runtimes.get(workspaceId);
 		if (!rt) throw new RpcError(command.type, `Workspace not registered: ${workspaceId}`);
 		const execute = async (): Promise<RpcResponse> => {
+			if (!READ_ONLY_COMMANDS.has(command.type)) this.assertControllerAndSession(rt, command.type, control);
 			await this.ensureProcess(workspaceId, cwdRealpath);
 			const proc = rt.proc;
 			if (!proc?.running) throw new RpcError(command.type, "pi process is not running");
@@ -311,9 +360,20 @@ export class Supervisor {
 			return response;
 		};
 
-		return SESSION_SWITCH_COMMANDS.has(command.type) || command.type === "get_state"
+		return !READ_ONLY_COMMANDS.has(command.type) || command.type === "get_state"
 			? this.runSessionTransition(rt, execute)
 			: execute();
+	}
+
+	private assertControllerAndSession(
+		rt: WorkspaceRuntime,
+		command: string,
+		control: SessionControlContext | undefined,
+	): void {
+		if (!control || rt.controllerConnectionId !== control.connectionId) {
+			throw new RpcError(command, "workspace_read_only");
+		}
+		if (control.expectedSessionId !== rt.session.id) throw new RpcError(command, "session_stale");
 	}
 
 	/** Serialize session-changing commands and REST session file mutations. */
@@ -361,26 +421,31 @@ export class Supervisor {
 	}
 
 	private applySessionState(rt: WorkspaceRuntime, state: RpcSessionState): void {
-		const previousId = rt.currentSessionId;
-		rt.currentSessionId = state.sessionId;
-		rt.currentSessionFile = state.sessionFile ? path.resolve(state.sessionFile) : null;
+		const nextFile = state.sessionFile ? path.resolve(state.sessionFile) : null;
+		const changed = rt.session.id !== state.sessionId || rt.session.file !== nextFile;
+		if (!changed) return;
+		const previousId = rt.session.id;
+		rt.session = { id: state.sessionId, file: nextFile, epoch: rt.session.epoch + 1 };
 		if (previousId !== state.sessionId) this.log("info", `active session changed to ${state.sessionId}`);
+		this.broadcastSessionState(rt);
 	}
 
 	/** Forward an extension UI response to the process (fire-and-forget). */
 	sendExtensionUiResponse(
 		workspaceId: string,
 		response: RpcExtensionUIResponse,
+		control: SessionControlContext,
 		sessionId?: string,
-	): boolean {
+	): "accepted" | "workspace_read_only" | "session_stale" | "no_dialog" {
 		const rt = this.runtimes.get(workspaceId);
-		if (!rt) return false;
+		if (!rt || rt.controllerConnectionId !== control.connectionId) return "workspace_read_only";
+		if (control.expectedSessionId !== rt.session.id) return "session_stale";
 		const dialogSessionId = rt.pendingDialogs.get(response.id);
-		if (!dialogSessionId || (sessionId !== undefined && sessionId !== dialogSessionId)) return false;
+		if (!dialogSessionId || (sessionId !== undefined && sessionId !== dialogSessionId)) return "no_dialog";
 		rt.pendingDialogs.delete(response.id);
-		if (!rt.proc?.running) return false;
+		if (!rt.proc?.running) return "no_dialog";
 		rt.proc.sendNoResponse(response);
-		return true;
+		return "accepted";
 	}
 
 	/**
@@ -411,7 +476,7 @@ export class Supervisor {
 
 	private handleEvent(rt: WorkspaceRuntime, generation: number, event: JsonAgentSessionEvent): void {
 		if (rt.generation !== generation) return;
-		const sessionId = rt.currentSessionId ?? "";
+		const sessionId = rt.session.id ?? "";
 		this.opts.broadcast({ type: "event", workspaceId: rt.workspaceId, sessionId, event });
 	}
 
@@ -421,7 +486,7 @@ export class Supervisor {
 		request: RpcExtensionUIRequest,
 	): void {
 		if (rt.generation !== generation) return;
-		const sessionId = rt.currentSessionId ?? "";
+		const sessionId = rt.session.id ?? "";
 		if (DIALOG_METHODS.has(request.method)) {
 			rt.pendingDialogs.set(request.id, sessionId);
 		}
@@ -434,6 +499,16 @@ export class Supervisor {
 			workspaceId: rt.workspaceId,
 			state,
 			...(state === "crashed" && rt.lastError ? { error: rt.lastError } : {}),
+		});
+	}
+
+	private broadcastSessionState(rt: WorkspaceRuntime): void {
+		this.opts.broadcast({
+			type: "session_state",
+			workspaceId: rt.workspaceId,
+			sessionId: rt.session.id,
+			sessionFile: rt.session.file,
+			epoch: rt.session.epoch,
 		});
 	}
 

@@ -146,6 +146,7 @@ describe("gateway access control", () => {
 		const command = JSON.stringify({
 			type: "command",
 			workspaceId,
+			expectedSessionId: null,
 			command: { id: "same-client-id", type: "get_state" },
 		});
 		a.send(command);

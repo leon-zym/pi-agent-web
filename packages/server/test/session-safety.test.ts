@@ -13,6 +13,7 @@ const sessionRootDir = path.join(tempRoot, "sessions");
 const webDataDir = path.join(tempRoot, "web-data");
 const fakePiPath = path.join(import.meta.dirname, "fixtures", "fake-pi.mjs");
 const viteOrigin = "http://localhost:5173";
+const testConnectionId = "session-safety-test";
 
 let handle: ServerHandle;
 let base: string;
@@ -23,6 +24,13 @@ let sessionDir: string;
 
 function authenticatedHeaders(): Record<string, string> {
 	return { Origin: viteOrigin, Cookie: cookie };
+}
+
+function controlContext(): { connectionId: string; expectedSessionId: string | null } {
+	return {
+		connectionId: testConnectionId,
+		expectedSessionId: handle.supervisor.getStatus(workspaceId)?.sessionId ?? null,
+	};
 }
 
 function writeSession(
@@ -79,6 +87,7 @@ beforeAll(async () => {
 	sessionDir = getSessionDirForCwd(workspaceRealpath, sessionRootDir);
 	fs.mkdirSync(sessionDir, { recursive: true });
 	handle.supervisor.registerWorkspace(workspaceId, workspaceRealpath);
+	handle.supervisor.claimController(workspaceId, testConnectionId);
 });
 
 afterAll(async () => {
@@ -98,10 +107,15 @@ describe("session file identity and transition safety", () => {
 	it("refuses to delete the active file even when the Header UUID differs from its filename", async () => {
 		const fileName = nextFile("active");
 		const activePath = writeSession(fileName, { id: "header-uuid-not-the-filename", cwd: workspaceRealpath });
-		await handle.supervisor.sendCommand(workspaceId, workspaceRealpath, {
-			type: "switch_session",
-			sessionPath: activePath,
-		});
+		await handle.supervisor.sendCommand(
+			workspaceId,
+			workspaceRealpath,
+			{
+				type: "switch_session",
+				sessionPath: activePath,
+			},
+			controlContext(),
+		);
 
 		expect(handle.supervisor.getStatus(workspaceId)?.sessionFile).toBe(activePath);
 		const response = await fetch(`${base}/api/v1/workspaces/${workspaceId}/sessions/${fileName}`, {
@@ -143,10 +157,15 @@ describe("session file identity and transition safety", () => {
 		expect(body.sessions.some((session) => session.absolutePath === foreignPath)).toBe(false);
 
 		await expect(
-			handle.supervisor.sendCommand(workspaceId, workspaceRealpath, {
-				type: "switch_session",
-				sessionPath: foreignPath,
-			}),
+			handle.supervisor.sendCommand(
+				workspaceId,
+				workspaceRealpath,
+				{
+					type: "switch_session",
+					sessionPath: foreignPath,
+				},
+				controlContext(),
+			),
 		).rejects.toThrow("Session header does not belong to this workspace");
 	});
 
@@ -163,10 +182,15 @@ describe("session file identity and transition safety", () => {
 		);
 		await waitForMicrotasks();
 
-		const switchPromise = handle.supervisor.sendCommand(workspaceId, workspaceRealpath, {
-			type: "switch_session",
-			sessionPath: queuedPath,
-		});
+		const switchPromise = handle.supervisor.sendCommand(
+			workspaceId,
+			workspaceRealpath,
+			{
+				type: "switch_session",
+				sessionPath: queuedPath,
+			},
+			controlContext(),
+		);
 		await waitForMicrotasks();
 		const deletePromise = fetch(`${base}/api/v1/workspaces/${workspaceId}/sessions/${fileName}`, {
 			method: "DELETE",

@@ -32,6 +32,7 @@ interface ConnectionState {
 	ws: WebSocket;
 	workspaceId?: string;
 	listenedSessionId: string | null;
+	controlledWorkspaces: Set<string>;
 	pendingCommands: Set<string>;
 	alive: boolean;
 }
@@ -127,6 +128,7 @@ export class WsBridge {
 			connectionId: randomUUID(),
 			ws,
 			listenedSessionId: null,
+			controlledWorkspaces: new Set(),
 			pendingCommands: new Set(),
 			alive: true,
 		};
@@ -152,6 +154,12 @@ export class WsBridge {
 			this.connections.delete(conn);
 			this.clearRequestMappings(conn);
 			this.clearListen(conn);
+			for (const workspaceId of conn.controlledWorkspaces) {
+				if (this.supervisor.releaseController(workspaceId, conn.connectionId)) {
+					this.broadcastLeaseStatus(workspaceId);
+				}
+			}
+			conn.controlledWorkspaces.clear();
 			this.log("info", `ws disconnected (${this.connections.size} open)`);
 		});
 
@@ -180,7 +188,23 @@ export class WsBridge {
 				return;
 			}
 			case "command": {
-				await this.handleCommand(conn, message.workspaceId, message.command);
+				await this.handleCommand(conn, message.workspaceId, message.expectedSessionId, message.command);
+				return;
+			}
+			case "session_claim": {
+				if (this.supervisor.claimController(message.workspaceId, conn.connectionId)) {
+					conn.controlledWorkspaces.add(message.workspaceId);
+				}
+				this.broadcastLeaseStatus(message.workspaceId);
+				return;
+			}
+			case "session_release": {
+				if (this.supervisor.releaseController(message.workspaceId, conn.connectionId)) {
+					conn.controlledWorkspaces.delete(message.workspaceId);
+					this.broadcastLeaseStatus(message.workspaceId);
+				} else {
+					this.sendLeaseStatus(conn, message.workspaceId);
+				}
 				return;
 			}
 			case "extension_ui_response": {
@@ -188,11 +212,13 @@ export class WsBridge {
 					this.closeForPolicyViolation(conn, "extension response does not match the listen scope");
 					return;
 				}
-				this.supervisor.sendExtensionUiResponse(
+				const outcome = this.supervisor.sendExtensionUiResponse(
 					message.workspaceId,
 					message.response,
+					{ connectionId: conn.connectionId, expectedSessionId: message.expectedSessionId },
 					conn.listenedSessionId,
 				);
+				if (outcome !== "accepted") this.sendLeaseStatus(conn, message.workspaceId);
 				return;
 			}
 			default:
@@ -203,6 +229,7 @@ export class WsBridge {
 	private async handleCommand(
 		conn: ConnectionState,
 		workspaceId: string,
+		expectedSessionId: string | null,
 		command: Extract<WsClientMessage, { type: "command" }>["command"],
 	): Promise<void> {
 		const workspace = this.getWorkspace(workspaceId);
@@ -228,7 +255,10 @@ export class WsBridge {
 		const internalCommand = { ...command, id: internalId } as RpcCommand;
 
 		try {
-			const response = await this.supervisor.sendCommand(workspaceId, workspace.cwd, internalCommand);
+			const response = await this.supervisor.sendCommand(workspaceId, workspace.cwd, internalCommand, {
+				connectionId: conn.connectionId,
+				expectedSessionId,
+			});
 			this.sendTargeted(conn, {
 				type: "response",
 				workspaceId,
@@ -295,6 +325,10 @@ export class WsBridge {
 		this.clearListen(conn);
 		conn.workspaceId = workspaceId;
 		conn.listenedSessionId = sessionId;
+		if (sessionId !== null && this.supervisor.claimController(workspaceId, conn.connectionId)) {
+			conn.controlledWorkspaces.add(workspaceId);
+		}
+		this.broadcastLeaseStatus(workspaceId);
 		if (sessionId !== null) {
 			const key = keyOf(workspaceId, sessionId);
 			this.listenCounts.set(key, (this.listenCounts.get(key) ?? 0) + 1);
@@ -314,5 +348,20 @@ export class WsBridge {
 			}
 		}
 		conn.listenedSessionId = null;
+	}
+
+	private broadcastLeaseStatus(workspaceId: string): void {
+		for (const conn of this.connections) {
+			if (conn.workspaceId !== workspaceId) continue;
+			this.sendLeaseStatus(conn, workspaceId);
+		}
+	}
+
+	private sendLeaseStatus(conn: ConnectionState, workspaceId: string): void {
+		this.sendTargeted(conn, {
+			type: "lease_status",
+			workspaceId,
+			isController: this.supervisor.isController(workspaceId, conn.connectionId),
+		});
 	}
 }
