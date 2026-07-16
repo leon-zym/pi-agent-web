@@ -14,7 +14,7 @@ export interface GatewayAccessControl {
 	createSessionCookie: () => string;
 }
 
-const DEV_ORIGINS = new Set(["http://localhost:5173", "http://127.0.0.1:5173"]);
+const DEV_ORIGINS = new Set(["http://localhost:5173", "http://127.0.0.1:5173", "http://[::1]:5173"]);
 
 function headerValue(headers: HeadersInput, name: string): string | undefined {
 	if (isHeaderBag(headers)) return headers.get(name) ?? undefined;
@@ -27,7 +27,7 @@ function isHeaderBag(headers: HeadersInput): headers is HeaderBag {
 }
 
 function isLoopbackHost(hostname: string): boolean {
-	return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+	return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1" || hostname === "[::1]";
 }
 
 function normalizedOrigin(value: string | undefined): string | undefined {

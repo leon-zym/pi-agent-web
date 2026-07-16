@@ -97,6 +97,9 @@ describe("gateway access control", () => {
 		).headers.get("set-cookie");
 		expect(sessionCookie).toContain("HttpOnly");
 		expect(sessionCookie).toContain("SameSite=Strict");
+		expect(
+			(await fetch(`${base}/api/v1/bootstrap`, { headers: { Origin: "http://[::1]:5173" } })).status,
+		).toBe(200);
 	});
 
 	it("rejects REST calls without a matching cookie and origin", async () => {
