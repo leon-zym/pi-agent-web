@@ -46,9 +46,14 @@ export async function sendControlCommand(
 	timeoutMs?: number,
 ): Promise<RpcResponse> {
 	if (!useSessionControlStore.getState().canControl(workspaceId)) throw new Error(tt("lease.readOnly"));
-	return useTransportStore
+	const response = await useTransportStore
 		.getState()
 		.sendCommand(workspaceId, command, timeoutMs, expectedSessionId(workspaceId));
+	if (response.success === false && response.error === "session_stale") {
+		useSessionControlStore.getState().setReconciling(workspaceId, true);
+		if (typeof window !== "undefined") window.dispatchEvent(new Event("piweb:session-stale"));
+	}
+	return response;
 }
 
 export function sendControlExtensionUiResponse(

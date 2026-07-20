@@ -204,6 +204,23 @@ function updateToolBlock(
 	return turn;
 }
 
+function upsertToolResult(step: AssistantStep, result: AssistantStep["toolResults"][number]): AssistantStep {
+	const index = step.toolResults.findIndex((entry) => entry.toolCallId === result.toolCallId);
+	const previous = index === -1 ? undefined : step.toolResults[index];
+	const toolResults =
+		index === -1
+			? [...step.toolResults, result]
+			: step.toolResults.map((entry, entryIndex) =>
+					entryIndex === index ? { ...result, isError: Boolean(previous?.isError || result.isError) } : entry,
+				);
+	const blocks = step.blocks.map((block) =>
+		block.type === "tool_call" && block.toolCallId === result.toolCallId && result.isError
+			? { ...block, status: "error" as const }
+			: block,
+	);
+	return { ...step, blocks, toolResults };
+}
+
 function upsertStatusRow(state: ConversationProjection, row: StatusRow): ConversationProjection {
 	const existing = state.statusRows.findIndex((r) => r.key === row.key);
 	if (existing === -1) return { ...state, statusRows: [...state.statusRows, row] };
@@ -398,17 +415,19 @@ function handleMessageStart(
 		};
 		const last = ensured.turn.steps[ensured.turn.steps.length - 1];
 		if (!last) return state;
-		const toolResults = [
-			...last.toolResults,
-			{
-				toolCallId: toolResult.toolCallId ?? "",
-				toolName: toolResult.toolName ?? "",
-				content: flattenText(toolResult.content),
-				isError: toolResult.isError ?? false,
-				details: toolResult.details,
-			},
-		];
-		return withTurn(ensured.state, withLastStep(ensured.turn, { ...last, toolResults }));
+		return withTurn(
+			ensured.state,
+			withLastStep(
+				ensured.turn,
+				upsertToolResult(last, {
+					toolCallId: toolResult.toolCallId ?? "",
+					toolName: toolResult.toolName ?? "",
+					content: flattenText(toolResult.content),
+					isError: toolResult.isError ?? false,
+					details: toolResult.details,
+				}),
+			),
+		);
 	}
 
 	return state;
@@ -474,6 +493,9 @@ function handleMessageEnd(
 			};
 		}
 		if (block.type === "toolCall") {
+			const historicalError = markedLast.toolResults.some(
+				(result) => result.toolCallId === (block.id ?? "") && result.isError,
+			);
 			return {
 				type: "tool_call" as const,
 				key,
@@ -481,7 +503,11 @@ function handleMessageEnd(
 				toolName: block.name ?? "",
 				argsText: JSON.stringify(block.arguments ?? {}),
 				args: block.arguments,
-				status: existing?.type === "tool_call" ? existing.status : ("preparing" as const),
+				status: historicalError
+					? ("error" as const)
+					: existing?.type === "tool_call"
+						? existing.status
+						: ("preparing" as const),
 				partialOutput: existing?.type === "tool_call" ? existing.partialOutput : undefined,
 				result: existing?.type === "tool_call" ? existing.result : undefined,
 			};

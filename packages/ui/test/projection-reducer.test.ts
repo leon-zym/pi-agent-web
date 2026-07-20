@@ -250,6 +250,42 @@ describe("projection reducer", () => {
 		expect(p.queue.steering).toEqual(["s1"]);
 	});
 
+	it("promotes a tool block to error when its streamed result fails", () => {
+		let p = createEmptyProjection("s1");
+		p = reduceProjection(p, { type: "agent_start" }, ctx);
+		p = reduceProjection(p, { type: "turn_start" }, ctx);
+		p = reduceProjection(
+			p,
+			{
+				type: "message_start",
+				message: {
+					role: "assistant",
+					content: [{ type: "toolCall", id: "call-fail", name: "bash", arguments: {} }],
+				},
+			} as never,
+			ctx,
+		);
+		p = reduceProjection(
+			p,
+			{
+				type: "message_start",
+				message: {
+					role: "toolResult",
+					toolCallId: "call-fail",
+					toolName: "bash",
+					content: "failed",
+					isError: true,
+				},
+			} as never,
+			ctx,
+		);
+
+		const steps = p.turns[0]?.steps ?? [];
+		const step = steps[steps.length - 1];
+		expect(step?.blocks[0]).toMatchObject({ type: "tool_call", status: "error" });
+		expect(step?.toolResults).toEqual([expect.objectContaining({ isError: true, content: "failed" })]);
+	});
+
 	it("labels injected user messages as steer via the injection source resolver", () => {
 		let p = createEmptyProjection("s1");
 		p = reduceProjection(p, { type: "agent_start" }, ctx);

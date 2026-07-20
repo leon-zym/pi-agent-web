@@ -13,21 +13,24 @@ export interface SessionLease {
 interface SessionControlState {
 	workspaceId: string | null;
 	lease: LeaseState;
+	reconciling: boolean;
 	session: SessionLease;
 	selectWorkspace: (workspaceId: string | null) => void;
 	claim: (workspaceId: string) => boolean;
 	release: () => boolean;
+	setReconciling: (workspaceId: string, reconciling: boolean) => void;
 	canControl: (workspaceId: string | null) => boolean;
 }
 
 export const useSessionControlStore = create<SessionControlState>()((set, get) => ({
 	workspaceId: null,
 	lease: "unknown",
+	reconciling: false,
 	session: { id: null, file: null, epoch: 0 },
 
 	selectWorkspace: (workspaceId) => {
 		if (get().workspaceId === workspaceId) return;
-		set({ workspaceId, lease: "unknown", session: { id: null, file: null, epoch: 0 } });
+		set({ workspaceId, lease: "unknown", reconciling: false, session: { id: null, file: null, epoch: 0 } });
 	},
 
 	claim: (workspaceId) => {
@@ -42,8 +45,15 @@ export const useSessionControlStore = create<SessionControlState>()((set, get) =
 		return useTransportStore.getState().releaseController(workspaceId);
 	},
 
+	setReconciling: (workspaceId, reconciling) => {
+		if (get().workspaceId === workspaceId) set({ reconciling });
+	},
+
 	canControl: (workspaceId) =>
-		workspaceId !== null && get().workspaceId === workspaceId && get().lease === "controller",
+		workspaceId !== null &&
+		get().workspaceId === workspaceId &&
+		get().lease === "controller" &&
+		!get().reconciling,
 }));
 
 serverFrameBus.addEventListener("frame", ((event: CustomEvent<WsServerMessage>) => {

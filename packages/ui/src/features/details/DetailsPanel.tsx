@@ -20,6 +20,7 @@ import { tt } from "../../lib/i18n";
 import { forkFromEntry } from "../../lib/session-controller";
 import { cn } from "../../lib/utils";
 import { useProjectionStore } from "../../stores/projection";
+import { useSessionControlStore } from "../../stores/session-control";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { useTransportStore } from "../../stores/transport";
 import { type RightPanelMode, useViewStore } from "../../stores/view";
@@ -177,11 +178,13 @@ function TreeNodeView({
 	depth,
 	leafId,
 	onFork,
+	canFork,
 }: {
 	node: SessionTreeNode;
 	depth: number;
 	leafId: string | null;
 	onFork: (entryId: string) => void;
+	canFork: boolean;
 }) {
 	const [expanded, setExpanded] = useState(depth < 2);
 	const Icon = entryIcon(node.entry);
@@ -229,8 +232,9 @@ function TreeNodeView({
 							<button
 								type="button"
 								aria-label={tt("details.forkFromHere")}
-								className="flex size-5 shrink-0 items-center justify-center rounded-sm text-ink-3 opacity-0 group-hover:opacity-100 hover:bg-hover hover:text-primary"
+								className="flex size-5 shrink-0 items-center justify-center rounded-sm text-ink-3 opacity-0 group-hover:opacity-100 hover:bg-hover hover:text-primary disabled:cursor-not-allowed disabled:opacity-30"
 								onClick={() => onFork(node.entry.id)}
+								disabled={!canFork}
 							>
 								<GitFork className="size-3.5" />
 							</button>
@@ -248,6 +252,7 @@ function TreeNodeView({
 							depth={depth + 1}
 							leafId={leafId}
 							onFork={onFork}
+							canFork={canFork}
 						/>
 					))}
 				</div>
@@ -258,6 +263,7 @@ function TreeNodeView({
 
 function TreeView() {
 	const workspaceId = useSessionDirectoryStore((s) => s.currentWorkspaceId);
+	const canFork = useSessionControlStore((s) => s.canControl(workspaceId));
 	const [tree, setTree] = useState<SessionTreeNode[]>([]);
 	const [leafId, setLeafId] = useState<string | null>(null);
 	const [loading, setLoading] = useState(true);
@@ -314,6 +320,7 @@ function TreeView() {
 							depth={0}
 							leafId={leafId}
 							onFork={(id) => void fork(id)}
+							canFork={canFork}
 						/>
 					))
 				)}

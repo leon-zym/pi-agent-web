@@ -19,11 +19,22 @@ interface ProjectionState {
 }
 
 function prune(state: ProjectionState): ProjectionState {
-	if (state.order.length <= MAX_CACHED_SESSIONS) return state;
-	const drop = state.order.slice(MAX_CACHED_SESSIONS);
 	const projections = { ...state.projections };
-	for (const sessionId of drop) delete projections[sessionId];
-	return { ...state, projections, order: state.order.slice(0, MAX_CACHED_SESSIONS) };
+	const order = [...state.order];
+	while (order.length > MAX_CACHED_SESSIONS) {
+		const index = order.findLastIndex((sessionId) => {
+			const projection = projections[sessionId];
+			return sessionId !== state.currentSessionId && projection?.activeTurnId === null;
+		});
+		if (index === -1) break;
+		const [sessionId] = order.splice(index, 1);
+		if (sessionId) delete projections[sessionId];
+	}
+	return { ...state, projections, order };
+}
+
+function touch(order: string[], sessionId: string): string[] {
+	return [sessionId, ...order.filter((id) => id !== sessionId)];
 }
 
 export const useProjectionStore = create<ProjectionState>()((set, get) => ({
@@ -38,7 +49,7 @@ export const useProjectionStore = create<ProjectionState>()((set, get) => ({
 			now: Date.now(),
 			resolveInjectionSource: (text) => useComposerStore.getState().consumeInjectionSource(text),
 		});
-		const order = state.order.includes(sessionId) ? state.order : [...state.order, sessionId];
+		const order = touch(state.order, sessionId);
 		set(prune({ ...state, projections: { ...state.projections, [sessionId]: next }, order }));
 	},
 
@@ -48,7 +59,7 @@ export const useProjectionStore = create<ProjectionState>()((set, get) => ({
 		// Snapshot must never clobber a running turn.
 		if (projection && !projection.replayable) return;
 		const next = rebuildProjectionFromMessages(sessionId, messages);
-		const order = state.order.includes(sessionId) ? state.order : [...state.order, sessionId];
+		const order = touch(state.order, sessionId);
 		set(prune({ ...state, projections: { ...state.projections, [sessionId]: next }, order }));
 	},
 
@@ -59,7 +70,16 @@ export const useProjectionStore = create<ProjectionState>()((set, get) => ({
 		set({ ...state, projections, order: state.order.filter((id) => id !== sessionId) });
 	},
 
-	setCurrentSession: (sessionId) => set({ currentSessionId: sessionId }),
+	setCurrentSession: (sessionId) => {
+		const state = get();
+		set(
+			prune({
+				...state,
+				currentSessionId: sessionId,
+				order: sessionId ? touch(state.order, sessionId) : state.order,
+			}),
+		);
+	},
 }));
 
 /** Selector: the active (running) turn id of the current session, or null. */
@@ -211,14 +231,38 @@ export function rebuildProjectionFromMessages(
 							.filter((b) => b.type === "text")
 							.map((b) => b.text ?? "")
 							.join("\n");
-			step.toolResults.push({
+			const result = {
 				toolCallId: message.toolCallId ?? "",
 				toolName: message.toolName ?? "",
 				content,
 				isError: message.isError ?? false,
 				details: message.details,
-			});
+			};
+			applyToolResult(step, result);
 		}
 	}
 	return projection;
+}
+
+function applyToolResult(
+	step: ConversationProjection["turns"][number]["steps"][number],
+	result: ConversationProjection["turns"][number]["steps"][number]["toolResults"][number],
+): void {
+	const existing = step.toolResults.findIndex((entry) => entry.toolCallId === result.toolCallId);
+	if (existing === -1) step.toolResults.push(result);
+	else {
+		const previous = step.toolResults[existing];
+		if (previous) {
+			step.toolResults[existing] = {
+				...result,
+				isError: previous.isError || result.isError,
+			};
+		}
+	}
+	if (!result.isError) return;
+	const block = step.blocks.find(
+		(entry): entry is Extract<(typeof step.blocks)[number], { type: "tool_call" }> =>
+			entry.type === "tool_call" && entry.toolCallId === result.toolCallId,
+	);
+	if (block) block.status = "error";
 }

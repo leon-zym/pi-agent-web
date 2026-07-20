@@ -72,11 +72,12 @@ export function ToolCallRow({ block, results }: { block: ToolCallBlock; results:
 	const [expanded, setExpanded] = useState(false);
 	const presenter = getToolPresenter(block.toolName);
 	const summary = presenter.summarize({ block, results });
-	const status = STATUS_ICON[block.status];
+	const effectiveStatus = results.some((result) => result.isError) ? "error" : block.status;
+	const status = STATUS_ICON[effectiveStatus];
 	const StatusIcon = status.icon;
 	const isBash = block.toolName === "bash";
 
-	const output = block.partialOutput ?? flattenResult(block.result) ?? results[0]?.content ?? "";
+	const output = block.partialOutput || flattenResult(block.result) || results[0]?.content || "";
 	const fullOutputPath =
 		typeof block.result === "object" && block.result !== null
 			? ((block.result as Record<string, unknown>).fullOutputPath as string | undefined)

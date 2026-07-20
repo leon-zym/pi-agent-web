@@ -18,9 +18,22 @@ interface SessionDirectoryState {
 	addWorkspace: (path: string) => Promise<WorkspaceSummary>;
 	removeWorkspace: (workspaceId: string) => Promise<void>;
 	selectWorkspace: (workspaceId: string) => Promise<void>;
-	reloadSessions: () => Promise<void>;
+	reloadSessions: () => Promise<SessionSummary[]>;
 	setCurrentSession: (session: SessionSummary | null) => void;
 	setSearchQuery: (query: string) => void;
+}
+
+const sessionRequestByWorkspace = new Map<string, number>();
+let sessionRequestCounter = 0;
+
+function nextSessionRequest(workspaceId: string): number {
+	sessionRequestCounter += 1;
+	sessionRequestByWorkspace.set(workspaceId, sessionRequestCounter);
+	return sessionRequestCounter;
+}
+
+function isLatestSessionRequest(workspaceId: string, request: number): boolean {
+	return sessionRequestByWorkspace.get(workspaceId) === request;
 }
 
 export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, get) => ({
@@ -58,6 +71,9 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 		await api.removeWorkspace(workspaceId);
 		if (get().currentWorkspaceId === workspaceId) {
 			set({ currentWorkspaceId: null, sessions: [], currentSession: null });
+			useProjectionStore.getState().setCurrentSession(null);
+			useTransportStore.getState().setListen(null, null);
+			useSessionControlStore.getState().selectWorkspace(null);
 		}
 		await get().loadWorkspaces();
 	},
@@ -70,11 +86,16 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 		useTransportStore.getState().setListen(workspaceId, null);
 		useSessionControlStore.getState().selectWorkspace(workspaceId);
 		useSessionControlStore.getState().claim(workspaceId);
+		const request = nextSessionRequest(workspaceId);
 		try {
 			const { sessions } = await api.listSessions(workspaceId);
-			set({ sessions, loadingSessions: false });
+			if (get().currentWorkspaceId === workspaceId && isLatestSessionRequest(workspaceId, request)) {
+				set({ sessions, loadingSessions: false });
+			}
 		} catch (error) {
-			set({ loadingSessions: false, error: error instanceof Error ? error.message : String(error) });
+			if (get().currentWorkspaceId === workspaceId && isLatestSessionRequest(workspaceId, request)) {
+				set({ loadingSessions: false, error: error instanceof Error ? error.message : String(error) });
+			}
 		}
 		// Warm up the workspace process (fires spawn + ready handshake).
 		void useTransportStore
@@ -85,9 +106,12 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 
 	reloadSessions: async () => {
 		const workspaceId = get().currentWorkspaceId;
-		if (!workspaceId) return;
+		if (!workspaceId) return [];
+		const request = nextSessionRequest(workspaceId);
 		const { sessions } = await api.listSessions(workspaceId);
-		set({ sessions });
+		if (get().currentWorkspaceId === workspaceId && isLatestSessionRequest(workspaceId, request))
+			set({ sessions });
+		return sessions;
 	},
 
 	setCurrentSession: (session) => set({ currentSession: session }),

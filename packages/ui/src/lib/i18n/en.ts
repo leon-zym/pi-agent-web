@@ -235,6 +235,7 @@ export const en: typeof zhCN = {
 
 	// Session controller toasts
 	"session.loadFailed": "Failed to load session content",
+	"session.recoveryFailed": "Unable to restore the Host session. Select a session and try again.",
 	"session.switchCancelled": "Session switch cancelled by an extension",
 	"session.openFailed": "Failed to open session",
 	"session.newCancelled": "New session cancelled by an extension",

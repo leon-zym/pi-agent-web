@@ -20,6 +20,9 @@ describe("session controller lease", () => {
 			file: "/tmp/session-a.jsonl",
 			epoch: 4,
 		});
+		useSessionControlStore.getState().setReconciling("workspace-a", true);
+		expect(useSessionControlStore.getState().canControl("workspace-a")).toBe(false);
+		useSessionControlStore.getState().setReconciling("workspace-a", false);
 
 		emitServerFrame({ type: "lease_status", workspaceId: "workspace-a", isController: false });
 		expect(useSessionControlStore.getState().canControl("workspace-a")).toBe(false);

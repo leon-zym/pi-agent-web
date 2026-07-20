@@ -4,13 +4,17 @@ import { useComposerStore } from "../stores/composer";
 import { useExtensionUiStore } from "../stores/extension-ui";
 import { useModelDirectoryStore } from "../stores/model-directory";
 import { useProjectionStore } from "../stores/projection";
+import { useSessionControlStore } from "../stores/session-control";
 import { useSessionDirectoryStore } from "../stores/session-directory";
 import { useSessionStatsStore } from "../stores/session-stats";
 import { useSlashCommandsStore } from "../stores/slash-commands";
 import { emitServerFrame, serverFrameBus, useTransportStore } from "../stores/transport";
+import { useViewStore } from "../stores/view";
 import { tt } from "./i18n";
 
 let initialized = false;
+let reconcileGeneration = 0;
+let unrecoverableSession: { workspaceId: string; sessionId: string | null; epoch: number } | null = null;
 
 /**
  * Wire message -> domain store routing (single pipeline, no components
@@ -29,6 +33,9 @@ export function initPipeline(): void {
 	window.addEventListener("piweb:ws-online", () => {
 		void runReconnectSnapshot();
 	});
+	window.addEventListener("piweb:session-stale", () => {
+		void runReconnectSnapshot();
+	});
 }
 
 function routeFrame(message: WsServerMessage): void {
@@ -38,6 +45,9 @@ function routeFrame(message: WsServerMessage): void {
 			return;
 		case "extension_ui_request":
 			routeExtensionUiRequest(message);
+			return;
+		case "session_state":
+			routeSessionState(message);
 			return;
 		case "session_directory_changed":
 			if (useSessionDirectoryStore.getState().currentWorkspaceId === message.workspaceId) {
@@ -52,8 +62,36 @@ function routeFrame(message: WsServerMessage): void {
 	}
 }
 
+function isCurrentScope(workspaceId: string, sessionId: string, epoch: number): boolean {
+	const directory = useSessionDirectoryStore.getState();
+	const control = useSessionControlStore.getState();
+	return (
+		directory.currentWorkspaceId === workspaceId &&
+		directory.currentSession?.id === sessionId &&
+		control.workspaceId === workspaceId &&
+		control.session.id === sessionId &&
+		control.session.epoch === epoch &&
+		!control.reconciling
+	);
+}
+
+function routeSessionState(message: Extract<WsServerMessage, { type: "session_state" }>): void {
+	const directory = useSessionDirectoryStore.getState();
+	if (directory.currentWorkspaceId !== message.workspaceId) return;
+	useExtensionUiStore.getState().clearDialogsOutside(message.workspaceId, message.sessionId, message.epoch);
+	if (
+		unrecoverableSession?.workspaceId === message.workspaceId &&
+		unrecoverableSession.sessionId === message.sessionId &&
+		unrecoverableSession.epoch === message.epoch
+	)
+		return;
+	unrecoverableSession = null;
+	if (directory.currentSession?.id !== message.sessionId) void reconcileHostSession(message.workspaceId);
+}
+
 function routeEvent(message: Extract<WsServerMessage, { type: "event" }>): void {
-	const { event, sessionId } = message;
+	const { event, sessionId, workspaceId, epoch } = message;
+	if (!isCurrentScope(workspaceId, sessionId, epoch)) return;
 
 	switch (event.type) {
 		case "queue_update":
@@ -63,9 +101,7 @@ function routeEvent(message: Extract<WsServerMessage, { type: "event" }>): void 
 			useModelDirectoryStore.getState().applyThinkingLevel(event.level);
 			return;
 		case "session_info_changed":
-			if (useSessionDirectoryStore.getState().currentWorkspaceId === message.workspaceId) {
-				void useSessionDirectoryStore.getState().reloadSessions();
-			}
+			void useSessionDirectoryStore.getState().reloadSessions();
 			return;
 		case "message_update":
 			useSessionStatsStore.getState().applyLiveUsage({
@@ -88,7 +124,8 @@ function routeEvent(message: Extract<WsServerMessage, { type: "event" }>): void 
 }
 
 function routeExtensionUiRequest(message: Extract<WsServerMessage, { type: "extension_ui_request" }>): void {
-	const { request, workspaceId, sessionId } = message;
+	const { request, workspaceId, sessionId, epoch } = message;
+	if (!isCurrentScope(workspaceId, sessionId, epoch)) return;
 	const extensionUi = useExtensionUiStore.getState();
 
 	switch (request.method) {
@@ -96,7 +133,7 @@ function routeExtensionUiRequest(message: Extract<WsServerMessage, { type: "exte
 		case "confirm":
 		case "input":
 		case "editor":
-			extensionUi.pushDialog({ request, workspaceId, sessionId, receivedAt: Date.now() });
+			extensionUi.pushDialog({ request, workspaceId, sessionId, epoch, receivedAt: Date.now() });
 			return;
 		case "notify":
 			if (request.notifyType === "error") toast.error(request.message);
@@ -121,41 +158,82 @@ function routeExtensionUiRequest(message: Extract<WsServerMessage, { type: "exte
 }
 
 /**
- * Reconnect snapshot protocol: get_state -> get_messages
- * -> get_commands -> model directory -> stats. Live events keep applying.
+ * Reconnect snapshot protocol is Host-authoritative. It first identifies the
+ * active Host session, then updates all selection stores before rebuilding.
  */
 async function runReconnectSnapshot(): Promise<void> {
 	const directory = useSessionDirectoryStore.getState();
 	const workspaceId = directory.currentWorkspaceId;
 	if (!workspaceId) return;
+	await reconcileHostSession(workspaceId);
+}
+
+async function reconcileHostSession(workspaceId: string): Promise<void> {
+	const generation = ++reconcileGeneration;
+	useSessionControlStore.getState().setReconciling(workspaceId, true);
 
 	const transport = useTransportStore.getState();
 	try {
-		const stateResponse = await transport.sendCommand(workspaceId, { type: "get_state" }, 15_000);
+		const stateResponse = await transport.sendCommand(workspaceId, { type: "get_state" }, 30_000);
 		const state = expectData(stateResponse) as { sessionId: string; sessionFile?: string };
-		const projectionStore = useProjectionStore.getState();
-		const session = directory.currentSession;
+		if (!isCurrentWorkspace(workspaceId, generation)) return;
 
-		if (session && state.sessionId !== session.id) {
-			// The server switched sessions while we were away: drop the stale projection.
-			projectionStore.resetSession(session.id);
+		const sessions = await useSessionDirectoryStore.getState().reloadSessions();
+		if (!isCurrentWorkspace(workspaceId, generation)) return;
+		const session = sessions.find((summary) => summary.id === state.sessionId);
+		if (!session) {
+			clearRecoveredSession(workspaceId, state.sessionId);
+			toast.error(tt("session.recoveryFailed"));
+			return;
 		}
 
-		if (session) {
-			useTransportStore.getState().setListen(workspaceId, state.sessionId);
-			const messagesResponse = await transport.sendCommand(workspaceId, { type: "get_messages" }, 20_000);
-			const { messages } = expectData(messagesResponse) as {
-				messages: Parameters<typeof projectionStore.rebuildFromMessages>[1];
-			};
-			projectionStore.rebuildFromMessages(state.sessionId, messages);
-		}
+		useSessionDirectoryStore.getState().setCurrentSession(session);
+		unrecoverableSession = null;
+		useProjectionStore.getState().setCurrentSession(session.id);
+		useViewStore.getState().clearSession();
+		useTransportStore.getState().setListen(workspaceId, session.id);
+
+		const control = useSessionControlStore.getState();
+		const epoch = control.workspaceId === workspaceId ? control.session.epoch : 0;
+		const messagesResponse = await transport.sendCommand(workspaceId, { type: "get_messages" }, 30_000);
+		const { messages } = expectData(messagesResponse) as {
+			messages: Parameters<ReturnType<typeof useProjectionStore.getState>["rebuildFromMessages"]>[1];
+		};
+		if (!isCurrentScope(workspaceId, session.id, epoch) || generation !== reconcileGeneration) return;
+		useProjectionStore.getState().rebuildFromMessages(session.id, messages);
 
 		void useSlashCommandsStore.getState().refresh(workspaceId);
 		void useModelDirectoryStore.getState().refresh(workspaceId);
 		void useSessionStatsStore.getState().refresh(workspaceId);
 	} catch {
 		// Process may be starting; the next online event retries.
+	} finally {
+		if (generation === reconcileGeneration)
+			useSessionControlStore.getState().setReconciling(workspaceId, false);
 	}
+}
+
+function isCurrentWorkspace(workspaceId: string, generation: number): boolean {
+	return (
+		generation === reconcileGeneration &&
+		useSessionDirectoryStore.getState().currentWorkspaceId === workspaceId
+	);
+}
+
+function clearRecoveredSession(workspaceId: string, sessionId: string): void {
+	const control = useSessionControlStore.getState();
+	unrecoverableSession = {
+		workspaceId,
+		sessionId,
+		epoch: control.workspaceId === workspaceId ? control.session.epoch : 0,
+	};
+	useSessionDirectoryStore.getState().setCurrentSession(null);
+	useProjectionStore.getState().setCurrentSession(null);
+	useViewStore.getState().clearSession();
+	useSessionStatsStore.getState().clear();
+	useComposerStore.getState().setQueue({ steering: [], followUp: [] });
+	useExtensionUiStore.getState().clearDialogsOutside(workspaceId, null, 0);
+	useTransportStore.getState().setListen(workspaceId, null);
 }
 
 /**

@@ -232,6 +232,7 @@ export const zhCN = {
 
 	// Session controller toasts
 	"session.loadFailed": "加载会话内容失败",
+	"session.recoveryFailed": "未能恢复 Host 当前会话，请重新选择会话后再试",
 	"session.switchCancelled": "会话切换已被扩展取消",
 	"session.openFailed": "打开会话失败",
 	"session.newCancelled": "新建会话已被扩展取消",

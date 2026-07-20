@@ -25,7 +25,8 @@ import { useSessionControlStore } from "../../stores/session-control";
 export function ExtensionDialogs() {
 	const dialogs = useExtensionUiStore((s) => s.dialogs);
 	const dialog = dialogs[0];
-	if (!dialog) return null;
+	const canControl = useSessionControlStore((s) => s.canControl(dialog?.workspaceId ?? null));
+	if (!dialog || !canControl) return null;
 	return <DialogView key={dialog.request.id} dialog={dialog} />;
 }
 
