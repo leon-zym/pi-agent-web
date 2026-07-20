@@ -68,8 +68,13 @@ interface WorkspaceRuntime {
 	manuallyStopped: boolean;
 	startPromise: Promise<void> | null;
 	generation: number;
-	pendingDialogs: Map<string, string>;
+	pendingDialogs: Map<string, PendingDialog>;
 	transitionTail: Promise<void>;
+}
+
+interface PendingDialog {
+	sessionId: string;
+	timer: NodeJS.Timeout | null;
 }
 
 const DIALOG_METHODS = new Set(["select", "confirm", "input", "editor"]);
@@ -249,6 +254,7 @@ export class Supervisor {
 		info: { code: number | null; signal: NodeJS.Signals | null; stderrTail: string },
 	): void {
 		if (rt.generation !== generation) return;
+		this.clearAllDialogs(rt);
 		rt.proc = null;
 		rt.status = "crashed";
 		rt.lastError =
@@ -291,6 +297,7 @@ export class Supervisor {
 			clearTimeout(rt.restartTimer);
 			rt.restartTimer = null;
 		}
+		this.clearAllDialogs(rt);
 		await rt.proc?.stop();
 		rt.proc = null;
 		await this.spawnProcess(rt);
@@ -308,7 +315,7 @@ export class Supervisor {
 		await rt.proc?.stop();
 		rt.proc = null;
 		rt.status = "crashed";
-		rt.pendingDialogs.clear();
+		this.clearAllDialogs(rt);
 	}
 
 	/** Stop every workspace process (server shutdown). */
@@ -425,6 +432,8 @@ export class Supervisor {
 		const changed = rt.session.id !== state.sessionId || rt.session.file !== nextFile;
 		if (!changed) return;
 		const previousId = rt.session.id;
+		if (previousId && previousId !== state.sessionId)
+			this.cancelDialogsForSession(rt.workspaceId, previousId);
 		rt.session = { id: state.sessionId, file: nextFile, epoch: rt.session.epoch + 1 };
 		if (previousId !== state.sessionId) this.log("info", `active session changed to ${state.sessionId}`);
 		this.broadcastSessionState(rt);
@@ -440,9 +449,9 @@ export class Supervisor {
 		const rt = this.runtimes.get(workspaceId);
 		if (!rt || rt.controllerConnectionId !== control.connectionId) return "workspace_read_only";
 		if (control.expectedSessionId !== rt.session.id) return "session_stale";
-		const dialogSessionId = rt.pendingDialogs.get(response.id);
-		if (!dialogSessionId || (sessionId !== undefined && sessionId !== dialogSessionId)) return "no_dialog";
-		rt.pendingDialogs.delete(response.id);
+		const dialog = rt.pendingDialogs.get(response.id);
+		if (!dialog || (sessionId !== undefined && sessionId !== dialog.sessionId)) return "no_dialog";
+		this.clearDialog(rt, response.id);
 		if (!rt.proc?.running) return "no_dialog";
 		rt.proc.sendNoResponse(response);
 		return "accepted";
@@ -457,9 +466,9 @@ export class Supervisor {
 		const rt = this.runtimes.get(workspaceId);
 		if (!rt) return 0;
 		let cancelled = 0;
-		for (const [requestId, openedSessionId] of rt.pendingDialogs) {
-			if (openedSessionId === sessionId) {
-				rt.pendingDialogs.delete(requestId);
+		for (const [requestId, dialog] of rt.pendingDialogs) {
+			if (dialog.sessionId === sessionId) {
+				this.clearDialog(rt, requestId);
 				if (rt.proc?.running) {
 					rt.proc.sendNoResponse({ type: "extension_ui_response", id: requestId, cancelled: true });
 				}
@@ -477,7 +486,13 @@ export class Supervisor {
 	private handleEvent(rt: WorkspaceRuntime, generation: number, event: JsonAgentSessionEvent): void {
 		if (rt.generation !== generation) return;
 		const sessionId = rt.session.id ?? "";
-		this.opts.broadcast({ type: "event", workspaceId: rt.workspaceId, sessionId, event });
+		this.opts.broadcast({
+			type: "event",
+			workspaceId: rt.workspaceId,
+			sessionId,
+			epoch: rt.session.epoch,
+			event,
+		});
 	}
 
 	private handleExtensionUiRequest(
@@ -488,9 +503,42 @@ export class Supervisor {
 		if (rt.generation !== generation) return;
 		const sessionId = rt.session.id ?? "";
 		if (DIALOG_METHODS.has(request.method)) {
-			rt.pendingDialogs.set(request.id, sessionId);
+			this.clearDialog(rt, request.id);
+			const timeout =
+				"timeout" in request && typeof request.timeout === "number" && request.timeout > 0
+					? request.timeout
+					: undefined;
+			const timer = timeout ? setTimeout(() => this.expireDialog(rt, generation, request.id), timeout) : null;
+			timer?.unref?.();
+			rt.pendingDialogs.set(request.id, { sessionId, timer });
 		}
-		this.opts.broadcast({ type: "extension_ui_request", workspaceId: rt.workspaceId, sessionId, request });
+		this.opts.broadcast({
+			type: "extension_ui_request",
+			workspaceId: rt.workspaceId,
+			sessionId,
+			epoch: rt.session.epoch,
+			request,
+		});
+	}
+
+	private clearDialog(rt: WorkspaceRuntime, requestId: string): void {
+		const dialog = rt.pendingDialogs.get(requestId);
+		if (!dialog) return;
+		if (dialog.timer) clearTimeout(dialog.timer);
+		rt.pendingDialogs.delete(requestId);
+	}
+
+	private clearAllDialogs(rt: WorkspaceRuntime): void {
+		for (const requestId of rt.pendingDialogs.keys()) this.clearDialog(rt, requestId);
+	}
+
+	private expireDialog(rt: WorkspaceRuntime, generation: number, requestId: string): void {
+		if (rt.generation !== generation || !rt.pendingDialogs.has(requestId)) return;
+		this.clearDialog(rt, requestId);
+		if (rt.proc?.running) {
+			rt.proc.sendNoResponse({ type: "extension_ui_response", id: requestId, cancelled: true });
+		}
+		this.log("info", `extension dialog ${requestId} expired for workspace ${rt.workspaceId}`);
 	}
 
 	private broadcastStatus(rt: WorkspaceRuntime, state: ProcessState): void {

@@ -211,8 +211,14 @@ export type PiWebSessionEvent = JsonAgentSessionEvent | ExtensionErrorEvent;
 
 export type WsServerMessage =
 	| { type: "response"; workspaceId: string; response: RpcResponse }
-	| { type: "event"; workspaceId: string; sessionId: string; event: PiWebSessionEvent }
-	| { type: "extension_ui_request"; workspaceId: string; sessionId: string; request: RpcExtensionUIRequest }
+	| { type: "event"; workspaceId: string; sessionId: string; epoch: number; event: PiWebSessionEvent }
+	| {
+			type: "extension_ui_request";
+			workspaceId: string;
+			sessionId: string;
+			epoch: number;
+			request: RpcExtensionUIRequest;
+	  }
 	| { type: "process_status"; workspaceId: string; state: "starting" | "running" | "crashed"; error?: string }
 	| { type: "lease_status"; workspaceId: string; isController: boolean }
 	| {

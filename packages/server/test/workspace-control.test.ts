@@ -110,6 +110,10 @@ describe("workspace controller leases", () => {
 		await expect(bLease).resolves.toMatchObject({ workspaceId, isController: false });
 
 		const stateResponse = responseFor(a, "a-state");
+		const sessionState = frameFor(
+			a,
+			(frame) => frame.type === "session_state" && frame.sessionId === "fake-session" && frame.epoch === 1,
+		);
 		a.send(
 			JSON.stringify({
 				type: "command",
@@ -119,6 +123,10 @@ describe("workspace controller leases", () => {
 			}),
 		);
 		await expect(stateResponse).resolves.toMatchObject({ success: true });
+		await expect(sessionState).resolves.toMatchObject({
+			workspaceId,
+			sessionFile: "/tmp/fake-session.jsonl",
+		});
 
 		for (const command of [
 			{ id: "b-prompt", type: "prompt", message: "blocked" },
@@ -168,6 +176,26 @@ describe("workspace controller leases", () => {
 		);
 		await new Promise((resolve) => setTimeout(resolve, 20));
 		expect(handle.supervisor.cancelDialogsForSession(workspaceId, "fake-session")).toBe(1);
+
+		const timeoutDialog = frameFor(
+			a,
+			(frame) =>
+				frame.type === "extension_ui_request" &&
+				(frame.request as { id?: unknown }).id === "fake-timeout-dialog",
+		);
+		const timeoutPrompt = responseFor(a, "a-timeout-dialog");
+		a.send(
+			JSON.stringify({
+				type: "command",
+				workspaceId,
+				expectedSessionId: "fake-session",
+				command: { id: "a-timeout-dialog", type: "prompt", message: "timeout-dialog" },
+			}),
+		);
+		await expect(timeoutPrompt).resolves.toMatchObject({ success: true });
+		await expect(timeoutDialog).resolves.toMatchObject({ epoch: expect.any(Number) });
+		await new Promise((resolve) => setTimeout(resolve, 40));
+		expect(handle.supervisor.cancelDialogsForSession(workspaceId, "fake-session")).toBe(0);
 
 		const bReleasedLease = frameFor(
 			b,

@@ -79,6 +79,16 @@ function handleLine(line) {
 					message: "Fixture dialog",
 				});
 			}
+			if (command.message === "timeout-dialog") {
+				send({
+					type: "extension_ui_request",
+					id: "fake-timeout-dialog",
+					method: "confirm",
+					title: "Timed confirm",
+					message: "Fixture timeout dialog",
+					timeout: 20,
+				});
+			}
 			send({ type: "response", id: command.id, command: command.type, success: true });
 			return;
 		case "get_last_assistant_text":

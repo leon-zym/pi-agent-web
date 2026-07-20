@@ -33,6 +33,12 @@ function makeStub(): StubSupervisor & Record<string, unknown> {
 	(stub as unknown as Record<string, unknown>).claimController = () => true;
 	(stub as unknown as Record<string, unknown>).releaseController = () => true;
 	(stub as unknown as Record<string, unknown>).isController = () => true;
+	(stub as unknown as Record<string, unknown>).getStatus = () => ({
+		state: "running",
+		sessionId: "s1",
+		sessionFile: "/tmp/s1.jsonl",
+		epoch: 1,
+	});
 	(stub as unknown as Record<string, unknown>).sendCommand = async () => ({
 		type: "response",
 		command: "get_state",

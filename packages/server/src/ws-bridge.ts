@@ -196,6 +196,7 @@ export class WsBridge {
 					conn.controlledWorkspaces.add(message.workspaceId);
 				}
 				this.broadcastLeaseStatus(message.workspaceId);
+				this.sendSessionState(conn, message.workspaceId);
 				return;
 			}
 			case "session_release": {
@@ -329,6 +330,7 @@ export class WsBridge {
 			conn.controlledWorkspaces.add(workspaceId);
 		}
 		this.broadcastLeaseStatus(workspaceId);
+		this.sendSessionState(conn, workspaceId);
 		if (sessionId !== null) {
 			const key = keyOf(workspaceId, sessionId);
 			this.listenCounts.set(key, (this.listenCounts.get(key) ?? 0) + 1);
@@ -362,6 +364,18 @@ export class WsBridge {
 			type: "lease_status",
 			workspaceId,
 			isController: this.supervisor.isController(workspaceId, conn.connectionId),
+		});
+	}
+
+	private sendSessionState(conn: ConnectionState, workspaceId: string): void {
+		const status = this.supervisor.getStatus(workspaceId);
+		if (!status) return;
+		this.sendTargeted(conn, {
+			type: "session_state",
+			workspaceId,
+			sessionId: status.sessionId,
+			sessionFile: status.sessionFile,
+			epoch: status.epoch,
 		});
 	}
 }
