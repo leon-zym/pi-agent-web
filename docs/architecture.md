@@ -19,19 +19,20 @@ Web Gateway (Node.js, Hono + ws)
 ## 进程模型（关键不变量）
 
 1. **1 Workspace = 1 进程**：进程 cwd 与扩展/技能/项目设置在启动时固定；`switch_session` / `new_session` / `fork` 只替换进程内部会话，不改变 cwd。
-2. **同工作区切会话复用进程**；**跨工作区切会话必须重启进程**。Supervisor 在 `switch_session` 前同时校验会话目录与首行 Header 的 `cwd` 真实路径；目录编码只用于定位，不能作为工作区归属依据。
+2. **同工作区切会话复用进程**；跨工作区 `switch_session` 一律拒绝。浏览器必须先显式选择目标 Workspace，再打开其中的会话；Supervisor 在 `switch_session` 前同时校验会话目录与首行 Header 的 `cwd` 真实路径，目录编码只用于定位，不能作为工作区归属依据。
 3. **就绪握手**：协议没有就绪帧。spawn 后发送 `get_state{id:"ready-1"}`，收到同 id response 视为就绪；超时（默认 10s）杀进程并广播 `process_status: "crashed"`。就绪后立即 `get_commands` 预热 Slash 菜单。
 4. **崩溃容错**：进程退出时 Supervisor 合成 `process_status: "crashed"`（死进程无法自报）。30 秒窗口内自动重启上限 3 次（指数退避），超出后仅保留手动重启。
 5. **断连保护**：WS 网关按 (workspaceId, sessionId) 聚合连接计数；归零时代发 `extension_ui_response{cancelled:true}`（幂等，超时已降级的请求会被 Agent 静默忽略）。
 6. **会话文件安全**：`get_state.sessionFile` 是运行中会话的文件身份；删除、`new_session`、`fork`、`clone` 和 `switch_session` 通过同一工作区互斥队列串行，删除前以规范化文件路径比对活动文件并检查同工作区子会话。
 7. **stderr 单独收集**：RPC 模式接管 stdout，第三方写 stdout 会被重定向到 stderr；网关只把解析成功的 stdout 帧转发，脏行丢弃。
+8. **控制权与会话纪元**：每个 Workspace 同时只能有一个 WS controller；控制命令携带 `expectedSessionId`，Supervisor 在互斥队列内验证 lease 与会话身份。`session_state` 广播 `{ id, file, epoch }`，断开 controller 后 lease 自动释放。
 
 ## 数据流
 
 ```text
 用户提交 → Composer 状态机（plain / trigger / submitting）
   → WsClientMessage{command} → Supervisor.sendCommand
-      → 跨工作区校验 → PiProcess.send（自动补 id）
+      → controller / expectedSessionId / 工作区归属校验 → PiProcess.send（自动补 id）
       → pi 进程执行 → stdout 三类帧：
           response  → 按 id 回给发起连接（仅该标签页）
           event     → 按 (workspace, session) 广播给声明监听的连接

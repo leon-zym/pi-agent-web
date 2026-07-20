@@ -8,7 +8,8 @@ import { Input } from "../../components/ui/input";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
 import { formatRelativeTime } from "../../lib/format";
 import { tt } from "../../lib/i18n";
-import { deleteSession, renameSession } from "../../lib/session-controller";
+import { deleteSession, renameSession, sendControlCommand } from "../../lib/session-controller";
+import { useSessionControlStore } from "../../stores/session-control";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { useTransportStore } from "../../stores/transport";
 import { useViewStore } from "../../stores/view";
@@ -25,6 +26,7 @@ export function SessionHeader() {
 	const workspace = useSessionDirectoryStore((s) => s.workspaces.find((w) => w.id === s.currentWorkspaceId));
 	const currentSession = useSessionDirectoryStore((s) => s.currentSession);
 	const workspaceId = useSessionDirectoryStore((s) => s.currentWorkspaceId);
+	const canControl = useSessionControlStore((s) => s.canControl(workspaceId));
 	const processStatus = useTransportStore((s) => (workspaceId ? s.processStatus[workspaceId] : undefined));
 	const setRightPanelMode = useViewStore((s) => s.setRightPanelMode);
 	const setRightPanelOpen = useViewStore((s) => s.setRightPanelOpen);
@@ -52,7 +54,7 @@ export function SessionHeader() {
 	const exportHtml = async () => {
 		if (!workspaceId) return;
 		try {
-			const response = await useTransportStore.getState().sendCommand(workspaceId, { type: "export_html" });
+			const response = await sendControlCommand(workspaceId, { type: "export_html" });
 			const { path } = expectData(response) as { path: string };
 			toast.success(tt("header.exported"), {
 				description: path,
@@ -96,6 +98,7 @@ export function SessionHeader() {
 									size="icon"
 									className="size-6"
 									onClick={() => void commitRename()}
+									disabled={!canControl}
 									aria-label={tt("header.confirmRename")}
 								>
 									<Check className="size-3.5" />
@@ -115,6 +118,7 @@ export function SessionHeader() {
 								type="button"
 								className="group flex min-w-0 items-center gap-1.5 rounded-sm px-1.5 py-0.5 text-ink hover:bg-hover focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
 								onClick={startRename}
+								disabled={!canControl}
 							>
 								<span className="truncate font-medium">{title}</span>
 								<Pencil className="size-3 shrink-0 text-ink-3 opacity-0 transition-opacity group-hover:opacity-100" />
@@ -178,6 +182,7 @@ export function SessionHeader() {
 								size="icon"
 								aria-label={tt("header.exportHtml")}
 								onClick={() => void exportHtml()}
+								disabled={!canControl}
 							>
 								<Download className="size-4" />
 							</Button>
@@ -191,6 +196,7 @@ export function SessionHeader() {
 								size="icon"
 								aria-label={tt("header.deleteSession")}
 								onClick={() => void deleteSession(currentSession)}
+								disabled={!canControl}
 							>
 								<Trash2 className="size-4 text-ink-3" />
 							</Button>

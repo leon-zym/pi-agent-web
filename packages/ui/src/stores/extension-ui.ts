@@ -1,6 +1,6 @@
 import type { RpcExtensionUIRequest, RpcExtensionUIResponse } from "@earendil-works/pi-coding-agent";
 import { create } from "zustand";
-import { useTransportStore } from "./transport";
+import { sendControlExtensionUiResponse } from "../lib/session-controller";
 
 export type DialogRequest = Extract<
 	RpcExtensionUIRequest,
@@ -44,8 +44,7 @@ export const useExtensionUiStore = create<ExtensionUiState>()((set, get) => ({
 	pushDialog: (dialog) => set((s) => ({ dialogs: [...s.dialogs, dialog] })),
 
 	respond: (dialog, response) => {
-		useTransportStore.getState().sendExtensionUiResponse(dialog.workspaceId, response);
-		get().dismissDialog(dialog.request.id);
+		if (sendControlExtensionUiResponse(dialog.workspaceId, response)) get().dismissDialog(dialog.request.id);
 	},
 
 	dismissDialog: (id) => set((s) => ({ dialogs: s.dialogs.filter((d) => d.request.id !== id) })),

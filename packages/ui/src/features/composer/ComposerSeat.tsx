@@ -8,6 +8,7 @@ import { abortCurrentRun, submitDraft } from "../../lib/session-controller";
 import { cn } from "../../lib/utils";
 import { useComposerStore } from "../../stores/composer";
 import { selectActiveTurnId, useProjectionStore } from "../../stores/projection";
+import { useSessionControlStore } from "../../stores/session-control";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { useSlashCommandsStore } from "../../stores/slash-commands";
 import { ContextMeter } from "./ContextMeter";
@@ -53,6 +54,8 @@ export function ComposerSeat() {
 
 	const hasWorkspace = useSessionDirectoryStore((s) => s.currentWorkspaceId !== null);
 	const hasSession = useSessionDirectoryStore((s) => s.currentSession !== null);
+	const currentWorkspaceId = useSessionDirectoryStore((s) => s.currentWorkspaceId);
+	const canControl = useSessionControlStore((s) => s.canControl(currentWorkspaceId));
 	const running = useProjectionStore(selectActiveTurnId) !== null;
 
 	const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -81,7 +84,7 @@ export function ComposerSeat() {
 	}, [draft, commands]);
 
 	const submit = (mode: "prompt" | "steer" | "follow_up") => {
-		if (!hasWorkspace || !hasSession) {
+		if (!hasWorkspace || !hasSession || !canControl) {
 			toast.error(tt("composer.needWorkspaceSession"));
 			return;
 		}
@@ -101,6 +104,7 @@ export function ComposerSeat() {
 	};
 
 	const onKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+		if (!canControl) return;
 		if (event.key === "Enter" && !event.shiftKey && !composing) {
 			event.preventDefault();
 			if (trigger) {
@@ -155,6 +159,11 @@ export function ComposerSeat() {
 	return (
 		<div className="relative mx-auto w-full max-w-[780px] px-4 pb-3">
 			<QueueDock />
+			{hasWorkspace && !canControl && (
+				<p className="mb-2 rounded-sm bg-surface-2 px-3 py-2 text-[12px] text-ink-3">
+					{tt("lease.readOnly")}
+				</p>
+			)}
 			{trigger && (
 				<SlashMenu
 					anchorRef={cardRef}
@@ -204,11 +213,14 @@ export function ComposerSeat() {
 								? tt("composer.pickWorkspace")
 								: !hasSession
 									? tt("composer.pickSession")
-									: running
-										? tt("composer.steerPlaceholder")
-										: tt("composer.defaultPlaceholder")
+									: !canControl
+										? tt("lease.readOnly")
+										: running
+											? tt("composer.steerPlaceholder")
+											: tt("composer.defaultPlaceholder")
 						}
 						rows={1}
+						disabled={!canControl}
 						className="w-full resize-none bg-transparent text-[15px] leading-6 text-ink outline-none placeholder:text-ink-3"
 						style={{ maxHeight: 24 * MAX_LINES }}
 					/>
@@ -233,6 +245,7 @@ export function ComposerSeat() {
 									}
 									focus();
 								}}
+								disabled={!canControl}
 							>
 								<Plus className="size-4 text-ink-3" />
 							</Button>
@@ -246,6 +259,7 @@ export function ComposerSeat() {
 								size="icon"
 								aria-label={tt("composer.addImage")}
 								onClick={() => document.getElementById("piweb-image-input")?.click()}
+								disabled={!canControl}
 							>
 								<ImagePlus className="size-4 text-ink-3" />
 							</Button>
@@ -259,6 +273,7 @@ export function ComposerSeat() {
 						multiple
 						className="hidden"
 						onChange={(event) => pickImage(event.target.files)}
+						disabled={!canControl}
 					/>
 
 					{running && (
@@ -301,6 +316,7 @@ export function ComposerSeat() {
 									aria-label={tt("composer.stop")}
 									className="text-danger"
 									onClick={() => void abortCurrentRun()}
+									disabled={!canControl}
 								>
 									<Square className="size-4 fill-current" />
 								</Button>
@@ -314,7 +330,7 @@ export function ComposerSeat() {
 								size="icon"
 								aria-label={running ? tt("composer.steerSend") : tt("composer.send")}
 								className="size-[34px] rounded-full"
-								disabled={!draft.trim() && images.length === 0 && queueCount === 0}
+								disabled={!canControl || (!draft.trim() && images.length === 0 && queueCount === 0)}
 								onClick={() =>
 									running ? submit(deliveryMode === "follow_up" ? "follow_up" : "steer") : submit("prompt")
 								}

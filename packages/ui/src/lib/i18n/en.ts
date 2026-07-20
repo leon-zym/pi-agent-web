@@ -257,6 +257,9 @@ export const en: typeof zhCN = {
 	"transport.unavailable": "WebSocket unavailable",
 	"transport.commandTimeout": "Command timed out: {command}",
 
+	// Workspace controller lease
+	"lease.readOnly": "Another tab controls this workspace; this tab is read-only",
+
 	// System status rows
 	"system.contextCompacted": "Context compacted",
 	"system.retryScheduled": "Retry {attempt}/{max} in {seconds}s",

@@ -1,9 +1,11 @@
+import { expectData } from "@pi-agent-web/protocol";
 import { Check, CircleAlert, Copy, GitFork, OctagonX } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 import { formatCost, formatDuration, formatTokens } from "../../lib/format";
 import { tt } from "../../lib/i18n";
-import { forkFromEntry } from "../../lib/session-controller";
+import { forkFromEntry, sendReadCommand } from "../../lib/session-controller";
+import { useSessionControlStore } from "../../stores/session-control";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
 import type { ProductTurn } from "../../types/view-models";
 
@@ -14,6 +16,8 @@ import type { ProductTurn } from "../../types/view-models";
  */
 export function TurnTail({ turn }: { turn: ProductTurn }) {
 	const [copied, setCopied] = useState(false);
+	const workspaceId = useSessionDirectoryStore((s) => s.currentWorkspaceId);
+	const canControl = useSessionControlStore((s) => s.canControl(workspaceId));
 
 	const copyTurn = async () => {
 		const text = turn.steps
@@ -30,14 +34,9 @@ export function TurnTail({ turn }: { turn: ProductTurn }) {
 	};
 
 	const forkLast = async () => {
-		const workspaceId = useSessionDirectoryStore.getState().currentWorkspaceId;
 		if (!workspaceId) return;
 		try {
-			const { expectData } = await import("@pi-agent-web/protocol");
-			const { useTransportStore } = await import("../../stores/transport");
-			const response = await useTransportStore
-				.getState()
-				.sendCommand(workspaceId, { type: "get_fork_messages" });
+			const response = await sendReadCommand(workspaceId, { type: "get_fork_messages" });
 			const { messages } = expectData(response) as { messages: Array<{ entryId: string; text: string }> };
 			const last = messages[messages.length - 1];
 			if (!last) {
@@ -91,8 +90,9 @@ export function TurnTail({ turn }: { turn: ProductTurn }) {
 			</button>
 			<button
 				type="button"
-				className="inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-ink-3 transition-colors hover:bg-hover hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
+				className="inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-ink-3 transition-colors hover:bg-hover hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40"
 				onClick={() => void forkLast()}
+				disabled={!canControl}
 			>
 				<GitFork className="size-3" />
 				{tt("common.fork")}

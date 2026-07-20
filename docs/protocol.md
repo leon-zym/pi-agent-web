@@ -30,6 +30,10 @@
 | `get_commands` | `{commands}` 包裹；source ∈ extension/prompt/skill；skill 带 `skill:` 前缀；内置 TUI 命令不在列表 |
 | `set_session_name` | 空字符串报错；写入 `session_info` 条目 |
 
+## Web Gateway 会话控制
+
+浏览器先用 `session_claim` 取得 Workspace controller lease，再发送控制命令。控制命令和 Extension UI 回包必须携带 `expectedSessionId`；Gateway 在同一 Workspace 的互斥队列里校验 lease 和当前会话。`lease_status` 只说明当前连接是否拥有控制权，`session_state` 广播当前会话的 id、文件路径和递增 epoch。observer 可以订阅事件与读取快照，但不能改变 Pi 状态。
+
 ## 事件流（JsonAgentSessionEvent 关键子集）
 
 | 事件 | 投影消费 |

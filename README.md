@@ -6,7 +6,8 @@ Pi Coding Agent RPC 模式的现代 Web 工作台。通过一个 Node.js 网关�
 
 ## 特性
 
-- **Workspace 粒度进程隔离**：一个工作区一个 `pi --mode rpc` 进程；同工作区内切换会话复用进程，跨工作区切换自动校验并拒绝错乱场景。
+- **Workspace 粒度进程隔离**：一个工作区一个 `pi --mode rpc` 进程；同工作区内切换会话复用进程，跨工作区先显式选择工作区再打开会话。
+- **单控制标签页**：每个工作区同时只允许一个标签页写入 Pi；其他标签页保留历史查看，controller 断开后可接管。
 - **严格 JSONL 协议**：仅按 LF 切分（U+2028/U+2029 安全），容忍 \r，脏行静默丢弃；bash 输出增量流式、Extension UI 双向对话框、断连自动 Cancel 保护。
 - **产品级对话投影**：ProductTurn → AssistantStep → ContentBlock 三层投影，稳定 React key，Thinking 扫光折叠行、Tool Call 两阶段卡片、插队/排队 Queue Dock。
 - **会话管理**：会话目录扫描（mtime 排序）、重命名/删除（血缘保护）、分支树可视化与 fork 时间旅行、HTML 导出。

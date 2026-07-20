@@ -15,6 +15,7 @@ import { Textarea } from "../../components/ui/textarea";
 import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import { type PendingDialog, useExtensionUiStore } from "../../stores/extension-ui";
+import { useSessionControlStore } from "../../stores/session-control";
 
 /**
  * Extension UI dialogs: select / confirm / input /
@@ -35,6 +36,7 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 	const [editorText, setEditorText] = useState(request.method === "editor" ? (request.prefill ?? "") : "");
 
 	const respond = useExtensionUiStore((s) => s.respond);
+	const canControl = useSessionControlStore((s) => s.canControl(dialog.workspaceId));
 
 	const cancel = () => {
 		if (useExtensionUiStore.getState().dialogs.some((d) => d.request.id === request.id)) {
@@ -84,6 +86,7 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 								key={option}
 								type="button"
 								onClick={() => setSelected(option)}
+								disabled={!canControl}
 								className={cn(
 									"flex items-center gap-2 rounded-sm px-2 py-2 text-left text-[14px] transition-colors hover:bg-hover",
 									selected === option ? "bg-hover text-ink" : "text-ink-2",
@@ -112,6 +115,7 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 							value={value}
 							placeholder={request.placeholder}
 							onChange={(event) => setValue(event.target.value)}
+							disabled={!canControl}
 							onKeyDown={(event) => {
 								if (event.key === "Enter") confirm();
 							}}
@@ -124,6 +128,7 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 						autoFocus
 						value={editorText}
 						onChange={(event) => setEditorText(event.target.value)}
+						disabled={!canControl}
 						rows={14}
 						className="font-mono text-[13px] leading-[20px]"
 					/>
@@ -134,10 +139,13 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 				)}
 
 				<DialogFooter>
-					<Button variant="outline" onClick={cancel}>
+					<Button variant="outline" onClick={cancel} disabled={!canControl}>
 						{tt("common.cancel")}
 					</Button>
-					<Button onClick={confirm} disabled={request.method === "select" && selected === null}>
+					<Button
+						onClick={confirm}
+						disabled={!canControl || (request.method === "select" && selected === null)}
+					>
 						{request.method === "confirm" ? tt("common.ok") : tt("common.confirm")}
 					</Button>
 				</DialogFooter>

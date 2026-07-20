@@ -1,6 +1,8 @@
 import { expectData } from "@pi-agent-web/protocol";
 import { create } from "zustand";
+import { sendControlCommand } from "../lib/session-controller";
 import type { ModelLite, ThinkingLevel } from "../types/pi-types";
+import { useSessionControlStore } from "./session-control";
 import { useTransportStore } from "./transport";
 
 interface ModelDirectoryState {
@@ -71,9 +73,9 @@ export const useModelDirectoryStore = create<ModelDirectoryState>()((set, get) =
 	},
 
 	selectModel: async (workspaceId, provider, modelId) => {
+		if (!useSessionControlStore.getState().canControl(workspaceId)) throw new Error("workspace_read_only");
 		const previous = get().currentModel;
-		const transport = useTransportStore.getState();
-		const response = await transport.sendCommand(workspaceId, { type: "set_model", provider, modelId });
+		const response = await sendControlCommand(workspaceId, { type: "set_model", provider, modelId });
 		const model = expectData(response) as ModelLite;
 		set({ currentModel: { provider: model.provider, modelId: model.id } });
 		// Failure leaves the previous selection untouched (toast at the call site).
@@ -83,8 +85,8 @@ export const useModelDirectoryStore = create<ModelDirectoryState>()((set, get) =
 	},
 
 	selectThinkingLevel: async (workspaceId, level) => {
-		const transport = useTransportStore.getState();
-		await transport.sendCommand(workspaceId, { type: "set_thinking_level", level });
+		if (!useSessionControlStore.getState().canControl(workspaceId)) throw new Error("workspace_read_only");
+		await sendControlCommand(workspaceId, { type: "set_thinking_level", level });
 		// The effective (possibly clamped) value arrives via thinking_level_changed.
 	},
 }));

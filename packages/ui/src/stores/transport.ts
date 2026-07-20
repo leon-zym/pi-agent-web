@@ -42,8 +42,19 @@ interface TransportState {
 	connect: () => void;
 	disconnect: () => void;
 	setListen: (workspaceId: string | null, sessionId: string | null) => void;
-	sendCommand: (workspaceId: string, command: RpcCommand, timeoutMs?: number) => Promise<RpcResponse>;
-	sendExtensionUiResponse: (workspaceId: string, response: RpcExtensionUIResponse) => void;
+	claimController: (workspaceId: string) => boolean;
+	releaseController: (workspaceId: string) => boolean;
+	sendCommand: (
+		workspaceId: string,
+		command: RpcCommand,
+		timeoutMs?: number,
+		expectedSessionId?: string | null,
+	) => Promise<RpcResponse>;
+	sendExtensionUiResponse: (
+		workspaceId: string,
+		response: RpcExtensionUIResponse,
+		expectedSessionId: string | null,
+	) => boolean;
 }
 
 interface PendingCommand {
@@ -240,13 +251,17 @@ export const useTransportStore = create<TransportState>()((set, get) => ({
 		}
 	},
 
-	sendCommand: (workspaceId, command, timeoutMs = 60_000) => {
+	claimController: (workspaceId) => send({ type: "session_claim", workspaceId }),
+
+	releaseController: (workspaceId) => send({ type: "session_release", workspaceId }),
+
+	sendCommand: (workspaceId, command, timeoutMs = 60_000, expectedSessionId = null) => {
 		if (get().wsState !== "online") {
 			return Promise.reject(new Error(tt("transport.reconnecting")));
 		}
 		const id = command.id ?? nextCommandId("cmd");
 		const withId = { ...command, id };
-		const delivered = send({ type: "command", workspaceId, command: withId });
+		const delivered = send({ type: "command", workspaceId, expectedSessionId, command: withId });
 		if (!delivered) {
 			return Promise.reject(new Error(tt("transport.unavailable")));
 		}
@@ -259,8 +274,8 @@ export const useTransportStore = create<TransportState>()((set, get) => ({
 		});
 	},
 
-	sendExtensionUiResponse: (workspaceId, response) => {
-		send({ type: "extension_ui_response", workspaceId, response });
+	sendExtensionUiResponse: (workspaceId, response, expectedSessionId) => {
+		return send({ type: "extension_ui_response", workspaceId, expectedSessionId, response });
 	},
 }));
 

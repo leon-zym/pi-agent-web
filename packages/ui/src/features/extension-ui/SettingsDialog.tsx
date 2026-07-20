@@ -13,8 +13,10 @@ import {
 import { Separator } from "../../components/ui/separator";
 import { Switch } from "../../components/ui/switch";
 import { tt } from "../../lib/i18n";
+import { sendControlCommand } from "../../lib/session-controller";
 import { useTheme } from "../../lib/use-theme";
 import { cn } from "../../lib/utils";
+import { useSessionControlStore } from "../../stores/session-control";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { useTransportStore } from "../../stores/transport";
 
@@ -31,10 +33,12 @@ function Segmented<T extends string>({
 	options,
 	value,
 	onChange,
+	disabled = false,
 }: {
 	options: Array<{ value: T; label: string }>;
 	value: T;
 	onChange: (value: T) => void;
+	disabled?: boolean;
 }) {
 	return (
 		<div className="flex items-center gap-0.5 rounded-sm bg-surface-2 p-0.5">
@@ -43,6 +47,7 @@ function Segmented<T extends string>({
 					key={option.value}
 					type="button"
 					onClick={() => onChange(option.value)}
+					disabled={disabled}
 					className={cn(
 						"rounded-sm px-2 py-0.5 text-[12px] transition-colors",
 						value === option.value
@@ -63,6 +68,7 @@ function Segmented<T extends string>({
  */
 export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 	const workspaceId = useSessionDirectoryStore((s) => s.currentWorkspaceId);
+	const canControl = useSessionControlStore((s) => s.canControl(workspaceId));
 	const [state, setState] = useState<Pick<
 		RpcSessionState,
 		"autoCompactionEnabled" | "steeringMode" | "followUpMode"
@@ -92,7 +98,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 		if (!workspaceId || !state) return;
 		setState({ ...state, autoCompactionEnabled: enabled });
 		try {
-			await useTransportStore.getState().sendCommand(workspaceId, { type: "set_auto_compaction", enabled });
+			await sendControlCommand(workspaceId, { type: "set_auto_compaction", enabled });
 		} catch (error) {
 			toast.error(tt("settings.saveFailed"), {
 				description: error instanceof Error ? error.message : String(error),
@@ -104,7 +110,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 		if (!workspaceId) return;
 		setAutoRetry(enabled);
 		try {
-			await useTransportStore.getState().sendCommand(workspaceId, { type: "set_auto_retry", enabled });
+			await sendControlCommand(workspaceId, { type: "set_auto_retry", enabled });
 		} catch (error) {
 			toast.error(tt("settings.saveFailed"), {
 				description: error instanceof Error ? error.message : String(error),
@@ -116,7 +122,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 		if (!workspaceId || !state) return;
 		setState({ ...state, steeringMode: mode });
 		try {
-			await useTransportStore.getState().sendCommand(workspaceId, { type: "set_steering_mode", mode });
+			await sendControlCommand(workspaceId, { type: "set_steering_mode", mode });
 		} catch (error) {
 			toast.error(tt("settings.saveFailed"), {
 				description: error instanceof Error ? error.message : String(error),
@@ -128,7 +134,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 		if (!workspaceId || !state) return;
 		setState({ ...state, followUpMode: mode });
 		try {
-			await useTransportStore.getState().sendCommand(workspaceId, { type: "set_follow_up_mode", mode });
+			await sendControlCommand(workspaceId, { type: "set_follow_up_mode", mode });
 		} catch (error) {
 			toast.error(tt("settings.saveFailed"), {
 				description: error instanceof Error ? error.message : String(error),
@@ -136,7 +142,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 		}
 	};
 
-	const disabled = !workspaceId || !state;
+	const disabled = !workspaceId || !state || !canControl;
 
 	return (
 		<Dialog open={open} onOpenChange={onOpenChange}>
@@ -186,6 +192,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 									]}
 									value={state?.steeringMode ?? "one-at-a-time"}
 									onChange={(value) => void setSteeringMode(value)}
+									disabled={disabled}
 								/>
 							</div>
 							<div className="flex items-center justify-between gap-4">
@@ -200,6 +207,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 									]}
 									value={state?.followUpMode ?? "one-at-a-time"}
 									onChange={(value) => void setFollowUpMode(value)}
+									disabled={disabled}
 								/>
 							</div>
 						</div>

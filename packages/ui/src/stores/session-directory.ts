@@ -2,6 +2,7 @@ import type { SessionSummary, WorkspaceSummary } from "@pi-agent-web/protocol";
 import { create } from "zustand";
 import { api } from "../lib/api";
 import { useProjectionStore } from "./projection";
+import { useSessionControlStore } from "./session-control";
 import { useTransportStore } from "./transport";
 
 interface SessionDirectoryState {
@@ -67,6 +68,8 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 		set({ currentWorkspaceId: workspaceId, currentSession: null, sessions: [], loadingSessions: true });
 		useProjectionStore.getState().setCurrentSession(null);
 		useTransportStore.getState().setListen(workspaceId, null);
+		useSessionControlStore.getState().selectWorkspace(workspaceId);
+		useSessionControlStore.getState().claim(workspaceId);
 		try {
 			const { sessions } = await api.listSessions(workspaceId);
 			set({ sessions, loadingSessions: false });

@@ -254,6 +254,9 @@ export const zhCN = {
 	"transport.unavailable": "WebSocket 不可用",
 	"transport.commandTimeout": "命令超时：{command}",
 
+	// Workspace controller lease
+	"lease.readOnly": "此工作区正由另一标签页控制，当前为只读模式",
+
 	// System status rows
 	"system.contextCompacted": "上下文已压缩",
 	"system.retryScheduled": "第 {attempt}/{max} 次重试，{seconds} 秒后发起",

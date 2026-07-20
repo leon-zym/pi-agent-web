@@ -28,7 +28,8 @@ A modern web workbench for Pi Coding Agent's RPC mode.
 - The event stream is authoritative; get_* snapshots are only for
   initialization / reconnect replay.
 - One `pi --mode rpc` child process per workspace (cwd = workspace);
-  cross-workspace session switches must restart the process.
+  cross-workspace `switch_session` is rejected. Select the target workspace
+  explicitly before opening one of its sessions.
 - bash commands must carry an id; prompts during streaming must carry
   streamingBehavior.
 - All code comments are written in English; user-facing UI copy is Chinese

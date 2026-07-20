@@ -52,6 +52,7 @@ import { deleteSession, newSession, openSession, renameSession } from "../../lib
 import { useTheme } from "../../lib/use-theme";
 import { cn } from "../../lib/utils";
 import { useProjectionStore } from "../../stores/projection";
+import { useSessionControlStore } from "../../stores/session-control";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { useTransportStore } from "../../stores/transport";
 
@@ -89,6 +90,8 @@ function SessionRow({ session, current }: SessionRowProps) {
 	const [renameOpen, setRenameOpen] = useState(false);
 	const [deleteOpen, setDeleteOpen] = useState(false);
 	const [name, setName] = useState(session.name ?? "");
+	const currentWorkspaceId = useSessionDirectoryStore((s) => s.currentWorkspaceId);
+	const canControl = useSessionControlStore((s) => s.canControl(currentWorkspaceId));
 
 	const status = sessionStatus(session, current);
 	const empty = session.messageCount === 0 && !session.name;
@@ -116,6 +119,7 @@ function SessionRow({ session, current }: SessionRowProps) {
 			<button
 				type="button"
 				onClick={() => void openSession(session)}
+				disabled={!current && !canControl}
 				className={cn(
 					"flex h-full min-w-0 flex-1 items-center gap-2 rounded-sm pl-2.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-primary/40",
 					current ? "font-medium text-ink" : "text-ink-2",
@@ -138,6 +142,7 @@ function SessionRow({ session, current }: SessionRowProps) {
 								aria-label={tt("sidebar.renameSession")}
 								className="flex size-6 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
 								onClick={startRename}
+								disabled={!canControl || !current}
 							>
 								<Pencil className="size-3.5" />
 							</button>
@@ -151,6 +156,7 @@ function SessionRow({ session, current }: SessionRowProps) {
 								aria-label={tt("sidebar.deleteSession")}
 								className="flex size-6 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-danger"
 								onClick={() => setDeleteOpen(true)}
+								disabled={!canControl}
 							>
 								<Trash2 className="size-3.5" />
 							</button>
@@ -179,7 +185,7 @@ function SessionRow({ session, current }: SessionRowProps) {
 						<Button variant="outline" onClick={() => setRenameOpen(false)}>
 							{tt("common.cancel")}
 						</Button>
-						<Button onClick={commitRename} disabled={!name.trim()}>
+						<Button onClick={commitRename} disabled={!canControl || !name.trim()}>
 							{tt("common.save")}
 						</Button>
 					</DialogFooter>
@@ -215,6 +221,7 @@ function WorkspaceGroup({ workspace, sessions, defaultExpanded }: WorkspaceGroup
 	const [removeOpen, setRemoveOpen] = useState(false);
 	const currentWorkspaceId = useSessionDirectoryStore((s) => s.currentWorkspaceId);
 	const currentSession = useSessionDirectoryStore((s) => s.currentSession);
+	const canControl = useSessionControlStore((s) => s.canControl(currentWorkspaceId));
 	const visible = sessions.slice(0, expanded ? undefined : 5);
 	const more = sessions.length - visible.length;
 
@@ -258,14 +265,8 @@ function WorkspaceGroup({ workspace, sessions, defaultExpanded }: WorkspaceGroup
 								type="button"
 								aria-label={tt("sidebar.newSession")}
 								className="flex size-6 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
-								onClick={() => {
-									if (currentWorkspaceId !== workspace.id)
-										void useSessionDirectoryStore
-											.getState()
-											.selectWorkspace(workspace.id)
-											.then(() => newSession());
-									else void newSession();
-								}}
+								onClick={() => void newSession()}
+								disabled={currentWorkspaceId !== workspace.id || !canControl}
 							>
 								<Plus className="size-3.5" />
 							</button>
@@ -403,6 +404,7 @@ export function WorkspaceSidebar({ rail }: { rail: boolean }) {
 	const workspaces = useSessionDirectoryStore((s) => s.workspaces);
 	const sessions = useSessionDirectoryStore((s) => s.sessions);
 	const currentWorkspaceId = useSessionDirectoryStore((s) => s.currentWorkspaceId);
+	const canControl = useSessionControlStore((s) => s.canControl(currentWorkspaceId));
 	const searchQuery = useSessionDirectoryStore((s) => s.searchQuery);
 	const setSearchQuery = useSessionDirectoryStore((s) => s.setSearchQuery);
 	const [addOpen, setAddOpen] = useState(false);
@@ -447,7 +449,7 @@ export function WorkspaceSidebar({ rail }: { rail: boolean }) {
 						<button
 							type="button"
 							aria-label={tt("sidebar.newSession")}
-							disabled={!currentWorkspaceId}
+							disabled={!currentWorkspaceId || !canControl}
 							className="flex size-9 items-center justify-center rounded-sm text-ink-2 hover:bg-hover disabled:opacity-40"
 							onClick={() => void newSession()}
 						>
@@ -515,7 +517,7 @@ export function WorkspaceSidebar({ rail }: { rail: boolean }) {
 				<Button
 					variant="secondary"
 					className="h-8 w-full justify-start gap-1.5 text-[13px]"
-					disabled={!currentWorkspaceId}
+					disabled={!currentWorkspaceId || !canControl}
 					onClick={() => void newSession()}
 				>
 					<Plus className="size-4" />
@@ -620,6 +622,7 @@ export function WorkspaceSidebar({ rail }: { rail: boolean }) {
 								aria-label={tt("sidebar.processNotStarted")}
 								className="flex h-7 flex-1 items-center justify-center gap-1.5 rounded-sm text-[11px] text-ink-3 hover:bg-hover"
 								onClick={() => void restartProcess()}
+								disabled={!canControl}
 							>
 								<span
 									className={cn(
@@ -666,6 +669,7 @@ export function WorkspaceSidebar({ rail }: { rail: boolean }) {
 							aria-label={tt("sidebar.restartProcess")}
 							className="flex size-7 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
 							onClick={() => void restartProcess()}
+							disabled={!canControl}
 						>
 							<RotateCw className="size-4" />
 						</button>

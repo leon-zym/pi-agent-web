@@ -5,6 +5,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "../../components/ui/pop
 import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import { useModelDirectoryStore } from "../../stores/model-directory";
+import { useSessionControlStore } from "../../stores/session-control";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
 
 const LEVEL_LABEL: Record<string, string> = {
@@ -32,6 +33,8 @@ export function ModelSelector() {
 	const currentLevel = useModelDirectoryStore((s) => s.currentThinkingLevel);
 	const [page, setPage] = useState<Page>("root");
 	const [open, setOpen] = useState(false);
+	const workspaceId = useSessionDirectoryStore((s) => s.currentWorkspaceId);
+	const canControl = useSessionControlStore((s) => s.canControl(workspaceId));
 
 	const currentModelObject = useMemo(
 		() =>
@@ -90,6 +93,7 @@ export function ModelSelector() {
 				<button
 					type="button"
 					aria-label={tt("model.menuAria")}
+					disabled={!canControl}
 					className="flex h-7 max-w-52 items-center gap-1 rounded-sm px-2 text-xs text-ink-2 transition-colors hover:bg-hover hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
 				>
 					<span className="min-w-0 truncate">{label}</span>
@@ -133,6 +137,7 @@ export function ModelSelector() {
 												? "text-primary"
 												: "text-ink",
 										)}
+										disabled={!canControl}
 										onClick={() => void selectModel(provider, model.id)}
 									>
 										<span className="min-w-0 flex-1 truncate">{model.name}</span>
@@ -156,6 +161,7 @@ export function ModelSelector() {
 									"flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-[13px] transition-colors hover:bg-hover",
 									currentLevel === level ? "text-primary" : "text-ink",
 								)}
+								disabled={!canControl}
 								onClick={() => void selectLevel(level)}
 							>
 								<span className="flex-1">{tt(LEVEL_LABEL[level] as never)}</span>
