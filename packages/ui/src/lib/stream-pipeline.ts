@@ -98,7 +98,7 @@ function routeEvent(message: Extract<WsServerMessage, { type: "event" }>): void 
 			useComposerStore.getState().setQueue({ steering: [...event.steering], followUp: [...event.followUp] });
 			return;
 		case "thinking_level_changed":
-			useModelDirectoryStore.getState().applyThinkingLevel(event.level);
+			useModelDirectoryStore.getState().applyThinkingLevel(workspaceId, event.level);
 			return;
 		case "session_info_changed":
 			void useSessionDirectoryStore.getState().reloadSessions();
@@ -174,7 +174,7 @@ async function reconcileHostSession(workspaceId: string): Promise<void> {
 
 	const transport = useTransportStore.getState();
 	try {
-		const stateResponse = await transport.sendCommand(workspaceId, { type: "get_state" }, 30_000);
+		const stateResponse = await transport.sendCommand(workspaceId, { type: "get_state" });
 		const state = expectData(stateResponse) as { sessionId: string; sessionFile?: string };
 		if (!isCurrentWorkspace(workspaceId, generation)) return;
 
@@ -195,7 +195,7 @@ async function reconcileHostSession(workspaceId: string): Promise<void> {
 
 		const control = useSessionControlStore.getState();
 		const epoch = control.workspaceId === workspaceId ? control.session.epoch : 0;
-		const messagesResponse = await transport.sendCommand(workspaceId, { type: "get_messages" }, 30_000);
+		const messagesResponse = await transport.sendCommand(workspaceId, { type: "get_messages" });
 		const { messages } = expectData(messagesResponse) as {
 			messages: Parameters<ReturnType<typeof useProjectionStore.getState>["rebuildFromMessages"]>[1];
 		};
@@ -249,7 +249,8 @@ async function refreshModelsAfterAuthChange(workspaceId: string): Promise<void> 
 		} catch {
 			// retry below
 		}
-		if (useModelDirectoryStore.getState().models.length > 0 || Date.now() >= deadline) return;
+		if (useModelDirectoryStore.getState().byWorkspace[workspaceId]?.models.length || Date.now() >= deadline)
+			return;
 		await new Promise((resolve) => setTimeout(resolve, 2500));
 	}
 }

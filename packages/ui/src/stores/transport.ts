@@ -1,5 +1,5 @@
 import type { RpcCommand, RpcExtensionUIResponse, RpcResponse } from "@earendil-works/pi-coding-agent";
-import type { WsClientMessage, WsServerMessage } from "@pi-agent-web/protocol";
+import { commandTimeoutMs, type WsClientMessage, type WsServerMessage } from "@pi-agent-web/protocol";
 import { create } from "zustand";
 import { tt } from "../lib/i18n";
 
@@ -255,7 +255,12 @@ export const useTransportStore = create<TransportState>()((set, get) => ({
 
 	releaseController: (workspaceId) => send({ type: "session_release", workspaceId }),
 
-	sendCommand: (workspaceId, command, timeoutMs = 60_000, expectedSessionId = null) => {
+	sendCommand: (
+		workspaceId,
+		command,
+		timeoutMs = commandTimeoutMs(command.type),
+		expectedSessionId = null,
+	) => {
 		if (get().wsState !== "online") {
 			return Promise.reject(new Error(tt("transport.reconnecting")));
 		}

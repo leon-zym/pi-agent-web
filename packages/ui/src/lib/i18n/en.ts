@@ -243,6 +243,7 @@ export const en: typeof zhCN = {
 	"session.deleted": "Session deleted",
 	"session.deleteFailed": "Failed to delete session",
 	"session.renameFailed": "Rename failed",
+	"session.renameCurrentOnly": "Only the currently controlled session can be renamed",
 	"session.needWorkspace": "Open a workspace first",
 	"session.sendFailed": "Send failed",
 	"session.abortFailed": "Abort failed",

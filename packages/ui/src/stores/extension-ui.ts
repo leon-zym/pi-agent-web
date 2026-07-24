@@ -1,6 +1,6 @@
 import type { RpcExtensionUIRequest, RpcExtensionUIResponse } from "@earendil-works/pi-coding-agent";
 import { create } from "zustand";
-import { sendControlExtensionUiResponse } from "../lib/session-controller";
+import { sendControlExtensionUiResponse } from "../lib/session-command";
 
 export type DialogRequest = Extract<
 	RpcExtensionUIRequest,

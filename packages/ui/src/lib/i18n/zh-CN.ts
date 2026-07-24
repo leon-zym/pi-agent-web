@@ -240,6 +240,7 @@ export const zhCN = {
 	"session.deleted": "会话已删除",
 	"session.deleteFailed": "删除会话失败",
 	"session.renameFailed": "重命名失败",
+	"session.renameCurrentOnly": "只能重命名当前正在控制的会话",
 	"session.needWorkspace": "请先打开一个工作区",
 	"session.sendFailed": "发送失败",
 	"session.abortFailed": "中止失败",

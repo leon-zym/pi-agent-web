@@ -1,4 +1,4 @@
-import type { RpcCommand, RpcExtensionUIResponse, RpcResponse } from "@earendil-works/pi-coding-agent";
+import type { RpcResponse } from "@earendil-works/pi-coding-agent";
 import { expectData, type SessionSummary } from "@pi-agent-web/protocol";
 import { toast } from "sonner";
 import { useComposerStore } from "../stores/composer";
@@ -13,6 +13,9 @@ import { useViewStore } from "../stores/view";
 import type { ImageContent } from "../types/pi-types";
 import { api } from "./api";
 import { tt } from "./i18n";
+import { sendControlCommand, sendReadCommand } from "./session-command";
+
+export { sendControlCommand, sendControlExtensionUiResponse, sendReadCommand } from "./session-command";
 
 /**
  * Session orchestration: switching, creating, deleting, submitting prompts.
@@ -25,54 +28,13 @@ function workspaceId(): string {
 	return id;
 }
 
-function expectedSessionId(workspaceId: string): string | null {
-	const control = useSessionControlStore.getState();
-	return control.workspaceId === workspaceId ? control.session.id : null;
-}
-
-export async function sendReadCommand(
-	workspaceId: string,
-	command: RpcCommand,
-	timeoutMs?: number,
-): Promise<RpcResponse> {
-	return useTransportStore
-		.getState()
-		.sendCommand(workspaceId, command, timeoutMs, expectedSessionId(workspaceId));
-}
-
-export async function sendControlCommand(
-	workspaceId: string,
-	command: RpcCommand,
-	timeoutMs?: number,
-): Promise<RpcResponse> {
-	if (!useSessionControlStore.getState().canControl(workspaceId)) throw new Error(tt("lease.readOnly"));
-	const response = await useTransportStore
-		.getState()
-		.sendCommand(workspaceId, command, timeoutMs, expectedSessionId(workspaceId));
-	if (response.success === false && response.error === "session_stale") {
-		useSessionControlStore.getState().setReconciling(workspaceId, true);
-		if (typeof window !== "undefined") window.dispatchEvent(new Event("piweb:session-stale"));
-	}
-	return response;
-}
-
-export function sendControlExtensionUiResponse(
-	workspaceId: string,
-	response: RpcExtensionUIResponse,
-): boolean {
-	if (!useSessionControlStore.getState().canControl(workspaceId)) return false;
-	return useTransportStore
-		.getState()
-		.sendExtensionUiResponse(workspaceId, response, expectedSessionId(workspaceId));
-}
-
 async function snapshotAfterOpen(wsId: string, sessionId: string): Promise<void> {
 	useTransportStore.getState().setListen(wsId, sessionId);
 	useProjectionStore.getState().setCurrentSession(sessionId);
 	useViewStore.getState().clearSession();
 	useSessionStatsStore.getState().clear();
 	try {
-		const response = await sendReadCommand(wsId, { type: "get_messages" }, 20_000);
+		const response = await sendReadCommand(wsId, { type: "get_messages" });
 		const { messages } = expectData(response) as { messages: never[] };
 		useProjectionStore.getState().rebuildFromMessages(sessionId, messages);
 	} catch (error) {
@@ -92,11 +54,10 @@ export async function openSession(summary: SessionSummary): Promise<void> {
 	directory.setCurrentSession(summary);
 
 	try {
-		const response = await sendControlCommand(
-			wsId,
-			{ type: "switch_session", sessionPath: summary.absolutePath },
-			30_000,
-		);
+		const response = await sendControlCommand(wsId, {
+			type: "switch_session",
+			sessionPath: summary.absolutePath,
+		});
 		const data = expectData(response) as { cancelled: boolean };
 		if (data.cancelled) {
 			directory.setCurrentSession(null);
@@ -116,7 +77,7 @@ export async function openSession(summary: SessionSummary): Promise<void> {
 export async function newSession(): Promise<void> {
 	const wsId = workspaceId();
 	try {
-		const response = await sendControlCommand(wsId, { type: "new_session" }, 30_000);
+		const response = await sendControlCommand(wsId, { type: "new_session" });
 		const data = expectData(response) as { cancelled: boolean };
 		if (data.cancelled) {
 			toast.info(tt("session.newCancelled"));
@@ -164,9 +125,18 @@ export async function deleteSession(summary: SessionSummary): Promise<void> {
 	}
 }
 
-export async function renameSession(_summary: SessionSummary, name: string): Promise<void> {
+export async function renameSession(summary: SessionSummary, name: string): Promise<void> {
 	const wsId = workspaceId();
 	try {
+		const currentSession = useSessionDirectoryStore.getState().currentSession;
+		const control = useSessionControlStore.getState();
+		if (
+			currentSession?.id !== summary.id ||
+			control.workspaceId !== wsId ||
+			control.session.id !== summary.id
+		) {
+			throw new Error(tt("session.renameCurrentOnly"));
+		}
 		await sendControlCommand(wsId, { type: "set_session_name", name });
 		await useSessionDirectoryStore.getState().reloadSessions();
 	} catch (error) {
@@ -215,7 +185,7 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 			composer.recordQueued(text, resolvedKind);
 			response = await sendControlCommand(wsId, { type: resolvedKind, message: text, images });
 		} else {
-			response = await sendControlCommand(wsId, { type: "prompt", message: text, images }, 120_000);
+			response = await sendControlCommand(wsId, { type: "prompt", message: text, images });
 		}
 		if (response.success === false) {
 			toast.error(tt("session.sendFailed"), { description: response.error });
@@ -235,7 +205,7 @@ export async function abortCurrentRun(): Promise<void> {
 	const wsId = useSessionDirectoryStore.getState().currentWorkspaceId;
 	if (!wsId) return;
 	try {
-		await sendControlCommand(wsId, { type: "abort" }, 60_000);
+		await sendControlCommand(wsId, { type: "abort" });
 	} catch (error) {
 		toast.error(tt("session.abortFailed"), {
 			description: error instanceof Error ? error.message : String(error),
@@ -248,7 +218,7 @@ export async function runSlashCommand(wsId: string, fullText: string): Promise<v
 	const composer = useComposerStore.getState();
 	composer.setSubmitState("submitting");
 	try {
-		const response = await sendControlCommand(wsId, { type: "prompt", message: fullText }, 120_000);
+		const response = await sendControlCommand(wsId, { type: "prompt", message: fullText });
 		if (response.success === false) toast.error(tt("session.commandFailed"), { description: response.error });
 		else composer.clearDraft();
 	} catch (error) {
@@ -263,7 +233,7 @@ export async function runSlashCommand(wsId: string, fullText: string): Promise<v
 export async function forkFromEntry(entryId: string): Promise<void> {
 	const wsId = workspaceId();
 	try {
-		const response = await sendControlCommand(wsId, { type: "fork", entryId }, 30_000);
+		const response = await sendControlCommand(wsId, { type: "fork", entryId });
 		const data = expectData(response) as { text: string; cancelled: boolean };
 		if (data.cancelled) {
 			toast.info(tt("session.forkCancelled"));

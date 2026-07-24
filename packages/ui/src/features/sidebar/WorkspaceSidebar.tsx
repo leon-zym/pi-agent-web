@@ -135,20 +135,22 @@ function SessionRow({ session, current }: SessionRowProps) {
 			</button>
 			{!empty && (
 				<div className="flex shrink-0 items-center opacity-0 transition-opacity group-hover:opacity-100 [@media(hover:hover)]:group-hover:opacity-100">
-					<Tooltip>
-						<TooltipTrigger asChild>
-							<button
-								type="button"
-								aria-label={tt("sidebar.renameSession")}
-								className="flex size-6 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
-								onClick={startRename}
-								disabled={!canControl || !current}
-							>
-								<Pencil className="size-3.5" />
-							</button>
-						</TooltipTrigger>
-						<TooltipContent>{tt("common.rename")}</TooltipContent>
-					</Tooltip>
+					{current && (
+						<Tooltip>
+							<TooltipTrigger asChild>
+								<button
+									type="button"
+									aria-label={tt("sidebar.renameSession")}
+									className="flex size-6 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
+									onClick={startRename}
+									disabled={!canControl}
+								>
+									<Pencil className="size-3.5" />
+								</button>
+							</TooltipTrigger>
+							<TooltipContent>{tt("common.rename")}</TooltipContent>
+						</Tooltip>
+					)}
 					<Tooltip>
 						<TooltipTrigger asChild>
 							<button

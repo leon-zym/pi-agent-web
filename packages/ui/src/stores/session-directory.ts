@@ -1,8 +1,10 @@
 import type { SessionSummary, WorkspaceSummary } from "@pi-agent-web/protocol";
 import { create } from "zustand";
 import { api } from "../lib/api";
+import { useModelDirectoryStore } from "./model-directory";
 import { useProjectionStore } from "./projection";
 import { useSessionControlStore } from "./session-control";
+import { useSlashCommandsStore } from "./slash-commands";
 import { useTransportStore } from "./transport";
 
 interface SessionDirectoryState {
@@ -74,6 +76,8 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 			useProjectionStore.getState().setCurrentSession(null);
 			useTransportStore.getState().setListen(null, null);
 			useSessionControlStore.getState().selectWorkspace(null);
+			useModelDirectoryStore.getState().beginWorkspace(null);
+			useSlashCommandsStore.getState().beginWorkspace(null);
 		}
 		await get().loadWorkspaces();
 	},
@@ -85,6 +89,8 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 		useProjectionStore.getState().setCurrentSession(null);
 		useTransportStore.getState().setListen(workspaceId, null);
 		useSessionControlStore.getState().selectWorkspace(workspaceId);
+		useModelDirectoryStore.getState().beginWorkspace(workspaceId);
+		useSlashCommandsStore.getState().beginWorkspace(workspaceId);
 		useSessionControlStore.getState().claim(workspaceId);
 		const request = nextSessionRequest(workspaceId);
 		try {
