@@ -1,8 +1,10 @@
 import path from "node:path";
+import { expectData } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import { PiProcess } from "../src/pi-process.js";
 
 const fakePiPath = path.join(import.meta.dirname, "fixtures", "fake-pi.mjs");
+const processGroupPiPath = path.join(import.meta.dirname, "fixtures", "process-group-pi.mjs");
 
 describe("PiProcess response correlation", () => {
 	let proc: PiProcess | undefined;
@@ -36,5 +38,22 @@ describe("PiProcess response correlation", () => {
 			"duplicate pending command id",
 		);
 		await expect(first).rejects.toThrow("command timed out");
+	});
+
+	it.runIf(process.platform !== "win32")("stops descendants in Pi's detached process group", async () => {
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: {
+				command: process.execPath,
+				args: [processGroupPiPath],
+				source: "pi-path",
+				label: "group Pi",
+			},
+		});
+		await proc.start();
+		const state = expectData(await proc.send({ type: "get_state" })) as { descendantPid: number };
+
+		await proc.stop();
+		expect(() => process.kill(state.descendantPid, 0)).toThrow();
 	});
 });

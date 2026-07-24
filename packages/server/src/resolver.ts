@@ -1,6 +1,5 @@
 import { execFile } from "node:child_process";
 import fs from "node:fs";
-import { createRequire } from "node:module";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -31,8 +30,10 @@ export interface ResolvedPi {
 export interface ResolveOptions {
 	env?: NodeJS.ProcessEnv;
 	piPath?: string;
-	/** Base module path used for the require.resolve fallback */
+	/** Base directory used to locate the bundled dependency fallback. */
 	baseDir?: string;
+	/** Homebrew Cellar roots, overridable by deterministic resolver tests. */
+	homebrewRoots?: string[];
 }
 
 function exists(p: string): boolean {
@@ -43,12 +44,14 @@ function exists(p: string): boolean {
 	}
 }
 
-function tryHomebrewEntries(env: NodeJS.ProcessEnv): string[] {
-	const roots = [
+function tryHomebrewEntries(
+	env: NodeJS.ProcessEnv,
+	roots = [
 		"/opt/homebrew/Cellar/pi-coding-agent",
 		"/usr/local/Cellar/pi-coding-agent",
 		path.join(env.HOME ?? "", "homebrew/Cellar/pi-coding-agent"),
-	];
+	],
+): string[] {
 	const found: string[] = [];
 	for (const root of roots) {
 		if (!exists(root)) continue;
@@ -74,30 +77,39 @@ function tryHomebrewEntries(env: NodeJS.ProcessEnv): string[] {
 	return found;
 }
 
-function resolveBundledEntry(env: NodeJS.ProcessEnv, baseDir?: string): string | null {
-	const requireBase = baseDir ?? process.cwd();
+function resolveBundledEntry(
+	env: NodeJS.ProcessEnv,
+	baseDir?: string,
+	homebrewRoots?: string[],
+): string | null {
 	const candidates: string[] = [];
-	// 1. This project's node_modules (the server package declares the dependency)
-	try {
-		const localRequire = createRequire(path.join(requireBase, "package.json"));
-		candidates.push(localRequire.resolve("@earendil-works/pi-coding-agent/dist/rpc-entry.js"));
-	} catch {
-		// not installed
-	}
-	// 2. pnpm global store / global install
-	try {
-		const probe = createRequire(path.join(requireBase, "__resolver_probe__.js"));
-		candidates.push(probe.resolve("@earendil-works/pi-coding-agent/dist/rpc-entry.js"));
-	} catch {
-		// not installed
-	}
-	// 3. Homebrew Cellar (verified layout on this machine)
-	candidates.push(...tryHomebrewEntries(env));
+	const bundled = findBundledEntry(baseDir ?? path.resolve(import.meta.dirname, ".."));
+	if (bundled) candidates.push(bundled);
+	// Homebrew Cellar fallback (verified formula layout).
+	candidates.push(...tryHomebrewEntries(env, homebrewRoots));
 
 	for (const candidate of candidates) {
 		if (candidate && exists(candidate)) return candidate;
 	}
 	return null;
+}
+
+function findBundledEntry(baseDir: string): string | null {
+	let dir = path.resolve(baseDir);
+	for (;;) {
+		const entry = path.join(
+			dir,
+			"node_modules",
+			"@earendil-works",
+			"pi-coding-agent",
+			"dist",
+			"rpc-entry.js",
+		);
+		if (exists(entry)) return entry;
+		const parent = path.dirname(dir);
+		if (parent === dir) return null;
+		dir = parent;
+	}
 }
 
 async function whichPi(env: NodeJS.ProcessEnv): Promise<string | null> {
@@ -127,8 +139,9 @@ export async function resolvePiRuntime(options: ResolveOptions = {}): Promise<Re
 	const env = options.env ?? process.env;
 
 	// Tier 1: PI_PATH / --pi-path (custom convention)
-	if (options.piPath) {
-		return resolveExplicitPath(options.piPath);
+	const explicitPath = options.piPath ?? env.PI_PATH;
+	if (explicitPath) {
+		return resolveExplicitPath(explicitPath);
 	}
 
 	// Tier 2: global pi on PATH
@@ -143,7 +156,7 @@ export async function resolvePiRuntime(options: ResolveOptions = {}): Promise<Re
 	}
 
 	// Tier 3: bundled dependency / homebrew fallback
-	const entry = resolveBundledEntry(env, options.baseDir);
+	const entry = resolveBundledEntry(env, options.baseDir, options.homebrewRoots);
 	if (entry) {
 		return {
 			command: process.execPath,
@@ -166,11 +179,10 @@ export async function resolvePiRuntime(options: ResolveOptions = {}): Promise<Re
 function resolveExplicitPath(piPath: string): ResolvedPi {
 	const resolved = path.resolve(expandHome(piPath));
 	if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
-		// Directory install: prefer rpc-entry.js, then cli.js
+		// Directory installs must expose Pi's dedicated RPC entry point.
 		for (const rel of [
 			"dist/rpc-entry.js",
 			"lib/node_modules/@earendil-works/pi-coding-agent/dist/rpc-entry.js",
-			"dist/cli.js",
 		]) {
 			const candidate = path.join(resolved, rel);
 			if (exists(candidate)) {

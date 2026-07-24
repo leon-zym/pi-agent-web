@@ -7,7 +7,7 @@ import type {
 	RpcResponse,
 	RpcSessionState,
 } from "@earendil-works/pi-coding-agent";
-import { RpcError, type WsServerMessage } from "@pi-agent-web/protocol";
+import { commandTimeoutMs, RpcError, type WsServerMessage } from "@pi-agent-web/protocol";
 import { getSessionDirForCwd, isSessionInDir } from "./config.js";
 import { PiProcess } from "./pi-process.js";
 import type { ResolvedPi } from "./resolver.js";
@@ -40,6 +40,7 @@ export interface SupervisorOptions {
 	/** 30s sliding window for auto-restart counting */
 	restartWindowMs?: number;
 	maxAutoRestarts?: number;
+	restartBaseDelayMs?: number;
 	readyTimeoutMs?: number;
 }
 
@@ -68,6 +69,7 @@ interface WorkspaceRuntime {
 	manuallyStopped: boolean;
 	startPromise: Promise<void> | null;
 	generation: number;
+	failedGeneration: number | null;
 	pendingDialogs: Map<string, PendingDialog>;
 	transitionTail: Promise<void>;
 }
@@ -94,7 +96,9 @@ const READ_ONLY_COMMANDS = new Set([
 
 export class Supervisor {
 	private runtimes = new Map<string, WorkspaceRuntime>();
-	private opts: Required<Pick<SupervisorOptions, "restartWindowMs" | "maxAutoRestarts" | "readyTimeoutMs">> &
+	private opts: Required<
+		Pick<SupervisorOptions, "restartWindowMs" | "maxAutoRestarts" | "restartBaseDelayMs" | "readyTimeoutMs">
+	> &
 		SupervisorOptions;
 	private resolveSessionDir: (cwd: string) => string;
 
@@ -103,6 +107,7 @@ export class Supervisor {
 			...opts,
 			restartWindowMs: opts.restartWindowMs ?? 30_000,
 			maxAutoRestarts: opts.maxAutoRestarts ?? 3,
+			restartBaseDelayMs: opts.restartBaseDelayMs ?? 500,
 			readyTimeoutMs: opts.readyTimeoutMs ?? 10_000,
 		};
 		this.resolveSessionDir = (cwd) => getSessionDirForCwd(cwd, this.opts.sessionRootDir);
@@ -136,6 +141,7 @@ export class Supervisor {
 			manuallyStopped: true,
 			startPromise: null,
 			generation: 0,
+			failedGeneration: null,
 			pendingDialogs: new Map(),
 			transitionTail: Promise.resolve(),
 		};
@@ -218,23 +224,22 @@ export class Supervisor {
 				if (rt.generation !== generation) return;
 				if (initialState) this.applySessionState(rt, initialState);
 				rt.status = "running";
-				rt.crashTimes = [];
 				this.broadcastStatus(rt, "running");
 				this.log("info", `pi process ready for ${rt.cwdRealpath} (session ${rt.session.id})`);
 				this.warmUpCommands(rt);
 			},
 			onEvent: (event) => this.handleEvent(rt, generation, event),
 			onExtensionUiRequest: (request) => this.handleExtensionUiRequest(rt, generation, request),
-			onExit: (info) => this.handleExit(rt, generation, info),
+			onExit: (info) => this.handleFailure(rt, generation, info),
 		});
 		rt.proc = proc;
 
 		return proc.start().catch((error) => {
-			if (rt.generation === generation) {
-				rt.lastError = error instanceof Error ? error.message : String(error);
-				rt.status = "crashed";
-				this.broadcastStatus(rt, "crashed");
-			}
+			this.handleFailure(rt, generation, {
+				code: null,
+				signal: null,
+				stderrTail: error instanceof Error ? error.message : String(error),
+			});
 			throw error;
 		});
 	}
@@ -243,17 +248,20 @@ export class Supervisor {
 	private warmUpCommands(rt: WorkspaceRuntime): void {
 		const proc = rt.proc;
 		if (!proc?.running) return;
-		void proc.send({ id: "ready-commands-1", type: "get_commands" }).catch(() => {
-			// Warm-up is best-effort; clients fetch their own snapshot on demand.
-		});
+		void proc
+			.send({ id: "ready-commands-1", type: "get_commands" }, commandTimeoutMs("get_commands"))
+			.catch(() => {
+				// Warm-up is best-effort; clients fetch their own snapshot on demand.
+			});
 	}
 
-	private handleExit(
+	private handleFailure(
 		rt: WorkspaceRuntime,
 		generation: number,
 		info: { code: number | null; signal: NodeJS.Signals | null; stderrTail: string },
 	): void {
-		if (rt.generation !== generation) return;
+		if (rt.generation !== generation || rt.failedGeneration === generation) return;
+		rt.failedGeneration = generation;
 		this.clearAllDialogs(rt);
 		rt.proc = null;
 		rt.status = "crashed";
@@ -276,12 +284,12 @@ export class Supervisor {
 			this.log("warn", `auto-restart budget exhausted for ${rt.cwdRealpath}; manual restart required`);
 			return;
 		}
-		const backoffMs = 500 * 2 ** (rt.crashTimes.length - 1);
+		const backoffMs = this.opts.restartBaseDelayMs * 2 ** (rt.crashTimes.length - 1);
 		this.log("info", `scheduling auto-restart for ${rt.cwdRealpath} in ${backoffMs}ms`);
 		rt.restartTimer = setTimeout(() => {
 			rt.restartTimer = null;
-			if (rt.manuallyStopped) return;
-			this.spawnProcess(rt).catch(() => {
+			if (rt.manuallyStopped || rt.proc?.running || rt.startPromise) return;
+			void this.ensureProcess(rt.workspaceId, rt.cwdRealpath).catch(() => {
 				// Failure handled by the crash path.
 			});
 		}, backoffMs);
@@ -353,7 +361,7 @@ export class Supervisor {
 			if (command.type === "switch_session")
 				await this.assertSessionBelongsToWorkspace(rt, command.sessionPath);
 
-			const response = await proc.send(command, timeoutMs);
+			const response = await proc.send(command, timeoutMs ?? commandTimeoutMs(command.type));
 			if (response.type === "response" && response.success === true && response.command === "get_state") {
 				this.applySessionState(rt, response.data as RpcSessionState);
 			}
@@ -420,7 +428,7 @@ export class Supervisor {
 	private async refreshSessionState(rt: WorkspaceRuntime): Promise<void> {
 		const proc = rt.proc;
 		if (!proc?.running) throw new RpcError("get_state", "pi process is not running after session transition");
-		const response = await proc.send({ type: "get_state" });
+		const response = await proc.send({ type: "get_state" }, commandTimeoutMs("get_state"));
 		if (response.type !== "response" || response.success !== true || response.command !== "get_state") {
 			throw new RpcError("get_state", "Unable to verify active session after session transition");
 		}

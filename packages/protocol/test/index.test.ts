@@ -1,6 +1,6 @@
 import type { RpcResponse } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
-import { expectData, isErrorResponse, isWsClientMessage, RpcError } from "../src/index.js";
+import { commandTimeoutMs, expectData, isErrorResponse, isWsClientMessage, RpcError } from "../src/index.js";
 
 describe("protocol response helpers", () => {
 	it("returns data from successful responses", () => {
@@ -32,6 +32,16 @@ describe("protocol response helpers", () => {
 		} catch (error) {
 			expect(error).toMatchObject({ command: "get_messages", message: "not ready" });
 		}
+	});
+});
+
+describe("gateway command deadlines", () => {
+	it("keeps long-running control commands above the ordinary read deadline", () => {
+		expect(commandTimeoutMs("get_state")).toBe(30_000);
+		expect(commandTimeoutMs("prompt")).toBe(120_000);
+		expect(commandTimeoutMs("abort")).toBe(90_000);
+		expect(commandTimeoutMs("compact")).toBe(120_000);
+		expect(commandTimeoutMs("export_html")).toBe(120_000);
 	});
 });
 

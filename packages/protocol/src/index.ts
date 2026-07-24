@@ -209,6 +209,39 @@ export interface ExtensionErrorEvent {
 
 export type PiWebSessionEvent = JsonAgentSessionEvent | ExtensionErrorEvent;
 
+/**
+ * Gateway command deadlines. Pi owns execution; these bounds only prevent an
+ * unresponsive process from holding a browser request forever.
+ */
+export const COMMAND_TIMEOUT_MS = {
+	default: 30_000,
+	prompt: 120_000,
+	steer: 120_000,
+	followUp: 120_000,
+	abort: 90_000,
+	compact: 120_000,
+	exportHtml: 120_000,
+} as const;
+
+export function commandTimeoutMs(commandType: string): number {
+	switch (commandType) {
+		case "prompt":
+			return COMMAND_TIMEOUT_MS.prompt;
+		case "steer":
+			return COMMAND_TIMEOUT_MS.steer;
+		case "follow_up":
+			return COMMAND_TIMEOUT_MS.followUp;
+		case "abort":
+			return COMMAND_TIMEOUT_MS.abort;
+		case "compact":
+			return COMMAND_TIMEOUT_MS.compact;
+		case "export_html":
+			return COMMAND_TIMEOUT_MS.exportHtml;
+		default:
+			return COMMAND_TIMEOUT_MS.default;
+	}
+}
+
 export type WsServerMessage =
 	| { type: "response"; workspaceId: string; response: RpcResponse }
 	| { type: "event"; workspaceId: string; sessionId: string; epoch: number; event: PiWebSessionEvent }

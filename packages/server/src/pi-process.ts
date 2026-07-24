@@ -270,7 +270,7 @@ export class PiProcess {
 		return `web-${this.requestCounter.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 	}
 
-	/** Graceful stop: SIGTERM, then SIGKILL after 1s (matches the official client). */
+	/** Graceful stop: terminate the complete detached process group before cleanup. */
 	async stop(): Promise<void> {
 		this.stopped = true;
 		const child = this.child;
@@ -278,30 +278,72 @@ export class PiProcess {
 		this.detach?.();
 		this.detach = null;
 
-		if (child.exitCode === null && child.signalCode === null) {
-			const exited = new Promise<void>((resolve) => {
-				const timer = setTimeout(() => {
-					try {
-						child.kill("SIGKILL");
-					} catch {
-						// already gone
-					}
-					resolve();
-				}, 1000);
-				child.once("exit", () => {
-					clearTimeout(timer);
-					resolve();
-				});
-				try {
-					child.kill("SIGTERM");
-				} catch {
-					// already gone
-				}
-			});
-			await exited;
-		}
+		if (process.platform !== "win32" && child.pid) await this.stopProcessGroup(child, child.pid);
+		else if (child.exitCode === null && child.signalCode === null) await this.stopChild(child);
 		this.child = null;
 		this.rejectAll(new RpcError("stop", "pi process stopped"));
 		this.ready = null;
+	}
+
+	private async stopProcessGroup(child: ChildProcess, groupId: number): Promise<void> {
+		this.signalProcessGroup(child, groupId, "SIGTERM");
+		const stopped = await this.waitForProcessGroupExit(groupId, 1_000);
+		if (!stopped) {
+			this.signalProcessGroup(child, groupId, "SIGKILL");
+			await this.waitForProcessGroupExit(groupId, 100);
+		}
+	}
+
+	private signalProcessGroup(child: ChildProcess, groupId: number, signal: NodeJS.Signals): void {
+		try {
+			process.kill(-groupId, signal);
+		} catch {
+			try {
+				child.kill(signal);
+			} catch {
+				// The process is already gone.
+			}
+		}
+	}
+
+	private async waitForProcessGroupExit(groupId: number, timeoutMs: number): Promise<boolean> {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			if (!this.processGroupExists(groupId)) return true;
+			await new Promise<void>((resolve) => setTimeout(resolve, 25));
+		}
+		return !this.processGroupExists(groupId);
+	}
+
+	private processGroupExists(groupId: number): boolean {
+		try {
+			process.kill(-groupId, 0);
+			return true;
+		} catch (error) {
+			return (error as NodeJS.ErrnoException).code === "EPERM";
+		}
+	}
+
+	private async stopChild(child: ChildProcess): Promise<void> {
+		if (child.exitCode !== null || child.signalCode !== null) return;
+		await new Promise<void>((resolve) => {
+			const timer = setTimeout(() => {
+				try {
+					child.kill("SIGKILL");
+				} catch {
+					// The process is already gone.
+				}
+				resolve();
+			}, 1_000);
+			child.once("exit", () => {
+				clearTimeout(timer);
+				resolve();
+			});
+			try {
+				child.kill("SIGTERM");
+			} catch {
+				// The process is already gone.
+			}
+		});
 	}
 }
