@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import { type ServerType, serve } from "@hono/node-server";
@@ -38,6 +39,29 @@ function log(level: "info" | "warn" | "error", message: string): void {
 	const line = `${prefix} ${message}`;
 	if (level === "error") console.error(line);
 	else console.log(line);
+}
+
+function openBrowser(host: string, port: number): void {
+	assertLoopbackHost(host);
+	if (!Number.isInteger(port) || port < 1 || port > 65_535)
+		throw new Error("browser port must be between 1 and 65535");
+	const hostname = host === "::1" ? "[::1]" : host;
+	const url = `http://${hostname}:${String(port)}`;
+	const [command, args] =
+		process.platform === "darwin"
+			? ["open", [url]]
+			: process.platform === "win32"
+				? ["explorer.exe", [url]]
+				: ["xdg-open", [url]];
+	try {
+		const child = spawn(command, args, { detached: true, stdio: "ignore" });
+		child.unref();
+		child.on("error", () => {
+			// Browser launch is best-effort and must never bring down the gateway.
+		});
+	} catch {
+		// Browser launch is best-effort and must never bring down the gateway.
+	}
 }
 
 export async function startServer(options: StartServerOptions = {}): Promise<ServerHandle> {
@@ -129,6 +153,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 	const server = serve({ fetch: app.fetch, port: config.port, hostname: config.host }, (info) => {
 		log("info", `pi-agent-web server listening on http://${config.host}:${info.port}`);
 		if (runtimeWarning) log("warn", runtimeWarning);
+		if (options.openInBrowser) openBrowser(config.host, info.port);
 	});
 
 	// WebSocket upgrade on /api/v1/ws
@@ -158,19 +183,11 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 		});
 	});
 
-	// Auto-open browser (npx one-shot flow).
-	if (options.openInBrowser) {
-		const { exec } = await import("node:child_process");
-		const url = `http://${config.host === "0.0.0.0" ? "127.0.0.1" : config.host}:${config.port}`;
-		const command =
-			process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
-		exec(`${command} ${JSON.stringify(url)}`, () => {});
-	}
-
 	const close = async (): Promise<void> => {
 		bridge.close();
 		await supervisor.stopAll();
 		await new Promise<void>((resolve) => server.close(() => resolve()));
+		registry.close();
 	};
 
 	for (const signal of ["SIGINT", "SIGTERM"] as const) {

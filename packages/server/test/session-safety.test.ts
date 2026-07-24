@@ -169,6 +169,33 @@ describe("session file identity and transition safety", () => {
 		).rejects.toThrow("Session header does not belong to this workspace");
 	});
 
+	it("caches workspace session counts without sharing an encoded-directory collision", async () => {
+		const foreignRealpath = fs.realpathSync(collidingWorkspacePath);
+		writeSession(nextFile("count-foreign"), { id: "count-foreign", cwd: foreignRealpath });
+		const collidingWorkspace = handle.registry.add(collidingWorkspacePath);
+		handle.supervisor.registerWorkspace(collidingWorkspace.id, foreignRealpath);
+
+		const [aSessionsResponse, bSessionsResponse] = await Promise.all([
+			fetch(`${base}/api/v1/workspaces/${workspaceId}/sessions`, { headers: authenticatedHeaders() }),
+			fetch(`${base}/api/v1/workspaces/${collidingWorkspace.id}/sessions`, {
+				headers: authenticatedHeaders(),
+			}),
+		]);
+		const [aSessions, bSessions] = await Promise.all([
+			aSessionsResponse.json() as Promise<{ sessions: unknown[] }>,
+			bSessionsResponse.json() as Promise<{ sessions: unknown[] }>,
+		]);
+
+		const workspacesResponse = await fetch(`${base}/api/v1/workspaces`, { headers: authenticatedHeaders() });
+		const workspaces = (await workspacesResponse.json()) as Array<{ id: string; sessionCount: number }>;
+		expect(workspaces.find((workspace) => workspace.id === workspaceId)?.sessionCount).toBe(
+			aSessions.sessions.length,
+		);
+		expect(workspaces.find((workspace) => workspace.id === collidingWorkspace.id)?.sessionCount).toBe(
+			bSessions.sessions.length,
+		);
+	});
+
 	it("serializes a pending switch ahead of deletion so the newly active file survives", async () => {
 		const fileName = nextFile("queued-active");
 		const queuedPath = writeSession(fileName, { id: "queued-header", cwd: workspaceRealpath });

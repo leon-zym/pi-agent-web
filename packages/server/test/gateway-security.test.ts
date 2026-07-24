@@ -122,6 +122,27 @@ describe("gateway access control", () => {
 		).toBe(403);
 	});
 
+	it("returns a client error for malformed or invalid write bodies", async () => {
+		expect(
+			(
+				await fetch(`${base}/api/v1/workspaces`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json", ...authenticatedHeaders() },
+					body: "{",
+				})
+			).status,
+		).toBe(400);
+		expect(
+			(
+				await fetch(`${base}/api/v1/auth/keys`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json", ...authenticatedHeaders() },
+					body: JSON.stringify({ provider: "  ", key: "  " }),
+				})
+			).status,
+		).toBe(400);
+	});
+
 	it("rejects unauthorized websocket upgrades and policy-violating frames", async () => {
 		const WebSocketCtor = (await import("ws")).default;
 		const unauthorized = new WebSocketCtor(`${base.replace("http", "ws")}/api/v1/ws`, {

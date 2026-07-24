@@ -1,7 +1,8 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { WorkspaceSummary } from "@pi-agent-web/protocol";
+import lockfile from "proper-lockfile";
 
 /**
  * Workspace registry (Host-owned; Pi has no Workspace concept).
@@ -34,9 +35,15 @@ function resolveWorkspaceRealpath(p: string): string {
 export class WorkspaceRegistry {
 	private filePath: string;
 	private records = new Map<string, WorkspaceRecord>();
+	private releaseInstanceLock: (() => void) | null = null;
 
 	constructor(dataDir: string) {
 		this.filePath = path.join(dataDir, "workspaces.json");
+		fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+		const seed = fs.openSync(this.filePath, "a", 0o600);
+		fs.closeSync(seed);
+		fs.chmodSync(this.filePath, 0o600);
+		this.releaseInstanceLock = lockfile.lockSync(this.filePath, { realpath: false, stale: 30_000 });
 		this.load();
 	}
 
@@ -78,11 +85,43 @@ export class WorkspaceRegistry {
 	}
 
 	private persist(): void {
-		fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+		const dir = path.dirname(this.filePath);
+		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+		const tempPath = path.join(dir, `.${path.basename(this.filePath)}.${process.pid}.${randomUUID()}.tmp`);
 		const file: RegistryFile = { version: 1, workspaces: [...this.records.values()] };
-		const tmp = `${this.filePath}.tmp`;
-		fs.writeFileSync(tmp, `${JSON.stringify(file, null, 2)}\n`, "utf8");
-		fs.renameSync(tmp, this.filePath);
+		let fd: number | undefined;
+		try {
+			fd = fs.openSync(tempPath, "wx", 0o600);
+			fs.writeFileSync(fd, `${JSON.stringify(file, null, 2)}\n`, "utf8");
+			fs.fsyncSync(fd);
+			fs.closeSync(fd);
+			fd = undefined;
+			fs.renameSync(tempPath, this.filePath);
+			try {
+				const dirFd = fs.openSync(dir, "r");
+				try {
+					fs.fsyncSync(dirFd);
+				} finally {
+					fs.closeSync(dirFd);
+				}
+			} catch {
+				// Directory fsync is unavailable on some platforms/filesystems.
+			}
+		} finally {
+			if (fd !== undefined) fs.closeSync(fd);
+			try {
+				fs.unlinkSync(tempPath);
+			} catch {
+				// The rename succeeded or the temporary file was never created.
+			}
+		}
+	}
+
+	/** Releases this data directory for a later gateway process during shutdown. */
+	close(): void {
+		const release = this.releaseInstanceLock;
+		this.releaseInstanceLock = null;
+		release?.();
 	}
 
 	/** Register or select a workspace. Returns its stable id. Throws when the dir is missing/unreadable. */

@@ -1,4 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { once } from "node:events";
 import type {
 	JsonAgentSessionEvent,
 	RpcCommand,
@@ -69,6 +70,7 @@ export class PiProcess {
 	private stopped = false;
 	private ready: Promise<void> | null = null;
 	private readyTimer: NodeJS.Timeout | undefined;
+	private writeTail: Promise<void> = Promise.resolve();
 	private opts: Required<Pick<PiProcessOptions, "stderrMaxBytes" | "commandTimeoutMs" | "readyTimeoutMs">> &
 		PiProcessOptions;
 
@@ -130,7 +132,9 @@ export class PiProcess {
 			}
 		});
 
-		this.detach = attachJsonlLineReader(child.stdout!, (line) => this.handleLine(line));
+		this.detach = attachJsonlLineReader(child.stdout!, (line) => this.handleLine(line), {
+			onError: (error) => this.handleProtocolFailure(error),
+		});
 
 		child.once("exit", (code, signal) => {
 			const info = { code, signal, stderrTail: this.stderrTail };
@@ -185,7 +189,9 @@ export class PiProcess {
 
 	/** Send a no-response protocol frame (extension_ui_response etc.). */
 	sendNoResponse(obj: RpcExtensionUIResponse): void {
-		this.write(obj);
+		void this.write(obj).catch((error) => {
+			this.handleProtocolFailure(error instanceof Error ? error : new Error(String(error)));
+		});
 	}
 
 	private sendRaw(obj: RpcCommand & { id: string }, timeoutMs?: number): Promise<RpcResponse> {
@@ -202,22 +208,38 @@ export class PiProcess {
 				reject(new Error(`command timed out (${timeout / 1000}s): ${obj.type}`));
 			}, timeout);
 			this.pending.set(obj.id, { resolve, reject, timer });
-			try {
-				this.write(obj);
-			} catch (error) {
+			void this.write(obj).catch((error) => {
 				clearTimeout(timer);
 				this.pending.delete(obj.id);
-				reject(error);
-			}
+				reject(error instanceof Error ? error : new Error(String(error)));
+			});
 		});
 	}
 
-	private write(obj: unknown): void {
+	private async write(obj: unknown): Promise<void> {
+		const next = this.writeTail.then(() => this.writeNow(obj));
+		this.writeTail = next.catch(() => {});
+		return next;
+	}
+
+	private async writeNow(obj: unknown): Promise<void> {
 		const child = this.child;
 		if (!child?.stdin?.writable) {
 			throw new Error("pi process stdin is not writable");
 		}
-		child.stdin.write(`${JSON.stringify(obj)}\n`);
+		if (!child.stdin.write(`${JSON.stringify(obj)}\n`)) await once(child.stdin, "drain");
+	}
+
+	private handleProtocolFailure(error: Error): void {
+		if (this.stopped) return;
+		this.rejectAll(error);
+		this.opts.onExit?.({
+			code: null,
+			signal: null,
+			stderrTail: `${this.stderrTail}\n${error.message}`,
+		});
+		this.stopped = true;
+		void this.stop();
 	}
 
 	private handleLine(line: string): void {

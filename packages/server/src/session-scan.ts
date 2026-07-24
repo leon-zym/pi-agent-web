@@ -18,6 +18,7 @@ const HEADER_READ_BUFFER_SIZE = 4096;
 const MAX_HEADER_SCAN_BYTES = 1024 * 1024;
 const INFO_WINDOW_BYTES = 128 * 1024;
 const FIRST_MESSAGE_MAX_CHARS = 200;
+export const SESSION_SCAN_CONCURRENCY = 8;
 
 export interface SessionHeader {
 	type: "session";
@@ -26,6 +27,11 @@ export interface SessionHeader {
 	timestamp: string;
 	cwd: string;
 	parentSession?: string;
+}
+
+export interface SessionScanOptions {
+	/** Receives per-file failures without aborting the whole directory scan. */
+	onDiagnostic?: (message: string) => void;
 }
 
 interface ScanAccum {
@@ -183,6 +189,7 @@ export async function scanSessionFile(
 export async function scanSessionDir(
 	sessionDir: string,
 	expectedCwdRealpath?: string,
+	options: SessionScanOptions = {},
 ): Promise<SessionSummary[]> {
 	let entries: fs.Dirent[];
 	try {
@@ -195,10 +202,40 @@ export async function scanSessionDir(
 		.filter((e) => e.isFile() && e.name.endsWith(".jsonl"))
 		.map((e) => path.join(sessionDir, e.name));
 
-	const summaries = await Promise.all(files.map((f) => scanSessionFile(f, expectedCwdRealpath)));
+	const summaries = await mapWithConcurrency(files, SESSION_SCAN_CONCURRENCY, async (filePath) => {
+		try {
+			return await scanSessionFile(filePath, expectedCwdRealpath);
+		} catch (error) {
+			options.onDiagnostic?.(
+				`Skipping unreadable session file ${path.basename(filePath)}: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+			return null;
+		}
+	});
 	const valid = summaries.filter((s): s is SessionSummary => s !== null);
 	valid.sort((a, b) => b.modified - a.modified);
 	return valid;
+}
+
+async function mapWithConcurrency<T, R>(
+	items: T[],
+	concurrency: number,
+	mapper: (item: T) => Promise<R>,
+): Promise<R[]> {
+	const results = new Array<R>(items.length);
+	let nextIndex = 0;
+	const worker = async () => {
+		for (;;) {
+			const index = nextIndex;
+			nextIndex += 1;
+			if (index >= items.length) return;
+			results[index] = await mapper(items[index]!);
+		}
+	};
+	await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+	return results;
 }
 
 /**

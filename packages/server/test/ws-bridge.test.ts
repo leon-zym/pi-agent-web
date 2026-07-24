@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { WebSocketServer } from "ws";
 import type { Supervisor } from "../src/supervisor";
-import { WsBridge } from "../src/ws-bridge";
+import { MAX_WS_IN_FLIGHT_COMMANDS, WsBridge } from "../src/ws-bridge";
 
 /**
  * Disconnect protection unit test:
@@ -66,6 +66,20 @@ async function closeClient(ws: import("ws").WebSocket): Promise<void> {
 	await new Promise<void>((resolve) => {
 		ws.on("close", () => resolve());
 		ws.close();
+	});
+}
+
+function responseFor(ws: import("ws").WebSocket, id: string): Promise<Record<string, unknown>> {
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => reject(new Error(`response ${id} timed out`)), 1_000);
+		const onMessage = (raw: Buffer) => {
+			const frame = JSON.parse(raw.toString()) as { type?: unknown; response?: Record<string, unknown> };
+			if (frame.type !== "response" || frame.response?.id !== id) return;
+			clearTimeout(timer);
+			ws.off("message", onMessage);
+			resolve(frame.response);
+		};
+		ws.on("message", onMessage);
 	});
 }
 
@@ -167,5 +181,33 @@ describe("ws bridge disconnect protection", () => {
 			{ workspaceId: "ws1", response: { type: "extension_ui_response", id: "req-1", confirmed: true } },
 		]);
 		await closeClient(a);
+	});
+
+	it("rejects the 33rd in-flight command without closing the connection", async () => {
+		const port = await setup();
+		(stub as unknown as Record<string, unknown>).sendCommand = () => new Promise(() => {});
+		const client = await openClient(port);
+		const overflow = responseFor(client, "overflow");
+		for (let index = 0; index < MAX_WS_IN_FLIGHT_COMMANDS; index += 1) {
+			client.send(
+				JSON.stringify({
+					type: "command",
+					workspaceId: "ws1",
+					expectedSessionId: null,
+					command: { id: `pending-${String(index)}`, type: "get_last_assistant_text" },
+				}),
+			);
+		}
+		client.send(
+			JSON.stringify({
+				type: "command",
+				workspaceId: "ws1",
+				expectedSessionId: null,
+				command: { id: "overflow", type: "get_last_assistant_text" },
+			}),
+		);
+
+		await expect(overflow).resolves.toMatchObject({ success: false, error: "too_many_in_flight_commands" });
+		await closeClient(client);
 	});
 });

@@ -51,6 +51,8 @@ export interface WsBridgeOptions {
 }
 
 const keyOf = (workspaceId: string, sessionId: string): string => `${workspaceId}\u0000${sessionId}`;
+export const MAX_WS_IN_FLIGHT_COMMANDS = 32;
+export const MAX_WS_BUFFERED_BYTES = 1024 * 1024;
 
 export class WsBridge {
 	readonly wss: WebSocketServer;
@@ -106,12 +108,7 @@ export class WsBridge {
 		const payload = JSON.stringify(message);
 		for (const conn of this.connections) {
 			if (!this.shouldDeliver(conn, message)) continue;
-			if (conn.ws.readyState !== conn.ws.OPEN) continue;
-			try {
-				conn.ws.send(payload);
-			} catch {
-				// Best-effort per connection.
-			}
+			this.sendPayload(conn, payload);
 		}
 	}
 
@@ -248,6 +245,20 @@ export class WsBridge {
 			});
 			return;
 		}
+		if (conn.pendingCommands.size >= MAX_WS_IN_FLIGHT_COMMANDS) {
+			this.sendTargeted(conn, {
+				type: "response",
+				workspaceId,
+				response: {
+					...(command.id ? { id: command.id } : {}),
+					type: "response",
+					command: command.type,
+					success: false,
+					error: "too_many_in_flight_commands",
+				},
+			});
+			return;
+		}
 
 		const internalId = this.nextInternalId(conn);
 		const mapping: RequestMapping = { connectionId: conn.connectionId, clientId: command.id };
@@ -314,9 +325,19 @@ export class WsBridge {
 	}
 
 	private sendTargeted(conn: ConnectionState, message: WsServerMessage): void {
+		this.sendPayload(conn, JSON.stringify(message));
+	}
+
+	private sendPayload(conn: ConnectionState, payload: string): void {
 		if (conn.ws.readyState !== conn.ws.OPEN) return;
+		if (conn.ws.bufferedAmount > MAX_WS_BUFFERED_BYTES) {
+			this.closeForPolicyViolation(conn, "slow WebSocket client");
+			return;
+		}
 		try {
-			conn.ws.send(JSON.stringify(message));
+			conn.ws.send(payload);
+			if (conn.ws.bufferedAmount > MAX_WS_BUFFERED_BYTES)
+				this.closeForPolicyViolation(conn, "slow WebSocket client");
 		} catch {
 			// ignore
 		}

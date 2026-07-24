@@ -22,6 +22,42 @@ export interface AppContext {
 	supervisor: Supervisor;
 }
 
+interface SessionCountCacheEntry {
+	directoryMtimeMs: number;
+	count: number;
+}
+
+async function sessionCountFor(
+	cache: Map<string, SessionCountCacheEntry>,
+	sessionDir: string,
+	expectedCwdRealpath: string,
+): Promise<number> {
+	const cacheKey = `${sessionDir}\u0000${expectedCwdRealpath}`;
+	try {
+		const stat = await fs.promises.stat(sessionDir);
+		const cached = cache.get(cacheKey);
+		if (cached?.directoryMtimeMs === stat.mtimeMs) return cached.count;
+		const count = (
+			await scanSessionDir(sessionDir, expectedCwdRealpath, {
+				onDiagnostic: (message) => console.warn(`[pi-web] WARN ${message}`),
+			})
+		).length;
+		cache.set(cacheKey, { directoryMtimeMs: stat.mtimeMs, count });
+		return count;
+	} catch {
+		cache.delete(cacheKey);
+		return 0;
+	}
+}
+
+async function readJsonBody<T>(request: Request): Promise<T> {
+	try {
+		return (await request.json()) as T;
+	} catch {
+		throw new HTTPException(400, { message: "request body must be valid JSON" });
+	}
+}
+
 function safeSessionId(raw: string): string {
 	const decoded = decodeURIComponent(raw);
 	if (decoded !== path.basename(decoded) || !decoded.endsWith(".jsonl")) {
@@ -32,6 +68,7 @@ function safeSessionId(raw: string): string {
 
 export function createApp(ctx: AppContext): Hono {
 	const { accessControl, config, registry, supervisor } = ctx;
+	const sessionCountCache = new Map<string, SessionCountCacheEntry>();
 	const app = new Hono();
 
 	app.get("/api/v1/bootstrap", (c) => {
@@ -65,7 +102,7 @@ export function createApp(ctx: AppContext): Hono {
 				const record = registry.get(ws.id);
 				if (!record) return;
 				const sessionDir = getSessionDirForCwd(record.cwdRealpath, config.sessionRootDir);
-				counts.set(ws.id, (await scanSessionDir(sessionDir, record.cwdRealpath)).length);
+				counts.set(ws.id, await sessionCountFor(sessionCountCache, sessionDir, record.cwdRealpath));
 			}),
 		);
 		return c.json(
@@ -77,7 +114,7 @@ export function createApp(ctx: AppContext): Hono {
 	});
 
 	app.post("/api/v1/workspaces", async (c) => {
-		const body = await c.req.json<{ path?: string; displayName?: string }>();
+		const body = await readJsonBody<{ path?: string; displayName?: string }>(c.req.raw);
 		if (!body?.path || typeof body.path !== "string") {
 			throw new HTTPException(400, { message: "body.path is required" });
 		}
@@ -107,7 +144,9 @@ export function createApp(ctx: AppContext): Hono {
 		const record = registry.get(c.req.param("workspaceId"));
 		if (!record) throw new HTTPException(404, { message: "workspace not found" });
 		const sessionDir = getSessionDirForCwd(record.cwdRealpath, config.sessionRootDir);
-		const sessions = await scanSessionDir(sessionDir, record.cwdRealpath);
+		const sessions = await scanSessionDir(sessionDir, record.cwdRealpath, {
+			onDiagnostic: (message) => console.warn(`[pi-web] WARN ${message}`),
+		});
 		registry.touch(record.id);
 		return c.json({ sessions, sessionDir });
 	});
@@ -162,11 +201,15 @@ export function createApp(ctx: AppContext): Hono {
 	});
 
 	app.post("/api/v1/auth/keys", async (c) => {
-		const body = await c.req.json<{ provider?: string; key?: string }>();
+		const body = await readJsonBody<{ provider?: string; key?: string }>(c.req.raw);
 		if (!body?.provider || typeof body.provider !== "string" || !body.key || typeof body.key !== "string") {
 			throw new HTTPException(400, { message: "body.provider and body.key are required" });
 		}
-		await saveApiKey(config.agentDir, body.provider, body.key);
+		try {
+			await saveApiKey(config.agentDir, body.provider, body.key);
+		} catch (error) {
+			throw new HTTPException(400, { message: error instanceof Error ? error.message : String(error) });
+		}
 		// Running processes snapshot models at startup (15s background refresh in
 		// pi). Tell clients to re-pull the model directory (auth refresh loop).
 		supervisor.notifyAuthChanged();

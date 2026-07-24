@@ -2,7 +2,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { findChildSessions, scanSessionDir, scanSessionFile } from "../src/session-scan";
+import {
+	findChildSessions,
+	SESSION_SCAN_CONCURRENCY,
+	scanSessionDir,
+	scanSessionFile,
+} from "../src/session-scan";
 
 function writeSession(dir: string, fileName: string, lines: string[]): string {
 	const p = path.join(dir, fileName);
@@ -87,6 +92,25 @@ describe("session scanning", () => {
 
 		const children = await findChildSessions(dir, parentPath);
 		expect(children).toEqual([childPath]);
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	it("scans large session directories with a fixed worker limit", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-scan-"));
+		for (let index = 0; index < 1_000; index += 1) {
+			writeSession(dir, `${String(index).padStart(4, "0")}.jsonl`, [
+				JSON.stringify({
+					type: "session",
+					id: `session-${String(index)}`,
+					timestamp: "2026-01-01T00:00:00.000Z",
+					cwd: "/tmp/proj",
+				}),
+			]);
+		}
+
+		const sessions = await scanSessionDir(dir);
+		expect(SESSION_SCAN_CONCURRENCY).toBe(8);
+		expect(sessions).toHaveLength(1_000);
 		fs.rmSync(dir, { recursive: true, force: true });
 	});
 });

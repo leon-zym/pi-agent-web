@@ -1,6 +1,6 @@
 import { Readable } from "node:stream";
 import { describe, expect, it } from "vitest";
-import { attachJsonlLineReader, collectLines } from "../src/jsonl";
+import { attachJsonlLineReader, collectLines, JsonlLineTooLongError } from "../src/jsonl";
 
 describe("strict JSONL framing", () => {
 	it("splits basic LF lines", () => {
@@ -62,5 +62,14 @@ describe("strict JSONL framing", () => {
 			stream.resume();
 		});
 		expect(collected).toEqual(['{"a":1}', '{"b":2}']);
+	});
+
+	it("reports an unterminated line that exceeds its byte budget", async () => {
+		const errors: Error[] = [];
+		const stream = Readable.from(["x".repeat(17)]);
+		attachJsonlLineReader(stream, () => {}, { maxLineBytes: 16, onError: (error) => errors.push(error) });
+		await new Promise<void>((resolve) => stream.on("end", resolve));
+		expect(errors).toHaveLength(1);
+		expect(errors[0]).toBeInstanceOf(JsonlLineTooLongError);
 	});
 });

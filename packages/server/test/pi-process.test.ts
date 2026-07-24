@@ -5,6 +5,16 @@ import { PiProcess } from "../src/pi-process.js";
 
 const fakePiPath = path.join(import.meta.dirname, "fixtures", "fake-pi.mjs");
 const processGroupPiPath = path.join(import.meta.dirname, "fixtures", "process-group-pi.mjs");
+const longLinePiPath = path.join(import.meta.dirname, "fixtures", "long-line-pi.mjs");
+
+async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (predicate()) return;
+		await new Promise<void>((resolve) => setTimeout(resolve, 5));
+	}
+	throw new Error("condition did not settle before timeout");
+}
 
 describe("PiProcess response correlation", () => {
 	let proc: PiProcess | undefined;
@@ -55,5 +65,23 @@ describe("PiProcess response correlation", () => {
 
 		await proc.stop();
 		expect(() => process.kill(state.descendantPid, 0)).toThrow();
+	});
+
+	it("terminates a process that emits an oversized JSONL line", async () => {
+		const failures: string[] = [];
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: {
+				command: process.execPath,
+				args: [longLinePiPath],
+				source: "pi-path",
+				label: "long line Pi",
+			},
+			onExit: (info) => failures.push(info.stderrTail),
+		});
+		await proc.start();
+		await waitFor(() => failures.length === 1);
+		await waitFor(() => !proc?.running);
+		expect(failures[0]).toContain("JSONL line exceeds");
 	});
 });
