@@ -32,7 +32,30 @@
 
 ## Web Gateway 会话控制
 
-浏览器先用 `session_claim` 取得 Workspace controller lease，再发送控制命令。控制命令和 Extension UI 回包必须携带 `expectedSessionId`；Gateway 在同一 Workspace 的互斥队列里校验 lease 和当前会话。`lease_status` 只说明当前连接是否拥有控制权，`session_state` 广播当前会话的 id、文件路径和递增 epoch。observer 可以订阅事件与读取快照，但不能改变 Pi 状态。
+浏览器先以允许的 loopback Origin 请求 `GET /api/v1/bootstrap`，获得启动期随机 secret 对应的
+HttpOnly、SameSite=Strict Cookie。除了 bootstrap 外，REST 和 WebSocket upgrade 都必须同时通过
+Cookie 与 Origin 校验；服务不接受非 loopback listener。
+
+连接随后用 `session_claim` 取得 Workspace controller lease，再发送控制命令。控制命令和 Extension
+UI 回包必须携带 `expectedSessionId`；Gateway 在同一 Workspace 的互斥队列里校验 lease、当前 session
+和 JSONL Header 的 Workspace 归属。`lease_status` 只说明当前连接是否拥有控制权，`session_state`
+广播当前会话的 id、文件路径和递增 epoch。observer 可以订阅事件、读取快照并缓存 dialog，但不能改变
+Pi 状态；取得 controller 后才显示并回应仍未过期的 dialog。
+
+| Browser → Gateway | 必填字段 | 语义 |
+|---|---|---|
+| `session_listen` | `workspaceId`, `sessionId` | 建立只读事件作用域，并定向收到当前 `session_state`。 |
+| `session_claim` / `session_release` | `workspaceId` | 取得 / 释放 Workspace controller lease。 |
+| `command` | `workspaceId`, `expectedSessionId`, `command` | 受 lease 与 session epoch 保护的 Pi 命令。 |
+| `extension_ui_response` | `workspaceId`, `expectedSessionId`, `response` | 仅原 controller 可回应其当前 session 的待处理 dialog。 |
+
+Gateway 使用 `@pi-agent-web/protocol` 的 runtime guard 拒绝未知字段、错误类型和超出长度限制的帧。
+每个连接命令分配内部 Pi id，response 回传前恢复 client id，因此不同标签页相同 client id 不会互相覆盖。
+每连接最多 32 个 in-flight 命令；WS 帧和 JSONL 单行的上限均为 8 MiB；超过 1 MiB pending 输出的
+慢 socket 会被关闭。
+
+命令 timeout 是 Gateway policy，而不是浏览器输入：普通读取 30 秒，prompt/steer/follow-up 120 秒，
+abort 90 秒，compact/export 120 秒。客户端只显示等于或略长于这些期限的等待状态。
 
 ## 事件流（JsonAgentSessionEvent 关键子集）
 
@@ -77,6 +100,11 @@
 | `~/.pi/agent/settings.json` | 默认模型/思考级别/steering 模式/压缩与重试开关 |
 | `<workspace>/.pi/settings.json` | 项目级覆盖 |
 | `~/.pi/agent/sessions/--<encoded-cwd>--/*.jsonl` | Append-only；首行 SessionHeader（version 3）；文件名 `<ISO时间戳>_<uuidv7>.jsonl` |
+
+Workspace Registry 位于 Gateway 自己的数据目录（默认 agent 目录的同级 `web`）。它由单实例锁保护；
+认证与 Registry 使用唯一临时文件、fsync、原子 rename 写入。`auth.json` 无法解析时拒绝覆盖以保留用户凭据。
+会话目录编码只能用于定位：因为不同 cwd 可编码到同一目录，扫描、切换、删除和计数一律再比对 Header 的
+`cwd` realpath。活动会话删除以 `get_state.sessionFile` 的规范化绝对路径作 409 防护，而非 Header UUID。
 
 编码算法：`"--" + resolvedCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-") + "--"`。
 

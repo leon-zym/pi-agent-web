@@ -11,15 +11,35 @@
 ```bash
 pnpm install --frozen-lockfile                  # 安装（allowBuilds 已在 pnpm-workspace.yaml）
 pnpm dev                                        # 先构建 protocol，再启动 server:3000 + ui:5173
-pnpm build                                      # protocol + server dist + ui dist
-pnpm test                                       # protocol/server/UI 的确定性单测
+pnpm build                                      # protocol + server + UI + CLI 的发行 dist
+pnpm start                                      # 经 pi-web 在 :3000 提供 SPA、REST 和 WS
+pnpm test                                       # protocol/server/UI/CLI 的确定性单测
 pnpm test:smoke                                 # fake Pi 的 REST/WS smoke
 pnpm test:e2e                                   # 默认跳过；PI_WEB_RUN_E2E=1 时才使用真实 Provider
-pnpm typecheck                                  # 先构建 protocol，再检查所有包
+pnpm test:pack                                  # 四个 tarball 的临时 npm install + CLI 启动验证
+pnpm typecheck                                  # 先构建 protocol、server，再检查所有包
 pnpm lint                                       # biome check（写修复加 --write）
 pnpm verify                                     # lint → typecheck → test → build
 node packages/ui/test/visual-walkthrough.mjs    # 截图走查（需 dev 双进程运行中）
 ```
+
+根 `pnpm start` 的额外参数要在 `--` 后传递，例如
+`pnpm start -- --pi-path /path/to/rpc-entry.js --port 3100`。CLI 只接受 loopback host；默认会打开浏览器，
+自动化使用 `--no-open`。
+
+## CI 与发布前验证
+
+GitHub Actions 使用 Node 22 与 pnpm 11.21.0，且不读取任何 Pi 凭据或用户目录。它固定执行：
+
+```bash
+pnpm install --frozen-lockfile
+pnpm verify
+pnpm test:smoke
+```
+
+在准备 tag 或变更 package manifest 时，本地还必须执行 `pnpm test:pack`。该脚本对 protocol、server、
+UI 和 CLI 创建 tarball，在临时空项目安装它们，检查只包含构建产物与精确依赖版本，然后通过 bin 和本地
+`npx` 等价路径启动带 fake Pi 的单端口服务。
 
 ## 验证矩阵（改动后必跑）
 
@@ -31,6 +51,7 @@ node packages/ui/test/visual-walkthrough.mjs    # 截图走查（需 dev 双进�
 | ui 视觉 | typecheck + build + visual-walkthrough 截图逐张核对 |
 | 端到端对话 | PI_WEB_RUN_E2E=1 pnpm test:e2e（真实模型往返） |
 | 断连/崩溃 | ws-bridge.test.ts + supervisor 崩溃退避日志 |
+| 分发与 CLI | pnpm test:pack + pnpm start -- --help |
 
 ## 提交规范
 

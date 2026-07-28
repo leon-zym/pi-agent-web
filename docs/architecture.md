@@ -4,16 +4,16 @@
 
 ```text
 Browser (React SPA)
-  │  REST  /api/v1/*（工作区、会话目录、认证、进程诊断）
-  │  WS    /api/v1/ws（命令、事件流、Extension UI）
+  │  bootstrap Cookie → authenticated REST / WS
+  │  @pi-agent-web/protocol DTO + runtime guard
   ▼
 Web Gateway (Node.js, Hono + ws)
+  ├─ Access control      loopback + Origin + HttpOnly session Cookie
   ├─ WorkspaceRegistry   工作区注册表（Host 职责，持久化于 Web 数据目录）
   ├─ Supervisor          Workspace 粒度进程管理器
-  │    ├─ PiProcess      pi --mode rpc 子进程封装（严格 JSONL、就绪握手、stderr 环形收集）
-  │    └─ 每个工作区一个子进程（cwd = 工作区根目录）
+  │    └─ WorkspaceRuntime { PiProcess, session { id, file, epoch }, controller lease }
   ├─ WsBridge            WS <-> JSONL 中继（命令关联、会话过滤、断连 Cancel 保护）
-  └─ Resolver            三层 Pi 运行时解析
+  └─ Resolver / PiProcess 三层运行时解析与严格 JSONL 子进程封装
 ```
 
 ## 进程模型（关键不变量）
@@ -26,17 +26,20 @@ Web Gateway (Node.js, Hono + ws)
 6. **会话文件安全**：`get_state.sessionFile` 是运行中会话的文件身份；删除、`new_session`、`fork`、`clone` 和 `switch_session` 通过同一工作区互斥队列串行，删除前以规范化文件路径比对活动文件并检查同工作区子会话。
 7. **stderr 单独收集**：RPC 模式接管 stdout，第三方写 stdout 会被重定向到 stderr；网关只把解析成功的 stdout 帧转发，脏行丢弃。
 8. **控制权与会话纪元**：每个 Workspace 同时只能有一个 WS controller；控制命令携带 `expectedSessionId`，Supervisor 在互斥队列内验证 lease 与会话身份。`session_state` 广播 `{ id, file, epoch }`，断开 controller 后 lease 自动释放。
+9. **本机同源边界**：Gateway 仅监听 `127.0.0.1`、`localhost` 或 `::1`。每次启动生成随机 secret；浏览器先请求 `/api/v1/bootstrap` 获得 HttpOnly、SameSite=Strict Cookie，之后 REST 和 WS 同时校验 Cookie 与允许的 Origin。
+10. **资源上限**：JSONL 与 WS 单帧均不超过 8 MiB；每连接最多 32 个 in-flight 命令；socket 积压超过 1 MiB 时关闭。Pi stdin 等待 `drain`，进程输出超长行被当作协议错误处理。
 
 ## 数据流
 
 ```text
-用户提交 → Composer 状态机（plain / trigger / submitting）
-  → WsClientMessage{command} → Supervisor.sendCommand
-      → controller / expectedSessionId / 工作区归属校验 → PiProcess.send（自动补 id）
-      → pi 进程执行 → stdout 三类帧：
-          response  → 按 id 回给发起连接（仅该标签页）
-          event     → 按 (workspace, session) 广播给声明监听的连接
-          extension_ui_request → 同上（对话框排队渲染，逐个应答）
+浏览器启动 → GET /api/v1/bootstrap（允许的 Origin）→ HttpOnly Cookie
+用户提交 → session-controller 统一附加 expectedSessionId
+  → WsClientMessage{command} → WsBridge runtime guard + connection 内部 id
+      → Supervisor transition mutex：controller / expectedSessionId / 工作区归属校验
+      → PiProcess.send（可信的命令级 timeout）→ pi 进程执行 → stdout 三类帧：
+          response  → 由内部 id 映射回发起连接的 client id
+          event     → 按 (workspace, session, epoch) 广播给声明监听的连接
+          extension_ui_request → 只允许 controller 回应；对话框按 deadline 清理
   → 前端 transportStore（原始事件环形缓冲 200 条）
   → projection reducer（纯函数流式装配状态机）
   → 组件（只消费投影，不读原始事件）
@@ -46,7 +49,10 @@ Web Gateway (Node.js, Hono + ws)
 
 ## 重连快照协议
 
-WS 重连成功后依次：`get_state`（sessionId 与本地不一致则清空投影）→ `get_messages` 重建 → `get_commands` / 模型目录 / 会话统计刷新。期间实时事件照常投影。
+WS 重连成功后依次：`get_state` → 刷新该 Workspace 的会话目录 → 以 Host session id 原子更新当前摘要、
+投影 key、listen scope 与 epoch → `get_messages` 重建 → `get_commands` / 模型目录 / 会话统计刷新。
+如果目录找不到 Host 会话，清空选择并显示恢复失败，而不是把数据写回陈旧投影。期间实时事件只接受匹配
+当前 session 与 epoch 的帧。
 
 ## 前端状态分层
 
@@ -71,6 +77,20 @@ WS 重连成功后依次：`get_state`（sessionId 与本地不一致则清空�
 
 ## 安全边界
 
-- 认证状态接口只返回脱敏信息；API Key 仅经 `POST /api/v1/auth/keys` 写入（600 权限 + proper-lockfile）。
-- 会话删除做双防护：运行中会话 409、有子会话引用的 409（血缘保护）。
-- 文件路径接口做目录存在/可读校验；会话 id 参数做 basename 校验防穿越。
+- **访问控制**：`/api/v1/bootstrap` 是唯一不需要 session Cookie 的 API，且仍要求允许的 Origin；其余 REST
+  与 WS upgrade 都需要同源 Cookie。Vite 开发期只额外允许三个 loopback `:5173` Origin。
+- **命令隔离**：observer 没有 lease 时不能 prompt、abort、切换、创建、fork、重命名、设置模型或回应
+  Extension UI。断开后只释放该连接的 lease 与待处理的内部命令映射。
+- **数据身份**：Workspace 以 `realpath` 身份化；会话扫描、切换和计数都以 JSONL Header 的 `cwd` 校验
+  归属，不能依赖会话目录编码。删除前读取 Header，比较规范化绝对 `sessionFile`。
+- **持久化**：认证与注册表通过锁、唯一临时文件、fsync 和原子 rename 更新。认证文件损坏时拒绝覆盖；
+  注册表数据目录以单实例锁保护。
+- **进程与浏览器**：Pi 在 POSIX 上作为独立进程组停止；浏览器打开使用参数数组 spawn，host/port 在调用
+  前经过 loopback 校验，不经过 shell。
+
+## 运行与分发
+
+`packages/cli` 的 `pi-web` 解析 `--pi-path`、`--host`、`--port` 与 `--no-open`，定位已安装的
+`@pi-agent-web/ui/dist`，再调用 `startServer()`。CLI 自己处理 SIGINT/SIGTERM，等待 Gateway 和 Pi
+进程关闭。运行时包只有 `@pi-agent-web/protocol`、`@pi-agent-web/server`、`@pi-agent-web/ui` 和
+`@pi-agent-web/cli`；每个 tarball 除 package manifest 外只包含 `dist`，不会包含认证、会话或 Pi 本体。

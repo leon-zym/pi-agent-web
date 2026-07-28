@@ -1,62 +1,84 @@
 # Pi Agent Web
 
-Pi Coding Agent RPC 模式的现代 Web 工作台。通过一个 Node.js 网关（Supervisor）驱动每个工作区一个 `pi --mode rpc` 子进程，在浏览器中提供完整的三栏对话工作台：会话浏览、流式对话、工具调用、模型切换、上下文计量、分支树时间旅行与扩展 UI 拦截。
+Pi Coding Agent RPC 模式的本机 Web 工作台。它在每个已注册 Workspace 中运行一个
+`pi --mode rpc` 子进程，并提供会话浏览、流式对话、工具调用、模型设置和 Extension UI。
 
-> 系统通过三层运行时解析自动发现本机的 Pi 运行时（`PI_PATH` → 全局 `pi` 命令 → 内置 `@earendil-works/pi-coding-agent` 包），无缝继承你现有的 `~/.pi` 配置、Provider 凭据与扩展。
+Pi Agent Web 是单用户、本机、同源产品：服务只监听 loopback 地址；启动时会生成新的
+HttpOnly session cookie；所有 REST 与 WebSocket 控制请求都必须同时通过 Origin 和 Cookie
+校验。
 
 ## 特性
 
-- **Workspace 粒度进程隔离**：一个工作区一个 `pi --mode rpc` 进程；同工作区内切换会话复用进程，跨工作区先显式选择工作区再打开会话。
-- **单控制标签页**：每个工作区同时只允许一个标签页写入 Pi；其他标签页保留历史查看，controller 断开后可接管。
-- **严格 JSONL 协议**：仅按 LF 切分（U+2028/U+2029 安全），容忍 \r，脏行静默丢弃；bash 输出增量流式、Extension UI 双向对话框、断连自动 Cancel 保护。
-- **产品级对话投影**：ProductTurn → AssistantStep → ContentBlock 三层投影，稳定 React key，Thinking 扫光折叠行、Tool Call 两阶段卡片、插队/排队 Queue Dock。
-- **会话管理**：会话目录扫描（mtime 排序）、重命名/删除（血缘保护）、分支树可视化与 fork 时间旅行、HTML 导出。
-- **模型与上下文**：Model/Thinking Level 两级菜单、上下文占用计量（null 感知）、会话 Token/费用统计。
-- **零配置向导**：无 Provider 凭据时自动弹出 Onboarding，密钥以 600 权限写入 `auth.json`（proper-lockfile 锁）。
-- **中文 / English 双语文案**：轻量字典式 i18n（zh-CN 默认，跟随浏览器语言）。
+- **一个 Workspace 一个 Pi 进程**：跨 Workspace 时先选择 Workspace，再打开其会话；不隐式切换 cwd。
+- **单控制标签页**：同一 Workspace 只能有一个 controller。观察标签页可以阅读历史和事件，不能写入 Pi。
+- **会话安全**：所有控制命令带预期 session id；删除会话按 Pi 返回的 `sessionFile` 比对，绝不按 UUID 猜测。
+- **可靠恢复**：重连时以 Host 的 session state 收敛目录、投影和控制权；历史失败的工具调用保留失败状态。
+- **有界网关**：严格 LF JSONL、8 MiB 行/帧上限、stdin backpressure、每连接命令配额与慢客户端断开。
+- **本地单命令启动**：`pi-web` 同端口提供 SPA、REST 和 WebSocket，并默认打开浏览器。
+
+Pi 运行时按以下顺序解析：`--pi-path` / `PI_PATH`、PATH 中的 `pi`、已安装 Pi 包的
+`rpc-entry.js`。现有的 Pi 配置、Provider 凭据与扩展会被继承；它们不会被打包进本项目的发行物。
 
 ## 快速开始
 
-要求 Node.js ≥ 22 与 pnpm ≥ 10。本机需可用任一 Pi 运行时（见上文三层解析）。
+要求 Node.js 22+ 与 pnpm 11.21.0，并且本机有可用的 Pi 运行时。
 
 ```bash
-pnpm install
-pnpm dev            # 网关 :3000 + Vite :5173（带 WS 代理）
+pnpm install --frozen-lockfile
+pnpm dev
 ```
 
-打开 <http://localhost:5173>。左侧添加一个工作区（本地项目目录），新建会话，开始对话。
+开发模式启动 Gateway（默认 `:3000`）和 Vite（默认 `:5173`）。打开 Vite 提示的 loopback
+地址，注册一个本地项目目录后即可新建会话。
 
-生产模式（单端口 :3000 托管构建产物）：
+生产模式使用构建后的 SPA 与 CLI：
 
 ```bash
-pnpm build          # 构建 server dist + ui dist
-pnpm start          # node packages/server/dist/main.js，自动打开浏览器
+pnpm build
+pnpm start
+
+# 透传 CLI 参数的示例
+pnpm start -- --pi-path /path/to/rpc-entry.js --port 3100
 ```
+
+`pi-web` 只接受 `127.0.0.1`、`localhost` 或 `::1` 作为 `--host`。常用参数：
+`--pi-path <path>`、`--host <host>`、`--port <port>`、`--no-open`、`--help`。
 
 ## 验证
 
 ```bash
-pnpm test           # server 单测 + 真实 pi 集成测试 + ui reducer 单测
-pnpm typecheck      # 全包 tsc
-pnpm lint           # biome check
+pnpm verify       # lint → typecheck → deterministic tests → build
+pnpm test:smoke   # fake Pi 驱动的 REST / WebSocket smoke
+pnpm test:e2e     # 默认跳过；PI_WEB_RUN_E2E=1 时才使用真实 Provider
+pnpm test:pack    # pack 四个运行时包，临时安装并启动 pi-web
 ```
 
-集成测试使用真实 Pi 运行时（隔离的临时会话目录），不触碰用户数据。UI 视觉走查脚本位于 `packages/ui/test/visual-walkthrough.mjs`（Playwright，需先 `pnpm --filter @pi-agent-web/ui exec playwright install chromium`）。
+CI 只运行无凭据的 `pnpm verify` 和 `pnpm test:smoke`。真实 Provider 对话、图片附件、fork、
+Extension editor/widget 与浏览器视觉走查是本地 release checklist，不会读取 CI 或其他人的 Pi 数据。
+
+## 本地分发验证
+
+运行时由四个包组成：`@pi-agent-web/protocol`、`@pi-agent-web/server`、
+`@pi-agent-web/ui` 和 `@pi-agent-web/cli`。`pnpm test:pack` 会在临时目录中打包、安装四个
+tarball，确认没有源码或 `workspace:*` 依赖泄漏，再通过 bin 与等价的本地 `npx` 路径启动 CLI。
+
+公开发布是独立决策；只有包被发布后，才可使用 `npx --yes @pi-agent-web/cli --help`。
 
 ## 项目结构
 
 ```text
 packages/
-  server/   Node 网关：jsonl / resolver / pi-process / supervisor / ws-bridge / routes
-  ui/       React 19 + Vite + Tailwind v4：stores 分层 + 特性组件 + i18n 字典
-  cli/      pi-web 命令（启动网关 + 打开浏览器）
+  protocol/ Browser-safe DTO、运行时 guards 与命令 timeout 策略
+  server/   Node Gateway：jsonl / resolver / pi-process / supervisor / ws-bridge / routes
+  ui/       React 19 + Vite + Tailwind v4：stores、特性组件和 i18n
+  cli/      pi-web 命令：静态资源定位、单端口启动与优雅关闭
 docs/       架构 / 协议 / UI-UX / 开发规范
 ```
 
 ## 文档
 
-- [docs/architecture.md](docs/architecture.md) — 系统拓扑与进程调度
-- [docs/protocol.md](docs/protocol.md) — RPC 协议与存储事实
+- [docs/architecture.md](docs/architecture.md) — 拓扑、控制权和数据流
+- [docs/protocol.md](docs/protocol.md) — Pi RPC 与 Gateway 协议、存储事实
 - [docs/ui-ux.md](docs/ui-ux.md) — 交互设计与 UX 规则
-- [docs/development.md](docs/development.md) — 工具链与提交规范
-- [DESIGN.md](DESIGN.md) — 视觉设计契约（颜色 / 字体 / 圆角 / 组件配方）
+- [docs/development.md](docs/development.md) — 工具链、CI、验证与提交规范
+- [DESIGN.md](DESIGN.md) — 视觉设计契约
