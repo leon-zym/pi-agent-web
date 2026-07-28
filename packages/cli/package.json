@@ -1,21 +1,19 @@
 {
-	"name": "@pi-agent-web/protocol",
+	"name": "@pi-agent-web/cli",
 	"version": "0.1.0",
-	"description": "Browser-safe DTOs and runtime guards for Pi Agent Web",
+	"description": "Local single-command launcher for Pi Agent Web",
 	"engines": {
 		"node": ">=22"
 	},
 	"type": "module",
-	"exports": {
-		".": {
-			"types": "./dist/index.d.ts",
-			"import": "./dist/index.js"
-		}
+	"bin": {
+		"pi-web": "./dist/cli.js"
 	},
 	"files": [
 		"dist"
 	],
 	"scripts": {
+		"start": "node dist/cli.js",
 		"prepack": "pnpm build",
 		"build": "tsc -p tsconfig.build.json",
 		"typecheck": "tsc -p tsconfig.json --noEmit",
@@ -23,10 +21,12 @@
 		"lint": "biome check ."
 	},
 	"dependencies": {
-		"@earendil-works/pi-coding-agent": "0.84.2"
+		"@pi-agent-web/server": "workspace:*",
+		"@pi-agent-web/ui": "workspace:*"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.3.0",
+		"@types/node": "^24.0.0",
 		"typescript": "^5.9.0",
 		"vitest": "^4.0.0"
 	}

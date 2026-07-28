@@ -21,6 +21,8 @@ export interface StartServerOptions {
 	/** Serve the built SPA from this directory (production mode). */
 	staticDir?: string;
 	openInBrowser?: boolean;
+	/** The CLI owns signal handling so it can await a clean shutdown itself. */
+	handleSignals?: boolean;
 }
 
 export interface ServerHandle {
@@ -183,17 +185,23 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 		});
 	});
 
-	const close = async (): Promise<void> => {
-		bridge.close();
-		await supervisor.stopAll();
-		await new Promise<void>((resolve) => server.close(() => resolve()));
-		registry.close();
+	let closePromise: Promise<void> | null = null;
+	const close = (): Promise<void> => {
+		closePromise ??= (async () => {
+			bridge.close();
+			await supervisor.stopAll();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+			registry.close();
+		})();
+		return closePromise;
 	};
 
-	for (const signal of ["SIGINT", "SIGTERM"] as const) {
-		process.on(signal, () => {
-			void close().then(() => process.exit(0));
-		});
+	if (options.handleSignals !== false) {
+		for (const signal of ["SIGINT", "SIGTERM"] as const) {
+			process.on(signal, () => {
+				void close().then(() => process.exit(0));
+			});
+		}
 	}
 
 	return { server, supervisor, bridge, registry, config, runtime, accessControl, close };

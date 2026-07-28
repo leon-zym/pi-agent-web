@@ -1,8 +1,10 @@
 {
 	"name": "@pi-agent-web/server",
 	"version": "0.1.0",
-	"private": true,
 	"description": "Pi Agent Web Gateway：Supervisor 进程调度 + REST API + WebSocket 中继",
+	"engines": {
+		"node": ">=22"
+	},
 	"type": "module",
 	"exports": {
 		".": {
@@ -10,9 +12,13 @@
 			"import": "./dist/index.js"
 		}
 	},
+	"files": [
+		"dist"
+	],
 	"scripts": {
 		"dev": "tsx watch src/main.ts",
-		"start": "tsx src/main.ts",
+		"start": "node dist/main.js",
+		"prepack": "pnpm build",
 		"build": "tsc -p tsconfig.build.json",
 		"typecheck": "tsc -p tsconfig.json --noEmit",
 		"test": "vitest run",

@@ -8,6 +8,28 @@ importers:
 
   .: {}
 
+  packages/cli:
+    dependencies:
+      '@pi-agent-web/server':
+        specifier: workspace:*
+        version: link:../server
+      '@pi-agent-web/ui':
+        specifier: workspace:*
+        version: link:../ui
+    devDependencies:
+      '@biomejs/biome':
+        specifier: ^2.3.0
+        version: 2.5.9
+      '@types/node':
+        specifier: ^24.0.0
+        version: 24.13.3
+      typescript:
+        specifier: ^5.9.0
+        version: 5.9.3
+      vitest:
+        specifier: ^4.0.0
+        version: 4.1.10(@opentelemetry/api@1.9.0)(@types/node@24.13.3)(vite@8.2.1(@types/node@24.13.3)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.12)(yaml@2.9.0))
+
   packages/protocol:
     dependencies:
       '@earendil-works/pi-coding-agent':

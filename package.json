@@ -12,12 +12,13 @@
 		"dev:ui": "pnpm --filter @pi-agent-web/protocol build && pnpm --filter @pi-agent-web/ui dev",
 		"dev:server": "pnpm --filter @pi-agent-web/protocol build && pnpm --filter @pi-agent-web/server dev",
 		"build": "pnpm -r build",
-		"test": "pnpm --filter @pi-agent-web/protocol build && pnpm -r test",
+		"test": "pnpm --filter @pi-agent-web/protocol build && pnpm --filter @pi-agent-web/server build && pnpm -r test",
 		"test:smoke": "pnpm --filter @pi-agent-web/server test:smoke",
 		"test:e2e": "pnpm --filter @pi-agent-web/server test:e2e",
 		"lint": "pnpm -r lint",
-		"typecheck": "pnpm --filter @pi-agent-web/protocol build && pnpm -r typecheck",
+		"typecheck": "pnpm --filter @pi-agent-web/protocol build && pnpm --filter @pi-agent-web/server build && pnpm -r typecheck",
 		"verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm build",
+		"test:pack": "node scripts/pack-smoke.mjs",
 		"start": "pnpm --filter @pi-agent-web/cli start"
 	},
 	"packageManager": "pnpm@11.21.0"
