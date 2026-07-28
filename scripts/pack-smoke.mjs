@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -100,6 +101,22 @@ try {
 		if (!bootstrap.ok || !cookie) throw new Error("Bootstrap did not issue a session cookie");
 		const response = await fetch(`${origin}/api/v1/health`, { headers: { Origin: origin, Cookie: cookie } });
 		if (!response.ok) throw new Error(`Health check failed with ${String(response.status)}`);
+		const spa = await fetch(origin);
+		if (!spa.ok || !(await spa.text()).includes('<div id="root"></div>')) {
+			throw new Error("Packaged SPA was not served from the CLI port");
+		}
+		const requireFromInstall = createRequire(path.join(installDir, "package.json"));
+		const WebSocket = requireFromInstall("ws");
+		await new Promise((resolve, reject) => {
+			const socket = new WebSocket(`${origin.replace("http", "ws")}/api/v1/ws`, {
+				headers: { Origin: origin, Cookie: cookie },
+			});
+			socket.once("open", () => {
+				socket.close();
+				resolve();
+			});
+			socket.once("error", reject);
+		});
 	} finally {
 		await closeChild(child);
 	}
