@@ -68,10 +68,18 @@ function matchesSecret(actual: string | undefined, expected: string): boolean {
 	return timingSafeEqual(Buffer.from(actual), Buffer.from(expected));
 }
 
+/**
+ * Same-origin browser GET requests do not carry an Origin header. Fetch
+ * Metadata is set by the browser and survives the Vite development proxy.
+ */
+function isSameOriginFetch(headers: HeadersInput): boolean {
+	return headerValue(headers, "sec-fetch-site") === "same-origin";
+}
+
 export function createGatewayAccessControl(sessionSecret: string): GatewayAccessControl {
 	const isAllowedOrigin = (headers: HeadersInput): boolean => {
 		const origin = normalizedOrigin(headerValue(headers, "origin"));
-		if (!origin) return false;
+		if (!origin) return isSameOriginFetch(headers);
 		return origin === requestOrigin(headers) || DEV_ORIGINS.has(origin);
 	};
 

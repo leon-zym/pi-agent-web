@@ -102,6 +102,25 @@ describe("gateway access control", () => {
 		).toBe(200);
 	});
 
+	it("accepts browser same-origin GET requests that omit Origin", async () => {
+		const bootstrap = await fetch(`${base}/api/v1/bootstrap`, {
+			headers: { "Sec-Fetch-Site": "same-origin" },
+		});
+		expect(bootstrap.status).toBe(200);
+		const browserCookie = bootstrap.headers.get("set-cookie")?.split(";", 1)[0];
+		expect(browserCookie).toMatch(/^pi_web_session=/);
+
+		const workspaces = await fetch(`${base}/api/v1/workspaces`, {
+			headers: { "Sec-Fetch-Site": "same-origin", Cookie: browserCookie ?? "" },
+		});
+		expect(workspaces.status).toBe(200);
+
+		const crossSite = await fetch(`${base}/api/v1/bootstrap`, {
+			headers: { "Sec-Fetch-Site": "cross-site" },
+		});
+		expect(crossSite.status).toBe(403);
+	});
+
 	it("rejects REST calls without a matching cookie and origin", async () => {
 		expect((await fetch(`${base}/api/v1/workspaces`, { headers: { Origin: viteOrigin } })).status).toBe(403);
 		expect(
