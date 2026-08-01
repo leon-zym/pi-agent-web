@@ -4,8 +4,8 @@ Pi Coding Agent RPC 模式的本机 Web 工作台。它在每个已注册 Worksp
 `pi --mode rpc` 子进程，并提供会话浏览、流式对话、工具调用、模型设置和 Extension UI。
 
 Pi Agent Web 是单用户、本机、同源产品：服务只监听 loopback 地址；启动时会生成新的
-HttpOnly session cookie；所有 REST 与 WebSocket 控制请求都必须同时通过 Origin 和 Cookie
-校验。
+HttpOnly session cookie。REST 与 WebSocket 控制请求必须有该 Cookie；带 `Origin` 的请求会校验
+loopback 同源，浏览器同源 GET 缺少 `Origin` 时使用 Fetch Metadata 校验。
 
 ## 特性
 

@@ -24,6 +24,11 @@ A modern web workbench for Pi Coding Agent's RPC mode.
 - `packages/cli`: the `pi-web` command — starts the server and opens the
   browser.
 
+## Naming
+- `pi-agent-web` is the repository, service, and `@pi-agent-web/*` package
+  namespace. `pi-web` is the short human-facing CLI command and local UI name.
+  Keep that boundary; do not perform a repository-wide rename between them.
+
 ## Key conventions
 - Protocol types are imported from `@earendil-works/pi-coding-agent`
   (RpcCommand, RpcResponse, RpcExtensionUIRequest, ...).
@@ -35,7 +40,8 @@ A modern web workbench for Pi Coding Agent's RPC mode.
   cross-workspace `switch_session` is rejected. Select the target workspace
   explicitly before opening one of its sessions.
 - Gateway is a local, same-origin control surface: only loopback listeners are
-  valid; REST and WS require the bootstrap session Cookie and an allowed Origin.
+  valid; REST and WS require the bootstrap session Cookie. Validate an Origin
+  when present; browser same-origin REST GETs use Fetch Metadata instead.
 - One Workspace has one controller lease. Every state-changing command carries
   `expectedSessionId`; observers remain read-only until they claim the lease.
 - Treat `sessionFile` and JSONL Header `cwd` realpaths as data identities. Do

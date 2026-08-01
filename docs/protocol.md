@@ -33,8 +33,9 @@
 ## Web Gateway 会话控制
 
 浏览器先以允许的 loopback Origin 请求 `GET /api/v1/bootstrap`，获得启动期随机 secret 对应的
-HttpOnly、SameSite=Strict Cookie。除了 bootstrap 外，REST 和 WebSocket upgrade 都必须同时通过
-Cookie 与 Origin 校验；服务不接受非 loopback listener。
+HttpOnly、SameSite=Strict Cookie。除了 bootstrap 外，REST 和 WebSocket upgrade 都必须通过 Cookie
+校验；带 `Origin` 的请求还会校验 Origin。浏览器同源 GET 不发送 `Origin` 时，REST 仅接受
+`Sec-Fetch-Site: same-origin`；服务不接受非 loopback listener。
 
 连接随后用 `session_claim` 取得 Workspace controller lease，再发送控制命令。控制命令和 Extension
 UI 回包必须携带 `expectedSessionId`；Gateway 在同一 Workspace 的互斥队列里校验 lease、当前 session

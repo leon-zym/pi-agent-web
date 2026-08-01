@@ -26,7 +26,7 @@ Web Gateway (Node.js, Hono + ws)
 6. **会话文件安全**：`get_state.sessionFile` 是运行中会话的文件身份；删除、`new_session`、`fork`、`clone` 和 `switch_session` 通过同一工作区互斥队列串行，删除前以规范化文件路径比对活动文件并检查同工作区子会话。
 7. **stderr 单独收集**：RPC 模式接管 stdout，第三方写 stdout 会被重定向到 stderr；网关只把解析成功的 stdout 帧转发，脏行丢弃。
 8. **控制权与会话纪元**：每个 Workspace 同时只能有一个 WS controller；控制命令携带 `expectedSessionId`，Supervisor 在互斥队列内验证 lease 与会话身份。`session_state` 广播 `{ id, file, epoch }`，断开 controller 后 lease 自动释放。
-9. **本机同源边界**：Gateway 仅监听 `127.0.0.1`、`localhost` 或 `::1`。每次启动生成随机 secret；浏览器先请求 `/api/v1/bootstrap` 获得 HttpOnly、SameSite=Strict Cookie，之后 REST 和 WS 同时校验 Cookie 与允许的 Origin。
+9. **本机同源边界**：Gateway 仅监听 `127.0.0.1`、`localhost` 或 `::1`。每次启动生成随机 secret；浏览器先请求 `/api/v1/bootstrap` 获得 HttpOnly、SameSite=Strict Cookie。带 `Origin` 的 REST 与 WS 校验允许的 loopback Origin；浏览器同源 GET 缺少 `Origin` 时，REST 以 `Sec-Fetch-Site: same-origin` 校验。
 10. **资源上限**：JSONL 与 WS 单帧均不超过 8 MiB；每连接最多 32 个 in-flight 命令；socket 积压超过 1 MiB 时关闭。Pi stdin 等待 `drain`，进程输出超长行被当作协议错误处理。
 
 ## 数据流
@@ -77,8 +77,9 @@ WS 重连成功后依次：`get_state` → 刷新该 Workspace 的会话目录 �
 
 ## 安全边界
 
-- **访问控制**：`/api/v1/bootstrap` 是唯一不需要 session Cookie 的 API，且仍要求允许的 Origin；其余 REST
-  与 WS upgrade 都需要同源 Cookie。Vite 开发期只额外允许三个 loopback `:5173` Origin。
+- **访问控制**：`/api/v1/bootstrap` 是唯一不需要 session Cookie 的 API。带 `Origin` 的请求必须使用允许的
+  loopback Origin；浏览器同源 GET 不带 `Origin` 时，REST 只接受 `Sec-Fetch-Site: same-origin`。其余 REST
+  与 WS upgrade 都需要 session Cookie，Vite 开发期只额外允许三个 loopback `:5173` Origin。
 - **命令隔离**：observer 没有 lease 时不能 prompt、abort、切换、创建、fork、重命名、设置模型或回应
   Extension UI。断开后只释放该连接的 lease 与待处理的内部命令映射。
 - **数据身份**：Workspace 以 `realpath` 身份化；会话扫描、切换和计数都以 JSONL Header 的 `cwd` 校验
