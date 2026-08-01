@@ -5,6 +5,8 @@ import {
 	Folder,
 	FolderPlus,
 	Moon,
+	PanelLeftClose,
+	PanelLeftOpen,
 	Pencil,
 	Plus,
 	RotateCw,
@@ -43,7 +45,6 @@ import {
 	DropdownMenuTrigger,
 } from "../../components/ui/dropdown-menu";
 import { Input } from "../../components/ui/input";
-import { Label } from "../../components/ui/label";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
 import { api } from "../../lib/api";
 import { formatRelativeTime } from "../../lib/format";
@@ -352,12 +353,27 @@ function AddWorkspaceDialog({
 	open: boolean;
 	onOpenChange: (open: boolean) => void;
 }) {
-	const [path, setPath] = useState("");
-	const add = async () => {
+	const [path, setPath] = useState<string | null>(null);
+	const [picking, setPicking] = useState(false);
+	const chooseDirectory = async () => {
+		setPicking(true);
 		try {
-			await useSessionDirectoryStore.getState().addWorkspace(path.trim());
+			const selected = await api.pickWorkspaceDirectory();
+			if (selected.path) setPath(selected.path);
+		} catch (error) {
+			toast.error(tt("sidebar.workspaceAddFailed"), {
+				description: error instanceof Error ? error.message : String(error),
+			});
+		} finally {
+			setPicking(false);
+		}
+	};
+	const add = async () => {
+		if (!path) return;
+		try {
+			await useSessionDirectoryStore.getState().addWorkspace(path);
 			toast.success(tt("sidebar.workspaceAdded"));
-			setPath("");
+			setPath(null);
 			onOpenChange(false);
 		} catch (error) {
 			toast.error(tt("sidebar.workspaceAddFailed"), {
@@ -372,24 +388,27 @@ function AddWorkspaceDialog({
 					<DialogTitle>{tt("sidebar.workspaceDialogTitle")}</DialogTitle>
 					<DialogDescription>{tt("sidebar.workspaceDialogDescription")}</DialogDescription>
 				</DialogHeader>
-				<div className="flex flex-col gap-1.5">
-					<Label htmlFor="workspace-path">{tt("sidebar.workspacePathLabel")}</Label>
-					<Input
-						id="workspace-path"
-						autoFocus
-						value={path}
-						placeholder={tt("sidebar.workspacePathPlaceholder")}
-						onChange={(event) => setPath(event.target.value)}
-						onKeyDown={(event) => {
-							if (event.key === "Enter") void add();
-						}}
-					/>
+				<div className="flex flex-col gap-2">
+					<Button
+						variant="outline"
+						className="h-9 justify-start"
+						onClick={() => void chooseDirectory()}
+						disabled={picking}
+					>
+						<FolderPlus className="size-4" />
+						{picking ? tt("common.loading") : tt("sidebar.chooseWorkspaceFolder")}
+					</Button>
+					<div className="min-h-9 rounded-sm bg-surface-2 px-3 py-2 font-mono text-[12px] leading-5 text-ink-2">
+						<span className={cn("break-all", !path && "text-ink-3")}>
+							{path ?? tt("sidebar.workspacePickerEmpty")}
+						</span>
+					</div>
 				</div>
 				<DialogFooter>
 					<Button variant="outline" onClick={() => onOpenChange(false)}>
 						{tt("common.cancel")}
 					</Button>
-					<Button onClick={() => void add()} disabled={!path.trim()}>
+					<Button onClick={() => void add()} disabled={!path || picking}>
 						{tt("sidebar.addWorkspace")}
 					</Button>
 				</DialogFooter>
@@ -402,7 +421,7 @@ function AddWorkspaceDialog({
  * Workspace / session browser (DESIGN.md): expanded 280px tree or 56px rail.
  * Rows are hover-fill only; the selected session gets a 2px primary bar.
  */
-export function WorkspaceSidebar({ rail }: { rail: boolean }) {
+export function WorkspaceSidebar({ rail, onToggleRail }: { rail: boolean; onToggleRail?: () => void }) {
 	const workspaces = useSessionDirectoryStore((s) => s.workspaces);
 	const sessions = useSessionDirectoryStore((s) => s.sessions);
 	const currentWorkspaceId = useSessionDirectoryStore((s) => s.currentWorkspaceId);
@@ -446,6 +465,21 @@ export function WorkspaceSidebar({ rail }: { rail: boolean }) {
 				<div className="mb-2 flex size-9 items-center justify-center rounded-sm bg-primary-soft text-primary">
 					<Bot className="size-5" />
 				</div>
+				{onToggleRail && (
+					<Tooltip>
+						<TooltipTrigger asChild>
+							<button
+								type="button"
+								aria-label={tt("appShell.expandSidebar")}
+								className="flex size-9 items-center justify-center rounded-sm text-ink-2 transition-[color,background-color,scale] hover:bg-hover active:scale-95"
+								onClick={onToggleRail}
+							>
+								<PanelLeftOpen className="size-4" />
+							</button>
+						</TooltipTrigger>
+						<TooltipContent side="right">{tt("appShell.expandSidebar")}</TooltipContent>
+					</Tooltip>
+				)}
 				<Tooltip>
 					<TooltipTrigger asChild>
 						<button
@@ -513,6 +547,21 @@ export function WorkspaceSidebar({ rail }: { rail: boolean }) {
 					</TooltipTrigger>
 					<TooltipContent>{tt("sidebar.addWorkspace")}</TooltipContent>
 				</Tooltip>
+				{onToggleRail && (
+					<Tooltip>
+						<TooltipTrigger asChild>
+							<button
+								type="button"
+								aria-label={tt("appShell.collapseSidebar")}
+								className="flex size-7 items-center justify-center rounded-sm text-ink-3 transition-[color,background-color,scale] hover:bg-hover hover:text-ink active:scale-95"
+								onClick={onToggleRail}
+							>
+								<PanelLeftClose className="size-4" />
+							</button>
+						</TooltipTrigger>
+						<TooltipContent>{tt("appShell.collapseSidebar")}</TooltipContent>
+					</Tooltip>
+				)}
 			</div>
 
 			<div className="px-3 pb-2">

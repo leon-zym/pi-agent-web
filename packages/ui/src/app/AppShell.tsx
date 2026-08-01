@@ -1,5 +1,7 @@
+import { PanelRightOpen } from "lucide-react";
 import type * as React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Tooltip, TooltipContent, TooltipTrigger } from "../components/ui/tooltip";
 import { ConversationColumn } from "../features/conversation/ConversationColumn";
 import { DetailsPanel } from "../features/details/DetailsPanel";
 import { WorkspaceSidebar } from "../features/sidebar/WorkspaceSidebar";
@@ -45,12 +47,13 @@ function clamp(value: number, min: number, max: number): number {
 /**
  * Three-column app shell with the DSH squeeze policy (DESIGN.md):
  * details shrinks to 300, then closes (subtree stays mounted), and only then
- * may the center drop below 640. The sidebar never yields; under 1024px it
- * becomes a 56px rail.
+ * may the center drop below 640. The sidebar can be manually reduced to a
+ * 56px rail and does so automatically under 1024px.
  */
 export function AppShell() {
 	const [widths, setWidths] = useState<StoredWidths>(() => loadWidths());
 	const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
+	const [sidebarOpen, setSidebarOpen] = useState(true);
 	const [detailsOpen, setDetailsOpen] = useState(true);
 	const dragging = useRef<"sidebar" | "details" | null>(null);
 
@@ -69,8 +72,9 @@ export function AppShell() {
 		}
 	}, []);
 
-	const rail = viewportWidth < RAIL_BREAKPOINT;
-	const sidebarWidth = rail ? 56 : widths.sidebar;
+	const compact = viewportWidth < RAIL_BREAKPOINT;
+	const sidebarRail = compact || !sidebarOpen;
+	const sidebarWidth = sidebarRail ? 56 : widths.sidebar;
 
 	// Squeeze policy: details yields first, then closes; center is last.
 	const availableForCenter = viewportWidth - sidebarWidth - (detailsOpen ? widths.details : 0);
@@ -79,6 +83,7 @@ export function AppShell() {
 		detailsWidth = Math.max(0, viewportWidth - sidebarWidth - CENTER_MIN);
 		if (detailsWidth > 0 && detailsWidth < DETAILS_MIN) detailsWidth = 0;
 	}
+	const canExpandDetails = viewportWidth - sidebarWidth >= CENTER_MIN + DETAILS_MIN;
 
 	const startDrag = (which: "sidebar" | "details") => (event: React.PointerEvent) => {
 		dragging.current = which;
@@ -105,10 +110,13 @@ export function AppShell() {
 				className="min-w-0 overflow-hidden border-r border-border bg-sidebar"
 				style={{ width: sidebarWidth, flexShrink: 0 }}
 			>
-				<WorkspaceSidebar rail={rail} />
+				<WorkspaceSidebar
+					rail={sidebarRail}
+					onToggleRail={compact ? undefined : () => setSidebarOpen((open) => !open)}
+				/>
 			</div>
 
-			{!rail && (
+			{!sidebarRail && (
 				<button
 					type="button"
 					aria-label={tt("appShell.sidebarWidth")}
@@ -130,6 +138,22 @@ export function AppShell() {
 			<main className="min-w-0 flex-1 overflow-hidden">
 				<ConversationColumn />
 			</main>
+
+			{detailsWidth === 0 && canExpandDetails && (
+				<Tooltip>
+					<TooltipTrigger asChild>
+						<button
+							type="button"
+							aria-label={tt("details.expandPanel")}
+							className="flex w-10 shrink-0 items-start justify-center border-l border-border pt-3 text-ink-3 transition-[color,background-color,scale] hover:bg-hover hover:text-ink active:scale-95 focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
+							onClick={() => setDetailsOpen(true)}
+						>
+							<PanelRightOpen className="size-4" />
+						</button>
+					</TooltipTrigger>
+					<TooltipContent side="left">{tt("details.expandPanel")}</TooltipContent>
+				</Tooltip>
+			)}
 
 			{detailsWidth > 0 && (
 				<button

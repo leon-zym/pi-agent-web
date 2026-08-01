@@ -26,6 +26,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
 	bootstrap: () => request<{ ok: true }>("/api/v1/bootstrap"),
 	listWorkspaces: () => request<WorkspaceSummary[]>("/api/v1/workspaces"),
+	pickWorkspaceDirectory: () =>
+		request<{ path: string | null }>("/api/v1/workspaces/pick-directory", { method: "POST" }),
 	addWorkspace: (path: string) =>
 		request<WorkspaceSummary>("/api/v1/workspaces", { method: "POST", body: JSON.stringify({ path }) }),
 	removeWorkspace: (workspaceId: string) =>

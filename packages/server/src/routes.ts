@@ -6,6 +6,7 @@ import type { GatewayAccessControl } from "./access-control.js";
 import { readAuthStatus, saveApiKey } from "./auth-storage.js";
 import type { ServerConfig } from "./config.js";
 import { getSessionDirForCwd } from "./config.js";
+import { pickWorkspaceDirectory } from "./directory-picker.js";
 import { findChildSessions, scanSessionDir, scanSessionFile } from "./session-scan.js";
 import type { Supervisor } from "./supervisor.js";
 import type { WorkspaceRegistry } from "./workspace-registry.js";
@@ -124,6 +125,16 @@ export function createApp(ctx: AppContext): Hono {
 			return c.json(summary, 201);
 		} catch (error) {
 			throw new HTTPException(400, { message: error instanceof Error ? error.message : String(error) });
+		}
+	});
+
+	app.post("/api/v1/workspaces/pick-directory", async (c) => {
+		try {
+			return c.json({ path: await pickWorkspaceDirectory() });
+		} catch (error) {
+			throw new HTTPException(503, {
+				message: error instanceof Error ? error.message : String(error),
+			});
 		}
 	});
 

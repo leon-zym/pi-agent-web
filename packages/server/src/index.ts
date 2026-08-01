@@ -1,5 +1,6 @@
 export * from "./auth-storage.js";
 export * from "./config.js";
+export * from "./directory-picker.js";
 export * from "./jsonl.js";
 export { type ServerHandle, type StartServerOptions, startServer } from "./main.js";
 export * from "./pi-process.js";
