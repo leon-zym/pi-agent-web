@@ -1,6 +1,7 @@
 import type { RpcCommand, RpcResponse } from "@earendil-works/pi-coding-agent";
 import type { SessionSummary } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { api } from "../src/lib/api";
 import { renameSession } from "../src/lib/session-controller";
 import { useModelDirectoryStore } from "../src/stores/model-directory";
 import { useSessionControlStore } from "../src/stores/session-control";
@@ -62,6 +63,45 @@ afterEach(() => {
 });
 
 describe("workspace-scoped controls", () => {
+	it("keeps an active Host session selectable before its empty JSONL file is materialized", async () => {
+		const listSessions = vi
+			.spyOn(api, "listSessions")
+			.mockResolvedValue({ sessions: [], sessionDir: "/tmp/sessions" });
+		useSessionDirectoryStore.setState({
+			workspaces: [
+				{
+					id: "workspace-a",
+					path: "/tmp/workspace-a",
+					displayName: "workspace-a",
+					sessionCount: 0,
+					lastOpenedAt: null,
+				},
+			],
+			currentWorkspaceId: "workspace-a",
+			sessions: [],
+			currentSession: null,
+		});
+		useSessionControlStore.setState({
+			workspaceId: "workspace-a",
+			lease: "controller",
+			reconciling: false,
+			session: { id: "session-next", file: "/tmp/session-next.jsonl", epoch: 2 },
+		});
+
+		const sessions = await useSessionDirectoryStore.getState().reloadSessions();
+
+		expect(sessions).toEqual([
+			expect.objectContaining({
+				id: "session-next",
+				path: "session-next.jsonl",
+				absolutePath: "/tmp/session-next.jsonl",
+				cwd: "/tmp/workspace-a",
+				messageCount: 0,
+			}),
+		]);
+		listSessions.mockRestore();
+	});
+
 	it("does not let a delayed model snapshot overwrite the newly selected workspace", async () => {
 		let releaseA: (() => void) | undefined;
 		const aGate = new Promise<void>((resolve) => {

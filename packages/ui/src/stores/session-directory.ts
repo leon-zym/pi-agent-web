@@ -38,6 +38,41 @@ function isLatestSessionRequest(workspaceId: string, request: number): boolean {
 	return sessionRequestByWorkspace.get(workspaceId) === request;
 }
 
+function activeHostSessionSummary(
+	workspaceId: string,
+	workspaces: WorkspaceSummary[],
+): SessionSummary | null {
+	// Pi keeps an empty session in memory until its first persisted entry. Keep
+	// the Host-authoritative selection visible during that short-lived phase.
+	const control = useSessionControlStore.getState();
+	if (control.workspaceId !== workspaceId || !control.session.id || !control.session.file) return null;
+	const workspace = workspaces.find((candidate) => candidate.id === workspaceId);
+	if (!workspace) return null;
+
+	const normalizedPath = control.session.file.replaceAll("\\", "/");
+	const path = normalizedPath.slice(normalizedPath.lastIndexOf("/") + 1);
+	const now = Date.now();
+	return {
+		path: path || `${control.session.id}.jsonl`,
+		absolutePath: control.session.file,
+		id: control.session.id,
+		cwd: workspace.path,
+		messageCount: 0,
+		created: new Date(now).toISOString(),
+		modified: now,
+	};
+}
+
+function mergeActiveHostSession(
+	sessions: SessionSummary[],
+	workspaceId: string,
+	workspaces: WorkspaceSummary[],
+): SessionSummary[] {
+	const active = activeHostSessionSummary(workspaceId, workspaces);
+	if (!active || sessions.some((session) => session.id === active.id)) return sessions;
+	return [active, ...sessions];
+}
+
 export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, get) => ({
 	workspaces: [],
 	currentWorkspaceId: null,
@@ -115,9 +150,10 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 		if (!workspaceId) return [];
 		const request = nextSessionRequest(workspaceId);
 		const { sessions } = await api.listSessions(workspaceId);
+		const merged = mergeActiveHostSession(sessions, workspaceId, get().workspaces);
 		if (get().currentWorkspaceId === workspaceId && isLatestSessionRequest(workspaceId, request))
-			set({ sessions });
-		return sessions;
+			set({ sessions: merged });
+		return merged;
 	},
 
 	setCurrentSession: (session) => set({ currentSession: session }),
