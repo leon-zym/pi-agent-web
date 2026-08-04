@@ -1,15 +1,29 @@
+# Dependencies and package-manager state
 node_modules/
+.pnpm-store/
+
+# Build output and test caches
 dist/
 build/
 coverage/
 *.tsbuildinfo
-.DS_Store
-*.log
 .vite/
-.env
-.env.local
 playwright-report/
 test-results/
-tmp/
+
+# Local runtime data and temporary files
 .pi-data/
-.pnpm-store/
+tmp/
+*.log
+
+# Local environment files (keep a future example file trackable)
+.env
+.env.*
+!.env.example
+
+# Private handoff and audit notes
+docs/notes/
+
+# OS metadata and generated session exports
+.DS_Store
+pi-session-*.html
