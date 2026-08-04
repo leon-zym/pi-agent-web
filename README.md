@@ -7,6 +7,13 @@ Pi Agent Web 是单用户、本机、同源产品：服务只监听 loopback 地
 HttpOnly session cookie。REST 与 WebSocket 控制请求必须有该 Cookie；带 `Origin` 的请求会校验
 loopback 同源，浏览器同源 GET 缺少 `Origin` 时使用 Fetch Metadata 校验。
 
+它不是托管服务，也不是账户或多用户协作层：Pi 进程、Provider 凭据、扩展和会话文件都由
+使用者自己的 Pi 安装管理。本仓库只提供 Gateway、SPA 和本地启动器；不要把它部署到公网，
+也不要把个人的 `~/.pi` 数据或凭据提交到仓库。
+
+> 当前项目处于快速迭代期，功能、交互和兼容性仍可能发生变化，已知或未知的 bug 可能影响
+> 普通用户正常使用。请把它当作开发预览版本，不要用于生产或不可替代的数据。
+
 ## 特性
 
 - **一个 Workspace 一个 Pi 进程**：跨 Workspace 时先选择 Workspace，再打开其会话；不隐式切换 cwd。
@@ -44,6 +51,9 @@ pnpm start -- --pi-path /path/to/rpc-entry.js --port 3100
 `pi-web` 只接受 `127.0.0.1`、`localhost` 或 `::1` 作为 `--host`。常用参数：
 `--pi-path <path>`、`--host <host>`、`--port <port>`、`--no-open`、`--help`。
 
+项目名和命令名有意不同：`pi-agent-web` 是仓库、服务和 `@pi-agent-web/*` 包命名空间；
+`pi-web` 是面向用户的短命令。不要在文档、包名或入口之间做全局重命名。
+
 ## 验证
 
 ```bash
@@ -63,6 +73,22 @@ Extension editor/widget 与浏览器视觉走查是本地 release checklist，�
 tarball，确认没有源码或 `workspace:*` 依赖泄漏，再通过 bin 与等价的本地 `npx` 路径启动 CLI。
 
 公开发布是独立决策；只有包被发布后，才可使用 `npx --yes @pi-agent-web/cli --help`。
+
+## 文档与开源边界
+
+文档按“一个事实一个来源”维护：
+
+- `docs/architecture.md`：进程拓扑、状态所有权、控制权和恢复时序。
+- `docs/protocol.md`：Pi RPC、Gateway 帧、存储布局和身份校验事实。
+- `docs/ui-ux.md`：交互语义、可访问性和响应式让步策略。
+- `DESIGN.md`：颜色、字体、间距、动效和组件配方的视觉契约。
+- `docs/development.md`：本地开发、测试、CI、打包和提交规范。
+- `docs/notes/`：交接和审计草稿，不是公开 API 或设计契约；默认被 Git 忽略。
+
+当前源码可作为 MIT 许可下的 GitHub 公开预览仓库，但还不应宣称为稳定的开源发行版。
+本阶段暂不提供贡献指南或独立的安全报告入口；公开前仍应建立版本/tag 与变更记录，并从
+干净 clone 完成 `pnpm verify`、`pnpm test:smoke` 和 `pnpm test:pack`。完整授权条款见
+[`LICENSE`](LICENSE)。
 
 ## 项目结构
 

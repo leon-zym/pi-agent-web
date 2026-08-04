@@ -73,6 +73,12 @@ Squeeze order: details -> 300px -> details to 0 (subtree stays mounted) -> cente
 below 640px last. Sidebar collapses to a 56px rail under 1024px. Conversation
 content 748px, composer 780px, side clearance 16px.
 
+Visibility affordance is part of the layout contract: an open Details panel exposes
+its close control, a closed panel leaves a persistent narrow reopen rail, and the
+Sidebar has matching collapse/expand controls between its full tree and 56px rail.
+Tool and branch entry points may reopen Details, but no panel may depend on a hidden
+or hover-only control for recovery.
+
 ## Depth
 Background steps, not borders: white base + `#f9fafb` sidebar + hover fills.
 Shadows only on floating surfaces: composer, menus, dialogs, tooltips, toasts.

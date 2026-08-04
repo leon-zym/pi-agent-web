@@ -41,6 +41,25 @@ pnpm test:smoke
 UI 和 CLI 创建 tarball，在临时空项目安装它们，检查只包含构建产物与精确依赖版本，然后通过 bin 和本地
 `npx` 等价路径启动带 fake Pi 的单端口服务。
 
+## 文档、开源与发布边界
+
+文档的事实来源按以下顺序维护：架构和状态时序写入 `docs/architecture.md`，Pi/Gateway 帧和存储事实
+写入 `docs/protocol.md`，交互语义写入 `docs/ui-ux.md`，视觉 token 和组件配方写入 `DESIGN.md`，
+命令与验证流程写入本文。README 只保留对使用者必要的产品边界和入口。`docs/notes/` 是本地交接、
+审计和草稿目录，默认被 `.gitignore` 排除，不应被代码或公开 API 引用。
+
+仓库当前以 MIT 许可证公开预览，且处于快速迭代期；它是本机单用户工具，不是远程部署方案。公开源码
+与发布可安装包是两个门槛：前者需要 README、LICENSE 和可复现验证，后者还需要版本/tag、四个包的
+打包内容、干净临时目录安装和单端口启动证据。当前阶段不要求贡献指南或独立安全报告入口，真实
+Provider 验收仍只在本地显式运行，不能作为 CI 的隐含依赖。
+
+发布前最小清单：
+
+1. 从干净 clone 执行 `pnpm install --frozen-lockfile`、`pnpm verify`、`pnpm test:smoke` 和 `pnpm test:pack`。
+2. 检查 README 的快速迭代警告、MIT `LICENSE`、Node/pnpm/Pi 版本约束与包版本一致。
+3. 用临时 agent/session/web 数据目录完成一次手工启动；不要读取或打包维护者个人的 Pi 数据。
+4. 若要发布 npm 包，再单独核对 npm 包名、版本/tag、tarball 内容和 `npx` 入口；源代码公开不等于包已发布。
+
 ## 验证矩阵（改动后必跑）
 
 | 改动面 | 验证 |

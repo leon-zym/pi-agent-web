@@ -43,6 +43,10 @@ UI 回包必须携带 `expectedSessionId`；Gateway 在同一 Workspace 的互�
 广播当前会话的 id、文件路径和递增 epoch。observer 可以订阅事件、读取快照并缓存 dialog，但不能改变
 Pi 状态；取得 controller 后才显示并回应仍未过期的 dialog。
 
+会话目录 REST 只扫描已经写入磁盘的 JSONL。Pi 刚执行 `new_session` 时，当前 Host 会话可能仍在内存中，
+此时 `get_state.sessionId` / `sessionFile` 先于首条 entry 成为事实；UI 必须暂时保留这个活动会话的摘要，
+不能因为目录快照为空就取消当前选择。首条 entry 落盘后，摘要再与正常扫描结果合并。
+
 | Browser → Gateway | 必填字段 | 语义 |
 |---|---|---|
 | `session_listen` | `workspaceId`, `sessionId` | 建立只读事件作用域，并定向收到当前 `session_state`。 |
@@ -109,7 +113,12 @@ Workspace Registry 位于 Gateway 自己的数据目录（默认 agent 目录的
 
 编码算法：`"--" + resolvedCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-") + "--"`。
 
-环境变量（网关必须读取并透传子进程）：`PI_CODING_AGENT_DIR`（覆盖 agent 配置目录）、`PI_CODING_AGENT_SESSION_DIR`（覆盖会话根目录）。
+环境变量（网关必须读取并透传子进程）：`PI_CODING_AGENT_DIR`（覆盖 agent 配置目录）、
+`PI_CODING_AGENT_SESSION_DIR`（覆盖 Pi 的会话存储目录）。默认情况下 Pi 使用
+`<agentDir>/sessions/--<encoded-cwd>--/`；显式的 `PI_CODING_AGENT_SESSION_DIR` / `--session-dir`
+是“直接存储目录”，不会再自动追加 cwd 编码子目录，并且 Pi 会通过 JSONL Header 的 `cwd` 过滤列表。
+因此网关的“session root + 每个 Workspace 派生目录”模型只适用于默认布局；自定义会话目录属于兼容性
+配置，启用前必须用真实 Pi 验证扫描、创建、切换和重连，不应仅凭目录名称推断 Workspace 归属。
 
 ## 三层运行时解析
 

@@ -29,6 +29,18 @@ Web Gateway (Node.js, Hono + ws)
 9. **本机同源边界**：Gateway 仅监听 `127.0.0.1`、`localhost` 或 `::1`。每次启动生成随机 secret；浏览器先请求 `/api/v1/bootstrap` 获得 HttpOnly、SameSite=Strict Cookie。带 `Origin` 的 REST 与 WS 校验允许的 loopback Origin；浏览器同源 GET 缺少 `Origin` 时，REST 以 `Sec-Fetch-Site: same-origin` 校验。
 10. **资源上限**：JSONL 与 WS 单帧均不超过 8 MiB；每连接最多 32 个 in-flight 命令；socket 积压超过 1 MiB 时关闭。Pi stdin 等待 `drain`，进程输出超长行被当作协议错误处理。
 
+### 会话状态的双层事实
+
+Pi 新建会话后，`get_state` 可能先返回一个只有 `sessionId` / `sessionFile` 的内存会话，直到首条
+entry 写入后才在磁盘上出现可扫描的 JSONL 文件。因此：
+
+- Supervisor 的 `{ id, file, epoch }` 是运行期 Host 状态的权威来源；
+- `GET /api/v1/workspaces/:id/sessions` 是持久化目录的快照，不保证立即包含刚创建的空会话；
+- `sessionDirectoryStore` 在当前 Workspace 中把 Host 的活动会话合并成临时摘要，首条 entry 落盘后再由扫描结果接管；
+- 重连时只有在 Host 会话既不在持久化目录、也没有可用的活动文件身份时，才清空选择并显示恢复失败。
+
+这条边界避免“新建成功但 Composer 没有可选会话”的竞态，也避免用旧投影猜测当前会话。
+
 ## 数据流
 
 ```text
@@ -49,10 +61,10 @@ Web Gateway (Node.js, Hono + ws)
 
 ## 重连快照协议
 
-WS 重连成功后依次：`get_state` → 刷新该 Workspace 的会话目录 → 以 Host session id 原子更新当前摘要、
-投影 key、listen scope 与 epoch → `get_messages` 重建 → `get_commands` / 模型目录 / 会话统计刷新。
-如果目录找不到 Host 会话，清空选择并显示恢复失败，而不是把数据写回陈旧投影。期间实时事件只接受匹配
-当前 session 与 epoch 的帧。
+WS 重连成功后依次：`get_state` → 刷新该 Workspace 的会话目录 → 以 Host session id 找到持久化摘要，
+必要时合并 Host 的活动空会话 → 原子更新当前摘要、投影 key、listen scope 与 epoch → `get_messages` 重建
+→ `get_commands` / 模型目录 / 会话统计刷新。如果 Host 会话既不在目录也没有有效活动文件身份，清空选择并
+显示恢复失败，而不是把数据写回陈旧投影。期间实时事件只接受匹配当前 session 与 epoch 的帧。
 
 ## 前端状态分层
 
