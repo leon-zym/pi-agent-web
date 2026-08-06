@@ -1,129 +1,146 @@
 # Pi Agent Web
 
-Pi Coding Agent RPC 模式的本机 Web 工作台。它在每个已注册 Workspace 中运行一个
-`pi --mode rpc` 子进程，并提供会话浏览、流式对话、工具调用、模型设置和 Extension UI。
+Pi Agent Web is a local web workbench for Pi Coding Agent's RPC mode. It runs one
+`pi --mode rpc` child process per registered workspace and provides session browsing,
+streaming conversations, tool calls, model settings, and Extension UI.
 
-Pi Agent Web 是单用户、本机、同源产品：服务只监听 loopback 地址；启动时会生成新的
-HttpOnly session cookie。REST 与 WebSocket 控制请求必须有该 Cookie；带 `Origin` 的请求会校验
-loopback 同源，浏览器同源 GET 缺少 `Origin` 时使用 Fetch Metadata 校验。
+[English](README.md) · [简体中文](README.zh-CN.md)
 
-它不是托管服务，也不是账户或多用户协作层：Pi 进程、Provider 凭据、扩展和会话文件都由
-使用者自己的 Pi 安装管理。本仓库只提供 Gateway、SPA 和本地启动器；不要把它部署到公网，
-也不要把个人的 `~/.pi` 数据或凭据提交到仓库。
+Pi Agent Web is a single-user, local, same-origin product: the service listens only on
+loopback addresses and creates a fresh HttpOnly session cookie at startup. REST and
+WebSocket control requests must include that cookie; requests with an `Origin` header
+are checked against the loopback origin, while same-origin browser GET requests without
+an `Origin` header use Fetch Metadata validation.
 
-> 当前项目处于快速迭代期，功能、交互和兼容性仍可能发生变化，已知或未知的 bug 可能影响
-> 普通用户正常使用。请把它当作开发预览版本，不要用于生产或不可替代的数据。
+It is not a hosted service, account system, or multi-user collaboration layer. The Pi
+process, provider credentials, extensions, and session files are managed by the user's
+own Pi installation. This repository provides only the gateway, SPA, and local launcher;
+do not deploy it to the public internet or commit personal `~/.pi` data and credentials.
 
-## 特性
+> This project is in rapid iteration. Features, interactions, and compatibility may
+> change, and known or unknown bugs may affect normal users. Treat it as a development
+> preview, not as a production tool or a place for irreplaceable data.
 
-- **一个 Workspace 一个 Pi 进程**：跨 Workspace 时先选择 Workspace，再打开其会话；不隐式切换 cwd。
-- **单控制标签页**：同一 Workspace 只能有一个 controller。观察标签页可以阅读历史和事件，不能写入 Pi。
-- **会话安全**：所有控制命令带预期 session id；删除会话按 Pi 返回的 `sessionFile` 比对，绝不按 UUID 猜测。
-- **可靠恢复**：重连时以 Host 的 session state 收敛目录、投影和控制权；历史失败的工具调用保留失败状态。
-- **有界网关**：严格 LF JSONL、8 MiB 行/帧上限、stdin backpressure、每连接命令配额与慢客户端断开。
-- **本地单命令启动**：`pi-web` 同端口提供 SPA、REST 和 WebSocket，并默认打开浏览器。
+## Features
 
-## 产品 Demo
+- **One Pi process per workspace**: select a workspace before opening one of its sessions; cwd is never switched implicitly.
+- **Single controller tab**: one workspace has one controller; observer tabs can read history and events but cannot write to Pi.
+- **Session safety**: every control command carries an expected session id; deletion compares Pi's `sessionFile` identity instead of guessing from a UUID.
+- **Reliable recovery**: reconnects reconcile the directory, projection, and controller state from the Host session state; failed tool calls keep their failure status.
+- **Bounded gateway**: strict LF JSONL, 8 MiB line/frame limits, stdin backpressure, per-connection command quotas, and slow-client termination.
+- **Single-command local launch**: `pi-web` serves the SPA, REST, and WebSocket on one port and opens the browser by default.
 
-以下截图展示当前工作台的主要界面和交互状态：
+## Product Demo
+
+These screenshots show the main workbench surfaces and interaction states:
 
 <table>
 <tr>
-<td align="center"><img src="docs/assets/demo/overall.png" alt="Pi Agent Web overall workbench" width="280" /><br /><sub>整体工作台</sub></td>
-<td align="center"><img src="docs/assets/demo/dark-mode.png" alt="Pi Agent Web dark mode" width="280" /><br /><sub>深色模式</sub></td>
-<td align="center"><img src="docs/assets/demo/context-status.png" alt="Context and status display" width="280" /><br /><sub>上下文与状态</sub></td>
-<td align="center"><img src="docs/assets/demo/markdown-code-fence.png" alt="Markdown and code fence rendering" width="280" /><br /><sub>Markdown 与代码渲染</sub></td>
+<td align="center"><img src="docs/assets/demo/overall.png" alt="Pi Agent Web overall workbench" width="280" /><br /><sub>Overall workbench</sub></td>
+<td align="center"><img src="docs/assets/demo/dark-mode.png" alt="Pi Agent Web dark mode" width="280" /><br /><sub>Dark mode</sub></td>
+<td align="center"><img src="docs/assets/demo/context-status.png" alt="Context and status display" width="280" /><br /><sub>Context and status</sub></td>
+<td align="center"><img src="docs/assets/demo/markdown-code-fence.png" alt="Markdown and code fence rendering" width="280" /><br /><sub>Markdown and code rendering</sub></td>
 </tr>
 <tr>
-<td align="center"><img src="docs/assets/demo/model-selection.png" alt="Model selection panel" width="280" /><br /><sub>模型选择面板</sub></td>
-<td align="center"><img src="docs/assets/demo/settings-panel.png" alt="Settings panel" width="280" /><br /><sub>设置面板</sub></td>
-<td align="center"><img src="docs/assets/demo/slash-commands.png" alt="Slash commands panel" width="280" /><br /><sub>Slash 命令面板</sub></td>
-<td align="center"><img src="docs/assets/demo/tool-inspect.png" alt="Tool calling inspector" width="280" /><br /><sub>工具调用检查</sub></td>
+<td align="center"><img src="docs/assets/demo/model-selection.png" alt="Model selection panel" width="280" /><br /><sub>Model selection panel</sub></td>
+<td align="center"><img src="docs/assets/demo/settings-panel.png" alt="Settings panel" width="280" /><br /><sub>Settings panel</sub></td>
+<td align="center"><img src="docs/assets/demo/slash-commands.png" alt="Slash commands panel" width="280" /><br /><sub>Slash commands panel</sub></td>
+<td align="center"><img src="docs/assets/demo/tool-inspect.png" alt="Tool calling inspector" width="280" /><br /><sub>Tool calling inspector</sub></td>
 </tr>
 </table>
 
-Pi 运行时按以下顺序解析：`--pi-path` / `PI_PATH`、PATH 中的 `pi`、已安装 Pi 包的
-`rpc-entry.js`。现有的 Pi 配置、Provider 凭据与扩展会被继承；它们不会被打包进本项目的发行物。
+Pi runtime resolution follows this order: `--pi-path` / `PI_PATH`, `pi` on `PATH`, then
+the installed Pi package's `rpc-entry.js`. Existing Pi configuration, provider
+credentials, and extensions are inherited; they are not bundled into this project's
+distribution artifacts.
 
-## 快速开始
+## Quick Start
 
-要求 Node.js 22+ 与 pnpm 11.21.0，并且本机有可用的 Pi 运行时。
+Requirements: Node.js 22+, pnpm 11.21.0, and an available Pi runtime on the machine.
 
 ```bash
 pnpm install --frozen-lockfile
 pnpm dev
 ```
 
-开发模式启动 Gateway（默认 `:3000`）和 Vite（默认 `:5173`）。打开 Vite 提示的 loopback
-地址，注册一个本地项目目录后即可新建会话。
+Development mode starts the gateway (default `:3000`) and Vite (default `:5173`). Open
+the loopback URL shown by Vite, register a local project directory, and create a session.
 
-生产模式使用构建后的 SPA 与 CLI：
+For production mode, build the SPA and use the CLI:
 
 ```bash
 pnpm build
 pnpm start
 
-# 透传 CLI 参数的示例
+# Example: pass CLI arguments through the root script
 pnpm start -- --pi-path /path/to/rpc-entry.js --port 3100
 ```
 
-`pi-web` 只接受 `127.0.0.1`、`localhost` 或 `::1` 作为 `--host`。常用参数：
-`--pi-path <path>`、`--host <host>`、`--port <port>`、`--no-open`、`--help`。
+`pi-web` accepts only `127.0.0.1`, `localhost`, or `::1` as `--host`. Common options are
+`--pi-path <path>`, `--host <host>`, `--port <port>`, `--no-open`, and `--help`.
 
-项目名和命令名有意不同：`pi-agent-web` 是仓库、服务和 `@pi-agent-web/*` 包命名空间；
-`pi-web` 是面向用户的短命令。不要在文档、包名或入口之间做全局重命名。
+The project and command names are intentionally different: `pi-agent-web` is the
+repository, service, and `@pi-agent-web/*` package namespace; `pi-web` is the short
+human-facing command. Do not perform a repository-wide rename between them.
 
-## 验证
+## Verification
 
 ```bash
-pnpm verify       # lint → typecheck → deterministic tests → build
-pnpm test:smoke   # fake Pi 驱动的 REST / WebSocket smoke
-pnpm test:e2e     # 默认跳过；PI_WEB_RUN_E2E=1 时才使用真实 Provider
-pnpm test:pack    # pack 四个运行时包，临时安装并启动 pi-web
+pnpm verify       # lint -> typecheck -> deterministic tests -> build
+pnpm test:smoke   # fake-Pi REST/WebSocket smoke test
+pnpm test:e2e     # skipped by default; PI_WEB_RUN_E2E=1 uses a real provider
+pnpm test:pack    # pack four runtime packages, install them temporarily, and launch pi-web
 ```
 
-CI 只运行无凭据的 `pnpm verify` 和 `pnpm test:smoke`。真实 Provider 对话、图片附件、fork、
-Extension editor/widget 与浏览器视觉走查是本地 release checklist，不会读取 CI 或其他人的 Pi 数据。
+CI runs credential-free `pnpm verify` and `pnpm test:smoke`. Real-provider conversations,
+image attachments, forks, Extension editor/widget behavior, and browser visual review
+remain explicit local release checks; CI never reads the Pi data of a developer or user.
 
-## 本地分发验证
+## Local Distribution Verification
 
-运行时由四个包组成：`@pi-agent-web/protocol`、`@pi-agent-web/server`、
-`@pi-agent-web/ui` 和 `@pi-agent-web/cli`。`pnpm test:pack` 会在临时目录中打包、安装四个
-tarball，确认没有源码或 `workspace:*` 依赖泄漏，再通过 bin 与等价的本地 `npx` 路径启动 CLI。
+The runtime consists of four packages: `@pi-agent-web/protocol`, `@pi-agent-web/server`,
+`@pi-agent-web/ui`, and `@pi-agent-web/cli`. `pnpm test:pack` packs and installs all four
+tarballs in a temporary directory, verifies that source files and `workspace:*` dependencies
+do not leak into the artifacts, and starts the CLI through both its bin and equivalent
+local `npx` paths.
 
-公开发布是独立决策；只有包被发布后，才可使用 `npx --yes @pi-agent-web/cli --help`。
+Public package release is a separate decision; `npx --yes @pi-agent-web/cli --help` is
+available only after the packages have actually been published.
 
-## 文档与开源边界
+## Documentation and Open-Source Boundary
 
-文档按“一个事实一个来源”维护：
+Documentation follows a single-source-of-truth rule:
 
-- `docs/architecture.md`：进程拓扑、状态所有权、控制权和恢复时序。
-- `docs/protocol.md`：Pi RPC、Gateway 帧、存储布局和身份校验事实。
-- `docs/ui-ux.md`：交互语义、可访问性和响应式让步策略。
-- `DESIGN.md`：颜色、字体、间距、动效和组件配方的视觉契约。
-- `docs/development.md`：本地开发、测试、CI、打包和提交规范。
-- `docs/notes/`：交接和审计草稿，不是公开 API 或设计契约；默认被 Git 忽略。
+- `docs/architecture.md`: process topology, state ownership, controller leases, and recovery sequencing.
+- `docs/protocol.md`: Pi RPC, gateway frames, storage layout, and identity checks.
+- `docs/ui-ux.md`: interaction semantics, accessibility, and responsive squeeze policy.
+- `DESIGN.md`: visual tokens, typography, motion, and component recipes.
+- `docs/development.md`: local development, tests, CI, packaging, and commit conventions.
+- `docs/notes/`: handoff, audit, and draft material; it is ignored by Git and is not a public API or design contract.
 
-当前源码可作为 MIT 许可下的 GitHub 公开预览仓库，但还不应宣称为稳定的开源发行版。
-本阶段暂不提供贡献指南或独立的安全报告入口；公开前仍应建立版本/tag 与变更记录，并从
-干净 clone 完成 `pnpm verify`、`pnpm test:smoke` 和 `pnpm test:pack`。完整授权条款见
-[`LICENSE`](LICENSE)。
+The source can be published as an MIT-licensed GitHub preview repository, but it should
+not yet be presented as a stable open-source release. This stage intentionally does not
+provide a contribution guide or a dedicated security-reporting channel. Before a public
+announcement, establish a version/tag and change record, then run `pnpm verify`,
+`pnpm test:smoke`, and `pnpm test:pack` from a clean clone. See [`LICENSE`](LICENSE) for
+the full license terms.
 
-## 项目结构
+## Project Structure
 
 ```text
 packages/
-  protocol/ Browser-safe DTO、运行时 guards 与命令 timeout 策略
-  server/   Node Gateway：jsonl / resolver / pi-process / supervisor / ws-bridge / routes
-  ui/       React 19 + Vite + Tailwind v4：stores、特性组件和 i18n
-  cli/      pi-web 命令：静态资源定位、单端口启动与优雅关闭
-docs/       架构 / 协议 / UI-UX / 开发规范
+  protocol/ Browser-safe DTOs, runtime guards, and command timeout policy
+  server/   Node gateway: jsonl / resolver / pi-process / supervisor / ws-bridge / routes
+  ui/       React 19 + Vite + Tailwind v4: stores, features, and i18n
+  cli/      pi-web command: static asset discovery, single-port launch, and graceful shutdown
+docs/       Architecture, protocol, UI/UX, and development documentation
 ```
 
-## 文档
+## Documentation
 
-- [docs/architecture.md](docs/architecture.md) — 拓扑、控制权和数据流
-- [docs/protocol.md](docs/protocol.md) — Pi RPC 与 Gateway 协议、存储事实
-- [docs/ui-ux.md](docs/ui-ux.md) — 交互设计与 UX 规则
-- [docs/development.md](docs/development.md) — 工具链、CI、验证与提交规范
-- [DESIGN.md](DESIGN.md) — 视觉设计契约
+- [docs/architecture.md](docs/architecture.md) — topology, controller leases, and data flow
+- [docs/protocol.md](docs/protocol.md) — Pi RPC, gateway protocol, and storage facts
+- [docs/ui-ux.md](docs/ui-ux.md) — interaction design and UX rules
+- [docs/development.md](docs/development.md) — toolchain, CI, verification, and commit conventions
+- [DESIGN.md](DESIGN.md) — visual design contract
+- [README.zh-CN.md](README.zh-CN.md) — Chinese documentation

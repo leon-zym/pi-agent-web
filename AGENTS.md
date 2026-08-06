@@ -3,7 +3,8 @@
 A modern web workbench for Pi Coding Agent's RPC mode.
 
 ## Documentation map
-- `README.md` — overview, quick start, feature list.
+- `README.md` — default English overview, quick start, feature list, and open-source boundary.
+- `README.zh-CN.md` — Chinese translation of the public README.
 - `docs/architecture.md` — topology, supervisor, stores, project structure.
 - `docs/protocol.md` — the verified Pi RPC protocol map and storage layout.
 - `docs/ui-ux.md` — interaction design and UX rules.
