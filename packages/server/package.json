@@ -1,7 +1,7 @@
 {
 	"name": "@pi-agent-web/server",
 	"version": "0.1.0",
-	"description": "Pi Agent Web Gateway：Supervisor 进程调度 + REST API + WebSocket 中继",
+	"description": "Supervisor gateway for Pi Agent Web with REST API and WebSocket relay.",
 	"engines": {
 		"node": ">=22"
 	},

@@ -2,7 +2,7 @@
 	"name": "pi-agent-web",
 	"version": "0.1.0",
 	"private": true,
-	"description": "Pi Coding Agent RPC 模式的现代 Web 工作台（Headless Agent Web UI + Supervisor Gateway）",
+	"description": "A local web workbench for Pi Coding Agent's RPC mode with a supervisor gateway and browser UI.",
 	"type": "module",
 	"engines": {
 		"node": ">=22"
