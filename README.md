@@ -23,6 +23,25 @@ loopback 同源，浏览器同源 GET 缺少 `Origin` 时使用 Fetch Metadata �
 - **有界网关**：严格 LF JSONL、8 MiB 行/帧上限、stdin backpressure、每连接命令配额与慢客户端断开。
 - **本地单命令启动**：`pi-web` 同端口提供 SPA、REST 和 WebSocket，并默认打开浏览器。
 
+## 产品 Demo
+
+以下截图展示当前工作台的主要界面和交互状态：
+
+<table>
+<tr>
+<td align="center"><img src="docs/assets/demo/overall.png" alt="Pi Agent Web overall workbench" width="280" /><br /><sub>整体工作台</sub></td>
+<td align="center"><img src="docs/assets/demo/dark-mode.png" alt="Pi Agent Web dark mode" width="280" /><br /><sub>深色模式</sub></td>
+<td align="center"><img src="docs/assets/demo/context-status.png" alt="Context and status display" width="280" /><br /><sub>上下文与状态</sub></td>
+<td align="center"><img src="docs/assets/demo/markdown-code-fence.png" alt="Markdown and code fence rendering" width="280" /><br /><sub>Markdown 与代码渲染</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="docs/assets/demo/model-selection.png" alt="Model selection panel" width="280" /><br /><sub>模型选择面板</sub></td>
+<td align="center"><img src="docs/assets/demo/settings-panel.png" alt="Settings panel" width="280" /><br /><sub>设置面板</sub></td>
+<td align="center"><img src="docs/assets/demo/slash-commands.png" alt="Slash commands panel" width="280" /><br /><sub>Slash 命令面板</sub></td>
+<td align="center"><img src="docs/assets/demo/tool-inspect.png" alt="Tool calling inspector" width="280" /><br /><sub>工具调用检查</sub></td>
+</tr>
+</table>
+
 Pi 运行时按以下顺序解析：`--pi-path` / `PI_PATH`、PATH 中的 `pi`、已安装 Pi 包的
 `rpc-entry.js`。现有的 Pi 配置、Provider 凭据与扩展会被继承；它们不会被打包进本项目的发行物。
 
