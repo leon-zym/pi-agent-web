@@ -193,6 +193,8 @@ test("1024px boundary keeps details discoverable as an overlay", async ({ page, 
 	await page.goto(harness.origin, { waitUntil: "domcontentloaded" });
 	await expect(page.locator("textarea")).toBeEnabled();
 	await expect(page.getByRole("button", { name: /^(Open sessions|打开会话列表)$/ })).toHaveCount(0);
+	const workspaceActions = page.getByRole("button", { name: /^(Workspace actions|工作区操作)$/ });
+	await expectMinimumHitTarget(workspaceActions);
 
 	await page
 		.locator("header")
@@ -225,4 +227,20 @@ test("reduced motion removes non-essential transitions and animation", async ({ 
 	});
 	expect(styles.transitionDuration).toMatch(/^(0s|0\.001ms|0\.000001s|1e-06s)$/);
 	expect(styles.scrollBehavior).toBe("auto");
+
+	await page.locator("textarea").fill(COMPLEX_PROMPT);
+	await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
+	await expect(page.getByRole("heading", { name: "Synthetic change review", level: 2 })).toBeVisible();
+	const viewport = page.locator('[data-chat-viewport="true"]');
+	await viewport.evaluate((element) => {
+		element.scrollTo({ top: 0, behavior: "auto" });
+		element.dispatchEvent(new Event("scroll"));
+	});
+	const backToLatest = page.getByRole("button", { name: /^(Back to latest|回到最新消息)$/ });
+	await expect(backToLatest).toBeVisible();
+	await backToLatest.click();
+	const distanceFromBottom = await viewport.evaluate(
+		(element) => element.scrollHeight - element.scrollTop - element.clientHeight,
+	);
+	expect(distanceFromBottom).toBeLessThanOrEqual(1);
 });

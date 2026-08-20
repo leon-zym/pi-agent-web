@@ -83,7 +83,8 @@ export function ChatViewport() {
 		(smooth = false) => {
 			const el = scrollRef.current;
 			if (!el) return;
-			el.scrollTo({ top: el.scrollHeight, behavior: smooth ? "smooth" : "auto" });
+			const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+			el.scrollTo({ top: el.scrollHeight, behavior: smooth && !reduceMotion ? "smooth" : "auto" });
 			pinnedRef.current = true;
 			setPinned(true);
 			if (currentSessionId) {

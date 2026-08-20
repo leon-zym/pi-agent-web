@@ -1,7 +1,7 @@
 import type { NativeSessionDto, NativeWorkspaceDto, SessionRuntimeDto } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api } from "../src/lib/api";
-import { openSession, renameSession } from "../src/lib/session-controller";
+import { deleteSession, openSession, renameSession } from "../src/lib/session-controller";
 import { selectCurrentWorkspaceSessions, useSessionDirectoryStore } from "../src/stores/session-directory";
 import { sessionTransport } from "../src/stores/session-transport";
 
@@ -284,5 +284,49 @@ describe("Session-scoped controls", () => {
 		await renameSession(sessionA, "must not apply");
 
 		expect(sendCommand).not.toHaveBeenCalled();
+	});
+
+	it("allows a controlled crashed Session to enter the gateway's recoverable deletion path", async () => {
+		const crashedSession = session("session-crashed", "workspace-a");
+		const crashedRuntime = { ...runtime("session-crashed", "workspace-a"), state: "crashed" as const };
+		const releaseSession = vi.fn(() => true);
+		const unsubscribeSession = vi.fn();
+		sessionTransport.store.setState({
+			releaseSession,
+			unsubscribeSession,
+			sessions: {
+				"session-crashed": {
+					sessionHandle: "session-crashed",
+					subscribed: true,
+					controllerIntent: true,
+					runtime: crashedRuntime,
+					generation: 3,
+					lastSeq: 0,
+					projectedSeq: 0,
+					lease: { isController: true, fencingToken: "fence-crashed" },
+					pendingExtensionRequests: [],
+					resync: null,
+					rawEvents: [],
+				},
+			},
+		});
+		useSessionDirectoryStore.setState({
+			workspaces: [workspace("workspace-a")],
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: crashedSession,
+			sessionsByWorkspace: { "workspace-a": [crashedSession] },
+			selectedSessionByWorkspace: { "workspace-a": "session-crashed" },
+		});
+		const request = vi.spyOn(api, "deleteSession").mockResolvedValue({ ok: true, recoverable: true });
+		vi.spyOn(api, "listWorkspaces").mockResolvedValue([workspace("workspace-a")]);
+
+		await deleteSession(crashedSession);
+
+		expect(request).toHaveBeenCalledWith("workspace-a", "session-crashed", {
+			generation: 3,
+			fencingToken: "fence-crashed",
+		});
+		expect(releaseSession).toHaveBeenCalledWith("session-crashed");
+		expect(unsubscribeSession).toHaveBeenCalledWith("session-crashed");
 	});
 });

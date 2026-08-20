@@ -157,7 +157,7 @@ function SessionRow({ session, current, comfortable = false, onSelect }: Session
 			data-queued-count={queuedCount}
 			className={cn(
 				"group relative flex items-center gap-2 rounded-sm pr-1 hover:bg-hover",
-				comfortable ? "h-10" : "h-8",
+				comfortable ? "h-10" : "h-8 [@media(hover:none)]:h-10",
 			)}
 		>
 			{current && <span className="absolute top-1.5 bottom-1.5 left-0 w-0.5 rounded-full bg-primary" />}
@@ -193,7 +193,9 @@ function SessionRow({ session, current, comfortable = false, onSelect }: Session
 				<div
 					className={cn(
 						"flex shrink-0 items-center transition-opacity",
-						comfortable ? "opacity-100" : "opacity-0 [@media(hover:hover)]:group-hover:opacity-100",
+						comfortable
+							? "opacity-100"
+							: "opacity-0 group-focus-within:opacity-100 [@media(hover:hover)]:group-hover:opacity-100 [@media(hover:none)]:opacity-100",
 					)}
 				>
 					{current && (
@@ -204,7 +206,7 @@ function SessionRow({ session, current, comfortable = false, onSelect }: Session
 									aria-label={tt("sidebar.renameSession")}
 									className={cn(
 										"flex items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink",
-										comfortable ? "size-10" : "size-6",
+										comfortable ? "size-10" : "size-6 [@media(hover:none)]:size-10",
 									)}
 									onClick={startRename}
 									disabled={!canRename}
@@ -222,7 +224,7 @@ function SessionRow({ session, current, comfortable = false, onSelect }: Session
 								aria-label={tt("sidebar.deleteSession")}
 								className={cn(
 									"flex items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-danger",
-									comfortable ? "size-10" : "size-6",
+									comfortable ? "size-10" : "size-6 [@media(hover:none)]:size-10",
 								)}
 								onClick={() => setDeleteOpen(true)}
 								disabled={!deleteCapability.allowed}
@@ -333,7 +335,7 @@ function WorkspaceGroup({
 			<div
 				className={cn(
 					"group flex items-center gap-1 rounded-sm pr-1 hover:bg-hover",
-					comfortable ? "h-10" : "h-8",
+					comfortable ? "h-10" : "h-8 [@media(hover:none)]:h-10",
 				)}
 				title={
 					workspace.available
@@ -381,7 +383,9 @@ function WorkspaceGroup({
 				<div
 					className={cn(
 						"flex shrink-0 items-center transition-opacity",
-						comfortable ? "opacity-100" : "opacity-0 [@media(hover:hover)]:group-hover:opacity-100",
+						comfortable
+							? "opacity-100"
+							: "opacity-0 group-focus-within:opacity-100 [@media(hover:hover)]:group-hover:opacity-100 [@media(hover:none)]:opacity-100",
 					)}
 				>
 					<Tooltip>
@@ -391,7 +395,7 @@ function WorkspaceGroup({
 								aria-label={tt("sidebar.newSession")}
 								className={cn(
 									"flex items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink",
-									comfortable ? "size-10" : "size-6",
+									comfortable ? "size-10" : "size-6 [@media(hover:none)]:size-10",
 								)}
 								onClick={() => void createSession()}
 								disabled={!workspace.available}
@@ -408,7 +412,7 @@ function WorkspaceGroup({
 								aria-label={tt("sidebar.workspaceActions")}
 								className={cn(
 									"flex items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink",
-									comfortable ? "size-10" : "size-6",
+									comfortable ? "size-10" : "size-6 [@media(hover:none)]:size-10",
 								)}
 							>
 								<Settings className="size-3.5" />

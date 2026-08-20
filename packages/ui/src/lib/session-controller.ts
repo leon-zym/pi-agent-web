@@ -9,6 +9,7 @@ import type { ImageContent } from "../types/pi-types";
 import { api } from "./api";
 import { displayError, stripAnsi } from "./format";
 import { tt } from "./i18n";
+import { sessionDeleteCapability } from "./session-capabilities";
 import { sendControlCommand } from "./session-command";
 
 export { sendControlCommand, sendControlExtensionUiResponse, sendReadCommand } from "./session-command";
@@ -74,15 +75,16 @@ export async function newSession(): Promise<void> {
 
 export async function deleteSession(session: NativeSessionDto): Promise<void> {
 	try {
-		const channel = controllerChannel(session.sessionHandle);
-		if (channel.runtime && channel.runtime.state !== "idle") {
-			throw new Error(`session_busy:${channel.runtime.state}`);
+		const transport = sessionTransport.store.getState();
+		const capability = sessionDeleteCapability(session, transport.sessions[session.sessionHandle]);
+		if (!capability.allowed) {
+			throw new Error(tt(`sidebar.deleteBlocked.${capability.reason}`));
 		}
+		const channel = controllerChannel(session.sessionHandle);
 		await api.deleteSession(session.workspaceHandle, session.sessionHandle, {
 			generation: channel.generation,
 			fencingToken: channel.fencingToken,
 		});
-		const transport = sessionTransport.store.getState();
 		transport.releaseSession(session.sessionHandle);
 		transport.unsubscribeSession(session.sessionHandle);
 		const directory = useSessionDirectoryStore.getState();
