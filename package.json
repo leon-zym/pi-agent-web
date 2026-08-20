@@ -14,12 +14,21 @@
 		"build": "pnpm -r build",
 		"test": "pnpm --filter @pi-agent-web/protocol build && pnpm --filter @pi-agent-web/server build && pnpm -r test",
 		"test:smoke": "pnpm --filter @pi-agent-web/server test:smoke",
-		"test:e2e": "pnpm --filter @pi-agent-web/server test:e2e",
-		"lint": "pnpm -r lint",
-		"typecheck": "pnpm --filter @pi-agent-web/protocol build && pnpm --filter @pi-agent-web/server build && pnpm -r typecheck",
+		"test:e2e": "pnpm test:browser",
+		"test:e2e:real": "pnpm --filter @pi-agent-web/server test:e2e",
+		"test:browser": "pnpm build && playwright test --config tests/e2e/playwright.config.ts",
+		"lint": "pnpm -r lint && biome check package.json tests/e2e",
+		"typecheck": "pnpm --filter @pi-agent-web/protocol build && pnpm --filter @pi-agent-web/server build && pnpm -r typecheck && pnpm typecheck:e2e",
+		"typecheck:e2e": "tsc -p tests/e2e/tsconfig.json --noEmit",
 		"verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm build",
 		"test:pack": "node scripts/pack-smoke.mjs",
 		"start": "pnpm --filter @pi-agent-web/cli start"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.3.0",
+		"@playwright/test": "^1.62.1",
+		"@types/node": "^24.0.0",
+		"typescript": "^5.9.0"
 	},
 	"packageManager": "pnpm@11.21.0"
 }
