@@ -39,6 +39,10 @@ export interface PiFixtureEvent {
 	imageMimeTypes?: string[];
 	imageChars?: number;
 	deltaIndex?: number;
+	toolCount?: number;
+	markdownChars?: number;
+	confirmed?: boolean;
+	cancelled?: boolean;
 }
 
 export interface ProductionHarness {

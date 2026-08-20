@@ -14,6 +14,45 @@ export function observePageErrors(page: Page): PageErrors {
 	return errors;
 }
 
+/** Install before navigation so a test can explicitly drop only browser WebSockets. */
+export async function installWebSocketDropControl(page: Page): Promise<void> {
+	await page.addInitScript(() => {
+		const sockets: WebSocket[] = [];
+		const ControlledWebSocket = new Proxy(window.WebSocket, {
+			construct(target, args) {
+				const socket = Reflect.construct(target, args) as WebSocket;
+				sockets.push(socket);
+				return socket;
+			},
+		});
+		Object.defineProperty(window, "WebSocket", {
+			configurable: true,
+			value: ControlledWebSocket,
+			writable: true,
+		});
+		Object.defineProperty(window, "__piwebDropSocketsForE2e", {
+			configurable: true,
+			value: () => {
+				for (const socket of sockets) {
+					if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+						socket.close(4100, "synthetic e2e disconnect");
+					}
+				}
+			},
+		});
+	});
+}
+
+export async function dropControlledWebSockets(page: Page): Promise<void> {
+	await page.evaluate(() => {
+		(
+			window as typeof window & {
+				__piwebDropSocketsForE2e: () => void;
+			}
+		).__piwebDropSocketsForE2e();
+	});
+}
+
 export async function bootstrapBrowserSession(page: Page, origin: string): Promise<number> {
 	const response = await page.context().request.get(`${origin}/api/v1/bootstrap`, {
 		headers: { Origin: origin },
