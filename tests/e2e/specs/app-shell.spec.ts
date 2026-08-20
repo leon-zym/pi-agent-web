@@ -30,6 +30,11 @@ test("packaged app bootstraps and renders the workbench without browser errors",
 	await expect(page.locator("nav")).toBeVisible();
 	await expect(page.locator("main")).toBeVisible();
 	await expect(page.locator("textarea")).toBeEnabled();
+	const workspaceActions = page.getByRole("button", { name: /^(Workspace actions|工作区操作)$/ });
+	await workspaceActions.focus();
+	await expect
+		.poll(() => workspaceActions.evaluate((element) => getComputedStyle(element.parentElement!).opacity))
+		.toBe("1");
 	await expect(page.getByRole("button", { name: /^(Expand details panel|展开详情面板)$/ })).toBeVisible();
 	await expect(page.getByRole("button", { name: /^(Inspect|检查)$/ })).toBeHidden();
 	await expect(page.getByRole("button", { name: /^(Configure model|配置模型)$/ })).toBeVisible();
