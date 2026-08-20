@@ -73,6 +73,8 @@ export const api = {
 		request<{ ok: boolean; nativeHistoryRetained: boolean }>(workspacePath(workspaceHandle), {
 			method: "DELETE",
 		}),
+	activateWorkspace: (workspaceHandle: string) =>
+		request<NativeWorkspaceDto>(workspacePath(workspaceHandle, "/activate"), { method: "POST" }),
 
 	listSessions: (workspaceHandle: string, options: { force?: boolean } = {}) =>
 		request<NativeSessionListDto>(
@@ -89,6 +91,18 @@ export const api = {
 		management: { generation: number; fencingToken: string },
 	) =>
 		request<{ ok: boolean; recoverable: boolean }>(sessionPath(workspaceHandle, sessionHandle), {
+			method: "DELETE",
+			headers: {
+				"X-Pi-Session-Generation": String(management.generation),
+				"X-Pi-Fencing-Token": management.fencingToken,
+			},
+		}),
+	abandonTransientSession: (
+		workspaceHandle: string,
+		sessionHandle: string,
+		management: { generation: number; fencingToken: string },
+	) =>
+		request<{ ok: boolean; abandoned: boolean }>(sessionPath(workspaceHandle, sessionHandle, "/transient"), {
 			method: "DELETE",
 			headers: {
 				"X-Pi-Session-Generation": String(management.generation),

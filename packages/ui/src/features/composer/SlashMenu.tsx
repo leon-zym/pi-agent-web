@@ -2,26 +2,25 @@ import { Blocks, CornerDownLeft, MessageSquareText, Sparkles } from "lucide-reac
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { displayLabel } from "../../lib/format";
 import { tt } from "../../lib/i18n";
-import { runSlashCommand } from "../../lib/session-controller";
 import { cn } from "../../lib/utils";
 import { useComposerStore } from "../../stores/composer";
-import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { useSlashCommandsStore } from "../../stores/slash-commands";
 import {
 	buildSlashMenuGroups,
 	edgeSlashHighlight,
 	moveSlashHighlight,
-	resolveSlashCommit,
+	resolveHighlightedSlashCommand,
+	type SlashMenuItem,
 } from "./slash-menu-model";
 
 interface SlashMenuProps {
-	onExecute: (commandName: string) => void;
+	onSelect: (item: SlashMenuItem) => void;
 }
 
 export interface SlashMenuHandle {
 	move: (delta: -1 | 1) => void;
 	moveTo: (edge: "first" | "last") => void;
-	commitExact: () => boolean;
+	commitHighlighted: () => boolean;
 }
 
 const SOURCE_META = {
@@ -32,10 +31,10 @@ const SOURCE_META = {
 
 /**
  * Slash command listbox anchored above the composer:
- * grouped by source, fuzzy candidates, exact-name execution, unknown "/"
- * input is never silently sent as a plain prompt.
+ * grouped by source with fuzzy candidates. A commit selects the highlighted
+ * command as an atomic composer token; it never executes from the menu.
  */
-export const SlashMenu = forwardRef<SlashMenuHandle, SlashMenuProps>(function SlashMenu({ onExecute }, ref) {
+export const SlashMenu = forwardRef<SlashMenuHandle, SlashMenuProps>(function SlashMenu({ onSelect }, ref) {
 	const commands = useSlashCommandsStore((s) => s.commands);
 	const trigger = useComposerStore((s) => s.trigger);
 	const [highlight, setHighlight] = useState(0);
@@ -59,24 +58,21 @@ export const SlashMenu = forwardRef<SlashMenuHandle, SlashMenuProps>(function Sl
 			?.scrollIntoView({ block: "nearest" });
 	}, [highlight]);
 
-	const commitExact = useCallback((): boolean => {
-		const action = resolveSlashCommit(groups, query);
-		if (action.kind === "none") return false;
-		const sessionHandle = useSessionDirectoryStore.getState().currentSession?.sessionHandle;
-		if (!sessionHandle) return false;
-		useComposerStore.getState().setTrigger(null);
-		void runSlashCommand(sessionHandle, `/${action.commandName}`);
+	const commitHighlighted = useCallback((): boolean => {
+		const item = resolveHighlightedSlashCommand(groups, highlight);
+		if (!item) return false;
+		onSelect(item);
 		return true;
-	}, [groups, query]);
+	}, [groups, highlight, onSelect]);
 
 	useImperativeHandle(
 		ref,
 		() => ({
 			move: (delta) => setHighlight((current) => moveSlashHighlight(current, delta, itemCount)),
 			moveTo: (edge) => setHighlight(edgeSlashHighlight(edge, itemCount)),
-			commitExact,
+			commitHighlighted,
 		}),
-		[commitExact, itemCount],
+		[commitHighlighted, itemCount],
 	);
 
 	if (itemCount === 0) {
@@ -104,7 +100,8 @@ export const SlashMenu = forwardRef<SlashMenuHandle, SlashMenuProps>(function Sl
 						<div className="px-2 pt-2 pb-1 text-[11px] font-medium tracking-wide text-ink-3 uppercase">
 							{tt(meta.label)}
 						</div>
-						{items.map(({ command, displayName, index }) => {
+						{items.map((item) => {
+							const { command, displayName, index } = item;
 							const selected = index === highlight;
 							return (
 								<div
@@ -114,7 +111,7 @@ export const SlashMenu = forwardRef<SlashMenuHandle, SlashMenuProps>(function Sl
 									tabIndex={-1}
 									onMouseDown={(event) => {
 										event.preventDefault();
-										onExecute(command.name);
+										onSelect(item);
 									}}
 									onMouseEnter={() => setHighlight(index)}
 									className={cn(

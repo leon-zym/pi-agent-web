@@ -58,7 +58,6 @@ export function ModelSelector() {
 		if (!sessionHandle) return;
 		try {
 			await useModelDirectoryStore.getState().selectModel(sessionHandle, provider, modelId);
-			setOpen(false);
 			setPage("root");
 		} catch (error) {
 			toast.error(tt("model.switchFailed"), {
@@ -72,7 +71,6 @@ export function ModelSelector() {
 		if (!sessionHandle) return;
 		try {
 			await useModelDirectoryStore.getState().selectThinkingLevel(sessionHandle, level as never);
-			setOpen(false);
 			setPage("root");
 		} catch (error) {
 			toast.error(tt("model.effortSwitchFailed"), {
@@ -139,50 +137,52 @@ export function ModelSelector() {
 					</div>
 				)}
 				{page === "model" && (
-					<div className="scroll-slim flex max-h-80 flex-col overflow-y-auto">
+					<div className="flex max-h-80 flex-col overflow-hidden">
 						<PageHeader title={tt("model.select")} onBack={() => setPage("root")} />
-						{!hasModels && (
-							<div className="px-3 py-3">
-								<p className="text-xs leading-5 text-ink-3">{tt("model.noModelsHint")}</p>
-								<button
-									type="button"
-									className="mt-2 inline-flex h-7 items-center gap-1.5 rounded-sm bg-primary px-2.5 text-xs font-medium text-white hover:bg-primary-hover focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
-									onClick={() => {
-										setOpen(false);
-										window.dispatchEvent(new CustomEvent("piweb:open-settings"));
-									}}
-								>
-									<Settings2 className="size-3.5" />
-									{tt("model.configure")}
-								</button>
-							</div>
-						)}
-						{Object.entries(byProvider).map(([provider, providerModels]) => (
-							<div key={provider}>
-								<div className="sticky top-0 z-10 bg-surface px-2 py-1 text-[11px] font-medium tracking-wide text-ink-3 uppercase">
-									{displayLabel(provider)}
-								</div>
-								{providerModels.map((model) => (
+						<div className="scroll-slim min-h-0 overflow-y-auto">
+							{!hasModels && (
+								<div className="px-3 py-3">
+									<p className="text-xs leading-5 text-ink-3">{tt("model.noModelsHint")}</p>
 									<button
-										key={model.id}
 										type="button"
-										className={cn(
-											"flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-[13px] transition-colors hover:bg-hover",
-											currentModel?.provider === provider && currentModel?.modelId === model.id
-												? "text-primary"
-												: "text-ink",
-										)}
-										disabled={!canControl}
-										onClick={() => void selectModel(provider, model.id)}
+										className="mt-2 inline-flex h-10 items-center gap-1.5 rounded-sm bg-primary px-2.5 text-xs font-medium text-white hover:bg-primary-hover focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none lg:h-7"
+										onClick={() => {
+											setOpen(false);
+											window.dispatchEvent(new CustomEvent("piweb:open-settings"));
+										}}
 									>
-										<span className="min-w-0 flex-1 truncate">{displayLabel(model.name)}</span>
-										{currentModel?.provider === provider && currentModel?.modelId === model.id && (
-											<Check className="size-4 shrink-0" />
-										)}
+										<Settings2 className="size-3.5" />
+										{tt("model.configure")}
 									</button>
-								))}
-							</div>
-						))}
+								</div>
+							)}
+							{Object.entries(byProvider).map(([provider, providerModels]) => (
+								<div key={provider}>
+									<div className="sticky top-0 z-10 bg-surface px-2 py-1 text-[11px] font-medium tracking-wide text-ink-3 uppercase">
+										{displayLabel(provider)}
+									</div>
+									{providerModels.map((model) => (
+										<button
+											key={model.id}
+											type="button"
+											className={cn(
+												"flex min-h-10 w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-[13px] transition-colors hover:bg-hover lg:min-h-0",
+												currentModel?.provider === provider && currentModel?.modelId === model.id
+													? "text-primary"
+													: "text-ink",
+											)}
+											disabled={!canControl}
+											onClick={() => void selectModel(provider, model.id)}
+										>
+											<span className="min-w-0 flex-1 truncate">{displayLabel(model.name)}</span>
+											{currentModel?.provider === provider && currentModel?.modelId === model.id && (
+												<Check className="size-4 shrink-0" />
+											)}
+										</button>
+									))}
+								</div>
+							))}
+						</div>
 					</div>
 				)}
 				{page === "effort" && (
@@ -193,7 +193,7 @@ export function ModelSelector() {
 								key={level}
 								type="button"
 								className={cn(
-									"flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-[13px] transition-colors hover:bg-hover",
+									"flex min-h-10 w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-[13px] transition-colors hover:bg-hover lg:min-h-0",
 									currentLevel === level ? "text-primary" : "text-ink",
 								)}
 								disabled={!canControl}
@@ -227,7 +227,7 @@ function MenuItem({
 	return (
 		<button
 			type="button"
-			className="flex items-center gap-2 rounded-sm px-2 py-2 text-left text-[13px] text-ink transition-colors hover:bg-hover"
+			className="flex min-h-10 items-center gap-2 rounded-sm px-2 py-2 text-left text-[13px] text-ink transition-colors hover:bg-hover"
 			onClick={onClick}
 		>
 			{icon}
@@ -239,11 +239,11 @@ function MenuItem({
 
 function PageHeader({ title, onBack }: { title: string; onBack: () => void }) {
 	return (
-		<div className="flex items-center gap-1 px-1 py-1.5">
+		<div className="z-20 flex flex-none items-center gap-1 border-b border-border bg-surface px-1 py-1.5">
 			<button
 				type="button"
 				aria-label={tt("model.back")}
-				className="flex size-6 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
+				className="flex size-10 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink lg:size-6"
 				onClick={onBack}
 			>
 				<ChevronLeft className="size-4" />

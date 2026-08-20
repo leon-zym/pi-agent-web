@@ -1,3 +1,4 @@
+import type { SlashCommandToken, SlashTrigger } from "../../stores/composer";
 import type { RpcSlashCommand } from "../../types/pi-types";
 
 const SOURCE_ORDER: RpcSlashCommand["source"][] = ["extension", "prompt", "skill"];
@@ -13,8 +14,6 @@ export interface SlashMenuGroup {
 	source: RpcSlashCommand["source"];
 	items: SlashMenuItem[];
 }
-
-export type SlashCommitAction = { kind: "execute"; commandName: string } | { kind: "none" };
 
 export function fuzzyScore(query: string, name: string): number {
 	if (!query) return 0;
@@ -71,26 +70,50 @@ export function edgeSlashHighlight(edge: "first" | "last", count: number): numbe
 	return count - 1;
 }
 
-/** Space/Enter execute only an exact real or display-name match. */
-export function resolveSlashCommit(groups: SlashMenuGroup[], query: string): SlashCommitAction {
-	const items = groups.flatMap((group) => group.items);
-	const normalizedQuery = query.trim().toLowerCase();
-	if (normalizedQuery) {
-		const exactName = items.find((item) => item.command.name.toLowerCase() === normalizedQuery);
-		const exactDisplay = items.find((item) => item.displayName.toLowerCase() === normalizedQuery);
-		const exact = exactName ?? exactDisplay;
-		if (exact) return { kind: "execute", commandName: exact.command.name };
-	}
-	return { kind: "none" };
+/** Resolve the visual highlight rather than guessing from a partial fuzzy query. */
+export function resolveHighlightedSlashCommand(
+	groups: SlashMenuGroup[],
+	highlight: number,
+): SlashMenuItem | null {
+	return groups.flatMap((group) => group.items).find((item) => item.index === highlight) ?? null;
 }
 
-export function insertSlashCommand(
+export function selectSlashCommand(
 	draft: string,
-	trigger: { index: number; query: string },
-	commandName: string,
-): string {
-	const before = draft.slice(0, trigger.index);
-	const after = draft.slice(trigger.index + 1 + trigger.query.length);
-	const separator = /^\s/.test(after) ? "" : " ";
-	return `${before}/${commandName}${separator}${after}`;
+	trigger: SlashTrigger,
+	item: Pick<SlashMenuItem, "command" | "displayName">,
+): { command: SlashCommandToken; draft: string } {
+	const before = draft.slice(0, trigger.index).trimEnd();
+	const after = draft.slice(trigger.index + 1 + trigger.query.length).trimStart();
+	return {
+		command: {
+			name: item.command.name,
+			displayName: item.displayName,
+			source: item.command.source,
+		},
+		draft: before && after ? `${before} ${after}` : before || after,
+	};
+}
+
+/** Parse an exact raw invocation at submit time so it cannot bypass the atomic token model. */
+export function resolveRawSlashCommand(
+	draft: string,
+	commands: RpcSlashCommand[],
+): { command: SlashCommandToken; draft: string } | null {
+	const match = draft.match(/^\s*\/([^\s]+)(?:\s+([\s\S]*))?$/);
+	if (!match?.[1]) return null;
+	const query = match[1].toLowerCase();
+	const command = commands.find((candidate) => {
+		const visibleName = displayName(candidate).toLowerCase();
+		return candidate.name.toLowerCase() === query || visibleName === query;
+	});
+	if (!command) return null;
+	return {
+		command: {
+			name: command.name,
+			displayName: displayName(command),
+			source: command.source,
+		},
+		draft: match[2]?.trim() ?? "",
+	};
 }

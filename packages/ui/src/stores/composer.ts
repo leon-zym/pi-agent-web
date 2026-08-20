@@ -16,11 +16,29 @@ export interface RecentQueued {
 	at: number;
 }
 
+/** A selected Pi command is atomic UI state; only its argument body remains editable. */
+export interface SlashCommandToken {
+	readonly name: string;
+	readonly displayName: string;
+	readonly source: "extension" | "prompt" | "skill";
+}
+
+/** Serialize the atomic command and editable body once at the transport boundary. */
+export function serializeComposerMessage(command: SlashCommandToken | null, draft: string): string {
+	const body = draft.trim();
+	if (!command) return body;
+	return body ? `/${command.name} ${body}` : `/${command.name}`;
+}
+
 export interface ComposerSnapshot {
 	draft: string;
 	images: ImageContent[];
 	trigger: SlashTrigger | null;
+	command: SlashCommandToken | null;
 	submitState: "plain" | "submitting";
+	activeSubmitId: number | null;
+	attachmentWorkCount: number;
+	attachmentWorkIds: readonly number[];
 	deliveryMode: DeliveryMode;
 	queue: { steering: string[]; followUp: string[] };
 	recentQueued: RecentQueued[];
@@ -35,8 +53,16 @@ interface ComposerState extends ComposerSnapshot {
 	setDraftForSession: (sessionHandle: string, draft: string) => void;
 	setImages: (images: ImageContent[]) => void;
 	setImagesForSession: (sessionHandle: string, images: ImageContent[]) => void;
+	beginAttachmentWorkForSession: (sessionHandle: string) => number;
+	finishAttachmentWorkForSession: (
+		sessionHandle: string,
+		attachmentWorkId: number,
+		preparedImages?: ImageContent[],
+	) => void;
 	setTrigger: (trigger: SlashTrigger | null) => void;
 	setTriggerForSession: (sessionHandle: string, trigger: SlashTrigger | null) => void;
+	setCommand: (command: SlashCommandToken | null) => void;
+	setCommandForSession: (sessionHandle: string, command: SlashCommandToken | null) => void;
 	setSubmitState: (state: "plain" | "submitting") => void;
 	setSubmitStateForSession: (sessionHandle: string, state: "plain" | "submitting") => void;
 	/** Atomically claim the active Session's single in-flight submit slot. */
@@ -58,19 +84,34 @@ interface ComposerState extends ComposerSnapshot {
 	clearDraft: () => void;
 	clearDraftForSession: (sessionHandle: string) => void;
 	/** Clear only when the user has not edited the draft during submission. */
-	clearDraftIfUnchanged: (draft: string, images: ImageContent[]) => void;
-	clearDraftIfUnchangedForSession: (sessionHandle: string, draft: string, images: ImageContent[]) => void;
+	clearDraftIfUnchanged: (draft: string, images: ImageContent[], command?: SlashCommandToken | null) => void;
+	clearDraftIfUnchangedForSession: (
+		sessionHandle: string,
+		draft: string,
+		images: ImageContent[],
+		command?: SlashCommandToken | null,
+		activeSubmitId?: number | null,
+	) => void;
+	finishSubmitForSession: (sessionHandle: string, activeSubmitId: number | null) => void;
+	/** Move in-flight composer state when a pending Session gets its canonical handle. */
+	rekeySession: (previousSessionHandle: string, sessionHandle: string) => void;
 }
 
 const RECENT_QUEUE_TTL_MS = 5 * 60_000;
 const RECENT_QUEUE_LIMIT = 20;
+let submitIdCounter = 0;
+let attachmentWorkIdCounter = 0;
 
 function emptySnapshot(): ComposerSnapshot {
 	return {
 		draft: "",
 		images: [],
 		trigger: null,
+		command: null,
 		submitState: "plain",
+		activeSubmitId: null,
+		attachmentWorkCount: 0,
+		attachmentWorkIds: [],
 		deliveryMode: "auto",
 		queue: { steering: [], followUp: [] },
 		recentQueued: [],
@@ -82,7 +123,11 @@ function visible(snapshot: ComposerSnapshot): ComposerSnapshot {
 		draft: snapshot.draft,
 		images: snapshot.images,
 		trigger: snapshot.trigger,
+		command: snapshot.command,
 		submitState: snapshot.submitState,
+		activeSubmitId: snapshot.activeSubmitId,
+		attachmentWorkCount: snapshot.attachmentWorkCount,
+		attachmentWorkIds: snapshot.attachmentWorkIds,
 		deliveryMode: snapshot.deliveryMode,
 		queue: snapshot.queue,
 		recentQueued: snapshot.recentQueued,
@@ -144,6 +189,32 @@ export const useComposerStore = create<ComposerState>()((set, get) => {
 		},
 		setImagesForSession: (sessionHandle, images) =>
 			updateSession(sessionHandle, (snapshot) => ({ ...snapshot, images })),
+		beginAttachmentWorkForSession: (sessionHandle) => {
+			attachmentWorkIdCounter += 1;
+			const attachmentWorkId = attachmentWorkIdCounter;
+			updateSession(sessionHandle, (snapshot) => ({
+				...snapshot,
+				attachmentWorkCount: snapshot.attachmentWorkCount + 1,
+				attachmentWorkIds: [...snapshot.attachmentWorkIds, attachmentWorkId],
+			}));
+			return attachmentWorkId;
+		},
+		finishAttachmentWorkForSession: (sessionHandle, attachmentWorkId, preparedImages) => {
+			const state = get();
+			const direct = state.bySession[sessionHandle];
+			const targetHandle = direct?.attachmentWorkIds.includes(attachmentWorkId)
+				? sessionHandle
+				: Object.entries(state.bySession).find(([, snapshot]) =>
+						snapshot.attachmentWorkIds.includes(attachmentWorkId),
+					)?.[0];
+			if (!targetHandle) return;
+			updateSession(targetHandle, (snapshot) => ({
+				...snapshot,
+				...(preparedImages ? { images: preparedImages } : {}),
+				attachmentWorkCount: Math.max(0, snapshot.attachmentWorkCount - 1),
+				attachmentWorkIds: snapshot.attachmentWorkIds.filter((id) => id !== attachmentWorkId),
+			}));
+		},
 
 		setTrigger: (trigger) => {
 			const handle = get().activeSessionHandle;
@@ -152,12 +223,27 @@ export const useComposerStore = create<ComposerState>()((set, get) => {
 		setTriggerForSession: (sessionHandle, trigger) =>
 			updateSession(sessionHandle, (snapshot) => ({ ...snapshot, trigger })),
 
+		setCommand: (command) => {
+			const handle = get().activeSessionHandle;
+			if (handle) get().setCommandForSession(handle, command);
+		},
+		setCommandForSession: (sessionHandle, command) =>
+			updateSession(sessionHandle, (snapshot) => ({
+				...snapshot,
+				command,
+				trigger: command ? null : snapshot.trigger,
+			})),
+
 		setSubmitState: (submitState) => {
 			const handle = get().activeSessionHandle;
 			if (handle) get().setSubmitStateForSession(handle, submitState);
 		},
 		setSubmitStateForSession: (sessionHandle, submitState) =>
-			updateSession(sessionHandle, (snapshot) => ({ ...snapshot, submitState })),
+			updateSession(sessionHandle, (snapshot) => ({
+				...snapshot,
+				submitState,
+				activeSubmitId: submitState === "plain" ? null : snapshot.activeSubmitId,
+			})),
 
 		beginSubmit: () => {
 			const handle = get().activeSessionHandle;
@@ -165,7 +251,12 @@ export const useComposerStore = create<ComposerState>()((set, get) => {
 		},
 		beginSubmitForSession: (sessionHandle) => {
 			if ((get().bySession[sessionHandle] ?? emptySnapshot()).submitState === "submitting") return false;
-			updateSession(sessionHandle, (snapshot) => ({ ...snapshot, submitState: "submitting" }));
+			submitIdCounter += 1;
+			updateSession(sessionHandle, (snapshot) => ({
+				...snapshot,
+				submitState: "submitting",
+				activeSubmitId: submitIdCounter,
+			}));
 			return true;
 		},
 
@@ -223,17 +314,70 @@ export const useComposerStore = create<ComposerState>()((set, get) => {
 				draft: "",
 				images: [],
 				trigger: null,
+				command: null,
 			})),
 
-		clearDraftIfUnchanged: (draft, images) => {
+		clearDraftIfUnchanged: (draft, images, command = null) => {
 			const handle = get().activeSessionHandle;
-			if (handle) get().clearDraftIfUnchangedForSession(handle, draft, images);
+			if (handle) get().clearDraftIfUnchangedForSession(handle, draft, images, command);
 		},
-		clearDraftIfUnchangedForSession: (sessionHandle, draft, images) => {
-			const current = get().bySession[sessionHandle];
-			if (current?.draft === draft && current.images === images) {
-				get().clearDraftForSession(sessionHandle);
+		clearDraftIfUnchangedForSession: (
+			sessionHandle,
+			draft,
+			images,
+			command = null,
+			activeSubmitId = null,
+		) => {
+			const state = get();
+			const targetHandle =
+				activeSubmitId === null
+					? sessionHandle
+					: Object.entries(state.bySession).find(
+							([, snapshot]) => snapshot.activeSubmitId === activeSubmitId,
+						)?.[0];
+			if (!targetHandle) return;
+			const current = state.bySession[targetHandle];
+			if (
+				current?.draft === draft &&
+				current.images === images &&
+				current.command === command &&
+				(activeSubmitId === null || current.activeSubmitId === activeSubmitId)
+			) {
+				get().clearDraftForSession(targetHandle);
 			}
+		},
+
+		finishSubmitForSession: (sessionHandle, activeSubmitId) => {
+			const state = get();
+			const targetHandle =
+				activeSubmitId === null
+					? sessionHandle
+					: Object.entries(state.bySession).find(
+							([, snapshot]) => snapshot.activeSubmitId === activeSubmitId,
+						)?.[0];
+			if (!targetHandle) return;
+			updateSession(targetHandle, (snapshot) => ({
+				...snapshot,
+				submitState: "plain",
+				activeSubmitId: null,
+			}));
+		},
+
+		rekeySession: (previousSessionHandle, sessionHandle) => {
+			if (previousSessionHandle === sessionHandle) return;
+			set((state) => {
+				const previous = state.bySession[previousSessionHandle];
+				if (!previous) return {};
+				const bySession = { ...state.bySession, [sessionHandle]: previous };
+				delete bySession[previousSessionHandle];
+				const activeSessionHandle =
+					state.activeSessionHandle === previousSessionHandle ? sessionHandle : state.activeSessionHandle;
+				return {
+					bySession,
+					activeSessionHandle,
+					...(activeSessionHandle === sessionHandle ? visible(previous) : {}),
+				};
+			});
 		},
 	};
 });

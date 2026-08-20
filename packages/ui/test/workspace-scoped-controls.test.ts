@@ -1,7 +1,12 @@
-import type { NativeSessionDto, NativeWorkspaceDto, SessionRuntimeDto } from "@pi-agent-web/protocol";
+import type {
+	NativeSessionCreateDto,
+	NativeSessionDto,
+	NativeWorkspaceDto,
+	SessionRuntimeDto,
+} from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api } from "../src/lib/api";
-import { deleteSession, openSession, renameSession } from "../src/lib/session-controller";
+import { deleteSession, newSession, openSession, renameSession } from "../src/lib/session-controller";
 import { selectCurrentWorkspaceSessions, useSessionDirectoryStore } from "../src/stores/session-directory";
 import { sessionTransport } from "../src/stores/session-transport";
 
@@ -87,6 +92,96 @@ describe("Session-scoped controls", () => {
 		useSessionDirectoryStore.setState(state, true);
 	});
 
+	it("boots into the most recently opened Workspace without opening its first Session", async () => {
+		const firstWorkspace = workspace("workspace-first");
+		const recentWorkspace = {
+			...workspace("workspace-recent"),
+			lastOpenedAt: 200,
+		};
+		const pinnedOlderWorkspace = {
+			...workspace("workspace-pinned"),
+			pinned: true,
+			lastOpenedAt: 100,
+		};
+		const recentSession = session("session-recent", "workspace-recent");
+		vi.spyOn(api, "listWorkspaces").mockResolvedValue([
+			firstWorkspace,
+			pinnedOlderWorkspace,
+			recentWorkspace,
+		]);
+		vi.spyOn(api, "listSessions").mockImplementation(async (workspaceHandle) =>
+			nativeList(workspaceHandle === "workspace-recent" ? [recentSession] : []),
+		);
+		const activateWorkspace = vi
+			.spyOn(api, "activateWorkspace")
+			.mockImplementation(async (workspaceHandle) => workspace(workspaceHandle));
+		const { subscribeSession } = isolateTransportActions();
+		useSessionDirectoryStore.setState({
+			workspaces: [],
+			currentWorkspaceHandle: null,
+			currentSession: null,
+			sessionsByWorkspace: {},
+			selectedSessionByWorkspace: {},
+		});
+
+		await useSessionDirectoryStore.getState().loadWorkspaces();
+
+		expect(useSessionDirectoryStore.getState()).toMatchObject({
+			currentWorkspaceHandle: "workspace-recent",
+			currentSession: null,
+			selectedSessionByWorkspace: {},
+			sessionsByWorkspace: {
+				"workspace-recent": [{ sessionHandle: "session-recent" }],
+			},
+		});
+		expect(subscribeSession).not.toHaveBeenCalled();
+		expect(activateWorkspace).not.toHaveBeenCalled();
+	});
+
+	it("materializes the initial new Session in the preferred Workspace, not from history", async () => {
+		const olderWorkspace = { ...workspace("workspace-older"), lastOpenedAt: 100 };
+		const preferred = { ...workspace("workspace-preferred"), lastOpenedAt: 200 };
+		const historical = session("session-historical", "workspace-preferred");
+		const createdSession = {
+			...session("session-created", "workspace-preferred"),
+			messageCount: 0,
+			firstMessage: "",
+		};
+		let resolveCreate: ((value: NativeSessionCreateDto) => void) | undefined;
+		vi.spyOn(api, "listWorkspaces").mockResolvedValue([olderWorkspace, preferred]);
+		vi.spyOn(api, "listSessions").mockResolvedValue(nativeList([historical]));
+		const createSession = vi.spyOn(api, "createSession").mockReturnValue(
+			new Promise<NativeSessionCreateDto>((resolve) => {
+				resolveCreate = resolve;
+			}),
+		);
+		isolateTransportActions();
+		useSessionDirectoryStore.setState({
+			workspaces: [],
+			currentWorkspaceHandle: null,
+			currentSession: null,
+			sessionsByWorkspace: {},
+			selectedSessionByWorkspace: {},
+		});
+
+		await useSessionDirectoryStore.getState().loadWorkspaces();
+		const creation = newSession();
+
+		expect(createSession).toHaveBeenCalledWith("workspace-preferred");
+		expect(useSessionDirectoryStore.getState()).toMatchObject({
+			currentSession: null,
+			sessionCreation: { workspaceHandle: "workspace-preferred" },
+		});
+		resolveCreate?.({
+			session: createdSession,
+			runtime: runtime("session-created", "workspace-preferred"),
+			layout: { sessionDir: "/tmp/sessions", source: "default" },
+		});
+		await creation;
+
+		expect(useSessionDirectoryStore.getState().currentSession?.sessionHandle).toBe("session-created");
+	});
+
 	it("keeps delayed native Session A results out of the selected Session B view", async () => {
 		let releaseA: (() => void) | undefined;
 		const gateA = new Promise<void>((resolve) => {
@@ -98,6 +193,9 @@ describe("Session-scoped controls", () => {
 			if (workspaceHandle === "workspace-a") await gateA;
 			return nativeList(workspaceHandle === "workspace-a" ? [sessionA] : [sessionB]);
 		});
+		const activateWorkspace = vi
+			.spyOn(api, "activateWorkspace")
+			.mockImplementation(async (workspaceHandle) => workspace(workspaceHandle));
 		isolateTransportActions();
 		useSessionDirectoryStore.setState({
 			workspaces: [workspace("workspace-a"), workspace("workspace-b")],
@@ -115,12 +213,15 @@ describe("Session-scoped controls", () => {
 
 		expect(useSessionDirectoryStore.getState()).toMatchObject({
 			currentWorkspaceHandle: "workspace-b",
-			currentSession: { sessionHandle: "session-b", workspaceHandle: "workspace-b" },
+			currentSession: null,
+			selectedSessionByWorkspace: {},
 			sessionsByWorkspace: {
 				"workspace-a": [{ sessionHandle: "session-a", nativeSessionId: "native-session-a" }],
 				"workspace-b": [{ sessionHandle: "session-b", nativeSessionId: "native-session-b" }],
 			},
 		});
+		expect(activateWorkspace).toHaveBeenCalledWith("workspace-a");
+		expect(activateWorkspace).toHaveBeenCalledWith("workspace-b");
 	});
 
 	it("propagates an event-driven force refresh without letting an older response overwrite it", async () => {
@@ -163,7 +264,7 @@ describe("Session-scoped controls", () => {
 		});
 	});
 
-	it("does not let a superseded same-Workspace selection choose its stale response", async () => {
+	it("does not auto-select either stale or fresh Session results while loading a Workspace", async () => {
 		let releaseSelection: (() => void) | undefined;
 		const selectionGate = new Promise<void>((resolve) => {
 			releaseSelection = resolve;
@@ -182,6 +283,9 @@ describe("Session-scoped controls", () => {
 			await refreshGate;
 			return nativeList([fresh]);
 		});
+		vi.spyOn(api, "activateWorkspace").mockImplementation(async (workspaceHandle) =>
+			workspace(workspaceHandle),
+		);
 		isolateTransportActions();
 		useSessionDirectoryStore.setState({
 			workspaces: [workspace("workspace-a")],
@@ -206,16 +310,63 @@ describe("Session-scoped controls", () => {
 		expect(observedSelections).not.toContain("session-stale");
 		expect(useSessionDirectoryStore.getState()).toMatchObject({
 			currentWorkspaceHandle: "workspace-a",
-			currentSession: { sessionHandle: "session-fresh" },
-			selectedSessionByWorkspace: { "workspace-a": "session-fresh" },
+			currentSession: null,
+			selectedSessionByWorkspace: {},
 			sessionsByWorkspace: {
 				"workspace-a": [{ sessionHandle: "session-fresh" }],
 			},
 		});
 	});
 
+	it("leaves the old conversation synchronously and ignores a stale new-Session completion", async () => {
+		const oldSession = session("session-old", "workspace-a");
+		const nextSession = session("session-next", "workspace-a");
+		const createdSession = {
+			...session("session-created", "workspace-a"),
+			messageCount: 0,
+			firstMessage: "",
+		};
+		let resolveCreate: ((value: NativeSessionCreateDto) => void) | undefined;
+		vi.spyOn(api, "createSession").mockReturnValue(
+			new Promise<NativeSessionCreateDto>((resolve) => {
+				resolveCreate = resolve;
+			}),
+		);
+		vi.spyOn(api, "listSessions").mockResolvedValue(nativeList([createdSession, nextSession, oldSession]));
+		isolateTransportActions();
+		useSessionDirectoryStore.setState({
+			workspaces: [workspace("workspace-a")],
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: oldSession,
+			sessionsByWorkspace: { "workspace-a": [oldSession, nextSession] },
+			selectedSessionByWorkspace: { "workspace-a": "session-old" },
+		});
+
+		const creation = newSession();
+		expect(useSessionDirectoryStore.getState()).toMatchObject({
+			currentSession: null,
+			sessionCreation: { workspaceHandle: "workspace-a" },
+		});
+
+		useSessionDirectoryStore.getState().selectSession(nextSession);
+		expect(useSessionDirectoryStore.getState().sessionCreation).toBeNull();
+		resolveCreate?.({
+			session: createdSession,
+			runtime: runtime("session-created", "workspace-a"),
+			layout: { sessionDir: "/tmp/sessions", source: "default" },
+		});
+		await creation;
+
+		expect(useSessionDirectoryStore.getState().currentSession?.sessionHandle).toBe("session-next");
+		expect(useSessionDirectoryStore.getState().sessionsByWorkspace["workspace-a"]).toContainEqual(
+			expect.objectContaining({ sessionHandle: "session-created" }),
+		);
+	});
+
 	it("opens an observer Session without requiring a controller lease", async () => {
 		const observerSession = session("session-observer", "workspace-a");
+		const activateWorkspace = vi.spyOn(api, "activateWorkspace").mockResolvedValue(workspace("workspace-a"));
+		vi.spyOn(api, "listSessions").mockResolvedValue(nativeList([observerSession]));
 		const { subscribeSession, claimSession } = isolateTransportActions();
 		useSessionDirectoryStore.setState({
 			workspaces: [workspace("workspace-a")],
@@ -230,6 +381,46 @@ describe("Session-scoped controls", () => {
 		expect(useSessionDirectoryStore.getState().currentSession).toEqual(observerSession);
 		expect(subscribeSession).toHaveBeenCalledWith("session-observer");
 		expect(claimSession).toHaveBeenCalledWith("session-observer");
+		expect(activateWorkspace).toHaveBeenCalledWith("workspace-a");
+	});
+
+	it("opens the exact cross-Workspace Session without an intermediate cached selection", async () => {
+		let releaseTarget: (() => void) | undefined;
+		const targetGate = new Promise<void>((resolve) => {
+			releaseTarget = resolve;
+		});
+		const previousSession = session("session-previous", "workspace-a");
+		const cachedFirst = session("session-cached-first", "workspace-b");
+		const targetSession = session("session-target", "workspace-b");
+		vi.spyOn(api, "activateWorkspace").mockResolvedValue(workspace("workspace-b"));
+		vi.spyOn(api, "listSessions").mockImplementation(async () => {
+			await targetGate;
+			return nativeList([cachedFirst, targetSession]);
+		});
+		isolateTransportActions();
+		useSessionDirectoryStore.setState({
+			workspaces: [workspace("workspace-a"), workspace("workspace-b")],
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: previousSession,
+			sessionsByWorkspace: {
+				"workspace-a": [previousSession],
+				"workspace-b": [cachedFirst, targetSession],
+			},
+			selectedSessionByWorkspace: { "workspace-b": "session-cached-first" },
+		});
+		const observedSelections: string[] = [];
+		const unsubscribe = useSessionDirectoryStore.subscribe((state) => {
+			if (state.currentSession) observedSelections.push(state.currentSession.sessionHandle);
+		});
+
+		const opening = openSession(targetSession);
+		expect(useSessionDirectoryStore.getState().currentSession?.sessionHandle).toBe("session-target");
+		releaseTarget?.();
+		await opening;
+		unsubscribe();
+
+		expect(new Set(observedSelections)).toEqual(new Set(["session-target"]));
+		expect(observedSelections).not.toContain("session-cached-first");
 	});
 
 	it("marks background settlement unread and clears it when that Session is selected", () => {

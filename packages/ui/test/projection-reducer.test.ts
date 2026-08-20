@@ -334,6 +334,51 @@ describe("projection reducer", () => {
 		expect(p.turns[0]?.userMessages.map((message) => message.source)).toEqual(["prompt", "steer"]);
 	});
 
+	it("collapses Pi-expanded skills into an invocation tag and keeps only user arguments", () => {
+		let p = createEmptyProjection("skill");
+		p = reduceProjection(
+			p,
+			{
+				type: "message_start",
+				message: {
+					role: "user",
+					content:
+						'<skill name="review" location="/private/skill/SKILL.md">\nReferences are relative to /private/skill.\n\nSECRET INTERNAL BODY\n</skill>\n\nfocus on auth',
+				},
+			} as never,
+			ctx,
+		);
+
+		expect(p.turns[0]?.userMessages[0]).toMatchObject({
+			command: "/skill:review",
+			text: "focus on auth",
+		});
+		expect(JSON.stringify(p.turns[0]?.userMessages[0])).not.toContain("SECRET INTERNAL BODY");
+	});
+
+	it("fails private when an expanded skill body contains an ambiguous closing delimiter", () => {
+		let p = createEmptyProjection("ambiguous-skill");
+		p = reduceProjection(
+			p,
+			{
+				type: "message_start",
+				message: {
+					role: "user",
+					content:
+						'<skill name="review" location="/private/skill/SKILL.md">\nExample delimiter:\n</skill>\n\nSECRET BODY AFTER EXAMPLE\n</skill>\n\nreal user args',
+				},
+			} as never,
+			ctx,
+		);
+
+		expect(p.turns[0]?.userMessages[0]).toMatchObject({
+			command: "/skill:review",
+			text: "",
+		});
+		expect(JSON.stringify(p.turns[0]?.userMessages[0])).not.toContain("SECRET");
+		expect(JSON.stringify(p.turns[0]?.userMessages[0])).not.toContain("/private");
+	});
+
 	it("aggregates compaction and retry status rows", () => {
 		let p = createEmptyProjection("s1");
 		p = reduceProjection(p, { type: "compaction_start", reason: "manual" }, ctx);

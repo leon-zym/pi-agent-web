@@ -3,6 +3,7 @@ import { memo, useState } from "react";
 import { Badge } from "../../components/ui/badge";
 import { stripAnsi } from "../../lib/format";
 import { tt } from "../../lib/i18n";
+import { serializePresentedUserMessage } from "../../lib/user-message-presentation";
 import { cn } from "../../lib/utils";
 import type { UiUserMessage } from "../../types/view-models";
 
@@ -13,9 +14,11 @@ import type { UiUserMessage } from "../../types/view-models";
 export const UserMessageBubble = memo(function UserMessageBubble({ message }: { message: UiUserMessage }) {
 	const [copied, setCopied] = useState(false);
 	const displayText = stripAnsi(message.text);
+	const displayCommand = message.command ? stripAnsi(message.command) : undefined;
+	const copyText = serializePresentedUserMessage({ text: message.text, command: message.command });
 
 	const copy = () => {
-		void navigator.clipboard.writeText(message.text).then(() => {
+		void navigator.clipboard.writeText(copyText).then(() => {
 			setCopied(true);
 			setTimeout(() => setCopied(false), 1500);
 		});
@@ -24,9 +27,14 @@ export const UserMessageBubble = memo(function UserMessageBubble({ message }: { 
 	return (
 		<div className="flex flex-col items-end gap-1.5">
 			<div className="group relative max-w-[525px] rounded-xl bg-user-bubble px-4 py-2.5">
-				{displayText && (
-					<p className="text-[15px] leading-[24px] whitespace-pre-wrap break-words text-ink">{displayText}</p>
-				)}
+				<div className="flex flex-wrap items-baseline gap-1.5 text-[15px] leading-[24px] text-ink">
+					{displayCommand && (
+						<span className="inline-flex max-w-full rounded-md border border-primary/15 bg-primary/8 px-1.5 py-0.5 font-mono text-[12px] leading-5 text-primary">
+							{displayCommand}
+						</span>
+					)}
+					{displayText && <span className="whitespace-pre-wrap break-words">{displayText}</span>}
+				</div>
 				{message.images?.map((image, index) => (
 					<img
 						key={`${image.mimeType}:${index}`}
