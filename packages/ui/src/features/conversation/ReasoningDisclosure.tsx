@@ -1,6 +1,6 @@
 import { Brain, ChevronRight } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { firstLine, lastLine } from "../../lib/format";
+import { firstLine, lastLine, stripAnsi } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import { useViewStore } from "../../stores/view";
@@ -18,6 +18,7 @@ export interface ReasoningDisclosureProps {
  * Pure props only, no socket access.
  */
 export function ReasoningDisclosure({ text, status, isTail, defaultOpen }: ReasoningDisclosureProps) {
+	const displayText = stripAnsi(text);
 	const open = useViewStore((s) =>
 		defaultOpen !== undefined ? defaultOpen : s.expandedThinking["thinking:"],
 	);
@@ -30,7 +31,7 @@ export function ReasoningDisclosure({ text, status, isTail, defaultOpen }: Reaso
 		if (status === "streaming" && expanded === false && summaryRef.current) {
 			summaryRef.current.scrollLeft = summaryRef.current.scrollWidth;
 		}
-	}, [text, status, expanded]);
+	}, [displayText, status, expanded]);
 
 	const toggle = () => {
 		if (localOpen === null) {
@@ -40,7 +41,7 @@ export function ReasoningDisclosure({ text, status, isTail, defaultOpen }: Reaso
 		}
 	};
 
-	const summary = status === "streaming" ? lastLine(text) : firstLine(text);
+	const summary = status === "streaming" ? lastLine(displayText) : firstLine(displayText);
 	const showSweep = status === "streaming" && isTail && !expanded;
 
 	return (
@@ -73,7 +74,9 @@ export function ReasoningDisclosure({ text, status, isTail, defaultOpen }: Reaso
 			</button>
 			{expanded && (
 				<div className="mt-1.5 ml-[22px] border-l border-border pl-3">
-					<p className="text-[13px] leading-[22px] whitespace-pre-wrap break-words text-ink-2">{text}</p>
+					<p className="text-[13px] leading-[22px] whitespace-pre-wrap break-words text-ink-2">
+						{displayText}
+					</p>
 				</div>
 			)}
 		</div>

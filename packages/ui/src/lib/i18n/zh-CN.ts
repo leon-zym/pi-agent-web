@@ -117,7 +117,7 @@ export const zhCN = {
 	"composer.sendQueued": "发送（插队/排队）",
 	"composer.steerSend": "插队发送",
 	"composer.runningHint1": "运行中：回车以「{mode}」注入，Cmd/Ctrl+Enter",
-	"composer.runningHint2": "切换为「{other}」",
+	"composer.runningHint2": " 始终以「排队」方式发送",
 	"composer.needWorkspaceSession": "请先打开工作区并选择会话",
 	"composer.unknownCommand": "未知命令：{command}",
 	"composer.unknownCommandDesc": "无法识别的 / 命令不会作为普通消息发送",
@@ -130,7 +130,7 @@ export const zhCN = {
 	"slash.skill": "技能",
 	"slash.loadingCommands": "正在加载命令…",
 	"slash.noMatch": "没有匹配的命令",
-	"slash.hint": "回车执行 · 点击插入命令",
+	"slash.hint": "空格/回车执行精确匹配 · 点击插入命令",
 
 	// Model / thinking
 	"model.select": "选择模型",

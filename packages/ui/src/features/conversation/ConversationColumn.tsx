@@ -1,4 +1,3 @@
-import { useViewStore } from "../../stores/view";
 import { ComposerSeat } from "../composer/ComposerSeat";
 import { ExtensionStatusStrip, ExtensionWidgets } from "../extension-ui/ExtensionStatusStrip";
 import { ChatViewport } from "./ChatViewport";
@@ -9,8 +8,6 @@ import { SessionHeader } from "./SessionHeader";
  * persistent composer seat docked at the bottom.
  */
 export function ConversationColumn() {
-	const rightPanelOpen = useViewStore((s) => s.rightPanelOpen);
-
 	return (
 		<div className="flex h-full min-w-0 flex-col">
 			<SessionHeader />
@@ -23,7 +20,6 @@ export function ConversationColumn() {
 			</div>
 			<ExtensionWidgets placement="belowEditor" />
 			<ComposerSeat />
-			{rightPanelOpen && <div className="hidden" />}
 		</div>
 	);
 }

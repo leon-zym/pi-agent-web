@@ -24,7 +24,7 @@ export const useViewStore = create<ViewState>()((set) => ({
 	expandedTools: {},
 	selectedTool: null,
 	selectedToolSessionId: null,
-	rightPanelOpen: false,
+	rightPanelOpen: true,
 	rightPanelMode: null,
 
 	toggleThinking: (key) =>

@@ -1,6 +1,7 @@
 import { Check, Copy } from "lucide-react";
 import { useState } from "react";
 import { Badge } from "../../components/ui/badge";
+import { stripAnsi } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import type { UiUserMessage } from "../../types/view-models";
@@ -11,6 +12,7 @@ import type { UiUserMessage } from "../../types/view-models";
  */
 export function UserMessageBubble({ message }: { message: UiUserMessage }) {
 	const [copied, setCopied] = useState(false);
+	const displayText = stripAnsi(message.text);
 
 	const copy = () => {
 		void navigator.clipboard.writeText(message.text).then(() => {
@@ -22,10 +24,8 @@ export function UserMessageBubble({ message }: { message: UiUserMessage }) {
 	return (
 		<div className="flex flex-col items-end gap-1.5">
 			<div className="group relative max-w-[525px] rounded-xl bg-user-bubble px-4 py-2.5">
-				{message.text && (
-					<p className="text-[15px] leading-[24px] whitespace-pre-wrap break-words text-ink">
-						{message.text}
-					</p>
+				{displayText && (
+					<p className="text-[15px] leading-[24px] whitespace-pre-wrap break-words text-ink">{displayText}</p>
 				)}
 				{message.images?.map((image, index) => (
 					<img

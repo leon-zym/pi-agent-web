@@ -9,6 +9,7 @@ import {
 	X,
 } from "lucide-react";
 import { useState } from "react";
+import { stripAnsi } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import { useProjectionStore } from "../../stores/projection";
@@ -31,7 +32,7 @@ const STATUS_ICON: Record<
 
 function flattenArgs(args: unknown): string {
 	if (args === undefined || args === null) return "";
-	if (typeof args === "string") return args;
+	if (typeof args === "string") return stripAnsi(args);
 	try {
 		return JSON.stringify(args, null, 2);
 	} catch {
@@ -41,17 +42,17 @@ function flattenArgs(args: unknown): string {
 
 function flattenResult(result: unknown): string {
 	if (result === undefined || result === null) return "";
-	if (typeof result === "string") return result;
+	if (typeof result === "string") return stripAnsi(result);
 	if (typeof result === "object") {
 		const record = result as Record<string, unknown>;
-		if (typeof record.content === "string") return record.content;
+		if (typeof record.content === "string") return stripAnsi(record.content);
 		if (Array.isArray(record.content)) {
 			return record.content
 				.filter(
 					(block) =>
 						typeof block === "object" && block !== null && (block as { type?: string }).type === "text",
 				)
-				.map((block) => (block as { text: string }).text)
+				.map((block) => stripAnsi((block as { text: string }).text))
 				.join("\n");
 		}
 		try {
@@ -71,13 +72,13 @@ function flattenResult(result: unknown): string {
 export function ToolCallRow({ block, results }: { block: ToolCallBlock; results: UiToolResult[] }) {
 	const [expanded, setExpanded] = useState(false);
 	const presenter = getToolPresenter(block.toolName);
-	const summary = presenter.summarize({ block, results });
+	const summary = stripAnsi(presenter.summarize({ block, results }));
 	const effectiveStatus = results.some((result) => result.isError) ? "error" : block.status;
 	const status = STATUS_ICON[effectiveStatus];
 	const StatusIcon = status.icon;
 	const isBash = block.toolName === "bash";
 
-	const output = block.partialOutput || flattenResult(block.result) || results[0]?.content || "";
+	const output = stripAnsi(block.partialOutput || flattenResult(block.result) || results[0]?.content || "");
 	const fullOutputPath =
 		typeof block.result === "object" && block.result !== null
 			? ((block.result as Record<string, unknown>).fullOutputPath as string | undefined)
@@ -139,7 +140,7 @@ export function ToolCallRow({ block, results }: { block: ToolCallBlock; results:
 							<div key={result.toolCallId} className="flex items-start gap-1.5 text-[13px] text-danger">
 								<X className="mt-0.5 size-3.5 shrink-0" />
 								<span className="whitespace-pre-wrap break-words">
-									{result.content || tt("tool.executionError")}
+									{stripAnsi(result.content) || tt("tool.executionError")}
 								</span>
 							</div>
 						) : null,

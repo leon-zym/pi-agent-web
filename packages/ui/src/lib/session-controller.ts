@@ -168,6 +168,7 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 	const composer = useComposerStore.getState();
 	const text = composer.draft.trim();
 	if (!text && composer.images.length === 0) return;
+	if (!composer.beginSubmit()) return;
 
 	const running = isRunning();
 	let resolvedKind: SubmitKind = kind;
@@ -178,7 +179,6 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 	}
 
 	const images = composer.images.length > 0 ? composer.images : undefined;
-	composer.setSubmitState("submitting");
 	try {
 		let response: RpcResponse;
 		if (resolvedKind === "steer" || resolvedKind === "follow_up") {
@@ -190,7 +190,7 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 		if (response.success === false) {
 			toast.error(tt("session.sendFailed"), { description: response.error });
 		} else {
-			composer.clearDraft();
+			useComposerStore.getState().clearDraftIfUnchanged(composer.draft, composer.images);
 		}
 	} catch (error) {
 		toast.error(tt("session.sendFailed"), {
@@ -216,11 +216,11 @@ export async function abortCurrentRun(): Promise<void> {
 /** Run the /name command through the prompt path (extensions handle it). */
 export async function runSlashCommand(wsId: string, fullText: string): Promise<void> {
 	const composer = useComposerStore.getState();
-	composer.setSubmitState("submitting");
+	if (!composer.beginSubmit()) return;
 	try {
 		const response = await sendControlCommand(wsId, { type: "prompt", message: fullText });
 		if (response.success === false) toast.error(tt("session.commandFailed"), { description: response.error });
-		else composer.clearDraft();
+		else useComposerStore.getState().clearDraftIfUnchanged(composer.draft, composer.images);
 	} catch (error) {
 		toast.error(tt("session.commandFailed"), {
 			description: error instanceof Error ? error.message : String(error),

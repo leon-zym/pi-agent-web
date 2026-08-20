@@ -7,6 +7,7 @@ import { DetailsPanel } from "../features/details/DetailsPanel";
 import { WorkspaceSidebar } from "../features/sidebar/WorkspaceSidebar";
 import { tt } from "../lib/i18n";
 import { cn } from "../lib/utils";
+import { useViewStore } from "../stores/view";
 
 const SIDEBAR_MIN = 264;
 const SIDEBAR_MAX = 420;
@@ -54,7 +55,8 @@ export function AppShell() {
 	const [widths, setWidths] = useState<StoredWidths>(() => loadWidths());
 	const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
 	const [sidebarOpen, setSidebarOpen] = useState(true);
-	const [detailsOpen, setDetailsOpen] = useState(true);
+	const detailsOpen = useViewStore((state) => state.rightPanelOpen);
+	const setDetailsOpen = useViewStore((state) => state.setRightPanelOpen);
 	const dragging = useRef<"sidebar" | "details" | null>(null);
 
 	useEffect(() => {
@@ -105,7 +107,7 @@ export function AppShell() {
 	};
 
 	return (
-		<div className="flex h-full select-none overflow-hidden bg-base">
+		<div className="flex h-full overflow-hidden bg-base">
 			<div
 				className="min-w-0 overflow-hidden border-r border-border bg-sidebar"
 				style={{ width: sidebarWidth, flexShrink: 0 }}
@@ -182,7 +184,7 @@ export function AppShell() {
 				)}
 				style={{ width: detailsWidth }}
 			>
-				<DetailsPanel open={detailsWidth > 0} onToggle={() => setDetailsOpen((open) => !open)} />
+				<DetailsPanel open={detailsWidth > 0} onToggle={() => setDetailsOpen(!detailsOpen)} />
 			</div>
 		</div>
 	);
