@@ -60,9 +60,12 @@ test("a 52-tool trajectory and 64 KiB settled response survive background naviga
 	const main = page.locator("main");
 	await expect(main.getByText(`E2E_REPLY:${FOREGROUND_PROMPT}`, { exact: true })).toBeVisible();
 	const foregroundRow = page.locator("[data-session-row]").filter({ hasText: FOREGROUND_PROMPT });
-	const stressRow = page.locator("[data-session-row]").filter({ hasNotText: FOREGROUND_PROMPT });
-	await expect(stressRow).toHaveCount(1);
-	await stressRow.getByRole("button").first().click();
+	await page
+		.getByRole("navigation", { name: /^(Sidebar|侧栏)$/ })
+		.getByRole("button", { name: /^(New session|新建会话)$/ })
+		.first()
+		.click();
+	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(0);
 	await expect(page.locator("textarea")).toBeEnabled();
 	await sendPrompt(page, STRESS_PROMPT);
 
@@ -71,6 +74,8 @@ test("a 52-tool trajectory and 64 KiB settled response survive background naviga
 			fixtureEvent(harness, (event) => event.type === "stress_checkpoint" && event.text === STRESS_PROMPT),
 		)
 		.toMatchObject({ toolCount: 26 });
+	const stressRow = page.locator("[data-session-row]").filter({ hasText: STRESS_PROMPT });
+	await expect(stressRow).toHaveCount(1);
 	const toolRows = main.locator('button[aria-expanded="false"]').filter({ hasText: "synthetic-tool-" });
 	await expect(toolRows).toHaveCount(26);
 	await foregroundRow.getByRole("button").first().click();

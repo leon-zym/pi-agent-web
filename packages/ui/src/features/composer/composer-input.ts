@@ -1,6 +1,9 @@
 import type { DeliveryMode, SlashTrigger } from "../../stores/composer";
 
 export function detectSlashTrigger(text: string, cursorIndex: number): SlashTrigger | null {
+	// Pi dispatches extension, prompt-template, and skill commands only when the
+	// entire message starts with "/". Mirror that protocol boundary instead of
+	// suggesting an inline token that Pi would send as ordinary prompt text.
 	const start = text.lastIndexOf("/", cursorIndex - 1);
 	if (start === -1 || text.slice(0, start).trim().length > 0) return null;
 	const after = text.slice(start + 1, cursorIndex);

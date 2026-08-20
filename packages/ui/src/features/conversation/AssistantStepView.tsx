@@ -66,7 +66,7 @@ export const AssistantStepView = memo(function AssistantStepView({
 	}
 
 	return (
-		<div className={cn("flex flex-col gap-3")}>
+		<div className={cn("flex min-w-0 max-w-full flex-col gap-3")}>
 			{step.blocks.map((block, index) => (
 				<BlockView
 					key={block.key}

@@ -77,7 +77,9 @@ export async function newSession(): Promise<void> {
 	let creationToken: number | undefined;
 	try {
 		const workspaceHandle = currentWorkspaceHandle();
-		creationToken = useSessionDirectoryStore.getState().beginSessionCreation(workspaceHandle);
+		const directoryBeforeCreation = useSessionDirectoryStore.getState();
+		if (directoryBeforeCreation.resumeTransientSession(workspaceHandle)) return;
+		creationToken = directoryBeforeCreation.beginSessionCreation(workspaceHandle);
 		const created = await api.createSession(workspaceHandle);
 		const directory = useSessionDirectoryStore.getState();
 		directory.completeSessionCreation(creationToken, created.session);

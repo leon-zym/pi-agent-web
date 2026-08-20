@@ -25,22 +25,29 @@ export const UserMessageBubble = memo(function UserMessageBubble({ message }: { 
 	};
 
 	return (
-		<div className="flex flex-col items-end gap-1.5">
-			<div className="group relative max-w-[525px] rounded-xl bg-user-bubble px-4 py-2.5">
-				<div className="flex flex-wrap items-baseline gap-1.5 text-[15px] leading-[24px] text-ink">
+		<div className="flex min-w-0 max-w-full flex-col items-end gap-1.5">
+			<div
+				data-user-message="true"
+				className="group relative min-w-0 max-w-[min(525px,100%)] rounded-xl bg-user-bubble px-4 py-2.5"
+			>
+				<div className="flex min-w-0 max-w-full flex-wrap items-baseline gap-1.5 text-[15px] leading-[24px] text-ink">
 					{displayCommand && (
 						<span className="inline-flex max-w-full rounded-md border border-primary/15 bg-primary/8 px-1.5 py-0.5 font-mono text-[12px] leading-5 text-primary">
 							{displayCommand}
 						</span>
 					)}
-					{displayText && <span className="whitespace-pre-wrap break-words">{displayText}</span>}
+					{displayText && (
+						<span className="min-w-0 max-w-full whitespace-pre-wrap [overflow-wrap:anywhere]">
+							{displayText}
+						</span>
+					)}
 				</div>
 				{message.images?.map((image, index) => (
 					<img
 						key={`${image.mimeType}:${index}`}
 						src={`data:${image.mimeType};base64,${image.data}`}
 						alt={tt("composer.attachmentImage", { n: index + 1 })}
-						className="mt-2 max-h-64 rounded-md"
+						className="mt-2 max-h-64 max-w-full rounded-md"
 					/>
 				))}
 				<button

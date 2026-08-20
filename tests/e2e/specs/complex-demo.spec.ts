@@ -80,7 +80,8 @@ test("settled complex turn renders rich content and restores tool context", asyn
 		.getByRole("button", { name: /^(New session|新建会话)$/ })
 		.first()
 		.click();
-	await expect(page.locator("[data-session-row]")).toHaveCount(3);
+	await expect(page.locator("[data-session-row]")).toHaveCount(1);
+	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(0);
 	const originalSession = page.locator("[data-session-row]").filter({ hasText: COMPLEX_PROMPT });
 	await originalSession.getByRole("button").first().click();
 	await expect(page.getByRole("heading", { name: "Synthetic change review", level: 2 })).toBeVisible();

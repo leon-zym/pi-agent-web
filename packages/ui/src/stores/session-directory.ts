@@ -16,6 +16,7 @@ interface SessionDirectoryState {
 	currentWorkspaceHandle: string | null;
 	sessionsByWorkspace: Record<string, NativeSessionDto[]>;
 	currentSession: NativeSessionDto | null;
+	retainedTransientByWorkspace: Record<string, NativeSessionDto>;
 	navigationToken: number;
 	sessionCreation: SessionCreationIntent | null;
 	selectedSessionByWorkspace: Record<string, string>;
@@ -30,6 +31,7 @@ interface SessionDirectoryState {
 	selectWorkspace: (workspaceHandle: string) => Promise<void>;
 	reloadSessions: (workspaceHandle?: string, options?: { force?: boolean }) => Promise<NativeSessionDto[]>;
 	selectSession: (session: NativeSessionDto | null) => void;
+	resumeTransientSession: (workspaceHandle: string) => boolean;
 	beginSessionCreation: (workspaceHandle: string) => number;
 	completeSessionCreation: (token: number, session: NativeSessionDto) => boolean;
 	failSessionCreation: (token: number) => boolean;
@@ -113,6 +115,11 @@ function sessionFromRuntime(runtime: SessionRuntimeDto): NativeSessionDto {
 		firstMessage: "",
 		runtime,
 	};
+}
+
+function isDirectorySession(session: NativeSessionDto): boolean {
+	if (!session.persisted) return false;
+	return Boolean(session.messageCount > 0 || session.firstMessage.trim() || session.name?.trim());
 }
 
 function selectVisibleSessionState(sessionHandle: string | null): void {
@@ -236,6 +243,23 @@ function hasLocalTransientContent(sessionHandle: string): boolean {
 	);
 }
 
+function retainLocalTransient(
+	retained: Record<string, NativeSessionDto>,
+	previousSession: NativeSessionDto | null,
+	nextSessionHandle: string | null,
+): Record<string, NativeSessionDto> {
+	const next = { ...retained };
+	if (
+		previousSession &&
+		previousSession.sessionHandle !== nextSessionHandle &&
+		!previousSession.persisted &&
+		hasLocalTransientContent(previousSession.sessionHandle)
+	) {
+		next[previousSession.workspaceHandle] = previousSession;
+	}
+	return next;
+}
+
 async function abandonTransientChannel(
 	sessionHandle: string,
 	management: NonNullable<ReturnType<typeof transientManagement>>,
@@ -312,11 +336,24 @@ async function discardStaleCreatedSession(session: NativeSessionDto): Promise<vo
 	void useSessionDirectoryStore.getState().reloadSessions(session.workspaceHandle, { force: true });
 }
 
+async function discardTransientForWorkspaceRemoval(
+	workspaceHandle: string,
+	sessionHandle: string,
+): Promise<void> {
+	const management = transientManagement(sessionHandle);
+	if (management && (await abandonTransientChannel(sessionHandle, management))) return;
+	const transport = sessionTransport.store.getState();
+	transport.releaseSession(sessionHandle);
+	transport.unsubscribeSession(sessionHandle);
+	useSessionDirectoryStore.getState().removeSession(workspaceHandle, sessionHandle);
+}
+
 export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, get) => ({
 	workspaces: [],
 	currentWorkspaceHandle: null,
 	sessionsByWorkspace: {},
 	currentSession: null,
+	retainedTransientByWorkspace: {},
 	navigationToken: 0,
 	sessionCreation: null,
 	selectedSessionByWorkspace: {},
@@ -333,7 +370,13 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 			set({ workspaces, loadingWorkspaces: false });
 			if (current && workspaces.some((workspace) => workspace.workspaceHandle === current)) return;
 			const preferred = preferredWorkspace(workspaces);
-			const previousSessionHandle = get().currentSession?.sessionHandle;
+			const previousSession = get().currentSession;
+			const previousSessionHandle = previousSession?.sessionHandle;
+			const retainedTransientByWorkspace = retainLocalTransient(
+				get().retainedTransientByWorkspace,
+				previousSession,
+				null,
+			);
 			const navigationToken = nextNavigationToken();
 			set({
 				currentWorkspaceHandle: preferred?.workspaceHandle ?? null,
@@ -341,6 +384,7 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 				navigationToken,
 				sessionCreation: null,
 				loadingSessions: Boolean(preferred),
+				retainedTransientByWorkspace,
 			});
 			releaseDormantView(previousSessionHandle, null);
 			activateSessionView(null);
@@ -358,7 +402,21 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 	},
 
 	removeWorkspace: async (workspaceHandle) => {
+		const beforeRemoval = get();
+		const transientHandles = new Set<string>();
+		const current = beforeRemoval.currentSession;
+		if (current?.workspaceHandle === workspaceHandle && !current.persisted) {
+			transientHandles.add(current.sessionHandle);
+		}
+		const retained = beforeRemoval.retainedTransientByWorkspace[workspaceHandle];
+		if (retained) transientHandles.add(retained.sessionHandle);
+		// Keep browser-only drafts intact if removing the Workspace preference fails.
+		// Active runtimes remain a supervisor-backed Workspace projection long enough
+		// for the transient abandon request that follows a successful removal.
 		await api.removeWorkspace(workspaceHandle);
+		for (const sessionHandle of transientHandles) {
+			await discardTransientForWorkspaceRemoval(workspaceHandle, sessionHandle);
+		}
 		const sessions = get().sessionsByWorkspace[workspaceHandle] ?? [];
 		for (const session of sessions) {
 			const transport = sessionTransport.store.getState();
@@ -371,6 +429,8 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 		delete selectedSessionByWorkspace[workspaceHandle];
 		const unreadBySession = { ...get().unreadBySession };
 		for (const session of sessions) delete unreadBySession[session.sessionHandle];
+		const retainedTransientByWorkspace = { ...get().retainedTransientByWorkspace };
+		delete retainedTransientByWorkspace[workspaceHandle];
 		if (get().currentWorkspaceHandle === workspaceHandle) {
 			set({
 				currentWorkspaceHandle: null,
@@ -378,16 +438,25 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 				sessionsByWorkspace,
 				selectedSessionByWorkspace,
 				unreadBySession,
+				retainedTransientByWorkspace,
 			});
 			activateSessionView(null);
-		} else set({ sessionsByWorkspace, selectedSessionByWorkspace, unreadBySession });
+		} else {
+			set({ sessionsByWorkspace, selectedSessionByWorkspace, unreadBySession, retainedTransientByWorkspace });
+		}
 		await get().loadWorkspaces();
 	},
 
 	selectWorkspace: async (workspaceHandle) => {
 		const workspace = get().workspaces.find((candidate) => candidate.workspaceHandle === workspaceHandle);
 		if (!workspace) return;
-		const previousSessionHandle = get().currentSession?.sessionHandle;
+		const previousSession = get().currentSession;
+		const previousSessionHandle = previousSession?.sessionHandle;
+		const retainedTransientByWorkspace = retainLocalTransient(
+			get().retainedTransientByWorkspace,
+			previousSession,
+			null,
+		);
 		const navigationToken = nextNavigationToken();
 		set({
 			currentWorkspaceHandle: workspaceHandle,
@@ -396,6 +465,7 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 			sessionCreation: null,
 			loadingSessions: true,
 			error: undefined,
+			retainedTransientByWorkspace,
 		});
 		releaseDormantView(previousSessionHandle, null);
 		activateSessionView(null);
@@ -433,16 +503,35 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 						[]
 					);
 				}
-				const sorted = [...sessions].sort(byMostRecent);
+				// Sidebar directory entries are durable Pi history, not hot runtime handles.
+				// Keep an unmaterialized active Session in currentSession until Pi writes its
+				// JSONL, then let a forced native-catalog refresh publish its real metadata.
+				const sorted = sessions.filter(isDirectorySession).sort(byMostRecent);
 				const current = get();
 				const sessionsByWorkspace = { ...current.sessionsByWorkspace, [workspaceHandle]: sorted };
+				const retainedTransientByWorkspace = { ...current.retainedTransientByWorkspace };
+				const retained = retainedTransientByWorkspace[workspaceHandle];
+				if (retained && sorted.some((session) => session.sessionHandle === retained.sessionHandle)) {
+					delete retainedTransientByWorkspace[workspaceHandle];
+				}
+				const workspaces = current.workspaces.map((workspace) =>
+					workspace.workspaceHandle === workspaceHandle
+						? {
+								...workspace,
+								sessionCount: sorted.length,
+								hasNativeHistory: sorted.length > 0,
+							}
+						: workspace,
+				);
 				const currentSession =
 					current.currentWorkspaceHandle === workspaceHandle && current.currentSession
 						? (sorted.find((session) => session.sessionHandle === current.currentSession?.sessionHandle) ??
 							current.currentSession)
 						: current.currentSession;
 				set({
+					workspaces,
 					sessionsByWorkspace,
+					retainedTransientByWorkspace,
 					currentSession,
 					...(current.currentWorkspaceHandle === workspaceHandle ? { loadingSessions: false } : {}),
 				});
@@ -469,8 +558,20 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 	},
 
 	selectSession: (session) => {
+		const previousSession = get().currentSession;
 		const workspaceHandle = session?.workspaceHandle ?? get().currentWorkspaceHandle;
-		const previousSessionHandle = get().currentSession?.sessionHandle;
+		const previousSessionHandle = previousSession?.sessionHandle;
+		const retainedTransientByWorkspace = retainLocalTransient(
+			get().retainedTransientByWorkspace,
+			previousSession,
+			session?.sessionHandle ?? null,
+		);
+		if (
+			session &&
+			retainedTransientByWorkspace[session.workspaceHandle]?.sessionHandle === session.sessionHandle
+		) {
+			delete retainedTransientByWorkspace[session.workspaceHandle];
+		}
 		const selectedSessionByWorkspace = { ...get().selectedSessionByWorkspace };
 		if (workspaceHandle) {
 			if (session) selectedSessionByWorkspace[workspaceHandle] = session.sessionHandle;
@@ -485,9 +586,26 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 			sessionCreation: null,
 			selectedSessionByWorkspace,
 			unreadBySession,
+			retainedTransientByWorkspace,
 		});
 		releaseDormantView(previousSessionHandle, session?.sessionHandle ?? null);
 		activateSessionView(session);
+	},
+
+	resumeTransientSession: (workspaceHandle) => {
+		const state = get();
+		const current = state.currentSession;
+		if (
+			current?.workspaceHandle === workspaceHandle &&
+			!current.persisted &&
+			hasLocalTransientContent(current.sessionHandle)
+		) {
+			return true;
+		}
+		const retained = state.retainedTransientByWorkspace[workspaceHandle];
+		if (!retained) return false;
+		get().selectSession(retained);
+		return true;
 	},
 
 	beginSessionCreation: (workspaceHandle) => {
@@ -529,9 +647,20 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 	},
 
 	upsertSession: (session) => {
+		if (!isDirectorySession(session)) {
+			if (get().currentSession?.sessionHandle === session.sessionHandle) {
+				set({ currentSession: session });
+			}
+			return;
+		}
 		const sessions = mergeSession(get().sessionsByWorkspace[session.workspaceHandle] ?? [], session);
+		const retainedTransientByWorkspace = { ...get().retainedTransientByWorkspace };
+		if (retainedTransientByWorkspace[session.workspaceHandle]?.sessionHandle === session.sessionHandle) {
+			delete retainedTransientByWorkspace[session.workspaceHandle];
+		}
 		set({
 			sessionsByWorkspace: { ...get().sessionsByWorkspace, [session.workspaceHandle]: sessions },
+			retainedTransientByWorkspace,
 			...(get().currentSession?.sessionHandle === session.sessionHandle ? { currentSession: session } : {}),
 		});
 	},
@@ -539,16 +668,48 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 	applyRuntime: (runtime) => {
 		const sessions = get().sessionsByWorkspace[runtime.workspaceId] ?? [];
 		const existing = sessions.find((session) => session.sessionHandle === runtime.sessionHandle);
-		const session = existing ? { ...existing, runtime } : sessionFromRuntime(runtime);
-		get().upsertSession(session);
+		if (existing?.persisted) {
+			get().upsertSession({ ...existing, runtime });
+			return;
+		}
+		const current = get().currentSession;
+		if (current?.sessionHandle !== runtime.sessionHandle) {
+			const retained = get().retainedTransientByWorkspace[runtime.workspaceId];
+			if (retained?.sessionHandle !== runtime.sessionHandle) return;
+			set({
+				retainedTransientByWorkspace: {
+					...get().retainedTransientByWorkspace,
+					[runtime.workspaceId]: {
+						...retained,
+						nativeSessionId: runtime.nativeSessionId,
+						sessionFile: runtime.sessionFile,
+						persisted: runtime.recoverable,
+						runtime,
+					},
+				},
+			});
+			return;
+		}
+		set({
+			currentSession: {
+				...current,
+				nativeSessionId: runtime.nativeSessionId,
+				sessionFile: runtime.sessionFile,
+				persisted: runtime.recoverable,
+				runtime,
+			},
+		});
 	},
 
 	rekeySession: (previousSessionHandle, sessionHandle, runtime) => {
 		const workspaceHandle = runtime.workspaceId;
 		const sessions = get().sessionsByWorkspace[workspaceHandle] ?? [];
 		const previous = sessions.find((session) => session.sessionHandle === previousSessionHandle);
+		const current = get().currentSession;
 		const replacement = {
-			...(previous ?? sessionFromRuntime(runtime)),
+			...(current?.sessionHandle === previousSessionHandle
+				? current
+				: (previous ?? sessionFromRuntime(runtime))),
 			sessionHandle,
 			workspaceHandle,
 			nativeSessionId: runtime.nativeSessionId,
@@ -556,11 +717,11 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 			persisted: runtime.recoverable,
 			runtime,
 		} satisfies NativeSessionDto;
-		const next = mergeSession(
-			sessions.filter((session) => session.sessionHandle !== previousSessionHandle),
-			replacement,
-		);
-		const wasCurrent = get().currentSession?.sessionHandle === previousSessionHandle;
+		// Fork/clone moves the hot process to a child identity, but the persisted
+		// parent remains independently reopenable. The child joins the directory
+		// only through the native catalog once its JSONL metadata is available.
+		const next = sessions.filter(isDirectorySession);
+		const wasCurrent = current?.sessionHandle === previousSessionHandle;
 		const selectedSessionByWorkspace = { ...get().selectedSessionByWorkspace };
 		if (selectedSessionByWorkspace[workspaceHandle] === previousSessionHandle) {
 			selectedSessionByWorkspace[workspaceHandle] = sessionHandle;
@@ -568,10 +729,15 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 		const unreadBySession = { ...get().unreadBySession };
 		if (unreadBySession[previousSessionHandle]) unreadBySession[sessionHandle] = true;
 		delete unreadBySession[previousSessionHandle];
+		const retainedTransientByWorkspace = { ...get().retainedTransientByWorkspace };
+		if (retainedTransientByWorkspace[workspaceHandle]?.sessionHandle === previousSessionHandle) {
+			retainedTransientByWorkspace[workspaceHandle] = replacement;
+		}
 		set({
 			sessionsByWorkspace: { ...get().sessionsByWorkspace, [workspaceHandle]: next },
 			selectedSessionByWorkspace,
 			unreadBySession,
+			retainedTransientByWorkspace,
 			...(wasCurrent ? { currentSession: replacement } : {}),
 		});
 		if (wasCurrent) {
@@ -590,10 +756,15 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 		const wasCurrent = get().currentSession?.sessionHandle === sessionHandle;
 		const unreadBySession = { ...get().unreadBySession };
 		delete unreadBySession[sessionHandle];
+		const retainedTransientByWorkspace = { ...get().retainedTransientByWorkspace };
+		if (retainedTransientByWorkspace[workspaceHandle]?.sessionHandle === sessionHandle) {
+			delete retainedTransientByWorkspace[workspaceHandle];
+		}
 		set({
 			sessionsByWorkspace: { ...get().sessionsByWorkspace, [workspaceHandle]: sessions },
 			selectedSessionByWorkspace,
 			unreadBySession,
+			retainedTransientByWorkspace,
 			...(wasCurrent ? { currentSession: null } : {}),
 		});
 		if (wasCurrent) activateSessionView(null);

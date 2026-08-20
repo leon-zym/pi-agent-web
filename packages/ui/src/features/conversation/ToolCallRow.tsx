@@ -1,13 +1,4 @@
-import {
-	Check,
-	ChevronRight,
-	CircleAlert,
-	ExternalLink,
-	Loader2,
-	SkipForward,
-	Wrench,
-	X,
-} from "lucide-react";
+import { Check, ChevronRight, CircleAlert, ExternalLink, Loader2, SkipForward, Wrench } from "lucide-react";
 import { useMemo, useState } from "react";
 import { stripAnsi } from "../../lib/format";
 import { tt } from "../../lib/i18n";
@@ -43,15 +34,22 @@ function boundedToolSummary(summary: string): string {
 
 function GenericToolBody({ context }: { context: ReturnType<typeof toolContext> }) {
 	const { block, results } = context;
+	const isError = block.status === "error" || results.some((result) => result.isError);
 	const args = useMemo(() => formatToolArguments(block.args, block.argsText), [block.args, block.argsText]);
 	const output = useMemo(() => toolOutputText({ block, results }), [block, results]);
+	const displayOutput = output || (isError ? tt("tool.executionError") : "");
 
 	return (
 		<>
 			<HighlightedCode code={args.code} language={args.language} className="max-h-[260px]" />
-			{block.toolName !== "bash" && output && (
-				<div className="max-h-[260px] overflow-y-auto scroll-slim rounded-sm bg-surface-2 p-2.5 font-mono text-xs leading-[18px] whitespace-pre-wrap break-all text-ink-2">
-					{output}
+			{block.toolName !== "bash" && displayOutput && (
+				<div
+					className={cn(
+						"scroll-slim max-h-[260px] overflow-y-auto rounded-sm bg-surface-2 p-2.5 font-mono text-xs leading-[18px] whitespace-pre-wrap break-all",
+						isError ? "text-danger" : "text-ink-2",
+					)}
+				>
+					{displayOutput}
 				</div>
 			)}
 		</>
@@ -62,14 +60,9 @@ function toolContext(block: ToolCallBlock, results: UiToolResult[]) {
 	return { block, results };
 }
 
-function ExpandedToolCall({
-	context,
-	presenter,
-}: {
-	context: ReturnType<typeof toolContext>;
-	presenter: ReturnType<typeof getToolPresenter>;
-}) {
-	const { block, results } = context;
+export function ExpandedToolCallBody({ block, results }: { block: ToolCallBlock; results: UiToolResult[] }) {
+	const context = toolContext(block, results);
+	const presenter = getToolPresenter(block.toolName);
 	const presenterBody = presenter.renderBody?.(context);
 	const fullOutputPath =
 		typeof block.result === "object" && block.result !== null
@@ -81,16 +74,6 @@ function ExpandedToolCall({
 			{presenterBody ?? <GenericToolBody context={context} />}
 			{block.toolName === "bash" && fullOutputPath && (
 				<span className="text-[11px] text-ink-3">{tt("tool.fullLog", { path: fullOutputPath })}</span>
-			)}
-			{results.map((result) =>
-				result.isError ? (
-					<div key={result.toolCallId} className="flex items-start gap-1.5 text-[13px] text-danger">
-						<X className="mt-0.5 size-3.5 shrink-0" />
-						<span className="whitespace-pre-wrap break-words">
-							{stripAnsi(result.content) || tt("tool.executionError")}
-						</span>
-					</div>
-				) : null,
 			)}
 		</div>
 	);
@@ -111,7 +94,7 @@ export function ToolCallRow({ block, results }: { block: ToolCallBlock; results:
 	const StatusIcon = status.icon;
 
 	return (
-		<div className="flex flex-col gap-1">
+		<div className="flex min-w-0 max-w-full flex-col gap-1">
 			<div className="group flex items-center gap-1.5 rounded-sm py-0.5 hover:bg-hover">
 				<button
 					type="button"
@@ -148,7 +131,7 @@ export function ToolCallRow({ block, results }: { block: ToolCallBlock; results:
 				)}
 			</div>
 
-			{expanded && <ExpandedToolCall context={presenterContext} presenter={presenter} />}
+			{expanded && <ExpandedToolCallBody block={block} results={results} />}
 		</div>
 	);
 }

@@ -318,7 +318,7 @@ describe("Session-scoped controls", () => {
 		});
 	});
 
-	it("leaves the old conversation synchronously and ignores a stale new-Session completion", async () => {
+	it("leaves the old conversation synchronously without publishing a stale empty Session", async () => {
 		const oldSession = session("session-old", "workspace-a");
 		const nextSession = session("session-next", "workspace-a");
 		const createdSession = {
@@ -358,9 +358,13 @@ describe("Session-scoped controls", () => {
 		await creation;
 
 		expect(useSessionDirectoryStore.getState().currentSession?.sessionHandle).toBe("session-next");
-		expect(useSessionDirectoryStore.getState().sessionsByWorkspace["workspace-a"]).toContainEqual(
-			expect.objectContaining({ sessionHandle: "session-created" }),
-		);
+		expect(
+			useSessionDirectoryStore
+				.getState()
+				.sessionsByWorkspace["workspace-a"]?.some(
+					(candidate) => candidate.sessionHandle === "session-created",
+				),
+		).toBe(false);
 	});
 
 	it("opens an observer Session without requiring a controller lease", async () => {

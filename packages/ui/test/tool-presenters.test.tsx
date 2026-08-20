@@ -1,7 +1,8 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { ToolCallRow } from "../src/features/conversation/ToolCallRow";
+import { ExpandedToolCallBody, ToolCallRow } from "../src/features/conversation/ToolCallRow";
 import { getToolPresenter } from "../src/features/conversation/tool-presenters";
+import { tt } from "../src/lib/i18n";
 
 describe("tool presenters", () => {
 	it("renders the complete Bash command separately from its output", () => {
@@ -75,6 +76,79 @@ describe("tool presenters", () => {
 			results: [],
 		});
 		expect(body).toBeNull();
+	});
+
+	it("renders a failed tool result exactly once in the expanded body", () => {
+		const failure = "Validation failed: missing required action";
+		const html = renderToStaticMarkup(
+			<ExpandedToolCallBody
+				block={{
+					type: "tool_call",
+					key: "todo-invalid",
+					toolCallId: "todo-invalid",
+					toolName: "todo",
+					argsText: '{"subject":"Audit"}',
+					args: { subject: "Audit" },
+					status: "error",
+					result: failure,
+				}}
+				results={[
+					{
+						toolCallId: "todo-invalid",
+						toolName: "todo",
+						content: failure,
+						isError: true,
+					},
+				]}
+			/>,
+		);
+
+		expect(html.split(failure)).toHaveLength(2);
+	});
+
+	it("keeps one useful error message for Bash and diff presenters", () => {
+		const emptyBashError = renderToStaticMarkup(
+			<ExpandedToolCallBody
+				block={{
+					type: "tool_call",
+					key: "bash-error",
+					toolCallId: "bash-error",
+					toolName: "bash",
+					argsText: "",
+					args: { command: "false" },
+					status: "error",
+				}}
+				results={[{ toolCallId: "bash-error", toolName: "bash", content: "", isError: true }]}
+			/>,
+		);
+		expect(emptyBashError).toContain(tt("tool.executionError"));
+		expect(emptyBashError).not.toContain(tt("common.noOutput"));
+
+		const editFailure = "Unable to apply the edit";
+		const failedEdit = renderToStaticMarkup(
+			<ExpandedToolCallBody
+				block={{
+					type: "tool_call",
+					key: "edit-error",
+					toolCallId: "edit-error",
+					toolName: "edit",
+					argsText: "",
+					args: { path: "src/app.ts" },
+					status: "error",
+				}}
+				results={[
+					{
+						toolCallId: "edit-error",
+						toolName: "edit",
+						content: editFailure,
+						isError: true,
+						details: { diff: "@@ -1 +1 @@\n-old\n+new" },
+					},
+				]}
+			/>,
+		);
+		expect(failedEdit).toContain("-old");
+		expect(failedEdit.split(editFailure)).toHaveLength(2);
 	});
 
 	it("does not serialize large arguments or results while a ToolCall is collapsed", () => {

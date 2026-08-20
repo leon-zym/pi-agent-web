@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { displayLabel, stripAnsi } from "../src/lib/format";
+import { displayLabel, formatExactDateTime, stripAnsi } from "../src/lib/format";
+
+it("formats an exact local timestamp through seconds", () => {
+	const timestamp = new Date(2026, 7, 21, 6, 7, 8).getTime();
+	expect(formatExactDateTime(timestamp)).toBe("2026-08-21 06:07:08");
+	expect(formatExactDateTime(Number.NaN)).toBe("--");
+});
 
 describe("stripAnsi", () => {
 	it("removes CSI colors and cursor controls", () => {

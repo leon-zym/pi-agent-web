@@ -27,7 +27,7 @@ test("packaged app bootstraps and renders the workbench without browser errors",
 	await page.goto(harness.origin, { waitUntil: "domcontentloaded" });
 	expect((await bootstrapResponse).status()).toBe(200);
 	await expect(page.locator("#root > div")).toBeVisible();
-	await expect(page.locator("nav")).toBeVisible();
+	await expect(page.getByRole("navigation", { name: /^(Sidebar|侧栏)$/ })).toBeVisible();
 	await expect(page.locator("main")).toBeVisible();
 	await expect(page.locator("textarea")).toBeEnabled();
 	const workspaceActions = page.getByRole("button", { name: /^(Workspace actions|工作区操作)$/ });
@@ -77,7 +77,7 @@ test("375px viewport has no page-level horizontal overflow", async ({ page, harn
 	await page.setViewportSize({ width: 375, height: 812 });
 	await page.goto(harness.origin, { waitUntil: "domcontentloaded" });
 	await expect(page.locator("#root > div")).toBeVisible();
-	await expect(page.locator("nav")).toBeVisible();
+	await expect(page.getByRole("navigation", { name: /^(Sidebar|侧栏)$/ })).toBeVisible();
 	await expect(page.locator("main")).toBeVisible();
 	await expect(page.locator("textarea")).toBeEnabled();
 	await page.locator("textarea").fill("Draft");

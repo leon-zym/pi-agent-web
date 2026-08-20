@@ -26,7 +26,7 @@ export const MarkdownBlock = memo(function MarkdownBlock({
 	return (
 		<div
 			className={cn(
-				"text-[15px] leading-[26px] break-words text-ink",
+				"min-w-0 max-w-full text-[15px] leading-[26px] break-words [overflow-wrap:anywhere] text-ink",
 				"[&_p]:my-2 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0",
 				"[&_ul]:my-2 [&_ul]:list-disc [&_ul]:pl-5",
 				"[&_ol]:my-2 [&_ol]:list-decimal [&_ol]:pl-5",

@@ -609,7 +609,7 @@ export function WorkspaceSidebar({
 
 	if (rail) {
 		return (
-			<nav aria-label={tt("sidebar.navAria")} className="flex h-full flex-col items-center gap-1 py-0.5">
+			<nav aria-label={tt("sidebar.navAria")} className="flex h-full flex-col items-center gap-1 pt-0.5">
 				{(onOpenNavigation || onToggleRail) && (
 					<Tooltip>
 						<TooltipTrigger asChild>
@@ -657,19 +657,21 @@ export function WorkspaceSidebar({
 					<TooltipContent side="right">{tt("sidebar.addWorkspace")}</TooltipContent>
 				</Tooltip>
 				<div className="flex-1" />
-				<Tooltip>
-					<TooltipTrigger asChild>
-						<button
-							type="button"
-							aria-label={tt("sidebar.switchTheme")}
-							className="flex size-10 items-center justify-center rounded-sm text-ink-2 hover:bg-hover"
-							onClick={cycleTheme}
-						>
-							<ThemeIcon className="size-4" />
-						</button>
-					</TooltipTrigger>
-					<TooltipContent side="right">{tt("sidebar.switchTheme")}</TooltipContent>
-				</Tooltip>
+				<div className="flex h-12 w-full flex-none items-center justify-center border-t border-border">
+					<Tooltip>
+						<TooltipTrigger asChild>
+							<button
+								type="button"
+								aria-label={tt("sidebar.switchTheme")}
+								className="flex size-10 items-center justify-center rounded-sm text-ink-2 hover:bg-hover"
+								onClick={cycleTheme}
+							>
+								<ThemeIcon className="size-4" />
+							</button>
+						</TooltipTrigger>
+						<TooltipContent side="right">{tt("sidebar.switchTheme")}</TooltipContent>
+					</Tooltip>
+				</div>
 				<AddWorkspaceDialog open={addOpen} onOpenChange={setAddOpen} />
 			</nav>
 		);
@@ -678,7 +680,10 @@ export function WorkspaceSidebar({
 	return (
 		<nav aria-label={tt("sidebar.navAria")} className="flex h-full flex-col">
 			<div className="flex h-11 flex-none items-center gap-2 px-2">
-				<div className="flex size-10 items-center justify-center rounded-sm bg-primary-soft text-primary">
+				<div
+					data-sidebar-brand-slot="true"
+					className="flex size-10 items-center justify-center rounded-sm bg-primary-soft text-primary"
+				>
 					<Bot className="size-5" />
 				</div>
 				<span className="text-[13px] font-semibold text-ink">{tt("sidebar.brand")}</span>
@@ -721,7 +726,7 @@ export function WorkspaceSidebar({
 				)}
 			</div>
 
-			<div className="px-3 pb-2">
+			<div className="px-3 pt-2 pb-2">
 				<Button
 					variant="secondary"
 					className={cn("w-full justify-start gap-1.5 text-[13px]", onRequestClose ? "h-10" : "h-8")}
@@ -791,16 +796,13 @@ export function WorkspaceSidebar({
 				)}
 			</div>
 
-			<div className="flex flex-none items-center gap-1 border-t border-border px-2 py-1.5">
+			<div className="flex h-12 flex-none items-center gap-1 border-t border-border px-2">
 				<Tooltip>
 					<TooltipTrigger asChild>
 						<button
 							type="button"
 							aria-label={tt("sidebar.switchTheme")}
-							className={cn(
-								"flex items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink",
-								onRequestClose ? "size-10" : "size-7",
-							)}
+							className="flex size-10 items-center justify-center rounded-sm text-ink-2 hover:bg-hover hover:text-ink"
 							onClick={cycleTheme}
 						>
 							<ThemeIcon className="size-4" />
@@ -821,7 +823,7 @@ export function WorkspaceSidebar({
 						<button
 							type="button"
 							aria-label={tt("common.settings")}
-							className="flex size-7 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
+							className="flex size-10 items-center justify-center rounded-sm text-ink-2 hover:bg-hover hover:text-ink"
 							onClick={() => window.dispatchEvent(new CustomEvent("piweb:open-settings"))}
 						>
 							<Settings className="size-4" />

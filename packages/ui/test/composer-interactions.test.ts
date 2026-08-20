@@ -59,9 +59,12 @@ describe("composer interactions", () => {
 	it("opens command completion only for the first non-whitespace token", () => {
 		expect(detectSlashTrigger("/rev", 4)).toEqual({ index: 0, query: "rev" });
 		expect(detectSlashTrigger("  /rev", 6)).toEqual({ index: 2, query: "rev" });
+		expect(detectSlashTrigger("\t/rev", 5)).toEqual({ index: 1, query: "rev" });
 		expect(detectSlashTrigger("Before /rev", 11)).toBeNull();
+		expect(detectSlashTrigger("Before\n/rev", 11)).toBeNull();
 		expect(detectSlashTrigger("https://example.com", 8)).toBeNull();
 		expect(detectSlashTrigger("/rev args", 9)).toBeNull();
+		expect(detectSlashTrigger("//rev", 5)).toBeNull();
 	});
 
 	it("serializes an immutable command token separately from its editable body", () => {

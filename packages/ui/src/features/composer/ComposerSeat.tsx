@@ -1,6 +1,7 @@
-import { ImagePlus, Plus, SendHorizontal, Square, X, Zap } from "lucide-react";
+import { ImagePlus, Plus, SendHorizontal, Sparkles, Square, X, Zap } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
+import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
 import { stripAnsi } from "../../lib/format";
@@ -8,7 +9,7 @@ import { tt, useT } from "../../lib/i18n";
 import { ImageAttachmentError, prepareImageAttachments } from "../../lib/image-attachments";
 import { abortCurrentRun, submitDraft } from "../../lib/session-controller";
 import { cn } from "../../lib/utils";
-import { useComposerStore } from "../../stores/composer";
+import { type SlashCommandToken, useComposerStore } from "../../stores/composer";
 import { selectActiveTurnId, useProjectionStore } from "../../stores/projection";
 import { reconcileHiddenSessionLifecycle, useSessionDirectoryStore } from "../../stores/session-directory";
 import { useSessionTransportStore } from "../../stores/session-transport";
@@ -27,6 +28,33 @@ import { resolveRawSlashCommand, selectSlashCommand } from "./slash-menu-model";
 
 const MAX_LINES = 14;
 const MAX_LENGTH = 100_000;
+
+export function ComposerCommandToken({
+	command,
+	onRemove,
+}: {
+	command: SlashCommandToken;
+	onRemove: () => void;
+}) {
+	return (
+		<Badge
+			variant="primary"
+			data-testid="composer-command-token"
+			className="h-6 max-w-[45%] shrink-0 gap-0.5 px-1.5 py-0 text-[12px] leading-4 whitespace-nowrap"
+		>
+			{command.source === "skill" && <Sparkles aria-hidden="true" className="size-3 shrink-0" />}
+			<span className="truncate">/{command.displayName}</span>
+			<button
+				type="button"
+				aria-label={tt("composer.removeCommand", { command: command.displayName })}
+				className="-mr-1 inline-flex size-5 shrink-0 items-center justify-center rounded-full text-primary/70 hover:bg-primary/10 hover:text-primary focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
+				onClick={onRemove}
+			>
+				<X className="size-3" />
+			</button>
+		</Badge>
+	);
+}
 
 /**
  * Persistent sticky composer (DESIGN.md): one DOM instance across session
@@ -246,23 +274,13 @@ export function ComposerSeat() {
 					)}
 					<div className="flex min-w-0 items-start gap-2">
 						{command && (
-							<span
-								data-testid="composer-command-token"
-								className="mt-0.5 inline-flex h-8 max-w-[45%] shrink-0 items-center gap-1 rounded-md border border-primary/20 bg-primary-soft px-2 font-mono text-[13px] text-primary max-lg:h-10"
-							>
-								<span className="truncate">/{command.displayName}</span>
-								<button
-									type="button"
-									aria-label={tt("composer.removeCommand", { command: command.displayName })}
-									className="-mr-1 inline-flex size-7 shrink-0 items-center justify-center rounded-sm text-primary/70 hover:bg-primary/10 hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-primary max-lg:size-8"
-									onClick={() => {
-										setCommand(null);
-										focus();
-									}}
-								>
-									<X className="size-3" />
-								</button>
-							</span>
+							<ComposerCommandToken
+								command={command}
+								onRemove={() => {
+									setCommand(null);
+									focus();
+								}}
+							/>
 						)}
 						<textarea
 							ref={textareaRef}
