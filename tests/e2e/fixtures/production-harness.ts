@@ -13,15 +13,43 @@ const CREDENTIAL_ENV_PATTERN =
 	/(api[_-]?key|token|secret|password|credential|openai|anthropic|gemini|deepseek)/i;
 
 export interface HarnessWorkspace {
-	id: string;
+	workspaceHandle: string;
 	path: string;
+}
+
+export interface HarnessSession {
+	sessionHandle: string;
+	workspaceHandle: string;
+	nativeSessionId: string;
+	sessionFile: string | null;
+	firstMessage: string;
+	messageCount: number;
+}
+
+export interface PiFixtureEvent {
+	type: string;
+	at: number;
+	pid: number;
+	sessionId: string;
+	commandId?: string;
+	commandType?: string;
+	text?: string;
+	label?: string;
+	imageCount?: number;
+	imageMimeTypes?: string[];
+	imageChars?: number;
+	deltaIndex?: number;
 }
 
 export interface ProductionHarness {
 	origin: string;
 	rootDir: string;
+	workspacePath: string;
 	workspace: HarnessWorkspace;
+	session: HarnessSession;
 	logs: () => string;
+	piEvents: () => PiFixtureEvent[];
+	releasePrompt: (text: string) => void;
 	requestJson: <T>(pathname: string, init?: RequestInit) => Promise<T>;
 	stop: () => Promise<void>;
 }
@@ -89,8 +117,9 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 	const sessionDir = path.join(rootDir, "sessions");
 	const webDataDir = path.join(rootDir, "web-data");
 	const workspacePath = path.join(rootDir, "workspace");
+	const controlDir = path.join(rootDir, "fixture-control");
 	const markerPath = path.join(rootDir, "fake-pi.started");
-	for (const directory of [agentDir, sessionDir, webDataDir, workspacePath]) {
+	for (const directory of [agentDir, sessionDir, webDataDir, workspacePath, controlDir]) {
 		fs.mkdirSync(directory, { recursive: true });
 	}
 	fs.writeFileSync(
@@ -121,6 +150,7 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 				PI_CODING_AGENT_SESSION_DIR: sessionDir,
 				PI_WEB_DATA_DIR: webDataDir,
 				PI_WEB_E2E_MARKER: markerPath,
+				PI_WEB_E2E_CONTROL_DIR: controlDir,
 			}),
 		},
 	);
@@ -147,10 +177,13 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 			if (init.body !== undefined && !headers.has("Content-Type"))
 				headers.set("Content-Type", "application/json");
 			const response = await fetch(`${origin}${pathname}`, { ...init, headers });
-			const body = (await response.json()) as T & { error?: string };
+			const body = (await response.json()) as T & {
+				error?: string | { message?: string };
+			};
 			if (!response.ok) {
+				const detail = typeof body.error === "string" ? body.error : (body.error?.message ?? "unknown error");
 				throw new Error(
-					`${init.method ?? "GET"} ${pathname} failed with ${String(response.status)}: ${body.error ?? "unknown error"}`,
+					`${init.method ?? "GET"} ${pathname} failed with ${String(response.status)}: ${detail}`,
 				);
 			}
 			return body;
@@ -160,16 +193,43 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 			method: "POST",
 			body: JSON.stringify({ path: workspacePath, displayName: "Browser E2E" }),
 		});
-		await requestJson(`/api/v1/workspaces/${encodeURIComponent(workspace.id)}/process/restart`, {
-			method: "POST",
-		});
+		const created = await requestJson<{ session: HarnessSession }>(
+			`/api/v1/workspaces/${encodeURIComponent(workspace.workspaceHandle)}/sessions`,
+			{
+				method: "POST",
+			},
+		);
 		if (!fs.existsSync(markerPath)) throw new Error("deterministic fake Pi was not started");
 
 		return {
 			origin,
 			rootDir,
+			workspacePath,
 			workspace,
+			session: created.session,
 			logs: () => output,
+			piEvents: () => {
+				if (!fs.existsSync(markerPath)) return [];
+				const content = fs.readFileSync(markerPath, "utf8");
+				const lines = content.split("\n");
+				const events: PiFixtureEvent[] = [];
+				for (const [index, line] of lines.entries()) {
+					if (!line) continue;
+					try {
+						events.push(JSON.parse(line) as PiFixtureEvent);
+					} catch (error) {
+						// A reader can observe only the final line while another Pi process appends it.
+						if (index === lines.length - 1 && !content.endsWith("\n")) continue;
+						throw new Error(`invalid deterministic Pi marker line ${String(index + 1)}`, {
+							cause: error,
+						});
+					}
+				}
+				return events;
+			},
+			releasePrompt: (text) => {
+				fs.writeFileSync(path.join(controlDir, `${encodeURIComponent(text)}.release`), "release\n", "utf8");
+			},
 			requestJson,
 			stop: async () => {
 				await terminate(child);
