@@ -1,5 +1,5 @@
 import { Check, Copy } from "lucide-react";
-import { useState } from "react";
+import { memo, useState } from "react";
 import { Badge } from "../../components/ui/badge";
 import { stripAnsi } from "../../lib/format";
 import { tt } from "../../lib/i18n";
@@ -10,7 +10,7 @@ import type { UiUserMessage } from "../../types/view-models";
  * Right-aligned light-blue bubble (DESIGN.md): max 525px, 22px radius,
  * queued injections carry a 插队/排队 badge.
  */
-export function UserMessageBubble({ message }: { message: UiUserMessage }) {
+export const UserMessageBubble = memo(function UserMessageBubble({ message }: { message: UiUserMessage }) {
 	const [copied, setCopied] = useState(false);
 	const displayText = stripAnsi(message.text);
 
@@ -54,4 +54,4 @@ export function UserMessageBubble({ message }: { message: UiUserMessage }) {
 			)}
 		</div>
 	);
-}
+});

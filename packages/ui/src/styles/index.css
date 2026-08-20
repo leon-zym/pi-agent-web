@@ -120,16 +120,14 @@
   button:disabled {
     cursor: default;
   }
-  /* Press feedback everywhere (DESIGN.md): scale on :active, never on hover. */
-  button:not(:disabled),
-  [role="button"]:not([aria-disabled="true"]) {
+  /* Restrained press feedback for actual controls; list/tree rows stay visually stable. */
+  button:not(:disabled) {
     transition-property: scale, opacity, background-color, color, border-color;
     transition-duration: 120ms;
     transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
   }
-  button:not(:disabled):active,
-  [role="button"]:not([aria-disabled="true"]):active {
-    scale: 0.96;
+  button:not(:disabled):active {
+    scale: 0.98;
   }
   ::selection {
     background: color-mix(in srgb, var(--piw-primary) 22%, transparent);
@@ -203,5 +201,22 @@
     .pulse-dot {
       animation: none;
     }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto !important;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.001ms !important;
+  }
+  button:not(:disabled):active {
+    scale: 1;
   }
 }

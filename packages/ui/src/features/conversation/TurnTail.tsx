@@ -2,11 +2,11 @@ import { expectData } from "@pi-agent-web/protocol";
 import { Check, CircleAlert, Copy, GitFork, OctagonX } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
-import { formatCost, formatDuration, formatTokens } from "../../lib/format";
+import { displayError, formatCost, formatDuration, formatTokens, stripAnsi } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { forkFromEntry, sendReadCommand } from "../../lib/session-controller";
-import { useSessionControlStore } from "../../stores/session-control";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
+import { useSessionTransportStore } from "../../stores/session-transport";
 import type { ProductTurn } from "../../types/view-models";
 
 /**
@@ -16,8 +16,11 @@ import type { ProductTurn } from "../../types/view-models";
  */
 export function TurnTail({ turn }: { turn: ProductTurn }) {
 	const [copied, setCopied] = useState(false);
-	const workspaceId = useSessionDirectoryStore((s) => s.currentWorkspaceId);
-	const canControl = useSessionControlStore((s) => s.canControl(workspaceId));
+	const sessionHandle = useSessionDirectoryStore((s) => s.currentSession?.sessionHandle ?? null);
+	const canControl = useSessionTransportStore((state) => {
+		const channel = sessionHandle ? state.sessions[sessionHandle] : undefined;
+		return Boolean(channel?.lease.isController && channel.lease.fencingToken);
+	});
 
 	const copyTurn = async () => {
 		const text = turn.steps
@@ -34,9 +37,9 @@ export function TurnTail({ turn }: { turn: ProductTurn }) {
 	};
 
 	const forkLast = async () => {
-		if (!workspaceId) return;
+		if (!sessionHandle) return;
 		try {
-			const response = await sendReadCommand(workspaceId, { type: "get_fork_messages" });
+			const response = await sendReadCommand(sessionHandle, { type: "get_fork_messages" });
 			const { messages } = expectData(response) as { messages: Array<{ entryId: string; text: string }> };
 			const last = messages[messages.length - 1];
 			if (!last) {
@@ -46,7 +49,7 @@ export function TurnTail({ turn }: { turn: ProductTurn }) {
 			await forkFromEntry(last.entryId);
 		} catch (error) {
 			toast.error(tt("tail.forkFailed"), {
-				description: error instanceof Error ? error.message : String(error),
+				description: displayError(error),
 			});
 		}
 	};
@@ -59,7 +62,7 @@ export function TurnTail({ turn }: { turn: ProductTurn }) {
 			{turn.status === "error" && (
 				<span className="inline-flex items-center gap-1 text-danger">
 					<CircleAlert className="size-3.5" />
-					{turn.errorMessage ?? tt("tail.modelError")}
+					{turn.errorMessage ? stripAnsi(turn.errorMessage) : tt("tail.modelError")}
 				</span>
 			)}
 			{turn.status === "aborted" && (

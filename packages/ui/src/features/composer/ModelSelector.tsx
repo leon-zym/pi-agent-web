@@ -1,12 +1,13 @@
-import { Check, ChevronLeft, ChevronsUpDown, Sparkles } from "lucide-react";
+import { Check, ChevronLeft, ChevronsUpDown, Settings2, Sparkles } from "lucide-react";
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
 import { Popover, PopoverContent, PopoverTrigger } from "../../components/ui/popover";
+import { displayError, displayLabel } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import { useModelDirectoryStore } from "../../stores/model-directory";
-import { useSessionControlStore } from "../../stores/session-control";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
+import { useSessionTransportStore } from "../../stores/session-transport";
 
 const LEVEL_LABEL: Record<string, string> = {
 	off: "model.levelOff",
@@ -33,8 +34,16 @@ export function ModelSelector() {
 	const currentLevel = useModelDirectoryStore((s) => s.currentThinkingLevel);
 	const [page, setPage] = useState<Page>("root");
 	const [open, setOpen] = useState(false);
-	const workspaceId = useSessionDirectoryStore((s) => s.currentWorkspaceId);
-	const canControl = useSessionControlStore((s) => s.canControl(workspaceId));
+	const sessionHandle = useSessionDirectoryStore((s) => s.currentSession?.sessionHandle ?? null);
+	const canControl = useSessionTransportStore((state) => {
+		const channel = sessionHandle ? state.sessions[sessionHandle] : undefined;
+		return Boolean(channel?.lease.isController && channel.lease.fencingToken);
+	});
+	const runtimeState = useSessionTransportStore((state) =>
+		sessionHandle ? state.sessions[sessionHandle]?.runtime?.state : undefined,
+	);
+	const runtimeBusy = runtimeState === "running" || runtimeState === "waiting_ui";
+	const hasModels = models.length > 0;
 
 	const currentModelObject = useMemo(
 		() =>
@@ -42,44 +51,47 @@ export function ModelSelector() {
 		[models, currentModel],
 	);
 
-	const supportsThinking = currentModelObject
-		? currentModelObject.reasoning && thinkingLevels.length > 0
-		: true;
+	const supportsThinking = Boolean(hasModels && currentModelObject?.reasoning && thinkingLevels.length > 0);
 
 	const selectModel = async (provider: string, modelId: string) => {
-		const workspaceId = useSessionDirectoryStore.getState().currentWorkspaceId;
-		if (!workspaceId) return;
+		const sessionHandle = useSessionDirectoryStore.getState().currentSession?.sessionHandle;
+		if (!sessionHandle) return;
 		try {
-			await useModelDirectoryStore.getState().selectModel(workspaceId, provider, modelId);
+			await useModelDirectoryStore.getState().selectModel(sessionHandle, provider, modelId);
 			setOpen(false);
 			setPage("root");
 		} catch (error) {
 			toast.error(tt("model.switchFailed"), {
-				description: error instanceof Error ? error.message : String(error),
+				description: displayError(error),
 			});
 		}
 	};
 
 	const selectLevel = async (level: string) => {
-		const workspaceId = useSessionDirectoryStore.getState().currentWorkspaceId;
-		if (!workspaceId) return;
+		const sessionHandle = useSessionDirectoryStore.getState().currentSession?.sessionHandle;
+		if (!sessionHandle) return;
 		try {
-			await useModelDirectoryStore.getState().selectThinkingLevel(workspaceId, level as never);
+			await useModelDirectoryStore.getState().selectThinkingLevel(sessionHandle, level as never);
 			setOpen(false);
 			setPage("root");
 		} catch (error) {
 			toast.error(tt("model.effortSwitchFailed"), {
-				description: error instanceof Error ? error.message : String(error),
+				description: displayError(error),
 			});
 		}
 	};
 
 	const label = [
-		currentModel ? (currentModelObject?.name ?? currentModel.modelId) : tt("model.select"),
+		!hasModels
+			? tt("model.configure")
+			: currentModel
+				? displayLabel(currentModelObject?.name ?? currentModel.modelId)
+				: tt("model.select"),
 		supportsThinking && currentLevel ? tt(LEVEL_LABEL[currentLevel] as never) : null,
 	]
 		.filter(Boolean)
 		.join(" · ");
+	const compactLabel = hasModels ? label : tt("model.noModels");
 
 	return (
 		<Popover
@@ -92,11 +104,12 @@ export function ModelSelector() {
 			<PopoverTrigger asChild>
 				<button
 					type="button"
-					aria-label={tt("model.menuAria")}
+					aria-label={tt(hasModels ? "model.menuAria" : "model.configure")}
 					disabled={!canControl}
-					className="flex h-7 max-w-52 items-center gap-1 rounded-sm px-2 text-xs text-ink-2 transition-colors hover:bg-hover hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
+					className="flex h-7 min-w-0 max-w-26 items-center gap-1 rounded-sm px-1.5 text-xs text-ink-2 transition-colors hover:bg-hover hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none sm:max-w-52 sm:px-2 max-lg:h-10 max-lg:min-w-10"
 				>
-					<span className="min-w-0 truncate">{label}</span>
+					<span className="min-w-0 truncate sm:hidden">{compactLabel}</span>
+					<span className="hidden min-w-0 truncate sm:inline">{label}</span>
 					<ChevronsUpDown className="size-3 shrink-0 text-ink-3" />
 				</button>
 			</PopoverTrigger>
@@ -106,7 +119,13 @@ export function ModelSelector() {
 						<MenuItem
 							icon={<Sparkles className="size-4 text-ink-3" />}
 							label={tt("model.label")}
-							value={currentModel ? (currentModelObject?.name ?? currentModel.modelId) : tt("model.none")}
+							value={
+								!hasModels
+									? tt("model.noModels")
+									: currentModel
+										? displayLabel(currentModelObject?.name ?? currentModel.modelId)
+										: tt("model.none")
+							}
 							onClick={() => setPage("model")}
 						/>
 						{supportsThinking && (
@@ -122,10 +141,26 @@ export function ModelSelector() {
 				{page === "model" && (
 					<div className="scroll-slim flex max-h-80 flex-col overflow-y-auto">
 						<PageHeader title={tt("model.select")} onBack={() => setPage("root")} />
+						{!hasModels && (
+							<div className="px-3 py-3">
+								<p className="text-xs leading-5 text-ink-3">{tt("model.noModelsHint")}</p>
+								<button
+									type="button"
+									className="mt-2 inline-flex h-7 items-center gap-1.5 rounded-sm bg-primary px-2.5 text-xs font-medium text-white hover:bg-primary-hover focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
+									onClick={() => {
+										setOpen(false);
+										window.dispatchEvent(new CustomEvent("piweb:open-settings"));
+									}}
+								>
+									<Settings2 className="size-3.5" />
+									{tt("model.configure")}
+								</button>
+							</div>
+						)}
 						{Object.entries(byProvider).map(([provider, providerModels]) => (
 							<div key={provider}>
 								<div className="sticky top-0 z-10 bg-surface px-2 py-1 text-[11px] font-medium tracking-wide text-ink-3 uppercase">
-									{provider}
+									{displayLabel(provider)}
 								</div>
 								{providerModels.map((model) => (
 									<button
@@ -140,7 +175,7 @@ export function ModelSelector() {
 										disabled={!canControl}
 										onClick={() => void selectModel(provider, model.id)}
 									>
-										<span className="min-w-0 flex-1 truncate">{model.name}</span>
+										<span className="min-w-0 flex-1 truncate">{displayLabel(model.name)}</span>
 										{currentModel?.provider === provider && currentModel?.modelId === model.id && (
 											<Check className="size-4 shrink-0" />
 										)}
@@ -170,6 +205,9 @@ export function ModelSelector() {
 						))}
 					</div>
 				)}
+				<p className="mt-1 border-t border-border px-2 pt-2 pb-1 text-[11px] leading-4 text-ink-3">
+					{tt(runtimeBusy ? "model.nextRequestBusy" : "model.nextRequest")}
+				</p>
 			</PopoverContent>
 		</Popover>
 	);

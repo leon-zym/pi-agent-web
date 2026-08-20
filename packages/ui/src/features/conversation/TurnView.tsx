@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { tt } from "../../lib/i18n";
 import type { ProductTurn } from "../../types/view-models";
 import { AssistantStepView } from "./AssistantStepView";
@@ -8,9 +9,9 @@ import { UserMessageBubble } from "./UserMessageBubble";
  * One product turn: queued/injected user messages, assistant steps, and a
  * single turn-level tail (timing/tokens/copy) under the last step.
  */
-export function TurnView({ turn }: { turn: ProductTurn }) {
+export const TurnView = memo(function TurnView({ turn }: { turn: ProductTurn }) {
 	return (
-		<section aria-label={tt("turn.sectionAria")} className="flex flex-col gap-4">
+		<section data-turn-id={turn.id} aria-label={tt("turn.sectionAria")} className="flex flex-col gap-4">
 			{turn.userMessages.map((message) => (
 				<UserMessageBubble key={message.entryKey} message={message} />
 			))}
@@ -20,4 +21,4 @@ export function TurnView({ turn }: { turn: ProductTurn }) {
 			<TurnTail turn={turn} />
 		</section>
 	);
-}
+});

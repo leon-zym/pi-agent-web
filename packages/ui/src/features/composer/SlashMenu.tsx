@@ -1,12 +1,18 @@
 import { Blocks, CornerDownLeft, MessageSquareText, Sparkles } from "lucide-react";
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import { displayLabel } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { runSlashCommand } from "../../lib/session-controller";
 import { cn } from "../../lib/utils";
 import { useComposerStore } from "../../stores/composer";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { useSlashCommandsStore } from "../../stores/slash-commands";
-import { buildSlashMenuGroups, moveSlashHighlight, resolveSlashCommit } from "./slash-menu-model";
+import {
+	buildSlashMenuGroups,
+	edgeSlashHighlight,
+	moveSlashHighlight,
+	resolveSlashCommit,
+} from "./slash-menu-model";
 
 interface SlashMenuProps {
 	onExecute: (commandName: string) => void;
@@ -14,6 +20,7 @@ interface SlashMenuProps {
 
 export interface SlashMenuHandle {
 	move: (delta: -1 | 1) => void;
+	moveTo: (edge: "first" | "last") => void;
 	commitExact: () => boolean;
 }
 
@@ -55,10 +62,10 @@ export const SlashMenu = forwardRef<SlashMenuHandle, SlashMenuProps>(function Sl
 	const commitExact = useCallback((): boolean => {
 		const action = resolveSlashCommit(groups, query);
 		if (action.kind === "none") return false;
-		const wsId = useSessionDirectoryStore.getState().currentWorkspaceId;
-		if (!wsId) return false;
+		const sessionHandle = useSessionDirectoryStore.getState().currentSession?.sessionHandle;
+		if (!sessionHandle) return false;
 		useComposerStore.getState().setTrigger(null);
-		void runSlashCommand(wsId, `/${action.commandName}`);
+		void runSlashCommand(sessionHandle, `/${action.commandName}`);
 		return true;
 	}, [groups, query]);
 
@@ -66,6 +73,7 @@ export const SlashMenu = forwardRef<SlashMenuHandle, SlashMenuProps>(function Sl
 		ref,
 		() => ({
 			move: (delta) => setHighlight((current) => moveSlashHighlight(current, delta, itemCount)),
+			moveTo: (edge) => setHighlight(edgeSlashHighlight(edge, itemCount)),
 			commitExact,
 		}),
 		[commitExact, itemCount],
@@ -115,9 +123,11 @@ export const SlashMenu = forwardRef<SlashMenuHandle, SlashMenuProps>(function Sl
 									)}
 								>
 									<Icon className="size-4 shrink-0 text-ink-3" />
-									<span className="min-w-0 flex-1 truncate font-mono">/{displayName}</span>
+									<span className="min-w-0 flex-1 truncate font-mono">/{displayLabel(displayName)}</span>
 									{command.description && (
-										<span className="max-w-48 truncate text-xs text-ink-3">{command.description}</span>
+										<span className="max-w-48 truncate text-xs text-ink-3">
+											{displayLabel(command.description)}
+										</span>
 									)}
 									{selected && <CornerDownLeft className="size-3.5 shrink-0 text-ink-3" />}
 								</div>

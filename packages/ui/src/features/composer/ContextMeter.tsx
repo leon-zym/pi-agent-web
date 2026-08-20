@@ -1,9 +1,12 @@
+import type { SessionStats } from "@earendil-works/pi-coding-agent";
 import { Gauge } from "lucide-react";
 import { useMemo } from "react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
 import { formatCost, formatTokens } from "../../lib/format";
 import { tt } from "../../lib/i18n";
+import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { useSessionStatsStore } from "../../stores/session-stats";
+import { useSessionTransportStore } from "../../stores/session-transport";
 
 /**
  * Context meter: get_session_stats().contextUsage with
@@ -13,26 +16,15 @@ import { useSessionStatsStore } from "../../stores/session-stats";
 export function ContextMeter() {
 	const stats = useSessionStatsStore((s) => s.stats);
 	const liveUsage = useSessionStatsStore((s) => s.liveUsage);
-
-	const usage = stats?.contextUsage;
+	const sessionHandle = useSessionDirectoryStore((s) => s.currentSession?.sessionHandle ?? null);
+	const runtimeState = useSessionTransportStore((state) =>
+		sessionHandle ? state.sessions[sessionHandle]?.runtime?.state : undefined,
+	);
+	const pending = runtimeState === "starting" || runtimeState === "running" || runtimeState === "waiting_ui";
 
 	const display = useMemo(() => {
-		if (!usage) return { kind: "empty" as const };
-		if (
-			usage.tokens === null ||
-			usage.percent === null ||
-			usage.tokens === undefined ||
-			usage.percent === undefined
-		) {
-			return { kind: "computing" as const };
-		}
-		return {
-			kind: "ready" as const,
-			tokens: usage.tokens,
-			percent: usage.percent,
-			window: usage.contextWindow,
-		};
-	}, [usage]);
+		return resolveContextDisplay(stats, pending);
+	}, [stats, pending]);
 
 	const liveTokens = liveUsage?.totalTokens ?? null;
 	const totalCost = stats?.cost ?? 0;
@@ -41,10 +33,12 @@ export function ContextMeter() {
 		display.kind === "ready"
 			? tt("context.tooltipTokens", {
 					tokens: formatTokens(display.tokens),
-					window: formatTokens(display.window),
+					window: display.window === null ? "—" : formatTokens(display.window),
 					percent: Math.round(display.percent),
 				})
-			: tt("context.tooltipComputing"),
+			: display.kind === "loading"
+				? tt("context.tooltipComputing")
+				: tt("context.tooltipUnavailable"),
 		stats
 			? tt("context.tooltipTotal", { tokens: formatTokens(stats.tokens.total), cost: formatCost(totalCost) })
 			: null,
@@ -56,12 +50,17 @@ export function ContextMeter() {
 			<TooltipTrigger asChild>
 				<button
 					type="button"
-					aria-label={tt("context.aria")}
-					className="flex h-7 items-center gap-1 rounded-sm px-2 text-xs text-ink-3 transition-colors hover:bg-hover hover:text-ink-2 focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
+					aria-label={
+						display.kind === "ready"
+							? tt("context.ariaReady", { percent: Math.round(display.percent) })
+							: tt(display.kind === "loading" ? "context.loading" : "context.unavailable")
+					}
+					data-state={display.kind}
+					className="flex size-7 shrink-0 items-center justify-center gap-1 rounded-sm text-xs text-ink-3 transition-colors hover:bg-hover hover:text-ink-2 focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none max-lg:size-10 lg:h-7 lg:w-auto lg:px-2"
 				>
 					<Gauge className="size-3.5" />
 					{display.kind === "ready" ? (
-						<>
+						<span className="hidden items-center gap-1 sm:inline-flex">
 							<span className="h-1 w-10 overflow-hidden rounded-full bg-hover">
 								<span
 									className="block h-full rounded-full bg-primary"
@@ -69,13 +68,40 @@ export function ContextMeter() {
 								/>
 							</span>
 							<span className="font-mono tabular-nums">{Math.round(display.percent)}%</span>
-						</>
-					) : display.kind === "computing" ? (
-						<span className="font-mono">{tt("common.computing")}</span>
-					) : null}
+						</span>
+					) : (
+						<span className="hidden font-mono sm:inline">
+							{tt(display.kind === "loading" ? "common.computing" : "context.unavailableShort")}
+						</span>
+					)}
 				</button>
 			</TooltipTrigger>
 			<TooltipContent className="font-mono text-[11px] whitespace-pre-line">{tooltip}</TooltipContent>
 		</Tooltip>
 	);
+}
+
+export type ContextDisplay =
+	| { kind: "loading" }
+	| { kind: "unavailable" }
+	| { kind: "ready"; tokens: number; percent: number; window: number | null };
+
+export function resolveContextDisplay(stats: SessionStats | null, pending = false): ContextDisplay {
+	if (!stats) return { kind: pending ? "loading" : "unavailable" };
+	const usage = stats.contextUsage;
+	if (
+		!usage ||
+		usage.tokens === null ||
+		usage.percent === null ||
+		usage.tokens === undefined ||
+		usage.percent === undefined
+	) {
+		return { kind: "unavailable" };
+	}
+	return {
+		kind: "ready",
+		tokens: usage.tokens,
+		percent: usage.percent,
+		window: usage.contextWindow,
+	};
 }

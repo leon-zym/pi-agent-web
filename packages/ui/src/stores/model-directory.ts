@@ -1,156 +1,193 @@
 import { expectData } from "@pi-agent-web/protocol";
 import { create } from "zustand";
-import { sendControlCommand } from "../lib/session-command";
 import type { ModelLite, ThinkingLevel } from "../types/pi-types";
-import { useSessionControlStore } from "./session-control";
-import { useTransportStore } from "./transport";
+import { sessionTransport } from "./session-transport";
 
-interface ModelDirectoryState {
-	byWorkspace: Record<string, ModelSnapshot>;
-	activeWorkspaceId: string | null;
+export interface ModelSnapshot {
 	models: ModelLite[];
 	byProvider: Record<string, ModelLite[]>;
 	currentModel: { provider: string; modelId: string } | null;
 	thinkingLevels: ThinkingLevel[];
 	currentThinkingLevel: ThinkingLevel | null;
+	loadedAt: number | null;
 	loading: boolean;
 	error?: string;
-	beginWorkspace: (workspaceId: string | null) => void;
-	/** Host-reported state is the only truth (get_state), never stale responses. */
-	applyState: (state: { model?: ModelLite; thinkingLevel: ThinkingLevel }) => void;
-	applyThinkingLevel: (workspaceId: string, level: ThinkingLevel) => void;
-	refresh: (workspaceId: string) => Promise<void>;
-	selectModel: (workspaceId: string, provider: string, modelId: string) => Promise<void>;
-	selectThinkingLevel: (workspaceId: string, level: ThinkingLevel) => Promise<void>;
 }
 
-interface ModelSnapshot {
-	models: ModelLite[];
-	byProvider: Record<string, ModelLite[]>;
-	currentModel: { provider: string; modelId: string } | null;
-	thinkingLevels: ThinkingLevel[];
-	currentThinkingLevel: ThinkingLevel | null;
-	loadedAt: number;
+interface ModelDirectoryState extends ModelSnapshot {
+	bySession: Record<string, ModelSnapshot>;
+	activeSessionHandle: string | null;
+	beginSession: (sessionHandle: string | null) => void;
+	forgetSession: (sessionHandle: string) => void;
+	/** Host-reported state is the only truth (get_state), never a stale cross-Session response. */
+	applyState: (state: { model?: ModelLite; thinkingLevel: ThinkingLevel }) => void;
+	applyStateForSession: (
+		sessionHandle: string,
+		state: { model?: ModelLite; thinkingLevel: ThinkingLevel },
+	) => void;
+	applyThinkingLevel: (sessionHandle: string, level: ThinkingLevel) => void;
+	applyThinkingLevelForSession: (sessionHandle: string, level: ThinkingLevel) => void;
+	refresh: (sessionHandle: string) => Promise<void>;
+	selectModel: (sessionHandle: string, provider: string, modelId: string) => Promise<void>;
+	selectThinkingLevel: (sessionHandle: string, level: ThinkingLevel) => Promise<void>;
 }
 
 const refreshGeneration = new Map<string, number>();
-let refreshCounter = 0;
+const modelSelectionGeneration = new Map<string, number>();
+let operationCounter = 0;
 
-function nextRefreshGeneration(workspaceId: string): number {
-	refreshCounter += 1;
-	refreshGeneration.set(workspaceId, refreshCounter);
-	return refreshCounter;
+function nextGeneration(target: Map<string, number>, sessionHandle: string): number {
+	operationCounter += 1;
+	target.set(sessionHandle, operationCounter);
+	return operationCounter;
 }
 
-function isLatestRefresh(workspaceId: string, generation: number): boolean {
-	return refreshGeneration.get(workspaceId) === generation;
+function isLatest(target: Map<string, number>, sessionHandle: string, generation: number): boolean {
+	return target.get(sessionHandle) === generation;
 }
 
-function emptyVisibleState(workspaceId: string | null) {
+function emptySnapshot(loading = false): ModelSnapshot {
 	return {
-		activeWorkspaceId: workspaceId,
 		models: [],
 		byProvider: {},
 		currentModel: null,
 		thinkingLevels: [],
 		currentThinkingLevel: null,
-		loading: workspaceId !== null,
+		loadedAt: null,
+		loading,
 		error: undefined,
 	};
 }
 
-export const useModelDirectoryStore = create<ModelDirectoryState>()((set, get) => ({
-	byWorkspace: {},
-	activeWorkspaceId: null,
-	models: [],
-	byProvider: {},
-	currentModel: null,
-	thinkingLevels: [],
-	currentThinkingLevel: null,
-	loading: false,
+function visible(snapshot: ModelSnapshot): ModelSnapshot {
+	return {
+		models: snapshot.models,
+		byProvider: snapshot.byProvider,
+		currentModel: snapshot.currentModel,
+		thinkingLevels: snapshot.thinkingLevels,
+		currentThinkingLevel: snapshot.currentThinkingLevel,
+		loadedAt: snapshot.loadedAt,
+		loading: snapshot.loading,
+		error: snapshot.error,
+	};
+}
 
-	beginWorkspace: (workspaceId) => set(emptyVisibleState(workspaceId)),
-
-	applyState: ({ model, thinkingLevel }) => {
-		const workspaceId = get().activeWorkspaceId;
-		if (!workspaceId) return;
-		const snapshot = get().byWorkspace[workspaceId];
-		const currentModel = model ? { provider: model.provider, modelId: model.id } : get().currentModel;
-		const currentThinkingLevel = thinkingLevel ?? get().currentThinkingLevel;
-		set({
-			currentModel,
-			currentThinkingLevel,
-			byWorkspace: snapshot
-				? { ...get().byWorkspace, [workspaceId]: { ...snapshot, currentModel, currentThinkingLevel } }
-				: get().byWorkspace,
-		});
-	},
-
-	applyThinkingLevel: (workspaceId, level) => {
-		const snapshot = get().byWorkspace[workspaceId];
-		const byWorkspace = snapshot
-			? { ...get().byWorkspace, [workspaceId]: { ...snapshot, currentThinkingLevel: level } }
-			: get().byWorkspace;
-		if (get().activeWorkspaceId === workspaceId) set({ currentThinkingLevel: level, byWorkspace });
-		else set({ byWorkspace });
-	},
-
-	refresh: async (workspaceId) => {
-		const generation = nextRefreshGeneration(workspaceId);
-		if (get().activeWorkspaceId === workspaceId) set({ loading: true, error: undefined });
-		try {
-			const transport = useTransportStore.getState();
-			const [modelsResponse, stateResponse, levelsResponse] = await Promise.all([
-				transport.sendCommand(workspaceId, { type: "get_available_models" }),
-				transport.sendCommand(workspaceId, { type: "get_state" }),
-				transport.sendCommand(workspaceId, { type: "get_available_thinking_levels" }),
-			]);
-			const { models } = expectData(modelsResponse) as { models: ModelLite[] };
-			const state = expectData(stateResponse) as { model?: ModelLite; thinkingLevel: ThinkingLevel };
-			const { levels } = expectData(levelsResponse) as { levels: ThinkingLevel[] };
-			const byProvider: Record<string, ModelLite[]> = {};
-			for (const model of models) {
-				const group = byProvider[model.provider] ?? [];
-				group.push(model);
-				byProvider[model.provider] = group;
-			}
-			const snapshot: ModelSnapshot = {
-				models,
-				byProvider,
-				currentModel: state.model ? { provider: state.model.provider, modelId: state.model.id } : null,
-				currentThinkingLevel: state.thinkingLevel,
-				thinkingLevels: levels,
-				loadedAt: Date.now(),
+export const useModelDirectoryStore = create<ModelDirectoryState>()((set, get) => {
+	const updateSession = (sessionHandle: string, update: (snapshot: ModelSnapshot) => ModelSnapshot): void =>
+		set((state) => {
+			const snapshot = update(state.bySession[sessionHandle] ?? emptySnapshot());
+			return {
+				bySession: { ...state.bySession, [sessionHandle]: snapshot },
+				...(state.activeSessionHandle === sessionHandle ? visible(snapshot) : {}),
 			};
-			const current = get();
-			const byWorkspace = { ...current.byWorkspace, [workspaceId]: snapshot };
-			if (current.activeWorkspaceId === workspaceId && isLatestRefresh(workspaceId, generation)) {
-				set({ ...snapshot, byWorkspace, loading: false, error: undefined });
-			} else set({ byWorkspace });
-		} catch (error) {
-			if (get().activeWorkspaceId === workspaceId && isLatestRefresh(workspaceId, generation)) {
-				set({ loading: false, error: error instanceof Error ? error.message : String(error) });
+		});
+
+	return {
+		...emptySnapshot(),
+		bySession: {},
+		activeSessionHandle: null,
+
+		beginSession: (activeSessionHandle) =>
+			set((state) => ({
+				activeSessionHandle,
+				...visible(
+					activeSessionHandle
+						? (state.bySession[activeSessionHandle] ?? emptySnapshot(true))
+						: emptySnapshot(),
+				),
+			})),
+
+		forgetSession: (sessionHandle) =>
+			set((state) => {
+				const bySession = { ...state.bySession };
+				delete bySession[sessionHandle];
+				refreshGeneration.delete(sessionHandle);
+				modelSelectionGeneration.delete(sessionHandle);
+				return {
+					bySession,
+					...(state.activeSessionHandle === sessionHandle
+						? { activeSessionHandle: null, ...visible(emptySnapshot()) }
+						: {}),
+				};
+			}),
+
+		applyState: (state) => {
+			const sessionHandle = get().activeSessionHandle;
+			if (sessionHandle) get().applyStateForSession(sessionHandle, state);
+		},
+
+		applyStateForSession: (sessionHandle, state) =>
+			updateSession(sessionHandle, (snapshot) => ({
+				...snapshot,
+				currentModel: state.model
+					? { provider: state.model.provider, modelId: state.model.id }
+					: snapshot.currentModel,
+				currentThinkingLevel: state.thinkingLevel,
+			})),
+
+		applyThinkingLevel: (sessionHandle, level) => get().applyThinkingLevelForSession(sessionHandle, level),
+
+		applyThinkingLevelForSession: (sessionHandle, level) =>
+			updateSession(sessionHandle, (snapshot) => ({ ...snapshot, currentThinkingLevel: level })),
+
+		refresh: async (sessionHandle) => {
+			const generation = nextGeneration(refreshGeneration, sessionHandle);
+			updateSession(sessionHandle, (snapshot) => ({ ...snapshot, loading: true, error: undefined }));
+			try {
+				const transport = sessionTransport.store.getState();
+				const [modelsResponse, stateResponse, levelsResponse] = await Promise.all([
+					transport.sendCommand(sessionHandle, { type: "get_available_models" }),
+					transport.sendCommand(sessionHandle, { type: "get_state" }),
+					transport.sendCommand(sessionHandle, { type: "get_available_thinking_levels" }),
+				]);
+				if (!isLatest(refreshGeneration, sessionHandle, generation)) return;
+				const { models } = expectData(modelsResponse) as { models: ModelLite[] };
+				const state = expectData(stateResponse) as { model?: ModelLite; thinkingLevel: ThinkingLevel };
+				const { levels } = expectData(levelsResponse) as { levels: ThinkingLevel[] };
+				const byProvider: Record<string, ModelLite[]> = {};
+				for (const model of models) {
+					const group = byProvider[model.provider] ?? [];
+					group.push(model);
+					byProvider[model.provider] = group;
+				}
+				updateSession(sessionHandle, () => ({
+					models,
+					byProvider,
+					currentModel: state.model ? { provider: state.model.provider, modelId: state.model.id } : null,
+					thinkingLevels: levels,
+					currentThinkingLevel: state.thinkingLevel,
+					loadedAt: Date.now(),
+					loading: false,
+					error: undefined,
+				}));
+			} catch (error) {
+				if (!isLatest(refreshGeneration, sessionHandle, generation)) return;
+				updateSession(sessionHandle, (snapshot) => ({
+					...snapshot,
+					loading: false,
+					error: error instanceof Error ? error.message : String(error),
+				}));
 			}
-		}
-	},
+		},
 
-	selectModel: async (workspaceId, provider, modelId) => {
-		if (!useSessionControlStore.getState().canControl(workspaceId)) throw new Error("workspace_read_only");
-		const response = await sendControlCommand(workspaceId, { type: "set_model", provider, modelId });
-		const model = expectData(response) as ModelLite;
-		const current = get();
-		const snapshot = current.byWorkspace[workspaceId];
-		const currentModel = { provider: model.provider, modelId: model.id };
-		const byWorkspace = snapshot
-			? { ...current.byWorkspace, [workspaceId]: { ...snapshot, currentModel } }
-			: current.byWorkspace;
-		if (current.activeWorkspaceId === workspaceId) set({ currentModel, byWorkspace });
-		else set({ byWorkspace });
-	},
+		selectModel: async (sessionHandle, provider, modelId) => {
+			const generation = nextGeneration(modelSelectionGeneration, sessionHandle);
+			const response = await sessionTransport.store
+				.getState()
+				.sendCommand(sessionHandle, { type: "set_model", provider, modelId });
+			const model = expectData(response) as ModelLite;
+			if (!isLatest(modelSelectionGeneration, sessionHandle, generation)) return;
+			updateSession(sessionHandle, (snapshot) => ({
+				...snapshot,
+				currentModel: { provider: model.provider, modelId: model.id },
+			}));
+		},
 
-	selectThinkingLevel: async (workspaceId, level) => {
-		if (!useSessionControlStore.getState().canControl(workspaceId)) throw new Error("workspace_read_only");
-		await sendControlCommand(workspaceId, { type: "set_thinking_level", level });
-		// The effective (possibly clamped) value arrives via thinking_level_changed.
-	},
-}));
+		selectThinkingLevel: async (sessionHandle, level) => {
+			await sessionTransport.store
+				.getState()
+				.sendCommand(sessionHandle, { type: "set_thinking_level", level });
+			// The effective (possibly clamped) value arrives via thinking_level_changed.
+		},
+	};
+});

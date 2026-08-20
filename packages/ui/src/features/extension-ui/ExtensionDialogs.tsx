@@ -12,10 +12,11 @@ import {
 import { Input } from "../../components/ui/input";
 import { Label } from "../../components/ui/label";
 import { Textarea } from "../../components/ui/textarea";
+import { displayLabel, stripAnsi } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import { type PendingDialog, useExtensionUiStore } from "../../stores/extension-ui";
-import { useSessionControlStore } from "../../stores/session-control";
+import { useSessionTransportStore } from "../../stores/session-transport";
 
 /**
  * Extension UI dialogs: select / confirm / input /
@@ -25,7 +26,10 @@ import { useSessionControlStore } from "../../stores/session-control";
 export function ExtensionDialogs() {
 	const dialogs = useExtensionUiStore((s) => s.dialogs);
 	const dialog = dialogs[0];
-	const canControl = useSessionControlStore((s) => s.canControl(dialog?.workspaceId ?? null));
+	const canControl = useSessionTransportStore((state) => {
+		const channel = dialog ? state.sessions[dialog.sessionHandle] : undefined;
+		return Boolean(channel?.lease.isController && channel.lease.fencingToken);
+	});
 	if (!dialog || !canControl) return null;
 	return <DialogView key={dialog.request.id} dialog={dialog} />;
 }
@@ -34,10 +38,15 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 	const request = dialog.request;
 	const [value, setValue] = useState<string>("");
 	const [selected, setSelected] = useState<string | null>(null);
-	const [editorText, setEditorText] = useState(request.method === "editor" ? (request.prefill ?? "") : "");
+	const [editorText, setEditorText] = useState(
+		request.method === "editor" ? stripAnsi(request.prefill ?? "") : "",
+	);
 
 	const respond = useExtensionUiStore((s) => s.respond);
-	const canControl = useSessionControlStore((s) => s.canControl(dialog.workspaceId));
+	const canControl = useSessionTransportStore((state) => {
+		const channel = state.sessions[dialog.sessionHandle];
+		return Boolean(channel?.lease.isController && channel.lease.fencingToken);
+	});
 
 	const cancel = () => {
 		if (useExtensionUiStore.getState().dialogs.some((d) => d.request.id === request.id)) {
@@ -60,7 +69,7 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 		}
 	};
 
-	const body = request.method === "confirm" ? request.message : "";
+	const body = request.method === "confirm" ? stripAnsi(request.message) : "";
 
 	return (
 		<Dialog
@@ -76,7 +85,7 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 				}}
 			>
 				<DialogHeader>
-					<DialogTitle>{request.title}</DialogTitle>
+					<DialogTitle>{displayLabel(request.title)}</DialogTitle>
 					{body && <DialogDescription>{body}</DialogDescription>}
 				</DialogHeader>
 
@@ -87,7 +96,7 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 								key={option}
 								type="button"
 								onClick={() => setSelected(option)}
-								disabled={!canControl}
+								disabled={!canControl || dialog.responding}
 								className={cn(
 									"flex items-center gap-2 rounded-sm px-2 py-2 text-left text-[14px] transition-colors hover:bg-hover",
 									selected === option ? "bg-hover text-ink" : "text-ink-2",
@@ -101,7 +110,7 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 								>
 									{selected === option && <Check className="size-3 text-white" />}
 								</span>
-								{option}
+								{displayLabel(option)}
 							</button>
 						))}
 					</div>
@@ -114,9 +123,9 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 							id="ext-input"
 							autoFocus
 							value={value}
-							placeholder={request.placeholder}
+							placeholder={request.placeholder ? displayLabel(request.placeholder) : undefined}
 							onChange={(event) => setValue(event.target.value)}
-							disabled={!canControl}
+							disabled={!canControl || dialog.responding}
 							onKeyDown={(event) => {
 								if (event.key === "Enter") confirm();
 							}}
@@ -129,7 +138,7 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 						autoFocus
 						value={editorText}
 						onChange={(event) => setEditorText(event.target.value)}
-						disabled={!canControl}
+						disabled={!canControl || dialog.responding}
 						rows={14}
 						className="font-mono text-[13px] leading-[20px]"
 					/>
@@ -140,12 +149,12 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 				)}
 
 				<DialogFooter>
-					<Button variant="outline" onClick={cancel} disabled={!canControl}>
+					<Button variant="outline" onClick={cancel} disabled={!canControl || dialog.responding}>
 						{tt("common.cancel")}
 					</Button>
 					<Button
 						onClick={confirm}
-						disabled={!canControl || (request.method === "select" && selected === null)}
+						disabled={!canControl || dialog.responding || (request.method === "select" && selected === null)}
 					>
 						{request.method === "confirm" ? tt("common.ok") : tt("common.confirm")}
 					</Button>

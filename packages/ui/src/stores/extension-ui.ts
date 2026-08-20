@@ -1,6 +1,7 @@
 import type { RpcExtensionUIRequest, RpcExtensionUIResponse } from "@earendil-works/pi-coding-agent";
 import { create } from "zustand";
-import { sendControlExtensionUiResponse } from "../lib/session-command";
+import { useComposerStore } from "./composer";
+import { sessionTransport } from "./session-transport";
 
 export type DialogRequest = Extract<
 	RpcExtensionUIRequest,
@@ -9,11 +10,18 @@ export type DialogRequest = Extract<
 
 export interface PendingDialog {
 	request: DialogRequest;
-	workspaceId: string;
-	sessionId: string;
-	epoch: number;
+	sessionHandle: string;
+	generation: number;
 	receivedAt: number;
 	deadlineAt?: number;
+	/** The Host owns dialog closure; this only prevents duplicate local responses. */
+	responding: boolean;
+}
+
+export interface PendingDialogInput {
+	request: DialogRequest;
+	generation: number;
+	receivedAt: number;
 }
 
 export interface StatusBarEntry {
@@ -27,88 +35,309 @@ export interface WidgetEntry {
 	placement: "aboveEditor" | "belowEditor";
 }
 
-interface ExtensionUiState {
+export interface ExtensionUiSnapshot {
+	generation: number | null;
 	dialogs: PendingDialog[];
 	status: Record<string, string>;
 	widgets: Record<string, WidgetEntry>;
-	pushDialog: (dialog: PendingDialog) => void;
-	respond: (dialog: PendingDialog, response: RpcExtensionUIResponse) => void;
-	dismissDialog: (id: string) => void;
-	clearDialogsOutside: (workspaceId: string, sessionId: string | null, epoch: number) => void;
-	clearDialogs: () => void;
-	applyStatus: (key: string, text: string | undefined) => void;
-	applyWidget: (key: string, lines: string[] | undefined, placement?: "aboveEditor" | "belowEditor") => void;
+	title: string | null;
+	editorText: string | null;
 }
 
-const dialogTimers = new Map<string, ReturnType<typeof setTimeout>>();
+interface ExtensionUiState extends ExtensionUiSnapshot {
+	bySession: Record<string, ExtensionUiSnapshot>;
+	activeSessionHandle: string | null;
+	beginSession: (sessionHandle: string | null) => void;
+	forgetSession: (sessionHandle: string) => void;
+	resetSessionForGeneration: (sessionHandle: string, generation: number) => void;
+	pushDialog: (dialog: PendingDialog) => void;
+	pushDialogForSession: (sessionHandle: string, dialog: PendingDialogInput) => void;
+	respond: (dialog: PendingDialog, response: RpcExtensionUIResponse) => boolean;
+	dismissDialog: (id: string) => void;
+	dismissDialogForSession: (sessionHandle: string, id: string) => void;
+	closeRequestForSession: (sessionHandle: string, requestId: string) => void;
+	clearDialogs: () => void;
+	clearDialogsForSession: (sessionHandle: string) => void;
+	applyStatus: (key: string, text: string | undefined) => void;
+	applyStatusForSession: (
+		sessionHandle: string,
+		key: string,
+		text: string | undefined,
+		generation?: number,
+	) => void;
+	applyWidget: (key: string, lines: string[] | undefined, placement?: "aboveEditor" | "belowEditor") => void;
+	applyWidgetForSession: (
+		sessionHandle: string,
+		key: string,
+		lines: string[] | undefined,
+		placement?: "aboveEditor" | "belowEditor",
+		generation?: number,
+	) => void;
+	applyRequestForSession: (
+		sessionHandle: string,
+		request: RpcExtensionUIRequest,
+		generation: number,
+		receivedAt?: number,
+	) => void;
+	replaceRequestsForSession: (
+		sessionHandle: string,
+		generation: number,
+		requests: RpcExtensionUIRequest[],
+		receivedAt?: number,
+	) => void;
+}
 
-function clearDialogTimer(id: string): void {
-	const timer = dialogTimers.get(id);
-	if (timer) clearTimeout(timer);
-	dialogTimers.delete(id);
+function emptySnapshot(generation: number | null = null): ExtensionUiSnapshot {
+	return { generation, dialogs: [], status: {}, widgets: {}, title: null, editorText: null };
+}
+
+function visible(snapshot: ExtensionUiSnapshot): ExtensionUiSnapshot {
+	return {
+		generation: snapshot.generation,
+		dialogs: snapshot.dialogs,
+		status: snapshot.status,
+		widgets: snapshot.widgets,
+		title: snapshot.title,
+		editorText: snapshot.editorText,
+	};
 }
 
 function timeoutFor(request: DialogRequest): number | undefined {
-	if (!("timeout" in request) || typeof request.timeout !== "number" || request.timeout <= 0)
+	if (!("timeout" in request) || typeof request.timeout !== "number" || request.timeout <= 0) {
 		return undefined;
+	}
 	return request.timeout;
 }
 
-export const useExtensionUiStore = create<ExtensionUiState>()((set, get) => ({
-	dialogs: [],
-	status: {},
-	widgets: {},
+function pendingDialog(sessionHandle: string, input: PendingDialogInput): PendingDialog {
+	const timeout = timeoutFor(input.request);
+	return {
+		...input,
+		sessionHandle,
+		...(timeout ? { deadlineAt: input.receivedAt + timeout } : {}),
+		responding: false,
+	};
+}
 
-	pushDialog: (dialog) => {
-		clearDialogTimer(dialog.request.id);
-		const timeout = timeoutFor(dialog.request);
-		const deadlineAt = timeout ? Date.now() + timeout : undefined;
-		const next = { ...dialog, ...(deadlineAt ? { deadlineAt } : {}) };
-		set((s) => ({ dialogs: [...s.dialogs.filter((entry) => entry.request.id !== dialog.request.id), next] }));
-		if (timeout) {
-			const timer = setTimeout(() => get().dismissDialog(dialog.request.id), timeout);
-			timer.unref?.();
-			dialogTimers.set(dialog.request.id, timer);
-		}
-	},
+function snapshotForGeneration(snapshot: ExtensionUiSnapshot, generation?: number): ExtensionUiSnapshot {
+	if (generation === undefined || snapshot.generation === generation) return snapshot;
+	return emptySnapshot(generation);
+}
 
-	respond: (dialog, response) => {
-		if (sendControlExtensionUiResponse(dialog.workspaceId, response)) get().dismissDialog(dialog.request.id);
-	},
+export const useExtensionUiStore = create<ExtensionUiState>()((set, get) => {
+	const updateSession = (
+		sessionHandle: string,
+		update: (snapshot: ExtensionUiSnapshot) => ExtensionUiSnapshot,
+	): void =>
+		set((state) => {
+			const snapshot = update(state.bySession[sessionHandle] ?? emptySnapshot());
+			return {
+				bySession: { ...state.bySession, [sessionHandle]: snapshot },
+				...(state.activeSessionHandle === sessionHandle ? visible(snapshot) : {}),
+			};
+		});
 
-	dismissDialog: (id) => {
-		clearDialogTimer(id);
-		set((s) => ({ dialogs: s.dialogs.filter((d) => d.request.id !== id) }));
-	},
+	return {
+		...emptySnapshot(),
+		bySession: {},
+		activeSessionHandle: null,
 
-	clearDialogsOutside: (workspaceId, sessionId, epoch) =>
-		set((s) => {
-			const discarded = s.dialogs.filter(
-				(dialog) =>
-					dialog.workspaceId !== workspaceId || dialog.sessionId !== sessionId || dialog.epoch !== epoch,
-			);
-			for (const dialog of discarded) clearDialogTimer(dialog.request.id);
-			return { dialogs: s.dialogs.filter((dialog) => !discarded.includes(dialog)) };
-		}),
+		beginSession: (activeSessionHandle) =>
+			set((state) => ({
+				activeSessionHandle,
+				...visible(
+					activeSessionHandle ? (state.bySession[activeSessionHandle] ?? emptySnapshot()) : emptySnapshot(),
+				),
+			})),
 
-	clearDialogs: () => {
-		for (const dialog of get().dialogs) clearDialogTimer(dialog.request.id);
-		set({ dialogs: [] });
-	},
+		forgetSession: (sessionHandle) =>
+			set((state) => {
+				const bySession = { ...state.bySession };
+				delete bySession[sessionHandle];
+				return {
+					bySession,
+					...(state.activeSessionHandle === sessionHandle
+						? { activeSessionHandle: null, ...visible(emptySnapshot()) }
+						: {}),
+				};
+			}),
 
-	applyStatus: (key, text) =>
-		set((s) => {
-			const status = { ...s.status };
-			if (text === undefined) delete status[key];
-			else status[key] = text;
-			return { status };
-		}),
+		resetSessionForGeneration: (sessionHandle, generation) =>
+			updateSession(sessionHandle, (snapshot) =>
+				snapshot.generation === generation ? snapshot : emptySnapshot(generation),
+			),
 
-	applyWidget: (key, lines, placement = "belowEditor") =>
-		set((s) => {
-			const widgets = { ...s.widgets };
-			if (lines === undefined) delete widgets[key];
-			else widgets[key] = { key, lines, placement };
-			return { widgets };
-		}),
-}));
+		pushDialog: (dialog) =>
+			get().pushDialogForSession(dialog.sessionHandle, {
+				request: dialog.request,
+				generation: dialog.generation,
+				receivedAt: dialog.receivedAt,
+			}),
+
+		pushDialogForSession: (sessionHandle, input) => {
+			const next = pendingDialog(sessionHandle, input);
+			updateSession(sessionHandle, (current) => {
+				const snapshot = snapshotForGeneration(current, input.generation);
+				return {
+					...snapshot,
+					dialogs: [...snapshot.dialogs.filter((entry) => entry.request.id !== input.request.id), next],
+				};
+			});
+		},
+
+		respond: (dialog, response) => {
+			if (response.id !== dialog.request.id) return false;
+			const current = get().bySession[dialog.sessionHandle];
+			const pending = current?.dialogs.find((entry) => entry.request.id === dialog.request.id);
+			if (!pending || pending.generation !== dialog.generation || pending.responding) return false;
+			const delivered = sessionTransport.store
+				.getState()
+				.sendExtensionUiResponse(dialog.sessionHandle, response);
+			if (!delivered) return false;
+			updateSession(dialog.sessionHandle, (snapshot) => ({
+				...snapshot,
+				dialogs: snapshot.dialogs.map((entry) =>
+					entry.request.id === dialog.request.id ? { ...entry, responding: true } : entry,
+				),
+			}));
+			return true;
+		},
+
+		dismissDialog: (id) => {
+			const sessionHandle = get().activeSessionHandle;
+			if (sessionHandle) get().dismissDialogForSession(sessionHandle, id);
+		},
+		dismissDialogForSession: (sessionHandle, id) =>
+			updateSession(sessionHandle, (snapshot) => ({
+				...snapshot,
+				dialogs: snapshot.dialogs.filter((dialog) => dialog.request.id !== id),
+			})),
+		closeRequestForSession: (sessionHandle, requestId) =>
+			get().dismissDialogForSession(sessionHandle, requestId),
+
+		clearDialogs: () => {
+			const sessionHandle = get().activeSessionHandle;
+			if (sessionHandle) get().clearDialogsForSession(sessionHandle);
+			else set({ dialogs: [] });
+		},
+		clearDialogsForSession: (sessionHandle) =>
+			updateSession(sessionHandle, (snapshot) => ({ ...snapshot, dialogs: [] })),
+
+		applyStatus: (key, text) => {
+			const sessionHandle = get().activeSessionHandle;
+			if (sessionHandle) get().applyStatusForSession(sessionHandle, key, text);
+		},
+		applyStatusForSession: (sessionHandle, key, text, generation) =>
+			updateSession(sessionHandle, (current) => {
+				const snapshot = snapshotForGeneration(current, generation);
+				const status = { ...snapshot.status };
+				if (text === undefined) delete status[key];
+				else status[key] = text;
+				return { ...snapshot, status };
+			}),
+
+		applyWidget: (key, lines, placement = "belowEditor") => {
+			const sessionHandle = get().activeSessionHandle;
+			if (sessionHandle) get().applyWidgetForSession(sessionHandle, key, lines, placement);
+		},
+		applyWidgetForSession: (sessionHandle, key, lines, placement = "belowEditor", generation) =>
+			updateSession(sessionHandle, (current) => {
+				const snapshot = snapshotForGeneration(current, generation);
+				const widgets = { ...snapshot.widgets };
+				if (lines === undefined) delete widgets[key];
+				else widgets[key] = { key, lines, placement };
+				return { ...snapshot, widgets };
+			}),
+
+		applyRequestForSession: (sessionHandle, request, generation, receivedAt = Date.now()) => {
+			get().resetSessionForGeneration(sessionHandle, generation);
+			switch (request.method) {
+				case "select":
+				case "confirm":
+				case "input":
+				case "editor":
+					get().pushDialogForSession(sessionHandle, { request, generation, receivedAt });
+					return;
+				case "setStatus":
+					get().applyStatusForSession(sessionHandle, request.statusKey, request.statusText, generation);
+					return;
+				case "setWidget":
+					get().applyWidgetForSession(
+						sessionHandle,
+						request.widgetKey,
+						request.widgetLines,
+						request.widgetPlacement,
+						generation,
+					);
+					return;
+				case "setTitle":
+					updateSession(sessionHandle, (current) => ({
+						...snapshotForGeneration(current, generation),
+						title: request.title,
+					}));
+					return;
+				case "set_editor_text":
+					updateSession(sessionHandle, (current) => ({
+						...snapshotForGeneration(current, generation),
+						editorText: request.text,
+					}));
+					useComposerStore.getState().setDraftForSession(sessionHandle, request.text);
+					return;
+				default:
+					return;
+			}
+		},
+
+		replaceRequestsForSession: (sessionHandle, generation, requests, receivedAt = Date.now()) => {
+			let snapshot = emptySnapshot(generation);
+			for (const request of requests) {
+				switch (request.method) {
+					case "select":
+					case "confirm":
+					case "input":
+					case "editor":
+						snapshot = {
+							...snapshot,
+							dialogs: [
+								...snapshot.dialogs.filter((entry) => entry.request.id !== request.id),
+								pendingDialog(sessionHandle, { request, generation, receivedAt }),
+							],
+						};
+						break;
+					case "setStatus": {
+						const status = { ...snapshot.status };
+						if (request.statusText === undefined) delete status[request.statusKey];
+						else status[request.statusKey] = request.statusText;
+						snapshot = { ...snapshot, status };
+						break;
+					}
+					case "setWidget": {
+						const widgets = { ...snapshot.widgets };
+						if (request.widgetLines === undefined) delete widgets[request.widgetKey];
+						else {
+							widgets[request.widgetKey] = {
+								key: request.widgetKey,
+								lines: request.widgetLines,
+								placement: request.widgetPlacement ?? "belowEditor",
+							};
+						}
+						snapshot = { ...snapshot, widgets };
+						break;
+					}
+					case "setTitle":
+						snapshot = { ...snapshot, title: request.title };
+						break;
+					case "set_editor_text":
+						snapshot = { ...snapshot, editorText: request.text };
+						break;
+					default:
+						break;
+				}
+			}
+			updateSession(sessionHandle, () => snapshot);
+			if (snapshot.editorText !== null) {
+				useComposerStore.getState().setDraftForSession(sessionHandle, snapshot.editorText);
+			}
+		},
+	};
+});

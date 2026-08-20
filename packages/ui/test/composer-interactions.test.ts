@@ -5,6 +5,8 @@ import type { ImageContent } from "../src/types/pi-types";
 
 beforeEach(() => {
 	useComposerStore.setState({
+		bySession: {},
+		activeSessionHandle: null,
 		draft: "",
 		images: [],
 		trigger: null,
@@ -13,6 +15,7 @@ beforeEach(() => {
 		queue: { steering: [], followUp: [] },
 		recentQueued: [],
 	});
+	useComposerStore.getState().beginSession("session-a");
 });
 
 describe("composer interactions", () => {
@@ -53,5 +56,28 @@ describe("composer interactions", () => {
 		useComposerStore.getState().clearDraftIfUnchanged(snapshot.draft, snapshot.images);
 
 		expect(useComposerStore.getState()).toMatchObject({ draft: "", images: [], trigger: null });
+	});
+
+	it("restores drafts and queues when the visible Session changes", () => {
+		useComposerStore.getState().setDraft("draft a");
+		useComposerStore.getState().setQueue({ steering: ["a"], followUp: [] });
+
+		useComposerStore.getState().beginSession("session-b");
+		useComposerStore.getState().setDraft("draft b");
+		useComposerStore
+			.getState()
+			.setQueueForSession("session-a", { steering: ["a", "background"], followUp: [] });
+
+		expect(useComposerStore.getState()).toMatchObject({
+			activeSessionHandle: "session-b",
+			draft: "draft b",
+			queue: { steering: [], followUp: [] },
+		});
+
+		useComposerStore.getState().beginSession("session-a");
+		expect(useComposerStore.getState()).toMatchObject({
+			draft: "draft a",
+			queue: { steering: ["a", "background"], followUp: [] },
+		});
 	});
 });

@@ -1,15 +1,18 @@
-import { memo } from "react";
-import ReactMarkdown from "react-markdown";
-import rehypeHighlight from "rehype-highlight";
-import remarkGfm from "remark-gfm";
+import { lazy, memo, Suspense } from "react";
 import { stripAnsi } from "../../lib/format";
 import { cn } from "../../lib/utils";
-import "highlight.js/styles/github.css";
+
+const SettledMarkdown = lazy(() => import("./SettledMarkdown"));
+
+function PlainMarkdownFallback({ text }: { text: string }) {
+	return <div className="whitespace-pre-wrap">{text}</div>;
+}
 
 /**
  * Assistant prose renderer: only text + streaming props.
- * Full syntax highlighting runs once the block settles; while streaming we
- * render plain so each delta stays cheap and React keys stay stable.
+ * Streaming stays on a stable plain-text renderer. The full Markdown parser
+ * and syntax highlighter load only after settlement, keeping them out of the
+ * initial bundle and off the high-frequency delta path.
  */
 export const MarkdownBlock = memo(function MarkdownBlock({
 	text,
@@ -43,15 +46,13 @@ export const MarkdownBlock = memo(function MarkdownBlock({
 				"[&_img]:my-2 [&_img]:max-w-full [&_img]:rounded-md",
 			)}
 		>
-			<ReactMarkdown
-				remarkPlugins={[remarkGfm]}
-				rehypePlugins={streaming ? [] : [rehypeHighlight]}
-				components={{
-					a: (props) => <a {...props} target="_blank" rel="noreferrer noopener" />,
-				}}
-			>
-				{displayText}
-			</ReactMarkdown>
+			{streaming ? (
+				<PlainMarkdownFallback text={displayText} />
+			) : (
+				<Suspense fallback={<PlainMarkdownFallback text={displayText} />}>
+					<SettledMarkdown text={displayText} />
+				</Suspense>
+			)}
 		</div>
 	);
 });

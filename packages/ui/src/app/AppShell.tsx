@@ -1,6 +1,7 @@
 import { PanelRightOpen } from "lucide-react";
 import type * as React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Sheet, SheetContent, SheetDescription, SheetTitle } from "../components/ui/sheet";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../components/ui/tooltip";
 import { ConversationColumn } from "../features/conversation/ConversationColumn";
 import { DetailsPanel } from "../features/details/DetailsPanel";
@@ -47,17 +48,21 @@ function clamp(value: number, min: number, max: number): number {
 
 /**
  * Three-column app shell with the DSH squeeze policy (DESIGN.md):
- * details shrinks to 300, then closes (subtree stays mounted), and only then
- * may the center drop below 640. The sidebar can be manually reduced to a
- * 56px rail and does so automatically under 1024px.
+ * details shrinks to 300, then moves into an overlay, and only then may the
+ * center drop below 640. The sidebar can be manually reduced to a 56px rail
+ * and does so automatically under 1024px.
  */
 export function AppShell() {
 	const [widths, setWidths] = useState<StoredWidths>(() => loadWidths());
 	const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
 	const [sidebarOpen, setSidebarOpen] = useState(true);
+	const [navigationOpen, setNavigationOpen] = useState(false);
 	const detailsOpen = useViewStore((state) => state.rightPanelOpen);
 	const setDetailsOpen = useViewStore((state) => state.setRightPanelOpen);
 	const dragging = useRef<"sidebar" | "details" | null>(null);
+	const navigationDrawer = useRef<HTMLDivElement>(null);
+	const navigationTrigger = useRef<HTMLButtonElement>(null);
+	const detailsReturnFocus = useRef<HTMLElement>(null);
 
 	useEffect(() => {
 		const observer = new ResizeObserver(() => setViewportWidth(window.innerWidth));
@@ -73,19 +78,34 @@ export function AppShell() {
 			// ignore
 		}
 	}, []);
+	const updateNavigationOpen = useCallback((open: boolean) => {
+		setNavigationOpen(open);
+		if (!open) window.requestAnimationFrame(() => navigationTrigger.current?.focus());
+	}, []);
+	const updateOverlayDetailsOpen = useCallback(
+		(open: boolean) => {
+			setDetailsOpen(open);
+			if (!open) window.requestAnimationFrame(() => detailsReturnFocus.current?.focus());
+		},
+		[setDetailsOpen],
+	);
 
 	const compact = viewportWidth < RAIL_BREAKPOINT;
+	useEffect(() => {
+		if (!compact) setNavigationOpen(false);
+	}, [compact]);
 	const sidebarRail = compact || !sidebarOpen;
 	const sidebarWidth = sidebarRail ? 56 : widths.sidebar;
 
-	// Squeeze policy: details yields first, then closes; center is last.
+	const canDockDetails = viewportWidth - sidebarWidth >= CENTER_MIN + DETAILS_MIN;
+	// Squeeze policy: details yields first. If it cannot retain its minimum
+	// width, it moves into an overlay instead of disappearing.
 	const availableForCenter = viewportWidth - sidebarWidth - (detailsOpen ? widths.details : 0);
-	let detailsWidth = detailsOpen ? widths.details : 0;
+	let detailsWidth = detailsOpen && canDockDetails ? widths.details : 0;
 	if (detailsWidth > 0 && availableForCenter < CENTER_MIN) {
 		detailsWidth = Math.max(0, viewportWidth - sidebarWidth - CENTER_MIN);
 		if (detailsWidth > 0 && detailsWidth < DETAILS_MIN) detailsWidth = 0;
 	}
-	const canExpandDetails = viewportWidth - sidebarWidth >= CENTER_MIN + DETAILS_MIN;
 
 	const startDrag = (which: "sidebar" | "details") => (event: React.PointerEvent) => {
 		dragging.current = which;
@@ -115,6 +135,8 @@ export function AppShell() {
 				<WorkspaceSidebar
 					rail={sidebarRail}
 					onToggleRail={compact ? undefined : () => setSidebarOpen((open) => !open)}
+					onOpenNavigation={compact ? () => updateNavigationOpen(true) : undefined}
+					navigationTriggerRef={compact ? navigationTrigger : undefined}
 				/>
 			</div>
 
@@ -141,7 +163,7 @@ export function AppShell() {
 				<ConversationColumn />
 			</main>
 
-			{detailsWidth === 0 && canExpandDetails && (
+			{detailsWidth === 0 && canDockDetails && (
 				<Tooltip>
 					<TooltipTrigger asChild>
 						<button
@@ -176,7 +198,7 @@ export function AppShell() {
 				/>
 			)}
 
-			{/* Details stays mounted at zero width so its subtree state survives. */}
+			{/* A docked panel stays mounted at zero width so close/open preserves local state. */}
 			<div
 				className={cn(
 					"min-w-0 shrink-0 overflow-hidden border-l border-border bg-base",
@@ -184,9 +206,48 @@ export function AppShell() {
 				)}
 				style={{ width: detailsWidth }}
 			>
-				<DetailsPanel open={detailsWidth > 0} onToggle={() => setDetailsOpen(!detailsOpen)} />
+				{canDockDetails && (
+					<DetailsPanel open={detailsWidth > 0} onToggle={() => setDetailsOpen(!detailsOpen)} />
+				)}
 			</div>
+
+			<Sheet open={compact && navigationOpen} onOpenChange={updateNavigationOpen}>
+				<SheetContent
+					ref={navigationDrawer}
+					side="left"
+					showCloseButton={false}
+					className="w-[calc(100vw-1rem)] max-w-80 bg-sidebar"
+					onOpenAutoFocus={(event) => {
+						event.preventDefault();
+						navigationDrawer.current?.focus();
+					}}
+				>
+					<SheetTitle className="sr-only">{tt("appShell.sessionsTitle")}</SheetTitle>
+					<SheetDescription className="sr-only">{tt("appShell.sessionsDescription")}</SheetDescription>
+					<WorkspaceSidebar
+						rail={false}
+						onRequestClose={() => updateNavigationOpen(false)}
+						onSessionSelect={() => updateNavigationOpen(false)}
+					/>
+				</SheetContent>
+			</Sheet>
+
+			<Sheet open={!canDockDetails && detailsOpen} onOpenChange={updateOverlayDetailsOpen}>
+				<SheetContent
+					side="right"
+					showCloseButton={false}
+					className="w-[calc(100vw-1rem)] max-w-[420px]"
+					onOpenAutoFocus={() => {
+						if (document.activeElement instanceof HTMLElement) {
+							detailsReturnFocus.current = document.activeElement;
+						}
+					}}
+				>
+					<SheetTitle className="sr-only">{tt("appShell.detailsTitle")}</SheetTitle>
+					<SheetDescription className="sr-only">{tt("appShell.detailsDescription")}</SheetDescription>
+					<DetailsPanel open onToggle={() => updateOverlayDetailsOpen(false)} />
+				</SheetContent>
+			</Sheet>
 		</div>
 	);
 }
-// APP_SHELL_TAIL
