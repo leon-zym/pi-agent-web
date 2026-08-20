@@ -22,7 +22,8 @@ import type { ResolvedPi } from "./resolver.js";
  *   means ready (the protocol has no ready frame; the official client blind-
  *   waits 100ms).
  * - Events / responses / Extension UI frames are routed separately.
- * - Dirty (non-JSON) lines are silently dropped; stderr is collected in a ring.
+ * - Ordinary dirty (non-JSON) lines are dropped; oversized lines fail closed.
+ *   stderr is collected in a ring.
  * - On exit, reject all pending requests and call onExit (for the Supervisor).
  */
 
@@ -105,7 +106,9 @@ function isOptionalString(value: unknown): boolean {
 	return value === undefined || typeof value === "string";
 }
 
-function isRpcResponseFrame(frame: UnknownFrame): frame is UnknownFrame & RpcResponse {
+function isRpcResponseFrame(
+	frame: UnknownFrame,
+): frame is UnknownFrame & RpcResponse & { id: string; command: string } {
 	return (
 		frame.type === "response" &&
 		typeof frame.id === "string" &&
@@ -578,12 +581,25 @@ export class PiProcess {
 	}
 
 	private handleLine(line: string): void {
+		const exceedsOrdinaryLimit = Buffer.byteLength(line) > MAX_JSONL_LINE_BYTES;
 		let data: unknown;
 		try {
 			data = JSON.parse(line);
 		} catch {
+			if (exceedsOrdinaryLimit) {
+				throw new InvalidPiProtocolFrameError(
+					"frame",
+					`oversized non-snapshot JSONL line exceeds the ${String(MAX_JSONL_LINE_BYTES)} byte limit`,
+				);
+			}
 			// Dirty line: tolerated and dropped (rpc-client.ts:305-311).
 			return;
+		}
+		if (exceedsOrdinaryLimit && !this.isPendingSnapshotResponse(data)) {
+			throw new InvalidPiProtocolFrameError(
+				"frame",
+				`oversized non-snapshot JSONL line exceeds the ${String(MAX_JSONL_LINE_BYTES)} byte limit`,
+			);
 		}
 		if (typeof data !== "object" || data === null) return;
 		const frame = data as Record<string, unknown>;
@@ -626,6 +642,11 @@ export class PiProcess {
 			}
 			this.opts.onEvent?.(frame);
 		}
+	}
+
+	private isPendingSnapshotResponse(data: unknown): data is UnknownFrame & RpcResponse {
+		if (!isRecord(data) || !isRpcResponseFrame(data) || data.command !== "get_messages") return false;
+		return this.pending.get(data.id)?.command === "get_messages";
 	}
 
 	private rejectAll(error: Error): void {

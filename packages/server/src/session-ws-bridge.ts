@@ -3,6 +3,7 @@ import type { RpcCommand, RpcResponse } from "@earendil-works/pi-coding-agent";
 import {
 	isSessionWsClientMessage,
 	RpcError,
+	SESSION_WS_CLIENT_MAX_BYTES,
 	type SessionReplayFrameDto,
 	type SessionRuntimeDto,
 	type SessionWsClientMessage,
@@ -10,6 +11,7 @@ import {
 } from "@pi-agent-web/protocol";
 import type { WebSocket } from "ws";
 import { WebSocketServer } from "ws";
+import { MAX_JSONL_SNAPSHOT_LINE_BYTES } from "./jsonl.js";
 import type { SessionSupervisorMessage } from "./session-runtime-types.js";
 import type { SessionSupervisor } from "./session-supervisor.js";
 
@@ -23,12 +25,20 @@ interface ConnectionState {
 	nextCatchUpOrder: number;
 	controlledSessions: Set<string>;
 	pendingCommands: Set<string>;
-	outboundQueue: Array<{ payload: string; bytes: number }>;
+	outboundQueue: OutboundPayload[];
 	outboundQueuedBytes: number;
+	outboundOversizedQueued: boolean;
 	outboundSending: boolean;
+	outboundSendingOversized: boolean;
 	alive: boolean;
 	closed: boolean;
 	epoch: number;
+}
+
+interface OutboundPayload {
+	payload: string;
+	bytes: number;
+	oversizedSnapshot: boolean;
 }
 
 interface BufferedCatchUpMessage {
@@ -59,6 +69,7 @@ export interface SessionWsBridgeOptions {
 
 export const MAX_SESSION_WS_IN_FLIGHT_COMMANDS = 32;
 export const MAX_SESSION_WS_BUFFERED_BYTES = 1024 * 1024;
+const MAX_SESSION_WS_SNAPSHOT_RESPONSE_BYTES = MAX_JSONL_SNAPSHOT_LINE_BYTES + MAX_SESSION_WS_BUFFERED_BYTES;
 
 /** Multiplexes one browser socket across any number of independent Sessions. */
 export class SessionWsBridge {
@@ -74,7 +85,7 @@ export class SessionWsBridge {
 	constructor(opts: SessionWsBridgeOptions) {
 		this.supervisor = opts.supervisor;
 		this.log = opts.log ?? (() => {});
-		this.wss = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024 });
+		this.wss = new WebSocketServer({ noServer: true, maxPayload: SESSION_WS_CLIENT_MAX_BYTES });
 		this.wss.on("connection", (ws) => this.handleConnection(ws));
 		this.wss.on("error", (error) => this.log("error", `ws server error: ${String(error)}`));
 		this.heartbeatTimer = setInterval(() => this.heartbeat(), opts.heartbeatIntervalMs ?? 30_000);
@@ -198,7 +209,9 @@ export class SessionWsBridge {
 			pendingCommands: new Set(),
 			outboundQueue: [],
 			outboundQueuedBytes: 0,
+			outboundOversizedQueued: false,
 			outboundSending: false,
+			outboundSendingOversized: false,
 			alive: true,
 			closed: false,
 			epoch: 0,
@@ -699,7 +712,9 @@ export class SessionWsBridge {
 		connection.pendingCommands.clear();
 		connection.outboundQueue = [];
 		connection.outboundQueuedBytes = 0;
+		connection.outboundOversizedQueued = false;
 		connection.outboundSending = false;
+		connection.outboundSendingOversized = false;
 		this.log("info", `ws disconnected (${this.connections.size} open)`);
 	}
 
@@ -742,7 +757,11 @@ export class SessionWsBridge {
 	}
 
 	private send(connection: ConnectionState, message: SessionWsServerMessage): void {
-		this.sendPayload(connection, this.payloadForConnection(connection, message));
+		this.sendPayload(
+			connection,
+			this.payloadForConnection(connection, message),
+			message.type === "response" && message.response.command === "get_messages",
+		);
 	}
 
 	private connectionSessionHandle(connection: ConnectionState, sessionHandle: string): string {
@@ -769,31 +788,49 @@ export class SessionWsBridge {
 		});
 	}
 
-	private sendPayload(connection: ConnectionState, payload: string): void {
+	private sendPayload(connection: ConnectionState, payload: string, allowOversizedSnapshot = false): void {
 		if (connection.closed) return;
 		if (connection.ws.readyState !== connection.ws.OPEN) return;
+		const bytes = Buffer.byteLength(payload);
+		const oversizedSnapshot = allowOversizedSnapshot && bytes > MAX_SESSION_WS_BUFFERED_BYTES;
+		if (bytes > MAX_SESSION_WS_BUFFERED_BYTES && !oversizedSnapshot) {
+			this.closeForPolicyViolation(connection, "oversized WebSocket frame");
+			return;
+		}
+		if (oversizedSnapshot && bytes > MAX_SESSION_WS_SNAPSHOT_RESPONSE_BYTES) {
+			this.closeForPolicyViolation(connection, "oversized WebSocket snapshot response");
+			return;
+		}
 		if (connection.outboundSending) {
-			const bytes = Buffer.byteLength(payload);
-			if (connection.outboundQueuedBytes + bytes > MAX_SESSION_WS_BUFFERED_BYTES) {
+			if (oversizedSnapshot) {
+				if (connection.outboundSendingOversized || connection.outboundOversizedQueued) {
+					this.closeForPolicyViolation(connection, "slow WebSocket client");
+					return;
+				}
+				connection.outboundOversizedQueued = true;
+			} else if (connection.outboundQueuedBytes + bytes > MAX_SESSION_WS_BUFFERED_BYTES) {
 				this.closeForPolicyViolation(connection, "slow WebSocket client");
 				return;
+			} else {
+				connection.outboundQueuedBytes += bytes;
 			}
-			connection.outboundQueue.push({ payload, bytes });
-			connection.outboundQueuedBytes += bytes;
+			connection.outboundQueue.push({ payload, bytes, oversizedSnapshot });
 			return;
 		}
 		if (connection.ws.bufferedAmount > MAX_SESSION_WS_BUFFERED_BYTES) {
 			this.closeForPolicyViolation(connection, "slow WebSocket client");
 			return;
 		}
-		this.startPayloadSend(connection, payload);
+		this.startPayloadSend(connection, { payload, bytes, oversizedSnapshot });
 	}
 
-	private startPayloadSend(connection: ConnectionState, payload: string): void {
+	private startPayloadSend(connection: ConnectionState, item: OutboundPayload): void {
 		connection.outboundSending = true;
+		connection.outboundSendingOversized = item.oversizedSnapshot;
 		try {
-			connection.ws.send(payload, (error) => {
+			connection.ws.send(item.payload, (error) => {
 				connection.outboundSending = false;
+				connection.outboundSendingOversized = false;
 				if (connection.closed) return;
 				if (error) {
 					this.log("warn", `WebSocket send failed: ${this.errorText(error)}`);
@@ -802,11 +839,15 @@ export class SessionWsBridge {
 				}
 				const next = connection.outboundQueue.shift();
 				if (!next) return;
-				connection.outboundQueuedBytes = Math.max(0, connection.outboundQueuedBytes - next.bytes);
-				this.sendPayload(connection, next.payload);
+				if (next.oversizedSnapshot) connection.outboundOversizedQueued = false;
+				else {
+					connection.outboundQueuedBytes = Math.max(0, connection.outboundQueuedBytes - next.bytes);
+				}
+				this.sendPayload(connection, next.payload, next.oversizedSnapshot);
 			});
 		} catch {
 			connection.outboundSending = false;
+			connection.outboundSendingOversized = false;
 			this.disconnect(connection);
 		}
 	}

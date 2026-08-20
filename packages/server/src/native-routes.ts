@@ -9,6 +9,12 @@ import type {
 	NativeWorkspaceRecord,
 } from "./native-session-catalog.js";
 import { sessionHandleForCanonicalFile } from "./native-session-catalog.js";
+import {
+	MAX_WORKSPACE_PATH_LENGTH,
+	optionalBoundedStringField,
+	RequestInputError,
+	readBoundedJsonObject,
+} from "./request-input.js";
 import { canonicalizePathAllowMissing, type SessionLayoutResolver } from "./session-layout-resolver.js";
 import type { SessionRuntimeSnapshot } from "./session-runtime-types.js";
 import type { CreateSessionRequest, SessionManagementContext } from "./session-supervisor.js";
@@ -78,8 +84,10 @@ export function createNativeRoutes(ctx: NativeRoutesContext): Hono {
 	});
 
 	app.post("/workspaces", async (c) => {
-		const body = await readJsonBody(c.req.raw);
-		const candidate = stringField(body, "path") ?? stringField(body, "pathHint");
+		const body = await readBoundedJsonObject(c.req.raw);
+		const candidate =
+			optionalBoundedStringField(body, "path", MAX_WORKSPACE_PATH_LENGTH) ??
+			optionalBoundedStringField(body, "pathHint", MAX_WORKSPACE_PATH_LENGTH);
 		if (!candidate) throw new NativeRouteError(400, "workspace_path_required", "body.path is required");
 		const workspacePath = await validateWorkspacePath(candidate);
 		const displayName = optionalDisplayName(body);
@@ -251,6 +259,9 @@ export function createNativeRoutes(ctx: NativeRoutesContext): Hono {
 	});
 
 	app.onError((error, c) => {
+		if (error instanceof RequestInputError) {
+			return c.json({ error: { code: error.code, message: error.message } }, error.status);
+		}
 		if (error instanceof NativeRouteError) {
 			return c.json({ error: { code: error.code, message: error.message } }, error.status);
 		}
@@ -280,25 +291,6 @@ function managementContext(request: Request): SessionManagementContext {
 		);
 	}
 	return { expectedGeneration, fencingToken };
-}
-
-async function readJsonBody(request: Request): Promise<Record<string, unknown>> {
-	try {
-		const body = (await request.json()) as unknown;
-		if (!isRecord(body)) throw new Error("body must be an object");
-		return body;
-	} catch (error) {
-		throw new NativeRouteError(
-			400,
-			"invalid_json",
-			error instanceof Error ? error.message : "request body must be valid JSON",
-		);
-	}
-}
-
-function stringField(body: Record<string, unknown>, key: string): string | undefined {
-	const value = body[key];
-	return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 function optionalBoolean(body: Record<string, unknown>, key: string): boolean | undefined {
@@ -633,8 +625,4 @@ function isMissing(error: unknown): boolean {
 		"code" in error &&
 		((error as { code?: unknown }).code === "ENOENT" || (error as { code?: unknown }).code === "ENOTDIR")
 	);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
