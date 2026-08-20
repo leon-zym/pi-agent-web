@@ -52,7 +52,16 @@ test("two Sessions in one Workspace stream independently while the user switches
 	const selectedARow = page.locator('[data-session-row][data-current="true"]');
 	await expect(selectedARow).toHaveAttribute("data-runtime-state", "idle");
 	await sendPrompt(page, A_PROMPT);
-	await expect.poll(() => runtimeState(harness, harness.session.sessionHandle)).toBe("running");
+	await expect
+		.poll(() => eventFor(harness, (event) => event.type === "prompt" && event.text === A_PROMPT))
+		.toBeTruthy();
+	const aPrompt = eventFor(harness, (event) => event.type === "prompt" && event.text === A_PROMPT);
+	const aSession = (await listSessions(harness)).find(
+		(session) => session.nativeSessionId === aPrompt?.sessionId,
+	);
+	expect(aSession, "the active fresh Session must materialize into the native directory").toBeDefined();
+	if (!aSession) throw new Error("Active fresh Session was missing");
+	await expect.poll(() => runtimeState(harness, aSession.sessionHandle)).toBe("running");
 	await expect(selectedARow).toHaveAttribute("data-runtime-state", "running");
 
 	const sidebar = page.locator("nav");
@@ -60,24 +69,23 @@ test("two Sessions in one Workspace stream independently while the user switches
 		.getByRole("button", { name: /^(New session|新建会话)$/ })
 		.first()
 		.click();
-	await expect.poll(async () => (await listSessions(harness)).length).toBe(2);
-	await expect(page.locator("[data-session-row]")).toHaveCount(2);
+	await expect.poll(async () => (await listSessions(harness)).length).toBe(3);
+	await expect(page.locator("[data-session-row]")).toHaveCount(3);
 	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(1);
 	await expect(page.locator("textarea")).toBeEnabled();
-
-	const sessionsAfterCreate = await listSessions(harness);
-	const bSession = sessionsAfterCreate.find(
-		(session) => session.sessionHandle !== harness.session.sessionHandle,
-	);
-	expect(bSession, "the UI-created Session must appear in the native directory").toBeDefined();
-	if (!bSession) throw new Error("UI-created Session was missing");
 
 	const selectedBRow = page.locator('[data-session-row][data-current="true"]');
 	await expect(selectedBRow).toHaveAttribute("data-runtime-state", "idle");
 	await sendPrompt(page, B_PROMPT);
 	await expect(page.locator("main")).toContainText(`E2E_REPLY:${B_PROMPT}`);
+	const bPrompt = eventFor(harness, (event) => event.type === "prompt" && event.text === B_PROMPT);
+	const bSession = (await listSessions(harness)).find(
+		(session) => session.nativeSessionId === bPrompt?.sessionId,
+	);
+	expect(bSession, "the second fresh Session must materialize into the native directory").toBeDefined();
+	if (!bSession) throw new Error("Second fresh Session was missing");
 	await expect.poll(() => runtimeState(harness, bSession.sessionHandle)).toBe("idle");
-	await expect.poll(() => runtimeState(harness, harness.session.sessionHandle)).toBe("running");
+	await expect.poll(() => runtimeState(harness, aSession.sessionHandle)).toBe("running");
 	await expect(page.locator("main").getByText(/^(Working…|处理中…)$/)).toHaveCount(0);
 	await expect(page.locator("main").getByText(/^(Steer|插队)$/)).toHaveCount(0);
 	await expect(page.locator("header").getByText(/^(Ready|就绪)$/)).toBeVisible();
@@ -94,12 +102,12 @@ test("two Sessions in one Workspace stream independently while the user switches
 	await expect
 		.poll(() => Boolean(eventFor(harness, (event) => event.type === "settled" && event.text === A_PROMPT)))
 		.toBe(true);
-	await expect.poll(() => runtimeState(harness, harness.session.sessionHandle)).toBe("idle");
+	await expect.poll(() => runtimeState(harness, aSession.sessionHandle)).toBe("idle");
 	await expect(page.locator("main")).not.toContainText(`E2E_REPLY:${A_PROMPT}`);
 	const aRow = page.locator("[data-session-row]").filter({ hasText: A_PROMPT });
 	await expect(aRow).toBeVisible();
 	await expect(aRow).toHaveAttribute("data-unread", "true");
-	const bRow = page.locator("[data-session-row]").filter({ hasNotText: A_PROMPT });
+	const bRow = page.locator("[data-session-row]").filter({ hasText: B_PROMPT });
 	await expect(bRow).toHaveCount(1);
 	await aRow.getByRole("button").first().click();
 	await expect(aRow).toHaveAttribute("data-unread", "false");
@@ -113,9 +121,7 @@ test("two Sessions in one Workspace stream independently while the user switches
 	await expect(page.locator("main")).toContainText(`E2E_REPLY:${B_PROMPT}`);
 	await expect(page.locator("main")).not.toContainText(`E2E_REPLY:${A_PROMPT}`);
 
-	const aPrompt = eventFor(harness, (event) => event.type === "prompt" && event.text === A_PROMPT);
-	const bPrompt = eventFor(harness, (event) => event.type === "prompt" && event.text === B_PROMPT);
-	expect(aPrompt?.sessionId).toBe(harness.session.nativeSessionId);
+	expect(aPrompt?.sessionId).toBe(aSession.nativeSessionId);
 	expect(bPrompt?.sessionId).toBe(bSession.nativeSessionId);
 	expect(aPrompt?.pid).not.toBe(bPrompt?.pid);
 	expect(
@@ -165,12 +171,21 @@ test("an image-only prompt is delivered and the same WebSocket remains usable", 
 			imageMimeTypes: ["image/png"],
 			imageChars: png.toString("base64").length,
 		});
-	await expect.poll(() => runtimeState(harness, harness.session.sessionHandle)).toBe("idle");
+	const imagePrompt = eventFor(
+		harness,
+		(event) => event.type === "prompt" && event.text === "" && event.imageCount === 1,
+	);
+	const imageSession = (await listSessions(harness)).find(
+		(session) => session.nativeSessionId === imagePrompt?.sessionId,
+	);
+	expect(imageSession, "the image Session must materialize into the native directory").toBeDefined();
+	if (!imageSession) throw new Error("Image Session was missing");
+	await expect.poll(() => runtimeState(harness, imageSession.sessionHandle)).toBe("idle");
 
 	// A second command proves that the image frame neither closed nor poisoned the multiplexed socket.
 	await sendPrompt(page, AFTER_IMAGE_PROMPT);
 	await expect(page.locator("main")).toContainText(`E2E_REPLY:${AFTER_IMAGE_PROMPT}`);
-	await expect.poll(() => runtimeState(harness, harness.session.sessionHandle)).toBe("idle");
+	await expect.poll(() => runtimeState(harness, imageSession.sessionHandle)).toBe("idle");
 	expect(sockets).toHaveLength(1);
 	expect(closedSockets).toEqual([]);
 	expect(errors.console).toEqual([]);

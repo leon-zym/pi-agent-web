@@ -5,7 +5,7 @@ import {
 	observePageErrors,
 	pageOverflow,
 } from "../fixtures/page-observation";
-import type { HarnessSession, PiFixtureEvent, ProductionHarness } from "../fixtures/production-harness";
+import type { PiFixtureEvent, ProductionHarness } from "../fixtures/production-harness";
 import { expect, test } from "../fixtures/test";
 
 const STRESS_PROMPT = "E2E_STRESS_TRAJECTORY";
@@ -26,13 +26,6 @@ async function sendPrompt(page: Page, message: string): Promise<void> {
 	const send = page.getByRole("button", { name: /^(Send|发送)$/ });
 	await expect(send).toBeEnabled();
 	await send.click({ timeout: 10_000 });
-}
-
-async function listSessions(harness: ProductionHarness): Promise<HarnessSession[]> {
-	const result = await harness.requestJson<{ sessions: HarnessSession[] }>(
-		`/api/v1/workspaces/${encodeURIComponent(harness.workspace.workspaceHandle)}/sessions`,
-	);
-	return result.sessions;
 }
 
 function fixtureEvent(
@@ -61,11 +54,6 @@ test("a 52-tool trajectory and 64 KiB settled response survive background naviga
 }) => {
 	test.slow();
 	const errors = observePageErrors(page);
-	await harness.requestJson(
-		`/api/v1/workspaces/${encodeURIComponent(harness.workspace.workspaceHandle)}/sessions`,
-		{ method: "POST" },
-	);
-	await expect.poll(async () => (await listSessions(harness)).length).toBe(2);
 	await openWorkbench(page, harness);
 	await expect(page.locator("textarea")).toBeEnabled();
 	await sendPrompt(page, FOREGROUND_PROMPT);
@@ -175,6 +163,9 @@ test("a second BrowserContext observes one Session without acquiring mutation co
 
 		await observer.page.goto(harness.origin, { waitUntil: "domcontentloaded" });
 		await expect(observer.page.locator("main")).toBeVisible();
+		const ownerRow = observer.page.locator("[data-session-row]").filter({ hasText: OBSERVER_PROMPT });
+		await expect(ownerRow).toBeVisible();
+		await ownerRow.getByRole("button").first().click();
 		const observerTurn = observer.page.getByRole("region", { name: /^(Conversation turn|对话轮次)$/ });
 		await expect(observerTurn.getByText(OBSERVER_PROMPT, { exact: true })).toBeVisible();
 		await expect(observer.page.locator("header").getByText(/^(Running|运行中)$/)).toBeVisible();

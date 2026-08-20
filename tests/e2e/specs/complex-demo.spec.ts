@@ -49,17 +49,17 @@ test("settled complex turn renders rich content and restores tool context", asyn
 	await expect(main.locator('[data-diff-kind="add"]')).toContainText("toUpperCase");
 
 	await main.getByRole("button", { name: /^(Open in details panel|在详情面板中查看)$/ }).click();
-	await expect(
-		page.getByText('{"file_path":"src/demo.ts","description":"Normalize status labels"}', {
-			exact: true,
-		}),
-	).toBeVisible();
-	await expect(page.getByText("Synthetic edit completed", { exact: true })).toBeVisible();
+	const inspectorArgs = page.locator("pre code.language-json").filter({ hasText: "src/demo.ts" }).first();
+	await expect(inspectorArgs).toBeVisible();
+	expect(await inspectorArgs.innerText()).toContain("\n");
+	await expect(inspectorArgs.locator(".hljs-attr").first()).toBeVisible();
+	const inspectorOutput = page.getByRole("code").filter({ hasText: "Synthetic edit completed" });
+	await expect(inspectorOutput).toHaveText("Synthetic edit completed");
 	await capture(page, "pi-agent-web-demo-tool-inspector");
 	await page.getByRole("button", { name: /^(Collapse details panel|收起详情面板)$/ }).click();
 	await expect(page.getByRole("button", { name: /^(Expand details panel|展开详情面板)$/ })).toBeVisible();
 	await page.getByRole("button", { name: /^(Expand details panel|展开详情面板)$/ }).click();
-	await expect(page.getByText("Synthetic edit completed", { exact: true })).toBeVisible();
+	await expect(inspectorOutput).toHaveText("Synthetic edit completed");
 
 	const viewport = page.locator('[data-chat-viewport="true"]');
 	const savedScrollTop = await viewport.evaluate((element) => {
@@ -80,7 +80,7 @@ test("settled complex turn renders rich content and restores tool context", asyn
 		.getByRole("button", { name: /^(New session|新建会话)$/ })
 		.first()
 		.click();
-	await expect(page.locator("[data-session-row]")).toHaveCount(2);
+	await expect(page.locator("[data-session-row]")).toHaveCount(3);
 	const originalSession = page.locator("[data-session-row]").filter({ hasText: COMPLEX_PROMPT });
 	await originalSession.getByRole("button").first().click();
 	await expect(page.getByRole("heading", { name: "Synthetic change review", level: 2 })).toBeVisible();
@@ -95,6 +95,12 @@ test("settled complex turn renders rich content and restores tool context", asyn
 	await page.evaluate(() => localStorage.setItem("pi-web-theme", "dark"));
 	await page.reload({ waitUntil: "domcontentloaded" });
 	await expect(page.locator("html")).toHaveClass(/dark/);
+	await page
+		.locator("[data-session-row]")
+		.filter({ hasText: COMPLEX_PROMPT })
+		.getByRole("button")
+		.first()
+		.click();
 	await expect(page.getByRole("heading", { name: "Synthetic change review", level: 2 })).toBeVisible();
 	const darkCode = page.locator("pre code.hljs");
 	await expect(darkCode).toBeVisible();
@@ -118,6 +124,14 @@ test("settled complex turn renders rich content and restores tool context", asyn
 		await page.evaluate(() => localStorage.setItem("pi-web-theme", "light"));
 		await page.reload({ waitUntil: "domcontentloaded" });
 		await expect(page.locator("html")).not.toHaveClass(/dark/);
+		await page.getByRole("button", { name: /^(Open sessions|打开会话列表)$/ }).click();
+		const sessionDrawer = page.getByRole("dialog", { name: /^(Sessions|会话)$/ });
+		await sessionDrawer
+			.locator("[data-session-row]")
+			.filter({ hasText: COMPLEX_PROMPT })
+			.getByRole("button")
+			.first()
+			.click();
 		await expect(page.getByRole("heading", { name: "Synthetic change review", level: 2 })).toBeVisible();
 		await capture(page, "pi-agent-web-demo-375");
 	}

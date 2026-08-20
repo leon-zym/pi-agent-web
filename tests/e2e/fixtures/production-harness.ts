@@ -61,6 +61,67 @@ export interface ProductionHarness {
 export interface StartHarnessOptions {
 	fakePiPath?: string;
 	extraEnv?: NodeJS.ProcessEnv;
+	seedHistoricalSession?: {
+		userText: string;
+		assistantText: string;
+	};
+}
+
+function seedHistoricalSession(
+	sessionDir: string,
+	workspacePath: string,
+	seed: NonNullable<StartHarnessOptions["seedHistoricalSession"]>,
+): { nativeSessionId: string; sessionFile: string } {
+	const nativeSessionId = "browser-e2e-history";
+	const timestamp = "2026-01-01T00:00:00.000Z";
+	const sessionFile = path.join(sessionDir, `2026-01-01T00-00-00-000Z_${nativeSessionId}.jsonl`);
+	const userId = `${nativeSessionId}-user`;
+	const assistantId = `${nativeSessionId}-assistant`;
+	const entries = [
+		{
+			type: "session",
+			version: 3,
+			id: nativeSessionId,
+			timestamp,
+			cwd: workspacePath,
+		},
+		{
+			type: "message",
+			id: userId,
+			parentId: null,
+			timestamp,
+			message: {
+				role: "user",
+				content: [{ type: "text", text: seed.userText }],
+				timestamp: Date.parse(timestamp),
+			},
+		},
+		{
+			type: "message",
+			id: assistantId,
+			parentId: userId,
+			timestamp: "2026-01-01T00:00:01.000Z",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: seed.assistantText }],
+				api: "openai-completions",
+				provider: "e2e",
+				model: "deterministic",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: Date.parse("2026-01-01T00:00:01.000Z"),
+			},
+		},
+	];
+	fs.writeFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf8");
+	return { nativeSessionId, sessionFile: fs.realpathSync(sessionFile) };
 }
 
 function childEnvironment(overrides: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -126,6 +187,9 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 	for (const directory of [agentDir, sessionDir, webDataDir, workspacePath, controlDir]) {
 		fs.mkdirSync(directory, { recursive: true });
 	}
+	const seeded = options.seedHistoricalSession
+		? seedHistoricalSession(sessionDir, workspacePath, options.seedHistoricalSession)
+		: null;
 	fs.writeFileSync(
 		path.join(agentDir, "auth.json"),
 		`${JSON.stringify({ e2e: { type: "api_key", key: "deterministic-test-key" } })}\n`,
@@ -197,20 +261,39 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 			method: "POST",
 			body: JSON.stringify({ path: workspacePath, displayName: "Browser E2E" }),
 		});
-		const created = await requestJson<{ session: HarnessSession }>(
-			`/api/v1/workspaces/${encodeURIComponent(workspace.workspaceHandle)}/sessions`,
-			{
-				method: "POST",
-			},
-		);
-		if (!fs.existsSync(markerPath)) throw new Error("deterministic fake Pi was not started");
+		let session: HarnessSession;
+		if (seeded) {
+			const directory = await requestJson<{ sessions: HarnessSession[] }>(
+				`/api/v1/workspaces/${encodeURIComponent(workspace.workspaceHandle)}/sessions?refresh=1`,
+			);
+			const historical = directory.sessions.find(
+				(candidate) =>
+					candidate.nativeSessionId === seeded.nativeSessionId &&
+					candidate.sessionFile === seeded.sessionFile,
+			);
+			if (!historical) {
+				throw new Error(
+					`seeded historical Session was not discovered: ${JSON.stringify(directory.sessions)}`,
+				);
+			}
+			session = historical;
+		} else {
+			const created = await requestJson<{ session: HarnessSession }>(
+				`/api/v1/workspaces/${encodeURIComponent(workspace.workspaceHandle)}/sessions`,
+				{
+					method: "POST",
+				},
+			);
+			session = created.session;
+			if (!fs.existsSync(markerPath)) throw new Error("deterministic fake Pi was not started");
+		}
 
 		return {
 			origin,
 			rootDir,
 			workspacePath,
 			workspace,
-			session: created.session,
+			session,
 			logs: () => output,
 			piEvents: () => {
 				if (!fs.existsSync(markerPath)) return [];

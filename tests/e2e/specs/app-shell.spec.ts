@@ -38,7 +38,9 @@ test("packaged app bootstraps and renders the workbench without browser errors",
 	await expect(page.getByRole("button", { name: /^(Expand details panel|展开详情面板)$/ })).toBeVisible();
 	await expect(page.getByRole("button", { name: /^(Inspect|检查)$/ })).toBeHidden();
 	await expect(page.getByRole("button", { name: /^(Configure model|配置模型)$/ })).toBeVisible();
-	await expect(page.getByRole("button", { name: /^(Context unavailable|上下文占用不可用)$/ })).toBeVisible();
+	await expect(
+		page.getByRole("progressbar", { name: /^(Context unavailable|上下文占用不可用)$/ }),
+	).toBeVisible();
 	await page.getByRole("button", { name: /^(Configure model|配置模型)$/ }).click();
 	const modelPopover = page.locator('[data-slot="popover-content"]');
 	await modelPopover.getByRole("button", { name: /^(Model No models|模型 没有可用模型)$/ }).click();
@@ -130,7 +132,7 @@ test("375px viewport has no page-level horizontal overflow", async ({ page, harn
 			);
 			return result.sessions.length;
 		})
-		.toBe(1);
+		.toBe(2);
 	await moreActions.click();
 	await page.getByRole("menuitem", { name: /^(Delete session|删除会话)$/ }).click();
 	await deleteDialog.getByRole("button", { name: /^(Delete|删除)$/ }).click();
@@ -141,7 +143,7 @@ test("375px viewport has no page-level horizontal overflow", async ({ page, harn
 			);
 			return result.sessions.length;
 		})
-		.toBe(0);
+		.toBe(1);
 
 	const overflow = await pageOverflow(page);
 	const diagnostic = JSON.stringify(overflow, null, 2);
