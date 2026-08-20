@@ -11,6 +11,9 @@ selected Session 只是显示指针，不能被误写成 Gateway 或 Pi 的唯�
   暂时不再出现在目录中；重新添加同一 Workspace 路径会恢复发现，确认文案必须说明这一点。
 - Session row 的运行状态独立于选中状态。A 正在生成时切到 B，A 继续运行，Sidebar 持续更新 A；
   再切回 A 立即显示已有投影，不发送 Pi `switch_session`。
+- 启动时只根据 Web 的 `lastOpenedAt` 选择默认 Workspace（Pi 本身没有 last-Workspace 设置），并进入
+  一个新的空 Session；不得自动打开历史列表第一项。展开/收起 Workspace 只加载或隐藏其目录，不能
+  改变当前 Workspace、Session、订阅或 lease；显式的 Open/New/Session row 才改变当前视图。
 - 同一 Workspace 和不同 Workspace 的多个 Session 都可同时工作。页面不宣传“无限并发”；容量
   不足时显示具体 runtime 错误，而不是静默终止已有运行。
 - 空 Session、unavailable Workspace、crashed/dormant runtime 使用不同状态，不用一个灰点概括。
@@ -20,8 +23,15 @@ selected Session 只是显示指针，不能被误写成 Gateway 或 Pi 的唯�
 选择 Session 时按顺序：恢复该 Session 的可见 store → subscribe channel → 在 baseline 完成后尝试
 claim。离开 Session 时：
 
+- 新建与尚无 projection 的历史 Session 先显示现代化 skeleton；只有 authoritative 空 snapshot 才能
+  显示 first-turn empty state。新建请求开始时旧对话必须立即退出可见树，迟到的 create response
+  不得把用户从后来选择的 Session 抢回；
 - running、waiting_ui、starting 或仍有活动投影的 Session 保持订阅，后台继续摄取；
 - settled、可重建且无待处理 UI 的 Session 可以 release/unsubscribe 以限制浏览器内存；
+- 离开一个仍未落盘、idle、无草稿/Command Tag/附件及附件处理、queue、对话或 Extension UI 的
+  Session 时，使用 exact generation + fencing token 请求 transient abandon。Gateway 只停止并忘记
+  runtime，绝不删除文件；若并发落盘或收到 mutation 就 fail closed。失去 controller 的孤儿由有界
+  TTL reaper 收敛；
 - crash 必须先把正在运行的投影结算为可见错误，再决定是否释放；
 - draft、附件、模型、命令目录、usage、Extension UI 与 submit state 按 handle 保存，异步 completion
   只能更新发起它的 Session。
@@ -63,17 +73,25 @@ Composer visual seat 固定在 Center 底部，同一 DOM 可以延续焦点，�
 - thinking level 使用 `get_available_thinking_levels`，不硬编码模型能力。无可用模型时显示
   “No models / Configure model”，禁用无意义的 effort 选择。
 - Context usage 有三态：active request 且等待统计 = loading；有值 = percent/tokens；空闲仍为 null =
-  unavailable。Unknown 不使用永久 spinner，也不渲染伪 0%。
+  unavailable。使用无按钮 press 效果的环形 meter；Unknown 不使用永久 spinner，也不渲染伪 0%。
+- 模型与 thinking 页面共享同一个 popover：列表的 Back header 固定在滚动 viewport 外；成功选择后
+  回到根页而不关闭 popover，便于连续调整模型与 thinking level。
 - Session metadata 的 `agent_settled`、`session_info_changed` 与 directory event 使用 forced refresh，
   标题和 message count 不允许滞后一整个对话。
 
 ## 6. Slash commands
 
 - 菜单锚定 Composer 上方，最大高度 320px，按 extension / prompt / skill 分组，显示时去掉 `skill:`。
-- ArrowUp/ArrowDown 循环；Escape 关闭；click 插入并保留焦点。
-- 模糊搜索只生成候选。Space/Enter 只有在命令名精确匹配时执行；未知 `/name` 不得作为普通
-  prompt 静默发送。
-- 命令刷新与执行使用捕获的 Session handle；A 的慢 response 不能覆盖 B 的 menu。
+- ArrowUp/ArrowDown 循环；Escape 关闭；Tab/Enter 或 click 选择当前高亮项并保留焦点；Space
+  是普通参数输入，不触发执行。
+- 选中的命令显示为不可编辑的原子 Tag，正文输入只保存参数；Backspace（空正文）或 Tag 的关闭按钮
+  一次移除完整命令。提交边界再序列化为 `/<command> <arguments>`。
+- 只有第一个非空白 Token 的 `/` 会打开菜单，避免把正文中间的 `/name` 重排到消息开头。模糊
+  搜索只生成候选；未知 `/name` 不得作为普通 prompt 静默发送。命令刷新、Token、草稿和异步
+  提交清理都按 Session 隔离，rekey 时迁移到 canonical handle。
+- Pi 会在发送前把 Skill 展开为含完整正文和本机 location 的 `<skill>` envelope；live、snapshot、
+  Conversation tree 与 native directory summary 都必须折叠回 `/skill:name` Tag + 用户参数，不能把
+  Skill 正文或绝对路径显示/复制到消息、Header、Sidebar 或搜索摘要。
 - Extension `select` 是独立 blocking dialog：键盘选项、confirm/cancel 与 authoritative close 都按
   Session/generation 处理，不与 Slash suggestion highlight 共用状态。
 
@@ -94,6 +112,9 @@ Assistant prose 无气泡，User 是右对齐 bubble。Thinking、tool call、to
 - Thinking 折叠态显示最新非空行或 settled 首行摘要；只展开当前行，不展开 siblings。
 - Tool 行显示 preparing/running/done/error/skipped。参数和 bounded preview 可内联；完整输出进入
   Inspector。所有 ANSI/control chars 在显示前清理。
+- Bash 展开体分开显示完整 Command 与 Output；settled result 优先于旧 partial snapshot。结构化工具
+  参数、Inspector 参数、runtime 与展开的 Event payload 使用安全的 JSON/Bash token highlighting；
+  streaming 中尚不完整的 JSON 才回退 raw text。
 - Edit/diff 使用结构化 `details.diff` 时渲染 hunk/add/delete；没有 diff 时才回退通用摘要。
 - stopReason length/error/aborted 保留 partial，并分别显示截断、失败、已停止；零 delta message 合法。
 
@@ -130,7 +151,12 @@ Assistant prose 无气泡，User 是右对齐 bubble。Thinking、tool call、to
 - Details 默认关闭，无 selected tool/tree/debug 内容时不占桌面宽度。关闭后有固定 reopen rail；
   tool、diff、branch action 会上下文打开正确 mode。
 - Branch tree 以 `get_tree` 显示 leaf 和 user-message fork action。Fork 成功后进入 child channel，父
-  Session 仍可在 Sidebar 打开。
+  Session 仍可在 Sidebar 打开。这个表面命名为 Conversation tree：它只描述当前 JSONL 内的 entry
+  parent/leaf 路径，并不是所有 forked Session 的全局列表；Current 标记 Pi 的 active leaf。
+- Export HTML 成功后 Gateway 返回已验证 regular file 的 canonical `file:` URL；UI 立即复制 URL，
+  让用户可直接粘贴到浏览器。它不把模型生成的 HTML 作为同源 HTTP 页面提供。
+- 当前 Pi RPC 没有 archive Session 或 archive Workspace 命令，因此 UI 不伪造“归档”入口；删除仍
+  只走上面的 recoverable trash 契约。
 - Session DELETE 只在当前 tab 控制该 Session、generation 精确、runtime 可删除时启用；确认文案
   说明它会移动到 recoverable trash。active、unpersisted、有 child、身份冲突或文件系统不支持时
   显示具体 409 原因。

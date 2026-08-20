@@ -35,9 +35,12 @@ This repository does not bundle them, and credential-free CI does not need them.
   are scoped to each Session.
 - Selecting a conversation changes only the visible view. Other subscribed Sessions continue to
   receive events, so switching Workspace or Session does not stop background work.
+- Startup opens a fresh Session in the most recently used Web Workspace instead of selecting the
+  first history row. Expanding Workspace groups never changes the active Session; untouched
+  unpersisted Sessions are abandoned without deleting any JSONL file.
 - The workbench supports streaming replies, reasoning and tool steps, settled GFM and code,
-  model/thinking controls, slash commands, Extension UI, and image attachments including
-  image-only prompts.
+  model/thinking controls, atomic slash/skill command tags, Extension UI, and image attachments,
+  including image-only prompts.
 - The gateway applies bounded JSONL, frame, command, replay, and client-buffer limits. Session
   deletion is fenced and moves a verified file to recoverable trash instead of unlinking it.
 

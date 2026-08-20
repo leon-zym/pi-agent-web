@@ -114,7 +114,8 @@ Header 的 delete/export 是低频操作；窄屏进入 overflow。Branch、runt
 ### Menus、dialogs 与 Extension UI
 
 - Row 32–40px，hover fill，无 card border；keyboard highlight 与 pointer hover 使用同一选中语言。
-- Slash menu 锚定 composer，max-height 320px；source 分组；精确 commit，模糊候选不误执行。
+- Slash menu 锚定 composer，max-height 320px；source 分组；Tab/Enter/click 把高亮候选补全为
+  不可编辑的 Command Tag，第二次 Enter 才提交；Space 输入参数，模糊候选不误执行。
 - Extension dialog 按 Session/generation 排队；responding 时按钮显式 disabled，等待 authoritative close。
 - Toast 只用于瞬时反馈；可恢复错误与 observer 原因留在发生位置。
 

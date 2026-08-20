@@ -32,8 +32,10 @@ Provider 凭据、扩展、设置和 JSONL 历史仍留在用户自己的 Pi 安
   `fencingToken`、序列游标、回放、重同步和 Extension UI 状态都按 Session 划分。
 - 选择对话只会切换当前视图，其他已订阅 Session 继续接收事件；切换 Workspace 或 Session 不会停止
   后台任务。
+- 启动时会在 Web 最近使用的 Workspace 新建 Session，而不是自动打开历史第一项。展开 Workspace
+  分组不会改变当前 Session；未落盘且从未使用的空 Session 会被安全忘记，不会删除任何 JSONL。
 - 工作台支持流式回复、思考与工具步骤、完整 GFM 与代码渲染、模型与思考强度控制、Slash 命令、
-  Extension UI 以及图片附件，包括纯图片提示。
+  原子化 Slash/Skill Command Tag、Extension UI 以及图片附件，包括纯图片提示。
 - 网关对 JSONL、帧、命令、回放和客户端缓冲设有边界。删除 Session 时会校验身份和
   `fencingToken`，再将文件移入可恢复回收区，而不是直接调用 `unlink`。
 

@@ -23,8 +23,9 @@ These are current product invariants, not roadmap items.
 
 Completed in this milestone:
 
-- Slash menu ArrowUp/ArrowDown cycling and exact Space/Enter execution; fuzzy or unknown commands do
-  not silently become prompts.
+- Slash menu ArrowUp/ArrowDown cycling and highlighted Tab/Enter/click completion into an atomic,
+  removable command Tag; Space remains argument input and unknown commands never silently become
+  prompts.
 - Semantic edit/diff presentation instead of summary-only tool rows.
 - Model/thinking copy explains that a change applies to the next request; the current Turn is stable.
 - Keyboard/unit regressions and packaged-browser layout checks.
