@@ -3,6 +3,7 @@ import { expectData } from "@pi-agent-web/protocol";
 import {
 	Bot,
 	Bug,
+	ChevronRight,
 	GitBranch,
 	GitFork,
 	ListTree,
@@ -17,13 +18,18 @@ import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
 import { Skeleton } from "../../components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
-import { displayError, displayLabel, stripAnsi } from "../../lib/format";
+import { displayError, displayLabel } from "../../lib/format";
 import { tt } from "../../lib/i18n";
+import { presentUserMessage, serializePresentedUserMessage } from "../../lib/user-message-presentation";
 import { cn } from "../../lib/utils";
 import { useProjectionStore } from "../../stores/projection";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { sessionTransport, useSessionTransportStore } from "../../stores/session-transport";
+import type { SessionRawEventRecord } from "../../stores/session-transport-contract";
 import { type RightPanelMode, useViewStore } from "../../stores/view";
+import { formatJsonCode, formatToolArguments, formatUnknownCode } from "../conversation/code-display";
+import { HighlightedCode } from "../conversation/HighlightedCode";
+import { activeTreeEntryIds, resolvedTreeNodeLabel } from "./tree-model";
 
 const MODES: Array<{ mode: RightPanelMode; label: string; icon: typeof Wrench }> = [
 	{ mode: "inspector", label: "details.inspector", icon: Wrench },
@@ -66,13 +72,9 @@ function InspectorView() {
 	const block = selected.block;
 	if (block.type !== "tool_call") return null;
 
-	const resultText = stripAnsi(
-		selected.results[0]?.content ??
-			(typeof block.result === "string"
-				? block.result
-				: typeof block.result === "object" && block.result !== null
-					? JSON.stringify(block.result, null, 2)
-					: (block.partialOutput ?? "")),
+	const argsCode = formatToolArguments(block.args, block.argsText);
+	const resultCode = formatUnknownCode(
+		selected.results[0]?.content ?? block.result ?? block.partialOutput ?? "",
 	);
 
 	return (
@@ -108,17 +110,17 @@ function InspectorView() {
 					<p className="mb-1.5 text-[11px] font-medium tracking-wide text-ink-3 uppercase">
 						{tt("details.args")}
 					</p>
-					<pre className="scroll-slim max-h-64 overflow-y-auto rounded-md bg-surface-2 p-3 font-mono text-xs leading-[18px] whitespace-pre-wrap break-all text-ink-2">
-						{stripAnsi(block.argsText || JSON.stringify(block.args ?? {}, null, 2))}
-					</pre>
+					<HighlightedCode code={argsCode.code} language={argsCode.language} className="max-h-64" />
 				</div>
 				<div className="px-4 py-3">
 					<p className="mb-1.5 text-[11px] font-medium tracking-wide text-ink-3 uppercase">
 						{tt("details.output")}
 					</p>
-					<pre className="scroll-slim max-h-[420px] overflow-y-auto rounded-md bg-surface-2 p-3 font-mono text-xs leading-[18px] whitespace-pre-wrap break-all text-ink-2">
-						{resultText || tt("common.noOutput")}
-					</pre>
+					<HighlightedCode
+						code={resultCode.code || tt("common.noOutput")}
+						language={resultCode.code ? resultCode.language : undefined}
+						className="max-h-[420px] whitespace-pre-wrap break-words"
+					/>
 				</div>
 			</div>
 		</div>
@@ -130,13 +132,14 @@ function entryLabel(entry: SessionEntry): string {
 		case "message": {
 			const message = entry.message;
 			if (message.role === "user") {
-				const content =
+				const rawContent =
 					typeof message.content === "string"
 						? message.content
 						: message.content
 								.filter((b) => b.type === "text")
 								.map((b) => (b as { text: string }).text)
 								.join(" ");
+				const content = serializePresentedUserMessage(presentUserMessage(rawContent));
 				return displayLabel(content).slice(0, 60) || tt("details.userMessage");
 			}
 			if (message.role === "assistant") {
@@ -186,25 +189,36 @@ function TreeNodeView({
 	node,
 	depth,
 	leafId,
+	activePathIds,
 	onFork,
 	canFork,
 }: {
 	node: SessionTreeNode;
 	depth: number;
 	leafId: string | null;
+	activePathIds: Set<string>;
 	onFork: (entryId: string) => void;
 	canFork: boolean;
 }) {
-	const [expanded, setExpanded] = useState(depth < 2);
 	const Icon = entryIcon(node.entry);
 	const isLeaf = node.entry.id === leafId;
+	const isOnActivePath = activePathIds.has(node.entry.id);
+	const [expanded, setExpanded] = useState(depth < 2 || isOnActivePath);
 	const isUserMessage = node.entry.type === "message" && node.entry.message.role === "user";
 	const hasChildren = node.children.length > 0;
+	useEffect(() => {
+		if (isOnActivePath) setExpanded(true);
+	}, [isOnActivePath]);
 
 	return (
 		<div className="flex flex-col">
 			<div
-				className="group flex items-center gap-1 rounded-sm py-0.5 pr-1 hover:bg-hover"
+				data-active-path={isOnActivePath ? "true" : undefined}
+				className={cn(
+					"group flex items-center gap-1 rounded-sm py-0.5 pr-1 hover:bg-hover focus-within:bg-hover",
+					isOnActivePath && !isLeaf && "bg-primary-soft/35",
+					isLeaf && "bg-primary-soft",
+				)}
 				style={{ paddingLeft: depth * 14 }}
 			>
 				<button
@@ -214,9 +228,10 @@ function TreeNodeView({
 					className="flex size-5 shrink-0 items-center justify-center text-ink-3 disabled:opacity-30"
 					disabled={!hasChildren}
 				>
-					<ListTree
+					<ChevronRight
 						className={cn(
-							"size-3.5 transition-transform duration-200",
+							"size-3.5 transition-transform duration-200 motion-reduce:transition-none",
+							!hasChildren && "invisible",
 							hasChildren && expanded && "rotate-90",
 						)}
 					/>
@@ -228,7 +243,7 @@ function TreeNodeView({
 						isLeaf ? "font-medium text-ink" : "text-ink-2",
 					)}
 				>
-					{entryLabel(node.entry)}
+					{resolvedTreeNodeLabel(node, entryLabel)}
 				</span>
 				{isLeaf && (
 					<Badge variant="primary" className="shrink-0">
@@ -241,7 +256,7 @@ function TreeNodeView({
 							<button
 								type="button"
 								aria-label={tt("details.forkFromHere")}
-								className="flex size-5 shrink-0 items-center justify-center rounded-sm text-ink-3 opacity-0 group-hover:opacity-100 hover:bg-hover hover:text-primary disabled:cursor-not-allowed disabled:opacity-30"
+								className="flex size-5 shrink-0 items-center justify-center rounded-sm text-ink-3 opacity-70 hover:bg-hover hover:text-primary focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-primary/40 disabled:cursor-not-allowed disabled:opacity-30 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100"
 								onClick={() => onFork(node.entry.id)}
 								disabled={!canFork}
 							>
@@ -260,6 +275,7 @@ function TreeNodeView({
 							node={child}
 							depth={depth + 1}
 							leafId={leafId}
+							activePathIds={activePathIds}
 							onFork={onFork}
 							canFork={canFork}
 						/>
@@ -286,6 +302,7 @@ function TreeView() {
 	const [leafId, setLeafId] = useState<string | null>(null);
 	const [loading, setLoading] = useState(false);
 	const requestRef = useRef(0);
+	const activePathIds = useMemo(() => activeTreeEntryIds(tree, leafId), [tree, leafId]);
 
 	const load = async (targetSessionHandle = sessionHandle) => {
 		const request = ++requestRef.current;
@@ -348,10 +365,12 @@ function TreeView() {
 
 	return (
 		<div className="flex h-full flex-col">
-			<div className="flex flex-none items-center gap-2 border-b border-border px-4 py-3">
-				<GitBranch className="size-4 text-ink-3" />
-				<span className="text-[13px] font-medium text-ink">{tt("details.treeTitle")}</span>
-				<div className="flex-1" />
+			<div className="flex flex-none items-start gap-2 border-b border-border px-4 py-3">
+				<GitBranch className="mt-0.5 size-4 shrink-0 text-ink-3" />
+				<div className="min-w-0 flex-1">
+					<p className="text-[13px] font-medium text-ink">{tt("details.treeTitle")}</p>
+					<p className="mt-0.5 text-[11px] leading-4 text-ink-3">{tt("details.treeDescription")}</p>
+				</div>
 				<Button variant="ghost" size="sm" onClick={() => void load()}>
 					{tt("details.refresh")}
 				</Button>
@@ -372,12 +391,58 @@ function TreeView() {
 							node={node}
 							depth={0}
 							leafId={leafId}
+							activePathIds={activePathIds}
 							onFork={(id) => void fork(id)}
 							canFork={canFork}
 						/>
 					))
 				)}
 			</div>
+		</div>
+	);
+}
+
+export function DebugEventRow({
+	event,
+	expanded,
+	onToggle,
+}: {
+	event: SessionRawEventRecord;
+	expanded: boolean;
+	onToggle: () => void;
+}) {
+	const eventKey = `${String(event.generation)}:${String(event.seq)}`;
+	return (
+		<div className="overflow-hidden rounded-md border border-border bg-surface">
+			<button
+				type="button"
+				aria-expanded={expanded}
+				onClick={onToggle}
+				className="flex w-full items-center gap-2 px-2 py-1.5 text-left outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-primary/40"
+			>
+				<ChevronRight
+					className={cn(
+						"size-3.5 shrink-0 text-ink-3 transition-transform motion-reduce:transition-none",
+						expanded && "rotate-90",
+					)}
+				/>
+				<span className="min-w-0 flex-1 truncate font-mono text-[11px] text-ink-2">{event.eventType}</span>
+				<span className="shrink-0 font-mono text-[10px] text-ink-3">
+					{new Date(event.receivedAt).toISOString().slice(11, 19)} · {event.generation}:{event.seq}
+				</span>
+			</button>
+			{expanded && (
+				<div className="border-t border-border p-2" data-event-payload={eventKey}>
+					<p className="mb-1.5 text-[10px] font-medium tracking-wide text-ink-3 uppercase">
+						{tt("details.eventPayload")}
+					</p>
+					<HighlightedCode
+						code={formatJsonCode(event.payload)}
+						language="json"
+						className="max-h-80 text-[11px] leading-4"
+					/>
+				</div>
+			)}
 		</div>
 	);
 }
@@ -389,17 +454,26 @@ function DebugView() {
 		sessionHandle ? state.sessions[sessionHandle] : undefined,
 	);
 	const [filter, setFilter] = useState("");
+	const [expandedEventKey, setExpandedEventKey] = useState<string | null>(null);
 	const events = useMemo(
 		() => (channel?.rawEvents ?? []).filter((event) => !filter || event.eventType.includes(filter)),
 		[channel?.rawEvents, filter],
 	);
 	const runtime = channel?.runtime ?? currentSession?.runtime ?? null;
+	const runtimeCode = formatJsonCode({
+		sessionHandle,
+		generation: channel?.generation ?? null,
+		lastSeq: channel?.lastSeq ?? 0,
+		controller: channel?.lease.isController ?? false,
+		runtime,
+	});
 	return (
 		<div className="flex h-full flex-col">
 			<div className="flex flex-none items-center gap-2 border-b border-border px-4 py-3">
 				<Bug className="size-4 text-ink-3" />
 				<span className="text-[13px] font-medium text-ink">{tt("details.debugTitle")}</span>
 				<input
+					aria-label={tt("details.filterEvents")}
 					value={filter}
 					onChange={(e) => setFilter(e.target.value)}
 					placeholder={tt("details.filterEvents")}
@@ -407,39 +481,28 @@ function DebugView() {
 				/>
 			</div>
 			<div className="scroll-slim min-h-0 flex-1 overflow-y-auto p-2">
-				<pre className="font-mono text-[11px] leading-[16px] whitespace-pre-wrap break-all text-ink-2">
-					{JSON.stringify(
-						{
-							sessionHandle,
-							generation: channel?.generation ?? null,
-							lastSeq: channel?.lastSeq ?? 0,
-							controller: channel?.lease.isController ?? false,
-							runtime,
-						},
-						null,
-						2,
-					)}
-					{"\n"}
-					{events
-						.map(
-							(event) =>
-								new Date(event.receivedAt).toISOString().slice(11, 19) +
-								" [" +
-								String(event.generation) +
-								":" +
-								String(event.seq) +
-								"] " +
-								event.eventType,
-						)
-						.join("\n")}
-				</pre>
+				<HighlightedCode code={runtimeCode} language="json" className="max-h-64 text-[11px] leading-4" />
+				<div className="mt-2 flex flex-col gap-1">
+					{events.map((event) => {
+						const eventKey = `${String(event.generation)}:${String(event.seq)}`;
+						const expanded = eventKey === expandedEventKey;
+						return (
+							<DebugEventRow
+								key={eventKey}
+								event={event}
+								expanded={expanded}
+								onToggle={() => setExpandedEventKey(expanded ? null : eventKey)}
+							/>
+						);
+					})}
+				</div>
 			</div>
 		</div>
 	);
 }
 
 /**
- * Right details panel (DESIGN.md): inspector / branch tree / debug drawer.
+ * Right details panel (DESIGN.md): inspector / conversation tree / debug drawer.
  * The column width is owned by AppShell; closing keeps this subtree mounted.
  */
 export function DetailsPanel({ open, onToggle }: { open: boolean; onToggle: () => void }) {
@@ -471,7 +534,7 @@ export function DetailsPanel({ open, onToggle }: { open: boolean; onToggle: () =
 						<button
 							type="button"
 							aria-label={open ? tt("details.collapsePanel") : tt("details.expandPanel")}
-							className="flex size-10 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink lg:size-7"
+							className="flex size-10 shrink-0 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink lg:size-7"
 							onClick={onToggle}
 						>
 							{open ? <PanelRightClose className="size-4" /> : <PanelRightOpen className="size-4" />}

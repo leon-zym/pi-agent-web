@@ -1,9 +1,13 @@
 import type { RpcResponse } from "@earendil-works/pi-coding-agent";
 import { expectData, type NativeSessionDto } from "@pi-agent-web/protocol";
 import { toast } from "sonner";
-import { useComposerStore } from "../stores/composer";
+import { serializeComposerMessage, useComposerStore } from "../stores/composer";
 import { useProjectionStore } from "../stores/projection";
-import { useSessionDirectoryStore } from "../stores/session-directory";
+import {
+	isSessionBeingAbandoned,
+	reconcileHiddenSessionLifecycle,
+	useSessionDirectoryStore,
+} from "../stores/session-directory";
 import { sessionTransport } from "../stores/session-transport";
 import type { ImageContent } from "../types/pi-types";
 import { api } from "./api";
@@ -49,24 +53,42 @@ function controllerChannel(sessionHandle: string) {
 
 /** Selecting a Session changes only the visible pointer; every subscribed Session keeps ingesting. */
 export async function openSession(session: NativeSessionDto): Promise<void> {
+	if (isSessionBeingAbandoned(session.sessionHandle)) return;
 	const directory = useSessionDirectoryStore.getState();
-	if (directory.currentWorkspaceHandle !== session.workspaceHandle) {
-		await directory.selectWorkspace(session.workspaceHandle);
-	}
-	useSessionDirectoryStore.getState().selectSession(session);
+	directory.selectSession(session);
+	const activation = api
+		.activateWorkspace(session.workspaceHandle)
+		.then((activatedWorkspace) => {
+			useSessionDirectoryStore.setState((state) => ({
+				workspaces: state.workspaces.map((workspace) =>
+					workspace.workspaceHandle === activatedWorkspace.workspaceHandle ? activatedWorkspace : workspace,
+				),
+			}));
+		})
+		.catch((error) => {
+			if (useSessionDirectoryStore.getState().currentWorkspaceHandle !== session.workspaceHandle) return;
+			useSessionDirectoryStore.setState({ error: displayError(error) });
+		});
+	await Promise.all([activation, directory.reloadSessions(session.workspaceHandle)]);
 }
 
 /** Create a new Pi-native Session and attach its dedicated runtime. */
 export async function newSession(): Promise<void> {
-	let workspaceHandle: string;
+	let creationToken: number | undefined;
 	try {
-		workspaceHandle = currentWorkspaceHandle();
+		const workspaceHandle = currentWorkspaceHandle();
+		creationToken = useSessionDirectoryStore.getState().beginSessionCreation(workspaceHandle);
 		const created = await api.createSession(workspaceHandle);
 		const directory = useSessionDirectoryStore.getState();
-		directory.upsertSession(created.session);
-		directory.selectSession(created.session);
+		directory.completeSessionCreation(creationToken, created.session);
 		void directory.reloadSessions(workspaceHandle);
 	} catch (error) {
+		if (
+			creationToken !== undefined &&
+			!useSessionDirectoryStore.getState().failSessionCreation(creationToken)
+		) {
+			return;
+		}
 		toast.error(tt("session.newFailed"), {
 			description: displayError(error),
 		});
@@ -132,17 +154,20 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 		return;
 	}
 	const composer = useComposerStore.getState();
-	const text = composer.draft.trim();
-	if (!text && composer.images.length === 0) return;
+	const initial = composer.bySession[sessionHandle];
+	const text = serializeComposerMessage(initial?.command ?? null, initial?.draft ?? "");
+	if (!text && (initial?.images.length ?? 0) === 0) return;
 	if (!composer.beginSubmitForSession(sessionHandle)) return;
+	const submitted = useComposerStore.getState().bySession[sessionHandle];
+	if (!submitted) return;
 
 	const running = isRunning(sessionHandle);
 	let resolvedKind: SubmitKind = kind;
 	if (running && kind === "prompt") {
-		resolvedKind = composer.deliveryMode === "follow_up" ? "follow_up" : "steer";
+		resolvedKind = submitted.deliveryMode === "follow_up" ? "follow_up" : "steer";
 	} else if (!running) resolvedKind = "prompt";
 
-	const images = composer.images.length > 0 ? composer.images : undefined;
+	const images = submitted.images.length > 0 ? submitted.images : undefined;
 	try {
 		let response: RpcResponse;
 		if (resolvedKind === "steer" || resolvedKind === "follow_up") {
@@ -160,14 +185,21 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 		} else {
 			useComposerStore
 				.getState()
-				.clearDraftIfUnchangedForSession(sessionHandle, composer.draft, composer.images);
+				.clearDraftIfUnchangedForSession(
+					sessionHandle,
+					submitted.draft,
+					submitted.images,
+					submitted.command,
+					submitted.activeSubmitId,
+				);
 		}
 	} catch (error) {
 		toast.error(tt("session.sendFailed"), {
 			description: displayError(error),
 		});
 	} finally {
-		useComposerStore.getState().setSubmitStateForSession(sessionHandle, "plain");
+		useComposerStore.getState().finishSubmitForSession(sessionHandle, submitted.activeSubmitId);
+		reconcileHiddenSessionLifecycle(sessionHandle);
 	}
 }
 
@@ -180,28 +212,6 @@ export async function abortCurrentRun(): Promise<void> {
 		toast.error(tt("session.abortFailed"), {
 			description: displayError(error),
 		});
-	}
-}
-
-/** Run a slash command through Pi's prompt path for the addressed Session. */
-export async function runSlashCommand(sessionHandle: string, fullText: string): Promise<void> {
-	const composer = useComposerStore.getState();
-	if (!composer.beginSubmitForSession(sessionHandle)) return;
-	try {
-		const response = await sendControlCommand(sessionHandle, { type: "prompt", message: fullText });
-		if (response.success === false) {
-			toast.error(tt("session.commandFailed"), { description: stripAnsi(response.error) });
-		} else {
-			useComposerStore
-				.getState()
-				.clearDraftIfUnchangedForSession(sessionHandle, composer.draft, composer.images);
-		}
-	} catch (error) {
-		toast.error(tt("session.commandFailed"), {
-			description: displayError(error),
-		});
-	} finally {
-		useComposerStore.getState().setSubmitStateForSession(sessionHandle, "plain");
 	}
 }
 

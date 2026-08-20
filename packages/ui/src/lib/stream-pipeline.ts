@@ -261,6 +261,7 @@ function routeExtensionRequest(
 }
 
 function routeRekey(previousSessionHandle: string, runtime: SessionRuntimeDto): void {
+	useComposerStore.getState().rekeySession(previousSessionHandle, runtime.sessionHandle);
 	useSessionDirectoryStore.getState().rekeySession(previousSessionHandle, runtime.sessionHandle, runtime);
 	useExtensionUiStore.getState().resetSessionForGeneration(runtime.sessionHandle, runtime.generation);
 	scheduleDirectoryReload(runtime.workspaceId);

@@ -1,5 +1,6 @@
 import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { tt } from "../lib/i18n";
+import { presentUserMessage, serializePresentedUserMessage } from "../lib/user-message-presentation";
 import type {
 	AssistantStep,
 	ContentBlock,
@@ -360,8 +361,8 @@ function handleMessageStart(
 
 	if (message.role === "user") {
 		const ensured = ensureTurn(state, ctx);
-		const text = flattenText(message.content);
-		const explicitSource = ctx.resolveInjectionSource?.(text);
+		const presented = presentUserMessage(flattenText(message.content));
+		const explicitSource = ctx.resolveInjectionSource?.(serializePresentedUserMessage(presented));
 		const hasPriorConversationWork =
 			ensured.turn.userMessages.length > 0 ||
 			ensured.turn.steps.some(
@@ -375,7 +376,8 @@ function handleMessageStart(
 			...ensured.turn.userMessages,
 			{
 				entryKey: `${ensured.turn.id}:u${String(ensured.turn.userMessages.length)}`,
-				text,
+				text: presented.text,
+				...(presented.command ? { command: presented.command } : {}),
 				images: extractImages(message.content),
 				source,
 				delivered: true,

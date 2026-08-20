@@ -3,9 +3,10 @@ import {
 	buildSlashMenuGroups,
 	edgeSlashHighlight,
 	fuzzyScore,
-	insertSlashCommand,
 	moveSlashHighlight,
-	resolveSlashCommit,
+	resolveHighlightedSlashCommand,
+	resolveRawSlashCommand,
+	selectSlashCommand,
 } from "../src/features/composer/slash-menu-model";
 import type { RpcSlashCommand } from "../src/types/pi-types";
 
@@ -35,15 +36,8 @@ describe("slash menu model", () => {
 		const groups = buildSlashMenuGroups([command("skill:review", "skill")], "review");
 
 		expect(groups[0]?.items[0]).toMatchObject({ displayName: "review" });
-		expect(resolveSlashCommit(groups, "review")).toEqual({
-			kind: "execute",
-			commandName: "skill:review",
-		});
-		expect(resolveSlashCommit(groups, "skill:review")).toEqual({
-			kind: "execute",
-			commandName: "skill:review",
-		});
-		expect(resolveSlashCommit(groups, "rev")).toEqual({ kind: "none" });
+		expect(resolveHighlightedSlashCommand(groups, 0)?.command.name).toBe("skill:review");
+		expect(resolveHighlightedSlashCommand(groups, 1)).toBeNull();
 	});
 
 	it("wraps keyboard highlights in both directions", () => {
@@ -59,11 +53,28 @@ describe("slash menu model", () => {
 		expect(edgeSlashHighlight("last", 0)).toBe(0);
 	});
 
-	it("inserts a clicked command at the active slash token", () => {
-		expect(insertSlashCommand("Before /rev after", { index: 7, query: "rev" }, "skill:review")).toBe(
-			"Before /skill:review after",
-		);
-		expect(insertSlashCommand("/rev", { index: 0, query: "rev" }, "skill:review")).toBe("/skill:review ");
+	it("turns a clicked candidate into an atomic command and editable body", () => {
+		const item = buildSlashMenuGroups([command("skill:review", "skill")], "rev")[0]?.items[0];
+		expect(item).toBeDefined();
+		expect(selectSlashCommand("  /rev after", { index: 2, query: "rev" }, item!)).toEqual({
+			command: { name: "skill:review", displayName: "review", source: "skill" },
+			draft: "after",
+		});
+		expect(selectSlashCommand("/rev", { index: 0, query: "rev" }, item!)).toEqual({
+			command: { name: "skill:review", displayName: "review", source: "skill" },
+			draft: "",
+		});
+	});
+
+	it("normalizes only exact raw invocations and never guesses unknown commands", () => {
+		const commands = [command("skill:review", "skill"), command("compact", "extension")];
+		expect(resolveRawSlashCommand("/review src/lib", commands)).toEqual({
+			command: { name: "skill:review", displayName: "review", source: "skill" },
+			draft: "src/lib",
+		});
+		expect(resolveRawSlashCommand("/skill:review", commands)?.command.name).toBe("skill:review");
+		expect(resolveRawSlashCommand("/rev", commands)).toBeNull();
+		expect(resolveRawSlashCommand("ordinary /review text", commands)).toBeNull();
 	});
 
 	it("ranks exact, prefix, contains, and subsequence matches in that order", () => {

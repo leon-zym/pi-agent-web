@@ -50,6 +50,38 @@ function deleteBlockReason(reason: SessionDeleteBlockReason): string {
 	return tt(`sidebar.deleteBlocked.${reason}`);
 }
 
+export interface ExportHtmlResult {
+	path: string;
+	url: string;
+}
+
+export function parseExportHtmlResult(value: unknown): ExportHtmlResult {
+	if (
+		typeof value !== "object" ||
+		value === null ||
+		typeof (value as { path?: unknown }).path !== "string" ||
+		typeof (value as { url?: unknown }).url !== "string"
+	) {
+		throw new Error("invalid export response");
+	}
+	const result = value as ExportHtmlResult;
+	let parsedUrl: URL;
+	try {
+		parsedUrl = new URL(result.url);
+	} catch {
+		throw new Error("invalid export URL");
+	}
+	if (parsedUrl.protocol !== "file:") throw new Error("invalid export URL");
+	return result;
+}
+
+export async function copyExportHtmlUrl(
+	result: ExportHtmlResult,
+	clipboard: Pick<Clipboard, "writeText">,
+): Promise<void> {
+	await clipboard.writeText(result.url);
+}
+
 /**
  * Top row of the center column: workspace crumb, session title (inline
  * rename), process status and session actions.
@@ -94,20 +126,37 @@ export function SessionHeader() {
 
 	const exportHtml = async () => {
 		if (!sessionHandle) return;
+		let result: ExportHtmlResult;
 		try {
 			const response = await sendControlCommand(sessionHandle, { type: "export_html" });
-			const { path } = expectData(response) as { path: string };
-			toast.success(tt("header.exported"), {
-				description: stripAnsi(path),
-				action: {
-					label: tt("common.copyPath"),
-					onClick: () =>
-						void navigator.clipboard.writeText(path).then(() => toast.success(tt("common.pathCopied"))),
-				},
-			});
+			result = parseExportHtmlResult(expectData(response));
 		} catch (error) {
 			toast.error(tt("header.exportFailed"), {
 				description: displayError(error),
+			});
+			return;
+		}
+
+		try {
+			await copyExportHtmlUrl(result, navigator.clipboard);
+			toast.success(tt("header.exportedAndCopied"), {
+				description: stripAnsi(result.url),
+			});
+		} catch (error) {
+			toast.warning(tt("header.exportedCopyFailed"), {
+				description: `${stripAnsi(result.url)} · ${displayError(error)}`,
+				action: {
+					label: tt("common.copyUrl"),
+					onClick: () => {
+						void copyExportHtmlUrl(result, navigator.clipboard).then(
+							() => toast.success(tt("common.urlCopied")),
+							(retryError) =>
+								toast.error(tt("header.copyUrlFailed"), {
+									description: displayError(retryError),
+								}),
+						);
+					},
+				},
 			});
 		}
 	};

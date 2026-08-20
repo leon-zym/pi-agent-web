@@ -16,6 +16,8 @@ interface SessionDirectoryState {
 	currentWorkspaceHandle: string | null;
 	sessionsByWorkspace: Record<string, NativeSessionDto[]>;
 	currentSession: NativeSessionDto | null;
+	navigationToken: number;
+	sessionCreation: SessionCreationIntent | null;
 	selectedSessionByWorkspace: Record<string, string>;
 	unreadBySession: Record<string, boolean>;
 	loadingWorkspaces: boolean;
@@ -28,6 +30,9 @@ interface SessionDirectoryState {
 	selectWorkspace: (workspaceHandle: string) => Promise<void>;
 	reloadSessions: (workspaceHandle?: string, options?: { force?: boolean }) => Promise<NativeSessionDto[]>;
 	selectSession: (session: NativeSessionDto | null) => void;
+	beginSessionCreation: (workspaceHandle: string) => number;
+	completeSessionCreation: (token: number, session: NativeSessionDto) => boolean;
+	failSessionCreation: (token: number) => boolean;
 	upsertSession: (session: NativeSessionDto) => void;
 	applyRuntime: (runtime: SessionRuntimeDto) => void;
 	rekeySession: (previousSessionHandle: string, sessionHandle: string, runtime: SessionRuntimeDto) => void;
@@ -37,17 +42,35 @@ interface SessionDirectoryState {
 	setSearchQuery: (query: string) => void;
 }
 
+export interface SessionCreationIntent {
+	token: number;
+	workspaceHandle: string;
+}
+
 interface SessionRequest {
 	generation: number;
 	completion: Promise<NativeSessionDto[]>;
 }
 
 const sessionRequestByWorkspace = new Map<string, SessionRequest>();
+const transientAbandons = new Set<string>();
 let sessionRequestCounter = 0;
+let navigationTokenCounter = 0;
+
+const TRANSIENT_CONTROL_WAIT_MS = 5_000;
+
+export function isSessionBeingAbandoned(sessionHandle: string): boolean {
+	return transientAbandons.has(sessionHandle);
+}
 
 function nextSessionRequest(): number {
 	sessionRequestCounter += 1;
 	return sessionRequestCounter;
+}
+
+function nextNavigationToken(): number {
+	navigationTokenCounter += 1;
+	return navigationTokenCounter;
 }
 
 function isLatestSessionRequest(workspaceHandle: string, request: number): boolean {
@@ -58,6 +81,17 @@ function byMostRecent(left: NativeSessionDto, right: NativeSessionDto): number {
 	const leftTime = left.modifiedAt ? Date.parse(left.modifiedAt) : 0;
 	const rightTime = right.modifiedAt ? Date.parse(right.modifiedAt) : 0;
 	return rightTime - leftTime;
+}
+
+function preferredWorkspace(workspaces: NativeWorkspaceDto[]): NativeWorkspaceDto | undefined {
+	return workspaces.reduce<NativeWorkspaceDto | undefined>((preferred, candidate) => {
+		if (!preferred) return candidate;
+		if (candidate.lastOpenedAt === null) return preferred;
+		if (preferred.lastOpenedAt === null || candidate.lastOpenedAt > preferred.lastOpenedAt) {
+			return candidate;
+		}
+		return preferred;
+	}, undefined);
 }
 
 function mergeSession(sessions: NativeSessionDto[], session: NativeSessionDto): NativeSessionDto[] {
@@ -72,7 +106,7 @@ function sessionFromRuntime(runtime: SessionRuntimeDto): NativeSessionDto {
 		workspaceHandle: runtime.workspaceId,
 		nativeSessionId: runtime.nativeSessionId,
 		sessionFile: runtime.sessionFile,
-		persisted: runtime.sessionFile !== null,
+		persisted: runtime.recoverable,
 		createdAt: null,
 		modifiedAt: new Date(runtime.lastActivityAt).toISOString(),
 		messageCount: 0,
@@ -109,19 +143,173 @@ function activateSessionView(session: NativeSessionDto | null): void {
 	transport.claimSession(sessionHandle);
 }
 
-function releaseDormantView(sessionHandle: string | undefined, nextSessionHandle: string | null): void {
-	if (!sessionHandle || sessionHandle === nextSessionHandle) return;
-	const transport = sessionTransport.store.getState();
-	const channel = transport.sessions[sessionHandle];
+function releasableSessionState(sessionHandle: string): boolean {
+	const state = sessionTransport.store.getState().sessions[sessionHandle]?.runtime?.state;
+	if (state === "running" || state === "waiting_ui" || state === "starting") return false;
+	const composerState = useComposerStore.getState();
+	const composer =
+		composerState.bySession[sessionHandle] ??
+		(composerState.activeSessionHandle === sessionHandle ? composerState : undefined);
 	if (
-		channel?.runtime?.state === "running" ||
-		channel?.runtime?.state === "waiting_ui" ||
-		channel?.runtime?.state === "starting"
+		composer?.submitState === "submitting" ||
+		(composer?.attachmentWorkCount ?? 0) > 0 ||
+		(composer?.queue.steering.length ?? 0) > 0 ||
+		(composer?.queue.followUp.length ?? 0) > 0
 	) {
-		return;
+		return false;
 	}
+	if (useProjectionStore.getState().projections[sessionHandle]?.activeTurnId) return false;
+	return (useExtensionUiStore.getState().bySession[sessionHandle]?.dialogs.length ?? 0) === 0;
+}
+
+function releaseSessionChannel(sessionHandle: string): void {
+	if (!releasableSessionState(sessionHandle)) return;
+	const transport = sessionTransport.store.getState();
+	const runtime = transport.sessions[sessionHandle]?.runtime;
+	// The gateway cannot see browser-only drafts or attachments. Keep the lease for an
+	// unmaterialized Session while local content exists so its orphan reaper cannot
+	// discard the only runtime that still owns that draft's future Session identity.
+	if (runtime?.recoverable === false && hasLocalTransientContent(sessionHandle)) return;
 	transport.releaseSession(sessionHandle);
 	transport.unsubscribeSession(sessionHandle);
+}
+
+function transientManagement(sessionHandle: string): {
+	workspaceHandle: string;
+	generation: number;
+	fencingToken: string;
+} | null {
+	const channel = sessionTransport.store.getState().sessions[sessionHandle];
+	if (
+		!channel?.subscribed ||
+		channel.generation === null ||
+		!channel.lease.isController ||
+		!channel.lease.fencingToken ||
+		channel.runtime?.recoverable !== false ||
+		channel.runtime.state !== "idle"
+	) {
+		return null;
+	}
+	return {
+		workspaceHandle: channel.runtime.workspaceId,
+		generation: channel.generation,
+		fencingToken: channel.lease.fencingToken,
+	};
+}
+
+function hasLocalTransientContent(sessionHandle: string): boolean {
+	const composerState = useComposerStore.getState();
+	const composer =
+		composerState.bySession[sessionHandle] ??
+		(composerState.activeSessionHandle === sessionHandle ? composerState : undefined);
+	if (
+		composer &&
+		(composer.draft.length > 0 ||
+			composer.images.length > 0 ||
+			composer.trigger !== null ||
+			composer.command !== null ||
+			composer.submitState !== "plain" ||
+			composer.attachmentWorkCount > 0 ||
+			composer.queue.steering.length > 0 ||
+			composer.queue.followUp.length > 0 ||
+			composer.recentQueued.length > 0)
+	) {
+		return true;
+	}
+
+	const projection = useProjectionStore.getState().projections[sessionHandle];
+	if (projection && (projection.turns.length > 0 || projection.activeTurnId !== null)) return true;
+
+	const transport = sessionTransport.store.getState().sessions[sessionHandle];
+	if ((transport?.pendingExtensionRequests.length ?? 0) > 0) return true;
+	const extensionState = useExtensionUiStore.getState();
+	const extension =
+		extensionState.bySession[sessionHandle] ??
+		(extensionState.activeSessionHandle === sessionHandle ? extensionState : undefined);
+	return Boolean(
+		extension &&
+			(extension.dialogs.length > 0 ||
+				Object.keys(extension.status).length > 0 ||
+				Object.keys(extension.widgets).length > 0 ||
+				extension.title ||
+				extension.editorText),
+	);
+}
+
+async function abandonTransientChannel(
+	sessionHandle: string,
+	management: NonNullable<ReturnType<typeof transientManagement>>,
+): Promise<boolean> {
+	if (transientAbandons.has(sessionHandle)) return true;
+	transientAbandons.add(sessionHandle);
+	try {
+		await api.abandonTransientSession(management.workspaceHandle, sessionHandle, {
+			generation: management.generation,
+			fencingToken: management.fencingToken,
+		});
+		sessionTransport.store.getState().unsubscribeSession(sessionHandle);
+		useSessionDirectoryStore.getState().removeSession(management.workspaceHandle, sessionHandle);
+		return true;
+	} catch {
+		return false;
+	} finally {
+		transientAbandons.delete(sessionHandle);
+	}
+}
+
+function abandonUntouchedView(sessionHandle: string): boolean {
+	const management = transientManagement(sessionHandle);
+	if (!management || hasLocalTransientContent(sessionHandle)) return false;
+	void abandonTransientChannel(sessionHandle, management).then((abandoned) => {
+		if (!abandoned) releaseSessionChannel(sessionHandle);
+	});
+	return true;
+}
+
+/** Re-run background lifecycle admission after an async composer operation settles. */
+export function reconcileHiddenSessionLifecycle(sessionHandle: string): void {
+	if (useSessionDirectoryStore.getState().currentSession?.sessionHandle === sessionHandle) return;
+	if (abandonUntouchedView(sessionHandle)) return;
+	releaseSessionChannel(sessionHandle);
+}
+
+function releaseDormantView(sessionHandle: string | undefined, nextSessionHandle: string | null): void {
+	if (!sessionHandle || sessionHandle === nextSessionHandle) return;
+	if (abandonUntouchedView(sessionHandle)) return;
+	releaseSessionChannel(sessionHandle);
+}
+
+async function waitForTransientControl(
+	sessionHandle: string,
+): Promise<ReturnType<typeof transientManagement>> {
+	const transport = sessionTransport.store;
+	transport.getState().subscribeSession(sessionHandle);
+	transport.getState().claimSession(sessionHandle);
+	const existing = transientManagement(sessionHandle);
+	if (existing) return existing;
+
+	return new Promise((resolve) => {
+		let settled = false;
+		const finish = (management: ReturnType<typeof transientManagement>) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			unsubscribe();
+			resolve(management);
+		};
+		const unsubscribe = transport.subscribe(() => {
+			const management = transientManagement(sessionHandle);
+			if (management) finish(management);
+		});
+		const timer = setTimeout(() => finish(null), TRANSIENT_CONTROL_WAIT_MS);
+	});
+}
+
+async function discardStaleCreatedSession(session: NativeSessionDto): Promise<void> {
+	const management = await waitForTransientControl(session.sessionHandle);
+	if (management && (await abandonTransientChannel(session.sessionHandle, management))) return;
+	releaseSessionChannel(session.sessionHandle);
+	void useSessionDirectoryStore.getState().reloadSessions(session.workspaceHandle, { force: true });
 }
 
 export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, get) => ({
@@ -129,6 +317,8 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 	currentWorkspaceHandle: null,
 	sessionsByWorkspace: {},
 	currentSession: null,
+	navigationToken: 0,
+	sessionCreation: null,
 	selectedSessionByWorkspace: {},
 	unreadBySession: {},
 	loadingWorkspaces: false,
@@ -142,15 +332,19 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 			const current = get().currentWorkspaceHandle;
 			set({ workspaces, loadingWorkspaces: false });
 			if (current && workspaces.some((workspace) => workspace.workspaceHandle === current)) return;
-			const preferred = [...workspaces].sort((left, right) => {
-				if (left.pinned !== right.pinned) return left.pinned ? -1 : 1;
-				return (right.lastOpenedAt ?? 0) - (left.lastOpenedAt ?? 0);
-			})[0];
-			if (preferred) void get().selectWorkspace(preferred.workspaceHandle);
-			else {
-				set({ currentWorkspaceHandle: null, currentSession: null });
-				activateSessionView(null);
-			}
+			const preferred = preferredWorkspace(workspaces);
+			const previousSessionHandle = get().currentSession?.sessionHandle;
+			const navigationToken = nextNavigationToken();
+			set({
+				currentWorkspaceHandle: preferred?.workspaceHandle ?? null,
+				currentSession: null,
+				navigationToken,
+				sessionCreation: null,
+				loadingSessions: Boolean(preferred),
+			});
+			releaseDormantView(previousSessionHandle, null);
+			activateSessionView(null);
+			if (preferred) await get().reloadSessions(preferred.workspaceHandle);
 		} catch (error) {
 			set({ loadingWorkspaces: false, error: error instanceof Error ? error.message : String(error) });
 		}
@@ -193,21 +387,32 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 	selectWorkspace: async (workspaceHandle) => {
 		const workspace = get().workspaces.find((candidate) => candidate.workspaceHandle === workspaceHandle);
 		if (!workspace) return;
-		const previousSelection = get().selectedSessionByWorkspace[workspaceHandle];
-		const cached = get().sessionsByWorkspace[workspaceHandle] ?? [];
-		const cachedSelection = cached.find((session) => session.sessionHandle === previousSelection) ?? null;
+		const previousSessionHandle = get().currentSession?.sessionHandle;
+		const navigationToken = nextNavigationToken();
 		set({
 			currentWorkspaceHandle: workspaceHandle,
-			currentSession: cachedSelection,
+			currentSession: null,
+			navigationToken,
+			sessionCreation: null,
 			loadingSessions: true,
 			error: undefined,
 		});
-		activateSessionView(cachedSelection);
-		const sessions = await get().reloadSessions(workspaceHandle);
-		if (get().currentWorkspaceHandle !== workspaceHandle) return;
-		const selectedHandle = get().selectedSessionByWorkspace[workspaceHandle];
-		const selected = sessions.find((session) => session.sessionHandle === selectedHandle);
-		get().selectSession(selected ?? sessions[0] ?? null);
+		releaseDormantView(previousSessionHandle, null);
+		activateSessionView(null);
+		const activation = api
+			.activateWorkspace(workspaceHandle)
+			.then((activatedWorkspace) => {
+				set((state) => ({
+					workspaces: state.workspaces.map((candidate) =>
+						candidate.workspaceHandle === activatedWorkspace.workspaceHandle ? activatedWorkspace : candidate,
+					),
+				}));
+			})
+			.catch((error) => {
+				if (get().navigationToken !== navigationToken) return;
+				set({ error: error instanceof Error ? error.message : String(error) });
+			});
+		await Promise.all([activation, get().reloadSessions(workspaceHandle)]);
 	},
 
 	reloadSessions: (requestedWorkspaceHandle, options = {}) => {
@@ -264,8 +469,7 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 	},
 
 	selectSession: (session) => {
-		const workspaceHandle = get().currentWorkspaceHandle;
-		if (session && workspaceHandle !== session.workspaceHandle) return;
+		const workspaceHandle = session?.workspaceHandle ?? get().currentWorkspaceHandle;
 		const previousSessionHandle = get().currentSession?.sessionHandle;
 		const selectedSessionByWorkspace = { ...get().selectedSessionByWorkspace };
 		if (workspaceHandle) {
@@ -274,9 +478,54 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 		}
 		const unreadBySession = { ...get().unreadBySession };
 		if (session) delete unreadBySession[session.sessionHandle];
-		set({ currentSession: session, selectedSessionByWorkspace, unreadBySession });
+		set({
+			currentWorkspaceHandle: workspaceHandle,
+			currentSession: session,
+			navigationToken: nextNavigationToken(),
+			sessionCreation: null,
+			selectedSessionByWorkspace,
+			unreadBySession,
+		});
 		releaseDormantView(previousSessionHandle, session?.sessionHandle ?? null);
 		activateSessionView(session);
+	},
+
+	beginSessionCreation: (workspaceHandle) => {
+		const token = nextNavigationToken();
+		const previousSessionHandle = get().currentSession?.sessionHandle;
+		set({
+			currentWorkspaceHandle: workspaceHandle,
+			currentSession: null,
+			navigationToken: token,
+			sessionCreation: { token, workspaceHandle },
+			error: undefined,
+		});
+		releaseDormantView(previousSessionHandle, null);
+		activateSessionView(null);
+		return token;
+	},
+
+	completeSessionCreation: (token, session) => {
+		get().upsertSession(session);
+		const state = get();
+		if (
+			state.navigationToken !== token ||
+			state.sessionCreation?.token !== token ||
+			state.currentWorkspaceHandle !== session.workspaceHandle
+		) {
+			void discardStaleCreatedSession(session);
+			return false;
+		}
+		set({ sessionCreation: null });
+		get().selectSession(session);
+		return true;
+	},
+
+	failSessionCreation: (token) => {
+		const state = get();
+		if (state.navigationToken !== token || state.sessionCreation?.token !== token) return false;
+		set({ sessionCreation: null });
+		return true;
 	},
 
 	upsertSession: (session) => {
@@ -304,7 +553,7 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 			workspaceHandle,
 			nativeSessionId: runtime.nativeSessionId,
 			sessionFile: runtime.sessionFile,
-			persisted: runtime.sessionFile !== null,
+			persisted: runtime.recoverable,
 			runtime,
 		} satisfies NativeSessionDto;
 		const next = mergeSession(

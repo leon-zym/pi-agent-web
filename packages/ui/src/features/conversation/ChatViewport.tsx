@@ -1,8 +1,10 @@
 import { ArrowDown } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Skeleton } from "../../components/ui/skeleton";
 import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import { useProjectionStore } from "../../stores/projection";
+import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { EmptyHero } from "./EmptyHero";
 import { StatusRowView } from "./StatusRowView";
 import { TurnView } from "./TurnView";
@@ -17,6 +19,40 @@ interface SavedSessionScroll {
 }
 
 const savedSessionScroll = new Map<string, SavedSessionScroll>();
+
+function ConversationLoadingSkeleton() {
+	return (
+		<div
+			data-conversation-loading="true"
+			role="status"
+			aria-label={tt("common.loading")}
+			className="flex flex-1 flex-col gap-8 pt-6"
+		>
+			<div className="flex justify-end">
+				<div className="w-[min(78%,32rem)] rounded-xl border border-border/70 bg-surface/70 p-4">
+					<Skeleton className="h-3 w-11/12 rounded-full" />
+					<Skeleton className="mt-3 h-3 w-3/5 rounded-full" />
+				</div>
+			</div>
+			<div className="flex gap-3">
+				<Skeleton className="size-7 shrink-0 rounded-full" />
+				<div className="min-w-0 flex-1 space-y-3 pt-1">
+					<Skeleton className="h-3 w-4/5 rounded-full" />
+					<Skeleton className="h-3 w-full rounded-full" />
+					<Skeleton className="h-3 w-2/3 rounded-full" />
+				</div>
+			</div>
+			<div className="flex gap-3 opacity-60">
+				<Skeleton className="size-7 shrink-0 rounded-full" />
+				<div className="min-w-0 flex-1 space-y-3 pt-1">
+					<Skeleton className="h-3 w-3/4 rounded-full" />
+					<Skeleton className="h-3 w-1/2 rounded-full" />
+				</div>
+			</div>
+			<span className="sr-only">{tt("common.loading")}</span>
+		</div>
+	);
+}
 
 function rememberSessionScroll(sessionHandle: string, value: SavedSessionScroll): void {
 	savedSessionScroll.delete(sessionHandle);
@@ -78,6 +114,7 @@ export function ChatViewport() {
 	const projection = useProjectionStore((s) =>
 		currentSessionId ? s.projections[currentSessionId] : undefined,
 	);
+	const creatingSession = useSessionDirectoryStore((state) => state.sessionCreation !== null);
 
 	const scrollToBottom = useCallback(
 		(smooth = false) => {
@@ -146,6 +183,7 @@ export function ChatViewport() {
 		}
 	};
 
+	const isLoading = creatingSession || (currentSessionId !== null && projection === undefined);
 	const isEmpty = !projection || projection.turns.length === 0;
 
 	return (
@@ -156,7 +194,9 @@ export function ChatViewport() {
 			className="scroll-slim h-full overflow-y-auto overscroll-contain"
 		>
 			<div ref={contentRef} className="mx-auto flex min-h-full w-full max-w-[748px] flex-col px-6 py-6">
-				{isEmpty ? (
+				{isLoading ? (
+					<ConversationLoadingSkeleton />
+				) : isEmpty ? (
 					<EmptyHero />
 				) : (
 					<div className="flex flex-col gap-6">

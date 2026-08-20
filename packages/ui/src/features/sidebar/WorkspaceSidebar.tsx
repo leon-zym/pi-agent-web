@@ -46,7 +46,7 @@ import {
 import { Input } from "../../components/ui/input";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
 import { api } from "../../lib/api";
-import { displayError, displayLabel, formatRelativeTime, stripAnsi } from "../../lib/format";
+import { displayError, displayLabel, formatRelativeTime } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { type SessionDeleteBlockReason, sessionDeleteCapability } from "../../lib/session-capabilities";
 import { deleteSession, newSession, openSession, renameSession } from "../../lib/session-controller";
@@ -313,8 +313,12 @@ function WorkspaceGroup({
 	const selected = currentWorkspaceHandle === workspace.workspaceHandle;
 
 	const openWorkspace = async () => {
-		setExpanded(true);
 		await useSessionDirectoryStore.getState().selectWorkspace(workspace.workspaceHandle);
+	};
+	const toggleExpanded = () => {
+		const next = !expanded;
+		setExpanded(next);
+		if (next) void useSessionDirectoryStore.getState().reloadSessions(workspace.workspaceHandle);
 	};
 
 	const createSession = async () => {
@@ -347,10 +351,7 @@ function WorkspaceGroup({
 			>
 				<button
 					type="button"
-					onClick={() => {
-						if (selected) setExpanded(!expanded);
-						else void openWorkspace();
-					}}
+					onClick={toggleExpanded}
 					aria-expanded={expanded}
 					className="flex h-full min-w-0 flex-1 items-center gap-1.5 rounded-sm pl-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
 				>
@@ -586,10 +587,6 @@ export function WorkspaceSidebar({
 	const currentWorkspace = workspaces.find(
 		(workspace) => workspace.workspaceHandle === currentWorkspaceHandle,
 	);
-	const currentChannel = useSessionTransportStore((state) =>
-		currentSession ? state.sessions[currentSession.sessionHandle] : undefined,
-	);
-	const currentRuntime = currentChannel?.runtime ?? currentSession?.runtime ?? null;
 
 	const filtered = useMemo(() => {
 		const query = searchQuery.trim().toLowerCase();
@@ -612,10 +609,7 @@ export function WorkspaceSidebar({
 
 	if (rail) {
 		return (
-			<nav aria-label={tt("sidebar.navAria")} className="flex h-full flex-col items-center gap-1 py-2">
-				<div className="mb-2 flex size-9 items-center justify-center rounded-sm bg-primary-soft text-primary">
-					<Bot className="size-5" />
-				</div>
+			<nav aria-label={tt("sidebar.navAria")} className="flex h-full flex-col items-center gap-1 py-0.5">
 				{(onOpenNavigation || onToggleRail) && (
 					<Tooltip>
 						<TooltipTrigger asChild>
@@ -623,10 +617,11 @@ export function WorkspaceSidebar({
 								ref={navigationTriggerRef}
 								type="button"
 								aria-label={tt(onOpenNavigation ? "appShell.openSessions" : "appShell.expandSidebar")}
-								className="flex size-10 items-center justify-center rounded-sm text-ink-2 hover:bg-hover focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
+								className="group relative mb-2 flex size-10 items-center justify-center rounded-sm bg-primary-soft text-primary focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
 								onClick={onOpenNavigation ?? onToggleRail}
 							>
-								<PanelLeftOpen className="size-4" />
+								<Bot className="size-5 transition-opacity group-hover:opacity-0 group-focus-visible:opacity-0" />
+								<PanelLeftOpen className="absolute size-4 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100" />
 							</button>
 						</TooltipTrigger>
 						<TooltipContent side="right">
@@ -682,9 +677,9 @@ export function WorkspaceSidebar({
 
 	return (
 		<nav aria-label={tt("sidebar.navAria")} className="flex h-full flex-col">
-			<div className="flex h-11 flex-none items-center gap-2 px-3">
-				<div className="flex size-7 items-center justify-center rounded-md bg-primary-soft text-primary">
-					<Bot className="size-4" />
+			<div className="flex h-11 flex-none items-center gap-2 px-2">
+				<div className="flex size-10 items-center justify-center rounded-sm bg-primary-soft text-primary">
+					<Bot className="size-5" />
 				</div>
 				<span className="text-[13px] font-semibold text-ink">{tt("sidebar.brand")}</span>
 				<div className="flex-1" />
@@ -820,35 +815,7 @@ export function WorkspaceSidebar({
 								: tt("sidebar.themeDark")}
 					</TooltipContent>
 				</Tooltip>
-				{currentSession && (
-					<Tooltip>
-						<TooltipTrigger asChild>
-							<div
-								className="flex h-7 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-sm text-[11px] text-ink-3"
-								role="status"
-								aria-label={runtimeLabel(currentRuntime?.state ?? "dormant")}
-							>
-								<span
-									className={cn(
-										"size-1.5 rounded-full",
-										currentRuntime?.state === "running" && "bg-primary pulse-dot",
-										currentRuntime?.state === "starting" && "bg-warning pulse-dot",
-										currentRuntime?.state === "waiting_ui" && "bg-warning",
-										currentRuntime?.state === "idle" && "bg-success",
-										currentRuntime?.state === "crashed" && "bg-danger",
-										(!currentRuntime || currentRuntime.state === "dormant") && "bg-ink-3/40",
-									)}
-								/>
-								<span className="truncate font-mono">{runtimeLabel(currentRuntime?.state ?? "dormant")}</span>
-							</div>
-						</TooltipTrigger>
-						<TooltipContent>
-							{currentRuntime?.error
-								? stripAnsi(currentRuntime.error)
-								: runtimeLabel(currentRuntime?.state ?? "dormant")}
-						</TooltipContent>
-					</Tooltip>
-				)}
+				<div className="flex-1" />
 				<Tooltip>
 					<TooltipTrigger asChild>
 						<button

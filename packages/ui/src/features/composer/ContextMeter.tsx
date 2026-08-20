@@ -1,5 +1,4 @@
 import type { SessionStats } from "@earendil-works/pi-coding-agent";
-import { Gauge } from "lucide-react";
 import { useMemo } from "react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
 import { formatCost, formatTokens } from "../../lib/format";
@@ -48,25 +47,39 @@ export function ContextMeter() {
 	return (
 		<Tooltip>
 			<TooltipTrigger asChild>
-				<button
-					type="button"
+				<span
+					role="progressbar"
+					aria-valuemin={0}
+					aria-valuemax={100}
+					aria-valuenow={display.kind === "ready" ? Math.round(display.percent) : undefined}
 					aria-label={
 						display.kind === "ready"
 							? tt("context.ariaReady", { percent: Math.round(display.percent) })
 							: tt(display.kind === "loading" ? "context.loading" : "context.unavailable")
 					}
 					data-state={display.kind}
-					className="flex size-7 shrink-0 items-center justify-center gap-1 rounded-sm text-xs text-ink-3 transition-colors hover:bg-hover hover:text-ink-2 focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none max-lg:size-10 lg:h-7 lg:w-auto lg:px-2"
+					data-testid="context-meter"
+					className="flex size-7 shrink-0 items-center justify-center gap-1.5 rounded-full text-xs text-ink-3 max-lg:size-10 lg:h-7 lg:w-auto lg:px-1"
 				>
-					<Gauge className="size-3.5" />
+					<svg viewBox="0 0 20 20" className="size-5 shrink-0 -rotate-90" aria-hidden="true">
+						<circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" strokeWidth="2" opacity="0.2" />
+						{display.kind === "ready" && (
+							<circle
+								cx="10"
+								cy="10"
+								r="7"
+								fill="none"
+								stroke="var(--piw-primary)"
+								strokeWidth="2"
+								strokeLinecap="round"
+								pathLength="100"
+								strokeDasharray="100"
+								strokeDashoffset={100 - Math.min(100, Math.max(0, display.percent))}
+							/>
+						)}
+					</svg>
 					{display.kind === "ready" ? (
-						<span className="hidden items-center gap-1 sm:inline-flex">
-							<span className="h-1 w-10 overflow-hidden rounded-full bg-hover">
-								<span
-									className="block h-full rounded-full bg-primary"
-									style={{ width: `${Math.min(100, Math.max(2, display.percent))}%` }}
-								/>
-							</span>
+						<span className="hidden items-center sm:inline-flex">
 							<span className="font-mono tabular-nums">{Math.round(display.percent)}%</span>
 						</span>
 					) : (
@@ -74,7 +87,7 @@ export function ContextMeter() {
 							{tt(display.kind === "loading" ? "common.computing" : "context.unavailableShort")}
 						</span>
 					)}
-				</button>
+				</span>
 			</TooltipTrigger>
 			<TooltipContent className="font-mono text-[11px] whitespace-pre-line">{tooltip}</TooltipContent>
 		</Tooltip>

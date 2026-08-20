@@ -1,5 +1,5 @@
-import { ImagePlus, Plus, SendHorizontal, Square, Zap } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { ImagePlus, Plus, SendHorizontal, Square, X, Zap } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Button } from "../../components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
@@ -10,32 +10,23 @@ import { abortCurrentRun, submitDraft } from "../../lib/session-controller";
 import { cn } from "../../lib/utils";
 import { useComposerStore } from "../../stores/composer";
 import { selectActiveTurnId, useProjectionStore } from "../../stores/projection";
-import { useSessionDirectoryStore } from "../../stores/session-directory";
+import { reconcileHiddenSessionLifecycle, useSessionDirectoryStore } from "../../stores/session-directory";
 import { useSessionTransportStore } from "../../stores/session-transport";
 import { useSlashCommandsStore } from "../../stores/slash-commands";
 import { ContextMeter } from "./ContextMeter";
-import { resolveRunningSubmitKind } from "./composer-input";
+import {
+	detectSlashTrigger,
+	isSlashCommitKey,
+	resolveRunningSubmitKind,
+	shouldRemoveCommandOnBackspace,
+} from "./composer-input";
 import { ModelSelector } from "./ModelSelector";
 import { QueueDock } from "./QueueDock";
 import { SlashMenu, type SlashMenuHandle } from "./SlashMenu";
-import { insertSlashCommand } from "./slash-menu-model";
+import { resolveRawSlashCommand, selectSlashCommand } from "./slash-menu-model";
 
 const MAX_LINES = 14;
 const MAX_LENGTH = 100_000;
-
-function detectSlashTrigger(text: string, cursorIndex: number): { index: number; query: string } | null {
-	// A slash opens the menu at line start or after whitespace/punctuation, and
-	// never inside a URL (https:// must not trigger).
-	const start = text.lastIndexOf("/", cursorIndex - 1);
-	if (start === -1) return null;
-	const before = text[start - 1];
-	if (start > 0 && before !== undefined && !/[\s，。、：；！？""''（）：]/.test(before)) return null;
-	const after = text.slice(start + 1, cursorIndex);
-	if (/\s/.test(after)) return null;
-	if (/[.:]\/\//.test(text.slice(start - 2, start + 2))) return null;
-	if (after.startsWith("/")) return null;
-	return { index: start, query: after };
-}
 
 /**
  * Persistent sticky composer (DESIGN.md): one DOM instance across session
@@ -49,11 +40,14 @@ export function ComposerSeat() {
 	const draft = useComposerStore((s) => s.draft);
 	const images = useComposerStore((s) => s.images);
 	const trigger = useComposerStore((s) => s.trigger);
+	const command = useComposerStore((s) => s.command);
+	const preparingAttachments = useComposerStore((s) => s.attachmentWorkCount > 0);
 	const deliveryMode = useComposerStore((s) => s.deliveryMode);
 	const submitting = useComposerStore((s) => s.submitState === "submitting");
 	const setDraft = useComposerStore((s) => s.setDraft);
 	const setImages = useComposerStore((s) => s.setImages);
 	const setTrigger = useComposerStore((s) => s.setTrigger);
+	const setCommand = useComposerStore((s) => s.setCommand);
 	const setDeliveryMode = useComposerStore((s) => s.setDeliveryMode);
 
 	const hasWorkspace = useSessionDirectoryStore((s) => s.currentWorkspaceHandle !== null);
@@ -87,28 +81,28 @@ export function ComposerSeat() {
 		adjustHeight();
 	}, [draft]);
 
-	const exactCommandMatch = useMemo(() => {
-		if (!draft.trimStart().startsWith("/")) return true;
-		const token = draft.trimStart().split(/\s/, 1)[0]?.slice(1) ?? "";
-		return commands.some((command) => command.name === token);
-	}, [draft, commands]);
-
 	const submit = (mode: "prompt" | "steer" | "follow_up") => {
 		if (useComposerStore.getState().submitState === "submitting") return;
+		if (preparingAttachments) return;
 		if (!hasWorkspace || !hasSession || !canControl) {
 			toast.error(tt("composer.needWorkspaceSession"));
 			return;
 		}
-		if (draft.trimStart().startsWith("/") && !exactCommandMatch) {
-			toast.error(
-				tt("composer.unknownCommand", {
-					command: stripAnsi(draft.trimStart().split(/\s/, 1)[0] ?? ""),
-				}),
-				{
-					description: tt("composer.unknownCommandDesc"),
-				},
-			);
-			return;
+		if (!command && draft.trimStart().startsWith("/")) {
+			const resolved = resolveRawSlashCommand(draft, commands);
+			if (!resolved) {
+				toast.error(
+					tt("composer.unknownCommand", {
+						command: stripAnsi(draft.trimStart().split(/\s/, 1)[0] ?? ""),
+					}),
+					{
+						description: tt("composer.unknownCommandDesc"),
+					},
+				);
+				return;
+			}
+			setDraft(resolved.draft);
+			setCommand(resolved.command);
 		}
 		if (draft.length > MAX_LENGTH) {
 			toast.error(tt("composer.tooLong"));
@@ -132,16 +126,25 @@ export function ComposerSeat() {
 				slashMenuRef.current?.moveTo(event.key === "Home" ? "first" : "last");
 				return;
 			}
-			const commitWithEnter = event.key === "Enter" && !event.shiftKey;
-			const commitWithSpace =
-				event.key === " " && !event.shiftKey && !event.altKey && !event.metaKey && !event.ctrlKey;
-			if (commitWithEnter || commitWithSpace) {
-				const executed = slashMenuRef.current?.commitExact() ?? false;
-				if (executed) {
-					event.preventDefault();
-					return;
-				}
+			if (isSlashCommitKey(event)) {
+				event.preventDefault();
+				slashMenuRef.current?.commitHighlighted();
+				return;
 			}
+		}
+		if (
+			shouldRemoveCommandOnBackspace({
+				hasCommand: command !== null,
+				draft,
+				key: event.key,
+				composing,
+				selectionStart: event.currentTarget.selectionStart,
+				selectionEnd: event.currentTarget.selectionEnd,
+			})
+		) {
+			event.preventDefault();
+			setCommand(null);
+			return;
 		}
 		if (event.key === "Enter" && !event.shiftKey && !composing) {
 			event.preventDefault();
@@ -167,7 +170,7 @@ export function ComposerSeat() {
 		const value = el.value;
 		const cursor = el.selectionStart ?? value.length;
 		setDraft(value);
-		setTrigger(detectSlashTrigger(value, cursor));
+		setTrigger(command ? null : detectSlashTrigger(value, cursor));
 		adjustHeight();
 	};
 
@@ -175,13 +178,20 @@ export function ComposerSeat() {
 		if (!files) return;
 		const targetSessionHandle = useSessionDirectoryStore.getState().currentSession?.sessionHandle;
 		if (!targetSessionHandle) return;
-		const existing = useComposerStore.getState().bySession[targetSessionHandle]?.images ?? [];
+		const composer = useComposerStore.getState();
+		const attachmentWorkId = composer.beginAttachmentWorkForSession(targetSessionHandle);
+		const existing = composer.bySession[targetSessionHandle]?.images ?? [];
 		try {
 			const prepared = await prepareImageAttachments(Array.from(files), existing);
-			useComposerStore.getState().setImagesForSession(targetSessionHandle, prepared);
+			useComposerStore
+				.getState()
+				.finishAttachmentWorkForSession(targetSessionHandle, attachmentWorkId, prepared);
 		} catch (error) {
 			const code = error instanceof ImageAttachmentError ? error.code : "decode_failed";
 			toast.error(tt(`composer.imageError.${code}` as never));
+		} finally {
+			useComposerStore.getState().finishAttachmentWorkForSession(targetSessionHandle, attachmentWorkId);
+			reconcileHiddenSessionLifecycle(targetSessionHandle);
 		}
 	};
 
@@ -198,10 +208,11 @@ export function ComposerSeat() {
 			{trigger && (
 				<SlashMenu
 					ref={slashMenuRef}
-					onExecute={(commandName) => {
+					onSelect={(item) => {
 						if (!trigger) return;
-						setDraft(insertSlashCommand(draft, trigger, commandName));
-						setTrigger(null);
+						const selected = selectSlashCommand(draft, trigger, item);
+						setDraft(selected.draft);
+						setCommand(selected.command);
 						focus();
 					}}
 				/>
@@ -233,29 +244,52 @@ export function ComposerSeat() {
 							))}
 						</div>
 					)}
-					<textarea
-						ref={textareaRef}
-						value={draft}
-						onChange={onInput}
-						onKeyDown={onKeyDown}
-						onCompositionStart={() => setComposing(true)}
-						onCompositionEnd={() => setComposing(false)}
-						placeholder={
-							!hasWorkspace
-								? tt("composer.pickWorkspace")
-								: !hasSession
-									? tt("composer.pickSession")
-									: !canControl
-										? tt("lease.observerPlaceholder")
-										: running
-											? tt("composer.steerPlaceholder")
-											: tt("composer.defaultPlaceholder")
-						}
-						rows={1}
-						disabled={!canControl}
-						className="w-full resize-none bg-transparent text-[15px] leading-6 text-ink outline-none placeholder:text-ink-3"
-						style={{ maxHeight: 24 * MAX_LINES }}
-					/>
+					<div className="flex min-w-0 items-start gap-2">
+						{command && (
+							<span
+								data-testid="composer-command-token"
+								className="mt-0.5 inline-flex h-8 max-w-[45%] shrink-0 items-center gap-1 rounded-md border border-primary/20 bg-primary-soft px-2 font-mono text-[13px] text-primary max-lg:h-10"
+							>
+								<span className="truncate">/{command.displayName}</span>
+								<button
+									type="button"
+									aria-label={tt("composer.removeCommand", { command: command.displayName })}
+									className="-mr-1 inline-flex size-7 shrink-0 items-center justify-center rounded-sm text-primary/70 hover:bg-primary/10 hover:text-primary focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-primary max-lg:size-8"
+									onClick={() => {
+										setCommand(null);
+										focus();
+									}}
+								>
+									<X className="size-3" />
+								</button>
+							</span>
+						)}
+						<textarea
+							ref={textareaRef}
+							value={draft}
+							onChange={onInput}
+							onKeyDown={onKeyDown}
+							onCompositionStart={() => setComposing(true)}
+							onCompositionEnd={() => setComposing(false)}
+							placeholder={
+								!hasWorkspace
+									? tt("composer.pickWorkspace")
+									: !hasSession
+										? tt("composer.pickSession")
+										: !canControl
+											? tt("lease.observerPlaceholder")
+											: command
+												? tt("composer.commandArgsPlaceholder")
+												: running
+													? tt("composer.steerPlaceholder")
+													: tt("composer.defaultPlaceholder")
+							}
+							rows={1}
+							disabled={!canControl}
+							className="min-w-0 flex-1 resize-none bg-transparent text-[15px] leading-6 text-ink outline-none placeholder:text-ink-3"
+							style={{ maxHeight: 24 * MAX_LINES }}
+						/>
+					</div>
 				</div>
 				{running && (
 					<div className="px-3 pt-1 sm:hidden">
@@ -303,12 +337,12 @@ export function ComposerSeat() {
 									if (at) {
 										setTrigger(at);
 									} else {
-										setDraft(`${draft}/`);
-										setTrigger({ index: draft.length, query: "" });
+										setDraft("/");
+										setTrigger({ index: 0, query: "" });
 									}
 									focus();
 								}}
-								disabled={!canControl}
+								disabled={!canControl || command !== null || draft.length > 0}
 							>
 								<Plus className="size-4 text-ink-3" />
 							</Button>
@@ -323,7 +357,7 @@ export function ComposerSeat() {
 								className="max-lg:size-10 shrink-0"
 								aria-label={tt("composer.addImage")}
 								onClick={() => document.getElementById("piweb-image-input")?.click()}
-								disabled={!canControl}
+								disabled={!canControl || preparingAttachments}
 							>
 								<ImagePlus className="size-4 text-ink-3" />
 							</Button>
@@ -340,7 +374,7 @@ export function ComposerSeat() {
 							void pickImage(event.target.files);
 							event.currentTarget.value = "";
 						}}
-						disabled={!canControl}
+						disabled={!canControl || preparingAttachments}
 					/>
 
 					{running && (
@@ -398,7 +432,12 @@ export function ComposerSeat() {
 									size="icon"
 									aria-label={running ? tt("composer.steerSend") : tt("composer.send")}
 									className="size-[34px] max-lg:size-10 shrink-0 rounded-full"
-									disabled={!canControl || submitting || (!draft.trim() && images.length === 0)}
+									disabled={
+										!canControl ||
+										submitting ||
+										preparingAttachments ||
+										(!command && !draft.trim() && images.length === 0)
+									}
 									onClick={() =>
 										running ? submit(deliveryMode === "follow_up" ? "follow_up" : "steer") : submit("prompt")
 									}
