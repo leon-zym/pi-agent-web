@@ -1,131 +1,217 @@
-# 协议 — Pi RPC 事实地图
+# 协议 — Pi RPC 与 Session Web Gateway
 
-本文档是工程内对 Pi Coding Agent RPC 协议**已核实事实**的沉淀（对照 0.84.2 源码逐项验证）。编码时以本文档与 `@earendil-works/pi-coding-agent` 的类型导出为准。
+本文区分上游 **Pi RPC** 与 Pi Agent Web 自己的 REST/WebSocket 协议。事实已对照当前依赖
+`@earendil-works/pi-coding-agent@0.84.2` 与本仓库 runtime guards 核对；升级 Pi 时必须重新验证。
 
-## 传输与分帧
+## 1. Pi RPC 传输
 
-- stdin/stdout 严格 JSONL，**仅按 LF 切分**；U+2028/U+2029 是合法 JSON 字符串内容，禁止 readline；容忍行尾 \r；非 JSON 行静默丢弃。
-- 命令可带可选 `id`；对应 response 回传相同 id。事件帧（`type` 为事件名）不带 id。
-- stdout 三类帧：`response`（命令结果）、`extension_ui_request`（扩展 UI）、事件帧。
-- ⚠ 顺序保证是「写入顺序」而非「因果顺序」：`get_*` 快照 response 可能夹在事件流中间到达。前端以事件流为权威。
+- 子进程 stdin/stdout 使用 JSONL，只按 LF 分帧；U+2028/U+2029 是合法 JSON 字符，禁止用
+  `readline`。输入容忍 CRLF。
+- stdout 帧分为 `response`、`extension_ui_request` 与 Agent Session event。命令可带 `id`，
+  response 回传相同 id；事件本身没有命令 id。
+- response 与事件只有写入顺序，没有业务因果保证。`get_*` response 可能夹在同一 Session
+  的事件流中间。
+- 普通 stdout 行上限 8 MiB。Pi 会把 `get_messages` 作为单行 response 输出，因此仅在该命令
+  pending 期间把 reader 预算临时提高到 64 MiB；解析后，任何大于 8 MiB 的行还必须是 id 与
+  command 都精确匹配当前 pending `get_messages` 的 response，否则 fail closed。完成、失败或
+  timeout 后立即恢复 8 MiB；更大快照同样 fail closed。
+- 不超过 8 MiB、无法解析的脏行可被容忍并丢弃；超过 8 MiB 的不可解析行按上一条 fail closed。
+  形似协议帧但字段非法的 typed JSON 被当作该 Session 的协议故障，不能让扩展输出触发整个
+  Gateway 的未捕获异常。
 
-## 命令矩阵（要点）
+### 命令事实
 
-| 命令 | 关键事实 |
+| 命令 | 已验证语义 |
 |---|---|
-| `prompt` | 支持 `images`；流式时**必须**带 `streamingBehavior`（否则 `success:false`）；`success:true` 只表示被接受，运行失败走事件流（assistant 消息 `stopReason:"error"`）；`/` 扩展命令流式时也立即执行 |
-| `steer` / `follow_up` | 排队注入（本轮工具完成后 / 完全空闲后）；空闲时发送同样有效；扩展命令被拒绝 |
-| `abort` | 中断生成与工具，响应在完全静止后返回 |
-| `set_model` | 不在快照中返回 `Model not found`；持久化 settings.json 并写 `model_change` 条目 |
-| `set_thinking_level` | 无效级别被静默钳制；事件 `thinking_level_changed` 回显实际值 |
-| `get_available_models` | 返回 `{models}` 包裹；只含已配置认证的 Provider |
-| `get_available_thinking_levels` | 基础集合 off/minimal/low/medium/high；xhigh/max 仅在模型 `thinkingLevelMap` 声明时出现 |
-| `new_session` / `switch_session` / `fork` | 可被扩展取消，返回 `{cancelled}`；fork 只接受 user 消息 entryId |
-| `get_entries` | `since` 游标增量拉取，未命中返回 `success:false`；返回 `{entries, leafId}` |
-| `get_tree` | `{tree, leafId}`；孤儿条目作为根返回 |
-| `get_messages` | 仅内存中当前活动分支（不含被压缩历史；全量历史用 get_entries） |
-| `get_state` | `model` 未选时缺失；`sessionFile` 在 --no-session 时缺失 |
-| `get_session_stats` | `contextUsage.tokens/percent` 刚压缩后可能为 **null** |
-| `bash` | **必须带 id**（关联 `bash_execution_update{id,delta}`）；结果延迟落库（挂起到 agent_end / 下一个 prompt 前） |
-| `get_commands` | `{commands}` 包裹；source ∈ extension/prompt/skill；skill 带 `skill:` 前缀；内置 TUI 命令不在列表 |
-| `set_session_name` | 空字符串报错；写入 `session_info` 条目 |
+| `prompt` | 支持 `images`；流式时必须带 `streamingBehavior`；`success:true` 只表示已接受，最终错误在事件流中 |
+| `steer` / `follow_up` | 分别在本轮工具闭环后、完全空闲后注入；空闲时也有效；扩展 slash command 不接受这两种投递 |
+| `abort` | 中断生成与工具，待运行静止后返回 |
+| `set_model` | 只接受可用模型；持久化设置并产生 `model_change`；不改变已经开始的请求 |
+| `set_thinking_level` | 无效级别可能被钳制；`thinking_level_changed` 回显实际值 |
+| `get_available_models` | 返回 `{models}`，只含当前已配置认证的 Provider |
+| `get_available_thinking_levels` | 基础集合加模型声明的扩展级别；UI 不硬编码最终列表 |
+| `new_session` / `switch_session` | Pi 支持，但 Web 将它们视为 Host-managed，浏览器导航不得直接调用 |
+| `fork` / `clone` | 可被扩展取消；fork 只接受 user message entry id；成功后进程身份转到 child Session |
+| `get_entries` | `since` 游标增量拉取；游标不存在时 `success:false`；返回 `{entries, leafId}` |
+| `get_tree` | 返回 `{tree, leafId}`；孤儿条目成为根 |
+| `get_messages` | 当前活动分支的内存消息快照，不等于完整 JSONL 历史 |
+| `get_state` | 未选模型时可缺 `model`；正常持久化模式返回 `sessionId` 与 `sessionFile` |
+| `get_session_stats` | 压缩边界上 `contextUsage.tokens/percent` 可为 `null` |
+| `bash` | 必须带 id，以关联 `bash_execution_update{id,delta}`；结果可能延后落库 |
+| `get_commands` | `{commands}`；source 为 extension/prompt/skill，skill 名带 `skill:` 前缀 |
+| `compact` | 手动压缩只发 `compaction_start/end`，不保证随后有 `agent_settled` |
+| `set_session_name` | 空名称报错，并写 `session_info` 条目 |
 
-## Web Gateway 会话控制
+Gateway command timeout 是本项目策略，不是浏览器输入：默认读取 30 秒，prompt/steer/
+follow_up 120 秒，abort 90 秒，compact/export 120 秒。Timeout 后身份变更命令属于不确定状态，
+Gateway 会停止进程并重新验证，而不是继续把它当作旧 Session。
 
-浏览器先以允许的 loopback Origin 请求 `GET /api/v1/bootstrap`，获得启动期随机 secret 对应的
-HttpOnly、SameSite=Strict Cookie。除了 bootstrap 外，REST 和 WebSocket upgrade 都必须通过 Cookie
-校验；带 `Origin` 的请求还会校验 Origin。浏览器同源 GET 不发送 `Origin` 时，REST 仅接受
-`Sec-Fetch-Site: same-origin`；服务不接受非 loopback listener。
+### 事件投影
 
-连接随后用 `session_claim` 取得 Workspace controller lease，再发送控制命令。控制命令和 Extension
-UI 回包必须携带 `expectedSessionId`；Gateway 在同一 Workspace 的互斥队列里校验 lease、当前 session
-和 JSONL Header 的 Workspace 归属。`lease_status` 只说明当前连接是否拥有控制权，`session_state`
-广播当前会话的 id、文件路径和递增 epoch。observer 可以订阅事件、读取快照并缓存 dialog，但不能改变
-Pi 状态；取得 controller 后才显示并回应仍未过期的 dialog。
+| 事件 | 投影规则 |
+|---|---|
+| `agent_start` | 开始 Product Turn；可先于首条 user message |
+| `turn_start` | 声明模型轮次边界；不应留下无内容的永久 step |
+| `message_start` | user 建消息；assistant 建/复用 step 内容；toolResult 归位到 tool call |
+| `message_update` | **delta-only**；按 message、contentIndex 与事件类型追加，usage 取最新值 |
+| `message_end` | 权威最终消息；全量替换内容但保持稳定 UI key |
+| `tool_execution_start/update/end` | preparing → running → done/error；`partialResult` 是累积快照 |
+| `turn_end` | 结算 step；其 `toolResults` 只用于统计，显示仍以 toolResult message 为准 |
+| `agent_end` | `willRetry:true` 时仍未结算 Product Turn |
+| `agent_settled` | Agent run 的最终结算边界 |
+| `queue_update` | `{steering[], followUp[]}`，按 Session 更新 Queue Dock |
+| `compaction_start/end` | `willRetry:false` 的 end 结算手动 compact；自动重试链不能提前 idle |
+| `auto_retry_*` / `summarization_retry_*` | 重试与状态行 |
+| `bash_execution_update` | 终端增量；Bridge 将内部执行 id 恢复为发起连接的 public id |
+| `thinking_level_changed` / `session_info_changed` | 更新 Session 快照或目录；目录事件使用 forced refresh 绕过短 TTL |
+| `extension_error` | Pi 直接写 stdout 的额外 wire event，不属于上游 Agent Session event union |
 
-会话目录 REST 只扫描已经写入磁盘的 JSONL。Pi 刚执行 `new_session` 时，当前 Host 会话可能仍在内存中，
-此时 `get_state.sessionId` / `sessionFile` 先于首条 entry 成为事实；UI 必须暂时保留这个活动会话的摘要，
-不能因为目录快照为空就取消当前选择。首条 entry 落盘后，摘要再与正常扫描结果合并。
+`stopReason`：`length` 表示截断且未执行准备中的工具；`error` 结算为错误；`aborted` 保留
+partial 并标记已停止。零 delta 的 assistant start/end 是合法序列。
 
-| Browser → Gateway | 必填字段 | 语义 |
+### Extension UI
+
+- 阻塞方法：`select`、`confirm`、`input`、`editor`。响应分别为 `{value}`、`{confirmed}` 或
+  `{cancelled:true}`；Editor 没有 Agent timeout，Host 必须在断连/进程丢失时收敛。
+- 语义状态：`setStatus`、`setWidget`、`setTitle`、`set_editor_text`；相同 key 替换，clear 删除。
+- `notify` 是瞬时 Toast，不应在 snapshot 中重复播放。
+- Web 为 request 设置数量/字节上限，并以 `extension_ui_closed` 向所有订阅者公布 answered、
+  cancelled、expired、process_lost 或 replaced。
+
+## 2. 本地访问控制
+
+Gateway 只接受 `127.0.0.1`、`localhost` 或 `::1` listener。浏览器先请求
+`GET /api/v1/bootstrap`；Gateway 校验 Host 与允许的 loopback Origin 后写入启动期随机的
+HttpOnly、SameSite=Strict Cookie。
+
+其余 REST 与 WebSocket upgrade 必须带 Cookie：
+
+- 有 `Origin` 时必须与允许的 loopback origin 匹配；
+- 浏览器同源 GET 缺少 `Origin` 时必须有 `Sec-Fetch-Site: same-origin`；
+- Host 本身也必须是 loopback，防止 DNS rebinding 用恶意域名同源读取本机数据。
+
+这层保护用于阻止普通网页跨站驱动 localhost，不是面向远程用户、敌对本机进程或共享账户的
+认证系统。
+
+## 3. Native REST
+
+除 bootstrap 外，下列路径都位于 `/api/v1` 且需要 Cookie。
+
+| Method / path | 语义 |
+|---|---|
+| `GET /health` | 服务与版本健康状态 |
+| `GET /auth/status` | Provider 是否已配置，不返回 credential 内容 |
+| `POST /auth/keys` | 保存一个 Provider key，并广播 `auth_changed` |
+| `POST /workspaces/pick-directory` | Gateway 所在操作系统的原生目录选择器 |
+| `GET /workspaces` | 从 native history、preferences 与 hot runtimes 投影 Workspace |
+| `POST /workspaces` | 添加/更新 path preference；不创建另一份 Workspace 数据 |
+| `DELETE /workspaces/:workspaceHandle` | 仅移除 preference；response 明示 native history 是否保留 |
+| `GET /workspaces/:workspaceHandle/sessions` | native Session 摘要；`?refresh=1` 强制绕过 catalog snapshot TTL |
+| `POST /workspaces/:workspaceHandle/sessions` | 用该 Workspace 的解析布局创建独立 Pi Session runtime |
+| `GET /workspaces/:workspaceHandle/sessions/:sessionHandle/process` | hot runtime，或合成的 dormant 状态 |
+| `DELETE /workspaces/:workspaceHandle/sessions/:sessionHandle` | 受 fencing 保护的可恢复文件移动 |
+
+Session DELETE 额外要求：
+
+```text
+X-Pi-Session-Generation: <exact positive integer>
+X-Pi-Fencing-Token: <current opaque controller token>
+```
+
+删除会在 supervisor reservation 内 force-refresh，再校验 Workspace/Session handle、Header id/cwd、
+子 Session、运行状态与文件 identity。成功返回 `{ok:true,recoverable:true}`；它不承诺当前 UI 已
+提供 restore/purge。
+
+## 4. Browser → Gateway WebSocket
+
+所有输入先经 `@pi-agent-web/protocol` 严格 guard，未知字段也会拒绝。单 frame 上限 8 MiB，
+每连接最多 32 个 in-flight command。
+
+| `type` | 必填字段 | 语义 |
 |---|---|---|
-| `session_listen` | `workspaceId`, `sessionId` | 建立只读事件作用域，并定向收到当前 `session_state`。 |
-| `session_claim` / `session_release` | `workspaceId` | 取得 / 释放 Workspace controller lease。 |
-| `command` | `workspaceId`, `expectedSessionId`, `command` | 受 lease 与 session epoch 保护的 Pi 命令。 |
-| `extension_ui_response` | `workspaceId`, `expectedSessionId`, `response` | 仅原 controller 可回应其当前 session 的待处理 dialog。 |
+| `session_subscribe` | `sessionHandle`, optional `{generation,seq}` cursor | 激活/订阅并获取 baseline 与 replay/resync |
+| `session_unsubscribe` | `sessionHandle` | 停止该连接的事件消费；不停止 Pi |
+| `session_claim` | `sessionHandle` | 尝试取得该 Session 的 controller lease |
+| `session_release` | `sessionHandle` | 释放该连接持有的 Session lease |
+| `command` | `sessionHandle`, `expectedGeneration`, optional `fencingToken`, `command` | 只读命令无需 token；mutation 必须精确匹配 token 与 generation |
+| `extension_ui_response` | `sessionHandle`, `expectedGeneration`, `fencingToken`, `response` | 回应当前 generation 的待处理 dialog |
 
-Gateway 使用 `@pi-agent-web/protocol` 的 runtime guard 拒绝未知字段、错误类型和超出长度限制的帧。
-每个连接命令分配内部 Pi id，response 回传前恢复 client id，因此不同标签页相同 client id 不会互相覆盖。
-每连接最多 32 个 in-flight 命令；WS 帧和 JSONL 单行的上限均为 8 MiB；超过 1 MiB pending 输出的
-慢 socket 会被关闭。
+Prompt/steer/follow_up 文本按 UTF-8 编码后上限 1 MiB。可以是 image-only，但 text 与 images
+不能同时为空；最多 16 张图片，每张 base64 ASCII payload 不超过 2 MiB，总 base64 payload 不超过
+6 MiB。共享 guard 还会对 `JSON.stringify` 后的完整 UTF-8 browser frame 执行 8 MiB 上限，因此
+反斜杠/引号转义、CJK 文本与图片组合不能绕过 transport 预算。UI 在 `WebSocket.send` 前执行同一
+整帧检查，并会预先解码、缩放和压缩图片；协议 guard 是最终边界而不是图片处理器。
 
-命令 timeout 是 Gateway policy，而不是浏览器输入：普通读取 30 秒，prompt/steer/follow-up 120 秒，
-abort 90 秒，compact/export 120 秒。客户端只显示等于或略长于这些期限的等待状态。
+## 5. Gateway → Browser WebSocket
 
-## 事件流（JsonAgentSessionEvent 关键子集）
+| `type` | 核心字段 | 语义 |
+|---|---|---|
+| `runtime_state` | `runtime` | Session 的 handle/workspace/id/file/generation/lastSeq/state/recoverable |
+| `event` | Session envelope + `event` | 权威 Pi/extension error 事件 |
+| `response` | handle, generation, `barrierSeq`, Pi response, optional previous handle | 只发回命令发起连接 |
+| `lease_status` | handle, `isController`, controller-only token | 当前连接在该 Session 的权限快照 |
+| `resync_required` | handle, runtime, reason | initial/generation_changed/gap/invalid_cursor |
+| `extension_ui_snapshot` | handle, generation, requests | catch-up 时的原子待处理/semantic UI 状态 |
+| `extension_ui_request` | sequenced request | live blocking/semantic/notify 请求 |
+| `extension_ui_result` | request id, accepted/no_dialog/not_running | 只确认 response admission；closed 帧负责全体收敛 |
+| `extension_ui_closed` | sequenced request id + reason | 所有订阅者删除对话框或 semantic request |
+| `session_rekeyed` | previous handle + authoritative runtime | new/fork/clone 或 catch-up identity 迁移 |
+| `session_error` | handle, operation, error | subscribe/claim/release/extension response 错误 |
+| `session_directory_changed` | workspace id | 触发该 Workspace 的 forced native catalog refresh |
+| `auth_changed` | optional workspace id | 重新获取模型/认证状态 |
 
-| 事件 | 投影消费 |
+Session envelope 是 `{sessionHandle,workspaceId,generation,seq}`。Runtime state：`starting`、`idle`、
+`running`、`waiting_ui`、`crashed`、`dormant`。
+
+### Subscribe 与 response barrier
+
+若请求的 handle 在 catch-up 中 fork/clone 到新 handle，Bridge 先发 synthetic `session_rekeyed`，
+让 UI 能关联 baseline。Bridge 的 wire 顺序为：runtime → replay 或 `resync_required` → Extension
+snapshot → lease → live。UI 不会把 baseline 中的 `resync_required` 提前暴露给 consumer；它先原子
+应用 Extension snapshot，再启动 snapshot resync，避免丢失让 Pi 阻塞的对话框。catch-up 窗口的
+新帧先缓冲，再按 generation/seq 去重；unsubscribe、重复 subscribe、close 与 buffer overflow 都会
+取消旧 continuation。
+
+Pi response 到达时 Gateway 记录 `barrierSeq`。UI 必须先应用同 generation 中不大于该序号的事件，
+再 resolve command。`get_messages` 是 resync 的特殊启动命令：它的 response 本身推进 snapshot barrier，
+否则“等待投影后 resolve / 等 response 才重建投影”会形成死锁。
+
+### 有界性与 backpressure
+
+- Runtime replay 默认同时受 1024 frame 与 8 MiB 限制；startup/transition staging、Extension state、
+  dialogs、UI raw events 和 resync buffers都有独立 item/byte ceiling。
+- Catch-up 与每连接应用层 outbound queue 分别限制积压。单个合法 `get_messages` snapshot response
+  （Pi JSONL line 不超过 64 MiB，另有固定上限的 Web envelope）可以成为唯一 oversized send/queue
+  item；其前后的普通 queued backlog 仍不得超过 1 MiB。已有 socket backlog 超过 1 MiB、出现第二个
+  oversized item 或追加 backlog 越界时才断开。
+- 浏览器断开时 pending command reject、catch-up 取消、controller lease 释放；不保留幽灵 token。
+
+## 6. Pi 存储与目录配置
+
+| 文件/目录 | 说明 |
 |---|---|
-| `agent_start` | 新建 ProductTurn（running） |
-| `turn_start` | 新建 AssistantStep（一轮 = 一次模型响应 + 其工具执行） |
-| `message_start(role)` | user → 用户消息节点；assistant → 内容块种子；toolResult → 工具结果归位（**渲染以它为准**） |
-| `message_update` | 仅含增量（无累积 snapshot）：`text_/thinking_/toolcall_{start,delta,end}` + `usage`；按 contentIndex 局部追加 |
-| `message_end` | 权威最终消息，全量替换但保留 key；stopReason 裁决状态 |
-| `tool_execution_start/update/end` | 两阶段状态；update 的 partialResult 是**累积快照**（覆写） |
-| `turn_end` | Step 结算；`toolResults` 只用于结算统计，不渲染 |
-| `agent_end` | `willRetry:true` 表示自动重试中，**不可结算 Turn** |
-| `agent_settled` | 唯一 Turn 结算信号 |
-| `queue_update` | `{steering[], followUp[]}` → Queue Dock |
-| `compaction_start/end`、`auto_retry_*`、`summarization_retry_*` | 状态行 |
-| `bash_execution_update` | 终端增量输出 |
-| `extension_error` | stdout 直发帧（不在会话事件总线内），Toast 展示 |
-| `thinking_level_changed` / `session_info_changed` / `entry_appended` | 目录/菜单回显 |
+| `~/.pi/agent/auth.json` | Provider credential；Gateway 只显示是否配置 |
+| `~/.pi/agent/settings.json` | 全局模型、thinking、重试、压缩与可选 `sessionDir` |
+| `<workspace>/.pi/settings.json` | 项目级覆盖与可选 `sessionDir`；project 覆盖 global |
+| 默认 Session 目录 | `<agentDir>/sessions/--<encoded-cwd>--/*.jsonl` |
+| 自定义 Session 目录 | env/global/project 指定的直接目录，不再追加 cwd 编码 |
+| Web data | Workspace presentation preferences、启动期控制数据与 recoverable trash；不保存正常 Session 副本 |
 
-⚠ `session_start` / `session_shutdown` 是扩展专用事件，不出现于 stdout；以 `get_state.sessionId` 变化推断会话边界。
+默认目录编码只用于发现候选目录：
 
-## stopReason 语义
+```text
+"--" + resolvedCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-") + "--"
+```
 
-- `length`：输出被上限截断，工具调用**不会执行**（Pi 会发 start+end(isError) 错误结果；前端将 preparing 工具标 skipped，永不转 running）。
-- `error`：Turn → error（`errorMessage` 展示）。
-- `aborted`：Turn → aborted（保留 partial，弱化「已停止」标记）。
-- abort/error 可能产生零 delta 的 assistant 消息（message_start+message_end 直连），前端需容忍。
+任何扫描、打开、计数或删除仍要读取 Header `cwd` 并比较 canonical real path。相对
+`PI_CODING_AGENT_DIR`、`PI_CODING_AGENT_SESSION_DIR` 与 settings `sessionDir` 按每个 Pi child 的
+Workspace cwd 解析；Gateway 必须让 Catalog 与 child 看到相同结果。
 
-## Extension UI 子协议
+## 7. Pi runtime 解析
 
-- 阻塞对话框 `select/confirm/input/editor`：Agent 原地阻塞等 `extension_ui_response`；`timeout` 存在时 Agent 侧自动降级默认值（select/input/editor → undefined，confirm → false）；`editor` 无 timeout，完全依赖 Host 断连保护。
-- 响应格式：`{value}` / `{confirmed}` / `{cancelled:true}`。
-- 单向通知：`notify`（Toast）、`setStatus`（状态栏）、`setWidget`（仅字符串数组）、`setTitle`、`set_editor_text`。
-- RPC 降级：`custom()` 返回 undefined；working indicator / footer / header / editor 组件均为 no-op；`getEditorText()` 返回 ""。
+1. `--pi-path` / `PI_PATH`：本项目约定，可指向 executable、安装目录或 rpc entry；
+2. `PATH` 中的全局 `pi`；
+3. 已安装 `@earendil-works/pi-coding-agent` 的 `dist/rpc-entry.js`，包括常见 Homebrew 布局探测。
 
-## 本地存储
-
-| 文件 | 说明 |
-|---|---|
-| `~/.pi/agent/auth.json` | `Record<providerId, Credential>`；权限 600；写入用 proper-lockfile |
-| `~/.pi/agent/settings.json` | 默认模型/思考级别/steering 模式/压缩与重试开关 |
-| `<workspace>/.pi/settings.json` | 项目级覆盖 |
-| `~/.pi/agent/sessions/--<encoded-cwd>--/*.jsonl` | Append-only；首行 SessionHeader（version 3）；文件名 `<ISO时间戳>_<uuidv7>.jsonl` |
-
-Workspace Registry 位于 Gateway 自己的数据目录（默认 agent 目录的同级 `web`）。它由单实例锁保护；
-认证与 Registry 使用唯一临时文件、fsync、原子 rename 写入。`auth.json` 无法解析时拒绝覆盖以保留用户凭据。
-会话目录编码只能用于定位：因为不同 cwd 可编码到同一目录，扫描、切换、删除和计数一律再比对 Header 的
-`cwd` realpath。活动会话删除以 `get_state.sessionFile` 的规范化绝对路径作 409 防护，而非 Header UUID。
-
-编码算法：`"--" + resolvedCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-") + "--"`。
-
-环境变量（网关必须读取并透传子进程）：`PI_CODING_AGENT_DIR`（覆盖 agent 配置目录）、
-`PI_CODING_AGENT_SESSION_DIR`（覆盖 Pi 的会话存储目录）。默认情况下 Pi 使用
-`<agentDir>/sessions/--<encoded-cwd>--/`；显式的 `PI_CODING_AGENT_SESSION_DIR` / `--session-dir`
-是“直接存储目录”，不会再自动追加 cwd 编码子目录，并且 Pi 会通过 JSONL Header 的 `cwd` 过滤列表。
-因此网关的“session root + 每个 Workspace 派生目录”模型只适用于默认布局；自定义会话目录属于兼容性
-配置，启用前必须用真实 Pi 验证扫描、创建、切换和重连，不应仅凭目录名称推断 Workspace 归属。
-
-## 三层运行时解析
-
-1. `PI_PATH` / `--pi-path`（pi-web 自定义约定，Pi 源码无此变量；可指向可执行文件或安装目录）。
-2. 系统 PATH 中的全局 `pi` 命令（无缝继承配置与扩展）。
-3. 内置兜底：`@earendil-works/pi-coding-agent` 的 `dist/rpc-entry.js`（**必须 rpc-entry**，非 cli.js）+ Homebrew Cellar 布局探测。
-
-## 认证时序闭环
-
-RPC 进程的模型快照在启动时刷新（后台 15s 周期）。Onboarding 保存 Key 后，前端收到 `auth_changed` 广播并轮询重拉模型目录（上限 20s），成功后再 `set_model`，避免命中启动时的空快照。
+子进程继承现有 Pi 配置、Provider credentials、extensions 与环境变量；本项目不把这些内容打入
+四个发行 tarball。

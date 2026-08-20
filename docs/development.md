@@ -1,106 +1,203 @@
-# 开发 — 工具链与规范
+# 开发 — 工具链、测试与发布门禁
 
 ## 环境
 
-- Node.js ≥ 22、pnpm 11.21.0。
-- 一个可用的 Pi 运行时（见 docs/protocol.md 三层解析）。
-- 编辑器建议启用 biome 插件；本项目不使用 ESLint/Prettier。
-
-## 常用命令
+- Node.js 22+；pnpm 11.21.0（以根 `packageManager` 为准）。
+- 一个可解析的 Pi runtime；开发与确定性测试使用 fake Pi，不需要 Provider credential。
+- Chromium 由 Playwright 管理。编辑器使用 Biome；项目不使用 ESLint/Prettier。
 
 ```bash
-pnpm install --frozen-lockfile                  # 安装（allowBuilds 已在 pnpm-workspace.yaml）
-pnpm dev                                        # 先构建 protocol，再启动 server:3000 + ui:5173
-pnpm build                                      # protocol + server + UI + CLI 的发行 dist
-pnpm start                                      # 经 pi-web 在 :3000 提供 SPA、REST 和 WS
-pnpm test                                       # protocol/server/UI/CLI 的确定性单测
-pnpm test:smoke                                 # fake Pi 的 REST/WS smoke
-pnpm test:e2e                                   # 默认跳过；PI_WEB_RUN_E2E=1 时才使用真实 Provider
-pnpm test:pack                                  # 四个 tarball 的临时 npm install + CLI 启动验证
-pnpm typecheck                                  # 先构建 protocol、server，再检查所有包
-pnpm lint                                       # biome check（写修复加 --write）
-pnpm verify                                     # lint → typecheck → test → build
-node packages/ui/test/visual-walkthrough.mjs    # 截图走查（需 dev 双进程运行中）
+pnpm install --frozen-lockfile
+pnpm dev                    # protocol build + server :3000 + Vite :5173
+pnpm build                  # 四个 package 的发行产物
+pnpm start                  # build 后由 pi-web 提供单端口 SPA/REST/WS
 ```
 
-根 `pnpm start` 的额外参数要在 `--` 后传递，例如
-`pnpm start -- --pi-path /path/to/rpc-entry.js --port 3100`。CLI 只接受 loopback host；默认会打开浏览器，
-自动化使用 `--no-open`。
+根 `pnpm start` 参数放在 `--` 之后，例如：
 
-## CI 与发布前验证
+```bash
+pnpm start -- --pi-path /path/to/rpc-entry.js --port 3100 --no-open
+```
 
-GitHub Actions 使用 Node 22 与 pnpm 11.21.0，且不读取任何 Pi 凭据或用户目录。它固定执行：
+CLI 只接受 `127.0.0.1`、`localhost` 或 `::1`。
+
+## 根命令
+
+| 命令 | 作用 | Credential |
+|---|---|---|
+| `pnpm lint` | 全 package Biome + root scripts/e2e files | 无 |
+| `pnpm typecheck` | 先 build protocol/server，再检查四包与 E2E TS | 无 |
+| `pnpm test` | protocol/server/UI/CLI 确定性测试 | 无 |
+| `pnpm build` | 清理并生成发行 dist | 无 |
+| `pnpm verify` | lint → typecheck → test → build | 无 |
+| `pnpm test:smoke` | fake Pi 的 authenticated REST/WS gateway smoke | 无 |
+| `pnpm test:browser` | production build + packaged Chromium black-box | 无 |
+| `pnpm test:e2e` | `test:browser` 的用户友好别名 | 无 |
+| `pnpm test:pack` | 四 tarball → install → bin/npx help + bin 启动工作台 | 无 |
+| `pnpm test:e2e:real` | 默认明确 skip；显式运行真实 Pi/provider compatibility | 有，release only |
+| `pnpm --filter @pi-agent-web/ui bench:conversation` | scheduler 与 Markdown benchmark | 无 |
+
+Focused Vitest 可以在 package 内传文件：
+
+```bash
+pnpm --filter @pi-agent-web/server exec vitest run test/session-supervisor.test.ts
+pnpm --filter @pi-agent-web/ui exec vitest run test/session-transport.test.ts
+pnpm exec playwright test --config tests/e2e/playwright.config.ts multi-session.spec.ts
+```
+
+Focused 绿灯不是 release gate；修改完成后仍按风险运行上层组合。
+
+## 测试层级
+
+| 层 | 目标 | 主要证据 |
+|---|---|---|
+| L0 静态 | 类型、格式、browser/server 包边界、可构建产物 | lint、typecheck、build |
+| L1 单元 | guards、LF reader、identity、layout、reducer、scheduler、formatter | package Vitest |
+| L2 模块集成 | 文件、process group、runtime pool、rekey、trash、shutdown | server fixtures + Vitest |
+| L3 Gateway 黑盒 | Cookie/Origin/Host、REST+real WS、lease/fencing/replay/dialog/backpressure | gateway/security/bridge tests + smoke |
+| L4 Packaged browser | 用户操作、同 Workspace 多 Session、后台运行、image-only、responsive、console errors | Playwright `test:browser` |
+| L5 Real Pi | fake 无法证明的 upstream/provider/multimodal/queue/fork 兼容性 | opt-in `test:e2e:real` |
+| L6 视觉/性能 | light/dark/mobile/zoom/states、长流公平性、Markdown/DOM profile | screenshots + benchmark |
+| L7 分发 | tarball contents、依赖可发布性、bin/npx、single port、clean dist | `verify` + smoke + pack |
+
+架构或协议改动至少要有 L1/L2 不变式与 L3/L4 中一条用户路径。UI shell/composer 改动不能用
+reducer 单测代替 browser bounding-box/console 断言。删除、process 或 shutdown 改动必须覆盖 race 和
+失败恢复；不能只检查 happy path。
+
+## 确定性 browser E2E
+
+`tests/e2e` 启动 build 后的真实 CLI、Hono、WebSocket 与 SPA，只替换 Pi RPC child。Harness 为每个
+case 建立隔离的 agent/session/web/workspace/control 目录，并从 child env 过滤 credential-like 变量。
+
+当前必须覆盖：
+
+- cold bootstrap，无 console/page error；
+- 同一 Workspace 的两个独立 Pi PID/Session 并发；A 后台流式时选择并完成 B，再切回 A；
+- image-only prompt 后同一 multiplexed socket 仍能发下一条 command；
+- ordinary first prompt 不被标成 steer，真实 event order 不留下空 Working step；
+- 375×812 没有页面水平 overflow，composer 主控件 bounding box 都在 viewport。
+
+失败时 Playwright 保存 screenshot 与 trace 到 `test-results/browser-e2e`；CI 只在失败时上传并保留
+7 天。Fixture 文案、路径和截图不得包含维护者数据。
+
+## 真实 Pi 验收
+
+运行方式：
+
+```bash
+PI_WEB_RUN_E2E=1 pnpm test:e2e:real
+
+# 可选：指定已配置且支持图片的 provider/model
+PI_WEB_RUN_E2E=1 \
+PI_WEB_E2E_IMAGE_MODEL=provider/model \
+pnpm test:e2e:real
+```
+
+规则：
+
+- 使用 `mkdtemp` 的 Workspace、Session root、Web data 与 Pi Agent root；只把现有 `auth.json` 和
+  `models.json` 白名单复制到权限为 `0700` 的临时 Agent 目录（文件为 `0600`），不加载用户的
+  `settings.json`、扩展、技能或 prompt。
+- 开始前记录真实 `settings.json` 的路径/目标元数据与内容哈希，所有 Pi 子进程退出后再次比对；任何
+  差异都令验收失败，测试绝不通过 snapshot/restore 覆盖并发用户修改。
+- 允许使用复制后的 Pi authentication 发请求，但不扫描、修改或删除用户旧 JSONL。
+- 不打印 key、Cookie、fencing token、私人 prompt/history 或 provider raw payload。
+- 测试自己生成小图片与唯一 marker；清理只针对已验证的临时根。
+- 未设置 opt-in 时输出明确 SKIPPED；已经 opt-in 却找不到配置好的 image-capable model 时必须失败，
+  不得空洞 0-exit 假装通过。
+- Release 记录通过的 provider/model 与场景，不记录 credential。
+
+当前 suite 验证一条 socket 上两个 Session 并发、image-only、内容隔离、streaming `follow_up`、abort、
+clone rekey/generation、父子 history isolation，以及 stats/tree/commands。Extension editor/widget 等尚未
+自动化的 upstream surface 必须在 release checklist 明示通过或跳过理由。
+
+## Conversation 性能
+
+```bash
+pnpm --filter @pi-agent-web/ui bench:conversation
+```
+
+Benchmark 至少报告：10k sequential reducer、scheduler coalescing、多 Session 公平性，以及大 GFM/code
+settlement。它是诊断数据，不是跨机器的绝对通过阈值。原始 profile 和候选库对比放在 gitignored
+`tmp/`；稳定决策写入 `docs/decisions/0005-conversation-rendering.md`。
+
+必须保持的语义门禁：
+
+- 同显示帧连续 compatible delta 至多一次 publication；
+- hidden tab 用 bounded timer 最终追上；
+- structural/error/settled/rekey/dialog boundary 不延迟；
+- 一个高频 Session 不饿死其他 Session；
+- 用户上翻不被吸底，settled Markdown 仍有完整 GFM/code 语义。
+
+只有 profile 证明 DOM/layout 是剩余主瓶颈后才引入 turn virtualization；只有候选 renderer 在真实长
+Markdown、Unicode、unfinished fence、GFM、highlight、DOM stability 上有证据时才替换当前 renderer。
+
+## 视觉验收
+
+使用 production build 与隔离 deterministic fixture；不要把开发者的真实 Session 当 demo 数据。
+最小矩阵见 `DESIGN.md`。操作并截图后逐项检查：
+
+- selected/background Session identity 与 runtime state；
+- composer send/stop、附件、model/context 在 375px 的实际 bounding box；
+- Details 初始关闭、上下文打开、固定 reopen 入口；
+- observer、waiting_ui、crashed、resync、no-model 与 context unavailable；
+- focus-visible、keyboard-only、reduced motion、200% zoom；
+- ANSI/control chars、绝对路径、credential、私人标题与真实 Provider 输出均不存在。
+
+截图不是测试替代品；功能/边界使用 Playwright assertion，审美与信息层级使用视觉 review。
+
+## CI
+
+GitHub Actions 使用 Node 22、pnpm 11.21.0，不读取 Pi credential 或用户目录：
+
+1. `pnpm install --frozen-lockfile`；
+2. `pnpm verify`、`pnpm test:smoke`、`pnpm test:pack`；
+3. 独立 browser job 安装 Chromium 并运行 `pnpm test:browser`；
+4. 同一 ref 的旧 run 会被取消；browser failure 上传 trace/screenshot。
+
+Real Pi/provider 与人工视觉检查只在本地 release 执行，不能成为隐式 CI dependency。
+
+## 打包与发布
+
+Runtime 由 `@pi-agent-web/protocol`、`server`、`ui`、`cli` 四包组成。`test:pack` 在临时目录创建
+tarball，检查 LICENSE/repository 元数据、拒绝残留 `workspace:*`；安装后由 bin 与等价本地 npx
+验证 `--help`，再由 bin 以 fake Pi 路径启动单端口 Gateway、SPA 与 WebSocket。真实 fake child/RPC
+启动由 `test:smoke` 验证。Build 在 tsc 前清理 `dist`，避免删除源码后孤儿 JS 泄漏进 tarball。
+
+公开源码与发布 npm 包是两个门槛。除非 registry 中真的存在对应版本，不要把
+`npx --yes @pi-agent-web/cli` 写成可用安装方式。
+
+Release 前从干净 clone 运行：
 
 ```bash
 pnpm install --frozen-lockfile
 pnpm verify
 pnpm test:smoke
+pnpm test:browser
+pnpm test:pack
+PI_WEB_RUN_E2E=1 pnpm test:e2e:real  # 有 credential 的显式 compatibility gate
 ```
 
-在准备 tag 或变更 package manifest 时，本地还必须执行 `pnpm test:pack`。该脚本对 protocol、server、
-UI 和 CLI 创建 tarball，在临时空项目安装它们，检查只包含构建产物与精确依赖版本，然后通过 bin 和本地
-`npx` 等价路径启动带 fake Pi 的单端口服务。
+同时完成最终截图、安全内容扫描、文档 consistency grep、版本/tag/change record；任何跳过的 L5/L6
+场景必须写原因。
 
-## 文档、开源与发布边界
+## 代码与提交约定
 
-文档的事实来源按以下顺序维护：架构和状态时序写入 `docs/architecture.md`，Pi/Gateway 帧和存储事实
-写入 `docs/protocol.md`，交互语义写入 `docs/ui-ux.md`，视觉 token 和组件配方写入 `DESIGN.md`，
-命令与验证流程写入本文。README 只保留对使用者必要的产品边界和入口。`docs/notes/` 是本地交接、
-审计和草稿目录，默认被 `.gitignore` 排除，不应被代码或公开 API 引用。
-
-仓库当前以 MIT 许可证公开预览，且处于快速迭代期；它是本机单用户工具，不是远程部署方案。公开源码
-与发布可安装包是两个门槛：前者需要 README、LICENSE 和可复现验证，后者还需要版本/tag、四个包的
-打包内容、干净临时目录安装和单端口启动证据。当前阶段不要求贡献指南或独立安全报告入口，真实
-Provider 验收仍只在本地显式运行，不能作为 CI 的隐含依赖。
-
-发布前最小清单：
-
-1. 从干净 clone 执行 `pnpm install --frozen-lockfile`、`pnpm verify`、`pnpm test:smoke` 和 `pnpm test:pack`。
-2. 检查 README 的快速迭代警告、MIT `LICENSE`、Node/pnpm/Pi 版本约束与包版本一致。
-3. 用临时 agent/session/web 数据目录完成一次手工启动；不要读取或打包维护者个人的 Pi 数据。
-4. 若要发布 npm 包，再单独核对 npm 包名、版本/tag、tarball 内容和 `npx` 入口；源代码公开不等于包已发布。
-
-## 验证矩阵（改动后必跑）
-
-| 改动面 | 验证 |
-|---|---|
-| server 协议层 | pnpm --filter @pi-agent-web/server test |
-| server REST | pnpm test:smoke + curl /api/v1/health |
-| ui 投影/状态 | pnpm --filter @pi-agent-web/ui test（reducer 单测） |
-| ui 视觉 | typecheck + build + visual-walkthrough 截图逐张核对 |
-| 端到端对话 | PI_WEB_RUN_E2E=1 pnpm test:e2e（真实模型往返） |
-| 断连/崩溃 | ws-bridge.test.ts + supervisor 崩溃退避日志 |
-| 分发与 CLI | pnpm test:pack + pnpm start -- --help |
-
-## 提交规范
-
-Conventional Commits，分阶段小步提交。scope 用包名（server / ui / cli / docs）。示例：
+- Biome tabs、110 columns、文件末尾换行；comments English。
+- UI copy 先加 `src/lib/i18n/zh-CN.ts` id，再在 `en.ts` 同形镜像；非 React 模块用 `tt()`。
+- Pi RPC types 来自 upstream package；Browser↔Gateway DTO 与 guards 只来自 protocol；UI 不 import
+  server runtime。
+- Components 只读 stores；socket ingestion 留在 transport/frame bus/pipeline。
+- Conventional Commits，按可验证切片提交，例如：
 
 ```text
-feat(server): add workspace supervisor with crash handling and ws relay
-fix(ui): correct slash trigger detection for CJK punctuation
-refactor(ui): migrate copy to the i18n dictionary
-docs: capture protocol facts in docs/protocol.md
-test(server): add disconnect-cancel protection tests
+feat(server): supervise Pi at Session granularity
+fix(ui): preserve background Session projections
+perf(ui): coalesce compatible streaming deltas
+test(e2e): cover concurrent native Sessions
+docs: record Session runtime decisions
 ```
 
-## 代码约定
-
-- **注释全英文**；用户可见文案走 src/lib/i18n 字典（zh-CN 为 id 与默认文案的单一事实源，en 镜像同形状，由 typeof zhCN 编译期校验）。
-- Pi RPC 类型 import 自 @earendil-works/pi-coding-agent；浏览器安全 DTO、响应 helpers 和输入 guards 由 @pi-agent-web/protocol 提供。UI 不得依赖 server 包。
-- 前端组件不直接订阅 socket：帧经 stream-pipeline 路由进 store，组件只读投影。
-- 缩进 tab（biome 配置），每文件末尾空行，行宽 110。
-- 不在代码/文档中引用仓库外路径的文件；需要的协议事实沉淀进 docs/。
-
-## 添加新 UI 文案
-
-1. 在 zh-CN.ts 添加 id 与中文文案（含 {arg} 占位）。
-2. 在 en.ts 镜像同 id 英文文案（编译期强制）。
-3. 组件内 const { t } = useT()；非 React 模块用 tt("id", { arg })。
-
-## 添加新特性面板
-
-1. 状态放对应 store（分层见 docs/architecture.md）。
-2. 组件放 packages/ui/src/features/<domain>/。
-3. 视觉遵循 DESIGN.md（token / 圆角 / 行高 / 按压反馈），不新造颜色与圆角。
-4. 交互语义遵循 docs/ui-ux.md 规则清单。
+临时审计、benchmark raw output 与进度台账可以放 gitignored `tmp/`。决定延期的永久产品工作建
+GitHub Issue，包含用户问题、成功条件、非目标、安全/性能边界与测试层级；不要把一次性 audit 原样
+提交为公共契约。
