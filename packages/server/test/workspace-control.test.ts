@@ -4,18 +4,24 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type ServerHandle, startServer } from "../src/main.js";
 
-const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-workspace-control-"));
+const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-session-control-"));
 const workspacePath = path.join(tempRoot, "workspace");
 const agentDir = path.join(tempRoot, "agent");
 const sessionRootDir = path.join(tempRoot, "sessions");
 const webDataDir = path.join(tempRoot, "web-data");
-const fakePiPath = path.join(import.meta.dirname, "fixtures", "fake-pi.mjs");
+const fakePiPath = path.join(import.meta.dirname, "fixtures", "session-runtime-pi.mjs");
 const viteOrigin = "http://localhost:5173";
+
+interface RuntimeIdentity {
+	sessionHandle: string;
+	generation: number;
+}
 
 let handle: ServerHandle;
 let base: string;
 let cookie: string;
-let workspaceId: string;
+let workspaceHandle: string;
+let sessions: [RuntimeIdentity, RuntimeIdentity];
 
 function headers(): Record<string, string> {
 	return { Origin: viteOrigin, Cookie: cookie };
@@ -33,12 +39,12 @@ async function openSocket(): Promise<import("ws").WebSocket> {
 
 function frameFor(
 	ws: import("ws").WebSocket,
-	predicate: (frame: Record<string, unknown>) => boolean,
-): Promise<Record<string, unknown>> {
+	predicate: (frame: Record<string, any>) => boolean,
+): Promise<Record<string, any>> {
 	return new Promise((resolve, reject) => {
 		const timer = setTimeout(() => reject(new Error("server frame timed out")), 10_000);
 		const onMessage = (raw: Buffer) => {
-			const frame = JSON.parse(raw.toString()) as Record<string, unknown>;
+			const frame = JSON.parse(raw.toString()) as Record<string, any>;
 			if (!predicate(frame)) return;
 			clearTimeout(timer);
 			ws.off("message", onMessage);
@@ -48,18 +54,53 @@ function frameFor(
 	});
 }
 
-function responseFor(ws: import("ws").WebSocket, id: string): Promise<{ success?: boolean; error?: string }> {
-	return frameFor(
+async function subscribe(ws: import("ws").WebSocket, sessionHandle: string): Promise<void> {
+	const baseline = frameFor(
+		ws,
+		(frame) => frame.type === "runtime_state" && frame.runtime?.sessionHandle === sessionHandle,
+	);
+	const lease = frameFor(
 		ws,
 		(frame) =>
-			frame.type === "response" &&
-			typeof frame.response === "object" &&
-			frame.response !== null &&
-			(frame.response as { id?: unknown }).id === id,
-	).then((frame) => frame.response as { success?: boolean; error?: string });
+			frame.type === "lease_status" && frame.sessionHandle === sessionHandle && frame.isController === false,
+	);
+	ws.send(JSON.stringify({ type: "session_subscribe", sessionHandle }));
+	await Promise.all([baseline, lease]);
+}
+
+async function claim(
+	ws: import("ws").WebSocket,
+	sessionHandle: string,
+): Promise<{ isController: boolean; fencingToken?: string }> {
+	const status = frameFor(
+		ws,
+		(frame) => frame.type === "lease_status" && frame.sessionHandle === sessionHandle,
+	);
+	ws.send(JSON.stringify({ type: "session_claim", sessionHandle }));
+	return (await status) as { isController: boolean; fencingToken?: string };
+}
+
+async function command(
+	ws: import("ws").WebSocket,
+	runtime: RuntimeIdentity,
+	id: string,
+	fencingToken: string | undefined,
+): Promise<Record<string, any>> {
+	const response = frameFor(ws, (frame) => frame.type === "response" && frame.response?.id === id);
+	ws.send(
+		JSON.stringify({
+			type: "command",
+			sessionHandle: runtime.sessionHandle,
+			expectedGeneration: runtime.generation,
+			...(fencingToken ? { fencingToken } : {}),
+			command: { id, type: "set_session_name", name: id },
+		}),
+	);
+	return response;
 }
 
 async function closeSocket(ws: import("ws").WebSocket): Promise<void> {
+	if (ws.readyState === ws.CLOSED) return;
 	await new Promise<void>((resolve) => {
 		ws.once("close", resolve);
 		ws.close();
@@ -71,10 +112,7 @@ beforeAll(async () => {
 	handle = await startServer({
 		config: { port: 0, host: "127.0.0.1", agentDir, sessionRootDir, webDataDir },
 		piPath: fakePiPath,
-	});
-	await new Promise<void>((resolve, reject) => {
-		handle.server.once("listening", resolve);
-		handle.server.once("error", reject);
+		handleSignals: false,
 	});
 	const address = handle.server.address();
 	if (!address || typeof address === "string") throw new Error("server did not expose a TCP address");
@@ -90,7 +128,18 @@ beforeAll(async () => {
 		headers: { "Content-Type": "application/json", ...headers() },
 		body: JSON.stringify({ path: workspacePath }),
 	});
-	workspaceId = ((await workspace.json()) as { id: string }).id;
+	workspaceHandle = ((await workspace.json()) as { workspaceHandle: string }).workspaceHandle;
+	const created = await Promise.all(
+		[0, 1].map(async () => {
+			const response = await fetch(`${base}/api/v1/workspaces/${workspaceHandle}/sessions`, {
+				method: "POST",
+				headers: headers(),
+			});
+			expect(response.status).toBe(201);
+			return ((await response.json()) as { runtime: RuntimeIdentity }).runtime;
+		}),
+	);
+	sessions = [created[0]!, created[1]!];
 });
 
 afterAll(async () => {
@@ -98,125 +147,42 @@ afterAll(async () => {
 	fs.rmSync(tempRoot, { recursive: true, force: true });
 });
 
-describe("workspace controller leases", () => {
-	it("serializes controller ownership, rejects stale writes, and releases on disconnect", async () => {
-		const [a, b] = await Promise.all([openSocket(), openSocket()]);
-		const aLease = frameFor(a, (frame) => frame.type === "lease_status" && frame.isController === true);
-		a.send(JSON.stringify({ type: "session_listen", workspaceId, sessionId: "fake-session" }));
-		await expect(aLease).resolves.toMatchObject({ workspaceId, isController: true });
+describe("Session controller leases", () => {
+	it("isolates ownership per Session and releases a lease on disconnect", async () => {
+		const [left, right] = await Promise.all([openSocket(), openSocket()]);
+		await Promise.all([
+			subscribe(left, sessions[0].sessionHandle),
+			subscribe(right, sessions[0].sessionHandle),
+			subscribe(right, sessions[1].sessionHandle),
+		]);
 
-		const bLease = frameFor(b, (frame) => frame.type === "lease_status" && frame.isController === false);
-		b.send(JSON.stringify({ type: "session_listen", workspaceId, sessionId: "fake-session" }));
-		await expect(bLease).resolves.toMatchObject({ workspaceId, isController: false });
-
-		const stateResponse = responseFor(a, "a-state");
-		const sessionState = frameFor(
-			a,
-			(frame) => frame.type === "session_state" && frame.sessionId === "fake-session" && frame.epoch === 1,
-		);
-		a.send(
-			JSON.stringify({
-				type: "command",
-				workspaceId,
-				expectedSessionId: null,
-				command: { id: "a-state", type: "get_state" },
-			}),
-		);
-		await expect(stateResponse).resolves.toMatchObject({ success: true });
-		await expect(sessionState).resolves.toMatchObject({
-			workspaceId,
-			sessionFile: "/tmp/fake-session.jsonl",
+		const leftFirst = await claim(left, sessions[0].sessionHandle);
+		expect(leftFirst).toMatchObject({ isController: true, fencingToken: expect.any(String) });
+		await expect(claim(right, sessions[0].sessionHandle)).resolves.toMatchObject({
+			isController: false,
+		});
+		await expect(command(right, sessions[0], "blocked", undefined)).resolves.toMatchObject({
+			response: { success: false, error: "session_read_only" },
+		});
+		await expect(command(left, sessions[0], "left-owned", leftFirst.fencingToken)).resolves.toMatchObject({
+			response: { success: true },
 		});
 
-		for (const command of [
-			{ id: "b-prompt", type: "prompt", message: "blocked" },
-			{ id: "b-abort", type: "abort" },
-			{ id: "b-switch", type: "switch_session", sessionPath: path.join(workspacePath, "foreign.jsonl") },
-		]) {
-			const response = responseFor(b, command.id);
-			b.send(JSON.stringify({ type: "command", workspaceId, expectedSessionId: "fake-session", command }));
-			await expect(response).resolves.toMatchObject({ success: false, error: "workspace_read_only" });
-		}
+		const rightSecond = await claim(right, sessions[1].sessionHandle);
+		expect(rightSecond).toMatchObject({ isController: true, fencingToken: expect.any(String) });
+		await expect(command(right, sessions[1], "right-owned", rightSecond.fencingToken)).resolves.toMatchObject(
+			{ response: { success: true } },
+		);
 
-		const staleResponse = responseFor(a, "a-stale");
-		a.send(
-			JSON.stringify({
-				type: "command",
-				workspaceId,
-				expectedSessionId: "old-session",
-				command: { id: "a-stale", type: "prompt", message: "stale" },
-			}),
-		);
-		await expect(staleResponse).resolves.toMatchObject({ success: false, error: "session_stale" });
+		await closeSocket(left);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		const reclaimed = await claim(right, sessions[0].sessionHandle);
+		expect(reclaimed).toMatchObject({ isController: true, fencingToken: expect.any(String) });
+		await expect(command(right, sessions[0], "reclaimed", reclaimed.fencingToken)).resolves.toMatchObject({
+			response: { success: true },
+		});
 
-		const dialogFrame = frameFor(
-			a,
-			(frame) =>
-				frame.type === "extension_ui_request" && (frame.request as { id?: unknown }).id === "fake-dialog",
-		);
-		const dialogPrompt = responseFor(a, "a-dialog");
-		a.send(
-			JSON.stringify({
-				type: "command",
-				workspaceId,
-				expectedSessionId: "fake-session",
-				command: { id: "a-dialog", type: "prompt", message: "open-dialog" },
-			}),
-		);
-		await expect(dialogPrompt).resolves.toMatchObject({ success: true });
-		await dialogFrame;
-
-		b.send(
-			JSON.stringify({
-				type: "extension_ui_response",
-				workspaceId,
-				expectedSessionId: "fake-session",
-				response: { type: "extension_ui_response", id: "fake-dialog", confirmed: true },
-			}),
-		);
-		await new Promise((resolve) => setTimeout(resolve, 20));
-		expect(handle.supervisor.cancelDialogsForSession(workspaceId, "fake-session")).toBe(1);
-
-		const timeoutDialog = frameFor(
-			a,
-			(frame) =>
-				frame.type === "extension_ui_request" &&
-				(frame.request as { id?: unknown }).id === "fake-timeout-dialog",
-		);
-		const timeoutPrompt = responseFor(a, "a-timeout-dialog");
-		a.send(
-			JSON.stringify({
-				type: "command",
-				workspaceId,
-				expectedSessionId: "fake-session",
-				command: { id: "a-timeout-dialog", type: "prompt", message: "timeout-dialog" },
-			}),
-		);
-		await expect(timeoutPrompt).resolves.toMatchObject({ success: true });
-		await expect(timeoutDialog).resolves.toMatchObject({ epoch: expect.any(Number) });
-		await new Promise((resolve) => setTimeout(resolve, 40));
-		expect(handle.supervisor.cancelDialogsForSession(workspaceId, "fake-session")).toBe(0);
-
-		const bReleasedLease = frameFor(
-			b,
-			(frame) => frame.type === "lease_status" && frame.isController === false,
-		);
-		await closeSocket(a);
-		await expect(bReleasedLease).resolves.toMatchObject({ workspaceId, isController: false });
-		const bClaim = frameFor(b, (frame) => frame.type === "lease_status" && frame.isController === true);
-		b.send(JSON.stringify({ type: "session_claim", workspaceId }));
-		await expect(bClaim).resolves.toMatchObject({ workspaceId, isController: true });
-
-		const resumedResponse = responseFor(b, "b-resumed");
-		b.send(
-			JSON.stringify({
-				type: "command",
-				workspaceId,
-				expectedSessionId: "fake-session",
-				command: { id: "b-resumed", type: "prompt", message: "resumed" },
-			}),
-		);
-		await expect(resumedResponse).resolves.toMatchObject({ success: true });
-		await closeSocket(b);
+		expect(handle.supervisor.listRuntimes()).toHaveLength(2);
+		await closeSocket(right);
 	});
 });

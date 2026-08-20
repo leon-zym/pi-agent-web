@@ -19,7 +19,7 @@
 		"dev": "tsx watch src/main.ts",
 		"start": "node dist/main.js",
 		"prepack": "pnpm build",
-		"build": "tsc -p tsconfig.build.json",
+		"build": "node ../../scripts/clean-dist.mjs && tsc -p tsconfig.build.json",
 		"typecheck": "tsc -p tsconfig.json --noEmit",
 		"test": "vitest run",
 		"test:watch": "vitest",

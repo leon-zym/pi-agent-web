@@ -72,4 +72,39 @@ describe("strict JSONL framing", () => {
 		expect(errors).toHaveLength(1);
 		expect(errors[0]).toBeInstanceOf(JsonlLineTooLongError);
 	});
+
+	it("reads the active byte budget for each in-flight line", async () => {
+		const errors: Error[] = [];
+		let maxLineBytes = 32;
+		const stream = Readable.from(["x".repeat(24), "x".repeat(9)]);
+		attachJsonlLineReader(stream, () => {}, {
+			maxLineBytes: () => maxLineBytes,
+			onError: (error) => errors.push(error),
+		});
+		stream.once("data", () => {
+			maxLineBytes = 64;
+		});
+		await new Promise<void>((resolve) => stream.on("end", resolve));
+
+		expect(errors).toEqual([]);
+	});
+
+	it("routes consumer exceptions through onError and stops reading", async () => {
+		const lines: string[] = [];
+		const errors: Error[] = [];
+		const stream = Readable.from(["first\nsecond\n"]);
+		attachJsonlLineReader(
+			stream,
+			(line) => {
+				lines.push(line);
+				throw new Error("consumer rejected frame");
+			},
+			{ onError: (error) => errors.push(error) },
+		);
+		await new Promise<void>((resolve) => stream.on("end", resolve));
+
+		expect(lines).toEqual(["first"]);
+		expect(errors).toHaveLength(1);
+		expect(errors[0]?.message).toBe("consumer rejected frame");
+	});
 });
