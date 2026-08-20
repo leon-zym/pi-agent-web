@@ -2,6 +2,12 @@
 	"name": "@pi-agent-web/cli",
 	"version": "0.1.0",
 	"description": "Local single-command launcher for Pi Agent Web",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/leon-zym/pi-agent-web.git",
+		"directory": "packages/cli"
+	},
 	"engines": {
 		"node": ">=22"
 	},
@@ -10,7 +16,8 @@
 		"pi-web": "./dist/cli.js"
 	},
 	"files": [
-		"dist"
+		"dist",
+		"LICENSE"
 	],
 	"scripts": {
 		"start": "node dist/cli.js",
