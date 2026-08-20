@@ -34,7 +34,13 @@ import {
 } from "../../components/ui/dropdown-menu";
 import { Input } from "../../components/ui/input";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
-import { displayError, displayLabel, formatRelativeTime, stripAnsi } from "../../lib/format";
+import {
+	displayError,
+	displayLabel,
+	formatExactDateTime,
+	formatRelativeTime,
+	stripAnsi,
+} from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { type SessionDeleteBlockReason, sessionDeleteCapability } from "../../lib/session-capabilities";
 import { deleteSession, renameSession, sendControlCommand } from "../../lib/session-controller";
@@ -223,9 +229,19 @@ export function SessionHeader() {
 			{currentSession && (
 				<div className="flex flex-none items-center gap-0.5">
 					{currentSession.messageCount > 0 && currentSession.modifiedAt && (
-						<span className="mr-2 hidden text-xs text-ink-3 md:inline">
-							{formatRelativeTime(Date.parse(currentSession.modifiedAt))}
-						</span>
+						<Tooltip>
+							<TooltipTrigger asChild>
+								<button
+									type="button"
+									className="mr-2 hidden cursor-default rounded-sm text-xs text-ink-3 focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none md:inline"
+								>
+									<time dateTime={currentSession.modifiedAt}>
+										{formatRelativeTime(Date.parse(currentSession.modifiedAt))}
+									</time>
+								</button>
+							</TooltipTrigger>
+							<TooltipContent>{formatExactDateTime(Date.parse(currentSession.modifiedAt))}</TooltipContent>
+						</Tooltip>
 					)}
 					<Badge
 						variant={

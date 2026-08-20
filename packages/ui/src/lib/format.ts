@@ -34,6 +34,15 @@ export function formatBytes(bytes: number): string {
 	return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+/** Format a local timestamp without dropping seconds in compact UI tooltips. */
+export function formatExactDateTime(timestampMs: number): string {
+	if (!Number.isFinite(timestampMs)) return "--";
+	const date = new Date(timestampMs);
+	if (Number.isNaN(date.getTime())) return "--";
+	const pad = (value: number) => value.toString().padStart(2, "0");
+	return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
 function consumeControlString(text: string, start: number): number {
 	let index = start;
 	while (index < text.length) {

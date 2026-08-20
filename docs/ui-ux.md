@@ -14,6 +14,10 @@ selected Session 只是显示指针，不能被误写成 Gateway 或 Pi 的唯�
 - 启动时只根据 Web 的 `lastOpenedAt` 选择默认 Workspace（Pi 本身没有 last-Workspace 设置），并进入
   一个新的空 Session；不得自动打开历史列表第一项。展开/收起 Workspace 只加载或隐藏其目录，不能
   改变当前 Workspace、Session、订阅或 lease；显式的 Open/New/Session row 才改变当前视图。
+- 新建且尚无对话的 Session 只存在于当前 Header/Composer 表面，不进入 Sidebar row，也不计入
+  Workspace 的历史数量。Pi 写入包含对话的 JSONL 后由强制 Catalog refresh 一次性发布 row、首条
+  消息标题与当前状态，不能先闪现 `Empty session` 占位 row；untouched transient 被 abandon 后始终
+  不留目录项。
 - 同一 Workspace 和不同 Workspace 的多个 Session 都可同时工作。页面不宣传“无限并发”；容量
   不足时显示具体 runtime 错误，而不是静默终止已有运行。
 - 空 Session、unavailable Workspace、crashed/dormant runtime 使用不同状态，不用一个灰点概括。

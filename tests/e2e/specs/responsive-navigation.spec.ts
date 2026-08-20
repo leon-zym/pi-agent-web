@@ -2,6 +2,7 @@ import { observePageErrors, pageOverflow } from "../fixtures/page-observation";
 import { expect, test } from "../fixtures/test";
 
 const B_PROMPT = "E2E_B_RESPONSIVE";
+const SECONDARY_PROMPT = "E2E_SECONDARY_RESPONSIVE";
 const COMPLEX_PROMPT = "E2E_COMPLEX_DEMO";
 const SLOW_PROMPT = "E2E_A_SLOW_RESPONSIVE";
 
@@ -76,6 +77,18 @@ for (const viewport of [
 			name: /^(Session details|会话详情)$/,
 		});
 		await expect(detailsDrawer).toBeVisible();
+		const treeFork = detailsDrawer
+			.getByRole("button", {
+				name: /^(Fork from this message|从这条消息分叉)$/,
+			})
+			.first();
+		await expectMinimumHitTarget(treeFork);
+		const treeRows = detailsDrawer.locator("[data-tree-depth]");
+		await expect(treeRows).toHaveCount(3);
+		expect(
+			await treeRows.evaluateAll((rows) => rows.map((row) => Number(row.getAttribute("data-tree-depth")))),
+		).toEqual([0, 1, 1]);
+		await expectMinimumHitTarget(detailsDrawer.getByRole("button", { name: /^(Refresh|刷新)$/ }));
 		const closeDetails = detailsDrawer.getByRole("button", {
 			name: /^(Collapse details panel|收起详情面板)$/,
 		});
@@ -112,37 +125,27 @@ for (const viewport of [
 		await expectMinimumHitTarget(drawerNewSession);
 		await drawerNewSession.click();
 		await expect(sessionDrawer).toBeHidden();
-		await expect
-			.poll(async () => {
-				const result = await harness.requestJson<{ sessions: unknown[] }>(
-					`/api/v1/workspaces/${encodeURIComponent(harness.workspace.workspaceHandle)}/sessions`,
-				);
-				return result.sessions.length;
-			})
-			.toBe(3);
+		await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(0);
 
 		await sendPrompt(page, B_PROMPT);
 		await expect(page.locator("main")).toContainText(`E2E_REPLY:${B_PROMPT}`);
 
 		await sessionsTrigger.click();
-		const emptySessionButton = sessionDrawer
-			.locator('[data-session-row][data-current="false"]')
-			.getByRole("button")
-			.first();
-		await expectMinimumHitTarget(emptySessionButton);
-		await emptySessionButton.click();
+		await expectMinimumHitTarget(drawerNewSession);
+		await drawerNewSession.click();
 		await expect(sessionDrawer).toBeHidden();
-		await expect(
-			page.locator("header").getByRole("button", { name: /^(Empty session|空会话)$/ }),
-		).toBeVisible();
+		await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(0);
+		await sendPrompt(page, SECONDARY_PROMPT);
+		await expect(page.locator("main")).toContainText(`E2E_REPLY:${SECONDARY_PROMPT}`);
 
 		await sessionsTrigger.click();
-		await sessionDrawer
+		const bSessionButton = sessionDrawer
 			.locator("[data-session-row]")
 			.filter({ hasText: B_PROMPT })
 			.getByRole("button")
-			.first()
-			.click();
+			.first();
+		await expectMinimumHitTarget(bSessionButton);
+		await bSessionButton.click();
 		await expect(sessionDrawer).toBeHidden();
 		await expect(page.locator("main")).toContainText(`E2E_REPLY:${B_PROMPT}`);
 
@@ -202,7 +205,15 @@ test("1024px boundary keeps details discoverable as an overlay", async ({ page, 
 		.click();
 	const detailsDrawer = page.getByRole("dialog", { name: /^(Session details|会话详情)$/ });
 	await expect(detailsDrawer).toBeVisible();
-	await detailsDrawer.getByRole("button", { name: /^(Collapse details panel|收起详情面板)$/ }).click();
+	await expectMinimumHitTarget(
+		detailsDrawer.getByRole("button", { name: /^(Fork from this message|从这条消息分叉)$/ }).first(),
+	);
+	await expectMinimumHitTarget(detailsDrawer.getByRole("button", { name: /^(Refresh|刷新)$/ }));
+	const closeDetails = detailsDrawer.getByRole("button", {
+		name: /^(Collapse details panel|收起详情面板)$/,
+	});
+	await expectMinimumHitTarget(closeDetails);
+	await closeDetails.click();
 	await expect(detailsDrawer).toBeHidden();
 
 	const overflow = await pageOverflow(page);

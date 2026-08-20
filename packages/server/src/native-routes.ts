@@ -454,10 +454,9 @@ async function projectWorkspace(
 	const nativeSessions = native
 		? snapshot.sessions.filter((session) => session.workspaceHandle === native.workspaceHandle)
 		: [];
-	const sessionHandles = new Set([
-		...nativeSessions.map((session) => session.sessionHandle),
-		...runtimes.map((runtime) => runtime.sessionHandle),
-	]);
+	const directorySessions = nativeSessions.filter(
+		(session) => session.messageCount > 0 || Boolean(session.firstMessage.trim() || session.name?.trim()),
+	);
 	return {
 		native,
 		preference,
@@ -470,7 +469,9 @@ async function projectWorkspace(
 			displayName:
 				preference?.displayName ?? (pathHint ? path.basename(pathHint) || pathHint : workspaceHandle),
 			lastOpenedAt: preference?.lastOpenedAt ?? null,
-			sessionCount: sessionHandles.size,
+			// The sidebar count describes durable Pi conversations. Hot runtimes and
+			// header-only files remain discoverable state, but do not create rows.
+			sessionCount: directorySessions.length,
 			hasNativeHistory: nativeSessions.length > 0,
 		},
 	};

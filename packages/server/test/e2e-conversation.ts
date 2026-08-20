@@ -525,6 +525,19 @@ if (!RUN_REAL_E2E) {
 		}
 		console.log("follow_up during streaming ok");
 
+		const middleMarker = "PI_WEB_MIDDLE_B_3A71";
+		const beforeMiddleSettle = sessionB.events.filter((event) => event.type === "agent_settled").length;
+		await client.command(
+			sessionB,
+			{
+				type: "prompt",
+				message: `只回复这个标记：${middleMarker}`,
+				streamingBehavior: "steer",
+			},
+			"middle prompt Session B",
+		);
+		await client.waitForSettled(sessionB, beforeMiddleSettle, "middle Session B settlement");
+
 		const beforeAbortSettle = sessionB.events.filter((event) => event.type === "agent_settled").length;
 		await client.command(
 			sessionB,
@@ -542,12 +555,76 @@ if (!RUN_REAL_E2E) {
 		const forkMessages = (
 			await client.command(sessionB, { type: "get_fork_messages" }, "get_fork_messages Session B")
 		).response.data as { messages?: Array<{ entryId?: string; text?: string }> } | undefined;
+		if ((forkMessages?.messages?.length ?? 0) < 3) {
+			throw new Error("Session B exposed too few user entries for middle/leaf/root Fork coverage");
+		}
+		const originalSessionBHandle = sessionB.handle;
+		const originalSessionBGeneration = sessionB.generation;
+		const middleForkMessage = forkMessages?.messages?.[1];
+		if (!middleForkMessage?.entryId) throw new Error("Session B exposed no ordinary middle Fork entry");
+		const middleFork = await client.command(
+			sessionB,
+			{ type: "fork", entryId: middleForkMessage.entryId },
+			"fork Session B from an ordinary middle user entry",
+		);
+		if (
+			middleFork.previousSessionHandle !== originalSessionBHandle ||
+			middleFork.sessionHandle === originalSessionBHandle ||
+			middleFork.generation !== originalSessionBGeneration + 1 ||
+			(middleFork.response.data as { cancelled?: boolean } | undefined)?.cancelled !== false ||
+			sessionB.runtime?.recoverable !== true ||
+			!sessionB.runtime.sessionFile ||
+			!fs.existsSync(sessionB.runtime.sessionFile)
+		) {
+			throw new Error("ordinary middle Fork did not produce a persisted child identity");
+		}
+		const middleForkHistory = messagesFrom(
+			(await client.command(sessionB, { type: "get_messages" }, "get_messages middle Fork child")).response,
+		);
+		if (!hasText(middleForkHistory, markerB) || hasText(middleForkHistory, middleMarker)) {
+			throw new Error("ordinary middle Fork retained the selected user entry or lost its parent history");
+		}
+
+		const leafForkParent = await client.attachExisting(originalSessionBHandle);
+		const leafForkMessage = forkMessages?.messages?.at(-1);
+		if (!leafForkMessage?.entryId) throw new Error("Session B exposed no leaf Fork entry");
+		const leafParentGeneration = leafForkParent.generation;
+		const leafFork = await client.command(
+			leafForkParent,
+			{ type: "fork", entryId: leafForkMessage.entryId },
+			"fork Session B from its leaf user entry",
+		);
+		if (
+			leafFork.previousSessionHandle !== originalSessionBHandle ||
+			leafFork.sessionHandle === originalSessionBHandle ||
+			leafFork.generation !== leafParentGeneration + 1 ||
+			(leafFork.response.data as { cancelled?: boolean } | undefined)?.cancelled !== false ||
+			leafForkParent.runtime?.recoverable !== true ||
+			!leafForkParent.runtime.sessionFile ||
+			!fs.existsSync(leafForkParent.runtime.sessionFile)
+		) {
+			throw new Error("leaf Fork did not produce a persisted child identity");
+		}
+		const leafForkHistory = messagesFrom(
+			(await client.command(leafForkParent, { type: "get_messages" }, "get_messages leaf Fork child"))
+				.response,
+		);
+		if (
+			!hasText(leafForkHistory, markerB) ||
+			!hasText(leafForkHistory, middleMarker) ||
+			(typeof leafForkMessage.text === "string" && hasText(leafForkHistory, leafForkMessage.text))
+		) {
+			throw new Error("leaf Fork did not preserve the exact history prefix before its selected entry");
+		}
+		console.log("ordinary middle + leaf Fork persistence and history boundaries ok");
+
+		const rootForkParent = await client.attachExisting(originalSessionBHandle);
 		const firstForkMessage = forkMessages?.messages?.[0];
 		if (!firstForkMessage?.entryId) throw new Error("Session B exposed no first user entry for fork");
-		const forkParentHandle = sessionB.handle;
-		const forkParentGeneration = sessionB.generation;
+		const forkParentHandle = rootForkParent.handle;
+		const forkParentGeneration = rootForkParent.generation;
 		const rootFork = await client.command(
-			sessionB,
+			rootForkParent,
 			{ type: "fork", entryId: firstForkMessage.entryId },
 			"fork Session B before its first user entry",
 		);
@@ -560,18 +637,20 @@ if (!RUN_REAL_E2E) {
 			throw new Error("first-user fork did not produce the expected pending child identity");
 		}
 		if (
-			sessionB.handle !== rootFork.sessionHandle ||
-			sessionB.runtime?.recoverable !== false ||
-			!sessionB.runtime.sessionFile ||
-			fs.existsSync(sessionB.runtime.sessionFile)
+			rootForkParent.handle !== rootFork.sessionHandle ||
+			rootForkParent.runtime?.recoverable !== false ||
+			!rootForkParent.runtime.sessionFile ||
+			fs.existsSync(rootForkParent.runtime.sessionFile)
 		) {
 			throw new Error("first-user fork child was not retained as an unpersisted live Session");
 		}
 
 		const rootForkMarker = "PI_WEB_ROOT_FORK_52A9";
-		const beforeRootForkSettle = sessionB.events.filter((event) => event.type === "agent_settled").length;
+		const beforeRootForkSettle = rootForkParent.events.filter(
+			(event) => event.type === "agent_settled",
+		).length;
 		await client.command(
-			sessionB,
+			rootForkParent,
 			{
 				type: "prompt",
 				message: `只回复这个标记：${rootForkMarker}`,
@@ -579,14 +658,14 @@ if (!RUN_REAL_E2E) {
 			},
 			"prompt first-user fork child",
 		);
-		await client.waitForSettled(sessionB, beforeRootForkSettle, "first-user fork child settlement");
+		await client.waitForSettled(rootForkParent, beforeRootForkSettle, "first-user fork child settlement");
 		await waitUntil(
-			() => sessionB.runtime?.recoverable === true,
+			() => rootForkParent.runtime?.recoverable === true,
 			COMMAND_TIMEOUT_MS,
 			"first-user fork child persistence",
 		);
 		const rootForkMessages = messagesFrom(
-			(await client.command(sessionB, { type: "get_messages" }, "get_messages first-user fork child"))
+			(await client.command(rootForkParent, { type: "get_messages" }, "get_messages first-user fork child"))
 				.response,
 		);
 		if (!hasText(rootForkMessages, rootForkMarker) || hasText(rootForkMessages, markerB)) {
@@ -640,7 +719,7 @@ if (!RUN_REAL_E2E) {
 		await Promise.all([
 			client.command(sessionA, { type: "get_session_stats" }, "get_session_stats child"),
 			client.command(parent, { type: "get_tree" }, "get_tree parent"),
-			client.command(sessionB, { type: "get_commands" }, "get_commands Session B"),
+			client.command(rootForkParent, { type: "get_commands" }, "get_commands Session B root child"),
 		]);
 		console.log("REAL PI E2E OK");
 	} catch (error) {

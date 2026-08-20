@@ -8,6 +8,7 @@ import { expect, test } from "../fixtures/test";
 const HISTORICAL_PROMPT = "E2E historical request";
 const HISTORICAL_REPLY = "E2E historical reply";
 const INSPECT_PROMPT = "E2E_RECOVERY_INSPECT";
+const FORK_CHILD_PROMPT = "E2E_FORK_CHILD";
 const captureDirectory = process.env.PI_WEB_E2E_CAPTURE_DIR;
 
 test.use({
@@ -49,7 +50,7 @@ async function openFreshSurface(page: Page, harness: ProductionHarness): Promise
 	await page.goto(harness.origin, { waitUntil: "domcontentloaded" });
 	await expect(page.locator("#root > div")).toBeVisible();
 	await expect(page.locator("textarea")).toBeEnabled();
-	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(1);
+	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(0);
 	await expect(
 		page.locator("header").getByRole("button", { name: /^(Empty session|空会话)$/ }),
 	).toBeVisible();
@@ -133,7 +134,7 @@ test("fresh boot and navigation never select or flash historical content", async
 	await secondary.click();
 	await expect(secondary).toHaveAttribute("aria-expanded", "true");
 	await expect(activeTitle).toBeVisible();
-	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(1);
+	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(0);
 	await secondary.click();
 	await expect(secondary).toHaveAttribute("aria-expanded", "false");
 	await expect(activeTitle).toBeVisible();
@@ -174,11 +175,31 @@ test("fresh boot and navigation never select or flash historical content", async
 		page.locator("header").getByRole("button", { name: /^(Empty session|空会话)$/ }),
 	).toBeVisible();
 	await expect(page.getByText(/^(Start your first turn|开始你的第一轮对话)$/)).toBeVisible();
+	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(0);
 	await historicalRow(page).getByRole("button").first().click();
 	await expect(page.locator("main").getByText(HISTORICAL_REPLY, { exact: true })).toBeVisible();
 	await expect
 		.poll(async () => (await listSessions(harness)).map((session) => session.sessionHandle))
 		.toEqual([harness.session.sessionHandle]);
+
+	await page
+		.locator("nav")
+		.getByRole("button", { name: /^(New session|新建会话)$/ })
+		.first()
+		.click();
+	await expect(
+		page.locator("header").getByRole("button", { name: /^(Empty session|空会话)$/ }),
+	).toBeVisible();
+	await page.locator("textarea").fill("E2E retained local draft");
+	await historicalRow(page).getByRole("button").first().click();
+	await expect(page.locator("main").getByText(HISTORICAL_REPLY, { exact: true })).toBeVisible();
+	await page
+		.locator("nav")
+		.getByRole("button", { name: /^(New session|新建会话)$/ })
+		.first()
+		.click();
+	await expect(page.locator("textarea")).toHaveValue("E2E retained local draft");
+	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(0);
 
 	await expectNoPageOverflow(page);
 	expect(errors.console).toEqual([]);
@@ -194,11 +215,13 @@ test("export, Bash, Inspect, Events, and the conversation tree expose complete s
 		origin: harness.origin,
 	});
 	await openFreshSurface(page, harness);
-	await openHistoricalWithoutEmptyFlash(page);
 
 	await page.locator("textarea").fill(INSPECT_PROMPT);
 	await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
 	await expect(page.locator("main").getByText("E2E_INSPECT_COMPLETE", { exact: true })).toBeVisible();
+	const inspectParentRow = page.locator("[data-session-row]").filter({ hasText: INSPECT_PROMPT });
+	await expect(inspectParentRow).toHaveCount(1);
+	await expect(inspectParentRow).toHaveAttribute("data-current", "true");
 
 	const bashRow = page
 		.locator("main")
@@ -245,7 +268,7 @@ test("export, Bash, Inspect, Events, and the conversation tree expose complete s
 	await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toMatch(/^file:\/\//);
 	const exportedUrl = await page.evaluate(() => navigator.clipboard.readText());
 	expect(new URL(exportedUrl).protocol).toBe("file:");
-	expect(decodeURIComponent(exportedUrl)).toContain("会话 #browser-e2e-history.html");
+	expect(decodeURIComponent(exportedUrl)).toMatch(/会话 #[^/]+\.html$/);
 
 	await page
 		.getByRole("button", { name: /^(Fork|分叉)$/ })
@@ -254,6 +277,21 @@ test("export, Bash, Inspect, Events, and the conversation tree expose complete s
 	await expect(page.getByText(/Forked a new session|已从该消息分叉出新会话/)).toBeVisible();
 	await expect(page.getByText(/^(Fork failed|分叉失败)$/)).toHaveCount(0);
 	await expect(page.locator("textarea")).toBeEnabled();
+	await expect(inspectParentRow).toHaveAttribute("data-current", "false");
+	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(0);
+
+	await page.locator("textarea").fill(FORK_CHILD_PROMPT);
+	await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
+	await expect(
+		page.locator("main").getByText(`E2E_REPLY:${FORK_CHILD_PROMPT}`, { exact: true }),
+	).toBeVisible();
+	const forkChildRow = page.locator("[data-session-row]").filter({ hasText: FORK_CHILD_PROMPT });
+	await expect(forkChildRow).toHaveCount(1);
+	await expect(forkChildRow).toHaveAttribute("data-current", "true");
+	await expect(inspectParentRow).toHaveAttribute("data-current", "false");
+	await expect
+		.poll(async () => (await listSessions(harness)).filter((session) => session.messageCount > 0).length)
+		.toBe(3);
 
 	await expectNoPageOverflow(page);
 	expect(errors.console).toEqual([]);
@@ -334,9 +372,10 @@ test("slash tokens, model navigation, context ring, and collapsed logo remain ke
 	await expect(main.getByText("E2E_REPLY:/skill:e2e atomic argument", { exact: true })).toBeVisible();
 	await expect(textarea).toBeEnabled();
 	await expect(page.locator("header")).not.toContainText("SECRET_SKILL_BODY_MUST_NOT_RENDER");
-	await expect(page.locator("nav")).not.toContainText("SECRET_SKILL_BODY_MUST_NOT_RENDER");
+	const sidebar = page.getByRole("navigation", { name: /^(Sidebar|侧栏)$/ });
+	await expect(sidebar).not.toContainText("SECRET_SKILL_BODY_MUST_NOT_RENDER");
 
-	const expandedLogo = page.locator("nav > div").first().locator("> div").first();
+	const expandedLogo = sidebar.locator(":scope > div").first().locator(":scope > div").first();
 	const expandedBox = await expandedLogo.boundingBox();
 	await page.getByRole("button", { name: /^(Collapse sidebar|收起侧栏)$/ }).click();
 	const railLogo = page.getByRole("button", { name: /^(Expand sidebar|展开侧栏)$/ });

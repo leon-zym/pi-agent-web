@@ -534,7 +534,7 @@ describe("native REST routes", () => {
 		expect(fs.existsSync(sessionFileB)).toBe(true);
 	});
 
-	it("creates two independent Session runtimes in one Workspace and overlays them before persistence", async () => {
+	it("creates independent runtimes without counting them as persisted Workspace history", async () => {
 		const root = temporaryRoot();
 		const resolver = createResolver(root);
 		const workspace = path.join(root, "workspace");
@@ -592,7 +592,8 @@ describe("native REST routes", () => {
 			expect.objectContaining({
 				workspaceHandle: preference.workspaceHandle,
 				displayName: path.basename(workspace),
-				sessionCount: 2,
+				sessionCount: 0,
+				hasNativeHistory: false,
 			}),
 		]);
 	});

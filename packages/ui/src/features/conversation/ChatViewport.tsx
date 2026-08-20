@@ -191,15 +191,18 @@ export function ChatViewport() {
 			ref={scrollRef}
 			onScroll={onScroll}
 			data-chat-viewport="true"
-			className="scroll-slim h-full overflow-y-auto overscroll-contain"
+			className="scroll-slim h-full overflow-x-hidden overflow-y-auto overscroll-contain"
 		>
-			<div ref={contentRef} className="mx-auto flex min-h-full w-full max-w-[748px] flex-col px-6 py-6">
+			<div
+				ref={contentRef}
+				className="mx-auto flex min-h-full min-w-0 w-full max-w-[748px] flex-col px-6 py-6"
+			>
 				{isLoading ? (
 					<ConversationLoadingSkeleton />
 				) : isEmpty ? (
 					<EmptyHero />
 				) : (
-					<div className="flex flex-col gap-6">
+					<div className="flex min-w-0 max-w-full flex-col gap-6">
 						{projection.turns.map((turn) => (
 							<TurnView key={turn.id} turn={turn} />
 						))}

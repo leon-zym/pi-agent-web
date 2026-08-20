@@ -10,7 +10,7 @@ const AFTER_IMAGE_PROMPT = "E2E_AFTER_IMAGE";
 async function openWorkbench(page: Page, harness: ProductionHarness): Promise<void> {
 	await page.goto(harness.origin, { waitUntil: "domcontentloaded" });
 	await expect(page.locator("#root > div")).toBeVisible();
-	await expect(page.locator("nav")).toBeVisible();
+	await expect(page.getByRole("navigation", { name: /^(Sidebar|侧栏)$/ })).toBeVisible();
 	await expect(page.locator("main")).toBeVisible();
 	await expect(page.locator("textarea")).toBeEnabled();
 }
@@ -50,7 +50,7 @@ test("two Sessions in one Workspace stream independently while the user switches
 	await openWorkbench(page, harness);
 
 	const selectedARow = page.locator('[data-session-row][data-current="true"]');
-	await expect(selectedARow).toHaveAttribute("data-runtime-state", "idle");
+	await expect(selectedARow).toHaveCount(0);
 	await sendPrompt(page, A_PROMPT);
 	await expect
 		.poll(() => eventFor(harness, (event) => event.type === "prompt" && event.text === A_PROMPT))
@@ -64,20 +64,20 @@ test("two Sessions in one Workspace stream independently while the user switches
 	await expect.poll(() => runtimeState(harness, aSession.sessionHandle)).toBe("running");
 	await expect(selectedARow).toHaveAttribute("data-runtime-state", "running");
 
-	const sidebar = page.locator("nav");
+	const sidebar = page.getByRole("navigation", { name: /^(Sidebar|侧栏)$/ });
 	await sidebar
 		.getByRole("button", { name: /^(New session|新建会话)$/ })
 		.first()
 		.click();
 	await expect.poll(async () => (await listSessions(harness)).length).toBe(3);
-	await expect(page.locator("[data-session-row]")).toHaveCount(3);
-	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(1);
+	await expect(page.locator("[data-session-row]")).toHaveCount(1);
+	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(0);
 	await expect(page.locator("textarea")).toBeEnabled();
 
-	const selectedBRow = page.locator('[data-session-row][data-current="true"]');
-	await expect(selectedBRow).toHaveAttribute("data-runtime-state", "idle");
 	await sendPrompt(page, B_PROMPT);
 	await expect(page.locator("main")).toContainText(`E2E_REPLY:${B_PROMPT}`);
+	const selectedBRow = page.locator('[data-session-row][data-current="true"]');
+	await expect(selectedBRow).toHaveAttribute("data-runtime-state", "idle");
 	const bPrompt = eventFor(harness, (event) => event.type === "prompt" && event.text === B_PROMPT);
 	const bSession = (await listSessions(harness)).find(
 		(session) => session.nativeSessionId === bPrompt?.sessionId,

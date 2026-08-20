@@ -11,7 +11,11 @@ import { UserMessageBubble } from "./UserMessageBubble";
  */
 export const TurnView = memo(function TurnView({ turn }: { turn: ProductTurn }) {
 	return (
-		<section data-turn-id={turn.id} aria-label={tt("turn.sectionAria")} className="flex flex-col gap-4">
+		<section
+			data-turn-id={turn.id}
+			aria-label={tt("turn.sectionAria")}
+			className="flex min-w-0 max-w-full flex-col gap-4"
+		>
 			{turn.userMessages.map((message) => (
 				<UserMessageBubble key={message.entryKey} message={message} />
 			))}

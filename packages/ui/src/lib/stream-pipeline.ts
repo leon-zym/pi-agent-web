@@ -4,7 +4,7 @@ import { useComposerStore } from "../stores/composer";
 import { useExtensionUiStore } from "../stores/extension-ui";
 import { useModelDirectoryStore } from "../stores/model-directory";
 import { useProjectionStore } from "../stores/projection";
-import { useSessionDirectoryStore } from "../stores/session-directory";
+import { reconcileHiddenSessionLifecycle, useSessionDirectoryStore } from "../stores/session-directory";
 import { useSessionStatsStore } from "../stores/session-stats";
 import { SESSION_FRAME_DEFERRED, sessionTransport } from "../stores/session-transport";
 import { useSlashCommandsStore } from "../stores/slash-commands";
@@ -140,9 +140,7 @@ function routeRuntime(runtime: SessionRuntimeDto): void {
 		!isCurrentSession(runtime.sessionHandle) &&
 		(runtime.state === "idle" || runtime.state === "dormant" || runtime.state === "crashed")
 	) {
-		const transport = sessionTransport.store.getState();
-		transport.releaseSession(runtime.sessionHandle);
-		transport.unsubscribeSession(runtime.sessionHandle);
+		reconcileHiddenSessionLifecycle(runtime.sessionHandle);
 	}
 	if (runtime.state === "crashed" && isCurrentSession(runtime.sessionHandle)) {
 		toast.error(tt("status.crashed"), { description: stripAnsi(runtime.error ?? "") });

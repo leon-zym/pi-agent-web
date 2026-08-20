@@ -84,6 +84,14 @@ export function toolOutputText(ctx: ToolPresenterContext): string {
 	return stripAnsi(output);
 }
 
+function hasToolError(ctx: ToolPresenterContext): boolean {
+	return ctx.block.status === "error" || ctx.results.some((result) => result.isError);
+}
+
+function toolErrorText(ctx: ToolPresenterContext): string {
+	return toolOutputText(ctx) || (hasToolError(ctx) ? tt("tool.executionError") : "");
+}
+
 function diffFromDetails(value: unknown): string | undefined {
 	if (typeof value !== "object" || value === null) return undefined;
 	const details = value as Record<string, unknown>;
@@ -135,7 +143,8 @@ function DiffBody({ diff }: { diff: string }) {
 
 function BashBody({ ctx }: { ctx: ToolPresenterContext }) {
 	const command = argText(ctx.block.args, "command") ?? "";
-	const output = toolOutputText(ctx);
+	const output = toolErrorText(ctx);
+	const isError = hasToolError(ctx);
 
 	return (
 		<div className="flex flex-col gap-3">
@@ -153,7 +162,12 @@ function BashBody({ ctx }: { ctx: ToolPresenterContext }) {
 				<p className="mb-1.5 text-[11px] font-medium tracking-wide text-ink-3 uppercase">
 					{tt("tool.output")}
 				</p>
-				<pre className="scroll-slim max-h-[260px] overflow-auto rounded-md bg-surface-2 p-3 font-mono text-xs leading-[18px] whitespace-pre-wrap break-words text-ink-2">
+				<pre
+					className={cn(
+						"scroll-slim max-h-[260px] overflow-auto rounded-md bg-surface-2 p-3 font-mono text-xs leading-[18px] whitespace-pre-wrap break-words",
+						isError ? "text-danger" : "text-ink-2",
+					)}
+				>
 					{output || tt("common.noOutput")}
 				</pre>
 			</section>
@@ -184,7 +198,18 @@ const editPresenter: ToolPresenter = {
 	},
 	renderBody: (ctx) => {
 		const diff = editDiff(ctx);
-		return diff ? <DiffBody diff={diff} /> : null;
+		if (!diff) return null;
+		const error = hasToolError(ctx) ? toolErrorText(ctx) : "";
+		return (
+			<div className="flex flex-col gap-2">
+				<DiffBody diff={diff} />
+				{error && error !== diff && (
+					<pre className="scroll-slim max-h-[260px] overflow-auto rounded-md bg-danger/5 p-3 font-mono text-xs leading-[18px] whitespace-pre-wrap break-words text-danger">
+						{error}
+					</pre>
+				)}
+			</div>
+		);
 	},
 };
 
