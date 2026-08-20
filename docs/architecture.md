@@ -49,12 +49,17 @@ RecoverableSessionTrash is a side store used only by fenced deletion.
 | Pi Session | JSONL 文件的 canonical real path | `sessionHandle` 由该路径生成，是不透明 Web 路由标识 |
 | Native Session id | JSONL Header `id` / `get_state.sessionId` | 用于验证文件与运行时一致，不作为跨文件全局主键 |
 | Workspace | JSONL Header `cwd` 的 canonical real path | `workspaceHandle` 是对应的不透明路由标识 |
-| 新空 Session | 短暂 pending handle | Pi 暴露真实 `sessionFile` 后通过 `session_rekeyed` 提交身份 |
+| 新空 Session | pending handle → allow-missing canonical path | Pi 可先分配 `sessionFile` 而不落盘；首次持久化后再冻结 Header/inode |
 | Controller | `(sessionHandle, connectionId, fencingToken)` | 只赋予一个 Session 的修改权，不是 Workspace 锁 |
 
 已存在文件用 `realpath`；尚未创建的 leaf 通过最近存在祖先的 realpath 规范化，防止符号链接
 父目录在落盘前后生成不同 handle。启动已有 Session 时，Runtime 会复核目标文件、Header id、
 Header cwd 与 Pi ready state；任何不一致都 fail closed。
+
+Pi 对新 Session 以及从首条 user entry fork 的 child，可能先在 `get_state` 返回目标路径，直到后续
+durable entry 才创建 JSONL。Runtime 只接受同一已验证 sessionDir 内、basename 与 native id 对应的
+allow-missing identity；验证前不可恢复、驱逐或删除。文件首次出现时必须复核 regular file、Header
+id/cwd 与冻结身份，失败就隔离该 Runtime，而不是把任意新 leaf 追认为 Session。
 
 ## 原生发现与 Workspace 偏好
 
@@ -88,6 +93,8 @@ Header、名称、计数、时间和截断首条消息，不复制完整对话�
   可以被驱逐；
 - idle TTL 到期后停止进程并进入 dormant，下一次打开同一 JSONL；
 - running、waiting_ui、starting、unpersisted、正在 fork/clone/delete 的 Runtime 不被驱逐；
+- 未触碰、未落盘且无 lease 的空 Runtime 由短 TTL reaper 停止并忘记，不执行任何文件删除；当前
+  controller 主动离开时可用 exact generation/fencing 的 transient abandon 提前完成同一收敛；
 - generation 在进程生命周期或身份迁移时递增，所有旧 mutation 都被拒绝；
 - crash 在滚动窗口内有限重试，超预算保留 crashed 状态供显式恢复；
 - POSIX 子进程使用独立进程组，显式停止与异常退出都会清理残留后代，再允许新进程启动。
@@ -144,7 +151,7 @@ Pi response 可与事件交错，因此 Gateway 附加 `barrierSeq`。UI 只有�
 | `session-frame-bus` | 按 Session 保序分发；组件不直接订阅 WebSocket |
 | `session-directory` | 原生 Workspace/Session 摘要、selected pointer、请求 generation |
 | `projection` | 按 Session 的 turn/step/block 投影；recent settled projection 可淘汰并从快照重建 |
-| `composer` | 按 Session 的 draft、附件、提交状态、delivery mode 与 queue 意图 |
+| `composer` | 按 Session 的 draft、原子 Slash Command Token、附件、提交状态、delivery mode 与 queue 意图 |
 | `model` / `slash` / `stats` | 按 Session 的 Host 快照与刷新状态 |
 | `extension-ui` | 按 Session/generation 的 dialog、status、widget、title、editor text |
 | `view` | 本地展开、选中工具和详情面板状态；不写回 Pi |
@@ -153,11 +160,19 @@ Pi response 可与事件交错，因此 Gateway 附加 `barrierSeq`。UI 只有�
 delta 由 per-Session scheduler 合并：可见页用 rAF，hidden 页用有界 timer；结构、错误、settled、
 rekey 等边界立即 flush。多 Session 在同一 publication 周期公平推进。
 
-## Fork、clone 与删除事务
+## Fork、clone、transient abandon 与删除事务
 
-Pi fork/clone 可能先创建 child JSONL，再返回 response。Supervisor 在 Workspace identity
-reservation 内验证 child 文件 Header、cwd 与 ready state，先原子占用新 handle，再广播 rekey
-并释放 staged frames。取消、timeout、碰撞或身份不确定会停止进程并丢弃 staged child 帧。
+Pi fork/clone 可能在返回 response 前就切换进程身份并分配或创建 child JSONL。Supervisor 在
+Workspace identity reservation 内验证 ready state 与 child identity；已落盘时还验证 Header/cwd，
+然后先原子占用新 handle，再广播 rekey 并释放 staged frames。取消、timeout、碰撞或身份不确定会
+停止进程并丢弃 staged child 帧。
+
+从 root user entry fork 时，Pi 也可能只分配 child path 而尚未创建文件。该 child 继续使用上面的
+pending persisted-identity 状态，直到首次落盘验证；不能把正常 ENOENT 当成 fork failure。
+
+Transient abandon 与 recoverable DELETE 是两个 API：前者只允许 untouched、idle、unpersisted
+runtime，并在 stop 后再次确认路径仍不存在再忘记内存身份；后者只处理已经验证的 JSONL 并移动
+文件。两者都在 Supervisor reservation 内与 command、claim、materialization 和 shutdown 互斥。
 
 DELETE 需要当前 Session 的 generation 与 fencing token。Reservation 内再次 force-refresh
 Catalog，并拒绝 active/unpersisted Session、子 Session、Workspace transition 和并发 deletion。

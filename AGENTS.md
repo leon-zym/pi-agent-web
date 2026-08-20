@@ -44,8 +44,12 @@ human-facing command. Do not perform a repository-wide rename between them.
   none. The hot pool is bounded. Same-Workspace and cross-Workspace Sessions may run concurrently.
 - Browser selection is only a view pointer. Never use Pi `switch_session`/`new_session` for
   navigation, and never stop one Session merely because the user selected another.
-- A new empty Session can rekey from a pending handle to its canonical file handle. Fork/clone
-  rekeys the active process to the child; the parent remains independently reopenable.
+- A new empty Session can rekey from a pending handle to its canonical file handle. Pi may allocate
+  a new/fork child path before creating the JSONL; keep that identity unverified and non-recoverable
+  until the first materialized Header id/cwd is frozen. Fork/clone rekeys the active process to the
+  child; the parent remains independently reopenable.
+- Untouched, idle, unpersisted Sessions may be abandoned with the exact lease/generation or by the
+  bounded orphan reaper. This path only stops and forgets memory state; it must never delete a file.
 - One authenticated WebSocket carries multiple Session channels. Subscription, lease, fencing
   token, generation, seq, replay/resync, command ids, and Extension UI state are isolated per
   Session.

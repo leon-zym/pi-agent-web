@@ -41,6 +41,7 @@
 | `get_commands` | `{commands}`；source 为 extension/prompt/skill，skill 名带 `skill:` 前缀 |
 | `compact` | 手动压缩只发 `compaction_start/end`，不保证随后有 `agent_settled` |
 | `set_session_name` | 空名称报错，并写 `session_info` 条目 |
+| archive | 当前依赖没有 Session 或 Workspace archive RPC；Web 不合成等价命令 |
 
 Gateway command timeout 是本项目策略，不是浏览器输入：默认读取 30 秒，prompt/steer/
 follow_up 120 秒，abort 90 秒，compact/export 120 秒。Timeout 后身份变更命令属于不确定状态，
@@ -105,13 +106,15 @@ HttpOnly、SameSite=Strict Cookie。
 | `POST /workspaces/pick-directory` | Gateway 所在操作系统的原生目录选择器 |
 | `GET /workspaces` | 从 native history、preferences 与 hot runtimes 投影 Workspace |
 | `POST /workspaces` | 添加/更新 path preference；不创建另一份 Workspace 数据 |
+| `POST /workspaces/:workspaceHandle/activate` | 记录 Web 最近显式使用的 Workspace；Pi 本身无 last-Workspace setting |
 | `DELETE /workspaces/:workspaceHandle` | 仅移除 preference；response 明示 native history 是否保留 |
 | `GET /workspaces/:workspaceHandle/sessions` | native Session 摘要；`?refresh=1` 强制绕过 catalog snapshot TTL |
 | `POST /workspaces/:workspaceHandle/sessions` | 用该 Workspace 的解析布局创建独立 Pi Session runtime |
 | `GET /workspaces/:workspaceHandle/sessions/:sessionHandle/process` | hot runtime，或合成的 dormant 状态 |
+| `DELETE /workspaces/:workspaceHandle/sessions/:sessionHandle/transient` | fenced 地忘记 untouched、idle、未落盘 runtime；不删除文件 |
 | `DELETE /workspaces/:workspaceHandle/sessions/:sessionHandle` | 受 fencing 保护的可恢复文件移动 |
 
-Session DELETE 额外要求：
+Session DELETE 与 transient abandon 都额外要求：
 
 ```text
 X-Pi-Session-Generation: <exact positive integer>
@@ -121,6 +124,10 @@ X-Pi-Fencing-Token: <current opaque controller token>
 删除会在 supervisor reservation 内 force-refresh，再校验 Workspace/Session handle、Header id/cwd、
 子 Session、运行状态与文件 identity。成功返回 `{ok:true,recoverable:true}`；它不承诺当前 UI 已
 提供 restore/purge。
+
+Transient abandon 只接受当前 controller 的精确 capability，且 runtime 必须 untouched、idle、
+unpersisted、无 command/dialog/transition reservation。停止进程后若目标路径已经出现则返回 409
+并保留 Session；成功返回 `{ok:true,abandoned:true}`，不会调用 unlink、rename 或 trash。
 
 ## 4. Browser → Gateway WebSocket
 
