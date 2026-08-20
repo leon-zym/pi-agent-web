@@ -8,7 +8,7 @@ const workspacePath = path.join(tempRoot, "workspace");
 const agentDir = path.join(tempRoot, "agent");
 const sessionRootDir = path.join(tempRoot, "sessions");
 const webDataDir = path.join(tempRoot, "web-data");
-const fakePiPath = path.join(import.meta.dirname, "fixtures", "fake-pi.mjs");
+const fakePiPath = path.join(import.meta.dirname, "fixtures", "session-runtime-pi.mjs");
 fs.mkdirSync(workspacePath, { recursive: true });
 
 let handle: Awaited<ReturnType<typeof startServer>> | undefined;
@@ -17,12 +17,9 @@ try {
 	const started = await startServer({
 		config: { port: 0, host: "127.0.0.1", agentDir, sessionRootDir, webDataDir },
 		piPath: fakePiPath,
+		handleSignals: false,
 	});
 	handle = started;
-	await new Promise<void>((resolve, reject) => {
-		started.server.once("listening", resolve);
-		started.server.once("error", reject);
-	});
 	const address = started.server.address();
 	if (!address || typeof address === "string") throw new Error("server did not expose a TCP address");
 	const base = `http://127.0.0.1:${String(address.port)}`;
@@ -43,22 +40,40 @@ try {
 	});
 	if (!workspaceResponse.ok)
 		throw new Error(`workspace registration failed: ${String(workspaceResponse.status)}`);
-	const workspace = (await workspaceResponse.json()) as { id: string };
+	const workspace = (await workspaceResponse.json()) as { workspaceHandle: string };
+	const sessionResponse = await fetch(`${base}/api/v1/workspaces/${workspace.workspaceHandle}/sessions`, {
+		method: "POST",
+		headers: authHeaders,
+	});
+	if (!sessionResponse.ok) throw new Error(`session creation failed: ${String(sessionResponse.status)}`);
+	const created = (await sessionResponse.json()) as {
+		runtime: { sessionHandle: string; generation: number };
+	};
 
 	const WebSocketCtor = (await import("ws")).default;
 	const ws = new WebSocketCtor(`ws://127.0.0.1:${String(address.port)}/api/v1/ws`, { headers: authHeaders });
+	await new Promise<void>((resolve, reject) => {
+		ws.once("open", resolve);
+		ws.once("error", reject);
+	});
+	const subscribed = new Promise<void>((resolve, reject) => {
+		const timeout = setTimeout(() => reject(new Error("Session subscribe timed out")), 10_000);
+		ws.on("message", (raw) => {
+			const frame = JSON.parse(raw.toString()) as {
+				type?: string;
+				runtime?: { sessionHandle?: string };
+			};
+			if (frame.type !== "runtime_state" || frame.runtime?.sessionHandle !== created.runtime.sessionHandle) {
+				return;
+			}
+			clearTimeout(timeout);
+			resolve();
+		});
+	});
+	ws.send(JSON.stringify({ type: "session_subscribe", sessionHandle: created.runtime.sessionHandle }));
+	await subscribed;
 	const state = await new Promise<{ sessionId: string }>((resolve, reject) => {
 		const timeout = setTimeout(() => reject(new Error("get_state timed out")), 10_000);
-		ws.once("open", () => {
-			ws.send(
-				JSON.stringify({
-					type: "command",
-					workspaceId: workspace.id,
-					expectedSessionId: null,
-					command: { id: "smoke-state", type: "get_state" },
-				}),
-			);
-		});
 		ws.on("message", (raw) => {
 			const frame = JSON.parse(raw.toString()) as {
 				type?: string;
@@ -73,9 +88,17 @@ try {
 			resolve({ sessionId: frame.response.data.sessionId });
 		});
 		ws.once("error", reject);
+		ws.send(
+			JSON.stringify({
+				type: "command",
+				sessionHandle: created.runtime.sessionHandle,
+				expectedGeneration: created.runtime.generation,
+				command: { id: "smoke-state", type: "get_state" },
+			}),
+		);
 	});
 	ws.close();
-	console.log(`SMOKE OK: workspace ${workspace.id}, session ${state.sessionId}`);
+	console.log(`SMOKE OK: workspace ${workspace.workspaceHandle}, session ${state.sessionId}`);
 } catch (error) {
 	process.exitCode = 1;
 	console.error("SMOKE ERROR:", error);

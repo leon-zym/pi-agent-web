@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -9,13 +10,15 @@ const workspacePath = path.join(tempRoot, "workspace");
 const agentDir = path.join(tempRoot, "agent");
 const sessionRootDir = path.join(tempRoot, "sessions");
 const webDataDir = path.join(tempRoot, "web-data");
-const fakePiPath = path.join(import.meta.dirname, "fixtures", "fake-pi.mjs");
+const fakePiPath = path.join(import.meta.dirname, "fixtures", "session-runtime-pi.mjs");
 const viteOrigin = "http://localhost:5173";
 
 let handle: ServerHandle;
 let base: string;
 let cookie: string;
-let workspaceId: string;
+let workspaceHandle: string;
+let sessionHandle: string;
+let sessionGeneration: number;
 
 function authenticatedHeaders(origin = viteOrigin): Record<string, string> {
 	return { Origin: origin, Cookie: cookie };
@@ -49,15 +52,31 @@ async function responseFor(
 	});
 }
 
+async function rawGet(pathname: string, headers: Record<string, string>): Promise<number | undefined> {
+	const target = new URL(base);
+	return new Promise((resolve, reject) => {
+		const request = http.get(
+			{
+				host: target.hostname,
+				port: Number(target.port),
+				path: pathname,
+				headers,
+			},
+			(response) => {
+				response.resume();
+				response.once("end", () => resolve(response.statusCode));
+			},
+		);
+		request.once("error", reject);
+	});
+}
+
 beforeAll(async () => {
 	fs.mkdirSync(workspacePath, { recursive: true });
 	handle = await startServer({
 		config: { port: 0, host: "127.0.0.1", agentDir, sessionRootDir, webDataDir },
 		piPath: fakePiPath,
-	});
-	await new Promise<void>((resolve, reject) => {
-		handle.server.once("listening", resolve);
-		handle.server.once("error", reject);
+		handleSignals: false,
 	});
 	const address = handle.server.address();
 	if (!address || typeof address === "string") throw new Error("server did not expose a TCP address");
@@ -76,7 +95,17 @@ beforeAll(async () => {
 		body: JSON.stringify({ path: workspacePath }),
 	});
 	expect(workspace.status).toBe(201);
-	workspaceId = ((await workspace.json()) as { id: string }).id;
+	workspaceHandle = ((await workspace.json()) as { workspaceHandle: string }).workspaceHandle;
+	const session = await fetch(`${base}/api/v1/workspaces/${workspaceHandle}/sessions`, {
+		method: "POST",
+		headers: authenticatedHeaders(),
+	});
+	expect(session.status).toBe(201);
+	const created = (await session.json()) as {
+		runtime: { sessionHandle: string; generation: number };
+	};
+	sessionHandle = created.runtime.sessionHandle;
+	sessionGeneration = created.runtime.generation;
 });
 
 afterAll(async () => {
@@ -119,6 +148,23 @@ describe("gateway access control", () => {
 			headers: { "Sec-Fetch-Site": "cross-site" },
 		});
 		expect(crossSite.status).toBe(403);
+	});
+
+	it("rejects DNS-rebinding requests with a non-loopback Host", async () => {
+		const port = new URL(base).port;
+		expect(
+			await rawGet("/api/v1/bootstrap", {
+				Host: `evil.example:${port}`,
+				"Sec-Fetch-Site": "same-origin",
+			}),
+		).toBe(403);
+		expect(
+			await rawGet("/api/v1/workspaces", {
+				Host: `evil.example:${port}`,
+				"Sec-Fetch-Site": "same-origin",
+				Cookie: cookie,
+			}),
+		).toBe(403);
 	});
 
 	it("rejects REST calls without a matching cookie and origin", async () => {
@@ -184,12 +230,29 @@ describe("gateway access control", () => {
 			openSocket(authenticatedHeaders()),
 			openSocket(authenticatedHeaders()),
 		]);
+		const subscribe = (ws: import("ws").WebSocket) =>
+			new Promise<void>((resolve, reject) => {
+				const timeout = setTimeout(() => reject(new Error("subscribe timed out")), 10_000);
+				const onMessage = (raw: Buffer) => {
+					const frame = JSON.parse(raw.toString()) as {
+						type?: string;
+						runtime?: { sessionHandle?: string };
+					};
+					if (frame.type !== "runtime_state" || frame.runtime?.sessionHandle !== sessionHandle) return;
+					clearTimeout(timeout);
+					ws.off("message", onMessage);
+					resolve();
+				};
+				ws.on("message", onMessage);
+				ws.send(JSON.stringify({ type: "session_subscribe", sessionHandle }));
+			});
+		await Promise.all([subscribe(a), subscribe(b)]);
 		const responseA = responseFor(a, "same-client-id");
 		const responseB = responseFor(b, "same-client-id");
 		const command = JSON.stringify({
 			type: "command",
-			workspaceId,
-			expectedSessionId: null,
+			sessionHandle,
+			expectedGeneration: sessionGeneration,
 			command: { id: "same-client-id", type: "get_state" },
 		});
 		a.send(command);

@@ -2,34 +2,48 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { getSessionDirForCwd } from "../src/config.js";
 import { type ServerHandle, startServer } from "../src/main.js";
+import { sessionHandleForFile } from "../src/native-session-catalog.js";
+import { workspaceHandleForPath } from "../src/session-layout-resolver.js";
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-session-safety-"));
-const workspacePath = path.join(tempRoot, "a-b");
-const collidingWorkspacePath = path.join(tempRoot, "a", "b");
+const workspacePath = path.join(tempRoot, "workspace");
+const otherWorkspacePath = path.join(tempRoot, "other-workspace");
 const agentDir = path.join(tempRoot, "agent");
 const sessionRootDir = path.join(tempRoot, "sessions");
 const webDataDir = path.join(tempRoot, "web-data");
-const fakePiPath = path.join(import.meta.dirname, "fixtures", "fake-pi.mjs");
+const fakePiPath = path.join(import.meta.dirname, "fixtures", "session-runtime-pi.mjs");
 const viteOrigin = "http://localhost:5173";
-const testConnectionId = "session-safety-test";
 
 let handle: ServerHandle;
 let base: string;
 let cookie: string;
-let workspaceId: string;
+let workspaceHandle: string;
 let workspaceRealpath: string;
-let sessionDir: string;
 
 function authenticatedHeaders(): Record<string, string> {
 	return { Origin: viteOrigin, Cookie: cookie };
 }
 
-function controlContext(): { connectionId: string; expectedSessionId: string | null } {
+async function controlledDelete(sessionHandle: string): Promise<{
+	connectionId: string;
+	fencingToken: string;
+	generation: number;
+	headers: Record<string, string>;
+}> {
+	const connectionId = `delete-${crypto.randomUUID()}`;
+	const lease = await handle.supervisor.claim(sessionHandle, connectionId);
+	const runtime = handle.supervisor.getRuntime(sessionHandle);
+	if (!lease.fencingToken || !runtime) throw new Error("unable to claim Session deletion control");
 	return {
-		connectionId: testConnectionId,
-		expectedSessionId: handle.supervisor.getStatus(workspaceId)?.sessionId ?? null,
+		connectionId,
+		fencingToken: lease.fencingToken,
+		generation: runtime.generation,
+		headers: {
+			...authenticatedHeaders(),
+			"X-Pi-Session-Generation": String(runtime.generation),
+			"X-Pi-Fencing-Token": lease.fencingToken,
+		},
 	};
 }
 
@@ -37,38 +51,42 @@ function writeSession(
 	fileName: string,
 	options: { id: string; cwd: string; parentSession?: string },
 ): string {
-	const filePath = path.join(sessionDir, fileName);
-	const header = {
-		type: "session",
-		version: 3,
-		id: options.id,
-		timestamp: "2026-01-01T00:00:00.000Z",
-		cwd: options.cwd,
-		...(options.parentSession ? { parentSession: options.parentSession } : {}),
-	};
-	fs.writeFileSync(filePath, `${JSON.stringify(header)}\n`, "utf8");
-	return filePath;
+	fs.mkdirSync(sessionRootDir, { recursive: true });
+	const filePath = path.join(sessionRootDir, fileName);
+	const timestamp = "2026-01-01T00:00:00.000Z";
+	const lines = [
+		{
+			type: "session",
+			version: 3,
+			id: options.id,
+			timestamp,
+			cwd: options.cwd,
+			...(options.parentSession ? { parentSession: options.parentSession } : {}),
+		},
+		{
+			type: "message",
+			id: `${options.id}-message`,
+			parentId: null,
+			timestamp,
+			message: { role: "user", content: `question ${options.id}`, timestamp: Date.parse(timestamp) },
+		},
+	];
+	fs.writeFileSync(filePath, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`, "utf8");
+	return fs.realpathSync(filePath);
 }
 
 function nextFile(label: string): string {
 	return `2026-01-01T00-00-00-000Z_${label}-${crypto.randomUUID()}.jsonl`;
 }
 
-async function waitForMicrotasks(): Promise<void> {
-	await new Promise<void>((resolve) => setImmediate(resolve));
-}
-
 beforeAll(async () => {
 	fs.mkdirSync(workspacePath, { recursive: true });
-	fs.mkdirSync(collidingWorkspacePath, { recursive: true });
-
+	fs.mkdirSync(otherWorkspacePath, { recursive: true });
+	workspaceRealpath = fs.realpathSync(workspacePath);
 	handle = await startServer({
 		config: { port: 0, host: "127.0.0.1", agentDir, sessionRootDir, webDataDir },
 		piPath: fakePiPath,
-	});
-	await new Promise<void>((resolve, reject) => {
-		handle.server.once("listening", resolve);
-		handle.server.once("error", reject);
+		handleSignals: false,
 	});
 	const address = handle.server.address();
 	if (!address || typeof address === "string") throw new Error("server did not expose a TCP address");
@@ -79,15 +97,12 @@ beforeAll(async () => {
 	if (!setCookie) throw new Error("bootstrap did not set a session cookie");
 	cookie = setCookie.split(";", 1)[0] ?? "";
 
-	const workspace = handle.registry.add(workspacePath);
-	workspaceId = workspace.id;
-	const record = handle.registry.get(workspaceId);
-	if (!record) throw new Error("workspace registration was not retained");
-	workspaceRealpath = record.cwdRealpath;
-	sessionDir = getSessionDirForCwd(workspaceRealpath, sessionRootDir);
-	fs.mkdirSync(sessionDir, { recursive: true });
-	handle.supervisor.registerWorkspace(workspaceId, workspaceRealpath);
-	handle.supervisor.claimController(workspaceId, testConnectionId);
+	const workspace = await fetch(`${base}/api/v1/workspaces`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json", ...authenticatedHeaders() },
+		body: JSON.stringify({ path: workspacePath }),
+	});
+	workspaceHandle = ((await workspace.json()) as { workspaceHandle: string }).workspaceHandle;
 });
 
 afterAll(async () => {
@@ -95,140 +110,112 @@ afterAll(async () => {
 	fs.rmSync(tempRoot, { recursive: true, force: true });
 });
 
-describe("session file identity and transition safety", () => {
-	it("uses a workspace realpath as the stable registry identity", () => {
+describe("native Session identity and deletion safety", () => {
+	it("derives one Workspace identity from the canonical cwd", async () => {
 		const aliasPath = path.join(tempRoot, "workspace-alias");
 		fs.symlinkSync(workspacePath, aliasPath);
-		const aliasedWorkspace = handle.registry.add(aliasPath);
-		expect(aliasedWorkspace.id).toBe(workspaceId);
-		expect(handle.registry.get(workspaceId)?.cwdRealpath).toBe(workspaceRealpath);
-	});
-
-	it("refuses to delete the active file even when the Header UUID differs from its filename", async () => {
-		const fileName = nextFile("active");
-		const activePath = writeSession(fileName, { id: "header-uuid-not-the-filename", cwd: workspaceRealpath });
-		await handle.supervisor.sendCommand(
-			workspaceId,
-			workspaceRealpath,
-			{
-				type: "switch_session",
-				sessionPath: activePath,
-			},
-			controlContext(),
-		);
-
-		expect(handle.supervisor.getStatus(workspaceId)?.sessionFile).toBe(activePath);
-		const response = await fetch(`${base}/api/v1/workspaces/${workspaceId}/sessions/${fileName}`, {
-			method: "DELETE",
-			headers: authenticatedHeaders(),
+		const response = await fetch(`${base}/api/v1/workspaces`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", ...authenticatedHeaders() },
+			body: JSON.stringify({ path: aliasPath }),
 		});
-		expect(response.status).toBe(409);
-		expect(fs.existsSync(activePath)).toBe(true);
+		const alias = (await response.json()) as { workspaceHandle: string; path: string };
+		expect(alias.workspaceHandle).toBe(workspaceHandle);
+		expect(alias.path).toBe(workspaceRealpath);
+		expect(workspaceHandle).toBe(workspaceHandleForPath(workspaceRealpath));
 	});
 
-	it("refuses to delete a parent session while a same-workspace child remains", async () => {
-		const parentPath = writeSession(nextFile("parent"), { id: "parent-header", cwd: workspaceRealpath });
-		const childPath = writeSession(nextFile("child"), {
-			id: "child-header",
+	it("force-refreshes native storage and resolves only the canonical file handle", async () => {
+		await handle.catalog.refresh({ force: true });
+		const sessionFile = writeSession(nextFile("late"), { id: "late-native", cwd: workspaceRealpath });
+		const sessionHandle = sessionHandleForFile(sessionFile);
+
+		await expect(handle.supervisor.activate(sessionHandle)).resolves.toMatchObject({
+			sessionHandle,
+			workspaceId: workspaceHandle,
+			sessionFile,
+		});
+		await expect(handle.supervisor.activate("session_forged")).rejects.toThrow("unknown_session");
+		await handle.supervisor.stop(sessionHandle);
+	});
+
+	it("refuses a busy Session and later moves that exact controlled file to recoverable trash", async () => {
+		const sessionFile = writeSession(nextFile("active"), {
+			id: "header-id-not-used-as-file-identity",
 			cwd: workspaceRealpath,
-			parentSession: parentPath,
 		});
-		const response = await fetch(
-			`${base}/api/v1/workspaces/${workspaceId}/sessions/${path.basename(parentPath)}`,
+		const sessionHandle = sessionHandleForFile(sessionFile);
+		await handle.supervisor.activate(sessionHandle);
+		const control = await controlledDelete(sessionHandle);
+		await handle.supervisor.sendCommand(
+			sessionHandle,
+			{ id: "busy-delete", type: "prompt", message: "slow", streamingBehavior: "steer" },
 			{
-				method: "DELETE",
-				headers: authenticatedHeaders(),
+				connectionId: control.connectionId,
+				expectedGeneration: control.generation,
+				fencingToken: control.fencingToken,
 			},
 		);
-		expect(response.status).toBe(409);
-		expect(fs.existsSync(parentPath)).toBe(true);
-		expect(fs.existsSync(childPath)).toBe(true);
-	});
 
-	it("filters encoded-directory collisions by Header cwd and refuses a foreign switch", async () => {
-		const foreignRealpath = fs.realpathSync(collidingWorkspacePath);
-		expect(getSessionDirForCwd(foreignRealpath, sessionRootDir)).toBe(sessionDir);
-		const foreignPath = writeSession(nextFile("foreign"), { id: "foreign-header", cwd: foreignRealpath });
-
-		const sessionsResponse = await fetch(`${base}/api/v1/workspaces/${workspaceId}/sessions`, {
-			headers: authenticatedHeaders(),
-		});
-		const body = (await sessionsResponse.json()) as { sessions: Array<{ absolutePath: string }> };
-		expect(body.sessions.some((session) => session.absolutePath === foreignPath)).toBe(false);
-
-		await expect(
-			handle.supervisor.sendCommand(
-				workspaceId,
-				workspaceRealpath,
-				{
-					type: "switch_session",
-					sessionPath: foreignPath,
-				},
-				controlContext(),
-			),
-		).rejects.toThrow("Session header does not belong to this workspace");
-	});
-
-	it("caches workspace session counts without sharing an encoded-directory collision", async () => {
-		const foreignRealpath = fs.realpathSync(collidingWorkspacePath);
-		writeSession(nextFile("count-foreign"), { id: "count-foreign", cwd: foreignRealpath });
-		const collidingWorkspace = handle.registry.add(collidingWorkspacePath);
-		handle.supervisor.registerWorkspace(collidingWorkspace.id, foreignRealpath);
-
-		const [aSessionsResponse, bSessionsResponse] = await Promise.all([
-			fetch(`${base}/api/v1/workspaces/${workspaceId}/sessions`, { headers: authenticatedHeaders() }),
-			fetch(`${base}/api/v1/workspaces/${collidingWorkspace.id}/sessions`, {
-				headers: authenticatedHeaders(),
-			}),
-		]);
-		const [aSessions, bSessions] = await Promise.all([
-			aSessionsResponse.json() as Promise<{ sessions: unknown[] }>,
-			bSessionsResponse.json() as Promise<{ sessions: unknown[] }>,
-		]);
-
-		const workspacesResponse = await fetch(`${base}/api/v1/workspaces`, { headers: authenticatedHeaders() });
-		const workspaces = (await workspacesResponse.json()) as Array<{ id: string; sessionCount: number }>;
-		expect(workspaces.find((workspace) => workspace.id === workspaceId)?.sessionCount).toBe(
-			aSessions.sessions.length,
-		);
-		expect(workspaces.find((workspace) => workspace.id === collidingWorkspace.id)?.sessionCount).toBe(
-			bSessions.sessions.length,
-		);
-	});
-
-	it("serializes a pending switch ahead of deletion so the newly active file survives", async () => {
-		const fileName = nextFile("queued-active");
-		const queuedPath = writeSession(fileName, { id: "queued-header", cwd: workspaceRealpath });
-		let release: (() => void) | undefined;
-		const heldTransition = handle.supervisor.withSessionTransition(
-			workspaceId,
-			() =>
-				new Promise<void>((resolve) => {
-					release = resolve;
-				}),
-		);
-		await waitForMicrotasks();
-
-		const switchPromise = handle.supervisor.sendCommand(
-			workspaceId,
-			workspaceRealpath,
-			{
-				type: "switch_session",
-				sessionPath: queuedPath,
-			},
-			controlContext(),
-		);
-		await waitForMicrotasks();
-		const deletePromise = fetch(`${base}/api/v1/workspaces/${workspaceId}/sessions/${fileName}`, {
+		const active = await fetch(`${base}/api/v1/workspaces/${workspaceHandle}/sessions/${sessionHandle}`, {
 			method: "DELETE",
-			headers: authenticatedHeaders(),
+			headers: control.headers,
 		});
-		await waitForMicrotasks();
+		expect(active.status).toBe(409);
+		expect((await active.json()) as unknown).toMatchObject({ error: { code: "session_busy" } });
+		expect(fs.existsSync(sessionFile)).toBe(true);
 
-		release?.();
-		await heldTransition;
-		await expect(switchPromise).resolves.toMatchObject({ success: true, command: "switch_session" });
-		expect((await deletePromise).status).toBe(409);
-		expect(fs.existsSync(queuedPath)).toBe(true);
+		await new Promise<void>((resolve) => setTimeout(resolve, 350));
+		const deleted = await fetch(`${base}/api/v1/workspaces/${workspaceHandle}/sessions/${sessionHandle}`, {
+			method: "DELETE",
+			headers: control.headers,
+		});
+		expect(deleted.status).toBe(200);
+		expect(await deleted.json()).toEqual({ ok: true, recoverable: true });
+		expect(fs.existsSync(sessionFile)).toBe(false);
+		const entries = fs.readdirSync(handle.trash.rootDirectory);
+		const matchingMetadata = entries
+			.map((entry) => path.join(handle.trash.rootDirectory, entry, "metadata.json"))
+			.map((file) => JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>)
+			.find((metadata) => metadata.sessionHandle === sessionHandle);
+		expect(matchingMetadata).toMatchObject({
+			originalSessionFile: sessionFile,
+			workspaceHandle,
+			nativeSessionId: "header-id-not-used-as-file-identity",
+		});
+	});
+
+	it("protects parent lineage and exact Workspace ownership", async () => {
+		const parentFile = writeSession(nextFile("parent"), { id: "parent", cwd: workspaceRealpath });
+		const childFile = writeSession(nextFile("child"), {
+			id: "child",
+			cwd: workspaceRealpath,
+			parentSession: parentFile,
+		});
+		const foreignFile = writeSession(nextFile("foreign"), {
+			id: "parent",
+			cwd: fs.realpathSync(otherWorkspacePath),
+		});
+		const parentHandle = sessionHandleForFile(parentFile);
+		const foreignHandle = sessionHandleForFile(foreignFile);
+		const parentControl = await controlledDelete(parentHandle);
+
+		const parent = await fetch(`${base}/api/v1/workspaces/${workspaceHandle}/sessions/${parentHandle}`, {
+			method: "DELETE",
+			headers: parentControl.headers,
+		});
+		expect(parent.status).toBe(409);
+		expect((await parent.json()) as unknown).toMatchObject({
+			error: { code: "session_has_children" },
+		});
+		expect(fs.existsSync(parentFile)).toBe(true);
+		expect(fs.existsSync(childFile)).toBe(true);
+
+		const crossWorkspace = await fetch(
+			`${base}/api/v1/workspaces/${workspaceHandle}/sessions/${foreignHandle}`,
+			{ method: "DELETE", headers: authenticatedHeaders() },
+		);
+		expect(crossWorkspace.status).toBe(404);
+		expect(fs.existsSync(foreignFile)).toBe(true);
 	});
 });
