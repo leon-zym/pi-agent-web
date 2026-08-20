@@ -1,13 +1,19 @@
 import { test as base, expect } from "@playwright/test";
-import { type ProductionHarness, startProductionHarness } from "./production-harness";
+import {
+	type ProductionHarness,
+	type StartHarnessOptions,
+	startProductionHarness,
+} from "./production-harness";
 
 interface BrowserFixtures {
 	harness: ProductionHarness;
+	harnessOptions: StartHarnessOptions;
 }
 
 export const test = base.extend<BrowserFixtures>({
-	harness: async ({ browserName: _browserName }, use, testInfo) => {
-		const harness = await startProductionHarness();
+	harnessOptions: [{}, { option: true }],
+	harness: async ({ browserName: _browserName, harnessOptions }, use, testInfo) => {
+		const harness = await startProductionHarness(harnessOptions);
 		try {
 			await use(harness);
 		} finally {

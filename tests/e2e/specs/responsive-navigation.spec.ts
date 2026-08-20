@@ -41,7 +41,7 @@ for (const viewport of [
 			name: /^(Open sessions|打开会话列表)$/,
 		});
 		const branchTrigger = page.locator("header").getByRole("button", {
-			name: /^(Branch tree|分支树)$/,
+			name: /^(Conversation tree|对话树)$/,
 		});
 		const moreTrigger = page.locator("header").getByRole("button", {
 			name: /^(More session actions|更多会话操作)$/,
@@ -50,7 +50,7 @@ for (const viewport of [
 		const commandButton = page.getByRole("button", { name: /^(Command menu|命令菜单)$/ });
 		const imageButton = page.getByRole("button", { name: /^(Add image|添加图片)$/ });
 		const modelButton = page.getByRole("button", { name: /^(Configure model|配置模型)$/ });
-		const contextButton = page.getByRole("button", {
+		const contextMeter = page.getByRole("progressbar", {
 			name: /^(Context unavailable|上下文占用不可用)$/,
 		});
 		const rail = page.getByRole("navigation", { name: /^(Sidebar|侧栏)$/ });
@@ -65,7 +65,7 @@ for (const viewport of [
 			commandButton,
 			imageButton,
 			modelButton,
-			contextButton,
+			contextMeter,
 			sendButton,
 		]) {
 			await expectMinimumHitTarget(control);
@@ -119,7 +119,7 @@ for (const viewport of [
 				);
 				return result.sessions.length;
 			})
-			.toBe(2);
+			.toBe(3);
 
 		await sendPrompt(page, B_PROMPT);
 		await expect(page.locator("main")).toContainText(`E2E_REPLY:${B_PROMPT}`);
@@ -198,7 +198,7 @@ test("1024px boundary keeps details discoverable as an overlay", async ({ page, 
 
 	await page
 		.locator("header")
-		.getByRole("button", { name: /^(Branch tree|分支树)$/ })
+		.getByRole("button", { name: /^(Conversation tree|对话树)$/ })
 		.click();
 	const detailsDrawer = page.getByRole("dialog", { name: /^(Session details|会话详情)$/ });
 	await expect(detailsDrawer).toBeVisible();
