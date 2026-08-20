@@ -208,6 +208,73 @@ describe("NativeSessionCatalog", () => {
 		expect(JSON.stringify(session).length).toBeLessThan(2_000);
 	});
 
+	it("collapses expanded skill bodies in the first-message summary", async () => {
+		const root = temporaryDirectory();
+		const workspace = path.join(root, "workspace");
+		fs.mkdirSync(workspace);
+		writeSession(path.join(root, "sessions"), "skill.jsonl", {
+			id: "skill-summary",
+			cwd: workspace,
+			firstMessage:
+				'<skill name="e2e" location="/private/e2e/SKILL.md">\nSECRET_SKILL_BODY_MUST_NOT_RENDER\n</skill>\n\natomic argument',
+		});
+
+		const snapshot = await new NativeSessionCatalog({
+			layoutResolver: createResolver(root, {
+				PI_CODING_AGENT_SESSION_DIR: path.join(root, "sessions"),
+			}),
+		}).refresh({ force: true });
+
+		expect(snapshot.sessions[0]?.firstMessage).toBe("/skill:e2e atomic argument");
+		expect(snapshot.sessions[0]?.firstMessage).not.toContain("SECRET_SKILL_BODY_MUST_NOT_RENDER");
+		expect(snapshot.sessions[0]?.firstMessage).not.toContain("/private/e2e/SKILL.md");
+	});
+
+	it("fails private when a skill summary has an ambiguous closing delimiter", async () => {
+		const root = temporaryDirectory();
+		const workspace = path.join(root, "workspace");
+		const sessionDirectory = path.join(root, "sessions");
+		fs.mkdirSync(workspace);
+		writeSession(sessionDirectory, "ambiguous-skill.jsonl", {
+			id: "ambiguous-skill-summary",
+			cwd: workspace,
+			firstMessage:
+				'<skill name="e2e" location="/private/e2e/SKILL.md">\nExample delimiter:\n</skill>\n\nSECRET BODY AFTER EXAMPLE\n</skill>\n\nreal user args',
+		});
+
+		const snapshot = await new NativeSessionCatalog({
+			layoutResolver: createResolver(root, {
+				PI_CODING_AGENT_SESSION_DIR: sessionDirectory,
+			}),
+		}).refresh({ force: true });
+
+		expect(snapshot.sessions[0]?.firstMessage).toBe("/skill:e2e");
+		expect(snapshot.sessions[0]?.firstMessage).not.toContain("SECRET");
+		expect(snapshot.sessions[0]?.firstMessage).not.toContain("/private");
+		expect(snapshot.sessions[0]?.firstMessage).not.toContain("real user args");
+	});
+
+	it("does not use an inline skill closing-token example as a summary boundary", async () => {
+		const root = temporaryDirectory();
+		const workspace = path.join(root, "workspace");
+		const sessionDirectory = path.join(root, "sessions");
+		fs.mkdirSync(workspace);
+		writeSession(sessionDirectory, "inline-skill-close.jsonl", {
+			id: "inline-skill-close",
+			cwd: workspace,
+			firstMessage:
+				'<skill name="e2e" location="/private/e2e/SKILL.md">\nUse inline example: </skill>\n\nSECRET TRAILING BODY',
+		});
+
+		const snapshot = await new NativeSessionCatalog({
+			layoutResolver: createResolver(root, {
+				PI_CODING_AGENT_SESSION_DIR: sessionDirectory,
+			}),
+		}).refresh({ force: true });
+
+		expect(snapshot.sessions[0]?.firstMessage).toBe("/skill:e2e");
+	});
+
 	it("treats custom environment and project session directories as direct layouts", async () => {
 		const root = temporaryDirectory();
 		const environmentDir = path.join(root, "environment-sessions");

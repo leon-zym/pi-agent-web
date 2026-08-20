@@ -558,30 +558,49 @@ function sidebarTextFromContent(content: unknown): string {
 			}
 		}
 	}
+	const previewText = collapseExpandedSkillInvocation(textParts.join("\n\n"));
 
 	const characters: string[] = [];
 	let whitespacePending = false;
-	for (const text of textParts) {
-		if (characters.length > 0) whitespacePending = true;
-		for (const character of text) {
-			if (/\s/u.test(character)) {
-				if (characters.length > 0) whitespacePending = true;
-				continue;
-			}
-			if (whitespacePending) {
-				if (characters.length >= NATIVE_SESSION_FIRST_MESSAGE_MAX_CHARS) {
-					return characters.join("");
-				}
-				characters.push(" ");
-				whitespacePending = false;
-			}
+	for (const character of previewText) {
+		if (/\s/u.test(character)) {
+			if (characters.length > 0) whitespacePending = true;
+			continue;
+		}
+		if (whitespacePending) {
 			if (characters.length >= NATIVE_SESSION_FIRST_MESSAGE_MAX_CHARS) {
 				return characters.join("");
 			}
-			characters.push(character);
+			characters.push(" ");
+			whitespacePending = false;
 		}
+		if (characters.length >= NATIVE_SESSION_FIRST_MESSAGE_MAX_CHARS) {
+			return characters.join("");
+		}
+		characters.push(character);
 	}
 	return characters.join("");
+}
+
+function collapseExpandedSkillInvocation(text: string): string {
+	const header = text.match(/^<skill name="([^"\r\n]+)" location="[^"\r\n]+">\r?\n/);
+	if (!header) return text;
+	const invocation = `/skill:${header[1]}`;
+	const bodyAndTail = text.slice(header[0].length);
+	// Skill Markdown can contain literal closing-token examples. The envelope is
+	// not escaped, so ambiguous boundaries must fail private instead of exposing a tail.
+	const closingIndex = bodyAndTail.indexOf("</skill>");
+	if (closingIndex === -1) return invocation;
+	if (closingIndex === 0 || bodyAndTail[closingIndex - 1] !== "\n") return invocation;
+	if (bodyAndTail.indexOf("</skill>", closingIndex + "</skill>".length) !== -1) {
+		return invocation;
+	}
+	const tail = bodyAndTail.slice(closingIndex + "</skill>".length);
+	if (tail === "") return invocation;
+	const separator = tail.match(/^(?:\r?\n){2}/)?.[0];
+	if (!separator) return invocation;
+	const argumentsText = tail.slice(separator.length).trim();
+	return argumentsText ? `${invocation} ${argumentsText}` : invocation;
 }
 
 function parseDateMillis(value: string | undefined): number | undefined {

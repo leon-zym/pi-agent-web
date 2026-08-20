@@ -1,10 +1,15 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { canonicalizeSessionFile, sessionHandleForFile } from "../src/native-session-catalog.js";
 import type { SessionRuntime } from "../src/session-runtime.js";
-import type { ExistingSessionTarget, SessionSupervisorMessage } from "../src/session-runtime-types.js";
+import type {
+	ExistingSessionTarget,
+	SessionRuntimeSnapshot,
+	SessionSupervisorMessage,
+} from "../src/session-runtime-types.js";
 import { SessionSupervisor } from "../src/session-supervisor.js";
 
 const fixturePath = path.join(import.meta.dirname, "fixtures", "session-runtime-pi.mjs");
@@ -53,6 +58,7 @@ function createHarness(options: {
 	restartBaseDelayMs?: number;
 	maxAutoRestarts?: number;
 	idleTtlMs?: number;
+	transientIdleTtlMs?: number;
 	env?: Record<string, string>;
 	commandTimeoutFor?: (commandType: string) => number;
 }) {
@@ -80,6 +86,7 @@ function createHarness(options: {
 		maxAutoRestarts: options.maxAutoRestarts,
 		readyTimeoutMs: 2_000,
 		idleTtlMs: options.idleTtlMs ?? 60_000,
+		transientIdleTtlMs: options.transientIdleTtlMs,
 	});
 	supervisors.push(supervisor);
 	return { supervisor, messages, targets };
@@ -100,6 +107,90 @@ afterEach(async () => {
 });
 
 describe("SessionSupervisor", () => {
+	it("turns a validated relative HTML export path into a pasteable file URL", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace #1 中文");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "export-relative");
+		const { supervisor } = createHarness({ targets: [target] });
+		const lease = await supervisor.claim(target.sessionHandle, "connection");
+		const runtime = supervisor.getRuntime(target.sessionHandle)!;
+		const relativePath = path.join("exports", "report #1 中文.html");
+
+		const result = await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "export_html", outputPath: relativePath },
+			{
+				connectionId: "connection",
+				expectedGeneration: runtime.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+
+		const exportedPath = fs.realpathSync(path.join(cwd, relativePath));
+		expect(result.response).toMatchObject({
+			success: true,
+			command: "export_html",
+			data: {
+				path: exportedPath,
+				url: pathToFileURL(exportedPath).href,
+			},
+		});
+		const exportUrl = (result.response as unknown as { data: { url: string } }).data.url;
+		expect(exportUrl).toContain("%23");
+		expect(exportUrl).toContain("%E4%B8%AD%E6%96%87");
+	});
+
+	it("rejects an HTML export response whose file is unavailable", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "export-missing");
+		const { supervisor } = createHarness({
+			targets: [target],
+			env: { PI_WEB_FIXTURE_EXPORT_MISSING: "1" },
+		});
+		const lease = await supervisor.claim(target.sessionHandle, "connection");
+		const runtime = supervisor.getRuntime(target.sessionHandle)!;
+
+		await expect(
+			supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "export_html", outputPath: "missing.html" },
+				{
+					connectionId: "connection",
+					expectedGeneration: runtime.generation,
+					fencingToken: lease.fencingToken,
+				},
+			),
+		).rejects.toThrow("exported HTML file is unavailable");
+	});
+
+	it("rejects an HTML export response that resolves to a directory", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "export-directory");
+		const { supervisor } = createHarness({
+			targets: [target],
+			env: { PI_WEB_FIXTURE_EXPORT_DIRECTORY: "1" },
+		});
+		const lease = await supervisor.claim(target.sessionHandle, "connection");
+		const runtime = supervisor.getRuntime(target.sessionHandle)!;
+
+		await expect(
+			supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "export_html", outputPath: "directory-export" },
+				{
+					connectionId: "connection",
+					expectedGeneration: runtime.generation,
+					fencingToken: lease.fencingToken,
+				},
+			),
+		).rejects.toThrow("exported HTML path is not a regular file");
+	});
+
 	it("runs two Sessions from the same Workspace concurrently without switching either process", async () => {
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace");
@@ -580,6 +671,503 @@ describe("SessionSupervisor", () => {
 		expect(supervisor.getRuntime(created.sessionHandle)?.state).toBe("idle");
 	});
 
+	it("reaps a stale unclaimed transient Session without touching the filesystem", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const { supervisor, messages } = createHarness({ targets: [], transientIdleTtlMs: 0 });
+		const stale = await supervisor.createSession({
+			workspaceId: "workspace",
+			cwd,
+			sessionDir: path.join(root, "sessions"),
+			requestedNativeSessionId: "stale-unclaimed",
+		});
+		const claimed = await supervisor.createSession({
+			workspaceId: "workspace",
+			cwd,
+			sessionDir: path.join(root, "sessions"),
+			requestedNativeSessionId: "stale-but-claimed",
+		});
+		await supervisor.claim(claimed.sessionHandle, "controller");
+		messages.length = 0;
+
+		await (supervisor as unknown as { reapIdle: () => Promise<void> }).reapIdle();
+
+		expect(supervisor.getRuntime(stale.sessionHandle)).toBeUndefined();
+		expect(stale.sessionFile && fs.existsSync(stale.sessionFile)).toBe(false);
+		expect(supervisor.getRuntime(claimed.sessionHandle)).toMatchObject({ state: "idle", recoverable: false });
+		expect(messages).toContainEqual({ type: "session_directory_changed", workspaceId: "workspace" });
+	});
+
+	it("abandons only an untouched transient Session owned by the exact controller", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const { supervisor, messages } = createHarness({ targets: [] });
+		const created = await supervisor.createSession({
+			workspaceId: "workspace",
+			cwd,
+			sessionDir: path.join(root, "sessions"),
+			requestedNativeSessionId: "transient-success",
+		});
+		const lease = await supervisor.claim(created.sessionHandle, "controller");
+		if (!lease.fencingToken || !created.sessionFile) throw new Error("transient controller was not ready");
+		messages.length = 0;
+
+		await supervisor.abandonTransient("workspace", created.sessionHandle, {
+			expectedGeneration: created.generation,
+			fencingToken: lease.fencingToken,
+		});
+
+		expect(fs.existsSync(created.sessionFile)).toBe(false);
+		expect(supervisor.getRuntime(created.sessionHandle)).toBeUndefined();
+		expect(supervisor.leaseFor(created.sessionHandle, "controller")).toEqual({
+			sessionHandle: created.sessionHandle,
+			isController: false,
+		});
+		expect(messages).toContainEqual({ type: "session_directory_changed", workspaceId: "workspace" });
+	});
+
+	it("rejects observer, stale-generation, stale-fence, and cross-Workspace transient abandon", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const { supervisor } = createHarness({ targets: [] });
+		const created = await supervisor.createSession({
+			workspaceId: "workspace",
+			cwd,
+			sessionDir: path.join(root, "sessions"),
+			requestedNativeSessionId: "transient-capability",
+		});
+		const lease = await supervisor.claim(created.sessionHandle, "controller");
+		if (!lease.fencingToken) throw new Error("controller lease was not granted");
+		expect(await supervisor.claim(created.sessionHandle, "observer")).toMatchObject({
+			isController: false,
+		});
+
+		await expect(
+			supervisor.abandonTransient("workspace", created.sessionHandle, {
+				expectedGeneration: created.generation,
+				fencingToken: "observer-has-no-capability",
+			}),
+		).rejects.toThrow("session_read_only");
+		await expect(
+			supervisor.abandonTransient("workspace", created.sessionHandle, {
+				expectedGeneration: created.generation + 1,
+				fencingToken: lease.fencingToken,
+			}),
+		).rejects.toThrow("session_generation_stale");
+		await expect(
+			supervisor.abandonTransient("workspace", created.sessionHandle, {
+				expectedGeneration: created.generation,
+				fencingToken: "stale-token",
+			}),
+		).rejects.toThrow("session_read_only");
+		await expect(
+			supervisor.abandonTransient("foreign-workspace", created.sessionHandle, {
+				expectedGeneration: created.generation,
+				fencingToken: lease.fencingToken,
+			}),
+		).rejects.toThrow("session_control_required");
+		expect(supervisor.getRuntime(created.sessionHandle)).toMatchObject({ state: "idle", recoverable: false });
+	});
+
+	it("rejects transient abandon during a Workspace identity transition", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const parent = createNativeSession(root, cwd, "transient-transition-parent");
+		const { supervisor } = createHarness({
+			targets: [parent],
+			env: { PI_WEB_FIXTURE_TRANSITION_STATE_DELAY_MS: "250" },
+		});
+		const parentLease = await supervisor.claim(parent.sessionHandle, "parent-controller");
+		const parentRuntime = supervisor.getRuntime(parent.sessionHandle)!;
+		const transient = await supervisor.createSession({
+			workspaceId: parent.workspaceId,
+			cwd,
+			sessionDir: path.join(root, "transient-sessions"),
+			requestedNativeSessionId: "transient-transition-candidate",
+		});
+		const transientLease = await supervisor.claim(transient.sessionHandle, "transient-controller");
+		if (!parentLease.fencingToken || !transientLease.fencingToken) {
+			throw new Error("controller lease was not granted");
+		}
+
+		const transitioning = supervisor.sendCommand(
+			parent.sessionHandle,
+			{ type: "clone" },
+			{
+				connectionId: "parent-controller",
+				expectedGeneration: parentRuntime.generation,
+				fencingToken: parentLease.fencingToken,
+			},
+		);
+		await waitFor(() =>
+			(supervisor as unknown as { workspaceTransitions: Set<string> }).workspaceTransitions.has(
+				parent.workspaceId,
+			),
+		);
+		await expect(
+			supervisor.abandonTransient(parent.workspaceId, transient.sessionHandle, {
+				expectedGeneration: transient.generation,
+				fencingToken: transientLease.fencingToken,
+			}),
+		).rejects.toThrow("workspace_identity_transitioning");
+		await transitioning;
+		expect(supervisor.getRuntime(transient.sessionHandle)).toMatchObject({ state: "idle" });
+	});
+
+	it("allows exact transient abandon after no-op and failed metadata mutations", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const { supervisor } = createHarness({
+			targets: [],
+			env: {
+				PI_WEB_FIXTURE_FAIL_MUTATION: "set_model",
+				PI_WEB_FIXTURE_EXPORT_MISSING: "1",
+			},
+		});
+
+		const createControlled = async (nativeSessionId: string) => {
+			const created = await supervisor.createSession({
+				workspaceId: "workspace",
+				cwd,
+				sessionDir: path.join(root, "sessions"),
+				requestedNativeSessionId: nativeSessionId,
+			});
+			const lease = await supervisor.claim(created.sessionHandle, `controller-${nativeSessionId}`);
+			if (!lease.fencingToken) throw new Error("controller lease was not granted");
+			return { created, lease };
+		};
+		const contextFor = (
+			created: SessionRuntimeSnapshot,
+			lease: { fencingToken?: string },
+			connectionId: string,
+		) => ({
+			connectionId,
+			expectedGeneration: created.generation,
+			fencingToken: lease.fencingToken,
+		});
+
+		const mutated = await createControlled("transient-noop-and-failed");
+		await supervisor.sendCommand(
+			mutated.created.sessionHandle,
+			{ type: "set_thinking_level", level: "off" },
+			contextFor(mutated.created, mutated.lease, "controller-transient-noop-and-failed"),
+		);
+		const failedModel = await supervisor.sendCommand(
+			mutated.created.sessionHandle,
+			{ type: "set_model", provider: "fixture", modelId: "missing" },
+			contextFor(mutated.created, mutated.lease, "controller-transient-noop-and-failed"),
+		);
+		expect(failedModel.response).toMatchObject({ success: false, command: "set_model" });
+		await expect(
+			supervisor.sendCommand(
+				mutated.created.sessionHandle,
+				{ type: "export_html", outputPath: "missing.html" },
+				contextFor(mutated.created, mutated.lease, "controller-transient-noop-and-failed"),
+			),
+		).rejects.toThrow("exported HTML file is unavailable");
+		expect(supervisor.getRuntime(mutated.created.sessionHandle)).toMatchObject({
+			state: "idle",
+			recoverable: false,
+		});
+		await supervisor.abandonTransient("workspace", mutated.created.sessionHandle, {
+			expectedGeneration: mutated.created.generation,
+			fencingToken: mutated.lease.fencingToken!,
+		});
+		expect(supervisor.getRuntime(mutated.created.sessionHandle)).toBeUndefined();
+	});
+
+	it("reaps repeated no-op transient mutations before they exhaust the hot pool", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const maxHotRuntimes = 2;
+		const { supervisor } = createHarness({
+			targets: [],
+			maxHotRuntimes,
+			transientIdleTtlMs: 0,
+		});
+		const reapIdle = () => (supervisor as unknown as { reapIdle: () => Promise<void> }).reapIdle();
+
+		for (let index = 0; index <= maxHotRuntimes; index += 1) {
+			const connectionId = `controller-noop-${String(index)}`;
+			const created = await supervisor.createSession({
+				workspaceId: "workspace",
+				cwd,
+				sessionDir: path.join(root, "sessions"),
+				requestedNativeSessionId: `transient-noop-${String(index)}`,
+			});
+			const lease = await supervisor.claim(created.sessionHandle, connectionId);
+			if (!lease.fencingToken) throw new Error("controller lease was not granted");
+			await supervisor.sendCommand(
+				created.sessionHandle,
+				{ type: "set_thinking_level", level: "off" },
+				{
+					connectionId,
+					expectedGeneration: created.generation,
+					fencingToken: lease.fencingToken,
+				},
+			);
+			expect(supervisor.release(created.sessionHandle, connectionId)).toBe(true);
+			await reapIdle();
+			expect(supervisor.getRuntime(created.sessionHandle)).toBeUndefined();
+		}
+	});
+
+	it("retains an unpersisted accepted multimodal prompt as genuine in-memory conversation state", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const { supervisor } = createHarness({
+			targets: [],
+			env: { PI_WEB_FIXTURE_SKIP_PROMPT_PERSIST: "1" },
+		});
+		const created = await supervisor.createSession({
+			workspaceId: "workspace",
+			cwd,
+			sessionDir: path.join(root, "sessions"),
+			requestedNativeSessionId: "transient-memory-conversation",
+		});
+		const connectionId = "controller-memory-conversation";
+		const lease = await supervisor.claim(created.sessionHandle, connectionId);
+		if (!lease.fencingToken) throw new Error("controller lease was not granted");
+		await supervisor.sendCommand(
+			created.sessionHandle,
+			{
+				type: "prompt",
+				message: "",
+				images: [{ type: "image", data: "YQ==", mimeType: "image/png" }],
+			},
+			{
+				connectionId,
+				expectedGeneration: created.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		await waitFor(() => supervisor.getRuntime(created.sessionHandle)?.state === "idle");
+		expect(supervisor.getRuntime(created.sessionHandle)).toMatchObject({ recoverable: false });
+		await expect(
+			supervisor.abandonTransient("workspace", created.sessionHandle, {
+				expectedGeneration: created.generation,
+				fencingToken: lease.fencingToken,
+			}),
+		).rejects.toThrow("session_not_abandonable");
+	});
+
+	it("refuses transient abandon while running or waiting on UI", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const { supervisor } = createHarness({ targets: [] });
+
+		const createControlled = async (nativeSessionId: string) => {
+			const created = await supervisor.createSession({
+				workspaceId: "workspace",
+				cwd,
+				sessionDir: path.join(root, "sessions"),
+				requestedNativeSessionId: nativeSessionId,
+			});
+			const lease = await supervisor.claim(created.sessionHandle, `controller-${nativeSessionId}`);
+			if (!lease.fencingToken) throw new Error("controller lease was not granted");
+			return { created, lease };
+		};
+		const contextFor = (
+			created: SessionRuntimeSnapshot,
+			lease: { fencingToken?: string },
+			connectionId: string,
+		) => ({
+			connectionId,
+			expectedGeneration: created.generation,
+			fencingToken: lease.fencingToken,
+		});
+
+		const running = await createControlled("transient-running");
+		await supervisor.sendCommand(
+			running.created.sessionHandle,
+			{ type: "prompt", message: "slow" },
+			contextFor(running.created, running.lease, "controller-transient-running"),
+		);
+		expect(supervisor.getRuntime(running.created.sessionHandle)?.state).toBe("running");
+		await expect(
+			supervisor.abandonTransient("workspace", running.created.sessionHandle, {
+				expectedGeneration: running.created.generation,
+				fencingToken: running.lease.fencingToken!,
+			}),
+		).rejects.toThrow("session_not_abandonable");
+
+		const waiting = await createControlled("transient-waiting");
+		await supervisor.sendCommand(
+			waiting.created.sessionHandle,
+			{ type: "prompt", message: "open-dialog-no-agent" },
+			contextFor(waiting.created, waiting.lease, "controller-transient-waiting"),
+		);
+		expect(supervisor.getRuntime(waiting.created.sessionHandle)?.state).toBe("waiting_ui");
+		await expect(
+			supervisor.abandonTransient("workspace", waiting.created.sessionHandle, {
+				expectedGeneration: waiting.created.generation,
+				fencingToken: waiting.lease.fencingToken!,
+			}),
+		).rejects.toThrow("session_not_abandonable");
+	});
+
+	it("retains a stopped runtime when its JSONL materializes during transient abandon", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const { supervisor } = createHarness({ targets: [] });
+		const created = await supervisor.createSession({
+			workspaceId: "workspace",
+			cwd,
+			sessionDir: path.join(root, "sessions"),
+			requestedNativeSessionId: "transient-materialized-race",
+		});
+		const lease = await supervisor.claim(created.sessionHandle, "controller");
+		if (!lease.fencingToken || !created.sessionFile) throw new Error("transient controller was not ready");
+		const internal = supervisor as unknown as { runtimes: Map<string, SessionRuntime> };
+		const runtime = internal.runtimes.get(created.sessionHandle)!;
+		const originalStop = runtime.stop.bind(runtime);
+		runtime.stop = async () => {
+			await originalStop();
+			fs.mkdirSync(path.dirname(created.sessionFile!), { recursive: true });
+			fs.writeFileSync(
+				created.sessionFile!,
+				`${JSON.stringify({
+					type: "session",
+					version: 3,
+					id: created.nativeSessionId,
+					timestamp: "2026-08-20T00:00:00.000Z",
+					cwd,
+				})}\n`,
+			);
+		};
+
+		await expect(
+			supervisor.abandonTransient("workspace", created.sessionHandle, {
+				expectedGeneration: created.generation,
+				fencingToken: lease.fencingToken,
+			}),
+		).rejects.toThrow("session_materialized");
+		expect(fs.existsSync(created.sessionFile)).toBe(true);
+		expect(supervisor.getRuntime(created.sessionHandle)).toMatchObject({
+			state: "dormant",
+			recoverable: true,
+		});
+		expect(supervisor.leaseFor(created.sessionHandle, "controller")).toMatchObject({
+			isController: true,
+			fencingToken: lease.fencingToken,
+		});
+	});
+
+	it("does not abandon across an already-reserved command admission window", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const { supervisor } = createHarness({ targets: [] });
+		const created = await supervisor.createSession({
+			workspaceId: "workspace",
+			cwd,
+			sessionDir: path.join(root, "sessions"),
+			requestedNativeSessionId: "transient-command-race",
+		});
+		const lease = await supervisor.claim(created.sessionHandle, "controller");
+		if (!lease.fencingToken) throw new Error("controller lease was not granted");
+		const internal = supervisor as unknown as { runtimes: Map<string, SessionRuntime> };
+		const runtime = internal.runtimes.get(created.sessionHandle)!;
+		const originalStart = runtime.start.bind(runtime);
+		let releaseStart: (() => void) | undefined;
+		let commandReserved = false;
+		let startCalls = 0;
+		const startGate = new Promise<void>((resolve) => {
+			releaseStart = resolve;
+		});
+		runtime.start = async () => {
+			startCalls += 1;
+			if (startCalls >= 2) {
+				commandReserved = true;
+				await startGate;
+			}
+			await originalStart();
+		};
+
+		const command = supervisor.sendCommand(
+			created.sessionHandle,
+			{ type: "get_state" },
+			{
+				connectionId: "controller",
+				expectedGeneration: created.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		await waitFor(() => commandReserved);
+		await expect(
+			supervisor.abandonTransient("workspace", created.sessionHandle, {
+				expectedGeneration: created.generation,
+				fencingToken: lease.fencingToken,
+			}),
+		).rejects.toThrow("session_not_abandonable");
+		releaseStart?.();
+		await expect(command).resolves.toMatchObject({ response: { success: true, command: "get_state" } });
+		expect(supervisor.getRuntime(created.sessionHandle)?.state).toBe("idle");
+	});
+
+	it("tracks an in-progress transient abandon through shutdown", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const { supervisor } = createHarness({ targets: [] });
+		const created = await supervisor.createSession({
+			workspaceId: "workspace",
+			cwd,
+			sessionDir: path.join(root, "sessions"),
+			requestedNativeSessionId: "transient-shutdown",
+		});
+		const lease = await supervisor.claim(created.sessionHandle, "controller");
+		if (!lease.fencingToken) throw new Error("controller lease was not granted");
+		const internal = supervisor as unknown as { runtimes: Map<string, SessionRuntime> };
+		const runtime = internal.runtimes.get(created.sessionHandle)!;
+		const originalStop = runtime.stop.bind(runtime);
+		let releaseStop: (() => void) | undefined;
+		let stopEntered = false;
+		const stopGate = new Promise<void>((resolve) => {
+			releaseStop = resolve;
+		});
+		runtime.stop = async () => {
+			stopEntered = true;
+			await stopGate;
+			await originalStop();
+		};
+
+		const abandoning = supervisor.abandonTransient("workspace", created.sessionHandle, {
+			expectedGeneration: created.generation,
+			fencingToken: lease.fencingToken,
+		});
+		await waitFor(() => stopEntered);
+		await expect(
+			supervisor.sendCommand(
+				created.sessionHandle,
+				{ type: "get_state" },
+				{
+					connectionId: "controller",
+					expectedGeneration: created.generation,
+					fencingToken: lease.fencingToken,
+				},
+			),
+		).rejects.toThrow("session_deleting");
+		const shutdown = supervisor.stopAll();
+		const premature = await Promise.race([
+			shutdown.then(() => "closed" as const),
+			new Promise<"waiting">((resolve) => setTimeout(() => resolve("waiting"), 20)),
+		]);
+		expect(premature).toBe("waiting");
+		releaseStop?.();
+		await Promise.all([abandoning, shutdown]);
+		expect(supervisor.listRuntimes()).toEqual([]);
+	});
+
 	it("rekeys forked processes to the child while leaving the parent independently addressable", async () => {
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace");
@@ -605,6 +1193,49 @@ describe("SessionSupervisor", () => {
 		const reopenedParent = await supervisor.activate(parent.sessionHandle);
 		expect(reopenedParent.nativeSessionId).toBe("parent");
 		expect(supervisor.listRuntimes()).toHaveLength(2);
+	});
+
+	it("accepts Pi's unpersisted child identity when forking before the first user entry", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const parent = createNativeSession(root, cwd, "unpersisted-fork-parent");
+		const { supervisor } = createHarness({
+			targets: [parent],
+			env: { PI_WEB_FIXTURE_UNPERSISTED_TRANSITION: "1" },
+		});
+		const lease = await supervisor.claim(parent.sessionHandle, "connection");
+		const before = supervisor.getRuntime(parent.sessionHandle)!;
+
+		const result = await supervisor.sendCommand(
+			parent.sessionHandle,
+			{ type: "fork", entryId: "first-user-entry" },
+			{
+				connectionId: "connection",
+				expectedGeneration: before.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+
+		const child = supervisor.getRuntime(result.sessionHandle)!;
+		expect(result.previousSessionHandle).toBe(parent.sessionHandle);
+		expect(child.nativeSessionId).toBe("unpersisted-fork-parent-fork");
+		expect(child.recoverable).toBe(false);
+		expect(child.sessionFile).toBeTruthy();
+		expect(fs.existsSync(child.sessionFile!)).toBe(false);
+		expect(child.state).toBe("idle");
+
+		await supervisor.sendCommand(
+			result.sessionHandle,
+			{ type: "prompt", message: "persist the fork" },
+			{
+				connectionId: "connection",
+				expectedGeneration: child.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		await waitFor(() => supervisor.getRuntime(result.sessionHandle)?.recoverable === true);
+		expect(fs.existsSync(child.sessionFile!)).toBe(true);
 	});
 
 	it("drops ambiguous child frames and reopens the parent when transition identity verification fails", async () => {

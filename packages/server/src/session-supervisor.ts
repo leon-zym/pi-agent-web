@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
-import type { RpcCommand, RpcExtensionUIResponse } from "@earendil-works/pi-coding-agent";
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+import type { RpcCommand, RpcExtensionUIResponse, RpcResponse } from "@earendil-works/pi-coding-agent";
 import { RpcError } from "@pi-agent-web/protocol";
 import type { ResolvedPi } from "./resolver.js";
 import { canonicalizePathAllowMissing } from "./session-layout-resolver.js";
@@ -17,6 +20,9 @@ import {
 	type SessionRuntimeSnapshot,
 	type SessionSupervisorMessage,
 } from "./session-runtime-types.js";
+
+const DEFAULT_TRANSIENT_IDLE_TTL_MS = 30_000;
+const MAX_TRANSIENT_IDLE_TTL_MS = 5 * 60_000;
 
 export interface SessionCommandContext {
 	connectionId: string;
@@ -53,6 +59,8 @@ export interface SessionSupervisorOptions {
 	commandTimeoutFor?: (commandType: string) => number;
 	maxHotRuntimes?: number;
 	idleTtlMs?: number;
+	/** Untouched, unclaimed, unpersisted Sessions are forgotten after this bounded grace period. */
+	transientIdleTtlMs?: number;
 	restartWindowMs?: number;
 	maxAutoRestarts?: number;
 	restartBaseDelayMs?: number;
@@ -83,6 +91,7 @@ export class SessionSupervisor {
 			| "replayLimit"
 			| "maxHotRuntimes"
 			| "idleTtlMs"
+			| "transientIdleTtlMs"
 			| "restartWindowMs"
 			| "maxAutoRestarts"
 			| "restartBaseDelayMs"
@@ -111,6 +120,10 @@ export class SessionSupervisor {
 			replayLimit: opts.replayLimit ?? 1_024,
 			maxHotRuntimes: Math.max(1, opts.maxHotRuntimes ?? 8),
 			idleTtlMs: opts.idleTtlMs ?? 10 * 60_000,
+			transientIdleTtlMs: Math.max(
+				0,
+				Math.min(opts.transientIdleTtlMs ?? DEFAULT_TRANSIENT_IDLE_TTL_MS, MAX_TRANSIENT_IDLE_TTL_MS),
+			),
 			restartWindowMs: opts.restartWindowMs ?? 30_000,
 			maxAutoRestarts: opts.maxAutoRestarts ?? 3,
 			restartBaseDelayMs: opts.restartBaseDelayMs ?? 500,
@@ -120,7 +133,7 @@ export class SessionSupervisor {
 				void this.reapIdle().catch((error) => {
 					if (!this.closed) this.log("warn", `Idle Session reaper failed: ${String(error)}`);
 				}),
-			Math.max(1_000, Math.min(30_000, this.opts.idleTtlMs)),
+			Math.max(1_000, Math.min(30_000, this.opts.idleTtlMs, this.opts.transientIdleTtlMs)),
 		);
 		this.reaper.unref?.();
 	}
@@ -205,14 +218,21 @@ export class SessionSupervisor {
 
 	async claim(sessionHandle: string, connectionId: string): Promise<SessionLeaseSnapshot> {
 		const runtime = await this.ensureRuntime(sessionHandle);
-		const handle = runtime.sessionHandle;
-		const existing = this.leases.get(handle);
-		if (existing && existing.connectionId !== connectionId) {
-			return { sessionHandle: handle, isController: false };
-		}
-		const lease = existing ?? { connectionId, fencingToken: randomUUID() };
-		this.leases.set(handle, lease);
-		return { sessionHandle: handle, isController: true, fencingToken: lease.fencingToken };
+		return this.withPoolLock(async () => {
+			this.assertOpen();
+			const handle = runtime.sessionHandle;
+			if (this.deletionReservations.has(handle)) throw new RpcError("claim", "session_deleting");
+			if (this.runtimes.get(handle) !== runtime) {
+				throw new RpcError("claim", "session_runtime_not_tracked");
+			}
+			const existing = this.leases.get(handle);
+			if (existing && existing.connectionId !== connectionId) {
+				return { sessionHandle: handle, isController: false };
+			}
+			const lease = existing ?? { connectionId, fencingToken: randomUUID() };
+			this.leases.set(handle, lease);
+			return { sessionHandle: handle, isController: true, fencingToken: lease.fencingToken };
+		});
 	}
 
 	release(sessionHandle: string, connectionId: string): boolean {
@@ -276,11 +296,12 @@ export class SessionSupervisor {
 			}
 
 			const response = await runtime.send(command, context.expectedGeneration, admit);
+			const verifiedResponse = await attachExportHtmlUrl(command, response, runtime.cwd);
 			return {
 				sessionHandle: runtime.sessionHandle,
 				generation: runtime.generation,
 				barrierSeq: runtime.lastSeq,
-				response,
+				response: verifiedResponse,
 			};
 		} finally {
 			release();
@@ -383,6 +404,86 @@ export class SessionSupervisor {
 		} finally {
 			this.deletionOperations.delete(pending);
 		}
+	}
+
+	/**
+	 * Stop and forget an untouched Pi Session that has never materialized a
+	 * JSONL file. This is deliberately separate from recoverable deletion: it
+	 * never removes a filesystem entry and requires the current controller's
+	 * exact generation and fencing capability.
+	 */
+	async abandonTransient(
+		workspaceId: string,
+		sessionHandle: string,
+		context: SessionManagementContext,
+	): Promise<void> {
+		const pending = this.performTransientAbandon(workspaceId, sessionHandle, context);
+		this.deletionOperations.add(pending);
+		try {
+			await pending;
+		} finally {
+			this.deletionOperations.delete(pending);
+		}
+	}
+
+	private async performTransientAbandon(
+		workspaceId: string,
+		sessionHandle: string,
+		context: SessionManagementContext,
+	): Promise<void> {
+		this.assertOpen();
+		const handle = this.resolveAlias(sessionHandle);
+		let runtime: SessionRuntime | undefined;
+		let sessionFile: string | null = null;
+		await this.withPoolLock(async () => {
+			this.assertOpen();
+			if (this.deletionReservations.has(handle)) throw new RpcError("abandon", "session_deleting");
+			if (this.workspaceHasPendingIdentity(workspaceId)) {
+				throw new RpcError("abandon", "workspace_identity_transitioning");
+			}
+			runtime = this.runtimes.get(handle);
+			if (!runtime || runtime.workspaceId !== workspaceId) {
+				throw new RpcError("abandon", "session_control_required");
+			}
+			this.assertGeneration(runtime, "abandon", context.expectedGeneration);
+			const lease = this.leases.get(handle);
+			if (!lease || lease.fencingToken !== context.fencingToken) {
+				throw new RpcError("abandon", "session_read_only");
+			}
+			if (!runtime.canAbandon || !runtime.sessionFile) {
+				throw new RpcError("abandon", "session_not_abandonable");
+			}
+			sessionFile = runtime.sessionFile;
+			this.deletionReservations.set(handle, workspaceId);
+		});
+
+		let succeeded = false;
+		try {
+			await runtime!.stop();
+			await this.withPoolLock(async () => {
+				if (this.runtimes.get(handle) !== runtime || this.deletionReservations.get(handle) !== workspaceId) {
+					throw new RpcError("abandon", "session_abandon_reservation_lost");
+				}
+				if (sessionPathEntryExists(sessionFile!)) {
+					throw new RpcError("abandon", "session_materialized");
+				}
+				this.clearRestart(handle);
+				this.runtimes.delete(handle);
+				this.leases.delete(handle);
+				this.crashTimes.delete(handle);
+				for (const [alias, entry] of this.aliases) {
+					if (alias === handle || entry.next === handle) this.aliases.delete(alias);
+				}
+				succeeded = true;
+			});
+		} finally {
+			await this.withPoolLock(async () => {
+				if (this.deletionReservations.get(handle) === workspaceId) {
+					this.deletionReservations.delete(handle);
+				}
+			});
+		}
+		if (succeeded) this.safeBroadcast({ type: "session_directory_changed", workspaceId });
 	}
 
 	private async performControlledSessionDeletion<T>(
@@ -865,7 +966,57 @@ export class SessionSupervisor {
 		if (this.closed) return;
 		await this.withPoolLock(async () => {
 			if (this.closed) return;
-			const cutoff = Date.now() - this.opts.idleTtlMs;
+			const now = Date.now();
+			const transientCutoff = now - this.opts.transientIdleTtlMs;
+			const transientCandidates = [...new Set(this.runtimes.values())].filter(
+				(runtime) =>
+					runtime.lastActivityAt <= transientCutoff &&
+					runtime.canAbandon &&
+					!this.leases.has(runtime.sessionHandle) &&
+					!this.deletionReservations.has(runtime.sessionHandle) &&
+					!this.workspaceHasPendingIdentity(runtime.workspaceId),
+			);
+			for (const runtime of transientCandidates) {
+				const handle = runtime.sessionHandle;
+				if (
+					this.runtimes.get(handle) !== runtime ||
+					this.leases.has(handle) ||
+					this.deletionReservations.has(handle) ||
+					this.workspaceHasPendingIdentity(runtime.workspaceId) ||
+					!runtime.canAbandon ||
+					runtime.lastActivityAt > transientCutoff
+				) {
+					continue;
+				}
+				this.deletionReservations.set(handle, runtime.workspaceId);
+				try {
+					await runtime.stop();
+					if (!runtime.sessionFile || sessionPathEntryExists(runtime.sessionFile)) {
+						this.safeBroadcast({
+							type: "session_directory_changed",
+							workspaceId: runtime.workspaceId,
+						});
+						continue;
+					}
+					this.clearRestart(handle);
+					this.runtimes.delete(handle);
+					this.leases.delete(handle);
+					this.crashTimes.delete(handle);
+					for (const [alias, entry] of this.aliases) {
+						if (alias === handle || entry.next === handle) this.aliases.delete(alias);
+					}
+					this.safeBroadcast({
+						type: "session_directory_changed",
+						workspaceId: runtime.workspaceId,
+					});
+				} finally {
+					if (this.deletionReservations.get(handle) === runtime.workspaceId) {
+						this.deletionReservations.delete(handle);
+					}
+				}
+			}
+
+			const cutoff = now - this.opts.idleTtlMs;
 			const candidates = [...new Set(this.runtimes.values())].filter(
 				(runtime) => this.isEvictable(runtime) && runtime.lastActivityAt <= cutoff,
 			);
@@ -908,4 +1059,60 @@ export class SessionSupervisor {
 	private assertOpen(): void {
 		if (this.closed) throw new RpcError("supervisor", "session_supervisor_closed");
 	}
+}
+
+function sessionPathEntryExists(sessionFile: string): boolean {
+	try {
+		fs.lstatSync(sessionFile);
+		return true;
+	} catch (error) {
+		if (
+			typeof error === "object" &&
+			error !== null &&
+			"code" in error &&
+			(error as { code?: unknown }).code === "ENOENT"
+		) {
+			return false;
+		}
+		throw new RpcError("abandon", `session_materialization_check_failed: ${String(error)}`);
+	}
+}
+
+async function attachExportHtmlUrl(
+	command: RpcCommand,
+	response: RpcResponse,
+	cwd: string,
+): Promise<RpcResponse> {
+	if (command.type !== "export_html" || response.success !== true || response.command !== "export_html") {
+		return response;
+	}
+	const data = response.data;
+	if (typeof data !== "object" || data === null || typeof (data as { path?: unknown }).path !== "string") {
+		throw new RpcError("export_html", "Pi returned an invalid exported HTML path");
+	}
+	const piPath = (data as { path: string }).path;
+	if (!piPath) throw new RpcError("export_html", "Pi returned an invalid exported HTML path");
+
+	let exportedPath: string;
+	try {
+		exportedPath = await fs.promises.realpath(path.resolve(cwd, piPath));
+	} catch (error) {
+		throw new RpcError("export_html", `exported HTML file is unavailable: ${String(error)}`);
+	}
+	let stat: fs.Stats;
+	try {
+		stat = await fs.promises.lstat(exportedPath);
+	} catch (error) {
+		throw new RpcError("export_html", `exported HTML file is unavailable: ${String(error)}`);
+	}
+	if (!stat.isFile()) throw new RpcError("export_html", "exported HTML path is not a regular file");
+
+	return {
+		...response,
+		data: {
+			...data,
+			path: exportedPath,
+			url: pathToFileURL(exportedPath).href,
+		},
+	} as RpcResponse;
 }

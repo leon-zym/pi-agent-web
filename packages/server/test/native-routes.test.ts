@@ -85,6 +85,11 @@ class FakeSupervisor implements NativeRouteSupervisor {
 	readonly runtimes = new Map<string, SessionRuntimeSnapshot>();
 	readonly active = new Set<string>();
 	readonly createRequests: CreateSessionRequest[] = [];
+	readonly abandonRequests: Array<{
+		workspaceId: string;
+		sessionHandle: string;
+		context: SessionManagementContext;
+	}> = [];
 
 	listRuntimes(): SessionRuntimeSnapshot[] {
 		return [...this.runtimes.values()];
@@ -126,6 +131,20 @@ class FakeSupervisor implements NativeRouteSupervisor {
 		}
 		if (this.active.has(sessionHandle)) throw new Error("session_active");
 		return operation();
+	}
+
+	async abandonTransient(
+		workspaceId: string,
+		sessionHandle: string,
+		context: SessionManagementContext,
+	): Promise<void> {
+		this.abandonRequests.push({ workspaceId, sessionHandle, context });
+		if (context.expectedGeneration !== 1) throw new Error("session_generation_stale");
+		if (context.fencingToken !== "test-fencing-token") throw new Error("session_read_only");
+		const runtime = this.runtimes.get(sessionHandle);
+		if (!runtime || runtime.workspaceId !== workspaceId) throw new Error("session_control_required");
+		this.runtimes.delete(sessionHandle);
+		this.active.delete(sessionHandle);
 	}
 }
 
@@ -346,6 +365,37 @@ describe("native REST routes", () => {
 		});
 	});
 
+	it("persists last-opened Workspace only for an explicit activation, not a Session list read", async () => {
+		const root = temporaryRoot();
+		const resolver = createResolver(root);
+		const workspace = path.join(root, "workspace");
+		fs.mkdirSync(workspace);
+		writeSession(resolver.defaultSessionDirForWorkspace(workspace), "native.jsonl", {
+			id: "native",
+			cwd: workspace,
+		});
+		const preferences = createPreferences(root);
+		const existing = preferences.upsert({ pathHint: workspace, lastOpenedAt: 1 });
+		const { app } = createHarness({ root, resolver, preferences });
+
+		const listed = await app.request(`/workspaces/${existing.workspaceHandle}/sessions`);
+		expect(listed.status).toBe(200);
+		expect(preferences.get(existing.workspaceHandle)?.lastOpenedAt).toBe(1);
+
+		const activated = await app.request(`/workspaces/${existing.workspaceHandle}/activate`, {
+			method: "POST",
+		});
+		expect(activated.status).toBe(200);
+		expect(await json(activated)).toMatchObject({
+			workspaceHandle: existing.workspaceHandle,
+			path: fs.realpathSync(workspace),
+			lastOpenedAt: Date.parse("2026-08-20T12:00:00.000Z"),
+		});
+		expect(preferences.get(existing.workspaceHandle)?.lastOpenedAt).toBe(
+			Date.parse("2026-08-20T12:00:00.000Z"),
+		);
+	});
+
 	it("removes only workspace preferences while retaining native Pi history", async () => {
 		const root = temporaryRoot();
 		const resolver = createResolver(root);
@@ -545,6 +595,77 @@ describe("native REST routes", () => {
 				sessionCount: 2,
 			}),
 		]);
+	});
+
+	it("abandons an unpersisted Session through exact management headers without touching native history", async () => {
+		const root = temporaryRoot();
+		const workspace = path.join(root, "workspace");
+		fs.mkdirSync(workspace);
+		const preferences = createPreferences(root);
+		const preference = preferences.upsert({ pathHint: workspace });
+		const supervisor = new FakeSupervisor();
+		const { app, trashSession } = createHarness({ root, preferences, supervisor });
+		const createdResponse = await app.request(`/workspaces/${preference.workspaceHandle}/sessions`, {
+			method: "POST",
+		});
+		const created = await json(createdResponse);
+		const endpoint = `/workspaces/${preference.workspaceHandle}/sessions/${created.runtime.sessionHandle}/transient`;
+
+		const observer = await app.request(endpoint, { method: "DELETE" });
+		expect(observer.status).toBe(409);
+		expect((await json(observer)).error.code).toBe("session_control_required");
+		expect(supervisor.abandonRequests).toEqual([]);
+
+		const staleGeneration = await app.request(endpoint, {
+			method: "DELETE",
+			headers: { ...controlledDeleteHeaders, "X-Pi-Session-Generation": "2" },
+		});
+		expect(staleGeneration.status).toBe(409);
+		expect((await json(staleGeneration)).error.code).toBe("session_generation_stale");
+
+		const stale = await app.request(endpoint, {
+			method: "DELETE",
+			headers: { ...controlledDeleteHeaders, "X-Pi-Fencing-Token": "stale-token" },
+		});
+		expect(stale.status).toBe(409);
+		expect((await json(stale)).error.code).toBe("session_read_only");
+
+		const abandoned = await app.request(endpoint, {
+			method: "DELETE",
+			headers: controlledDeleteHeaders,
+		});
+		expect(abandoned.status).toBe(200);
+		expect(await json(abandoned)).toEqual({ ok: true, abandoned: true });
+		expect(supervisor.abandonRequests.at(-1)).toEqual({
+			workspaceId: preference.workspaceHandle,
+			sessionHandle: created.runtime.sessionHandle,
+			context: { expectedGeneration: 1, fencingToken: "test-fencing-token" },
+		});
+		expect(supervisor.getRuntime(created.runtime.sessionHandle)).toBeUndefined();
+		expect(trashSession).not.toHaveBeenCalled();
+	});
+
+	it("maps transient abandon lifecycle conflicts to stable HTTP 409 codes", async () => {
+		const root = temporaryRoot();
+		const workspace = path.join(root, "workspace");
+		fs.mkdirSync(workspace);
+		const preferences = createPreferences(root);
+		const preference = preferences.upsert({ pathHint: workspace });
+		const supervisor = new FakeSupervisor();
+		const { app } = createHarness({ root, preferences, supervisor });
+		const created = await json(
+			await app.request(`/workspaces/${preference.workspaceHandle}/sessions`, { method: "POST" }),
+		);
+		vi.spyOn(supervisor, "abandonTransient").mockRejectedValue(
+			new RpcError("abandon", "session_not_abandonable"),
+		);
+
+		const response = await app.request(
+			`/workspaces/${preference.workspaceHandle}/sessions/${created.runtime.sessionHandle}/transient`,
+			{ method: "DELETE", headers: controlledDeleteHeaders },
+		);
+		expect(response.status).toBe(409);
+		expect((await json(response)).error.code).toBe("session_not_abandonable");
 	});
 
 	it("refuses to trash a fork child before its Workspace identity commit", async () => {
