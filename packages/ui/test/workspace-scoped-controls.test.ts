@@ -1,179 +1,287 @@
-import type { RpcCommand, RpcResponse } from "@earendil-works/pi-coding-agent";
-import type { SessionSummary } from "@pi-agent-web/protocol";
+import type { NativeSessionDto, NativeWorkspaceDto, SessionRuntimeDto } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api } from "../src/lib/api";
-import { renameSession } from "../src/lib/session-controller";
-import { useModelDirectoryStore } from "../src/stores/model-directory";
-import { useSessionControlStore } from "../src/stores/session-control";
-import { useSessionDirectoryStore } from "../src/stores/session-directory";
-import { useSlashCommandsStore } from "../src/stores/slash-commands";
-import { useTransportStore } from "../src/stores/transport";
+import { openSession, renameSession } from "../src/lib/session-controller";
+import { selectCurrentWorkspaceSessions, useSessionDirectoryStore } from "../src/stores/session-directory";
+import { sessionTransport } from "../src/stores/session-transport";
 
-const model = (workspaceId: string) => ({
-	id: `${workspaceId}-model`,
-	name: `${workspaceId} model`,
-	provider: workspaceId,
-	reasoning: false,
-	contextWindow: 1,
-	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-});
+const originalTransport = sessionTransport.store.getState();
+const originalDirectory = useSessionDirectoryStore.getState();
 
-function response(command: string, data: unknown): RpcResponse {
-	return { type: "response", command, success: true, data } as RpcResponse;
-}
-
-function session(id: string): SessionSummary {
+function workspace(workspaceHandle: string, available = true): NativeWorkspaceDto {
 	return {
-		id,
-		path: `${id}.jsonl`,
-		absolutePath: `/tmp/${id}.jsonl`,
-		cwd: "/tmp/workspace",
-		messageCount: 1,
-		created: "2026-01-01T00:00:00.000Z",
-		modified: 0,
+		workspaceHandle,
+		path: `/tmp/${workspaceHandle}`,
+		available,
+		pinned: false,
+		displayName: workspaceHandle,
+		lastOpenedAt: null,
+		sessionCount: 1,
+		hasNativeHistory: true,
 	};
 }
 
-const originalTransport = useTransportStore.getState();
-const originalDirectory = useSessionDirectoryStore.getState();
-const originalControl = useSessionControlStore.getState();
+function runtime(sessionHandle: string, workspaceHandle: string): SessionRuntimeDto {
+	return {
+		sessionHandle,
+		workspaceId: workspaceHandle,
+		nativeSessionId: `native-${sessionHandle}`,
+		sessionFile: `/tmp/${workspaceHandle}/${sessionHandle}.jsonl`,
+		cwd: `/tmp/${workspaceHandle}`,
+		generation: 3,
+		lastSeq: 0,
+		state: "idle",
+		lastActivityAt: 1,
+		recoverable: true,
+	};
+}
+
+function session(sessionHandle: string, workspaceHandle: string): NativeSessionDto {
+	return {
+		sessionHandle,
+		workspaceHandle,
+		nativeSessionId: `native-${sessionHandle}`,
+		sessionFile: `/tmp/${workspaceHandle}/${sessionHandle}.jsonl`,
+		persisted: true,
+		createdAt: "2026-01-01T00:00:00.000Z",
+		modifiedAt: "2026-01-01T00:00:00.000Z",
+		messageCount: 1,
+		firstMessage: sessionHandle,
+		runtime: null,
+	};
+}
+
+function nativeList(sessions: NativeSessionDto[]) {
+	return {
+		sessions,
+		layout: { sessionDir: "/tmp/sessions", source: "default" as const },
+	};
+}
+
+function isolateTransportActions() {
+	const subscribeSession = vi.fn();
+	const claimSession = vi.fn(() => false);
+	sessionTransport.store.setState({
+		subscribeSession,
+		claimSession,
+		invalidateSessionSnapshot: vi.fn(() => false),
+		releaseSession: vi.fn(() => false),
+		unsubscribeSession: vi.fn(),
+	});
+	return { subscribeSession, claimSession };
+}
 
 afterEach(() => {
-	useTransportStore.setState(originalTransport, true);
+	vi.restoreAllMocks();
+	sessionTransport.store.setState(originalTransport, true);
 	useSessionDirectoryStore.setState(originalDirectory, true);
-	useSessionControlStore.setState(originalControl, true);
-	useModelDirectoryStore.setState({
-		byWorkspace: {},
-		activeWorkspaceId: null,
-		models: [],
-		byProvider: {},
-		currentModel: null,
-		thinkingLevels: [],
-		currentThinkingLevel: null,
-		loading: false,
-		error: undefined,
-	});
-	useSlashCommandsStore.setState({
-		byWorkspace: {},
-		activeWorkspaceId: null,
-		commands: [],
-		loadedAt: null,
-		loading: false,
-	});
 });
 
-describe("workspace-scoped controls", () => {
-	it("keeps an active Host session selectable before its empty JSONL file is materialized", async () => {
-		const listSessions = vi
-			.spyOn(api, "listSessions")
-			.mockResolvedValue({ sessions: [], sessionDir: "/tmp/sessions" });
+describe("Session-scoped controls", () => {
+	it("keeps the empty Workspace Session snapshot referentially stable for React", () => {
+		const state = useSessionDirectoryStore.getState();
+		useSessionDirectoryStore.setState({ currentWorkspaceHandle: null, sessionsByWorkspace: {} });
+		const first = selectCurrentWorkspaceSessions(useSessionDirectoryStore.getState());
+		const second = selectCurrentWorkspaceSessions(useSessionDirectoryStore.getState());
+		expect(first).toBe(second);
+		useSessionDirectoryStore.setState(state, true);
+	});
+
+	it("keeps delayed native Session A results out of the selected Session B view", async () => {
+		let releaseA: (() => void) | undefined;
+		const gateA = new Promise<void>((resolve) => {
+			releaseA = resolve;
+		});
+		const sessionA = session("session-a", "workspace-a");
+		const sessionB = session("session-b", "workspace-b");
+		vi.spyOn(api, "listSessions").mockImplementation(async (workspaceHandle) => {
+			if (workspaceHandle === "workspace-a") await gateA;
+			return nativeList(workspaceHandle === "workspace-a" ? [sessionA] : [sessionB]);
+		});
+		isolateTransportActions();
 		useSessionDirectoryStore.setState({
-			workspaces: [
-				{
-					id: "workspace-a",
-					path: "/tmp/workspace-a",
-					displayName: "workspace-a",
-					sessionCount: 0,
-					lastOpenedAt: null,
-				},
-			],
-			currentWorkspaceId: "workspace-a",
-			sessions: [],
+			workspaces: [workspace("workspace-a"), workspace("workspace-b")],
+			currentWorkspaceHandle: null,
 			currentSession: null,
-		});
-		useSessionControlStore.setState({
-			workspaceId: "workspace-a",
-			lease: "controller",
-			reconciling: false,
-			session: { id: "session-next", file: "/tmp/session-next.jsonl", epoch: 2 },
+			sessionsByWorkspace: {},
+			selectedSessionByWorkspace: {},
 		});
 
-		const sessions = await useSessionDirectoryStore.getState().reloadSessions();
+		const selectA = useSessionDirectoryStore.getState().selectWorkspace("workspace-a");
+		const selectB = useSessionDirectoryStore.getState().selectWorkspace("workspace-b");
+		await selectB;
+		releaseA?.();
+		await selectA;
 
-		expect(sessions).toEqual([
-			expect.objectContaining({
-				id: "session-next",
-				path: "session-next.jsonl",
-				absolutePath: "/tmp/session-next.jsonl",
-				cwd: "/tmp/workspace-a",
-				messageCount: 0,
-			}),
-		]);
-		listSessions.mockRestore();
-	});
-
-	it("does not let a delayed model snapshot overwrite the newly selected workspace", async () => {
-		let releaseA: (() => void) | undefined;
-		const aGate = new Promise<void>((resolve) => {
-			releaseA = resolve;
-		});
-		useTransportStore.setState({
-			sendCommand: async (workspaceId, command: RpcCommand) => {
-				if (workspaceId === "workspace-a") await aGate;
-				const current = model(workspaceId);
-				if (command.type === "get_available_models") return response(command.type, { models: [current] });
-				if (command.type === "get_state")
-					return response(command.type, { model: current, thinkingLevel: "off" });
-				return response(command.type, { levels: ["off"] });
+		expect(useSessionDirectoryStore.getState()).toMatchObject({
+			currentWorkspaceHandle: "workspace-b",
+			currentSession: { sessionHandle: "session-b", workspaceHandle: "workspace-b" },
+			sessionsByWorkspace: {
+				"workspace-a": [{ sessionHandle: "session-a", nativeSessionId: "native-session-a" }],
+				"workspace-b": [{ sessionHandle: "session-b", nativeSessionId: "native-session-b" }],
 			},
 		});
-
-		useModelDirectoryStore.getState().beginWorkspace("workspace-a");
-		const refreshA = useModelDirectoryStore.getState().refresh("workspace-a");
-		useModelDirectoryStore.getState().beginWorkspace("workspace-b");
-		await useModelDirectoryStore.getState().refresh("workspace-b");
-		releaseA?.();
-		await refreshA;
-
-		expect(useModelDirectoryStore.getState()).toMatchObject({
-			activeWorkspaceId: "workspace-b",
-			models: [{ id: "workspace-b-model" }],
-			currentModel: { provider: "workspace-b", modelId: "workspace-b-model" },
-		});
 	});
 
-	it("does not let delayed slash commands appear in another workspace", async () => {
-		let releaseA: (() => void) | undefined;
-		const aGate = new Promise<void>((resolve) => {
-			releaseA = resolve;
+	it("propagates an event-driven force refresh without letting an older response overwrite it", async () => {
+		let releaseCached: (() => void) | undefined;
+		const cachedGate = new Promise<void>((resolve) => {
+			releaseCached = resolve;
 		});
-		useTransportStore.setState({
-			sendCommand: async (workspaceId, command: RpcCommand) => {
-				if (workspaceId === "workspace-a") await aGate;
-				return response(command.type, {
-					commands: [{ name: workspaceId, source: "prompt", sourceInfo: {} }],
-				});
-			},
+		const empty = { ...session("session-a", "workspace-a"), messageCount: 0, firstMessage: "" };
+		const settled = {
+			...session("session-a", "workspace-a"),
+			messageCount: 2,
+			firstMessage: "fresh prompt",
+		};
+		const listSessions = vi.spyOn(api, "listSessions").mockImplementation(async (_workspace, options) => {
+			if (!options?.force) {
+				await cachedGate;
+				return nativeList([empty]);
+			}
+			return nativeList([settled]);
 		});
-
-		useSlashCommandsStore.getState().beginWorkspace("workspace-a");
-		const refreshA = useSlashCommandsStore.getState().refresh("workspace-a");
-		useSlashCommandsStore.getState().beginWorkspace("workspace-b");
-		await useSlashCommandsStore.getState().refresh("workspace-b");
-		releaseA?.();
-		await refreshA;
-
-		expect(useSlashCommandsStore.getState()).toMatchObject({
-			activeWorkspaceId: "workspace-b",
-			commands: [{ name: "workspace-b" }],
-		});
-	});
-
-	it("does not send a rename command for a non-current session", async () => {
-		const sendCommand = vi.fn<() => Promise<RpcResponse>>();
-		useTransportStore.setState({ wsState: "online", sendCommand });
 		useSessionDirectoryStore.setState({
-			currentWorkspaceId: "workspace-a",
-			currentSession: session("session-b"),
-		});
-		useSessionControlStore.setState({
-			workspaceId: "workspace-a",
-			lease: "controller",
-			reconciling: false,
-			session: { id: "session-b", file: "/tmp/session-b.jsonl", epoch: 1 },
+			workspaces: [workspace("workspace-a")],
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: empty,
+			sessionsByWorkspace: { "workspace-a": [empty] },
+			selectedSessionByWorkspace: { "workspace-a": "session-a" },
 		});
 
-		await renameSession(session("session-a"), "must not apply");
+		const cachedReload = useSessionDirectoryStore.getState().reloadSessions("workspace-a");
+		const forcedReload = useSessionDirectoryStore.getState().reloadSessions("workspace-a", { force: true });
+		releaseCached?.();
+		await Promise.all([cachedReload, forcedReload]);
+
+		expect(listSessions).toHaveBeenCalledWith("workspace-a", { force: true });
+		expect(useSessionDirectoryStore.getState()).toMatchObject({
+			currentSession: { sessionHandle: "session-a", messageCount: 2, firstMessage: "fresh prompt" },
+			sessionsByWorkspace: {
+				"workspace-a": [{ sessionHandle: "session-a", messageCount: 2, firstMessage: "fresh prompt" }],
+			},
+		});
+	});
+
+	it("does not let a superseded same-Workspace selection choose its stale response", async () => {
+		let releaseSelection: (() => void) | undefined;
+		const selectionGate = new Promise<void>((resolve) => {
+			releaseSelection = resolve;
+		});
+		let releaseRefresh: (() => void) | undefined;
+		const refreshGate = new Promise<void>((resolve) => {
+			releaseRefresh = resolve;
+		});
+		const stale = session("session-stale", "workspace-a");
+		const fresh = session("session-fresh", "workspace-a");
+		vi.spyOn(api, "listSessions").mockImplementation(async (_workspace, options) => {
+			if (!options?.force) {
+				await selectionGate;
+				return nativeList([stale]);
+			}
+			await refreshGate;
+			return nativeList([fresh]);
+		});
+		isolateTransportActions();
+		useSessionDirectoryStore.setState({
+			workspaces: [workspace("workspace-a")],
+			currentWorkspaceHandle: null,
+			currentSession: null,
+			sessionsByWorkspace: {},
+			selectedSessionByWorkspace: {},
+		});
+		const observedSelections: string[] = [];
+		const unsubscribe = useSessionDirectoryStore.subscribe((state) => {
+			if (state.currentSession) observedSelections.push(state.currentSession.sessionHandle);
+		});
+
+		const selection = useSessionDirectoryStore.getState().selectWorkspace("workspace-a");
+		const refresh = useSessionDirectoryStore.getState().reloadSessions("workspace-a", { force: true });
+		releaseSelection?.();
+		await Promise.resolve();
+		releaseRefresh?.();
+		await Promise.all([selection, refresh]);
+		unsubscribe();
+
+		expect(observedSelections).not.toContain("session-stale");
+		expect(useSessionDirectoryStore.getState()).toMatchObject({
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: { sessionHandle: "session-fresh" },
+			selectedSessionByWorkspace: { "workspace-a": "session-fresh" },
+			sessionsByWorkspace: {
+				"workspace-a": [{ sessionHandle: "session-fresh" }],
+			},
+		});
+	});
+
+	it("opens an observer Session without requiring a controller lease", async () => {
+		const observerSession = session("session-observer", "workspace-a");
+		const { subscribeSession, claimSession } = isolateTransportActions();
+		useSessionDirectoryStore.setState({
+			workspaces: [workspace("workspace-a")],
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: null,
+			sessionsByWorkspace: { "workspace-a": [observerSession] },
+			selectedSessionByWorkspace: {},
+		});
+
+		await openSession(observerSession);
+
+		expect(useSessionDirectoryStore.getState().currentSession).toEqual(observerSession);
+		expect(subscribeSession).toHaveBeenCalledWith("session-observer");
+		expect(claimSession).toHaveBeenCalledWith("session-observer");
+	});
+
+	it("marks background settlement unread and clears it when that Session is selected", () => {
+		const sessionA = session("session-a", "workspace-a");
+		const sessionB = session("session-b", "workspace-a");
+		isolateTransportActions();
+		useSessionDirectoryStore.setState({
+			workspaces: [workspace("workspace-a")],
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: sessionB,
+			sessionsByWorkspace: { "workspace-a": [sessionA, sessionB] },
+			selectedSessionByWorkspace: { "workspace-a": "session-b" },
+			unreadBySession: {},
+		});
+
+		useSessionDirectoryStore.getState().markSessionUnread("session-a");
+		expect(useSessionDirectoryStore.getState().unreadBySession).toEqual({ "session-a": true });
+
+		useSessionDirectoryStore.getState().selectSession(sessionA);
+		expect(useSessionDirectoryStore.getState().unreadBySession).toEqual({});
+	});
+
+	it("refuses to rename a non-current Session even when its exact channel owns a lease", async () => {
+		const sessionA = session("session-a", "workspace-a");
+		const sessionB = session("session-b", "workspace-a");
+		const sendCommand = vi.fn();
+		sessionTransport.store.setState({
+			sendCommand,
+			sessions: {
+				"session-a": {
+					sessionHandle: "session-a",
+					subscribed: true,
+					controllerIntent: true,
+					runtime: runtime("session-a", "workspace-a"),
+					generation: 3,
+					lastSeq: 0,
+					projectedSeq: 0,
+					lease: { isController: true, fencingToken: "fence-a" },
+					pendingExtensionRequests: [],
+					resync: null,
+					rawEvents: [],
+				},
+			},
+		});
+		useSessionDirectoryStore.setState({
+			workspaces: [workspace("workspace-a")],
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: sessionB,
+			sessionsByWorkspace: { "workspace-a": [sessionA, sessionB] },
+		});
+
+		await renameSession(sessionA, "must not apply");
 
 		expect(sendCommand).not.toHaveBeenCalled();
 	});

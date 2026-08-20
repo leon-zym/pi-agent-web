@@ -66,6 +66,11 @@ export function moveSlashHighlight(current: number, delta: -1 | 1, count: number
 	return (current + delta + count) % count;
 }
 
+export function edgeSlashHighlight(edge: "first" | "last", count: number): number {
+	if (count <= 0 || edge === "first") return 0;
+	return count - 1;
+}
+
 /** Space/Enter execute only an exact real or display-name match. */
 export function resolveSlashCommit(groups: SlashMenuGroup[], query: string): SlashCommitAction {
 	const items = groups.flatMap((group) => group.items);

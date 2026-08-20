@@ -1,3 +1,4 @@
+import { memo, useMemo } from "react";
 import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import type { AssistantStep, ContentBlock } from "../../types/view-models";
@@ -5,7 +6,9 @@ import { MarkdownBlock } from "./MarkdownBlock";
 import { ReasoningDisclosure } from "./ReasoningDisclosure";
 import { ToolCallRow } from "./ToolCallRow";
 
-function BlockView({
+const EMPTY_RESULTS: import("../../types/view-models").UiToolResult[] = [];
+
+const BlockView = memo(function BlockView({
 	block,
 	results,
 	isLast,
@@ -30,13 +33,28 @@ function BlockView({
 		default:
 			return null;
 	}
-}
+});
 
 /**
  * One assistant response step: blocks in source order, then tool results.
  * Text blocks sit on the 748px reading axis; no bubble (DESIGN.md).
  */
-export function AssistantStepView({ step }: { turnId: string; step: AssistantStep }) {
+export const AssistantStepView = memo(function AssistantStepView({
+	step,
+}: {
+	turnId: string;
+	step: AssistantStep;
+}) {
+	const resultsByToolCallId = useMemo(() => {
+		const index = new Map<string, import("../../types/view-models").UiToolResult[]>();
+		for (const result of step.toolResults) {
+			const results = index.get(result.toolCallId);
+			if (results) results.push(result);
+			else index.set(result.toolCallId, [result]);
+		}
+		return index;
+	}, [step.toolResults]);
+
 	if (step.blocks.length === 0 && step.toolResults.length === 0) {
 		// Streaming gap between turns: show a working indicator line.
 		return (
@@ -53,12 +71,14 @@ export function AssistantStepView({ step }: { turnId: string; step: AssistantSte
 				<BlockView
 					key={block.key}
 					block={block}
-					results={step.toolResults.filter(
-						(r) => r.toolCallId === (block.type === "tool_call" ? block.toolCallId : ""),
-					)}
+					results={
+						block.type === "tool_call"
+							? (resultsByToolCallId.get(block.toolCallId) ?? EMPTY_RESULTS)
+							: EMPTY_RESULTS
+					}
 					isLast={index === step.blocks.length - 1}
 				/>
 			))}
 		</div>
 	);
-}
+});

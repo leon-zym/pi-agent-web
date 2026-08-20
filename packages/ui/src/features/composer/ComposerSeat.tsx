@@ -3,13 +3,15 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Button } from "../../components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
+import { stripAnsi } from "../../lib/format";
 import { tt, useT } from "../../lib/i18n";
+import { ImageAttachmentError, prepareImageAttachments } from "../../lib/image-attachments";
 import { abortCurrentRun, submitDraft } from "../../lib/session-controller";
 import { cn } from "../../lib/utils";
 import { useComposerStore } from "../../stores/composer";
 import { selectActiveTurnId, useProjectionStore } from "../../stores/projection";
-import { useSessionControlStore } from "../../stores/session-control";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
+import { useSessionTransportStore } from "../../stores/session-transport";
 import { useSlashCommandsStore } from "../../stores/slash-commands";
 import { ContextMeter } from "./ContextMeter";
 import { resolveRunningSubmitKind } from "./composer-input";
@@ -54,11 +56,19 @@ export function ComposerSeat() {
 	const setTrigger = useComposerStore((s) => s.setTrigger);
 	const setDeliveryMode = useComposerStore((s) => s.setDeliveryMode);
 
-	const hasWorkspace = useSessionDirectoryStore((s) => s.currentWorkspaceId !== null);
+	const hasWorkspace = useSessionDirectoryStore((s) => s.currentWorkspaceHandle !== null);
 	const hasSession = useSessionDirectoryStore((s) => s.currentSession !== null);
-	const currentWorkspaceId = useSessionDirectoryStore((s) => s.currentWorkspaceId);
-	const canControl = useSessionControlStore((s) => s.canControl(currentWorkspaceId));
-	const running = useProjectionStore(selectActiveTurnId) !== null;
+	const sessionHandle = useSessionDirectoryStore((s) => s.currentSession?.sessionHandle ?? null);
+	const canControl = useSessionTransportStore((state) => {
+		const channel = sessionHandle ? state.sessions[sessionHandle] : undefined;
+		return Boolean(channel?.lease.isController && channel.lease.fencingToken);
+	});
+	const runtimeBusy = useSessionTransportStore((state) => {
+		const runtimeState = sessionHandle ? state.sessions[sessionHandle]?.runtime?.state : undefined;
+		return runtimeState === "running" || runtimeState === "waiting_ui";
+	});
+	const activeTurnId = useProjectionStore(selectActiveTurnId);
+	const running = runtimeBusy || activeTurnId !== null;
 
 	const textareaRef = useRef<HTMLTextAreaElement>(null);
 	const slashMenuRef = useRef<SlashMenuHandle>(null);
@@ -90,9 +100,14 @@ export function ComposerSeat() {
 			return;
 		}
 		if (draft.trimStart().startsWith("/") && !exactCommandMatch) {
-			toast.error(tt("composer.unknownCommand", { command: draft.trimStart().split(/\s/, 1)[0] ?? "" }), {
-				description: tt("composer.unknownCommandDesc"),
-			});
+			toast.error(
+				tt("composer.unknownCommand", {
+					command: stripAnsi(draft.trimStart().split(/\s/, 1)[0] ?? ""),
+				}),
+				{
+					description: tt("composer.unknownCommandDesc"),
+				},
+			);
 			return;
 		}
 		if (draft.length > MAX_LENGTH) {
@@ -110,6 +125,11 @@ export function ComposerSeat() {
 			if (event.key === "ArrowDown" || event.key === "ArrowUp") {
 				event.preventDefault();
 				slashMenuRef.current?.move(event.key === "ArrowDown" ? 1 : -1);
+				return;
+			}
+			if (event.key === "Home" || event.key === "End") {
+				event.preventDefault();
+				slashMenuRef.current?.moveTo(event.key === "Home" ? "first" : "last");
 				return;
 			}
 			const commitWithEnter = event.key === "Enter" && !event.shiftKey;
@@ -151,28 +171,24 @@ export function ComposerSeat() {
 		adjustHeight();
 	};
 
-	const pickImage = (files: FileList | null) => {
+	const pickImage = async (files: FileList | null) => {
 		if (!files) return;
-		for (const file of Array.from(files).slice(0, 4)) {
-			if (!file.type.startsWith("image/")) continue;
-			const reader = new FileReader();
-			reader.onload = () => {
-				const result = reader.result;
-				if (typeof result !== "string") return;
-				const base64 = result.slice(result.indexOf(",") + 1);
-				setImages([
-					...useComposerStore.getState().images,
-					{ type: "image", data: base64, mimeType: file.type },
-				]);
-			};
-			reader.readAsDataURL(file);
+		const targetSessionHandle = useSessionDirectoryStore.getState().currentSession?.sessionHandle;
+		if (!targetSessionHandle) return;
+		const existing = useComposerStore.getState().bySession[targetSessionHandle]?.images ?? [];
+		try {
+			const prepared = await prepareImageAttachments(Array.from(files), existing);
+			useComposerStore.getState().setImagesForSession(targetSessionHandle, prepared);
+		} catch (error) {
+			const code = error instanceof ImageAttachmentError ? error.code : "decode_failed";
+			toast.error(tt(`composer.imageError.${code}` as never));
 		}
 	};
 
 	const focus = () => textareaRef.current?.focus();
 
 	return (
-		<div className="relative mx-auto w-full max-w-[780px] px-4 pb-3">
+		<div className="relative mx-auto w-full max-w-[780px] px-3 pb-3 sm:px-4">
 			<QueueDock />
 			{hasWorkspace && !canControl && (
 				<p className="mb-2 rounded-sm bg-surface-2 px-3 py-2 text-[12px] text-ink-3">
@@ -190,7 +206,11 @@ export function ComposerSeat() {
 					}}
 				/>
 			)}
-			<div className="rounded-xl border border-border bg-surface shadow-lv2" aria-busy={submitting}>
+			<div
+				data-testid="composer-card"
+				className="min-w-0 rounded-xl border border-border bg-surface shadow-lv2"
+				aria-busy={submitting}
+			>
 				<div className="px-4 pt-3">
 					{images.length > 0 && (
 						<div className="mb-2 flex flex-wrap gap-2">
@@ -199,7 +219,7 @@ export function ComposerSeat() {
 									<img
 										src={`data:${image.mimeType};base64,${image.data}`}
 										alt={tt("composer.attachment", { n: index + 1 })}
-										className="h-16 rounded-md object-cover"
+										className="size-16 rounded-md object-cover"
 									/>
 									<button
 										type="button"
@@ -226,7 +246,7 @@ export function ComposerSeat() {
 								: !hasSession
 									? tt("composer.pickSession")
 									: !canControl
-										? tt("lease.readOnly")
+										? tt("lease.observerPlaceholder")
 										: running
 											? tt("composer.steerPlaceholder")
 											: tt("composer.defaultPlaceholder")
@@ -237,12 +257,43 @@ export function ComposerSeat() {
 						style={{ maxHeight: 24 * MAX_LINES }}
 					/>
 				</div>
-				<div className="flex items-center gap-1 px-2.5 pt-1 pb-2.5">
+				{running && (
+					<div className="px-3 pt-1 sm:hidden">
+						<div className="inline-flex items-center gap-1 rounded-full border border-border bg-surface-2 px-1.5 py-0.5 text-[11px] text-ink-2">
+							<Zap className="size-3 text-primary" />
+							<button
+								type="button"
+								onClick={() => setDeliveryMode("steer")}
+								className={cn(
+									"min-h-10 rounded-full px-3 transition-colors",
+									deliveryMode === "steer" && "bg-primary-soft text-primary",
+								)}
+							>
+								{tt("status.steer")}
+							</button>
+							<button
+								type="button"
+								onClick={() => setDeliveryMode("follow_up")}
+								className={cn(
+									"min-h-10 rounded-full px-3 transition-colors",
+									deliveryMode === "follow_up" && "bg-primary-soft text-primary",
+								)}
+							>
+								{tt("status.followUp")}
+							</button>
+						</div>
+					</div>
+				)}
+				<div
+					data-testid="composer-toolbar"
+					className="flex min-w-0 items-center gap-0.5 overflow-hidden px-2 pt-1 pb-2.5 sm:gap-1 sm:px-2.5"
+				>
 					<Tooltip>
 						<TooltipTrigger asChild>
 							<Button
 								variant="ghost"
 								size="icon"
+								className="max-lg:size-10 shrink-0"
 								aria-label={tt("composer.commandMenu")}
 								onClick={() => {
 									const el = textareaRef.current;
@@ -269,6 +320,7 @@ export function ComposerSeat() {
 							<Button
 								variant="ghost"
 								size="icon"
+								className="max-lg:size-10 shrink-0"
 								aria-label={tt("composer.addImage")}
 								onClick={() => document.getElementById("piweb-image-input")?.click()}
 								disabled={!canControl}
@@ -284,78 +336,83 @@ export function ComposerSeat() {
 						accept="image/*"
 						multiple
 						className="hidden"
-						onChange={(event) => pickImage(event.target.files)}
+						onChange={(event) => {
+							void pickImage(event.target.files);
+							event.currentTarget.value = "";
+						}}
 						disabled={!canControl}
 					/>
 
 					{running && (
-						<div className="ml-1 flex items-center gap-1 rounded-full border border-border bg-surface-2 px-1.5 py-0.5 text-[11px] text-ink-2">
+						<div className="ml-1 hidden items-center gap-1 rounded-full border border-border bg-surface-2 px-1.5 py-0.5 text-[11px] text-ink-2 sm:flex">
 							<Zap className="size-3 text-primary" />
 							<button
 								type="button"
 								onClick={() => setDeliveryMode("steer")}
 								className={cn(
-									"rounded-full px-1.5 py-0.5 transition-colors",
+									"max-lg:min-h-10 max-lg:px-3 rounded-full px-1.5 py-0.5 transition-colors",
 									deliveryMode === "steer" && "bg-primary-soft text-primary",
 								)}
 							>
-								插队
+								{tt("status.steer")}
 							</button>
 							<button
 								type="button"
 								onClick={() => setDeliveryMode("follow_up")}
 								className={cn(
-									"rounded-full px-1.5 py-0.5 transition-colors",
+									"max-lg:min-h-10 max-lg:px-3 rounded-full px-1.5 py-0.5 transition-colors",
 									deliveryMode === "follow_up" && "bg-primary-soft text-primary",
 								)}
 							>
-								排队
+								{tt("status.followUp")}
 							</button>
 						</div>
 					)}
 
-					<div className="flex-1" />
+					<div className="min-w-0 flex-1" />
 
-					<ModelSelector />
-					<ContextMeter />
+					<div className="flex min-w-0 items-center justify-end gap-0.5 sm:gap-1">
+						<ModelSelector />
+						<ContextMeter />
 
-					{running && (
+						{running && (
+							<Tooltip>
+								<TooltipTrigger asChild>
+									<Button
+										variant="ghost"
+										size="icon"
+										aria-label={tt("composer.stop")}
+										className="max-lg:size-10 shrink-0 text-danger"
+										onClick={() => void abortCurrentRun()}
+										disabled={!canControl}
+									>
+										<Square className="size-4 fill-current" />
+									</Button>
+								</TooltipTrigger>
+								<TooltipContent>{tt("composer.stopCurrent")}</TooltipContent>
+							</Tooltip>
+						)}
 						<Tooltip>
 							<TooltipTrigger asChild>
 								<Button
-									variant="ghost"
 									size="icon"
-									aria-label={tt("composer.stop")}
-									className="text-danger"
-									onClick={() => void abortCurrentRun()}
-									disabled={!canControl}
+									aria-label={running ? tt("composer.steerSend") : tt("composer.send")}
+									className="size-[34px] max-lg:size-10 shrink-0 rounded-full"
+									disabled={!canControl || submitting || (!draft.trim() && images.length === 0)}
+									onClick={() =>
+										running ? submit(deliveryMode === "follow_up" ? "follow_up" : "steer") : submit("prompt")
+									}
 								>
-									<Square className="size-4 fill-current" />
+									<SendHorizontal className="size-4" />
 								</Button>
 							</TooltipTrigger>
-							<TooltipContent>{tt("composer.stopCurrent")}</TooltipContent>
+							<TooltipContent>{running ? tt("composer.sendQueued") : tt("composer.send")}</TooltipContent>
 						</Tooltip>
-					)}
-					<Tooltip>
-						<TooltipTrigger asChild>
-							<Button
-								size="icon"
-								aria-label={running ? tt("composer.steerSend") : tt("composer.send")}
-								className="size-[34px] rounded-full"
-								disabled={!canControl || submitting || (!draft.trim() && images.length === 0)}
-								onClick={() =>
-									running ? submit(deliveryMode === "follow_up" ? "follow_up" : "steer") : submit("prompt")
-								}
-							>
-								<SendHorizontal className="size-4" />
-							</Button>
-						</TooltipTrigger>
-						<TooltipContent>{running ? tt("composer.sendQueued") : tt("composer.send")}</TooltipContent>
-					</Tooltip>
+					</div>
 				</div>
 			</div>
 			{running && (
-				<p className="mt-1.5 text-center text-[11px] text-ink-3">
+				<p className="mt-1.5 hidden text-center text-[11px] text-ink-3 sm:block">
 					{tt("composer.runningHint1", {
 						mode: deliveryMode === "follow_up" ? tt("status.followUp") : tt("status.steer"),
 					})}

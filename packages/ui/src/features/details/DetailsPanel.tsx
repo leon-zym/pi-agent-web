@@ -11,19 +11,18 @@ import {
 	PanelRightOpen,
 	Wrench,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
 import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
 import { Skeleton } from "../../components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
-import { stripAnsi } from "../../lib/format";
+import { displayError, displayLabel, stripAnsi } from "../../lib/format";
 import { tt } from "../../lib/i18n";
-import { forkFromEntry } from "../../lib/session-controller";
 import { cn } from "../../lib/utils";
 import { useProjectionStore } from "../../stores/projection";
-import { useSessionControlStore } from "../../stores/session-control";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
-import { useTransportStore } from "../../stores/transport";
+import { sessionTransport, useSessionTransportStore } from "../../stores/session-transport";
 import { type RightPanelMode, useViewStore } from "../../stores/view";
 
 const MODES: Array<{ mode: RightPanelMode; label: string; icon: typeof Wrench }> = [
@@ -35,8 +34,11 @@ const MODES: Array<{ mode: RightPanelMode; label: string; icon: typeof Wrench }>
 function useSelectedToolBlock() {
 	const selectedTool = useViewStore((s) => s.selectedTool);
 	const selectedSessionId = useViewStore((s) => s.selectedToolSessionId);
+	const currentSessionHandle = useSessionDirectoryStore((s) => s.currentSession?.sessionHandle ?? null);
 	const projection = useProjectionStore((s) =>
-		selectedSessionId ? s.projections[selectedSessionId] : undefined,
+		selectedSessionId && selectedSessionId === currentSessionHandle
+			? s.projections[selectedSessionId]
+			: undefined,
 	);
 	return useMemo(() => {
 		if (!projection || !selectedTool) return undefined;
@@ -135,31 +137,36 @@ function entryLabel(entry: SessionEntry): string {
 								.filter((b) => b.type === "text")
 								.map((b) => (b as { text: string }).text)
 								.join(" ");
-				return content.slice(0, 60) || tt("details.userMessage");
+				return displayLabel(content).slice(0, 60) || tt("details.userMessage");
 			}
 			if (message.role === "assistant") {
 				const text = message.content
 					.filter((b) => b.type === "text")
 					.map((b) => (b as { text: string }).text)
 					.join(" ");
-				return text.slice(0, 60) || tt("details.assistantReply");
+				return displayLabel(text).slice(0, 60) || tt("details.assistantReply");
 			}
 			return "role" in message && message.role === "toolResult" && "toolName" in message
-				? String(message.toolName)
+				? displayLabel(String(message.toolName))
 				: tt("details.toolResult");
 		}
 		case "thinking_level_change":
-			return tt("details.levelChange", { level: entry.thinkingLevel });
+			return tt("details.levelChange", { level: displayLabel(entry.thinkingLevel) });
 		case "model_change":
-			return tt("details.modelChange", { provider: entry.provider, model: entry.modelId });
+			return tt("details.modelChange", {
+				provider: displayLabel(entry.provider),
+				model: displayLabel(entry.modelId),
+			});
 		case "compaction":
 			return tt("details.compaction");
 		case "branch_summary":
 			return tt("details.branchSummary");
 		case "label":
-			return entry.label ?? tt("details.labelEntry");
+			return entry.label ? displayLabel(entry.label) : tt("details.labelEntry");
 		case "session_info":
-			return entry.name ? tt("details.renameTo", { name: entry.name }) : tt("details.sessionInfo");
+			return entry.name
+				? tt("details.renameTo", { name: displayLabel(entry.name) })
+				: tt("details.sessionInfo");
 		case "custom":
 		case "custom_message":
 			return tt("details.customEntry");
@@ -264,35 +271,79 @@ function TreeNodeView({
 }
 
 function TreeView() {
-	const workspaceId = useSessionDirectoryStore((s) => s.currentWorkspaceId);
-	const canFork = useSessionControlStore((s) => s.canControl(workspaceId));
+	const sessionHandle = useSessionDirectoryStore((s) => s.currentSession?.sessionHandle ?? null);
+	const channel = useSessionTransportStore((state) =>
+		sessionHandle ? state.sessions[sessionHandle] : undefined,
+	);
+	const canFork = Boolean(
+		channel?.subscribed &&
+			channel.generation !== null &&
+			channel.lease.isController &&
+			channel.lease.fencingToken &&
+			channel.runtime?.state === "idle",
+	);
 	const [tree, setTree] = useState<SessionTreeNode[]>([]);
 	const [leafId, setLeafId] = useState<string | null>(null);
-	const [loading, setLoading] = useState(true);
+	const [loading, setLoading] = useState(false);
+	const requestRef = useRef(0);
 
-	const load = async () => {
-		if (!workspaceId) return;
+	const load = async (targetSessionHandle = sessionHandle) => {
+		const request = ++requestRef.current;
+		if (!targetSessionHandle) {
+			setTree([]);
+			setLeafId(null);
+			setLoading(false);
+			return;
+		}
 		setLoading(true);
 		try {
-			const response = await useTransportStore.getState().sendCommand(workspaceId, { type: "get_tree" });
+			const response = await sessionTransport.store
+				.getState()
+				.sendCommand(targetSessionHandle, { type: "get_tree" });
 			const data = expectData(response) as { tree: SessionTreeNode[]; leafId: string | null };
+			if (
+				request !== requestRef.current ||
+				useSessionDirectoryStore.getState().currentSession?.sessionHandle !== targetSessionHandle
+			) {
+				return;
+			}
 			setTree(data.tree);
 			setLeafId(data.leafId);
 		} catch {
 			// stale tree is better than a crash
 		} finally {
-			setLoading(false);
+			if (request === requestRef.current) setLoading(false);
 		}
 	};
 
 	useEffect(() => {
-		void load();
-		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [workspaceId]);
+		void load(sessionHandle);
+		return () => {
+			requestRef.current += 1;
+		};
+	}, [sessionHandle]);
 
 	const fork = async (entryId: string) => {
-		await forkFromEntry(entryId);
-		await load();
+		const targetSessionHandle = sessionHandle;
+		if (!targetSessionHandle || !canFork) return;
+		try {
+			const response = await sessionTransport.store
+				.getState()
+				.sendCommand(targetSessionHandle, { type: "fork", entryId });
+			const data = expectData(response) as { cancelled?: boolean } | undefined;
+			if (data?.cancelled) {
+				toast.info(tt("session.forkCancelled"));
+				return;
+			}
+			toast.success(tt("session.forked"));
+			if (useSessionDirectoryStore.getState().currentSession?.sessionHandle === targetSessionHandle) {
+				await load(targetSessionHandle);
+			}
+		} catch (error) {
+			toast.error(tt("session.forkFailed"), {
+				description: displayError(error),
+			});
+		}
 	};
 
 	return (
@@ -332,13 +383,17 @@ function TreeView() {
 }
 
 function DebugView() {
-	const rawEvents = useTransportStore((s) => s.rawEvents);
-	const processStatus = useTransportStore((s) => s.processStatus);
+	const currentSession = useSessionDirectoryStore((s) => s.currentSession);
+	const sessionHandle = currentSession?.sessionHandle ?? null;
+	const channel = useSessionTransportStore((state) =>
+		sessionHandle ? state.sessions[sessionHandle] : undefined,
+	);
 	const [filter, setFilter] = useState("");
 	const events = useMemo(
-		() => rawEvents.filter((e) => !filter || e.eventType.includes(filter)),
-		[rawEvents, filter],
+		() => (channel?.rawEvents ?? []).filter((event) => !filter || event.eventType.includes(filter)),
+		[channel?.rawEvents, filter],
 	);
+	const runtime = channel?.runtime ?? currentSession?.runtime ?? null;
 	return (
 		<div className="flex h-full flex-col">
 			<div className="flex flex-none items-center gap-2 border-b border-border px-4 py-3">
@@ -353,16 +408,28 @@ function DebugView() {
 			</div>
 			<div className="scroll-slim min-h-0 flex-1 overflow-y-auto p-2">
 				<pre className="font-mono text-[11px] leading-[16px] whitespace-pre-wrap break-all text-ink-2">
-					{JSON.stringify(processStatus, null, 2)}
+					{JSON.stringify(
+						{
+							sessionHandle,
+							generation: channel?.generation ?? null,
+							lastSeq: channel?.lastSeq ?? 0,
+							controller: channel?.lease.isController ?? false,
+							runtime,
+						},
+						null,
+						2,
+					)}
 					{"\n"}
 					{events
 						.map(
-							(e) =>
-								new Date(e.at).toISOString().slice(11, 19) +
+							(event) =>
+								new Date(event.receivedAt).toISOString().slice(11, 19) +
 								" [" +
-								e.sessionId.slice(0, 8) +
+								String(event.generation) +
+								":" +
+								String(event.seq) +
 								"] " +
-								e.eventType,
+								event.eventType,
 						)
 						.join("\n")}
 				</pre>
@@ -380,7 +447,7 @@ export function DetailsPanel({ open, onToggle }: { open: boolean; onToggle: () =
 
 	return (
 		<div className="flex h-full flex-col">
-			<div className="flex h-11 flex-none items-center gap-1 border-b border-border px-2">
+			<div className="flex h-12 flex-none items-center gap-1 border-b border-border px-2 lg:h-11">
 				{MODES.map(({ mode: m, label, icon: Icon }) => (
 					<button
 						key={m}
@@ -390,7 +457,7 @@ export function DetailsPanel({ open, onToggle }: { open: boolean; onToggle: () =
 							if (!open) onToggle();
 						}}
 						className={cn(
-							"flex h-7 items-center gap-1.5 rounded-sm px-2 text-[12px] transition-colors",
+							"flex h-10 items-center gap-1.5 rounded-sm px-2 text-[12px] transition-colors lg:h-7",
 							mode === m ? "bg-hover font-medium text-ink" : "text-ink-3 hover:bg-hover hover:text-ink-2",
 						)}
 					>
@@ -404,7 +471,7 @@ export function DetailsPanel({ open, onToggle }: { open: boolean; onToggle: () =
 						<button
 							type="button"
 							aria-label={open ? tt("details.collapsePanel") : tt("details.expandPanel")}
-							className="flex size-7 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
+							className="flex size-10 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink lg:size-7"
 							onClick={onToggle}
 						>
 							{open ? <PanelRightClose className="size-4" /> : <PanelRightOpen className="size-4" />}

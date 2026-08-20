@@ -1,5 +1,15 @@
+import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { beforeEach, describe, expect, it } from "vitest";
 import { useProjectionStore } from "../src/stores/projection";
+
+const usage = {
+	input: 10,
+	output: 20,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 30,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
 
 function resetProjectionStore(): void {
 	useProjectionStore.setState({ projections: {}, order: [], currentSessionId: null });
@@ -36,6 +46,20 @@ describe("projection cache", () => {
 		expect(state.order).toContain("streaming");
 	});
 
+	it("settles an active turn as an error when its Pi runtime is lost", () => {
+		const store = useProjectionStore.getState();
+		store.applyEvent("crashed", { type: "agent_start" } as never);
+		store.markRuntimeFailure("crashed", "process exited");
+
+		const projection = useProjectionStore.getState().projections.crashed;
+		expect(projection?.activeTurnId).toBeNull();
+		expect(projection?.replayable).toBe(true);
+		expect(projection?.turns.at(-1)).toMatchObject({
+			status: "error",
+			errorMessage: "process exited",
+		});
+	});
+
 	it("marks replayed tool calls as errors when their tool result failed", () => {
 		useProjectionStore.getState().rebuildFromMessages("s1", [
 			{ role: "user", content: "Run it", timestamp: 1 },
@@ -51,5 +75,32 @@ describe("projection cache", () => {
 		expect(step?.toolResults).toEqual([
 			expect.objectContaining({ toolCallId: "call-1", content: "failed", isError: true }),
 		]);
+	});
+
+	it("publishes one store commit for an ordered reducer batch", () => {
+		const deltas = Array.from(
+			{ length: 1_000 },
+			() =>
+				({
+					type: "message_update",
+					usage,
+					assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x" },
+				}) as JsonAgentSessionEvent,
+		);
+		let commits = 0;
+		const unsubscribe = useProjectionStore.subscribe(() => {
+			commits += 1;
+		});
+
+		useProjectionStore
+			.getState()
+			.applyEvents("batched", [{ type: "agent_start" }, { type: "turn_start" }, ...deltas]);
+		unsubscribe();
+
+		expect(commits).toBe(1);
+		expect(useProjectionStore.getState().projections.batched?.turns[0]?.steps[0]?.blocks[0]).toMatchObject({
+			type: "text",
+			markdown: "x".repeat(1_000),
+		});
 	});
 });

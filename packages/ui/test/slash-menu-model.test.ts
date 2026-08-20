@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	buildSlashMenuGroups,
+	edgeSlashHighlight,
 	fuzzyScore,
 	insertSlashCommand,
 	moveSlashHighlight,
@@ -50,6 +51,12 @@ describe("slash menu model", () => {
 		expect(moveSlashHighlight(2, 1, 3)).toBe(0);
 		expect(moveSlashHighlight(1, 1, 3)).toBe(2);
 		expect(moveSlashHighlight(0, 1, 0)).toBe(0);
+	});
+
+	it("moves Home and End to the listbox edges", () => {
+		expect(edgeSlashHighlight("first", 4)).toBe(0);
+		expect(edgeSlashHighlight("last", 4)).toBe(3);
+		expect(edgeSlashHighlight("last", 0)).toBe(0);
 	});
 
 	it("inserts a clicked command at the active slash token", () => {

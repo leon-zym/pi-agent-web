@@ -28,11 +28,17 @@ export const zhCN = {
 	"common.settings": "设置",
 	"common.noOutput": "（无输出）",
 	"common.more": "更多",
+	"conversation.markdownImage": "Markdown 图片",
+	"conversation.markdownImageLink": "打开外部图片：{label}",
+	"conversation.markdownImageBlocked": "已阻止不安全的图片地址：{label}",
 
 	// Status dots / badges
 	"status.running": "运行中",
 	"status.starting": "启动中",
 	"status.crashed": "进程已崩溃",
+	"status.idle": "就绪",
+	"status.dormant": "未运行",
+	"status.waitingUi": "等待输入",
 	"status.clickToRestart": "点击重启",
 	"status.waitingInjection": "等待注入",
 	"status.steer": "插队",
@@ -57,11 +63,19 @@ export const zhCN = {
 	"sidebar.renameDescription": "名称会写入会话的 session_info 条目。",
 	"sidebar.sessionNamePlaceholder": "会话名称",
 	"sidebar.deleteSession": "删除会话",
-	"sidebar.deleteDescription": "将永久删除「{title}」及其全部消息记录，此操作无法撤销。",
+	"sidebar.deleteBlocked.controller_required": "当前标签页没有此 Session 的控制权。",
+	"sidebar.deleteBlocked.runtime_active": "Session 正在运行或等待输入，停止后才能删除。",
+	"sidebar.deleteBlocked.runtime_unavailable": "Session 文件当前不可恢复删除。",
+	"sidebar.deleteBlocked.session_unpersisted": "新 Session 尚未写入 JSONL，暂时不能删除。",
+	"sidebar.deleteDescription":
+		"从 Pi 历史中移除「{title}」并停止其运行时。JSONL 会移入可恢复回收区，但当前界面尚不能恢复。",
 	"sidebar.removeWorkspace": "移除工作区",
-	"sidebar.removeWorkspaceDescription": "仅从列表中移除「{name}」，会话文件与进程不受影响。",
+	"sidebar.removeWorkspaceDescription":
+		"从列表中移除「{name}」并释放本页面的 Session 控制权。JSONL 文件不会删除；重新添加同一文件夹即可恢复发现。",
 	"sidebar.expandMore": "展开其余 {count} 个会话",
 	"sidebar.noMatch": "没有匹配的会话",
+	"sidebar.unread": "新消息",
+	"sidebar.queued": "排队 {count}",
 	"sidebar.openWorkspace": "打开工作区",
 	"sidebar.chooseWorkspaceFolder": "选择文件夹",
 	"sidebar.workspacePickerEmpty": "尚未选择文件夹",
@@ -90,6 +104,7 @@ export const zhCN = {
 	"header.exportFailed": "导出失败",
 	"header.branchTree": "分支树",
 	"header.deleteSession": "删除会话",
+	"header.moreActions": "更多会话操作",
 	"header.confirmRename": "确认重命名",
 	"header.cancelRename": "取消重命名",
 
@@ -108,6 +123,10 @@ export const zhCN = {
 	"composer.commandMenu": "命令菜单",
 	"composer.commandMenuSlash": "命令菜单（/）",
 	"composer.addImage": "添加图片",
+	"composer.imageError.decode_failed": "无法读取这张图片",
+	"composer.imageError.too_large": "图片压缩后仍然过大",
+	"composer.imageError.too_many": "最多可添加四张图片",
+	"composer.imageError.total_too_large": "图片总大小超出限制",
 	"composer.removeAttachment": "移除附件",
 	"composer.attachment": "附件 {n}",
 	"composer.attachmentImage": "附件图片 {n}",
@@ -135,11 +154,16 @@ export const zhCN = {
 	// Model / thinking
 	"model.select": "选择模型",
 	"model.none": "未选择",
+	"model.noModels": "没有可用模型",
+	"model.configure": "配置模型",
+	"model.noModelsHint": "当前没有可用模型，请在设置中配置 Provider 凭据。",
 	"model.label": "模型",
 	"model.effort": "思考级别",
 	"model.switchFailed": "切换模型失败",
 	"model.effortSwitchFailed": "切换思考级别失败",
 	"model.menuAria": "模型与思考级别",
+	"model.nextRequest": "更改从下一次请求开始生效。",
+	"model.nextRequestBusy": "更改从下一次请求开始生效；当前回复仍使用原模型。",
 	"model.levelOff": "关闭",
 	"model.levelMinimal": "最小",
 	"model.levelLow": "低",
@@ -150,14 +174,20 @@ export const zhCN = {
 
 	// Context meter
 	"context.aria": "上下文占用",
+	"context.ariaReady": "上下文占用 {percent}%",
+	"context.loading": "上下文占用加载中",
+	"context.unavailable": "上下文占用不可用",
+	"context.unavailableShort": "不可用",
 	"context.tooltipTokens": "上下文 {tokens} / {window} tokens ({percent}%)",
 	"context.tooltipComputing": "上下文占用计算中…",
+	"context.tooltipUnavailable": "当前模型响应未提供上下文占用信息。",
 	"context.tooltipTotal": "会话累计 {tokens} tokens · {cost}",
 	"context.tooltipLive": "本轮实时 {tokens} tokens",
 
 	// Tool call rows
 	"tool.inspectAria": "在详情面板中查看",
 	"tool.fullLog": "完整日志：{path}",
+	"tool.diff": "文件变更",
 	"tool.executionError": "工具执行出错",
 
 	// Turn tail
@@ -214,12 +244,10 @@ export const zhCN = {
 
 	// Settings
 	"settings.title": "设置",
-	"settings.description": "写入 ~/.pi/agent/settings.json，对当前工作区进程即时生效。",
+	"settings.description": "会话选项通过当前 Pi 运行时应用；外观设置仅保存在此浏览器。",
 	"settings.session": "会话",
 	"settings.autoCompaction": "上下文自动压缩",
 	"settings.autoCompactionDesc": "达到上下文上限时自动总结并压缩",
-	"settings.autoRetry": "API 故障自动重试",
-	"settings.autoRetryDesc": "overloaded / Rate Limit / 5xx 时自动退避重试",
 	"settings.steerMode": "插队消息消费",
 	"settings.steerModeDesc": "每次注入一条或一次性全部注入",
 	"settings.followUpMode": "排队消息消费",
@@ -227,15 +255,12 @@ export const zhCN = {
 	"settings.oneAtATime": "一次一条",
 	"settings.all": "全部",
 	"settings.appearance": "外观",
-	"settings.openWorkspaceHint": "打开工作区后可配置会话选项。",
+	"settings.openWorkspaceHint": "选择并控制一个会话后，才能修改其 Pi 选项。",
 	"settings.saveFailed": "设置失败",
 
 	// Session controller toasts
 	"session.loadFailed": "加载会话内容失败",
-	"session.recoveryFailed": "未能恢复 Host 当前会话，请重新选择会话后再试",
-	"session.switchCancelled": "会话切换已被扩展取消",
 	"session.openFailed": "打开会话失败",
-	"session.newCancelled": "新建会话已被扩展取消",
 	"session.newFailed": "新建会话失败",
 	"session.deleted": "会话已删除",
 	"session.deleteFailed": "删除会话失败",
@@ -256,8 +281,10 @@ export const zhCN = {
 	"transport.unavailable": "WebSocket 不可用",
 	"transport.commandTimeout": "命令超时：{command}",
 
-	// Workspace controller lease
-	"lease.readOnly": "此工作区正由另一标签页控制，当前为只读模式",
+	// Session controller lease
+	"lease.readOnly": "另一标签页正在控制此会话；关闭它后重新选择此 Session 即可接管",
+	"lease.observer": "当前为只读模式；关闭原控制标签页后，请重新选择此会话以接管。",
+	"lease.observerPlaceholder": "当前标签页为只读模式",
 
 	// System status rows
 	"system.contextCompacted": "上下文已压缩",
@@ -274,6 +301,12 @@ export const zhCN = {
 	"appShell.detailsWidth": "调整详情面板宽度",
 	"appShell.collapseSidebar": "收起侧栏",
 	"appShell.expandSidebar": "展开侧栏",
+	"appShell.openSessions": "打开会话列表",
+	"appShell.closeSessions": "关闭会话列表",
+	"appShell.sessionsTitle": "会话",
+	"appShell.sessionsDescription": "浏览工作区并切换当前会话。",
+	"appShell.detailsTitle": "会话详情",
+	"appShell.detailsDescription": "查看工具输出、分支与会话原始事件。",
 	"userMessage.copyAria": "复制消息",
 	"turn.sectionAria": "对话轮次",
 	"model.back": "返回",

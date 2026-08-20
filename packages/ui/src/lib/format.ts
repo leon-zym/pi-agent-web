@@ -58,7 +58,9 @@ function consumeControlSequence(text: string, start: number): number {
 /**
  * Remove terminal control sequences from display text without mutating the
  * event or projection that supplied it. Handles CSI colors/cursor movement,
- * OSC hyperlinks/titles, DCS-style strings, C1 controls, and short ESC forms.
+ * OSC hyperlinks/titles, DCS-style strings, C0/C1 controls, bidi formatting
+ * controls, and short ESC forms. Newlines and tabs remain available to text
+ * surfaces; protocol values must retain their raw identity separately.
  */
 export function stripAnsi(text: string): string {
 	let output = "";
@@ -94,10 +96,32 @@ export function stripAnsi(text: string): string {
 			index += 1;
 			continue;
 		}
+		if (
+			(code <= 0x1f && code !== 0x09 && code !== 0x0a) ||
+			code === 0x7f ||
+			code === 0x061c ||
+			code === 0x200e ||
+			code === 0x200f ||
+			(code >= 0x202a && code <= 0x202e) ||
+			(code >= 0x2066 && code <= 0x2069)
+		) {
+			index += 1;
+			continue;
+		}
 		output += text[index];
 		index += 1;
 	}
 	return output;
+}
+
+/** Convert an unknown failure into inert display text without reflecting control sequences. */
+export function displayError(error: unknown): string {
+	return stripAnsi(error instanceof Error ? error.message : String(error));
+}
+
+/** Sanitize a single-line label or document title and collapse layout whitespace. */
+export function displayLabel(text: string): string {
+	return stripAnsi(text).replace(/\s+/gu, " ").trim();
 }
 
 /** First non-empty line of a block of text (thinking summaries, tool output). */

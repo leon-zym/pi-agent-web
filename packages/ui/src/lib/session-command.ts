@@ -1,46 +1,28 @@
 import type { RpcCommand, RpcExtensionUIResponse, RpcResponse } from "@earendil-works/pi-coding-agent";
 import { commandTimeoutMs } from "@pi-agent-web/protocol";
-import { useSessionControlStore } from "../stores/session-control";
-import { useTransportStore } from "../stores/transport";
-import { tt } from "./i18n";
+import { sessionTransport } from "../stores/session-transport";
 
-function expectedSessionId(workspaceId: string): string | null {
-	const control = useSessionControlStore.getState();
-	return control.workspaceId === workspaceId ? control.session.id : null;
-}
-
+/** Read commands are Session-addressed and never require a controller lease. */
 export async function sendReadCommand(
-	workspaceId: string,
+	sessionHandle: string,
 	command: RpcCommand,
 	timeoutMs = commandTimeoutMs(command.type),
 ): Promise<RpcResponse> {
-	return useTransportStore
-		.getState()
-		.sendCommand(workspaceId, command, timeoutMs, expectedSessionId(workspaceId));
+	return sessionTransport.store.getState().sendCommand(sessionHandle, command, timeoutMs);
 }
 
+/** Mutations are fenced by the Session transport using the exact generation and lease token. */
 export async function sendControlCommand(
-	workspaceId: string,
+	sessionHandle: string,
 	command: RpcCommand,
 	timeoutMs = commandTimeoutMs(command.type),
 ): Promise<RpcResponse> {
-	if (!useSessionControlStore.getState().canControl(workspaceId)) throw new Error(tt("lease.readOnly"));
-	const response = await useTransportStore
-		.getState()
-		.sendCommand(workspaceId, command, timeoutMs, expectedSessionId(workspaceId));
-	if (response.success === false && response.error === "session_stale") {
-		useSessionControlStore.getState().setReconciling(workspaceId, true);
-		if (typeof window !== "undefined") window.dispatchEvent(new Event("piweb:session-stale"));
-	}
-	return response;
+	return sessionTransport.store.getState().sendCommand(sessionHandle, command, timeoutMs);
 }
 
 export function sendControlExtensionUiResponse(
-	workspaceId: string,
+	sessionHandle: string,
 	response: RpcExtensionUIResponse,
 ): boolean {
-	if (!useSessionControlStore.getState().canControl(workspaceId)) return false;
-	return useTransportStore
-		.getState()
-		.sendExtensionUiResponse(workspaceId, response, expectedSessionId(workspaceId));
+	return sessionTransport.store.getState().sendExtensionUiResponse(sessionHandle, response);
 }

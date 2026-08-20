@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { stripAnsi } from "../src/lib/format";
+import { displayLabel, stripAnsi } from "../src/lib/format";
 
 describe("stripAnsi", () => {
 	it("removes CSI colors and cursor controls", () => {
@@ -19,5 +19,13 @@ describe("stripAnsi", () => {
 	it("preserves ordinary text, newlines, and tabs", () => {
 		const text = "alpha\n\tbeta 中文";
 		expect(stripAnsi(text)).toBe(text);
+	});
+
+	it("removes standalone controls and bidi formatting without flattening lines", () => {
+		expect(stripAnsi("safe\u0000\u0007\b\u007f\u202eevil\u202c\nnext\tcell")).toBe("safeevil\nnext\tcell");
+	});
+
+	it("collapses whitespace for one-line presentation labels", () => {
+		expect(displayLabel("  title\n\u001b[31mred\u001b[0m\tvalue  ")).toBe("title red value");
 	});
 });

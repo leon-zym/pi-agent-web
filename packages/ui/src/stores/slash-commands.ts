@@ -1,62 +1,98 @@
 import { expectData } from "@pi-agent-web/protocol";
 import { create } from "zustand";
 import type { RpcSlashCommand } from "../types/pi-types";
-import { useTransportStore } from "./transport";
+import { sessionTransport } from "./session-transport";
 
-interface SlashCommandsState {
-	byWorkspace: Record<string, SlashCommandSnapshot>;
-	activeWorkspaceId: string | null;
+export interface SlashCommandSnapshot {
 	commands: RpcSlashCommand[];
 	loadedAt: number | null;
 	loading: boolean;
-	beginWorkspace: (workspaceId: string | null) => void;
-	refresh: (workspaceId: string) => Promise<void>;
 }
 
-interface SlashCommandSnapshot {
-	commands: RpcSlashCommand[];
-	loadedAt: number;
+interface SlashCommandsState extends SlashCommandSnapshot {
+	bySession: Record<string, SlashCommandSnapshot>;
+	activeSessionHandle: string | null;
+	beginSession: (sessionHandle: string | null) => void;
+	forgetSession: (sessionHandle: string) => void;
+	refresh: (sessionHandle: string) => Promise<void>;
 }
 
 const refreshGeneration = new Map<string, number>();
 let refreshCounter = 0;
 
-function nextRefreshGeneration(workspaceId: string): number {
+function nextRefreshGeneration(sessionHandle: string): number {
 	refreshCounter += 1;
-	refreshGeneration.set(workspaceId, refreshCounter);
+	refreshGeneration.set(sessionHandle, refreshCounter);
 	return refreshCounter;
 }
 
-function isLatestRefresh(workspaceId: string, generation: number): boolean {
-	return refreshGeneration.get(workspaceId) === generation;
+function isLatestRefresh(sessionHandle: string, generation: number): boolean {
+	return refreshGeneration.get(sessionHandle) === generation;
 }
 
-export const useSlashCommandsStore = create<SlashCommandsState>()((set, get) => ({
-	byWorkspace: {},
-	activeWorkspaceId: null,
-	commands: [],
-	loadedAt: null,
-	loading: false,
+function emptySnapshot(loading = false): SlashCommandSnapshot {
+	return { commands: [], loadedAt: null, loading };
+}
 
-	beginWorkspace: (workspaceId) =>
-		set({ activeWorkspaceId: workspaceId, commands: [], loadedAt: null, loading: workspaceId !== null }),
+function visible(snapshot: SlashCommandSnapshot): SlashCommandSnapshot {
+	return { commands: snapshot.commands, loadedAt: snapshot.loadedAt, loading: snapshot.loading };
+}
 
-	refresh: async (workspaceId) => {
-		const generation = nextRefreshGeneration(workspaceId);
-		if (get().activeWorkspaceId === workspaceId) set({ loading: true });
-		try {
-			const response = await useTransportStore.getState().sendCommand(workspaceId, { type: "get_commands" });
-			const { commands } = expectData(response) as { commands: RpcSlashCommand[] };
-			const snapshot = { commands, loadedAt: Date.now() };
-			const current = get();
-			const byWorkspace = { ...current.byWorkspace, [workspaceId]: snapshot };
-			if (current.activeWorkspaceId === workspaceId && isLatestRefresh(workspaceId, generation)) {
-				set({ byWorkspace, commands, loadedAt: snapshot.loadedAt, loading: false });
-			} else set({ byWorkspace });
-		} catch {
-			if (get().activeWorkspaceId === workspaceId && isLatestRefresh(workspaceId, generation)) {
-				set({ loading: false });
+export const useSlashCommandsStore = create<SlashCommandsState>()((set) => {
+	const updateSession = (
+		sessionHandle: string,
+		update: (snapshot: SlashCommandSnapshot) => SlashCommandSnapshot,
+	): void =>
+		set((state) => {
+			const snapshot = update(state.bySession[sessionHandle] ?? emptySnapshot());
+			return {
+				bySession: { ...state.bySession, [sessionHandle]: snapshot },
+				...(state.activeSessionHandle === sessionHandle ? visible(snapshot) : {}),
+			};
+		});
+
+	return {
+		...emptySnapshot(),
+		bySession: {},
+		activeSessionHandle: null,
+
+		beginSession: (activeSessionHandle) =>
+			set((state) => ({
+				activeSessionHandle,
+				...visible(
+					activeSessionHandle
+						? (state.bySession[activeSessionHandle] ?? emptySnapshot(true))
+						: emptySnapshot(),
+				),
+			})),
+
+		forgetSession: (sessionHandle) =>
+			set((state) => {
+				const bySession = { ...state.bySession };
+				delete bySession[sessionHandle];
+				refreshGeneration.delete(sessionHandle);
+				return {
+					bySession,
+					...(state.activeSessionHandle === sessionHandle
+						? { activeSessionHandle: null, ...visible(emptySnapshot()) }
+						: {}),
+				};
+			}),
+
+		refresh: async (sessionHandle) => {
+			const generation = nextRefreshGeneration(sessionHandle);
+			updateSession(sessionHandle, (snapshot) => ({ ...snapshot, loading: true }));
+			try {
+				const response = await sessionTransport.store
+					.getState()
+					.sendCommand(sessionHandle, { type: "get_commands" });
+				if (!isLatestRefresh(sessionHandle, generation)) return;
+				const { commands } = expectData(response) as { commands: RpcSlashCommand[] };
+				updateSession(sessionHandle, () => ({ commands, loadedAt: Date.now(), loading: false }));
+			} catch {
+				if (!isLatestRefresh(sessionHandle, generation)) return;
+				updateSession(sessionHandle, (snapshot) => ({ ...snapshot, loading: false }));
 			}
-		}
-	},
-}));
+		},
+	};
+});

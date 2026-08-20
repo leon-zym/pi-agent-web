@@ -72,7 +72,9 @@ function flattenResult(result: unknown): string {
 export function ToolCallRow({ block, results }: { block: ToolCallBlock; results: UiToolResult[] }) {
 	const [expanded, setExpanded] = useState(false);
 	const presenter = getToolPresenter(block.toolName);
-	const summary = stripAnsi(presenter.summarize({ block, results }));
+	const presenterContext = { block, results };
+	const summary = stripAnsi(presenter.summarize(presenterContext));
+	const presenterBody = presenter.renderBody?.(presenterContext);
 	const effectiveStatus = results.some((result) => result.isError) ? "error" : block.status;
 	const status = STATUS_ICON[effectiveStatus];
 	const StatusIcon = status.icon;
@@ -124,9 +126,11 @@ export function ToolCallRow({ block, results }: { block: ToolCallBlock; results:
 
 			{expanded && (
 				<div className="ml-[22px] flex flex-col gap-2 border-l border-border pl-3">
-					<div className="max-h-[224px] overflow-y-auto scroll-slim rounded-sm bg-surface-2 p-2.5 font-mono text-xs leading-[18px] whitespace-pre-wrap break-all text-ink-2">
-						{isBash ? output || tt("common.noOutput") : flattenArgs(block.args)}
-					</div>
+					{presenterBody ?? (
+						<div className="max-h-[260px] overflow-y-auto scroll-slim rounded-sm bg-surface-2 p-2.5 font-mono text-xs leading-[18px] whitespace-pre-wrap break-all text-ink-2">
+							{isBash ? output || tt("common.noOutput") : flattenArgs(block.args)}
+						</div>
+					)}
 					{!isBash && output && (
 						<div className="max-h-[260px] overflow-y-auto scroll-slim rounded-sm bg-surface-2 p-2.5 font-mono text-xs leading-[18px] whitespace-pre-wrap break-all text-ink-2">
 							{output}

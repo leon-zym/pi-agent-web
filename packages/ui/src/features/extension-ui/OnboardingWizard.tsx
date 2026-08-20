@@ -13,6 +13,7 @@ import {
 import { Input } from "../../components/ui/input";
 import { Label } from "../../components/ui/label";
 import { api } from "../../lib/api";
+import { displayError } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 
 /**
@@ -55,7 +56,7 @@ export function OnboardingWizard() {
 			setOpen(false);
 		} catch (error) {
 			toast.error(tt("onboarding.saveFailed"), {
-				description: error instanceof Error ? error.message : String(error),
+				description: displayError(error),
 			});
 		} finally {
 			setSaving(false);

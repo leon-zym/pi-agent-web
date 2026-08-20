@@ -1,3 +1,4 @@
+import { displayLabel, stripAnsi } from "../../lib/format";
 import { useExtensionUiStore } from "../../stores/extension-ui";
 
 /**
@@ -16,9 +17,9 @@ export function ExtensionStatusStrip() {
 		<div className="mb-1 flex h-7 items-center gap-2 overflow-x-auto rounded-sm bg-surface-2 px-3 font-mono text-[12px] text-ink-2">
 			{visible.map(([key, text]) => (
 				<span key={key} className="shrink-0 whitespace-nowrap">
-					<span className="text-ink-3">{key}</span>
+					<span className="text-ink-3">{displayLabel(key)}</span>
 					<span className="mx-1 text-ink-3/60">·</span>
-					{text}
+					{displayLabel(text)}
 				</span>
 			))}
 			{rest > 0 && <span className="shrink-0 text-ink-3">+{rest}</span>}
@@ -40,10 +41,10 @@ export function ExtensionWidgets({ placement }: { placement: "aboveEditor" | "be
 			{matching.map((widget) => (
 				<div key={widget.key} className="border-t border-border bg-surface">
 					<p className="px-4 pt-2 pb-0.5 font-mono text-[10px] tracking-wide text-ink-3 uppercase">
-						{widget.key}
+						{displayLabel(widget.key)}
 					</p>
 					<div className="scroll-slim max-h-24 overflow-y-auto px-4 pb-2 font-mono text-[12px] leading-[18px] whitespace-pre-wrap text-ink-2">
-						{widget.lines.join("\n")}
+						{widget.lines.map(stripAnsi).join("\n")}
 					</div>
 				</div>
 			))}
