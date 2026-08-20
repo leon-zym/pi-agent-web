@@ -16,6 +16,7 @@ import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
 import { Skeleton } from "../../components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
+import { stripAnsi } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { forkFromEntry } from "../../lib/session-controller";
 import { cn } from "../../lib/utils";
@@ -63,13 +64,14 @@ function InspectorView() {
 	const block = selected.block;
 	if (block.type !== "tool_call") return null;
 
-	const resultText =
+	const resultText = stripAnsi(
 		selected.results[0]?.content ??
-		(typeof block.result === "string"
-			? block.result
-			: typeof block.result === "object" && block.result !== null
-				? JSON.stringify(block.result, null, 2)
-				: (block.partialOutput ?? ""));
+			(typeof block.result === "string"
+				? block.result
+				: typeof block.result === "object" && block.result !== null
+					? JSON.stringify(block.result, null, 2)
+					: (block.partialOutput ?? "")),
+	);
 
 	return (
 		<div className="flex h-full flex-col">
@@ -105,7 +107,7 @@ function InspectorView() {
 						{tt("details.args")}
 					</p>
 					<pre className="scroll-slim max-h-64 overflow-y-auto rounded-md bg-surface-2 p-3 font-mono text-xs leading-[18px] whitespace-pre-wrap break-all text-ink-2">
-						{block.argsText || JSON.stringify(block.args ?? {}, null, 2)}
+						{stripAnsi(block.argsText || JSON.stringify(block.args ?? {}, null, 2))}
 					</pre>
 				</div>
 				<div className="px-4 py-3">

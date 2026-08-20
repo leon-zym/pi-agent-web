@@ -30,6 +30,8 @@ interface ComposerState {
 	setImages: (images: ImageContent[]) => void;
 	setTrigger: (trigger: SlashTrigger | null) => void;
 	setSubmitState: (state: "plain" | "submitting") => void;
+	/** Atomically claim the single in-flight submit slot. */
+	beginSubmit: () => boolean;
 	setDeliveryMode: (mode: DeliveryMode) => void;
 	setQueue: (queue: { steering: string[]; followUp: string[] }) => void;
 	/** Record a just-submitted queued message for injection source labeling. */
@@ -37,6 +39,8 @@ interface ComposerState {
 	/** Resolve a queued text to its source; consumes the entry. */
 	consumeInjectionSource: (text: string) => "steer" | "follow_up" | undefined;
 	clearDraft: () => void;
+	/** Clear only when the user has not edited the draft during submission. */
+	clearDraftIfUnchanged: (draft: string, images: ImageContent[]) => void;
 }
 
 export const useComposerStore = create<ComposerState>()((set, get) => ({
@@ -52,6 +56,11 @@ export const useComposerStore = create<ComposerState>()((set, get) => ({
 	setImages: (images) => set({ images }),
 	setTrigger: (trigger) => set({ trigger }),
 	setSubmitState: (submitState) => set({ submitState }),
+	beginSubmit: () => {
+		if (get().submitState === "submitting") return false;
+		set({ submitState: "submitting" });
+		return true;
+	},
 	setDeliveryMode: (deliveryMode) => set({ deliveryMode }),
 	setQueue: (queue) => set({ queue }),
 
@@ -72,4 +81,10 @@ export const useComposerStore = create<ComposerState>()((set, get) => ({
 	},
 
 	clearDraft: () => set({ draft: "", images: [], trigger: null }),
+	clearDraftIfUnchanged: (draft, images) => {
+		const current = get();
+		if (current.draft === draft && current.images === images) {
+			set({ draft: "", images: [], trigger: null });
+		}
+	},
 }));

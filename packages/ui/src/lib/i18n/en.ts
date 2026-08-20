@@ -118,7 +118,7 @@ export const en: typeof zhCN = {
 	"composer.sendQueued": "Send (steer / queue)",
 	"composer.steerSend": "Steer send",
 	"composer.runningHint1": 'Running: Enter injects as "{mode}", Cmd/Ctrl+Enter',
-	"composer.runningHint2": 'switches to "{other}"',
+	"composer.runningHint2": " always queues as follow-up",
 	"composer.needWorkspaceSession": "Open a workspace and select a session first",
 	"composer.unknownCommand": "Unknown command: {command}",
 	"composer.unknownCommandDesc": "Unrecognized / commands are never sent as plain prompts",
@@ -131,7 +131,7 @@ export const en: typeof zhCN = {
 	"slash.skill": "Skills",
 	"slash.loadingCommands": "Loading commands…",
 	"slash.noMatch": "No matching commands",
-	"slash.hint": "Enter to run · click to insert",
+	"slash.hint": "Space/Enter runs an exact match · click to insert",
 
 	// Model / thinking
 	"model.select": "Select model",

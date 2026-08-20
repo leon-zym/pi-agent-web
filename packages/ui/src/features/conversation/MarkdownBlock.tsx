@@ -2,6 +2,7 @@ import { memo } from "react";
 import ReactMarkdown from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import remarkGfm from "remark-gfm";
+import { stripAnsi } from "../../lib/format";
 import { cn } from "../../lib/utils";
 import "highlight.js/styles/github.css";
 
@@ -17,6 +18,8 @@ export const MarkdownBlock = memo(function MarkdownBlock({
 	text: string;
 	streaming: boolean;
 }) {
+	const displayText = stripAnsi(text);
+
 	return (
 		<div
 			className={cn(
@@ -47,7 +50,7 @@ export const MarkdownBlock = memo(function MarkdownBlock({
 					a: (props) => <a {...props} target="_blank" rel="noreferrer noopener" />,
 				}}
 			>
-				{text}
+				{displayText}
 			</ReactMarkdown>
 		</div>
 	);

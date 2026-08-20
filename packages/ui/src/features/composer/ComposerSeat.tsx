@@ -12,9 +12,11 @@ import { useSessionControlStore } from "../../stores/session-control";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { useSlashCommandsStore } from "../../stores/slash-commands";
 import { ContextMeter } from "./ContextMeter";
+import { resolveRunningSubmitKind } from "./composer-input";
 import { ModelSelector } from "./ModelSelector";
 import { QueueDock } from "./QueueDock";
-import { SlashMenu } from "./SlashMenu";
+import { SlashMenu, type SlashMenuHandle } from "./SlashMenu";
+import { insertSlashCommand } from "./slash-menu-model";
 
 const MAX_LINES = 14;
 const MAX_LENGTH = 100_000;
@@ -44,9 +46,9 @@ export function ComposerSeat() {
 	void t;
 	const draft = useComposerStore((s) => s.draft);
 	const images = useComposerStore((s) => s.images);
-	const queue = useComposerStore((s) => s.queue);
 	const trigger = useComposerStore((s) => s.trigger);
 	const deliveryMode = useComposerStore((s) => s.deliveryMode);
+	const submitting = useComposerStore((s) => s.submitState === "submitting");
 	const setDraft = useComposerStore((s) => s.setDraft);
 	const setImages = useComposerStore((s) => s.setImages);
 	const setTrigger = useComposerStore((s) => s.setTrigger);
@@ -59,7 +61,7 @@ export function ComposerSeat() {
 	const running = useProjectionStore(selectActiveTurnId) !== null;
 
 	const textareaRef = useRef<HTMLTextAreaElement>(null);
-	const cardRef = useRef<HTMLDivElement>(null);
+	const slashMenuRef = useRef<SlashMenuHandle>(null);
 	const [composing, setComposing] = useState(false);
 
 	const commands = useSlashCommandsStore((s) => s.commands);
@@ -75,8 +77,6 @@ export function ComposerSeat() {
 		adjustHeight();
 	}, [draft]);
 
-	const queueCount = queue.steering.length + queue.followUp.length;
-
 	const exactCommandMatch = useMemo(() => {
 		if (!draft.trimStart().startsWith("/")) return true;
 		const token = draft.trimStart().split(/\s/, 1)[0]?.slice(1) ?? "";
@@ -84,6 +84,7 @@ export function ComposerSeat() {
 	}, [draft, commands]);
 
 	const submit = (mode: "prompt" | "steer" | "follow_up") => {
+		if (useComposerStore.getState().submitState === "submitting") return;
 		if (!hasWorkspace || !hasSession || !canControl) {
 			toast.error(tt("composer.needWorkspaceSession"));
 			return;
@@ -105,18 +106,32 @@ export function ComposerSeat() {
 
 	const onKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
 		if (!canControl) return;
-		if (event.key === "Enter" && !event.shiftKey && !composing) {
-			event.preventDefault();
-			if (trigger) {
-				// Slash menu owns Enter: execute the highlighted command.
-				window.dispatchEvent(new CustomEvent("piweb:slash-enter"));
+		if (trigger && !composing) {
+			if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+				event.preventDefault();
+				slashMenuRef.current?.move(event.key === "ArrowDown" ? 1 : -1);
 				return;
 			}
+			const commitWithEnter = event.key === "Enter" && !event.shiftKey;
+			const commitWithSpace =
+				event.key === " " && !event.shiftKey && !event.altKey && !event.metaKey && !event.ctrlKey;
+			if (commitWithEnter || commitWithSpace) {
+				const executed = slashMenuRef.current?.commitExact() ?? false;
+				if (executed) {
+					event.preventDefault();
+					return;
+				}
+			}
+		}
+		if (event.key === "Enter" && !event.shiftKey && !composing) {
+			event.preventDefault();
 			if (running) {
-				if ((event.metaKey || event.ctrlKey) && deliveryMode !== "follow_up") {
+				const queueShortcut = event.metaKey || event.ctrlKey;
+				const kind = resolveRunningSubmitKind(deliveryMode, queueShortcut);
+				if (queueShortcut && deliveryMode !== "follow_up") {
 					setDeliveryMode("follow_up");
 				}
-				submit(deliveryMode === "follow_up" ? "follow_up" : "steer");
+				submit(kind);
 			} else {
 				submit("prompt");
 			}
@@ -166,19 +181,16 @@ export function ComposerSeat() {
 			)}
 			{trigger && (
 				<SlashMenu
-					anchorRef={cardRef}
+					ref={slashMenuRef}
 					onExecute={(commandName) => {
 						if (!trigger) return;
-						const value = draft;
-						const before = value.slice(0, trigger.index);
-						const after = value.slice(trigger.index + 1 + trigger.query.length);
-						setDraft(`${before}/${commandName} ${after}`);
+						setDraft(insertSlashCommand(draft, trigger, commandName));
 						setTrigger(null);
 						focus();
 					}}
 				/>
 			)}
-			<div ref={cardRef} className="rounded-xl border border-border bg-surface shadow-lv2">
+			<div className="rounded-xl border border-border bg-surface shadow-lv2" aria-busy={submitting}>
 				<div className="px-4 pt-3">
 					{images.length > 0 && (
 						<div className="mb-2 flex flex-wrap gap-2">
@@ -330,7 +342,7 @@ export function ComposerSeat() {
 								size="icon"
 								aria-label={running ? tt("composer.steerSend") : tt("composer.send")}
 								className="size-[34px] rounded-full"
-								disabled={!canControl || (!draft.trim() && images.length === 0 && queueCount === 0)}
+								disabled={!canControl || submitting || (!draft.trim() && images.length === 0)}
 								onClick={() =>
 									running ? submit(deliveryMode === "follow_up" ? "follow_up" : "steer") : submit("prompt")
 								}
@@ -347,9 +359,7 @@ export function ComposerSeat() {
 					{tt("composer.runningHint1", {
 						mode: deliveryMode === "follow_up" ? tt("status.followUp") : tt("status.steer"),
 					})}
-					{tt("composer.runningHint2", {
-						other: deliveryMode === "follow_up" ? tt("status.steer") : tt("status.followUp"),
-					})}
+					{tt("composer.runningHint2")}
 				</p>
 			)}
 		</div>
