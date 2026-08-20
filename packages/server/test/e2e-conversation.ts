@@ -19,6 +19,7 @@ interface RuntimeSnapshot {
 	generation: number;
 	lastSeq: number;
 	state: string;
+	recoverable: boolean;
 }
 
 interface RpcResult {
@@ -537,6 +538,61 @@ if (!RUN_REAL_E2E) {
 		await client.command(sessionB, { type: "abort" }, "abort Session B");
 		await client.waitForSettled(sessionB, beforeAbortSettle, "abort Session B settlement");
 		console.log("abort ok");
+
+		const forkMessages = (
+			await client.command(sessionB, { type: "get_fork_messages" }, "get_fork_messages Session B")
+		).response.data as { messages?: Array<{ entryId?: string; text?: string }> } | undefined;
+		const firstForkMessage = forkMessages?.messages?.[0];
+		if (!firstForkMessage?.entryId) throw new Error("Session B exposed no first user entry for fork");
+		const forkParentHandle = sessionB.handle;
+		const forkParentGeneration = sessionB.generation;
+		const rootFork = await client.command(
+			sessionB,
+			{ type: "fork", entryId: firstForkMessage.entryId },
+			"fork Session B before its first user entry",
+		);
+		if (
+			rootFork.previousSessionHandle !== forkParentHandle ||
+			rootFork.sessionHandle === forkParentHandle ||
+			rootFork.generation !== forkParentGeneration + 1 ||
+			(rootFork.response.data as { cancelled?: boolean } | undefined)?.cancelled !== false
+		) {
+			throw new Error("first-user fork did not produce the expected pending child identity");
+		}
+		if (
+			sessionB.handle !== rootFork.sessionHandle ||
+			sessionB.runtime?.recoverable !== false ||
+			!sessionB.runtime.sessionFile ||
+			fs.existsSync(sessionB.runtime.sessionFile)
+		) {
+			throw new Error("first-user fork child was not retained as an unpersisted live Session");
+		}
+
+		const rootForkMarker = "PI_WEB_ROOT_FORK_52A9";
+		const beforeRootForkSettle = sessionB.events.filter((event) => event.type === "agent_settled").length;
+		await client.command(
+			sessionB,
+			{
+				type: "prompt",
+				message: `只回复这个标记：${rootForkMarker}`,
+				streamingBehavior: "steer",
+			},
+			"prompt first-user fork child",
+		);
+		await client.waitForSettled(sessionB, beforeRootForkSettle, "first-user fork child settlement");
+		await waitUntil(
+			() => sessionB.runtime?.recoverable === true,
+			COMMAND_TIMEOUT_MS,
+			"first-user fork child persistence",
+		);
+		const rootForkMessages = messagesFrom(
+			(await client.command(sessionB, { type: "get_messages" }, "get_messages first-user fork child"))
+				.response,
+		);
+		if (!hasText(rootForkMessages, rootForkMarker) || hasText(rootForkMessages, markerB)) {
+			throw new Error("first-user fork child did not persist an isolated replacement history");
+		}
+		console.log("first-user fork pending identity + persistence ok");
 
 		const parentHandle = sessionA.handle;
 		const parentGeneration = sessionA.generation;

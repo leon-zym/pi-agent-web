@@ -34,6 +34,11 @@ export interface NativeRouteSupervisor {
 	listRuntimes(): SessionRuntimeSnapshot[];
 	getRuntime(sessionHandle: string): SessionRuntimeSnapshot | undefined;
 	createSession(request: CreateSessionRequest): Promise<SessionRuntimeSnapshot>;
+	abandonTransient(
+		workspaceId: string,
+		sessionHandle: string,
+		context: SessionManagementContext,
+	): Promise<void>;
 	withControlledSessionDeletion<T>(
 		workspaceId: string,
 		sessionHandle: string,
@@ -126,11 +131,33 @@ export function createNativeRoutes(ctx: NativeRoutesContext): Hono {
 		return c.json({ ok: true, nativeHistoryRetained: projection.dto.hasNativeHistory });
 	});
 
+	app.post("/workspaces/:workspaceHandle/activate", async (c) => {
+		const workspaceHandle = c.req.param("workspaceHandle");
+		const snapshot = await ctx.catalog.refresh();
+		const workspace = await requireWorkspace(
+			snapshot,
+			ctx.preferences,
+			workspaceHandle,
+			ctx.supervisor.listRuntimes(),
+		);
+		if (!workspace.dto.path || !workspace.dto.available) {
+			throw new NativeRouteError(409, "workspace_unavailable", "workspace is not an available directory");
+		}
+		ctx.preferences.upsert({ pathHint: workspace.dto.path, lastOpenedAt: now() });
+		const refreshed = await ctx.catalog.refresh({ force: true });
+		const activated = await requireWorkspace(
+			refreshed,
+			ctx.preferences,
+			workspaceHandle,
+			ctx.supervisor.listRuntimes(),
+		);
+		return c.json(activated.dto);
+	});
+
 	app.get("/workspaces/:workspaceHandle/sessions", async (c) => {
 		const workspaceHandle = c.req.param("workspaceHandle");
 		const snapshot = await ctx.catalog.refresh({ force: c.req.query("refresh") === "1" });
 		await requireWorkspace(snapshot, ctx.preferences, workspaceHandle, ctx.supervisor.listRuntimes());
-		ctx.preferences.touch(workspaceHandle, now());
 		const sessions = projectSessions(snapshot, ctx.supervisor.listRuntimes(), workspaceHandle);
 		const workspace = await requireWorkspace(
 			snapshot,
@@ -185,6 +212,26 @@ export function createNativeRoutes(ctx: NativeRoutesContext): Hono {
 			},
 			201,
 		);
+	});
+
+	app.delete("/workspaces/:workspaceHandle/sessions/:sessionHandle/transient", async (c) => {
+		const workspaceHandle = c.req.param("workspaceHandle");
+		const sessionHandle = c.req.param("sessionHandle");
+		const snapshot = await ctx.catalog.refresh();
+		await requireWorkspace(snapshot, ctx.preferences, workspaceHandle, ctx.supervisor.listRuntimes());
+		const management = managementContext(c.req.raw);
+		try {
+			await ctx.supervisor.abandonTransient(workspaceHandle, sessionHandle, management);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			const code = messageToken(message);
+			if (TRANSIENT_ABANDON_CONFLICT_CODES.has(code)) {
+				throw new NativeRouteError(409, code, message);
+			}
+			throw new NativeRouteError(500, "session_abandon_failed", message);
+		}
+		await ctx.catalog.refresh({ force: true });
+		return c.json({ ok: true, abandoned: true });
 	});
 
 	app.delete("/workspaces/:workspaceHandle/sessions/:sessionHandle", async (c) => {
@@ -607,6 +654,16 @@ const SUPERVISOR_CONFLICT_CODES = new Set([
 	"workspace_creation_in_progress",
 	"workspace_identity_transitioning",
 	"workspace_session_deleting",
+]);
+
+const TRANSIENT_ABANDON_CONFLICT_CODES = new Set([
+	"session_control_required",
+	"session_deleting",
+	"session_generation_stale",
+	"session_materialized",
+	"session_not_abandonable",
+	"session_read_only",
+	"workspace_identity_transitioning",
 ]);
 
 function messageToken(message: string): string {

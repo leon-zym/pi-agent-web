@@ -134,6 +134,8 @@ export class SessionRuntime {
 	private awaitingWorkStart = false;
 	private workStartTimer: NodeJS.Timeout | null = null;
 	private manuallyStopped = true;
+	private sessionFileIdentityVerified = false;
+	private hasConversationIntent = false;
 
 	sessionHandle: string;
 	readonly workspaceId: string;
@@ -173,6 +175,10 @@ export class SessionRuntime {
 		this.cwd = target.cwd;
 		this.nativeSessionId = target.nativeSessionId;
 		this.sessionFile = target.kind === "existing" ? target.sessionFile : null;
+		// Catalog-resolved existing targets are frozen again during ready. This
+		// initial trust only keeps a failed startup tracked for bounded recovery;
+		// unpersisted new/fork targets explicitly reset it until Header validation.
+		this.sessionFileIdentityVerified = target.kind === "existing";
 	}
 
 	get running(): boolean {
@@ -184,7 +190,15 @@ export class SessionRuntime {
 	}
 
 	get recoverable(): boolean {
-		return this.sessionFile !== null && fs.existsSync(this.sessionFile);
+		if (!this.sessionFile || !fs.existsSync(this.sessionFile)) return false;
+		if (this.sessionFileIdentityVerified) return true;
+		try {
+			this.verifyMaterializedSessionFile();
+			return true;
+		} catch (error) {
+			this.error = error instanceof Error ? error.message : String(error);
+			return false;
+		}
 	}
 
 	get canEvict(): boolean {
@@ -193,6 +207,16 @@ export class SessionRuntime {
 		return (
 			this.stopPromise === null &&
 			this.recoverable &&
+			this.reservations === 0 &&
+			this.identityTransitionBlocker() === null
+		);
+	}
+
+	/** True only when no accepted conversation could be lost by forgetting this unpersisted runtime. */
+	get canAbandon(): boolean {
+		return (
+			!this.hasConversationIntent &&
+			!this.recoverable &&
 			this.reservations === 0 &&
 			this.identityTransitionBlocker() === null
 		);
@@ -328,6 +352,7 @@ export class SessionRuntime {
 			) {
 				throw new RpcError("get_state", "Pi Session header identity changed after native discovery");
 			}
+			this.sessionFileIdentityVerified = true;
 		} else {
 			if (state.sessionId !== target.nativeSessionId) {
 				throw new RpcError("get_state", "Pi opened an existing session instead of the requested new id");
@@ -345,6 +370,7 @@ export class SessionRuntime {
 				) {
 					throw new RpcError("get_state", "new Pi Session header identity does not match its request");
 				}
+				this.sessionFileIdentityVerified = true;
 			}
 		}
 
@@ -379,6 +405,10 @@ export class SessionRuntime {
 			const proc = this.proc;
 			if (!proc?.running) throw new RpcError(command.type, "pi process is not running");
 			this.inFlight += 1;
+			// Once user content reaches a live Pi process, a timeout or malformed
+			// response cannot prove that Pi rejected it. Retain the runtime unless
+			// the Session later materializes and becomes independently recoverable.
+			if (commandCarriesConversation(command.type)) this.hasConversationIntent = true;
 			const expectsWork = commandMayStartWork(command.type);
 			if (expectsWork) this.beginWorkStartGrace();
 			this.touch();
@@ -460,9 +490,13 @@ export class SessionRuntime {
 					nextTarget,
 					apply: () => {
 						if (applied) throw new RpcError(command.type, "transition identity applied twice");
-						assertFrozenSessionFile(transition.frozenFile, nextTarget.nativeSessionId, nextTarget.cwd);
+						if (transition.frozenFile) {
+							assertFrozenSessionFile(transition.frozenFile, nextTarget.nativeSessionId, nextTarget.cwd);
+						} else {
+							assertUnpersistedTransitionTarget(nextTarget);
+						}
 						applied = true;
-						this.adoptTransitionTarget(nextTarget);
+						this.adoptTransitionTarget(nextTarget, transition.frozenFile !== null);
 					},
 				});
 				if (!applied) throw new RpcError(command.type, "transition identity was not committed");
@@ -497,7 +531,7 @@ export class SessionRuntime {
 
 	private transitionTarget(state: RpcSessionState): {
 		target: ExistingSessionTarget;
-		frozenFile: FrozenSessionFileIdentity;
+		frozenFile: FrozenSessionFileIdentity | null;
 	} {
 		if (!state.sessionFile || !this.sessionFile)
 			throw new RpcError("get_state", "forked session has no file");
@@ -505,12 +539,16 @@ export class SessionRuntime {
 		if (path.dirname(sessionFile) !== path.dirname(this.sessionFile)) {
 			throw new RpcError("get_state", "forked session escaped the parent session directory");
 		}
-		const frozenFile = inspectFrozenSessionFile(sessionFile);
-		if (
-			frozenFile.nativeSessionId !== state.sessionId ||
-			canonicalizePathAllowMissing(frozenFile.cwd) !== this.cwd
-		) {
-			throw new RpcError("get_state", "forked Session Header does not match its verified Pi state");
+		const frozenFile = fs.existsSync(sessionFile) ? inspectFrozenSessionFile(sessionFile) : null;
+		if (frozenFile) {
+			if (
+				frozenFile.nativeSessionId !== state.sessionId ||
+				canonicalizePathAllowMissing(frozenFile.cwd) !== this.cwd
+			) {
+				throw new RpcError("get_state", "forked Session Header does not match its verified Pi state");
+			}
+		} else if (!sessionFileBasenameMatchesId(sessionFile, state.sessionId)) {
+			throw new RpcError("get_state", "unpersisted fork path does not match its Pi session id");
 		}
 		return {
 			frozenFile,
@@ -525,8 +563,9 @@ export class SessionRuntime {
 		};
 	}
 
-	private adoptTransitionTarget(target: ExistingSessionTarget): void {
+	private adoptTransitionTarget(target: ExistingSessionTarget, identityVerified: boolean): void {
 		this.sessionFile = target.sessionFile;
+		this.sessionFileIdentityVerified = identityVerified;
 		this.sessionHandle = target.sessionHandle;
 		this.nativeSessionId = target.nativeSessionId;
 		this.opts.target = target;
@@ -613,6 +652,7 @@ export class SessionRuntime {
 
 	private handleEvent(processToken: number, event: PiWebSessionEvent): void {
 		if (processToken !== this.processToken) return;
+		this.verifyMaterializedSessionFile();
 		this.enqueueFrame({ type: "event", event });
 	}
 
@@ -643,6 +683,7 @@ export class SessionRuntime {
 
 	private handleExtensionRequest(processToken: number, request: RpcExtensionUIRequest): void {
 		if (processToken !== this.processToken) return;
+		this.verifyMaterializedSessionFile();
 		if (BLOCKING_DIALOG_METHODS.has(request.method)) {
 			const publishImmediately = this.transitionStage?.phase === "awaiting_response";
 			this.trackDialog(request, processToken, !this.transitionStage || publishImmediately);
@@ -653,6 +694,18 @@ export class SessionRuntime {
 			}
 		}
 		this.enqueueFrame({ type: "extension_ui_request", request });
+	}
+
+	private verifyMaterializedSessionFile(): void {
+		if (this.sessionFileIdentityVerified || !this.sessionFile || !fs.existsSync(this.sessionFile)) return;
+		const frozenFile = inspectFrozenSessionFile(this.sessionFile);
+		if (
+			frozenFile.nativeSessionId !== this.nativeSessionId ||
+			canonicalizePathAllowMissing(frozenFile.cwd) !== this.cwd
+		) {
+			throw new RpcError("get_state", "materialized Pi Session Header does not match its pending identity");
+		}
+		this.sessionFileIdentityVerified = true;
 	}
 
 	private trackDialog(request: RpcExtensionUIRequest, processToken: number, publishState: boolean): void {
@@ -973,6 +1026,11 @@ function commandMayStartWork(commandType: string): boolean {
 	return commandType === "prompt" || commandType === "steer" || commandType === "follow_up";
 }
 
+/** Commands whose successful admission represents user content that may still exist only in Pi memory. */
+function commandCarriesConversation(commandType: string): boolean {
+	return commandMayStartWork(commandType) || commandType === "bash";
+}
+
 function transitionWasCancelled(response: RpcResponse): boolean {
 	if (response.success !== true || !("data" in response)) return false;
 	const data = response.data;
@@ -1034,6 +1092,30 @@ function assertFrozenSessionFile(
 	) {
 		throw new RpcError("get_state", "Pi Session file identity changed before commit");
 	}
+}
+
+function assertUnpersistedTransitionTarget(target: ExistingSessionTarget): void {
+	const canonical = canonicalizeSessionFile(target.sessionFile);
+	if (
+		canonical !== target.sessionFile ||
+		sessionHandleForCanonicalFile(canonical) !== target.sessionHandle ||
+		!sessionFileBasenameMatchesId(canonical, target.nativeSessionId)
+	) {
+		throw new RpcError("get_state", "unpersisted fork identity changed before commit");
+	}
+	if (!fs.existsSync(canonical)) return;
+	const materialized = inspectFrozenSessionFile(canonical);
+	if (
+		materialized.nativeSessionId !== target.nativeSessionId ||
+		canonicalizePathAllowMissing(materialized.cwd) !== target.cwd
+	) {
+		throw new RpcError("get_state", "materialized fork Session Header does not match its pending identity");
+	}
+}
+
+function sessionFileBasenameMatchesId(sessionFile: string, nativeSessionId: string): boolean {
+	const basename = path.basename(sessionFile);
+	return basename.length > nativeSessionId.length + 7 && basename.endsWith(`_${nativeSessionId}.jsonl`);
 }
 
 function readFrozenSessionHeader(descriptor: number): { nativeSessionId: string; cwd: string } {

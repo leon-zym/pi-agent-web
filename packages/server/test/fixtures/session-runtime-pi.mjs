@@ -161,7 +161,7 @@ function sendLargeExtensionRequest(id, bytes) {
 function streamPrompt(command) {
 	const text = command.message;
 	messages.push({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() });
-	ensurePersisted();
+	if (process.env.PI_WEB_FIXTURE_SKIP_PROMPT_PERSIST !== "1") ensurePersisted();
 	if (text === "open-dialog-no-agent" || text === "open-dialog-timeout" || text === "open-dialog-crash") {
 		send({
 			type: "extension_ui_request",
@@ -257,7 +257,7 @@ function transition(command) {
 	const previousFile = sessionFile;
 	sessionId = `${sessionId}-${command.type}`;
 	sessionFile = path.join(path.dirname(previousFile), `2026-08-20T00-00-01-000Z_${sessionId}.jsonl`);
-	ensurePersisted();
+	if (process.env.PI_WEB_FIXTURE_UNPERSISTED_TRANSITION !== "1") ensurePersisted();
 	sendLargeExtensionRequest(
 		`transition-flood-${sessionId}`,
 		configuredBytes("PI_WEB_FIXTURE_TRANSITION_FRAME_BYTES"),
@@ -333,9 +333,32 @@ function handleLine(line) {
 		case "get_commands":
 			response(command, { commands: [] });
 			return;
+		case "set_model":
+		case "set_thinking_level":
+			if (process.env.PI_WEB_FIXTURE_FAIL_MUTATION === command.type) {
+				errorResponse(command, `fixture ${command.type} failure`);
+				return;
+			}
+			response(command);
+			return;
 		case "prompt":
 			streamPrompt(command);
 			return;
+		case "export_html": {
+			const outputPath =
+				typeof command.outputPath === "string" ? command.outputPath : `pi-session-${sessionId}.html`;
+			const resolvedOutputPath = path.resolve(outputPath);
+			if (process.env.PI_WEB_FIXTURE_EXPORT_MISSING !== "1") {
+				if (process.env.PI_WEB_FIXTURE_EXPORT_DIRECTORY === "1") {
+					fs.mkdirSync(resolvedOutputPath, { recursive: true });
+				} else {
+					fs.mkdirSync(path.dirname(resolvedOutputPath), { recursive: true });
+					fs.writeFileSync(resolvedOutputPath, "<html><body>fixture export</body></html>\n");
+				}
+			}
+			response(command, { path: outputPath });
+			return;
+		}
 		case "bash":
 			if (command.command !== "long") {
 				response(command, { output: "ok", exitCode: 0, cancelled: false, truncated: false });
