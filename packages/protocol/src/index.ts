@@ -12,10 +12,13 @@ import type {
 
 const MAX_IDENTIFIER_LENGTH = 256;
 const MAX_PATH_LENGTH = 8192;
-const MAX_TEXT_LENGTH = 1024 * 1024;
+export const SESSION_TEXT_MAX_BYTES = 1024 * 1024;
+export const SESSION_WS_CLIENT_MAX_BYTES = 8 * 1024 * 1024;
 export const SESSION_IMAGE_MAX_COUNT = 16;
 export const SESSION_IMAGE_MAX_BASE64_CHARS = 2 * 1024 * 1024;
 export const SESSION_IMAGE_TOTAL_MAX_BASE64_CHARS = 6 * 1024 * 1024;
+
+const UTF8_ENCODER = new TextEncoder();
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -32,7 +35,19 @@ function isOptionalString(value: unknown, maxLength = MAX_IDENTIFIER_LENGTH): bo
 }
 
 function isBoundedString(value: unknown, maxLength: number): value is string {
-	return typeof value === "string" && value.length <= maxLength;
+	return typeof value === "string" && UTF8_ENCODER.encode(value).byteLength <= maxLength;
+}
+
+/** Exact UTF-8 wire size used by browser WebSocket text frames. */
+export function sessionWsClientMessageBytes(value: unknown): number {
+	try {
+		const serialized = JSON.stringify(value);
+		return typeof serialized === "string"
+			? UTF8_ENCODER.encode(serialized).byteLength
+			: Number.POSITIVE_INFINITY;
+	} catch {
+		return Number.POSITIVE_INFINITY;
+	}
 }
 
 function hasOnlyKeys(value: UnknownRecord, allowed: readonly string[]): boolean {
@@ -67,7 +82,7 @@ function isPromptLikeCommand(value: UnknownRecord, allowStreamingBehavior: boole
 	const keys = allowStreamingBehavior ? ["message", "images", "streamingBehavior"] : ["message", "images"];
 	if (
 		!hasCommandPrefix(value, keys) ||
-		!isBoundedString(value.message, MAX_TEXT_LENGTH) ||
+		!isBoundedString(value.message, SESSION_TEXT_MAX_BYTES) ||
 		!isImages(value.images)
 	)
 		return false;
@@ -123,7 +138,10 @@ function isRpcCommand(value: unknown): value is RpcCommand {
 		case "compact":
 			return (
 				hasCommandPrefix(value, ["customInstructions"]) &&
-				isOptionalString(value.customInstructions, MAX_TEXT_LENGTH)
+				(value.customInstructions === undefined ||
+					(typeof value.customInstructions === "string" &&
+						value.customInstructions.length > 0 &&
+						isBoundedString(value.customInstructions, SESSION_TEXT_MAX_BYTES)))
 			);
 		case "set_auto_compaction":
 		case "set_auto_retry":
@@ -132,7 +150,9 @@ function isRpcCommand(value: unknown): value is RpcCommand {
 			return (
 				hasCommandPrefix(value, ["command", "excludeFromContext"]) &&
 				isString(value.id) &&
-				isString(value.command, MAX_TEXT_LENGTH) &&
+				typeof value.command === "string" &&
+				value.command.length > 0 &&
+				isBoundedString(value.command, SESSION_TEXT_MAX_BYTES) &&
 				(value.excludeFromContext === undefined || typeof value.excludeFromContext === "boolean")
 			);
 		case "export_html":
@@ -155,7 +175,7 @@ function isExtensionUiResponse(value: unknown): value is RpcExtensionUIResponse 
 	const variants = [
 		value.value !== undefined &&
 			hasOnlyKeys(value, ["type", "id", "value"]) &&
-			isBoundedString(value.value, MAX_TEXT_LENGTH),
+			isBoundedString(value.value, SESSION_TEXT_MAX_BYTES),
 		value.confirmed !== undefined &&
 			hasOnlyKeys(value, ["type", "id", "confirmed"]) &&
 			typeof value.confirmed === "boolean",
@@ -206,9 +226,10 @@ function isReplayCursor(value: unknown): value is SessionReplayCursorDto {
 	);
 }
 
-/** Strictly validate every v2 browser frame before it reaches a Session runtime. */
+/** Strictly validate every Session browser frame before it reaches a runtime. */
 export function isSessionWsClientMessage(value: unknown): value is SessionWsClientMessage {
 	if (!isRecord(value) || !isString(value.type, 64) || !isString(value.sessionHandle)) return false;
+	if (sessionWsClientMessageBytes(value) > SESSION_WS_CLIENT_MAX_BYTES) return false;
 
 	switch (value.type) {
 		case "command":

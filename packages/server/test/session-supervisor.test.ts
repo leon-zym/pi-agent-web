@@ -52,6 +52,7 @@ function createHarness(options: {
 	pendingDialogLimit?: number;
 	restartBaseDelayMs?: number;
 	maxAutoRestarts?: number;
+	idleTtlMs?: number;
 	env?: Record<string, string>;
 	commandTimeoutFor?: (commandType: string) => number;
 }) {
@@ -78,7 +79,7 @@ function createHarness(options: {
 		restartBaseDelayMs: options.restartBaseDelayMs ?? 5,
 		maxAutoRestarts: options.maxAutoRestarts,
 		readyTimeoutMs: 2_000,
-		idleTtlMs: 60_000,
+		idleTtlMs: options.idleTtlMs ?? 60_000,
 	});
 	supervisors.push(supervisor);
 	return { supervisor, messages, targets };
@@ -523,6 +524,40 @@ describe("SessionSupervisor", () => {
 
 		await expect(supervisor.activate(second.sessionHandle)).rejects.toThrow("session_runtime_capacity");
 		expect(supervisor.getRuntime(first.sessionHandle)?.state).toBe("running");
+	});
+
+	it("pins an idle controller lease against capacity eviction until release", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const first = createNativeSession(root, cwd, "capacity-leased");
+		const second = createNativeSession(root, cwd, "capacity-after-release");
+		const { supervisor } = createHarness({ targets: [first, second], maxHotRuntimes: 1 });
+
+		await supervisor.claim(first.sessionHandle, "controller");
+		await expect(supervisor.activate(second.sessionHandle)).rejects.toThrow("session_runtime_capacity");
+		expect(supervisor.getRuntime(first.sessionHandle)?.state).toBe("idle");
+
+		expect(supervisor.release(first.sessionHandle, "controller")).toBe(true);
+		await expect(supervisor.activate(second.sessionHandle)).resolves.toMatchObject({ state: "idle" });
+		expect(supervisor.getRuntime(first.sessionHandle)?.state).toBe("dormant");
+	});
+
+	it("pins an idle controller lease against TTL eviction until release", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "ttl-leased");
+		const { supervisor } = createHarness({ targets: [target], idleTtlMs: 0 });
+		const reapIdle = () => (supervisor as unknown as { reapIdle: () => Promise<void> }).reapIdle();
+
+		await supervisor.claim(target.sessionHandle, "controller");
+		await reapIdle();
+		expect(supervisor.getRuntime(target.sessionHandle)?.state).toBe("idle");
+
+		expect(supervisor.release(target.sessionHandle, "controller")).toBe(true);
+		await reapIdle();
+		expect(supervisor.getRuntime(target.sessionHandle)?.state).toBe("dormant");
 	});
 
 	it("never evicts an unpersisted empty Session because it cannot be recovered", async () => {

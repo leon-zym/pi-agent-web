@@ -12,6 +12,10 @@ const sessionRootDir = path.join(tempRoot, "sessions");
 const webDataDir = path.join(tempRoot, "web-data");
 const fakePiPath = path.join(import.meta.dirname, "fixtures", "session-runtime-pi.mjs");
 const viteOrigin = "http://localhost:5173";
+const REST_JSON_BODY_LIMIT_BYTES = 64 * 1024;
+const PROVIDER_ID_LIMIT = 256;
+const API_KEY_LIMIT = 16 * 1024;
+const WORKSPACE_PATH_LIMIT = 8192;
 
 let handle: ServerHandle;
 let base: string;
@@ -206,6 +210,86 @@ describe("gateway access control", () => {
 				})
 			).status,
 		).toBe(400);
+	});
+
+	it("rejects oversized authenticated JSON bodies from Content-Length and streaming uploads", async () => {
+		const contentLengthSentinel = "CONTENT_LENGTH_SECRET_SENTINEL";
+		const declared = await fetch(`${base}/api/v1/auth/keys`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", ...authenticatedHeaders() },
+			body: JSON.stringify({
+				provider: "bounded-provider",
+				key: `${contentLengthSentinel}${"x".repeat(REST_JSON_BODY_LIMIT_BYTES)}`,
+			}),
+		});
+		const declaredBody = (await declared.json()) as {
+			error?: { code?: string; message?: string };
+		};
+		expect(declared.status).toBe(413);
+		expect(declaredBody.error?.code).toBe("request_body_too_large");
+		expect(declaredBody.error?.message).not.toContain(contentLengthSentinel);
+
+		const streamedText = JSON.stringify({
+			path: workspacePath,
+			padding: "y".repeat(REST_JSON_BODY_LIMIT_BYTES),
+		});
+		const encoded = new TextEncoder().encode(streamedText);
+		const streamedBody = new ReadableStream<Uint8Array>({
+			start(controller) {
+				for (let offset = 0; offset < encoded.length; offset += 4096) {
+					controller.enqueue(encoded.subarray(offset, Math.min(offset + 4096, encoded.length)));
+				}
+				controller.close();
+			},
+		});
+		const streamed = await fetch(`${base}/api/v1/workspaces`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", ...authenticatedHeaders() },
+			body: streamedBody,
+			duplex: "half",
+		} as RequestInit & { duplex: "half" });
+		const streamedResponseBody = (await streamed.json()) as {
+			error?: { code?: string; message?: string };
+		};
+		expect(streamed.status).toBe(413);
+		expect(streamedResponseBody.error?.code).toBe("request_body_too_large");
+
+		const health = await fetch(`${base}/api/v1/health`, { headers: authenticatedHeaders() });
+		expect(health.status).toBe(200);
+	});
+
+	it("bounds credential and workspace fields without reflecting credential values", async () => {
+		const provider = await fetch(`${base}/api/v1/auth/keys`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", ...authenticatedHeaders() },
+			body: JSON.stringify({ provider: "p".repeat(PROVIDER_ID_LIMIT + 1), key: "unused" }),
+		});
+		expect(provider.status).toBe(422);
+		expect((await provider.json()) as unknown).toMatchObject({ error: { code: "invalid_provider" } });
+
+		const keySentinel = "FIELD_SECRET_SENTINEL";
+		const key = await fetch(`${base}/api/v1/auth/keys`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", ...authenticatedHeaders() },
+			body: JSON.stringify({
+				provider: "bounded-provider",
+				key: `${keySentinel}${"k".repeat(API_KEY_LIMIT)}`,
+			}),
+		});
+		const keyResponseText = await key.text();
+		expect(key.status).toBe(422);
+		expect(JSON.parse(keyResponseText)).toMatchObject({ error: { code: "invalid_key" } });
+		expect(keyResponseText).not.toContain(keySentinel);
+		const authFile = path.join(agentDir, "auth.json");
+		if (fs.existsSync(authFile)) expect(fs.readFileSync(authFile, "utf8")).not.toContain(keySentinel);
+
+		const workspace = await fetch(`${base}/api/v1/workspaces`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", ...authenticatedHeaders() },
+			body: JSON.stringify({ path: `/${"w".repeat(WORKSPACE_PATH_LIMIT)}` }),
+		});
+		expect(workspace.status).toBe(422);
+		expect((await workspace.json()) as unknown).toMatchObject({ error: { code: "invalid_path" } });
 	});
 
 	it("rejects unauthorized websocket upgrades and policy-violating frames", async () => {

@@ -12,6 +12,7 @@ import type {
 } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
+import { MAX_JSONL_SNAPSHOT_LINE_BYTES } from "../src/jsonl.js";
 import { canonicalizeSessionFile, sessionHandleForFile } from "../src/native-session-catalog.js";
 import type { ExistingSessionTarget } from "../src/session-runtime-types.js";
 import { SessionSupervisor } from "../src/session-supervisor.js";
@@ -34,6 +35,48 @@ class NonClosingSocket extends EventEmitter {
 
 	send(payload: string): void {
 		this.sent.push(payload);
+	}
+
+	close(code?: number, reason?: string): void {
+		this.closeCalls.push({ code, reason });
+		this.readyState = WebSocket.CLOSING;
+	}
+
+	ping(): void {}
+
+	terminate(): void {
+		this.readyState = WebSocket.CLOSED;
+	}
+}
+
+class ControlledSendSocket extends EventEmitter {
+	readonly OPEN = WebSocket.OPEN;
+	readonly CONNECTING = WebSocket.CONNECTING;
+	readyState: number = WebSocket.OPEN;
+	bufferedAmount = 0;
+	readonly closeCalls: Array<{ code?: number; reason?: string }> = [];
+	readonly sentBytes: number[] = [];
+	private deferNext = false;
+	private deferredCallback: ((error?: Error) => void) | undefined;
+
+	deferNextSend(): void {
+		this.deferNext = true;
+	}
+
+	send(payload: string, callback?: (error?: Error) => void): void {
+		this.sentBytes.push(Buffer.byteLength(payload));
+		if (this.deferNext) {
+			this.deferNext = false;
+			this.deferredCallback = callback;
+			return;
+		}
+		queueMicrotask(() => callback?.());
+	}
+
+	releaseDeferredSend(): void {
+		const callback = this.deferredCallback;
+		this.deferredCallback = undefined;
+		queueMicrotask(() => callback?.());
 	}
 
 	close(code?: number, reason?: string): void {
@@ -117,6 +160,37 @@ function createNativeSession(root: string, cwd: string, nativeSessionId: string)
 		sessionFile: canonicalizeSessionFile(sessionFile),
 		nativeSessionId,
 	};
+}
+
+function snapshotResponse(textBytes: number): SessionWsServerMessage {
+	return {
+		type: "response",
+		sessionHandle: "snapshot-session",
+		generation: 1,
+		barrierSeq: 0,
+		response: {
+			type: "response",
+			id: "snapshot-command",
+			command: "get_messages",
+			success: true,
+			data: {
+				messages: [{ role: "assistant", content: [{ type: "text", text: "x".repeat(textBytes) }] }],
+			},
+		} as RpcResponse,
+	};
+}
+
+function bridgeConnection(bridge: SessionWsBridge): {
+	connection: unknown;
+	send: (connection: unknown, message: SessionWsServerMessage) => void;
+} {
+	const internals = bridge as unknown as {
+		connections: Set<unknown>;
+		send: (connection: unknown, message: SessionWsServerMessage) => void;
+	};
+	const connection = [...internals.connections][0];
+	if (!connection) throw new Error("bridge test socket did not create a connection");
+	return { connection, send: internals.send.bind(bridge) };
 }
 
 async function createHarness(
@@ -855,6 +929,83 @@ describe("SessionWsBridge", () => {
 		harness.bridge.broadcast({ type: "auth_changed" });
 
 		expect(socket.sent).toEqual([]);
+		expect(socket.closeCalls).toEqual([{ code: 1008, reason: "policy violation" }]);
+		expect(harness.connectionEvents).toContainEqual(expect.stringContaining("slow WebSocket client"));
+	});
+
+	it("rejects a single oversized non-snapshot outbound frame before sending it", async () => {
+		const harness = await createHarness([]);
+		const socket = new ControlledSendSocket();
+		harness.bridge.wss.emit("connection", socket as unknown as WebSocket, {} as http.IncomingMessage);
+		const { connection, send } = bridgeConnection(harness.bridge);
+
+		send(connection, {
+			type: "session_error",
+			sessionHandle: "ordinary-oversized-session",
+			operation: "subscribe",
+			error: "x".repeat(MAX_SESSION_WS_BUFFERED_BYTES),
+		});
+
+		expect(socket.sentBytes).toEqual([]);
+		expect(socket.closeCalls).toEqual([{ code: 1008, reason: "policy violation" }]);
+		expect(harness.connectionEvents).toContainEqual(expect.stringContaining("oversized WebSocket frame"));
+	});
+
+	it("queues one near-limit get_messages response behind an in-flight frame", async () => {
+		const harness = await createHarness([]);
+		const socket = new ControlledSendSocket();
+		socket.deferNextSend();
+		harness.bridge.wss.emit("connection", socket as unknown as WebSocket, {} as http.IncomingMessage);
+		const { connection, send } = bridgeConnection(harness.bridge);
+
+		send(connection, { type: "auth_changed" });
+		send(connection, snapshotResponse(MAX_JSONL_SNAPSHOT_LINE_BYTES - 4_096));
+
+		expect(socket.sentBytes).toHaveLength(1);
+		expect(socket.closeCalls).toEqual([]);
+		socket.releaseDeferredSend();
+		await eventually(() => socket.sentBytes.length === 2);
+		expect(socket.sentBytes[1]).toBeGreaterThan(MAX_JSONL_SNAPSHOT_LINE_BYTES - 4_096);
+		expect(socket.closeCalls).toEqual([]);
+		expect(socket.readyState).toBe(WebSocket.OPEN);
+	});
+
+	it("keeps additional backlog bounded while one oversized response is queued", async () => {
+		const harness = await createHarness([]);
+		const socket = new ControlledSendSocket();
+		socket.deferNextSend();
+		harness.bridge.wss.emit("connection", socket as unknown as WebSocket, {} as http.IncomingMessage);
+		const { connection, send } = bridgeConnection(harness.bridge);
+		const backlogFrame = (suffix: string): SessionWsServerMessage => ({
+			type: "session_error",
+			sessionHandle: "snapshot-session",
+			operation: "subscribe",
+			error: `${suffix}${"x".repeat(600_000)}`,
+		});
+
+		send(connection, { type: "auth_changed" });
+		send(connection, snapshotResponse(2_000_000));
+		expect(socket.closeCalls).toEqual([]);
+		send(connection, backlogFrame("first"));
+		expect(socket.closeCalls).toEqual([]);
+		send(connection, backlogFrame("second"));
+
+		expect(socket.closeCalls).toEqual([{ code: 1008, reason: "policy violation" }]);
+		expect(harness.connectionEvents).toContainEqual(expect.stringContaining("slow WebSocket client"));
+	});
+
+	it("rejects a second oversized snapshot while the first is still in flight", async () => {
+		const harness = await createHarness([]);
+		const socket = new ControlledSendSocket();
+		socket.deferNextSend();
+		harness.bridge.wss.emit("connection", socket as unknown as WebSocket, {} as http.IncomingMessage);
+		const { connection, send } = bridgeConnection(harness.bridge);
+
+		send(connection, snapshotResponse(2_000_000));
+		expect(socket.closeCalls).toEqual([]);
+		send(connection, snapshotResponse(2_000_000));
+
+		expect(socket.sentBytes).toHaveLength(1);
 		expect(socket.closeCalls).toEqual([{ code: 1008, reason: "policy violation" }]);
 		expect(harness.connectionEvents).toContainEqual(expect.stringContaining("slow WebSocket client"));
 	});

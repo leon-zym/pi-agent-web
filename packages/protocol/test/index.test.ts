@@ -8,6 +8,10 @@ import {
 	isSessionWsClientMessage,
 	isSessionWsServerMessage,
 	RpcError,
+	SESSION_IMAGE_MAX_BASE64_CHARS,
+	SESSION_TEXT_MAX_BYTES,
+	SESSION_WS_CLIENT_MAX_BYTES,
+	sessionWsClientMessageBytes,
 } from "../src/index.js";
 
 describe("protocol response helpers", () => {
@@ -109,6 +113,32 @@ describe("Session runtime browser frame guard", () => {
 				),
 			),
 		).toBe(false);
+	});
+
+	it("bounds text by UTF-8 bytes and the complete serialized browser frame", () => {
+		const command = (message: string, images?: Array<{ type: "image"; data: string; mimeType: string }>) => ({
+			type: "command",
+			sessionHandle: "session-native-b",
+			expectedGeneration: 2,
+			fencingToken: "lease-token",
+			command: { id: "utf8-request", type: "prompt", message, ...(images ? { images } : {}) },
+		});
+		const nearLimitCjk = "界".repeat(Math.floor(SESSION_TEXT_MAX_BYTES / 3));
+		const overLimitCjk = `${nearLimitCjk}界`;
+		const nearLimitImages = Array.from({ length: 3 }, () => ({
+			type: "image" as const,
+			data: "a".repeat(SESSION_IMAGE_MAX_BASE64_CHARS),
+			mimeType: "image/png",
+		}));
+
+		expect(isSessionWsClientMessage(command(nearLimitCjk))).toBe(true);
+		expect(isSessionWsClientMessage(command(overLimitCjk))).toBe(false);
+		expect(isSessionWsClientMessage(command(nearLimitCjk, nearLimitImages))).toBe(true);
+
+		const escapedText = "\\".repeat(SESSION_TEXT_MAX_BYTES);
+		const oversizedWireFrame = command(escapedText, nearLimitImages);
+		expect(sessionWsClientMessageBytes(oversizedWireFrame)).toBeGreaterThan(SESSION_WS_CLIENT_MAX_BYTES);
+		expect(isSessionWsClientMessage(oversizedWireFrame)).toBe(false);
 	});
 
 	it("rejects invalid cursors, unknown keys, and unfenced dialog responses", () => {

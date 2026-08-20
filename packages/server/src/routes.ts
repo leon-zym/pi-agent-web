@@ -7,6 +7,13 @@ import { pickWorkspaceDirectory } from "./directory-picker.js";
 import { createNativeRoutes } from "./native-routes.js";
 import type { NativeSessionCatalog } from "./native-session-catalog.js";
 import type { RecoverableSessionTrash } from "./recoverable-session-trash.js";
+import {
+	MAX_AUTH_API_KEY_LENGTH,
+	MAX_AUTH_PROVIDER_ID_LENGTH,
+	RequestInputError,
+	readBoundedJsonObject,
+	requiredBoundedStringField,
+} from "./request-input.js";
 import type { SessionLayoutResolver } from "./session-layout-resolver.js";
 import type { SessionSupervisor } from "./session-supervisor.js";
 import type { WorkspacePreferences } from "./workspace-preferences.js";
@@ -61,9 +68,9 @@ export function createApp(ctx: AppContext): Hono {
 	});
 
 	app.post("/api/v1/auth/keys", async (c) => {
-		const body = await readJsonObject(c.req.raw);
-		const provider = requiredTrimmedString(body, "provider");
-		const key = requiredTrimmedString(body, "key");
+		const body = await readBoundedJsonObject(c.req.raw);
+		const provider = requiredBoundedStringField(body, "provider", MAX_AUTH_PROVIDER_ID_LENGTH);
+		const key = requiredBoundedStringField(body, "key", MAX_AUTH_API_KEY_LENGTH);
 		try {
 			await saveApiKey(config.agentDir, provider, key);
 		} catch (error) {
@@ -88,6 +95,9 @@ export function createApp(ctx: AppContext): Hono {
 
 	app.notFound((c) => c.json({ error: "not found" }, 404));
 	app.onError((error, c) => {
+		if (error instanceof RequestInputError) {
+			return c.json({ error: { code: error.code, message: error.message } }, error.status);
+		}
 		if (error instanceof HTTPException) {
 			return c.json({ error: error.message }, error.status);
 		}
@@ -96,27 +106,6 @@ export function createApp(ctx: AppContext): Hono {
 
 	return app;
 }
-
-async function readJsonObject(request: Request): Promise<Record<string, unknown>> {
-	try {
-		const value = (await request.json()) as unknown;
-		if (typeof value !== "object" || value === null || Array.isArray(value)) {
-			throw new Error("request body must be a JSON object");
-		}
-		return value as Record<string, unknown>;
-	} catch (error) {
-		throw new HTTPException(400, { message: errorText(error) });
-	}
-}
-
-function requiredTrimmedString(body: Record<string, unknown>, field: string): string {
-	const value = body[field];
-	if (typeof value !== "string" || !value.trim()) {
-		throw new HTTPException(400, { message: `body.${field} is required` });
-	}
-	return value.trim();
-}
-
 function errorText(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }

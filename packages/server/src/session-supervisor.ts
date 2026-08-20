@@ -853,7 +853,7 @@ export class SessionSupervisor {
 			);
 			if (hot.length < this.opts.maxHotRuntimes) return;
 			const candidate = hot
-				.filter((runtime) => runtime.canEvict)
+				.filter((runtime) => this.isEvictable(runtime))
 				.sort((a, b) => a.lastActivityAt - b.lastActivityAt)[0];
 			if (!candidate) throw new RpcError("activate", "session_runtime_capacity");
 			await candidate.stop();
@@ -867,12 +867,16 @@ export class SessionSupervisor {
 			if (this.closed) return;
 			const cutoff = Date.now() - this.opts.idleTtlMs;
 			const candidates = [...new Set(this.runtimes.values())].filter(
-				(runtime) => runtime.canEvict && runtime.lastActivityAt <= cutoff,
+				(runtime) => this.isEvictable(runtime) && runtime.lastActivityAt <= cutoff,
 			);
 			for (const runtime of candidates) {
-				if (runtime.canEvict && runtime.lastActivityAt <= cutoff) await runtime.stop();
+				if (this.isEvictable(runtime) && runtime.lastActivityAt <= cutoff) await runtime.stop();
 			}
 		});
+	}
+
+	private isEvictable(runtime: SessionRuntime): boolean {
+		return runtime.canEvict && !this.leases.has(runtime.sessionHandle);
 	}
 
 	private async withPoolLock<T>(operation: () => Promise<T>): Promise<T> {

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { expectData } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MAX_JSONL_LINE_BYTES } from "../src/jsonl.js";
 import { PiProcess } from "../src/pi-process.js";
 
 const fakePiPath = path.join(import.meta.dirname, "fixtures", "fake-pi.mjs");
@@ -368,6 +369,64 @@ describe("PiProcess response correlation", () => {
 		};
 		expect(data.messages[0]?.content[0]?.text).toHaveLength(snapshotBytes);
 		expect(proc.running).toBe(true);
+	});
+
+	it.each([
+		{
+			name: "an interleaved event",
+			line: () => JSON.stringify({ type: "agent_start", padding: "x".repeat(MAX_JSONL_LINE_BYTES) }),
+		},
+		{
+			name: "an unrelated response",
+			line: () =>
+				JSON.stringify({
+					type: "response",
+					id: "ordinary",
+					command: "get_state",
+					success: true,
+					data: { padding: "x".repeat(MAX_JSONL_LINE_BYTES) },
+				}),
+		},
+		{
+			name: "a dirty line",
+			line: () => "x".repeat(MAX_JSONL_LINE_BYTES + 1),
+		},
+	])("rejects $name above the ordinary limit while get_messages is pending", ({ line }) => {
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+		});
+		const internals = proc as unknown as {
+			pending: Map<
+				string,
+				{
+					command: string;
+					resolve: (value: unknown) => void;
+					reject: (error: Error) => void;
+					timer: NodeJS.Timeout;
+				}
+			>;
+			handleLine: (line: string) => void;
+		};
+		const timers = [setTimeout(() => {}, 60_000), setTimeout(() => {}, 60_000)];
+		internals.pending.set("snapshot", {
+			command: "get_messages",
+			resolve: vi.fn(),
+			reject: vi.fn(),
+			timer: timers[0]!,
+		});
+		internals.pending.set("ordinary", {
+			command: "get_state",
+			resolve: vi.fn(),
+			reject: vi.fn(),
+			timer: timers[1]!,
+		});
+
+		try {
+			expect(() => internals.handleLine(line())).toThrow("oversized non-snapshot JSONL line");
+		} finally {
+			for (const timer of timers) clearTimeout(timer);
+		}
 	});
 
 	it("terminates a get_messages response that exceeds its explicit snapshot budget", async () => {
