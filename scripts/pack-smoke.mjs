@@ -27,7 +27,10 @@ function packageManifest(tarball) {
 function waitForOutput(child, pattern, timeoutMs = 10_000) {
 	return new Promise((resolve, reject) => {
 		let output = "";
-		const timer = setTimeout(() => reject(new Error(`CLI did not print ${String(pattern)}:\n${output}`)), timeoutMs);
+		const timer = setTimeout(
+			() => reject(new Error(`CLI did not print ${String(pattern)}:\n${output}`)),
+			timeoutMs,
+		);
 		const onData = (chunk) => {
 			output += chunk.toString();
 			const match = output.match(pattern);
@@ -68,16 +71,31 @@ try {
 	if (tarballs.length !== 4) throw new Error(`Expected four tarballs, found ${String(tarballs.length)}`);
 	for (const tarball of tarballs) {
 		const files = run("tar", ["-tzf", tarball]);
-		if (!files.includes("package/dist/")) throw new Error(`Missing dist directory in ${path.basename(tarball)}`);
-		if (files.includes("package/src/")) throw new Error(`Source directory leaked into ${path.basename(tarball)}`);
-		if (JSON.stringify(packageManifest(tarball)).includes("workspace:*")) {
+		if (!files.includes("package/dist/"))
+			throw new Error(`Missing dist directory in ${path.basename(tarball)}`);
+		if (!files.includes("package/LICENSE")) throw new Error(`Missing LICENSE in ${path.basename(tarball)}`);
+		if (files.includes("package/src/"))
+			throw new Error(`Source directory leaked into ${path.basename(tarball)}`);
+		const manifest = packageManifest(tarball);
+		if (
+			manifest.license !== "MIT" ||
+			manifest.repository?.url !== "git+https://github.com/leon-zym/pi-agent-web.git"
+		) {
+			throw new Error(`Missing publish metadata in ${path.basename(tarball)}`);
+		}
+		if (JSON.stringify(manifest).includes("workspace:*")) {
 			throw new Error(`Workspace dependency leaked into ${path.basename(tarball)}`);
 		}
 	}
 	fs.writeFileSync(path.join(installDir, "package.json"), '{"name":"piweb-pack-smoke","private":true}\n');
 	run("npm", ["install", "--ignore-scripts", ...tarballs], installDir);
 
-	const bin = path.join(installDir, "node_modules", ".bin", process.platform === "win32" ? "pi-web.cmd" : "pi-web");
+	const bin = path.join(
+		installDir,
+		"node_modules",
+		".bin",
+		process.platform === "win32" ? "pi-web.cmd" : "pi-web",
+	);
 	run(bin, ["--help"], installDir);
 	run("npx", ["--prefix", installDir, "--no-install", "pi-web", "--help"], installDir);
 

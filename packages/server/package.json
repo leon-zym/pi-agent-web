@@ -2,6 +2,12 @@
 	"name": "@pi-agent-web/server",
 	"version": "0.1.0",
 	"description": "Supervisor gateway for Pi Agent Web with REST API and WebSocket relay.",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/leon-zym/pi-agent-web.git",
+		"directory": "packages/server"
+	},
 	"engines": {
 		"node": ">=22"
 	},
@@ -13,13 +19,14 @@
 		}
 	},
 	"files": [
-		"dist"
+		"dist",
+		"LICENSE"
 	],
 	"scripts": {
 		"dev": "tsx watch src/main.ts",
 		"start": "node dist/main.js",
 		"prepack": "pnpm build",
-		"build": "tsc -p tsconfig.build.json",
+		"build": "node ../../scripts/clean-dist.mjs && tsc -p tsconfig.build.json",
 		"typecheck": "tsc -p tsconfig.json --noEmit",
 		"test": "vitest run",
 		"test:watch": "vitest",
@@ -31,7 +38,6 @@
 		"@earendil-works/pi-coding-agent": "0.84.2",
 		"@pi-agent-web/protocol": "workspace:*",
 		"@hono/node-server": "^1.14.0",
-		"@hono/node-ws": "^1.1.0",
 		"hono": "^4.7.0",
 		"proper-lockfile": "^4.1.2",
 		"ws": "^8.18.0"

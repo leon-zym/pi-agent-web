@@ -1,20 +1,14 @@
-import {
-	Check,
-	ChevronRight,
-	CircleAlert,
-	ExternalLink,
-	Loader2,
-	SkipForward,
-	Wrench,
-	X,
-} from "lucide-react";
-import { useState } from "react";
+import { Check, ChevronRight, CircleAlert, ExternalLink, Loader2, SkipForward, Wrench } from "lucide-react";
+import { useMemo, useState } from "react";
+import { stripAnsi } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import { useProjectionStore } from "../../stores/projection";
 import { useViewStore } from "../../stores/view";
 import type { ContentBlock, UiToolResult } from "../../types/view-models";
-import { getToolPresenter } from "./tool-presenters";
+import { formatToolArguments } from "./code-display";
+import { HighlightedCode } from "./HighlightedCode";
+import { getToolPresenter, toolOutputText } from "./tool-presenters";
 
 type ToolCallBlock = Extract<ContentBlock, { type: "tool_call" }>;
 
@@ -29,38 +23,60 @@ const STATUS_ICON: Record<
 	skipped: { icon: SkipForward, className: "text-ink-3", label: "status.skipped" },
 };
 
-function flattenArgs(args: unknown): string {
-	if (args === undefined || args === null) return "";
-	if (typeof args === "string") return args;
-	try {
-		return JSON.stringify(args, null, 2);
-	} catch {
-		return String(args);
-	}
+const MAX_TOOL_SUMMARY_CHARACTERS = 320;
+
+function boundedToolSummary(summary: string): string {
+	const sample = summary.slice(0, MAX_TOOL_SUMMARY_CHARACTERS * 4);
+	const clean = stripAnsi(sample);
+	const truncated = summary.length > sample.length || clean.length > MAX_TOOL_SUMMARY_CHARACTERS;
+	return `${clean.slice(0, MAX_TOOL_SUMMARY_CHARACTERS)}${truncated ? "…" : ""}`;
 }
 
-function flattenResult(result: unknown): string {
-	if (result === undefined || result === null) return "";
-	if (typeof result === "string") return result;
-	if (typeof result === "object") {
-		const record = result as Record<string, unknown>;
-		if (typeof record.content === "string") return record.content;
-		if (Array.isArray(record.content)) {
-			return record.content
-				.filter(
-					(block) =>
-						typeof block === "object" && block !== null && (block as { type?: string }).type === "text",
-				)
-				.map((block) => (block as { text: string }).text)
-				.join("\n");
-		}
-		try {
-			return JSON.stringify(result, null, 2);
-		} catch {
-			return String(result);
-		}
-	}
-	return String(result);
+function GenericToolBody({ context }: { context: ReturnType<typeof toolContext> }) {
+	const { block, results } = context;
+	const isError = block.status === "error" || results.some((result) => result.isError);
+	const args = useMemo(() => formatToolArguments(block.args, block.argsText), [block.args, block.argsText]);
+	const output = useMemo(() => toolOutputText({ block, results }), [block, results]);
+	const displayOutput = output || (isError ? tt("tool.executionError") : "");
+
+	return (
+		<>
+			<HighlightedCode code={args.code} language={args.language} className="max-h-[260px]" />
+			{block.toolName !== "bash" && displayOutput && (
+				<div
+					className={cn(
+						"scroll-slim max-h-[260px] overflow-y-auto rounded-sm bg-surface-2 p-2.5 font-mono text-xs leading-[18px] whitespace-pre-wrap break-all",
+						isError ? "text-danger" : "text-ink-2",
+					)}
+				>
+					{displayOutput}
+				</div>
+			)}
+		</>
+	);
+}
+
+function toolContext(block: ToolCallBlock, results: UiToolResult[]) {
+	return { block, results };
+}
+
+export function ExpandedToolCallBody({ block, results }: { block: ToolCallBlock; results: UiToolResult[] }) {
+	const context = toolContext(block, results);
+	const presenter = getToolPresenter(block.toolName);
+	const presenterBody = presenter.renderBody?.(context);
+	const fullOutputPath =
+		typeof block.result === "object" && block.result !== null
+			? ((block.result as Record<string, unknown>).fullOutputPath as string | undefined)
+			: undefined;
+
+	return (
+		<div className="ml-[22px] flex flex-col gap-2 border-l border-border pl-3">
+			{presenterBody ?? <GenericToolBody context={context} />}
+			{block.toolName === "bash" && fullOutputPath && (
+				<span className="text-[11px] text-ink-3">{tt("tool.fullLog", { path: fullOutputPath })}</span>
+			)}
+		</div>
+	);
 }
 
 /**
@@ -71,20 +87,14 @@ function flattenResult(result: unknown): string {
 export function ToolCallRow({ block, results }: { block: ToolCallBlock; results: UiToolResult[] }) {
 	const [expanded, setExpanded] = useState(false);
 	const presenter = getToolPresenter(block.toolName);
-	const summary = presenter.summarize({ block, results });
+	const presenterContext = toolContext(block, results);
+	const summary = boundedToolSummary(presenter.summarize(presenterContext));
 	const effectiveStatus = results.some((result) => result.isError) ? "error" : block.status;
 	const status = STATUS_ICON[effectiveStatus];
 	const StatusIcon = status.icon;
-	const isBash = block.toolName === "bash";
-
-	const output = block.partialOutput || flattenResult(block.result) || results[0]?.content || "";
-	const fullOutputPath =
-		typeof block.result === "object" && block.result !== null
-			? ((block.result as Record<string, unknown>).fullOutputPath as string | undefined)
-			: undefined;
 
 	return (
-		<div className="flex flex-col gap-1">
+		<div className="flex min-w-0 max-w-full flex-col gap-1">
 			<div className="group flex items-center gap-1.5 rounded-sm py-0.5 hover:bg-hover">
 				<button
 					type="button"
@@ -121,31 +131,7 @@ export function ToolCallRow({ block, results }: { block: ToolCallBlock; results:
 				)}
 			</div>
 
-			{expanded && (
-				<div className="ml-[22px] flex flex-col gap-2 border-l border-border pl-3">
-					<div className="max-h-[224px] overflow-y-auto scroll-slim rounded-sm bg-surface-2 p-2.5 font-mono text-xs leading-[18px] whitespace-pre-wrap break-all text-ink-2">
-						{isBash ? output || tt("common.noOutput") : flattenArgs(block.args)}
-					</div>
-					{!isBash && output && (
-						<div className="max-h-[260px] overflow-y-auto scroll-slim rounded-sm bg-surface-2 p-2.5 font-mono text-xs leading-[18px] whitespace-pre-wrap break-all text-ink-2">
-							{output}
-						</div>
-					)}
-					{isBash && fullOutputPath && (
-						<span className="text-[11px] text-ink-3">{tt("tool.fullLog", { path: fullOutputPath })}</span>
-					)}
-					{results.map((result) =>
-						result.isError ? (
-							<div key={result.toolCallId} className="flex items-start gap-1.5 text-[13px] text-danger">
-								<X className="mt-0.5 size-3.5 shrink-0" />
-								<span className="whitespace-pre-wrap break-words">
-									{result.content || tt("tool.executionError")}
-								</span>
-							</div>
-						) : null,
-					)}
-				</div>
-			)}
+			{expanded && <ExpandedToolCallBody block={block} results={results} />}
 		</div>
 	);
 }

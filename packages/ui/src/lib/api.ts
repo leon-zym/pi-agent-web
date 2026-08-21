@@ -1,47 +1,116 @@
-import type { AuthStatusEntry, SessionSummary, WorkspaceSummary } from "@pi-agent-web/protocol";
+import type {
+	AuthStatusEntry,
+	NativeSessionCreateDto,
+	NativeSessionListDto,
+	NativeWorkspaceDto,
+	SessionRuntimeDto,
+} from "@pi-agent-web/protocol";
 
-/** Minimal REST client for the gateway. */
+/** Structured REST failure returned by the local gateway. */
+export class GatewayApiError extends Error {
+	constructor(
+		readonly status: number,
+		readonly code: string,
+		message: string,
+	) {
+		super(message);
+		this.name = "GatewayApiError";
+	}
+}
 
+interface GatewayErrorBody {
+	error?: string | { code?: string; message?: string };
+}
+
+/** Minimal same-origin REST client for the gateway. */
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
 	const headers = new Headers(init?.headers);
-	if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+	if (init?.body !== undefined && !headers.has("Content-Type")) {
+		headers.set("Content-Type", "application/json");
+	}
 	const response = await fetch(path, {
 		...init,
 		credentials: "include",
 		headers,
 	});
 	if (!response.ok) {
-		let message = `HTTP ${response.status}`;
+		let code = `http_${String(response.status)}`;
+		let message = `HTTP ${String(response.status)}`;
 		try {
-			const body = (await response.json()) as { error?: string };
-			if (body?.error) message = body.error;
+			const body = (await response.json()) as GatewayErrorBody;
+			if (typeof body.error === "string") message = body.error;
+			else if (body.error) {
+				code = body.error.code ?? code;
+				message = body.error.message ?? message;
+			}
 		} catch {
-			// keep the status message
+			// Keep the stable status-derived fallback.
 		}
-		throw new Error(message);
+		throw new GatewayApiError(response.status, code, message);
 	}
 	return (await response.json()) as T;
 }
 
+function workspacePath(workspaceHandle: string, suffix = ""): string {
+	return `/api/v1/workspaces/${encodeURIComponent(workspaceHandle)}${suffix}`;
+}
+
+function sessionPath(workspaceHandle: string, sessionHandle: string, suffix = ""): string {
+	return workspacePath(workspaceHandle, `/sessions/${encodeURIComponent(sessionHandle)}${suffix}`);
+}
+
 export const api = {
 	bootstrap: () => request<{ ok: true }>("/api/v1/bootstrap"),
-	listWorkspaces: () => request<WorkspaceSummary[]>("/api/v1/workspaces"),
+	listWorkspaces: () => request<NativeWorkspaceDto[]>("/api/v1/workspaces"),
 	pickWorkspaceDirectory: () =>
 		request<{ path: string | null }>("/api/v1/workspaces/pick-directory", { method: "POST" }),
 	addWorkspace: (path: string) =>
-		request<WorkspaceSummary>("/api/v1/workspaces", { method: "POST", body: JSON.stringify({ path }) }),
-	removeWorkspace: (workspaceId: string) =>
-		request<{ ok: boolean }>(`/api/v1/workspaces/${workspaceId}`, { method: "DELETE" }),
+		request<NativeWorkspaceDto>("/api/v1/workspaces", {
+			method: "POST",
+			body: JSON.stringify({ path }),
+		}),
+	removeWorkspace: (workspaceHandle: string) =>
+		request<{ ok: boolean; nativeHistoryRetained: boolean }>(workspacePath(workspaceHandle), {
+			method: "DELETE",
+		}),
+	activateWorkspace: (workspaceHandle: string) =>
+		request<NativeWorkspaceDto>(workspacePath(workspaceHandle, "/activate"), { method: "POST" }),
 
-	listSessions: (workspaceId: string) =>
-		request<{ sessions: SessionSummary[]; sessionDir: string }>(`/api/v1/workspaces/${workspaceId}/sessions`),
-	deleteSession: (workspaceId: string, sessionPath: string) =>
-		request<{ ok: boolean }>(
-			`/api/v1/workspaces/${workspaceId}/sessions/${encodeURIComponent(sessionPath)}`,
-			{
-				method: "DELETE",
-			},
+	listSessions: (workspaceHandle: string, options: { force?: boolean } = {}) =>
+		request<NativeSessionListDto>(
+			workspacePath(workspaceHandle, `/sessions${options.force ? "?refresh=1" : ""}`),
 		),
+	createSession: (workspaceHandle: string) =>
+		request<NativeSessionCreateDto>(workspacePath(workspaceHandle, "/sessions"), {
+			method: "POST",
+			body: "{}",
+		}),
+	deleteSession: (
+		workspaceHandle: string,
+		sessionHandle: string,
+		management: { generation: number; fencingToken: string },
+	) =>
+		request<{ ok: boolean; recoverable: boolean }>(sessionPath(workspaceHandle, sessionHandle), {
+			method: "DELETE",
+			headers: {
+				"X-Pi-Session-Generation": String(management.generation),
+				"X-Pi-Fencing-Token": management.fencingToken,
+			},
+		}),
+	abandonTransientSession: (
+		workspaceHandle: string,
+		sessionHandle: string,
+		management: { generation: number; fencingToken: string },
+	) =>
+		request<{ ok: boolean; abandoned: boolean }>(sessionPath(workspaceHandle, sessionHandle, "/transient"), {
+			method: "DELETE",
+			headers: {
+				"X-Pi-Session-Generation": String(management.generation),
+				"X-Pi-Fencing-Token": management.fencingToken,
+			},
+		}),
+	getSessionRuntime: (workspaceHandle: string, sessionHandle: string) =>
+		request<SessionRuntimeDto>(sessionPath(workspaceHandle, sessionHandle, "/process")),
 
 	authStatus: () => request<{ providers: AuthStatusEntry[] }>("/api/v1/auth/status"),
 	saveApiKey: (provider: string, key: string) =>
@@ -49,7 +118,4 @@ export const api = {
 			method: "POST",
 			body: JSON.stringify({ provider, key }),
 		}),
-
-	restartProcess: (workspaceId: string) =>
-		request<{ ok: boolean }>(`/api/v1/workspaces/${workspaceId}/process/restart`, { method: "POST" }),
 };

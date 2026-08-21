@@ -1,4 +1,4 @@
-import type { SessionSummary, WorkspaceSummary } from "@pi-agent-web/protocol";
+import type { NativeSessionDto, NativeWorkspaceDto, SessionRuntimeStateDto } from "@pi-agent-web/protocol";
 import {
 	Bot,
 	ChevronRight,
@@ -9,14 +9,13 @@ import {
 	PanelLeftOpen,
 	Pencil,
 	Plus,
-	RotateCw,
 	Search,
 	Settings,
 	Sun,
 	SunMoon,
 	Trash2,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { type Ref, useMemo, useState } from "react";
 import { toast } from "sonner";
 import {
 	AlertDialog,
@@ -47,59 +46,99 @@ import {
 import { Input } from "../../components/ui/input";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
 import { api } from "../../lib/api";
-import { formatRelativeTime } from "../../lib/format";
+import { displayError, displayLabel, formatRelativeTime } from "../../lib/format";
 import { tt } from "../../lib/i18n";
+import { type SessionDeleteBlockReason, sessionDeleteCapability } from "../../lib/session-capabilities";
 import { deleteSession, newSession, openSession, renameSession } from "../../lib/session-controller";
 import { useTheme } from "../../lib/use-theme";
 import { cn } from "../../lib/utils";
+import { useComposerStore } from "../../stores/composer";
 import { useProjectionStore } from "../../stores/projection";
-import { useSessionControlStore } from "../../stores/session-control";
-import { useSessionDirectoryStore } from "../../stores/session-directory";
-import { useTransportStore } from "../../stores/transport";
+import { selectCurrentWorkspaceSessions, useSessionDirectoryStore } from "../../stores/session-directory";
+import { useSessionTransportStore } from "../../stores/session-transport";
 
-type SessionStatus = "idle" | "running" | "error";
+type SessionStatus = SessionRuntimeStateDto | "error";
 
-function sessionTitle(session: SessionSummary): string {
-	if (session.name) return session.name;
-	if (session.firstMessage) return session.firstMessage.slice(0, 40);
+function deleteBlockReason(reason: SessionDeleteBlockReason): string {
+	return tt(`sidebar.deleteBlocked.${reason}`);
+}
+
+function sessionTitle(session: NativeSessionDto): string {
+	if (session.name) return displayLabel(session.name);
+	if (session.firstMessage) return displayLabel(session.firstMessage).slice(0, 40);
 	return tt("sidebar.emptySession");
 }
 
-function sessionStatus(session: SessionSummary, isCurrent: boolean): SessionStatus {
-	if (!isCurrent) return "idle";
-	const projectionState = useProjectionStore.getState();
-	const projection = projectionState.projections[session.id];
-	if (projectionState.currentSessionId === session.id && projection?.activeTurnId != null) return "running";
-	const last = projection?.turns[projection.turns.length - 1];
-	if (last?.status === "error") return "error";
-	return "idle";
+function runtimeLabel(status: SessionStatus): string {
+	switch (status) {
+		case "starting":
+			return tt("status.starting");
+		case "running":
+			return tt("status.running");
+		case "waiting_ui":
+			return tt("status.waitingUi");
+		case "crashed":
+		case "error":
+			return tt("status.crashed");
+		case "dormant":
+			return tt("status.dormant");
+		default:
+			return tt("status.idle");
+	}
 }
 
 function StatusDot({ status }: { status: SessionStatus }) {
-	if (status === "running") return <span className="size-2 shrink-0 rounded-full bg-primary pulse-dot" />;
-	if (status === "error") return <span className="size-2 shrink-0 rounded-full bg-danger" />;
-	return <span className="size-2 shrink-0 rounded-full bg-ink-3/30" />;
+	return (
+		<span
+			title={runtimeLabel(status)}
+			className={cn(
+				"size-2 shrink-0 rounded-full",
+				status === "running" && "bg-primary pulse-dot",
+				status === "starting" && "bg-warning pulse-dot",
+				status === "waiting_ui" && "bg-warning",
+				(status === "crashed" || status === "error") && "bg-danger",
+				status === "idle" && "bg-success",
+				status === "dormant" && "bg-ink-3/30",
+			)}
+		/>
+	);
 }
 
 interface SessionRowProps {
-	session: SessionSummary;
-	workspace: WorkspaceSummary;
+	session: NativeSessionDto;
 	current: boolean;
+	comfortable?: boolean;
+	onSelect?: () => void;
 }
 
-function SessionRow({ session, current }: SessionRowProps) {
+function SessionRow({ session, current, comfortable = false, onSelect }: SessionRowProps) {
 	const [renameOpen, setRenameOpen] = useState(false);
 	const [deleteOpen, setDeleteOpen] = useState(false);
-	const [name, setName] = useState(session.name ?? "");
-	const currentWorkspaceId = useSessionDirectoryStore((s) => s.currentWorkspaceId);
-	const canControl = useSessionControlStore((s) => s.canControl(currentWorkspaceId));
-
-	const status = sessionStatus(session, current);
-	const empty = session.messageCount === 0 && !session.name;
+	const [name, setName] = useState(displayLabel(session.name ?? ""));
+	const channel = useSessionTransportStore((state) => state.sessions[session.sessionHandle]);
+	const projection = useProjectionStore((state) => state.projections[session.sessionHandle]);
+	const unread = useSessionDirectoryStore((state) => Boolean(state.unreadBySession[session.sessionHandle]));
+	const queuedCount = useComposerStore((state) => {
+		const queue = state.bySession[session.sessionHandle]?.queue;
+		return (queue?.steering.length ?? 0) + (queue?.followUp.length ?? 0);
+	});
+	const runtime = channel?.runtime ?? session.runtime;
+	const exactLease = Boolean(
+		channel?.subscribed &&
+			channel.generation !== null &&
+			channel.lease.isController &&
+			channel.lease.fencingToken,
+	);
+	const status: SessionStatus =
+		projection?.turns.at(-1)?.status === "error" ? "error" : (runtime?.state ?? "dormant");
+	const canRename = current && exactLease;
+	const deleteCapability = sessionDeleteCapability(session, channel);
+	const empty = session.messageCount === 0 && !session.name && !session.firstMessage;
 	const title = sessionTitle(session);
+	const modifiedAt = session.modifiedAt ? Date.parse(session.modifiedAt) : Number.NaN;
 
 	const startRename = () => {
-		setName(session.name ?? "");
+		setName(displayLabel(session.name ?? ""));
 		setRenameOpen(true);
 	};
 
@@ -111,40 +150,66 @@ function SessionRow({ session, current }: SessionRowProps) {
 
 	return (
 		<li
-			role="treeitem"
-			aria-selected={current}
-			tabIndex={-1}
-			className="group relative flex h-8 items-center gap-2 rounded-sm pr-1 hover:bg-hover"
+			data-session-row=""
+			data-current={current ? "true" : "false"}
+			data-runtime-state={status}
+			data-unread={unread ? "true" : "false"}
+			data-queued-count={queuedCount}
+			className={cn(
+				"group relative flex items-center gap-2 rounded-sm pr-1 hover:bg-hover",
+				comfortable ? "h-10" : "h-8 [@media(hover:none)]:h-10",
+			)}
 		>
 			{current && <span className="absolute top-1.5 bottom-1.5 left-0 w-0.5 rounded-full bg-primary" />}
 			<button
 				type="button"
-				onClick={() => void openSession(session)}
-				disabled={!current && !canControl}
+				aria-current={current ? "page" : undefined}
+				onClick={() => void openSession(session).then(() => onSelect?.())}
 				className={cn(
 					"flex h-full min-w-0 flex-1 items-center gap-2 rounded-sm pl-2.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-primary/40",
 					current ? "font-medium text-ink" : "text-ink-2",
 				)}
 			>
 				<StatusDot status={status} />
+				<span className="sr-only">{runtimeLabel(status)}</span>
 				<span className={cn("min-w-0 flex-1 truncate text-[13px]", empty && "text-ink-3")}>{title}</span>
-				{!empty && (
+				{queuedCount > 0 && (
+					<span className="shrink-0 rounded-full bg-warning/12 px-1.5 py-0.5 text-[10px] font-medium text-warning">
+						{tt("sidebar.queued", { count: queuedCount })}
+					</span>
+				)}
+				{unread && !current && (
+					<span className="shrink-0 rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary">
+						{tt("sidebar.unread")}
+					</span>
+				)}
+				{!empty && Number.isFinite(modifiedAt) && (
 					<span className="shrink-0 font-mono text-[11px] text-ink-3 tabular-nums">
-						{formatRelativeTime(session.modified)}
+						{formatRelativeTime(modifiedAt)}
 					</span>
 				)}
 			</button>
 			{!empty && (
-				<div className="flex shrink-0 items-center opacity-0 transition-opacity group-hover:opacity-100 [@media(hover:hover)]:group-hover:opacity-100">
+				<div
+					className={cn(
+						"flex shrink-0 items-center transition-opacity",
+						comfortable
+							? "opacity-100"
+							: "opacity-0 group-focus-within:opacity-100 [@media(hover:hover)]:group-hover:opacity-100 [@media(hover:none)]:opacity-100",
+					)}
+				>
 					{current && (
 						<Tooltip>
 							<TooltipTrigger asChild>
 								<button
 									type="button"
 									aria-label={tt("sidebar.renameSession")}
-									className="flex size-6 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
+									className={cn(
+										"flex items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink",
+										comfortable ? "size-10" : "size-6 [@media(hover:none)]:size-10",
+									)}
 									onClick={startRename}
-									disabled={!canControl}
+									disabled={!canRename}
 								>
 									<Pencil className="size-3.5" />
 								</button>
@@ -157,14 +222,19 @@ function SessionRow({ session, current }: SessionRowProps) {
 							<button
 								type="button"
 								aria-label={tt("sidebar.deleteSession")}
-								className="flex size-6 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-danger"
+								className={cn(
+									"flex items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-danger",
+									comfortable ? "size-10" : "size-6 [@media(hover:none)]:size-10",
+								)}
 								onClick={() => setDeleteOpen(true)}
-								disabled={!canControl}
+								disabled={!deleteCapability.allowed}
 							>
 								<Trash2 className="size-3.5" />
 							</button>
 						</TooltipTrigger>
-						<TooltipContent>{tt("common.delete")}</TooltipContent>
+						<TooltipContent>
+							{deleteCapability.allowed ? tt("common.delete") : deleteBlockReason(deleteCapability.reason)}
+						</TooltipContent>
 					</Tooltip>
 				</div>
 			)}
@@ -178,7 +248,9 @@ function SessionRow({ session, current }: SessionRowProps) {
 					<Input
 						autoFocus
 						value={name}
-						placeholder={session.firstMessage ?? tt("sidebar.sessionNamePlaceholder")}
+						placeholder={
+							session.firstMessage ? displayLabel(session.firstMessage) : tt("sidebar.sessionNamePlaceholder")
+						}
 						onChange={(event) => setName(event.target.value)}
 						onKeyDown={(event) => {
 							if (event.key === "Enter") commitRename();
@@ -188,7 +260,7 @@ function SessionRow({ session, current }: SessionRowProps) {
 						<Button variant="outline" onClick={() => setRenameOpen(false)}>
 							{tt("common.cancel")}
 						</Button>
-						<Button onClick={commitRename} disabled={!canControl || !name.trim()}>
+						<Button onClick={commitRename} disabled={!canRename || !name.trim()}>
 							{tt("common.save")}
 						</Button>
 					</DialogFooter>
@@ -203,7 +275,11 @@ function SessionRow({ session, current }: SessionRowProps) {
 					</AlertDialogHeader>
 					<AlertDialogFooter>
 						<AlertDialogCancel>{tt("common.cancel")}</AlertDialogCancel>
-						<AlertDialogAction variant="destructive" onClick={() => void deleteSession(session)}>
+						<AlertDialogAction
+							variant="destructive"
+							disabled={!deleteCapability.allowed}
+							onClick={() => void deleteSession(session)}
+						>
 							{tt("common.delete")}
 						</AlertDialogAction>
 					</AlertDialogFooter>
@@ -214,26 +290,68 @@ function SessionRow({ session, current }: SessionRowProps) {
 }
 
 interface WorkspaceGroupProps {
-	workspace: WorkspaceSummary;
-	sessions: SessionSummary[];
+	workspace: NativeWorkspaceDto;
+	sessions: NativeSessionDto[];
 	defaultExpanded: boolean;
+	comfortable?: boolean;
+	onSessionSelect?: () => void;
 }
 
-function WorkspaceGroup({ workspace, sessions, defaultExpanded }: WorkspaceGroupProps) {
+function WorkspaceGroup({
+	workspace,
+	sessions,
+	defaultExpanded,
+	comfortable = false,
+	onSessionSelect,
+}: WorkspaceGroupProps) {
 	const [expanded, setExpanded] = useState(defaultExpanded);
 	const [removeOpen, setRemoveOpen] = useState(false);
-	const currentWorkspaceId = useSessionDirectoryStore((s) => s.currentWorkspaceId);
+	const currentWorkspaceHandle = useSessionDirectoryStore((s) => s.currentWorkspaceHandle);
 	const currentSession = useSessionDirectoryStore((s) => s.currentSession);
-	const canControl = useSessionControlStore((s) => s.canControl(currentWorkspaceId));
 	const visible = sessions.slice(0, expanded ? undefined : 5);
 	const more = sessions.length - visible.length;
+	const selected = currentWorkspaceHandle === workspace.workspaceHandle;
+
+	const openWorkspace = async () => {
+		await useSessionDirectoryStore.getState().selectWorkspace(workspace.workspaceHandle);
+	};
+	const toggleExpanded = () => {
+		const next = !expanded;
+		setExpanded(next);
+		if (next) void useSessionDirectoryStore.getState().reloadSessions(workspace.workspaceHandle);
+	};
+
+	const createSession = async () => {
+		if (!workspace.available) return;
+		if (useSessionDirectoryStore.getState().currentWorkspaceHandle !== workspace.workspaceHandle) {
+			await useSessionDirectoryStore.getState().selectWorkspace(workspace.workspaceHandle);
+		}
+		if (useSessionDirectoryStore.getState().currentWorkspaceHandle !== workspace.workspaceHandle) return;
+		const previousSessionHandle = useSessionDirectoryStore.getState().currentSession?.sessionHandle;
+		await newSession();
+		if (useSessionDirectoryStore.getState().currentSession?.sessionHandle !== previousSessionHandle) {
+			onSessionSelect?.();
+		}
+	};
 
 	return (
 		<div className="flex flex-col">
-			<div className="group flex h-8 items-center gap-1 rounded-sm pr-1 hover:bg-hover">
+			<div
+				className={cn(
+					"group flex items-center gap-1 rounded-sm pr-1 hover:bg-hover",
+					comfortable ? "h-10" : "h-8 [@media(hover:none)]:h-10",
+				)}
+				title={
+					workspace.available
+						? workspace.path
+							? displayLabel(workspace.path)
+							: undefined
+						: displayLabel(workspace.unavailableReason ?? "")
+				}
+			>
 				<button
 					type="button"
-					onClick={() => setExpanded(!expanded)}
+					onClick={toggleExpanded}
 					aria-expanded={expanded}
 					className="flex h-full min-w-0 flex-1 items-center gap-1.5 rounded-sm pl-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
 				>
@@ -246,30 +364,42 @@ function WorkspaceGroup({ workspace, sessions, defaultExpanded }: WorkspaceGroup
 					<Folder
 						className={cn(
 							"size-3.5 shrink-0",
-							currentWorkspaceId === workspace.id ? "text-primary" : "text-ink-3",
+							selected ? "text-primary" : "text-ink-3",
+							!workspace.available && "opacity-50",
 						)}
 					/>
 					<span
 						className={cn(
 							"min-w-0 flex-1 truncate text-[13px]",
-							currentWorkspaceId === workspace.id ? "font-medium text-ink" : "text-ink-2",
+							selected ? "font-medium text-ink" : "text-ink-2",
+							!workspace.available && "text-ink-3",
 						)}
 					>
-						{workspace.displayName}
+						{displayLabel(workspace.displayName)}
 					</span>
 					<span className="shrink-0 font-mono text-[11px] text-ink-3 tabular-nums">
 						{workspace.sessionCount}
 					</span>
 				</button>
-				<div className="flex shrink-0 items-center opacity-0 transition-opacity group-hover:opacity-100 [@media(hover:hover)]:group-hover:opacity-100">
+				<div
+					className={cn(
+						"flex shrink-0 items-center transition-opacity",
+						comfortable
+							? "opacity-100"
+							: "opacity-0 group-focus-within:opacity-100 [@media(hover:hover)]:group-hover:opacity-100 [@media(hover:none)]:opacity-100",
+					)}
+				>
 					<Tooltip>
 						<TooltipTrigger asChild>
 							<button
 								type="button"
 								aria-label={tt("sidebar.newSession")}
-								className="flex size-6 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
-								onClick={() => void newSession()}
-								disabled={currentWorkspaceId !== workspace.id || !canControl}
+								className={cn(
+									"flex items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink",
+									comfortable ? "size-10" : "size-6 [@media(hover:none)]:size-10",
+								)}
+								onClick={() => void createSession()}
+								disabled={!workspace.available}
 							>
 								<Plus className="size-3.5" />
 							</button>
@@ -281,15 +411,16 @@ function WorkspaceGroup({ workspace, sessions, defaultExpanded }: WorkspaceGroup
 							<button
 								type="button"
 								aria-label={tt("sidebar.workspaceActions")}
-								className="flex size-6 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
+								className={cn(
+									"flex items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink",
+									comfortable ? "size-10" : "size-6 [@media(hover:none)]:size-10",
+								)}
 							>
 								<Settings className="size-3.5" />
 							</button>
 						</DropdownMenuTrigger>
 						<DropdownMenuContent align="end" className="w-44">
-							<DropdownMenuItem
-								onClick={() => void useSessionDirectoryStore.getState().selectWorkspace(workspace.id)}
-							>
+							<DropdownMenuItem onClick={() => void openWorkspace()}>
 								{tt("sidebar.openWorkspace")}
 							</DropdownMenuItem>
 							<DropdownMenuSeparator />
@@ -305,16 +436,20 @@ function WorkspaceGroup({ workspace, sessions, defaultExpanded }: WorkspaceGroup
 				<ul className="flex flex-col pl-3">
 					{visible.map((session) => (
 						<SessionRow
-							key={session.id}
+							key={session.sessionHandle}
 							session={session}
-							workspace={workspace}
-							current={currentWorkspaceId === workspace.id && currentSession?.id === session.id}
+							current={selected && currentSession?.sessionHandle === session.sessionHandle}
+							comfortable={comfortable}
+							onSelect={onSessionSelect}
 						/>
 					))}
 					{more > 0 && (
 						<button
 							type="button"
-							className="h-7 rounded-sm pl-2.5 text-left text-[12px] text-ink-3 hover:bg-hover hover:text-ink-2"
+							className={cn(
+								"rounded-sm pl-2.5 text-left text-[12px] text-ink-3 hover:bg-hover hover:text-ink-2",
+								comfortable ? "h-10" : "h-7",
+							)}
 							onClick={() => setExpanded(true)}
 						>
 							{tt("sidebar.expandMore", { count: more })}
@@ -328,14 +463,16 @@ function WorkspaceGroup({ workspace, sessions, defaultExpanded }: WorkspaceGroup
 					<AlertDialogHeader>
 						<AlertDialogTitle>{tt("sidebar.removeWorkspace")}</AlertDialogTitle>
 						<AlertDialogDescription>
-							{tt("sidebar.removeWorkspaceDescription", { name: workspace.displayName })}
+							{tt("sidebar.removeWorkspaceDescription", { name: displayLabel(workspace.displayName) })}
 						</AlertDialogDescription>
 					</AlertDialogHeader>
 					<AlertDialogFooter>
 						<AlertDialogCancel>{tt("common.cancel")}</AlertDialogCancel>
 						<AlertDialogAction
 							variant="destructive"
-							onClick={() => void useSessionDirectoryStore.getState().removeWorkspace(workspace.id)}
+							onClick={() =>
+								void useSessionDirectoryStore.getState().removeWorkspace(workspace.workspaceHandle)
+							}
 						>
 							{tt("sidebar.removeWorkspace")}
 						</AlertDialogAction>
@@ -362,7 +499,7 @@ function AddWorkspaceDialog({
 			if (selected.path) setPath(selected.path);
 		} catch (error) {
 			toast.error(tt("sidebar.workspaceAddFailed"), {
-				description: error instanceof Error ? error.message : String(error),
+				description: displayError(error),
 			});
 		} finally {
 			setPicking(false);
@@ -377,7 +514,7 @@ function AddWorkspaceDialog({
 			onOpenChange(false);
 		} catch (error) {
 			toast.error(tt("sidebar.workspaceAddFailed"), {
-				description: error instanceof Error ? error.message : String(error),
+				description: displayError(error),
 			});
 		}
 	};
@@ -421,18 +558,34 @@ function AddWorkspaceDialog({
  * Workspace / session browser (DESIGN.md): expanded 280px tree or 56px rail.
  * Rows are hover-fill only; the selected session gets a 2px primary bar.
  */
-export function WorkspaceSidebar({ rail, onToggleRail }: { rail: boolean; onToggleRail?: () => void }) {
+interface WorkspaceSidebarProps {
+	rail: boolean;
+	onToggleRail?: () => void;
+	onOpenNavigation?: () => void;
+	navigationTriggerRef?: Ref<HTMLButtonElement>;
+	onRequestClose?: () => void;
+	onSessionSelect?: () => void;
+}
+
+export function WorkspaceSidebar({
+	rail,
+	onToggleRail,
+	onOpenNavigation,
+	navigationTriggerRef,
+	onRequestClose,
+	onSessionSelect,
+}: WorkspaceSidebarProps) {
 	const workspaces = useSessionDirectoryStore((s) => s.workspaces);
-	const sessions = useSessionDirectoryStore((s) => s.sessions);
-	const currentWorkspaceId = useSessionDirectoryStore((s) => s.currentWorkspaceId);
-	const canControl = useSessionControlStore((s) => s.canControl(currentWorkspaceId));
+	const sessions = useSessionDirectoryStore(selectCurrentWorkspaceSessions);
+	const sessionsByWorkspace = useSessionDirectoryStore((s) => s.sessionsByWorkspace);
+	const currentWorkspaceHandle = useSessionDirectoryStore((s) => s.currentWorkspaceHandle);
+	const currentSession = useSessionDirectoryStore((s) => s.currentSession);
 	const searchQuery = useSessionDirectoryStore((s) => s.searchQuery);
 	const setSearchQuery = useSessionDirectoryStore((s) => s.setSearchQuery);
 	const [addOpen, setAddOpen] = useState(false);
 	const { preference, resolved, set } = useTheme();
-
-	const processStatus = useTransportStore((s) =>
-		currentWorkspaceId ? s.processStatus[currentWorkspaceId] : undefined,
+	const currentWorkspace = workspaces.find(
+		(workspace) => workspace.workspaceHandle === currentWorkspaceHandle,
 	);
 
 	const filtered = useMemo(() => {
@@ -446,38 +599,34 @@ export function WorkspaceSidebar({ rail, onToggleRail }: { rail: boolean; onTogg
 	};
 
 	const ThemeIcon = preference === "system" ? SunMoon : resolved === "dark" ? Moon : Sun;
-
-	const restartProcess = async () => {
-		if (!currentWorkspaceId) return;
-		try {
-			await api.restartProcess(currentWorkspaceId);
-			toast.success(tt("sidebar.restarted"));
-		} catch (error) {
-			toast.error(tt("sidebar.restartFailed"), {
-				description: error instanceof Error ? error.message : String(error),
-			});
+	const createSession = async () => {
+		const previousSessionHandle = useSessionDirectoryStore.getState().currentSession?.sessionHandle;
+		await newSession();
+		if (useSessionDirectoryStore.getState().currentSession?.sessionHandle !== previousSessionHandle) {
+			onSessionSelect?.();
 		}
 	};
 
 	if (rail) {
 		return (
-			<nav aria-label={tt("sidebar.navAria")} className="flex h-full flex-col items-center gap-1 py-2">
-				<div className="mb-2 flex size-9 items-center justify-center rounded-sm bg-primary-soft text-primary">
-					<Bot className="size-5" />
-				</div>
-				{onToggleRail && (
+			<nav aria-label={tt("sidebar.navAria")} className="flex h-full flex-col items-center gap-1 pt-0.5">
+				{(onOpenNavigation || onToggleRail) && (
 					<Tooltip>
 						<TooltipTrigger asChild>
 							<button
+								ref={navigationTriggerRef}
 								type="button"
-								aria-label={tt("appShell.expandSidebar")}
-								className="flex size-9 items-center justify-center rounded-sm text-ink-2 transition-[color,background-color,scale] hover:bg-hover active:scale-95"
-								onClick={onToggleRail}
+								aria-label={tt(onOpenNavigation ? "appShell.openSessions" : "appShell.expandSidebar")}
+								className="group relative mb-2 flex size-10 items-center justify-center rounded-sm bg-primary-soft text-primary focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
+								onClick={onOpenNavigation ?? onToggleRail}
 							>
-								<PanelLeftOpen className="size-4" />
+								<Bot className="size-5 transition-opacity group-hover:opacity-0 group-focus-visible:opacity-0" />
+								<PanelLeftOpen className="absolute size-4 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100" />
 							</button>
 						</TooltipTrigger>
-						<TooltipContent side="right">{tt("appShell.expandSidebar")}</TooltipContent>
+						<TooltipContent side="right">
+							{tt(onOpenNavigation ? "appShell.openSessions" : "appShell.expandSidebar")}
+						</TooltipContent>
 					</Tooltip>
 				)}
 				<Tooltip>
@@ -485,9 +634,9 @@ export function WorkspaceSidebar({ rail, onToggleRail }: { rail: boolean; onTogg
 						<button
 							type="button"
 							aria-label={tt("sidebar.newSession")}
-							disabled={!currentWorkspaceId || !canControl}
-							className="flex size-9 items-center justify-center rounded-sm text-ink-2 hover:bg-hover disabled:opacity-40"
-							onClick={() => void newSession()}
+							disabled={!currentWorkspace?.available}
+							className="flex size-10 items-center justify-center rounded-sm text-ink-2 hover:bg-hover disabled:opacity-40"
+							onClick={() => void createSession()}
 						>
 							<Plus className="size-4" />
 						</button>
@@ -499,7 +648,7 @@ export function WorkspaceSidebar({ rail, onToggleRail }: { rail: boolean; onTogg
 						<button
 							type="button"
 							aria-label={tt("sidebar.addWorkspace")}
-							className="flex size-9 items-center justify-center rounded-sm text-ink-2 hover:bg-hover"
+							className="flex size-10 items-center justify-center rounded-sm text-ink-2 hover:bg-hover"
 							onClick={() => setAddOpen(true)}
 						>
 							<FolderPlus className="size-4" />
@@ -508,19 +657,21 @@ export function WorkspaceSidebar({ rail, onToggleRail }: { rail: boolean; onTogg
 					<TooltipContent side="right">{tt("sidebar.addWorkspace")}</TooltipContent>
 				</Tooltip>
 				<div className="flex-1" />
-				<Tooltip>
-					<TooltipTrigger asChild>
-						<button
-							type="button"
-							aria-label={tt("sidebar.switchTheme")}
-							className="flex size-9 items-center justify-center rounded-sm text-ink-2 hover:bg-hover"
-							onClick={cycleTheme}
-						>
-							<ThemeIcon className="size-4" />
-						</button>
-					</TooltipTrigger>
-					<TooltipContent side="right">{tt("sidebar.switchTheme")}</TooltipContent>
-				</Tooltip>
+				<div className="flex h-12 w-full flex-none items-center justify-center border-t border-border">
+					<Tooltip>
+						<TooltipTrigger asChild>
+							<button
+								type="button"
+								aria-label={tt("sidebar.switchTheme")}
+								className="flex size-10 items-center justify-center rounded-sm text-ink-2 hover:bg-hover"
+								onClick={cycleTheme}
+							>
+								<ThemeIcon className="size-4" />
+							</button>
+						</TooltipTrigger>
+						<TooltipContent side="right">{tt("sidebar.switchTheme")}</TooltipContent>
+					</Tooltip>
+				</div>
 				<AddWorkspaceDialog open={addOpen} onOpenChange={setAddOpen} />
 			</nav>
 		);
@@ -528,9 +679,12 @@ export function WorkspaceSidebar({ rail, onToggleRail }: { rail: boolean; onTogg
 
 	return (
 		<nav aria-label={tt("sidebar.navAria")} className="flex h-full flex-col">
-			<div className="flex h-11 flex-none items-center gap-2 px-3">
-				<div className="flex size-7 items-center justify-center rounded-md bg-primary-soft text-primary">
-					<Bot className="size-4" />
+			<div className="flex h-11 flex-none items-center gap-2 px-2">
+				<div
+					data-sidebar-brand-slot="true"
+					className="flex size-10 items-center justify-center rounded-sm bg-primary-soft text-primary"
+				>
+					<Bot className="size-5" />
 				</div>
 				<span className="text-[13px] font-semibold text-ink">{tt("sidebar.brand")}</span>
 				<div className="flex-1" />
@@ -539,7 +693,10 @@ export function WorkspaceSidebar({ rail, onToggleRail }: { rail: boolean; onTogg
 						<button
 							type="button"
 							aria-label={tt("sidebar.addWorkspace")}
-							className="flex size-7 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
+							className={cn(
+								"flex items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink",
+								onRequestClose ? "size-10" : "size-7",
+							)}
 							onClick={() => setAddOpen(true)}
 						>
 							<FolderPlus className="size-4" />
@@ -547,29 +704,34 @@ export function WorkspaceSidebar({ rail, onToggleRail }: { rail: boolean; onTogg
 					</TooltipTrigger>
 					<TooltipContent>{tt("sidebar.addWorkspace")}</TooltipContent>
 				</Tooltip>
-				{onToggleRail && (
+				{(onRequestClose || onToggleRail) && (
 					<Tooltip>
 						<TooltipTrigger asChild>
 							<button
 								type="button"
-								aria-label={tt("appShell.collapseSidebar")}
-								className="flex size-7 items-center justify-center rounded-sm text-ink-3 transition-[color,background-color,scale] hover:bg-hover hover:text-ink active:scale-95"
-								onClick={onToggleRail}
+								aria-label={tt(onRequestClose ? "appShell.closeSessions" : "appShell.collapseSidebar")}
+								className={cn(
+									"flex items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none",
+									onRequestClose ? "size-10" : "size-7",
+								)}
+								onClick={onRequestClose ?? onToggleRail}
 							>
 								<PanelLeftClose className="size-4" />
 							</button>
 						</TooltipTrigger>
-						<TooltipContent>{tt("appShell.collapseSidebar")}</TooltipContent>
+						<TooltipContent>
+							{tt(onRequestClose ? "appShell.closeSessions" : "appShell.collapseSidebar")}
+						</TooltipContent>
 					</Tooltip>
 				)}
 			</div>
 
-			<div className="px-3 pb-2">
+			<div className="px-3 pt-2 pb-2">
 				<Button
 					variant="secondary"
-					className="h-8 w-full justify-start gap-1.5 text-[13px]"
-					disabled={!currentWorkspaceId || !canControl}
-					onClick={() => void newSession()}
+					className={cn("w-full justify-start gap-1.5 text-[13px]", onRequestClose ? "h-10" : "h-8")}
+					disabled={!currentWorkspace?.available}
+					onClick={() => void createSession()}
 				>
 					<Plus className="size-4" />
 					{tt("sidebar.newSession")}
@@ -583,7 +745,7 @@ export function WorkspaceSidebar({ rail, onToggleRail }: { rail: boolean; onTogg
 						value={searchQuery}
 						onChange={(event) => setSearchQuery(event.target.value)}
 						placeholder={tt("sidebar.searchPlaceholder")}
-						className="h-7 pr-7 pl-8 text-[13px]"
+						className={cn("pr-7 pl-8 text-[13px]", onRequestClose ? "h-10" : "h-7")}
 					/>
 				</div>
 			</div>
@@ -591,34 +753,22 @@ export function WorkspaceSidebar({ rail, onToggleRail }: { rail: boolean; onTogg
 			<div className="scroll-slim min-h-0 flex-1 overflow-y-auto px-2 pb-2">
 				{filtered !== null ? (
 					filtered.length > 0 ? (
-						<ul className="flex flex-col">
-							{filtered.map((session) => {
-								const workspace = workspaces.find((w) => w.id === currentWorkspaceId);
-								return (
-									<div key={session.id} className="flex flex-col">
-										<div className="px-2 pt-1.5 pb-0.5 text-[11px] text-ink-3">
-											{workspace?.displayName ?? ""}
-										</div>
-										<SessionRow
-											session={session}
-											workspace={
-												workspace ?? {
-													id: "",
-													path: "",
-													displayName: "",
-													sessionCount: 0,
-													lastOpenedAt: null,
-												}
-											}
-											current={
-												currentWorkspaceId === workspace?.id &&
-												useSessionDirectoryStore.getState().currentSession?.id === session.id
-											}
-										/>
-									</div>
-								);
-							})}
-						</ul>
+						<div className="flex flex-col">
+							<div className="px-2 pt-1.5 pb-0.5 text-[11px] text-ink-3">
+								{currentWorkspace?.displayName ? displayLabel(currentWorkspace.displayName) : ""}
+							</div>
+							<ul className="flex flex-col">
+								{filtered.map((session) => (
+									<SessionRow
+										key={session.sessionHandle}
+										session={session}
+										current={currentSession?.sessionHandle === session.sessionHandle}
+										comfortable={Boolean(onRequestClose)}
+										onSelect={onSessionSelect}
+									/>
+								))}
+							</ul>
+						</div>
 					) : (
 						<p className="px-2 py-4 text-center text-[12px] text-ink-3">{tt("sidebar.noMatch")}</p>
 					)
@@ -634,23 +784,25 @@ export function WorkspaceSidebar({ rail, onToggleRail }: { rail: boolean; onTogg
 					<div className="flex flex-col gap-0.5">
 						{workspaces.map((workspace) => (
 							<WorkspaceGroup
-								key={workspace.id}
+								key={workspace.workspaceHandle}
 								workspace={workspace}
-								sessions={workspace.id === currentWorkspaceId ? sessions : []}
-								defaultExpanded={workspace.id === currentWorkspaceId}
+								sessions={sessionsByWorkspace[workspace.workspaceHandle] ?? []}
+								defaultExpanded={workspace.workspaceHandle === currentWorkspaceHandle}
+								comfortable={Boolean(onRequestClose)}
+								onSessionSelect={onSessionSelect}
 							/>
 						))}
 					</div>
 				)}
 			</div>
 
-			<div className="flex flex-none items-center gap-1 border-t border-border px-2 py-1.5">
+			<div className="flex h-12 flex-none items-center gap-1 border-t border-border px-2">
 				<Tooltip>
 					<TooltipTrigger asChild>
 						<button
 							type="button"
 							aria-label={tt("sidebar.switchTheme")}
-							className="flex size-7 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
+							className="flex size-10 items-center justify-center rounded-sm text-ink-2 hover:bg-hover hover:text-ink"
 							onClick={cycleTheme}
 						>
 							<ThemeIcon className="size-4" />
@@ -665,67 +817,19 @@ export function WorkspaceSidebar({ rail, onToggleRail }: { rail: boolean; onTogg
 								: tt("sidebar.themeDark")}
 					</TooltipContent>
 				</Tooltip>
-				{currentWorkspaceId && (
-					<Tooltip>
-						<TooltipTrigger asChild>
-							<button
-								type="button"
-								aria-label={tt("sidebar.processNotStarted")}
-								className="flex h-7 flex-1 items-center justify-center gap-1.5 rounded-sm text-[11px] text-ink-3 hover:bg-hover"
-								onClick={() => void restartProcess()}
-								disabled={!canControl}
-							>
-								<span
-									className={cn(
-										"size-1.5 rounded-full",
-										processStatus?.state === "running" && "bg-success",
-										processStatus?.state === "starting" && "bg-warning pulse-dot",
-										processStatus?.state === "crashed" && "bg-danger",
-										!processStatus && "bg-ink-3/40",
-									)}
-								/>
-								<span className="font-mono">
-									{processStatus?.state === "running"
-										? tt("sidebar.processPi")
-										: processStatus?.state === "starting"
-											? tt("sidebar.processStarting")
-											: processStatus?.state === "crashed"
-												? tt("sidebar.processCrashed")
-												: tt("sidebar.processNotStarted")}
-								</span>
-							</button>
-						</TooltipTrigger>
-						<TooltipContent>
-							{processStatus?.state === "crashed" ? processStatus.error : tt("status.clickToRestart")}
-						</TooltipContent>
-					</Tooltip>
-				)}
+				<div className="flex-1" />
 				<Tooltip>
 					<TooltipTrigger asChild>
 						<button
 							type="button"
 							aria-label={tt("common.settings")}
-							className="flex size-7 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
+							className="flex size-10 items-center justify-center rounded-sm text-ink-2 hover:bg-hover hover:text-ink"
 							onClick={() => window.dispatchEvent(new CustomEvent("piweb:open-settings"))}
 						>
 							<Settings className="size-4" />
 						</button>
 					</TooltipTrigger>
 					<TooltipContent>{tt("common.settings")}</TooltipContent>
-				</Tooltip>
-				<Tooltip>
-					<TooltipTrigger asChild>
-						<button
-							type="button"
-							aria-label={tt("sidebar.restartProcess")}
-							className="flex size-7 items-center justify-center rounded-sm text-ink-3 hover:bg-hover hover:text-ink"
-							onClick={() => void restartProcess()}
-							disabled={!canControl}
-						>
-							<RotateCw className="size-4" />
-						</button>
-					</TooltipTrigger>
-					<TooltipContent>{tt("sidebar.restartProcess")}</TooltipContent>
 				</Tooltip>
 			</div>
 

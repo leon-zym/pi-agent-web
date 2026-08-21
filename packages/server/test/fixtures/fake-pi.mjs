@@ -35,7 +35,7 @@ function handleLine(line) {
 				id: command.id,
 				command: command.type,
 				success: true,
-				data: { sessionId, sessionFile, thinkingLevel: "off" },
+				data: { sessionId, sessionFile, thinkingLevel: "off", argv: process.argv.slice(2) },
 			});
 			return;
 		case "get_commands":
@@ -47,6 +47,19 @@ function handleLine(line) {
 				data: { commands: [] },
 			});
 			return;
+		case "get_messages": {
+			const configuredBytes = Number(process.env.PI_WEB_FAKE_SNAPSHOT_BYTES);
+			const text =
+				Number.isSafeInteger(configuredBytes) && configuredBytes > 0 ? "x".repeat(configuredBytes) : "";
+			send({
+				type: "response",
+				id: command.id,
+				command: command.type,
+				success: true,
+				data: { messages: [{ role: "assistant", content: [{ type: "text", text }] }] },
+			});
+			return;
+		}
 		case "new_session":
 			sessionId = "fake-session-next";
 			sessionFile = "/tmp/fake-session-next.jsonl";
@@ -70,6 +83,10 @@ function handleLine(line) {
 			});
 			return;
 		case "prompt":
+			if (command.message === "malformed-event") {
+				send({ type: "queue_update" });
+				return;
+			}
 			if (command.message === "open-dialog") {
 				send({
 					type: "extension_ui_request",

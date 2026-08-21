@@ -1,5 +1,6 @@
 import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { tt } from "../lib/i18n";
+import { presentUserMessage, serializePresentedUserMessage } from "../lib/user-message-presentation";
 import type {
 	AssistantStep,
 	ContentBlock,
@@ -147,6 +148,11 @@ function ensureStep(turn: ProductTurn, ctx: ReducerContext): { turn: ProductTurn
 	return { turn: { ...turn, steps: [...turn.steps, step] }, step };
 }
 
+function ensureOpenStep(turn: ProductTurn, ctx: ReducerContext): { turn: ProductTurn; step: AssistantStep } {
+	const latest = turn.steps[turn.steps.length - 1];
+	return latest && !latest.isSettled ? { turn, step: latest } : ensureStep(turn, ctx);
+}
+
 function ensureBlock(
 	step: AssistantStep,
 	contentIndex: number,
@@ -241,8 +247,7 @@ function handleMessageUpdate(
 	const ensured = ensureTurn(state, ctx);
 	// Attach deltas to the step created by turn_start; create one defensively
 	// only when the event stream skipped turn_start.
-	const existingStep = ensured.turn.steps[ensured.turn.steps.length - 1];
-	const stepped = existingStep ? { turn: ensured.turn, step: existingStep } : ensureStep(ensured.turn, ctx);
+	const stepped = ensureOpenStep(ensured.turn, ctx);
 	let finalStep = stepped.step;
 	const inner = event.assistantMessageEvent;
 
@@ -356,14 +361,23 @@ function handleMessageStart(
 
 	if (message.role === "user") {
 		const ensured = ensureTurn(state, ctx);
-		const injected = ensured.turn.steps.length > 0;
-		const text = flattenText(message.content);
-		const source: UiUserMessageSource = injected ? (ctx.resolveInjectionSource?.(text) ?? "steer") : "prompt";
+		const presented = presentUserMessage(flattenText(message.content));
+		const explicitSource = ctx.resolveInjectionSource?.(serializePresentedUserMessage(presented));
+		const hasPriorConversationWork =
+			ensured.turn.userMessages.length > 0 ||
+			ensured.turn.steps.some(
+				(step) => step.blocks.length > 0 || step.toolResults.length > 0 || step.isSettled,
+			);
+		// Pi emits turn_start before the initial user message. An empty step is
+		// therefore not evidence that the message was injected into a running
+		// turn; only an explicit queued mode or prior conversation work is.
+		const source: UiUserMessageSource = explicitSource ?? (hasPriorConversationWork ? "steer" : "prompt");
 		const userMessages = [
 			...ensured.turn.userMessages,
 			{
 				entryKey: `${ensured.turn.id}:u${String(ensured.turn.userMessages.length)}`,
-				text,
+				text: presented.text,
+				...(presented.command ? { command: presented.command } : {}),
 				images: extractImages(message.content),
 				source,
 				delivered: true,
@@ -374,7 +388,7 @@ function handleMessageStart(
 
 	if (message.role === "assistant") {
 		const ensured = ensureTurn(state, ctx);
-		const stepped = ensureStep(ensured.turn, ctx);
+		const stepped = ensureOpenStep(ensured.turn, ctx);
 		// Seed any already-present content (snapshot replay / zero-delta messages).
 		const seeded = (message.content as ContentBlockLite[]).map((block, index) => {
 			const key = `${stepped.step.key}:${String(index)}`;

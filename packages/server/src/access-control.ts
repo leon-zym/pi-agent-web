@@ -78,9 +78,11 @@ function isSameOriginFetch(headers: HeadersInput): boolean {
 
 export function createGatewayAccessControl(sessionSecret: string): GatewayAccessControl {
 	const isAllowedOrigin = (headers: HeadersInput): boolean => {
+		const targetOrigin = requestOrigin(headers);
+		if (!targetOrigin) return false;
 		const origin = normalizedOrigin(headerValue(headers, "origin"));
 		if (!origin) return isSameOriginFetch(headers);
-		return origin === requestOrigin(headers) || DEV_ORIGINS.has(origin);
+		return origin === targetOrigin || DEV_ORIGINS.has(origin);
 	};
 
 	return {

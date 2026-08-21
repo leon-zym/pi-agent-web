@@ -3,14 +3,14 @@ import os from "node:os";
 import path from "node:path";
 import { expectData } from "@pi-agent-web/protocol";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { getSessionDirForCwd } from "../src/config";
 import { PiProcess } from "../src/pi-process";
 import { resolvePiRuntime } from "../src/resolver";
+import { SessionLayoutResolver } from "../src/session-layout-resolver";
 
 /**
- * Milestone 1 acceptance against the real pi runtime (installed on this
- * machine). Uses a temp session dir via PI_CODING_AGENT_SESSION_DIR so the
- * user's real sessions are never touched.
+ * Transport compatibility against the installed Pi runtime. Uses a temporary
+ * session directory via PI_CODING_AGENT_SESSION_DIR so the user's real
+ * sessions are never touched.
  */
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-e2e-"));
@@ -20,7 +20,10 @@ fs.mkdirSync(workspaceDir, { recursive: true });
 fs.mkdirSync(sessionRoot, { recursive: true });
 
 // Pre-seed a session file belonging to this workspace (header + two messages).
-const seededDir = getSessionDirForCwd(workspaceDir, sessionRoot);
+const seededDir = new SessionLayoutResolver({
+	env: { PI_CODING_AGENT_SESSION_DIR: sessionRoot },
+	runtimeCwd: workspaceDir,
+}).resolveForWorkspace(workspaceDir).sessionDir;
 fs.mkdirSync(seededDir, { recursive: true });
 const seededPath = path.join(seededDir, "2026-01-01T00-00-00-000Z_seeded.jsonl");
 fs.writeFileSync(
@@ -73,7 +76,6 @@ describe("pi process integration (real runtime)", () => {
 
 	beforeAll(async () => {
 		const resolved = await resolvePiRuntime({ baseDir: process.cwd() });
-		// eslint-disable-next-line no-console
 		console.log("integration test uses runtime:", resolved.label);
 		proc = new PiProcess({
 			cwd: workspaceDir,

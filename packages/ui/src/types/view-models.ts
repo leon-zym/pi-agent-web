@@ -13,6 +13,8 @@ export interface UiUserMessage {
 	/** Stable key (turnId + ordinal). */
 	entryKey: string;
 	text: string;
+	/** Slash/skill invocation rendered as an atomic tag; expanded skill source is never displayed. */
+	command?: string;
 	images?: ImageContent[];
 	source: UiUserMessageSource;
 	/** queued-but-not-injected messages show a badge */

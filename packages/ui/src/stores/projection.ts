@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { type ConversationProjection, createEmptyProjection } from "../types/view-models";
 import { useComposerStore } from "./composer";
 import { reduceProjection } from "./projection-reducer";
+import { sessionTransport } from "./session-transport";
 
 const MAX_CACHED_SESSIONS = 3;
 
@@ -11,8 +12,12 @@ interface ProjectionState {
 	currentSessionId: string | null;
 	/** Apply one session event through the assembler state machine. */
 	applyEvent: (sessionId: string, event: Parameters<typeof reduceProjection>[1]) => void;
+	/** Reduce an ordered event batch and publish one Zustand commit. */
+	applyEvents: (sessionId: string, events: Parameters<typeof reduceProjection>[1][]) => void;
 	/** Rebuild the projection from a get_messages snapshot (reconnect/first load). */
 	rebuildFromMessages: (sessionId: string, messages: unknown[]) => void;
+	/** Settle a locally active turn when the owning Pi process is lost. */
+	markRuntimeFailure: (sessionId: string, error?: string) => void;
 	/** Drop a session projection (switch away, eviction). */
 	resetSession: (sessionId: string) => void;
 	setCurrentSession: (sessionId: string | null) => void;
@@ -24,7 +29,8 @@ function prune(state: ProjectionState): ProjectionState {
 	while (order.length > MAX_CACHED_SESSIONS) {
 		const index = order.findLastIndex((sessionId) => {
 			const projection = projections[sessionId];
-			return sessionId !== state.currentSessionId && projection?.activeTurnId === null;
+			const subscribed = sessionTransport.store.getState().sessions[sessionId]?.subscribed === true;
+			return !subscribed && sessionId !== state.currentSessionId && projection?.activeTurnId === null;
 		});
 		if (index === -1) break;
 		const [sessionId] = order.splice(index, 1);
@@ -42,25 +48,66 @@ export const useProjectionStore = create<ProjectionState>()((set, get) => ({
 	order: [],
 	currentSessionId: null,
 
-	applyEvent: (sessionId, event) => {
+	applyEvent: (sessionId, event) => get().applyEvents(sessionId, [event]),
+
+	applyEvents: (sessionId, events) => {
+		if (events.length === 0) return;
 		const state = get();
-		const existing = state.projections[sessionId] ?? createEmptyProjection(sessionId);
-		const next = reduceProjection(existing, event, {
-			now: Date.now(),
-			resolveInjectionSource: (text) => useComposerStore.getState().consumeInjectionSource(text),
-		});
+		let next = state.projections[sessionId] ?? createEmptyProjection(sessionId);
+		for (const event of events) {
+			next = reduceProjection(next, event, {
+				now: Date.now(),
+				resolveInjectionSource: (text) =>
+					useComposerStore.getState().consumeInjectionSourceForSession(sessionId, text),
+			});
+		}
 		const order = touch(state.order, sessionId);
 		set(prune({ ...state, projections: { ...state.projections, [sessionId]: next }, order }));
 	},
 
 	rebuildFromMessages: (sessionId, messages) => {
 		const state = get();
-		const projection = state.projections[sessionId];
-		// Snapshot must never clobber a running turn.
-		if (projection && !projection.replayable) return;
+		// A snapshot is applied only while the Session transport holds later
+		// frames behind a resync barrier, so it is authoritative even if the
+		// previous local projection appeared to be streaming.
 		const next = rebuildProjectionFromMessages(sessionId, messages);
 		const order = touch(state.order, sessionId);
 		set(prune({ ...state, projections: { ...state.projections, [sessionId]: next }, order }));
+	},
+
+	markRuntimeFailure: (sessionId, error) => {
+		const state = get();
+		const projection = state.projections[sessionId];
+		if (!projection?.activeTurnId) return;
+		const now = Date.now();
+		set({
+			projections: {
+				...state.projections,
+				[sessionId]: {
+					...projection,
+					activeTurnId: null,
+					replayable: true,
+					turns: projection.turns.map((turn) =>
+						turn.id === projection.activeTurnId
+							? (() => {
+									const startTime = turn.timing?.startTime ?? now;
+									return {
+										...turn,
+										status: "error" as const,
+										errorMessage: error,
+										timing: {
+											...turn.timing,
+											startTime,
+											endTime: now,
+											durationMs: Math.max(0, now - startTime),
+										},
+									};
+								})()
+							: turn,
+					),
+				},
+			},
+		});
 	},
 
 	resetSession: (sessionId) => {

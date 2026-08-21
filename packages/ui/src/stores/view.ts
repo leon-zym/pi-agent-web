@@ -32,12 +32,12 @@ export const useViewStore = create<ViewState>()((set) => ({
 	toggleTool: (key) => set((s) => ({ expandedTools: { ...s.expandedTools, [key]: !s.expandedTools[key] } })),
 
 	selectTool: (sessionId, key) =>
-		set((s) => ({
-			selectedTool: s.selectedTool === key && s.rightPanelMode === "inspector" ? null : key,
+		set({
+			selectedTool: key,
 			selectedToolSessionId: sessionId,
 			rightPanelMode: "inspector",
 			rightPanelOpen: true,
-		})),
+		}),
 
 	setRightPanelOpen: (rightPanelOpen) => set({ rightPanelOpen }),
 	setRightPanelMode: (rightPanelMode) => set({ rightPanelMode }),

@@ -1,54 +1,176 @@
+import type { RpcExtensionUIRequest } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useComposerStore } from "../src/stores/composer";
 import { useExtensionUiStore } from "../src/stores/extension-ui";
+import { sessionTransport } from "../src/stores/session-transport";
 
-function dialog(id: string, timeout?: number) {
+function request(id: string, timeout?: number) {
 	return {
-		request: {
-			type: "extension_ui_request" as const,
-			id,
-			method: "confirm" as const,
-			title: id,
-			message: id,
-			...(timeout ? { timeout } : {}),
-		},
-		workspaceId: "workspace-a",
-		sessionId: "session-a",
-		epoch: 2,
-		receivedAt: Date.now(),
+		type: "extension_ui_request" as const,
+		id,
+		method: "confirm" as const,
+		title: id,
+		message: id,
+		...(timeout ? { timeout } : {}),
 	};
 }
 
-describe("extension dialog deadlines", () => {
+const originalTransport = sessionTransport.store.getState();
+
+describe("Session-scoped extension UI", () => {
 	beforeEach(() => {
 		vi.useFakeTimers();
-		useExtensionUiStore.getState().clearDialogs();
+		vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+		useExtensionUiStore.setState({
+			bySession: {},
+			activeSessionHandle: null,
+			generation: null,
+			dialogs: [],
+			status: {},
+			widgets: {},
+			title: null,
+			editorText: null,
+		});
+		useComposerStore.setState({
+			bySession: {},
+			activeSessionHandle: null,
+			draft: "",
+			images: [],
+			trigger: null,
+			command: null,
+			submitState: "plain",
+			activeSubmitId: null,
+			attachmentWorkCount: 0,
+			attachmentWorkIds: [],
+			deliveryMode: "auto",
+			queue: { steering: [], followUp: [] },
+			recentQueued: [],
+		});
 	});
 
-	afterEach(() => vi.useRealTimers());
-
-	it("expires timed dialogs without blocking the next queued request", () => {
-		useExtensionUiStore.getState().pushDialog(dialog("first", 100));
-		useExtensionUiStore.getState().pushDialog(dialog("second"));
-		expect(useExtensionUiStore.getState().dialogs.map((entry) => entry.request.id)).toEqual([
-			"first",
-			"second",
-		]);
-
-		vi.advanceTimersByTime(100);
-		expect(useExtensionUiStore.getState().dialogs.map((entry) => entry.request.id)).toEqual(["second"]);
+	afterEach(() => {
+		vi.useRealTimers();
+		sessionTransport.store.setState(originalTransport, true);
 	});
 
-	it("clears a deadline when a dialog is dismissed manually", () => {
-		useExtensionUiStore.getState().pushDialog(dialog("first", 100));
-		useExtensionUiStore.getState().dismissDialog("first");
+	it("keeps timeout closure Host-authoritative", () => {
+		useExtensionUiStore.getState().beginSession("session-a");
+		useExtensionUiStore.getState().pushDialogForSession("session-a", {
+			request: request("first", 100),
+			generation: 2,
+			receivedAt: Date.now(),
+		});
+
+		expect(useExtensionUiStore.getState().dialogs[0]?.deadlineAt).toBe(Date.now() + 100);
 		vi.advanceTimersByTime(100);
+		expect(useExtensionUiStore.getState().dialogs.map((entry) => entry.request.id)).toEqual(["first"]);
+
+		useExtensionUiStore.getState().closeRequestForSession("session-a", "first");
 		expect(useExtensionUiStore.getState().dialogs).toEqual([]);
 	});
 
-	it("drops dialogs that no longer match the Host session epoch", () => {
-		useExtensionUiStore.getState().pushDialog(dialog("current"));
-		useExtensionUiStore.getState().pushDialog({ ...dialog("stale"), epoch: 1 });
-		useExtensionUiStore.getState().clearDialogsOutside("workspace-a", "session-a", 2);
-		expect(useExtensionUiStore.getState().dialogs.map((entry) => entry.request.id)).toEqual(["current"]);
+	it("keeps background dialogs, status, and widgets isolated and restores them on switch", () => {
+		const store = useExtensionUiStore.getState();
+		store.beginSession("session-a");
+		store.pushDialogForSession("session-a", {
+			request: request("a"),
+			generation: 1,
+			receivedAt: Date.now(),
+		});
+		store.applyStatusForSession("session-a", "branch", "A", 1);
+		store.applyWidgetForSession("session-b", "tests", ["passing"], "aboveEditor", 4);
+		store.pushDialogForSession("session-b", {
+			request: request("b"),
+			generation: 4,
+			receivedAt: Date.now(),
+		});
+
+		expect(useExtensionUiStore.getState().dialogs.map((dialog) => dialog.request.id)).toEqual(["a"]);
+		expect(useExtensionUiStore.getState().status).toEqual({ branch: "A" });
+
+		store.beginSession("session-b");
+		expect(useExtensionUiStore.getState().dialogs.map((dialog) => dialog.request.id)).toEqual(["b"]);
+		expect(useExtensionUiStore.getState().status).toEqual({});
+		expect(useExtensionUiStore.getState().widgets.tests?.lines).toEqual(["passing"]);
+	});
+
+	it("atomically replaces sticky snapshot state without replaying notifications", () => {
+		const requests: RpcExtensionUIRequest[] = [
+			request("blocking"),
+			{
+				type: "extension_ui_request",
+				id: "notify",
+				method: "notify",
+				message: "must not be replayed",
+			},
+			{
+				type: "extension_ui_request",
+				id: "status",
+				method: "setStatus",
+				statusKey: "branch",
+				statusText: "main",
+			},
+			{
+				type: "extension_ui_request",
+				id: "widget",
+				method: "setWidget",
+				widgetKey: "tests",
+				widgetLines: ["42 passed"],
+			},
+			{ type: "extension_ui_request", id: "title", method: "setTitle", title: "Agent A" },
+			{
+				type: "extension_ui_request",
+				id: "editor",
+				method: "set_editor_text",
+				text: "extension draft",
+			},
+		];
+
+		useExtensionUiStore.getState().replaceRequestsForSession("session-a", 7, requests);
+		useExtensionUiStore.getState().beginSession("session-a");
+		useComposerStore.getState().beginSession("session-a");
+
+		expect(useExtensionUiStore.getState()).toMatchObject({
+			generation: 7,
+			status: { branch: "main" },
+			title: "Agent A",
+			editorText: "extension draft",
+		});
+		expect(useExtensionUiStore.getState().dialogs.map((dialog) => dialog.request.id)).toEqual(["blocking"]);
+		expect(useExtensionUiStore.getState().widgets.tests?.lines).toEqual(["42 passed"]);
+		expect(useComposerStore.getState().draft).toBe("extension draft");
+	});
+
+	it("routes responses to their Session and waits for an authoritative close", () => {
+		const sendExtensionUiResponse = vi.fn(() => true);
+		sessionTransport.store.setState({ sendExtensionUiResponse });
+		useExtensionUiStore.getState().beginSession("session-a");
+		useExtensionUiStore.getState().pushDialogForSession("session-a", {
+			request: request("confirm-a"),
+			generation: 3,
+			receivedAt: Date.now(),
+		});
+		const dialog = useExtensionUiStore.getState().dialogs[0];
+		expect(dialog).toBeDefined();
+
+		expect(
+			useExtensionUiStore
+				.getState()
+				.respond(dialog!, { type: "extension_ui_response", id: "confirm-a", confirmed: true }),
+		).toBe(true);
+		expect(sendExtensionUiResponse).toHaveBeenCalledWith("session-a", {
+			type: "extension_ui_response",
+			id: "confirm-a",
+			confirmed: true,
+		});
+		expect(useExtensionUiStore.getState().dialogs[0]?.responding).toBe(true);
+		expect(
+			useExtensionUiStore
+				.getState()
+				.respond(dialog!, { type: "extension_ui_response", id: "confirm-a", confirmed: true }),
+		).toBe(false);
+
+		useExtensionUiStore.getState().closeRequestForSession("session-a", "confirm-a");
+		expect(useExtensionUiStore.getState().dialogs).toEqual([]);
 	});
 });

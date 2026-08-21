@@ -27,7 +27,7 @@ export function getSessionRootDir(env: NodeJS.ProcessEnv = process.env): string 
 	return path.join(getAgentDir(env), "sessions");
 }
 
-/** Web Server's own data dir (workspace registry), default <agentDir>/../web */
+/** Web Server's own data dir (workspace preferences), default <agentDir>/../web. */
 export function getWebDataDir(env: NodeJS.ProcessEnv = process.env): string {
 	const override = env.PI_WEB_DATA_DIR;
 	if (override) return path.resolve(expandHome(override));
@@ -65,32 +65,4 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
 	};
 	assertLoopbackHost(config.host);
 	return config;
-}
-
-/**
- * Session dir safe encoding, character-for-character identical to pi's
- * session-manager.ts:
- *   "--" + resolvedCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-") + "--"
- */
-export function encodeSessionDir(cwd: string): string {
-	const resolved = path.resolve(cwd);
-	return `--${resolved.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
-}
-
-/** Derive a workspace's session dir from its cwd (pi-native capability, Host derives only). */
-export function getSessionDirForCwd(cwd: string, sessionRootDir: string): string {
-	return path.join(sessionRootDir, encodeSessionDir(cwd));
-}
-
-/** Whether a session path belongs to a workspace process's session dir (cross-workspace switch guard). */
-export function isSessionInDir(sessionPath: string, sessionDir: string): boolean {
-	const resolvedSession = path.resolve(sessionPath);
-	const resolvedDir = path.resolve(sessionDir);
-	const relative = path.relative(resolvedDir, resolvedSession);
-	return (
-		relative.length > 0 &&
-		!relative.startsWith(`..${path.sep}`) &&
-		relative !== ".." &&
-		path.extname(resolvedSession) === ".jsonl"
-	);
 }

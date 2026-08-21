@@ -12,13 +12,13 @@ import {
 } from "../../components/ui/dialog";
 import { Separator } from "../../components/ui/separator";
 import { Switch } from "../../components/ui/switch";
+import { displayError } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { sendControlCommand } from "../../lib/session-controller";
 import { useTheme } from "../../lib/use-theme";
 import { cn } from "../../lib/utils";
-import { useSessionControlStore } from "../../stores/session-control";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
-import { useTransportStore } from "../../stores/transport";
+import { sessionTransport, useSessionTransportStore } from "../../stores/session-transport";
 
 interface SettingsDialogProps {
 	open: boolean;
@@ -67,22 +67,27 @@ function Segmented<T extends string>({
  * through RPC commands into ~/.pi/agent/settings.json.
  */
 export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
-	const workspaceId = useSessionDirectoryStore((s) => s.currentWorkspaceId);
-	const canControl = useSessionControlStore((s) => s.canControl(workspaceId));
+	const sessionHandle = useSessionDirectoryStore((s) => s.currentSession?.sessionHandle ?? null);
+	const canControl = useSessionTransportStore((transport) => {
+		const channel = sessionHandle ? transport.sessions[sessionHandle] : undefined;
+		return Boolean(channel?.lease.isController && channel.lease.fencingToken);
+	});
 	const [state, setState] = useState<Pick<
 		RpcSessionState,
 		"autoCompactionEnabled" | "steeringMode" | "followUpMode"
 	> | null>(null);
-	const [autoRetry, setAutoRetry] = useState(true);
 	const { preference, set: setTheme } = useTheme();
 
 	useEffect(() => {
-		if (!open || !workspaceId) return;
-		void useTransportStore
+		setState(null);
+		if (!open || !sessionHandle) return;
+		let cancelled = false;
+		void sessionTransport.store
 			.getState()
-			.sendCommand(workspaceId, { type: "get_state" })
+			.sendCommand(sessionHandle, { type: "get_state" })
 			.then((response) => {
 				const data = expectData(response) as RpcSessionState;
+				if (cancelled) return;
 				setState({
 					autoCompactionEnabled: data.autoCompactionEnabled,
 					steeringMode: data.steeringMode,
@@ -92,57 +97,57 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 			.catch(() => {
 				// switches stay disabled
 			});
-	}, [open, workspaceId]);
+		return () => {
+			cancelled = true;
+		};
+	}, [open, sessionHandle]);
 
 	const toggleAutoCompaction = async (enabled: boolean) => {
-		if (!workspaceId || !state) return;
-		setState({ ...state, autoCompactionEnabled: enabled });
+		if (!sessionHandle || !state) return;
+		const targetSessionHandle = sessionHandle;
 		try {
-			await sendControlCommand(workspaceId, { type: "set_auto_compaction", enabled });
+			await sendControlCommand(targetSessionHandle, { type: "set_auto_compaction", enabled });
+			if (useSessionDirectoryStore.getState().currentSession?.sessionHandle === targetSessionHandle) {
+				setState((current) => (current ? { ...current, autoCompactionEnabled: enabled } : current));
+			}
 		} catch (error) {
 			toast.error(tt("settings.saveFailed"), {
-				description: error instanceof Error ? error.message : String(error),
-			});
-		}
-	};
-
-	const toggleAutoRetry = async (enabled: boolean) => {
-		if (!workspaceId) return;
-		setAutoRetry(enabled);
-		try {
-			await sendControlCommand(workspaceId, { type: "set_auto_retry", enabled });
-		} catch (error) {
-			toast.error(tt("settings.saveFailed"), {
-				description: error instanceof Error ? error.message : String(error),
+				description: displayError(error),
 			});
 		}
 	};
 
 	const setSteeringMode = async (mode: "all" | "one-at-a-time") => {
-		if (!workspaceId || !state) return;
-		setState({ ...state, steeringMode: mode });
+		if (!sessionHandle || !state) return;
+		const targetSessionHandle = sessionHandle;
 		try {
-			await sendControlCommand(workspaceId, { type: "set_steering_mode", mode });
+			await sendControlCommand(targetSessionHandle, { type: "set_steering_mode", mode });
+			if (useSessionDirectoryStore.getState().currentSession?.sessionHandle === targetSessionHandle) {
+				setState((current) => (current ? { ...current, steeringMode: mode } : current));
+			}
 		} catch (error) {
 			toast.error(tt("settings.saveFailed"), {
-				description: error instanceof Error ? error.message : String(error),
+				description: displayError(error),
 			});
 		}
 	};
 
 	const setFollowUpMode = async (mode: "all" | "one-at-a-time") => {
-		if (!workspaceId || !state) return;
-		setState({ ...state, followUpMode: mode });
+		if (!sessionHandle || !state) return;
+		const targetSessionHandle = sessionHandle;
 		try {
-			await sendControlCommand(workspaceId, { type: "set_follow_up_mode", mode });
+			await sendControlCommand(targetSessionHandle, { type: "set_follow_up_mode", mode });
+			if (useSessionDirectoryStore.getState().currentSession?.sessionHandle === targetSessionHandle) {
+				setState((current) => (current ? { ...current, followUpMode: mode } : current));
+			}
 		} catch (error) {
 			toast.error(tt("settings.saveFailed"), {
-				description: error instanceof Error ? error.message : String(error),
+				description: displayError(error),
 			});
 		}
 	};
 
-	const disabled = !workspaceId || !state || !canControl;
+	const disabled = !sessionHandle || !state || !canControl;
 
 	return (
 		<Dialog open={open} onOpenChange={onOpenChange}>
@@ -166,18 +171,6 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 									disabled={disabled}
 									onCheckedChange={(checked) => void toggleAutoCompaction(checked)}
 									aria-label={tt("settings.autoCompaction")}
-								/>
-							</div>
-							<div className="flex items-center justify-between gap-4">
-								<div className="min-w-0">
-									<p className="text-[13px] text-ink">{tt("settings.autoRetry")}</p>
-									<p className="text-[12px] text-ink-3">{tt("settings.autoRetryDesc")}</p>
-								</div>
-								<Switch
-									checked={autoRetry}
-									disabled={disabled}
-									onCheckedChange={(checked) => void toggleAutoRetry(checked)}
-									aria-label={tt("settings.autoRetry")}
 								/>
 							</div>
 							<div className="flex items-center justify-between gap-4">

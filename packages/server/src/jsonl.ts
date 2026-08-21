@@ -2,6 +2,8 @@ import type { Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 
 export const MAX_JSONL_LINE_BYTES = 8 * 1024 * 1024;
+/** Pi emits get_messages as one JSONL response, so snapshots receive a larger but still finite budget. */
+export const MAX_JSONL_SNAPSHOT_LINE_BYTES = 64 * 1024 * 1024;
 
 export class JsonlLineTooLongError extends Error {
 	constructor(maxBytes: number) {
@@ -11,7 +13,7 @@ export class JsonlLineTooLongError extends Error {
 }
 
 export interface JsonlReaderOptions {
-	maxLineBytes?: number;
+	maxLineBytes?: number | (() => number);
 	onError?: (error: Error) => void;
 }
 
@@ -31,23 +33,31 @@ export function attachJsonlLineReader(
 	options: JsonlReaderOptions = {},
 ): () => void {
 	const decoder = new StringDecoder("utf8");
-	const maxLineBytes = options.maxLineBytes ?? MAX_JSONL_LINE_BYTES;
+	const currentMaxLineBytes = () => {
+		const configured = options.maxLineBytes ?? MAX_JSONL_LINE_BYTES;
+		return typeof configured === "function" ? configured() : configured;
+	};
 	let buffer = "";
 	let failed = false;
 
-	const fail = () => {
+	const fail = (error: Error) => {
 		if (failed) return;
 		failed = true;
 		buffer = "";
-		options.onError?.(new JsonlLineTooLongError(maxLineBytes));
+		options.onError?.(error);
 	};
 
 	const emitLine = (line: string) => {
+		const maxLineBytes = currentMaxLineBytes();
 		if (Buffer.byteLength(line) > maxLineBytes) {
-			fail();
+			fail(new JsonlLineTooLongError(maxLineBytes));
 			return;
 		}
-		onLine(line.endsWith("\r") ? line.slice(0, -1) : line);
+		try {
+			onLine(line.endsWith("\r") ? line.slice(0, -1) : line);
+		} catch (error) {
+			fail(error instanceof Error ? error : new Error(String(error)));
+		}
 	};
 
 	const onData = (chunk: string | Buffer) => {
@@ -57,7 +67,8 @@ export function attachJsonlLineReader(
 		for (;;) {
 			const newlineIndex = buffer.indexOf("\n");
 			if (newlineIndex === -1) {
-				if (Buffer.byteLength(buffer) > maxLineBytes) fail();
+				const maxLineBytes = currentMaxLineBytes();
+				if (Buffer.byteLength(buffer) > maxLineBytes) fail(new JsonlLineTooLongError(maxLineBytes));
 				return;
 			}
 			emitLine(buffer.slice(0, newlineIndex));

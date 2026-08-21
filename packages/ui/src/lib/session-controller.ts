@@ -1,255 +1,235 @@
 import type { RpcResponse } from "@earendil-works/pi-coding-agent";
-import { expectData, type SessionSummary } from "@pi-agent-web/protocol";
+import { expectData, type NativeSessionDto } from "@pi-agent-web/protocol";
 import { toast } from "sonner";
-import { useComposerStore } from "../stores/composer";
-import { useModelDirectoryStore } from "../stores/model-directory";
+import { serializeComposerMessage, useComposerStore } from "../stores/composer";
 import { useProjectionStore } from "../stores/projection";
-import { useSessionControlStore } from "../stores/session-control";
-import { useSessionDirectoryStore } from "../stores/session-directory";
-import { useSessionStatsStore } from "../stores/session-stats";
-import { useSlashCommandsStore } from "../stores/slash-commands";
-import { useTransportStore } from "../stores/transport";
-import { useViewStore } from "../stores/view";
+import {
+	isSessionBeingAbandoned,
+	reconcileHiddenSessionLifecycle,
+	useSessionDirectoryStore,
+} from "../stores/session-directory";
+import { sessionTransport } from "../stores/session-transport";
 import type { ImageContent } from "../types/pi-types";
 import { api } from "./api";
+import { displayError, stripAnsi } from "./format";
 import { tt } from "./i18n";
-import { sendControlCommand, sendReadCommand } from "./session-command";
+import { sessionDeleteCapability } from "./session-capabilities";
+import { sendControlCommand } from "./session-command";
 
 export { sendControlCommand, sendControlExtensionUiResponse, sendReadCommand } from "./session-command";
 
-/**
- * Session orchestration: switching, creating, deleting, submitting prompts.
- * Kept outside components so the flow survives Composer re-renders.
- */
-
-function workspaceId(): string {
-	const id = useSessionDirectoryStore.getState().currentWorkspaceId;
-	if (!id) throw new Error(tt("session.workspaceRequired"));
-	return id;
+function currentWorkspaceHandle(): string {
+	const handle = useSessionDirectoryStore.getState().currentWorkspaceHandle;
+	if (!handle) throw new Error(tt("session.workspaceRequired"));
+	return handle;
 }
 
-async function snapshotAfterOpen(wsId: string, sessionId: string): Promise<void> {
-	useTransportStore.getState().setListen(wsId, sessionId);
-	useProjectionStore.getState().setCurrentSession(sessionId);
-	useViewStore.getState().clearSession();
-	useSessionStatsStore.getState().clear();
-	try {
-		const response = await sendReadCommand(wsId, { type: "get_messages" });
-		const { messages } = expectData(response) as { messages: never[] };
-		useProjectionStore.getState().rebuildFromMessages(sessionId, messages);
-	} catch (error) {
-		toast.error(tt("session.loadFailed"), {
-			description: error instanceof Error ? error.message : String(error),
-		});
+function currentSession(): NativeSessionDto {
+	const session = useSessionDirectoryStore.getState().currentSession;
+	if (!session) throw new Error(tt("session.needWorkspace"));
+	return session;
+}
+
+function currentSessionHandle(): string {
+	return currentSession().sessionHandle;
+}
+
+function controllerChannel(sessionHandle: string) {
+	const channel = sessionTransport.store.getState().sessions[sessionHandle];
+	if (
+		!channel?.subscribed ||
+		channel.generation === null ||
+		!channel.lease.isController ||
+		!channel.lease.fencingToken
+	) {
+		throw new Error(tt("lease.readOnly"));
 	}
-	void useSlashCommandsStore.getState().refresh(wsId);
-	void useModelDirectoryStore.getState().refresh(wsId);
-	void useSessionStatsStore.getState().refresh(wsId);
+	return {
+		generation: channel.generation,
+		fencingToken: channel.lease.fencingToken,
+		runtime: channel.runtime,
+	};
 }
 
-/** Open a session file inside the current workspace process (switch_session). */
-export async function openSession(summary: SessionSummary): Promise<void> {
-	const wsId = workspaceId();
+/** Selecting a Session changes only the visible pointer; every subscribed Session keeps ingesting. */
+export async function openSession(session: NativeSessionDto): Promise<void> {
+	if (isSessionBeingAbandoned(session.sessionHandle)) return;
 	const directory = useSessionDirectoryStore.getState();
-	directory.setCurrentSession(summary);
-
-	try {
-		const response = await sendControlCommand(wsId, {
-			type: "switch_session",
-			sessionPath: summary.absolutePath,
+	directory.selectSession(session);
+	const activation = api
+		.activateWorkspace(session.workspaceHandle)
+		.then((activatedWorkspace) => {
+			useSessionDirectoryStore.setState((state) => ({
+				workspaces: state.workspaces.map((workspace) =>
+					workspace.workspaceHandle === activatedWorkspace.workspaceHandle ? activatedWorkspace : workspace,
+				),
+			}));
+		})
+		.catch((error) => {
+			if (useSessionDirectoryStore.getState().currentWorkspaceHandle !== session.workspaceHandle) return;
+			useSessionDirectoryStore.setState({ error: displayError(error) });
 		});
-		const data = expectData(response) as { cancelled: boolean };
-		if (data.cancelled) {
-			directory.setCurrentSession(null);
-			toast.info(tt("session.switchCancelled"));
-			return;
-		}
-		await snapshotAfterOpen(wsId, summary.id);
-	} catch (error) {
-		directory.setCurrentSession(null);
-		toast.error(tt("session.openFailed"), {
-			description: error instanceof Error ? error.message : String(error),
-		});
-	}
+	await Promise.all([activation, directory.reloadSessions(session.workspaceHandle)]);
 }
 
-/** Create a brand-new session in the current workspace (new_session). */
+/** Create a new Pi-native Session and attach its dedicated runtime. */
 export async function newSession(): Promise<void> {
-	const wsId = workspaceId();
+	let creationToken: number | undefined;
 	try {
-		const response = await sendControlCommand(wsId, { type: "new_session" });
-		const data = expectData(response) as { cancelled: boolean };
-		if (data.cancelled) {
-			toast.info(tt("session.newCancelled"));
+		const workspaceHandle = currentWorkspaceHandle();
+		const directoryBeforeCreation = useSessionDirectoryStore.getState();
+		if (directoryBeforeCreation.resumeTransientSession(workspaceHandle)) return;
+		creationToken = directoryBeforeCreation.beginSessionCreation(workspaceHandle);
+		const created = await api.createSession(workspaceHandle);
+		const directory = useSessionDirectoryStore.getState();
+		directory.completeSessionCreation(creationToken, created.session);
+		void directory.reloadSessions(workspaceHandle);
+	} catch (error) {
+		if (
+			creationToken !== undefined &&
+			!useSessionDirectoryStore.getState().failSessionCreation(creationToken)
+		) {
 			return;
 		}
-		const stateResponse = await sendReadCommand(wsId, { type: "get_state" });
-		const state = expectData(stateResponse) as { sessionId: string; sessionFile?: string };
-		const directory = useSessionDirectoryStore.getState();
-		await directory.reloadSessions();
-		const fresh = useSessionDirectoryStore.getState().sessions.find((s) => s.id === state.sessionId);
-		if (fresh) {
-			useSessionDirectoryStore.getState().setCurrentSession(fresh);
-			await snapshotAfterOpen(wsId, fresh.id);
-		} else {
-			// Session file may take a moment to appear in the scan; retry once.
-			await new Promise((resolve) => setTimeout(resolve, 400));
-			await directory.reloadSessions();
-			const retry = useSessionDirectoryStore.getState().sessions.find((s) => s.id === state.sessionId);
-			if (retry) {
-				useSessionDirectoryStore.getState().setCurrentSession(retry);
-				await snapshotAfterOpen(wsId, retry.id);
-			}
-		}
-	} catch (error) {
 		toast.error(tt("session.newFailed"), {
-			description: error instanceof Error ? error.message : String(error),
+			description: displayError(error),
 		});
 	}
 }
 
-export async function deleteSession(summary: SessionSummary): Promise<void> {
-	const wsId = workspaceId();
+export async function deleteSession(session: NativeSessionDto): Promise<void> {
 	try {
-		if (!useSessionControlStore.getState().canControl(wsId)) throw new Error(tt("lease.readOnly"));
-		await api.deleteSession(wsId, summary.path);
-		await useSessionDirectoryStore.getState().reloadSessions();
-		if (useSessionDirectoryStore.getState().currentSession?.id === summary.id) {
-			useSessionDirectoryStore.getState().setCurrentSession(null);
+		const transport = sessionTransport.store.getState();
+		const capability = sessionDeleteCapability(session, transport.sessions[session.sessionHandle]);
+		if (!capability.allowed) {
+			throw new Error(tt(`sidebar.deleteBlocked.${capability.reason}`));
 		}
+		const channel = controllerChannel(session.sessionHandle);
+		await api.deleteSession(session.workspaceHandle, session.sessionHandle, {
+			generation: channel.generation,
+			fencingToken: channel.fencingToken,
+		});
+		transport.releaseSession(session.sessionHandle);
+		transport.unsubscribeSession(session.sessionHandle);
+		const directory = useSessionDirectoryStore.getState();
+		directory.removeSession(session.workspaceHandle, session.sessionHandle);
+		void directory.loadWorkspaces();
 		toast.success(tt("session.deleted"));
 	} catch (error) {
 		toast.error(tt("session.deleteFailed"), {
-			description: error instanceof Error ? error.message : String(error),
+			description: displayError(error),
 		});
 	}
 }
 
-export async function renameSession(summary: SessionSummary, name: string): Promise<void> {
-	const wsId = workspaceId();
+export async function renameSession(session: NativeSessionDto, name: string): Promise<void> {
 	try {
-		const currentSession = useSessionDirectoryStore.getState().currentSession;
-		const control = useSessionControlStore.getState();
-		if (
-			currentSession?.id !== summary.id ||
-			control.workspaceId !== wsId ||
-			control.session.id !== summary.id
-		) {
+		if (useSessionDirectoryStore.getState().currentSession?.sessionHandle !== session.sessionHandle) {
 			throw new Error(tt("session.renameCurrentOnly"));
 		}
-		await sendControlCommand(wsId, { type: "set_session_name", name });
-		await useSessionDirectoryStore.getState().reloadSessions();
+		controllerChannel(session.sessionHandle);
+		await sendControlCommand(session.sessionHandle, { type: "set_session_name", name });
+		await useSessionDirectoryStore.getState().reloadSessions(session.workspaceHandle);
 	} catch (error) {
 		toast.error(tt("session.renameFailed"), {
-			description: error instanceof Error ? error.message : String(error),
+			description: displayError(error),
 		});
 	}
 }
 
 export type SubmitKind = "prompt" | "steer" | "follow_up";
 
-function isRunning(): boolean {
-	const projection = useProjectionStore.getState();
-	if (!projection.currentSessionId) return false;
-	const current = projection.projections[projection.currentSessionId];
-	return current?.activeTurnId !== null && current?.activeTurnId !== undefined;
+function isRunning(sessionHandle: string): boolean {
+	const runtime = sessionTransport.store.getState().sessions[sessionHandle]?.runtime;
+	if (runtime?.state === "running" || runtime?.state === "waiting_ui") return true;
+	const projection = useProjectionStore.getState().projections[sessionHandle];
+	return projection?.activeTurnId !== null && projection?.activeTurnId !== undefined;
 }
 
-/**
- * Submit the composer draft. While running, bare prompt is blocked and the
- * delivery mode picks steer (插队) or follow_up (排队).
- */
+/** Submit the active Session's draft with exact generation and fencing handled by the transport. */
 export async function submitDraft(kind: SubmitKind): Promise<void> {
-	const wsId = useSessionDirectoryStore.getState().currentWorkspaceId;
-	if (!wsId) {
+	let sessionHandle: string;
+	try {
+		sessionHandle = currentSessionHandle();
+	} catch {
 		toast.error(tt("session.needWorkspace"));
 		return;
 	}
 	const composer = useComposerStore.getState();
-	const text = composer.draft.trim();
-	if (!text && composer.images.length === 0) return;
+	const initial = composer.bySession[sessionHandle];
+	const text = serializeComposerMessage(initial?.command ?? null, initial?.draft ?? "");
+	if (!text && (initial?.images.length ?? 0) === 0) return;
+	if (!composer.beginSubmitForSession(sessionHandle)) return;
+	const submitted = useComposerStore.getState().bySession[sessionHandle];
+	if (!submitted) return;
 
-	const running = isRunning();
+	const running = isRunning(sessionHandle);
 	let resolvedKind: SubmitKind = kind;
-	if (running) {
-		if (kind === "prompt") resolvedKind = composer.deliveryMode === "follow_up" ? "follow_up" : "steer";
-	} else {
-		resolvedKind = "prompt";
-	}
+	if (running && kind === "prompt") {
+		resolvedKind = submitted.deliveryMode === "follow_up" ? "follow_up" : "steer";
+	} else if (!running) resolvedKind = "prompt";
 
-	const images = composer.images.length > 0 ? composer.images : undefined;
-	composer.setSubmitState("submitting");
+	const images = submitted.images.length > 0 ? submitted.images : undefined;
 	try {
 		let response: RpcResponse;
 		if (resolvedKind === "steer" || resolvedKind === "follow_up") {
-			composer.recordQueued(text, resolvedKind);
-			response = await sendControlCommand(wsId, { type: resolvedKind, message: text, images });
+			composer.recordQueuedForSession(sessionHandle, text, resolvedKind);
+			response = await sendControlCommand(sessionHandle, {
+				type: resolvedKind,
+				message: text,
+				images,
+			});
 		} else {
-			response = await sendControlCommand(wsId, { type: "prompt", message: text, images });
+			response = await sendControlCommand(sessionHandle, { type: "prompt", message: text, images });
 		}
 		if (response.success === false) {
-			toast.error(tt("session.sendFailed"), { description: response.error });
+			toast.error(tt("session.sendFailed"), { description: stripAnsi(response.error) });
 		} else {
-			composer.clearDraft();
+			useComposerStore
+				.getState()
+				.clearDraftIfUnchangedForSession(
+					sessionHandle,
+					submitted.draft,
+					submitted.images,
+					submitted.command,
+					submitted.activeSubmitId,
+				);
 		}
 	} catch (error) {
 		toast.error(tt("session.sendFailed"), {
-			description: error instanceof Error ? error.message : String(error),
+			description: displayError(error),
 		});
 	} finally {
-		composer.setSubmitState("plain");
+		useComposerStore.getState().finishSubmitForSession(sessionHandle, submitted.activeSubmitId);
+		reconcileHiddenSessionLifecycle(sessionHandle);
 	}
 }
 
 export async function abortCurrentRun(): Promise<void> {
-	const wsId = useSessionDirectoryStore.getState().currentWorkspaceId;
-	if (!wsId) return;
+	const session = useSessionDirectoryStore.getState().currentSession;
+	if (!session) return;
 	try {
-		await sendControlCommand(wsId, { type: "abort" });
+		await sendControlCommand(session.sessionHandle, { type: "abort" });
 	} catch (error) {
 		toast.error(tt("session.abortFailed"), {
-			description: error instanceof Error ? error.message : String(error),
+			description: displayError(error),
 		});
-	}
-}
-
-/** Run the /name command through the prompt path (extensions handle it). */
-export async function runSlashCommand(wsId: string, fullText: string): Promise<void> {
-	const composer = useComposerStore.getState();
-	composer.setSubmitState("submitting");
-	try {
-		const response = await sendControlCommand(wsId, { type: "prompt", message: fullText });
-		if (response.success === false) toast.error(tt("session.commandFailed"), { description: response.error });
-		else composer.clearDraft();
-	} catch (error) {
-		toast.error(tt("session.commandFailed"), {
-			description: error instanceof Error ? error.message : String(error),
-		});
-	} finally {
-		composer.setSubmitState("plain");
 	}
 }
 
 export async function forkFromEntry(entryId: string): Promise<void> {
-	const wsId = workspaceId();
 	try {
-		const response = await sendControlCommand(wsId, { type: "fork", entryId });
-		const data = expectData(response) as { text: string; cancelled: boolean };
-		if (data.cancelled) {
+		const sessionHandle = currentSessionHandle();
+		const response = await sendControlCommand(sessionHandle, { type: "fork", entryId });
+		const data = expectData(response) as { cancelled?: boolean } | undefined;
+		if (data?.cancelled) {
 			toast.info(tt("session.forkCancelled"));
 			return;
 		}
-		const stateResponse = await sendReadCommand(wsId, { type: "get_state" });
-		const state = expectData(stateResponse) as { sessionId: string };
-		await useSessionDirectoryStore.getState().reloadSessions();
-		const forked = useSessionDirectoryStore.getState().sessions.find((s) => s.id === state.sessionId);
-		if (forked) {
-			await openSession(forked);
-			toast.success(tt("session.forked"));
-		}
+		toast.success(tt("session.forked"));
 	} catch (error) {
 		toast.error(tt("session.forkFailed"), {
-			description: error instanceof Error ? error.message : String(error),
+			description: displayError(error),
 		});
 	}
 }

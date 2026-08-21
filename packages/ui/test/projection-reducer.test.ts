@@ -71,15 +71,23 @@ describe("projection reducer", () => {
 			} as never,
 			ctx,
 		);
+		p = reduceProjection(
+			p,
+			{
+				type: "message_start",
+				message: { role: "assistant", content: [] },
+			} as never,
+			ctx,
+		);
 
 		expect(p.turns).toHaveLength(1);
 		expect(p.activeTurnId).toBe("turn-1");
 		expect(p.turns[0]?.userMessages[0]?.text).toBe("hi");
+		expect(p.turns[0]?.userMessages[0]?.source).toBe("prompt");
 
-		p = reduceProjection(p, { type: "turn_start" }, ctx);
 		p = reduceProjection(p, textDelta(0, "Hel"), ctx);
 		p = reduceProjection(p, textDelta(0, "lo"), ctx);
-		expect(p.turns[0]?.steps[1]?.blocks[0]).toMatchObject({
+		expect(p.turns[0]?.steps[0]?.blocks[0]).toMatchObject({
 			type: "text",
 			markdown: "Hello",
 			isStreaming: true,
@@ -87,11 +95,11 @@ describe("projection reducer", () => {
 
 		p = reduceProjection(p, finalAssistant("Hello, world"), ctx);
 		// Final swap keeps the block key and settles the step.
-		expect(p.turns[0]?.steps[1]?.blocks[0]).toMatchObject({
+		expect(p.turns[0]?.steps[0]?.blocks[0]).toMatchObject({
 			type: "text",
 			markdown: "Hello, world",
 			isStreaming: false,
-			key: "turn-1:1:0",
+			key: "turn-1:0:0",
 		});
 
 		p = reduceProjection(p, { type: "turn_end", message: {} as never, toolResults: [] }, ctx);
@@ -299,6 +307,76 @@ describe("projection reducer", () => {
 			{ now: 2000, resolveInjectionSource: (text) => (text === "steer me" ? "steer" : undefined) },
 		);
 		expect(p.turns[0]?.userMessages[0]?.source).toBe("steer");
+	});
+
+	it("defaults a later user message to steer only after real conversation work", () => {
+		let p = createEmptyProjection("s1");
+		p = reduceProjection(p, { type: "agent_start" }, ctx);
+		p = reduceProjection(p, { type: "turn_start" }, ctx);
+		p = reduceProjection(
+			p,
+			{
+				type: "message_start",
+				message: { role: "user", content: [{ type: "text", text: "initial" }], timestamp: 0 },
+			} as never,
+			ctx,
+		);
+		p = reduceProjection(p, textDelta(0, "working"), ctx);
+		p = reduceProjection(
+			p,
+			{
+				type: "message_start",
+				message: { role: "user", content: [{ type: "text", text: "interrupt" }], timestamp: 1 },
+			} as never,
+			ctx,
+		);
+
+		expect(p.turns[0]?.userMessages.map((message) => message.source)).toEqual(["prompt", "steer"]);
+	});
+
+	it("collapses Pi-expanded skills into an invocation tag and keeps only user arguments", () => {
+		let p = createEmptyProjection("skill");
+		p = reduceProjection(
+			p,
+			{
+				type: "message_start",
+				message: {
+					role: "user",
+					content:
+						'<skill name="review" location="/private/skill/SKILL.md">\nReferences are relative to /private/skill.\n\nSECRET INTERNAL BODY\n</skill>\n\nfocus on auth',
+				},
+			} as never,
+			ctx,
+		);
+
+		expect(p.turns[0]?.userMessages[0]).toMatchObject({
+			command: "/skill:review",
+			text: "focus on auth",
+		});
+		expect(JSON.stringify(p.turns[0]?.userMessages[0])).not.toContain("SECRET INTERNAL BODY");
+	});
+
+	it("fails private when an expanded skill body contains an ambiguous closing delimiter", () => {
+		let p = createEmptyProjection("ambiguous-skill");
+		p = reduceProjection(
+			p,
+			{
+				type: "message_start",
+				message: {
+					role: "user",
+					content:
+						'<skill name="review" location="/private/skill/SKILL.md">\nExample delimiter:\n</skill>\n\nSECRET BODY AFTER EXAMPLE\n</skill>\n\nreal user args',
+				},
+			} as never,
+			ctx,
+		);
+
+		expect(p.turns[0]?.userMessages[0]).toMatchObject({
+			command: "/skill:review",
+			text: "",
+		});
+		expect(JSON.stringify(p.turns[0]?.userMessages[0])).not.toContain("SECRET");
+		expect(JSON.stringify(p.turns[0]?.userMessages[0])).not.toContain("/private");
 	});
 
 	it("aggregates compaction and retry status rows", () => {

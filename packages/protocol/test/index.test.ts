@@ -1,6 +1,18 @@
 import type { RpcResponse } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
-import { commandTimeoutMs, expectData, isErrorResponse, isWsClientMessage, RpcError } from "../src/index.js";
+import {
+	commandTimeoutMs,
+	expectData,
+	isErrorResponse,
+	isReadOnlyRpcCommand,
+	isSessionWsClientMessage,
+	isSessionWsServerMessage,
+	RpcError,
+	SESSION_IMAGE_MAX_BASE64_CHARS,
+	SESSION_TEXT_MAX_BYTES,
+	SESSION_WS_CLIENT_MAX_BYTES,
+	sessionWsClientMessageBytes,
+} from "../src/index.js";
 
 describe("protocol response helpers", () => {
 	it("returns data from successful responses", () => {
@@ -45,49 +57,191 @@ describe("gateway command deadlines", () => {
 	});
 });
 
-describe("browser frame guard", () => {
-	it("accepts supported command frames with bounded fields", () => {
+describe("Session runtime browser frame guard", () => {
+	it("accepts multi-Session subscriptions and generation-fenced commands", () => {
 		expect(
-			isWsClientMessage({
-				type: "command",
-				workspaceId: "workspace-1",
-				expectedSessionId: "session-1",
-				command: { id: "request-1", type: "prompt", message: "hello", streamingBehavior: "steer" },
+			isSessionWsClientMessage({
+				type: "session_subscribe",
+				sessionHandle: "session_native-a",
+				cursor: { generation: 4, seq: 18 },
 			}),
 		).toBe(true);
 		expect(
-			isWsClientMessage({
-				type: "extension_ui_response",
-				workspaceId: "workspace-1",
-				expectedSessionId: "session-1",
-				response: { type: "extension_ui_response", id: "dialog-1", cancelled: true },
+			isSessionWsClientMessage({
+				type: "command",
+				sessionHandle: "session_native-b",
+				expectedGeneration: 2,
+				fencingToken: "lease-token",
+				command: { id: "request-1", type: "prompt", message: "hello" },
 			}),
 		).toBe(true);
 	});
 
-	it("rejects malformed, unsupported, and overlong browser frames", () => {
-		expect(isWsClientMessage({ type: "command", workspaceId: "workspace-1" })).toBe(false);
+	it("accepts practical image payloads but bounds each image and the aggregate frame", () => {
+		const command = (
+			images: Array<{ type: "image"; data: string; mimeType: string }>,
+			message = "inspect",
+		) => ({
+			type: "command",
+			sessionHandle: "session-native-b",
+			expectedGeneration: 2,
+			fencingToken: "lease-token",
+			command: { id: "image-request", type: "prompt", message, images },
+		});
 		expect(
-			isWsClientMessage({
+			isSessionWsClientMessage(command([{ type: "image", data: "YQ==", mimeType: "image/png" }], "")),
+		).toBe(true);
+		expect(isSessionWsClientMessage(command([], ""))).toBe(false);
+		expect(
+			isSessionWsClientMessage(
+				command([{ type: "image", data: "a".repeat(1_500_000), mimeType: "image/webp" }]),
+			),
+		).toBe(true);
+		expect(
+			isSessionWsClientMessage(
+				command([{ type: "image", data: "a".repeat(2 * 1024 * 1024 + 1), mimeType: "image/png" }]),
+			),
+		).toBe(false);
+		expect(
+			isSessionWsClientMessage(
+				command(
+					Array.from({ length: 4 }, (_, index) => ({
+						type: "image" as const,
+						data: String(index).repeat(1_600_000),
+						mimeType: "image/webp",
+					})),
+				),
+			),
+		).toBe(false);
+	});
+
+	it("bounds text by UTF-8 bytes and the complete serialized browser frame", () => {
+		const command = (message: string, images?: Array<{ type: "image"; data: string; mimeType: string }>) => ({
+			type: "command",
+			sessionHandle: "session-native-b",
+			expectedGeneration: 2,
+			fencingToken: "lease-token",
+			command: { id: "utf8-request", type: "prompt", message, ...(images ? { images } : {}) },
+		});
+		const nearLimitCjk = "界".repeat(Math.floor(SESSION_TEXT_MAX_BYTES / 3));
+		const overLimitCjk = `${nearLimitCjk}界`;
+		const nearLimitImages = Array.from({ length: 3 }, () => ({
+			type: "image" as const,
+			data: "a".repeat(SESSION_IMAGE_MAX_BASE64_CHARS),
+			mimeType: "image/png",
+		}));
+
+		expect(isSessionWsClientMessage(command(nearLimitCjk))).toBe(true);
+		expect(isSessionWsClientMessage(command(overLimitCjk))).toBe(false);
+		expect(isSessionWsClientMessage(command(nearLimitCjk, nearLimitImages))).toBe(true);
+
+		const escapedText = "\\".repeat(SESSION_TEXT_MAX_BYTES);
+		const oversizedWireFrame = command(escapedText, nearLimitImages);
+		expect(sessionWsClientMessageBytes(oversizedWireFrame)).toBeGreaterThan(SESSION_WS_CLIENT_MAX_BYTES);
+		expect(isSessionWsClientMessage(oversizedWireFrame)).toBe(false);
+	});
+
+	it("rejects invalid cursors, unknown keys, and unfenced dialog responses", () => {
+		expect(
+			isSessionWsClientMessage({
 				type: "command",
-				workspaceId: "workspace-1",
-				expectedSessionId: null,
-				command: { id: "request-1", type: "unsupported" },
+				sessionHandle: "session-a",
+				expectedGeneration: null,
+				command: { type: "get_state" },
 			}),
 		).toBe(false);
 		expect(
-			isWsClientMessage({
-				type: "command",
-				workspaceId: "workspace-1",
-				expectedSessionId: null,
-				command: { type: "bash", command: "echo ok" },
+			isSessionWsClientMessage({
+				type: "session_subscribe",
+				sessionHandle: "session-a",
+				cursor: { generation: 1, seq: -1 },
 			}),
 		).toBe(false);
 		expect(
-			isWsClientMessage({
-				type: "session_listen",
-				workspaceId: "x".repeat(257),
-				sessionId: null,
+			isSessionWsClientMessage({
+				type: "session_claim",
+				sessionHandle: "session-a",
+				workspaceId: "must-not-be-trusted",
+			}),
+		).toBe(false);
+		expect(
+			isSessionWsClientMessage({
+				type: "extension_ui_response",
+				sessionHandle: "session-a",
+				expectedGeneration: 1,
+				response: { type: "extension_ui_response", id: "dialog", confirmed: true },
+			}),
+		).toBe(false);
+	});
+
+	it("accepts an intentionally empty input or editor response", () => {
+		expect(
+			isSessionWsClientMessage({
+				type: "extension_ui_response",
+				sessionHandle: "session-a",
+				expectedGeneration: 1,
+				fencingToken: "lease-a",
+				response: { type: "extension_ui_response", id: "input-a", value: "" },
+			}),
+		).toBe(true);
+	});
+
+	it("shares controller-lease command policy across browser and gateway", () => {
+		expect(isReadOnlyRpcCommand("get_state")).toBe(true);
+		expect(isReadOnlyRpcCommand({ type: "get_messages" })).toBe(true);
+		expect(isReadOnlyRpcCommand({ type: "prompt" })).toBe(false);
+	});
+
+	it("accepts valid Session server frames and rejects malformed runtime envelopes", () => {
+		const runtime = {
+			sessionHandle: "session-native",
+			workspaceId: "workspace-native",
+			nativeSessionId: "native-id",
+			sessionFile: "/tmp/native.jsonl",
+			cwd: "/tmp/workspace",
+			generation: 2,
+			lastSeq: 4,
+			state: "idle",
+			lastActivityAt: 123,
+			recoverable: true,
+		};
+		expect(isSessionWsServerMessage({ type: "runtime_state", runtime })).toBe(true);
+		expect(
+			isSessionWsServerMessage({
+				type: "extension_ui_snapshot",
+				sessionHandle: runtime.sessionHandle,
+				generation: runtime.generation,
+				requests: [
+					{
+						type: "extension_ui_request",
+						id: "dialog-1",
+						method: "confirm",
+						title: "Confirm",
+						message: "Proceed?",
+					},
+				],
+			}),
+		).toBe(true);
+		expect(
+			isSessionWsServerMessage({
+				type: "extension_ui_result",
+				sessionHandle: runtime.sessionHandle,
+				generation: runtime.generation,
+				requestId: "dialog-1",
+				outcome: "accepted",
+			}),
+		).toBe(true);
+		expect(isSessionWsServerMessage({ type: "runtime_state", runtime: { ...runtime, lastSeq: -1 } })).toBe(
+			false,
+		);
+		expect(
+			isSessionWsServerMessage({
+				type: "event",
+				sessionHandle: runtime.sessionHandle,
+				workspaceId: runtime.workspaceId,
+				generation: runtime.generation,
+				seq: 5,
+				event: {},
 			}),
 		).toBe(false);
 	});
