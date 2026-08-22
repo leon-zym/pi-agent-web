@@ -146,6 +146,15 @@ export const zhCN = {
 	"composer.unknownCommandDesc": "无法识别的 / 命令不会作为普通消息发送",
 	"composer.tooLong": "消息过长",
 	"composer.queueCount": "还有 {count} 条排队消息",
+	"composer.expand70vh": "展开至 70vh 沉浸式编辑",
+	"composer.collapse70vh": "收起 70vh 沉浸式编辑",
+	"composer.deliveryMode": "发送模式",
+	"composer.steerMode": "插队模式",
+	"composer.followUpMode": "排队模式",
+
+	// TOC
+	"toc.title": "对话大纲轨",
+	"toc.turn": "第 {n} 轮对话",
 
 	// Slash menu
 	"slash.extension": "扩展",

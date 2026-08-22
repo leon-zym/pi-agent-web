@@ -47,3 +47,59 @@ export function shouldRemoveCommandOnBackspace(input: {
 		input.selectionEnd === 0
 	);
 }
+
+export type ComposerKeyAction =
+	| { type: "submit"; mode: "prompt" | "steer" | "follow_up" }
+	| { type: "newline" }
+	| { type: "none" };
+
+/**
+ * Keybinding arbitration state machine (DESIGN.md Section 6.2):
+ * - Idle + Normal: Enter sends prompt, Shift+Enter wraps.
+ * - Idle + 70vh: Enter wraps, Cmd/Ctrl+Enter sends prompt.
+ * - Running + Normal: Enter steers, Cmd/Ctrl+Enter follow_up.
+ * - Running + 70vh: Enter wraps, Cmd/Ctrl+Enter sends with selected delivery mode.
+ */
+export function resolveComposerKeyAction(input: {
+	key: string;
+	shiftKey?: boolean;
+	metaKey?: boolean;
+	ctrlKey?: boolean;
+	composing?: boolean;
+	running: boolean;
+	isExpanded: boolean;
+	deliveryMode: DeliveryMode;
+}): ComposerKeyAction {
+	if (input.composing) return { type: "none" };
+	if (input.key !== "Enter") return { type: "none" };
+
+	const isModifier = Boolean(input.metaKey || input.ctrlKey);
+
+	if (!input.isExpanded) {
+		// Normal mode
+		if (input.shiftKey) {
+			return { type: "newline" };
+		}
+		if (input.running) {
+			if (isModifier) {
+				return { type: "submit", mode: "follow_up" };
+			}
+			return { type: "submit", mode: "steer" };
+		}
+		// Idle
+		return { type: "submit", mode: "prompt" };
+	}
+
+	// 70vh mode: Enter always wraps (newlines) unless Cmd/Ctrl is pressed
+	if (isModifier) {
+		if (input.running) {
+			return {
+				type: "submit",
+				mode: input.deliveryMode === "follow_up" ? "follow_up" : "steer",
+			};
+		}
+		return { type: "submit", mode: "prompt" };
+	}
+
+	return { type: "newline" };
+}

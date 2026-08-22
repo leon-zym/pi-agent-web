@@ -41,4 +41,30 @@ describe("SettledMarkdown image privacy", () => {
 		expect(html).toContain("bg-success-soft/30");
 		expect(html).toContain("bg-danger-soft/30");
 	});
+
+	it("bypasses DiffBlock when diff exceeds 32KB / 64KB circuit breaker and renders plain pre code", () => {
+		// Create a diff larger than 32KB
+		const largeDiff = `\`\`\`diff\n${"- old line\n+ new line\n".repeat(2000)}\`\`\``;
+		const html = renderToStaticMarkup(
+			createElement(SettledMarkdown, {
+				text: largeDiff,
+			}),
+		);
+
+		expect(html).not.toContain("data-diff-block");
+		expect(html).toContain("<pre><code");
+	});
+
+	it("skips syntax highlighting for generic code blocks exceeding 32KB / 64KB circuit breaker", () => {
+		const largeCode = `\`\`\`ts\n${"const a = 1;\n".repeat(3000)}\`\`\``;
+		const html = renderToStaticMarkup(
+			createElement(SettledMarkdown, {
+				text: largeCode,
+			}),
+		);
+
+		// Should not have hljs span token explosion
+		expect(html).not.toContain('<span class="hljs-');
+		expect(html).toContain("<pre><code");
+	});
 });

@@ -145,6 +145,15 @@ export const en: typeof zhCN = {
 	"composer.unknownCommandDesc": "Unrecognized / commands are never sent as plain prompts",
 	"composer.tooLong": "Message is too long",
 	"composer.queueCount": "{count} more queued messages",
+	"composer.expand70vh": "Expand to 70vh immersive editor",
+	"composer.collapse70vh": "Collapse 70vh immersive editor",
+	"composer.deliveryMode": "Delivery mode",
+	"composer.steerMode": "Steer mode",
+	"composer.followUpMode": "Follow-up mode",
+
+	// TOC
+	"toc.title": "Conversation Outline",
+	"toc.turn": "Turn {n}",
 
 	// Slash menu
 	"slash.extension": "Extensions",

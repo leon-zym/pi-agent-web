@@ -1,5 +1,6 @@
 import { expectData, type SessionRuntimeDto, type SessionWsServerMessage } from "@pi-agent-web/protocol";
 import { toast } from "sonner";
+import { migrateComposerHistory } from "../features/composer/use-composer-history";
 import { useComposerStore } from "../stores/composer";
 import { useExtensionUiStore } from "../stores/extension-ui";
 import { useModelDirectoryStore } from "../stores/model-directory";
@@ -260,6 +261,7 @@ function routeExtensionRequest(
 
 function routeRekey(previousSessionHandle: string, runtime: SessionRuntimeDto): void {
 	useComposerStore.getState().rekeySession(previousSessionHandle, runtime.sessionHandle);
+	migrateComposerHistory(runtime.workspaceId, previousSessionHandle, runtime.sessionHandle);
 	useSessionDirectoryStore.getState().rekeySession(previousSessionHandle, runtime.sessionHandle, runtime);
 	useExtensionUiStore.getState().resetSessionForGeneration(runtime.sessionHandle, runtime.generation);
 	scheduleDirectoryReload(runtime.workspaceId);

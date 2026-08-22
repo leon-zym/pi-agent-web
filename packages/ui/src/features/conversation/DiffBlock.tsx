@@ -1,7 +1,7 @@
 import { Check, Copy, FileCode } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { stripAnsi } from "../../lib/format";
-import { tt } from "../../lib/i18n";
+import { tt, useT } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 
 export type DiffLineKind = "add" | "delete" | "context" | "hunk" | "header";
@@ -115,8 +115,19 @@ export interface DiffBlockProps {
  * - Top action bar with Clean Copy button (strips +/- markers) and Raw Diff Copy button
  */
 export function DiffBlock({ diff, fileName, className }: DiffBlockProps) {
+	const { t } = useT();
+	void t;
 	const [copiedClean, setCopiedClean] = useState(false);
 	const [copiedRaw, setCopiedRaw] = useState(false);
+	const cleanTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const rawTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+	useEffect(() => {
+		return () => {
+			if (cleanTimerRef.current) clearTimeout(cleanTimerRef.current);
+			if (rawTimerRef.current) clearTimeout(rawTimerRef.current);
+		};
+	}, []);
 
 	const parsedLines = useMemo(() => parseUnifiedDiff(diff), [diff]);
 
@@ -127,7 +138,8 @@ export function DiffBlock({ diff, fileName, className }: DiffBlockProps) {
 				await navigator.clipboard.writeText(cleanCode);
 			}
 			setCopiedClean(true);
-			setTimeout(() => setCopiedClean(false), 2000);
+			if (cleanTimerRef.current) clearTimeout(cleanTimerRef.current);
+			cleanTimerRef.current = setTimeout(() => setCopiedClean(false), 2000);
 		} catch {}
 	};
 
@@ -137,7 +149,8 @@ export function DiffBlock({ diff, fileName, className }: DiffBlockProps) {
 				await navigator.clipboard.writeText(diff);
 			}
 			setCopiedRaw(true);
-			setTimeout(() => setCopiedRaw(false), 2000);
+			if (rawTimerRef.current) clearTimeout(rawTimerRef.current);
+			rawTimerRef.current = setTimeout(() => setCopiedRaw(false), 2000);
 		} catch {}
 	};
 

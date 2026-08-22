@@ -9,22 +9,22 @@ function PlainMarkdownFallback({ text }: { text: string }) {
 }
 
 /**
- * Assistant prose renderer: only text + streaming props.
- * Streaming stays on a stable plain-text renderer. The full Markdown parser
- * and syntax highlighter load only after settlement, keeping them out of the
- * initial bundle and off the high-frequency delta path.
+ * Assistant prose renderer with progressive streaming Markdown support:
+ * Headings, lists, bold/italic, inline code, and code blocks render progressively
+ * during streaming while enforcing syntax-highlighting circuit breakers.
  */
 export const MarkdownBlock = memo(function MarkdownBlock({
 	text,
-	streaming,
+	streaming = false,
 }: {
 	text: string;
-	streaming: boolean;
+	streaming?: boolean;
 }) {
 	const displayText = stripAnsi(text);
 
 	return (
 		<div
+			data-markdown-streaming={streaming ? "true" : undefined}
 			className={cn(
 				"min-w-0 max-w-full text-[15px] leading-[26px] break-words [overflow-wrap:anywhere] text-ink",
 				"[&_p]:my-2 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0",
@@ -46,13 +46,9 @@ export const MarkdownBlock = memo(function MarkdownBlock({
 				"[&_img]:my-2 [&_img]:max-w-full [&_img]:rounded-md",
 			)}
 		>
-			{streaming ? (
-				<PlainMarkdownFallback text={displayText} />
-			) : (
-				<Suspense fallback={<PlainMarkdownFallback text={displayText} />}>
-					<SettledMarkdown text={displayText} />
-				</Suspense>
-			)}
+			<Suspense fallback={<PlainMarkdownFallback text={displayText} />}>
+				<SettledMarkdown text={displayText} streaming={streaming} />
+			</Suspense>
 		</div>
 	);
 });
