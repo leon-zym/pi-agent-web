@@ -173,4 +173,34 @@ describe("Session-scoped extension UI", () => {
 		useExtensionUiStore.getState().closeRequestForSession("session-a", "confirm-a");
 		expect(useExtensionUiStore.getState().dialogs).toEqual([]);
 	});
+
+	it("tracks minimized dialogs per session and cleans up on dismissal", () => {
+		const store = useExtensionUiStore.getState();
+		store.beginSession("session-a");
+		store.pushDialogForSession("session-a", {
+			request: request("dlg-1"),
+			generation: 1,
+			receivedAt: Date.now(),
+		});
+
+		expect(useExtensionUiStore.getState().minimizedDialogIds["dlg-1"]).toBeUndefined();
+
+		store.minimize("dlg-1");
+		expect(useExtensionUiStore.getState().minimizedDialogIds["dlg-1"]).toBe(true);
+
+		store.toggleMinimize("dlg-1");
+		expect(useExtensionUiStore.getState().minimizedDialogIds["dlg-1"]).toBe(false);
+
+		store.toggleMinimize("dlg-1");
+		expect(useExtensionUiStore.getState().minimizedDialogIds["dlg-1"]).toBe(true);
+
+		store.maximize("dlg-1");
+		expect(useExtensionUiStore.getState().minimizedDialogIds["dlg-1"]).toBeUndefined();
+
+		store.minimize("dlg-1");
+		expect(useExtensionUiStore.getState().minimizedDialogIds["dlg-1"]).toBe(true);
+
+		store.dismissDialog("dlg-1");
+		expect(useExtensionUiStore.getState().minimizedDialogIds["dlg-1"]).toBeUndefined();
+	});
 });

@@ -1,4 +1,4 @@
-import { Check } from "lucide-react";
+import { Minus } from "lucide-react";
 import { useState } from "react";
 import { Button } from "../../components/ui/button";
 import {
@@ -12,11 +12,12 @@ import {
 import { Input } from "../../components/ui/input";
 import { Label } from "../../components/ui/label";
 import { Textarea } from "../../components/ui/textarea";
+import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
 import { displayLabel, stripAnsi } from "../../lib/format";
 import { tt } from "../../lib/i18n";
-import { cn } from "../../lib/utils";
 import { type PendingDialog, useExtensionUiStore } from "../../stores/extension-ui";
 import { useSessionTransportStore } from "../../stores/session-transport";
+import { QuestionCard } from "./QuestionCard";
 
 /**
  * Extension UI dialogs: select / confirm / input /
@@ -25,7 +26,8 @@ import { useSessionTransportStore } from "../../stores/session-transport";
  */
 export function ExtensionDialogs() {
 	const dialogs = useExtensionUiStore((s) => s.dialogs);
-	const dialog = dialogs[0];
+	const minimizedDialogIds = useExtensionUiStore((s) => s.minimizedDialogIds);
+	const dialog = dialogs.find((d) => !minimizedDialogIds[d.request.id]);
 	const canControl = useSessionTransportStore((state) => {
 		const channel = dialog ? state.sessions[dialog.sessionHandle] : undefined;
 		return Boolean(channel?.lease.isController && channel.lease.fencingToken);
@@ -43,6 +45,7 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 	);
 
 	const respond = useExtensionUiStore((s) => s.respond);
+	const minimize = useExtensionUiStore((s) => s.minimize);
 	const canControl = useSessionTransportStore((state) => {
 		const channel = state.sessions[dialog.sessionHandle];
 		return Boolean(channel?.lease.isController && channel.lease.fencingToken);
@@ -85,35 +88,33 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 				}}
 			>
 				<DialogHeader>
-					<DialogTitle>{displayLabel(request.title)}</DialogTitle>
+					<div className="flex items-center justify-between">
+						<DialogTitle>{displayLabel(request.title)}</DialogTitle>
+						<Tooltip>
+							<TooltipTrigger asChild>
+								<Button
+									variant="ghost"
+									size="icon"
+									className="-mr-1 size-7 text-ink-3 hover:text-ink"
+									aria-label={tt("ext.minimize")}
+									onClick={() => minimize(request.id)}
+								>
+									<Minus className="size-4" />
+								</Button>
+							</TooltipTrigger>
+							<TooltipContent>{tt("ext.minimize")}</TooltipContent>
+						</Tooltip>
+					</div>
 					{body && <DialogDescription>{body}</DialogDescription>}
 				</DialogHeader>
 
 				{request.method === "select" && (
-					<div className="flex flex-col gap-0.5">
-						{request.options.map((option) => (
-							<button
-								key={option}
-								type="button"
-								onClick={() => setSelected(option)}
-								disabled={!canControl || dialog.responding}
-								className={cn(
-									"flex items-center gap-2 rounded-sm px-2 py-2 text-left text-[14px] transition-colors hover:bg-hover",
-									selected === option ? "bg-hover text-ink" : "text-ink-2",
-								)}
-							>
-								<span
-									className={cn(
-										"flex size-4 shrink-0 items-center justify-center rounded-full border",
-										selected === option ? "border-primary bg-primary" : "border-border-strong",
-									)}
-								>
-									{selected === option && <Check className="size-3 text-white" />}
-								</span>
-								{displayLabel(option)}
-							</button>
-						))}
-					</div>
+					<QuestionCard
+						options={request.options}
+						selectedValue={selected}
+						onSelect={setSelected}
+						disabled={!canControl || dialog.responding}
+					/>
 				)}
 
 				{request.method === "input" && (

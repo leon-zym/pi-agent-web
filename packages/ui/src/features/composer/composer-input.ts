@@ -1,4 +1,4 @@
-import type { DeliveryMode, SlashTrigger } from "../../stores/composer";
+import type { DeliveryMode, MentionTrigger, SlashTrigger } from "../../stores/composer";
 
 export function detectSlashTrigger(text: string, cursorIndex: number): SlashTrigger | null {
 	// Pi dispatches extension, prompt-template, and skill commands only when the
@@ -9,6 +9,49 @@ export function detectSlashTrigger(text: string, cursorIndex: number): SlashTrig
 	const after = text.slice(start + 1, cursorIndex);
 	if (/\s/.test(after) || after.startsWith("/")) return null;
 	return { index: start, query: after };
+}
+
+export function detectMentionTrigger(text: string, cursorIndex: number): MentionTrigger | null {
+	const start = text.lastIndexOf("@", cursorIndex - 1);
+	if (start === -1) return null;
+	if (start > 0) {
+		const prevChar = text[start - 1];
+		if (!prevChar || !/[\s([{,;:"]/.test(prevChar)) {
+			return null;
+		}
+	}
+
+	const after = text.slice(start + 1, cursorIndex);
+	if (/[\s@]/.test(after)) return null;
+	return { index: start, query: after };
+}
+
+export function selectFileMention(
+	draft: string,
+	trigger: MentionTrigger,
+	filePath: string,
+	cursorIndex = trigger.index + 1 + trigger.query.length,
+): { draft: string; cursor: number } {
+	const before = draft.slice(0, trigger.index);
+	const after = draft.slice(cursorIndex);
+	const suffix = after.startsWith(" ") ? "" : " ";
+	const mention = `@${filePath}${suffix}`;
+	const nextDraft = `${before}${mention}${after}`;
+	return {
+		draft: nextDraft,
+		cursor: trigger.index + mention.length,
+	};
+}
+
+export function isMentionCommitKey(event: {
+	key: string;
+	shiftKey?: boolean;
+	altKey?: boolean;
+	metaKey?: boolean;
+	ctrlKey?: boolean;
+}): boolean {
+	if (event.shiftKey || event.altKey || event.metaKey || event.ctrlKey) return false;
+	return event.key === "Tab" || event.key === "Enter";
 }
 
 export function resolveRunningSubmitKind(

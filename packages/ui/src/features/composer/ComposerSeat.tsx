@@ -24,13 +24,18 @@ import { selectActiveTurnId, useProjectionStore } from "../../stores/projection"
 import { reconcileHiddenSessionLifecycle, useSessionDirectoryStore } from "../../stores/session-directory";
 import { useSessionTransportStore } from "../../stores/session-transport";
 import { useSlashCommandsStore } from "../../stores/slash-commands";
+import { ChatDock } from "../extension-ui/ChatDock";
 import { ContextMeter } from "./ContextMeter";
 import {
+	detectMentionTrigger,
 	detectSlashTrigger,
+	isMentionCommitKey,
 	isSlashCommitKey,
 	resolveComposerKeyAction,
+	selectFileMention,
 	shouldRemoveCommandOnBackspace,
 } from "./composer-input";
+import { FileMentionMenu, type FileMentionMenuHandle } from "./FileMentionMenu";
 import { ModelSelector } from "./ModelSelector";
 import { QueueDock } from "./QueueDock";
 import { SlashMenu, type SlashMenuHandle } from "./SlashMenu";
@@ -91,6 +96,7 @@ export function ComposerSeat() {
 	const draft = activeSnapshot.draft;
 	const images = activeSnapshot.images;
 	const trigger = activeSnapshot.trigger;
+	const mentionTrigger = activeSnapshot.mentionTrigger;
 	const command = activeSnapshot.command;
 	const preparingAttachments = activeSnapshot.attachmentWorkCount > 0;
 	const deliveryMode = activeSnapshot.deliveryMode;
@@ -100,6 +106,7 @@ export function ComposerSeat() {
 	const setDraft = useComposerStore((s) => s.setDraft);
 	const setImages = useComposerStore((s) => s.setImages);
 	const setTrigger = useComposerStore((s) => s.setTrigger);
+	const setMentionTrigger = useComposerStore((s) => s.setMentionTrigger);
 	const setCommand = useComposerStore((s) => s.setCommand);
 	const setDeliveryMode = useComposerStore((s) => s.setDeliveryMode);
 	const setIsExpanded = useComposerStore((s) => s.setIsExpanded);
@@ -117,6 +124,7 @@ export function ComposerSeat() {
 
 	const textareaRef = useRef<HTMLTextAreaElement>(null);
 	const slashMenuRef = useRef<SlashMenuHandle>(null);
+	const fileMentionMenuRef = useRef<FileMentionMenuHandle>(null);
 	const [composing, setComposing] = useState(false);
 
 	const commands = useSlashCommandsStore((s) => s.commands);
@@ -173,6 +181,7 @@ export function ComposerSeat() {
 		const serialized = serializeComposerMessage(command, draft);
 		history.recordPrompt(serialized);
 		setTrigger(null);
+		setMentionTrigger(null);
 		window.dispatchEvent(new CustomEvent("piweb:scroll-bottom"));
 		void submitDraft(mode);
 	};
@@ -196,6 +205,23 @@ export function ComposerSeat() {
 				return;
 			}
 		}
+		if (mentionTrigger && !composing) {
+			if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+				event.preventDefault();
+				fileMentionMenuRef.current?.move(event.key === "ArrowDown" ? 1 : -1);
+				return;
+			}
+			if (event.key === "Home" || event.key === "End") {
+				event.preventDefault();
+				fileMentionMenuRef.current?.moveTo(event.key === "Home" ? "first" : "last");
+				return;
+			}
+			if (isMentionCommitKey(event)) {
+				event.preventDefault();
+				fileMentionMenuRef.current?.commitHighlighted();
+				return;
+			}
+		}
 		if (
 			shouldRemoveCommandOnBackspace({
 				hasCommand: command !== null,
@@ -212,7 +238,7 @@ export function ComposerSeat() {
 		}
 
 		// Shell-style ArrowUp / ArrowDown history penetration
-		if (!trigger && !composing && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+		if (!trigger && !mentionTrigger && !composing && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
 			if (history.onKeyDown(event)) {
 				return;
 			}
@@ -236,8 +262,9 @@ export function ComposerSeat() {
 			return;
 		}
 
-		if (event.key === "Escape" && trigger) {
-			setTrigger(null);
+		if (event.key === "Escape") {
+			if (trigger) setTrigger(null);
+			if (mentionTrigger) setMentionTrigger(null);
 		}
 	};
 
@@ -248,6 +275,7 @@ export function ComposerSeat() {
 		const cursor = el.selectionStart ?? value.length;
 		setDraft(value);
 		setTrigger(command ? null : detectSlashTrigger(value, cursor));
+		setMentionTrigger(detectMentionTrigger(value, cursor));
 		adjustHeight();
 	};
 
@@ -276,6 +304,7 @@ export function ComposerSeat() {
 
 	return (
 		<div className="relative mx-auto w-full max-w-[780px] px-3 pb-3 sm:px-4">
+			<ChatDock />
 			<QueueDock />
 			{hasWorkspace && !canControl && (
 				<p className="mb-2 rounded-sm bg-surface-2 px-3 py-2 text-[12px] text-ink-3">
@@ -294,6 +323,28 @@ export function ComposerSeat() {
 					}}
 				/>
 			)}
+			{mentionTrigger && currentWorkspaceHandle && (
+				<FileMentionMenu
+					ref={fileMentionMenuRef}
+					workspaceHandle={currentWorkspaceHandle}
+					onSelect={(filePath) => {
+						if (!mentionTrigger) return;
+						const el = textareaRef.current;
+						const cursor = el?.selectionStart ?? draft.length;
+						const selected = selectFileMention(draft, mentionTrigger, filePath, cursor);
+						setDraft(selected.draft);
+						setMentionTrigger(null);
+						focus();
+						setTimeout(() => {
+							if (el) {
+								el.selectionStart = selected.cursor;
+								el.selectionEnd = selected.cursor;
+							}
+						}, 0);
+					}}
+				/>
+			)}
+
 			<div
 				data-testid="composer-card"
 				className={cn(
@@ -479,6 +530,7 @@ export function ComposerSeat() {
 							<Zap className="size-3 text-primary" />
 							<button
 								type="button"
+								aria-pressed={deliveryMode === "steer"}
 								onClick={() => setDeliveryMode("steer")}
 								className={cn(
 									"max-lg:min-h-10 max-lg:px-3 rounded-full px-2 py-0.5 font-medium transition-colors",
@@ -489,6 +541,7 @@ export function ComposerSeat() {
 							</button>
 							<button
 								type="button"
+								aria-pressed={deliveryMode === "follow_up"}
 								onClick={() => setDeliveryMode("follow_up")}
 								className={cn(
 									"max-lg:min-h-10 max-lg:px-3 rounded-full px-2 py-0.5 font-medium transition-colors",
@@ -506,6 +559,7 @@ export function ComposerSeat() {
 							<Zap className="size-3 text-primary" />
 							<button
 								type="button"
+								aria-pressed={deliveryMode === "steer"}
 								onClick={() => setDeliveryMode("steer")}
 								className={cn(
 									"max-lg:min-h-10 max-lg:px-3 rounded-full px-1.5 py-0.5 transition-colors",
@@ -516,6 +570,7 @@ export function ComposerSeat() {
 							</button>
 							<button
 								type="button"
+								aria-pressed={deliveryMode === "follow_up"}
 								onClick={() => setDeliveryMode("follow_up")}
 								className={cn(
 									"max-lg:min-h-10 max-lg:px-3 rounded-full px-1.5 py-0.5 transition-colors",

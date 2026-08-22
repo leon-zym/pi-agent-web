@@ -789,4 +789,58 @@ describe("native REST routes", () => {
 		);
 		expect(restart.status).toBe(404);
 	});
+
+	it("safely searches workspace files excluding git, node_modules, dist, and .pi", async () => {
+		const root = temporaryRoot();
+		const workspace = path.join(root, "my-workspace");
+		fs.mkdirSync(workspace);
+		fs.mkdirSync(path.join(workspace, "src", "components"), { recursive: true });
+		fs.mkdirSync(path.join(workspace, ".git", "objects"), { recursive: true });
+		fs.mkdirSync(path.join(workspace, "node_modules", "lib"), { recursive: true });
+		fs.mkdirSync(path.join(workspace, "dist"), { recursive: true });
+		fs.mkdirSync(path.join(workspace, ".pi"), { recursive: true });
+
+		fs.writeFileSync(path.join(workspace, "src", "index.ts"), "console.log(1)");
+		fs.writeFileSync(path.join(workspace, "src", "components", "Button.tsx"), "export const Button = 1;");
+		fs.writeFileSync(path.join(workspace, "src", "components", "Card.tsx"), "export const Card = 1;");
+		fs.writeFileSync(path.join(workspace, "package.json"), "{}");
+		fs.writeFileSync(path.join(workspace, ".git", "HEAD"), "ref");
+		fs.writeFileSync(path.join(workspace, "node_modules", "lib", "index.js"), "");
+		fs.writeFileSync(path.join(workspace, "dist", "bundle.js"), "");
+		fs.writeFileSync(path.join(workspace, ".pi", "settings.json"), "{}");
+
+		const preferences = createPreferences(root);
+		const preference = preferences.upsert({ pathHint: workspace });
+		const { app } = createHarness({ root, preferences });
+
+		const resAll = await app.request(`/workspaces/${preference.workspaceHandle}/files`);
+		expect(resAll.status).toBe(200);
+		const dataAll = await json(resAll);
+		expect(dataAll.files).toEqual(
+			expect.arrayContaining([
+				"package.json",
+				"src/index.ts",
+				"src/components/Button.tsx",
+				"src/components/Card.tsx",
+			]),
+		);
+		expect(dataAll.files).not.toEqual(
+			expect.arrayContaining([
+				expect.stringContaining(".git"),
+				expect.stringContaining("node_modules"),
+				expect.stringContaining("dist/"),
+				expect.stringContaining(".pi/"),
+			]),
+		);
+
+		// Test query filter
+		const resQuery = await app.request(`/workspaces/${preference.workspaceHandle}/files?q=Card`);
+		expect(resQuery.status).toBe(200);
+		const dataQuery = await json(resQuery);
+		expect(dataQuery.files).toEqual(["src/components/Card.tsx"]);
+
+		// Test non-existent workspace
+		const resMissing = await app.request("/workspaces/non-existent-workspace/files");
+		expect(resMissing.status).toBe(404);
+	});
 });

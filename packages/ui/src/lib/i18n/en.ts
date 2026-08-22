@@ -163,6 +163,12 @@ export const en: typeof zhCN = {
 	"slash.noMatch": "No matching commands",
 	"slash.hint": "↑↓ Select · Tab/Enter complete · Esc close",
 
+	// Mention menu
+	"mention.title": "File Mention",
+	"mention.loadingFiles": "Searching files…",
+	"mention.noMatch": "No matching files",
+	"mention.hint": "↑↓ Navigate · Tab/Enter insert · Esc dismiss",
+
 	// Model / thinking
 	"model.select": "Select model",
 	"model.none": "None",
@@ -255,6 +261,15 @@ export const en: typeof zhCN = {
 	"ext.input": "Input",
 	"ext.timeoutHint": "The extension set a timeout; it falls back to the default value.",
 	"ext.error": "Extension error",
+	"ext.minimize": "Minimize to dock",
+	"ext.maximize": "Expand dialog",
+	"ext.cancel": "Cancel",
+	"ext.confirm": "Confirm",
+	"ext.dockTitle": "Pending extension request",
+	"ext.dockDeadline": "{seconds}s remaining",
+	"ext.other": "Other…",
+	"ext.customInput": "Custom input",
+	"ext.recommended": "Recommended",
 
 	// Onboarding
 	"onboarding.title": "Configure a provider API key",

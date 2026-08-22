@@ -11,6 +11,7 @@ import { SESSION_FRAME_DEFERRED, sessionTransport } from "../stores/session-tran
 import { useSlashCommandsStore } from "../stores/slash-commands";
 import { displayError, displayLabel, stripAnsi } from "./format";
 import { tt } from "./i18n";
+import { isSoftIdempotentError } from "./session-controller";
 import { isCoalescibleMessageUpdate, SessionEventScheduler } from "./session-event-scheduler";
 
 type SessionFrameMessage = Exclude<
@@ -271,6 +272,9 @@ function routeSessionError(message: Extract<SessionWsServerMessage, { type: "ses
 	if (!isCurrentSession(message.sessionHandle)) return;
 	if (message.operation === "claim") {
 		toast.info(tt("lease.observer"), { description: stripAnsi(message.error) });
+		return;
+	}
+	if (isSoftIdempotentError(message.error)) {
 		return;
 	}
 	toast.error(stripAnsi(message.error));

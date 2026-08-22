@@ -164,6 +164,12 @@ export const zhCN = {
 	"slash.noMatch": "没有匹配的命令",
 	"slash.hint": "↑↓ 选择 · Tab/回车补全 · Esc 关闭",
 
+	// Mention menu
+	"mention.title": "文件引用",
+	"mention.loadingFiles": "正在搜索文件…",
+	"mention.noMatch": "没有匹配的文件",
+	"mention.hint": "↑↓ 选择 · Tab/回车补全 · Esc 关闭",
+
 	// Model / thinking
 	"model.select": "选择模型",
 	"model.none": "未选择",
@@ -256,6 +262,15 @@ export const zhCN = {
 	"ext.input": "输入",
 	"ext.timeoutHint": "扩展设置了超时，超时后将按默认值自动处理。",
 	"ext.error": "扩展出错",
+	"ext.minimize": "最小化到停靠栏",
+	"ext.maximize": "展开对话框",
+	"ext.cancel": "取消",
+	"ext.confirm": "确认",
+	"ext.dockTitle": "待处理扩展交互",
+	"ext.dockDeadline": "剩余 {seconds} 秒",
+	"ext.other": "其他…",
+	"ext.customInput": "自定义输入",
+	"ext.recommended": "推荐",
 
 	// Onboarding
 	"onboarding.title": "配置 Provider API Key",
