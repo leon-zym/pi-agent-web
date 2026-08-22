@@ -9,10 +9,12 @@ import { reconcileHiddenSessionLifecycle, useSessionDirectoryStore } from "../st
 import { useSessionStatsStore } from "../stores/session-stats";
 import { SESSION_FRAME_DEFERRED, sessionTransport } from "../stores/session-transport";
 import { useSlashCommandsStore } from "../stores/slash-commands";
+import { playAttentionChime, playCompletionChime } from "./audio-feedback";
 import { displayError, displayLabel, stripAnsi } from "./format";
 import { tt } from "./i18n";
 import { isSoftIdempotentError } from "./session-controller";
 import { isCoalescibleMessageUpdate, SessionEventScheduler } from "./session-event-scheduler";
+import { updateTabBadge } from "./tab-badge";
 
 type SessionFrameMessage = Exclude<
 	SessionWsServerMessage,
@@ -147,6 +149,15 @@ function routeRuntime(runtime: SessionRuntimeDto): void {
 	if (runtime.state === "crashed" && isCurrentSession(runtime.sessionHandle)) {
 		toast.error(tt("status.crashed"), { description: stripAnsi(runtime.error ?? "") });
 	}
+	if (isCurrentSession(runtime.sessionHandle)) {
+		if (runtime.state === "running") {
+			updateTabBadge("running", sessionLabel(runtime.sessionHandle));
+		} else if (runtime.state === "waiting_ui") {
+			updateTabBadge("waiting_ui", sessionLabel(runtime.sessionHandle));
+		} else if (runtime.state === "idle" || runtime.state === "dormant") {
+			updateTabBadge("idle", sessionLabel(runtime.sessionHandle));
+		}
+	}
 }
 
 function routeEvent(
@@ -199,6 +210,10 @@ function routeEvent(
 			useSessionDirectoryStore.getState().markSessionUnread(sessionHandle);
 			void useSessionStatsStore.getState().refresh(sessionHandle);
 			scheduleDirectoryReload(workspaceId);
+			void playCompletionChime();
+			if (isCurrentSession(sessionHandle)) {
+				updateTabBadge("done", sessionLabel(sessionHandle));
+			}
 			break;
 		case "compaction_end":
 			void useSessionStatsStore.getState().refresh(sessionHandle);
@@ -258,6 +273,10 @@ function routeExtensionRequest(
 	}
 	useExtensionUiStore.getState().applyRequestForSession(sessionHandle, request, generation);
 	applyVisibleExtensionTitle(sessionHandle);
+	void playAttentionChime();
+	if (isCurrentSession(sessionHandle)) {
+		updateTabBadge("waiting_ui", sessionLabel(sessionHandle));
+	}
 }
 
 function routeRekey(previousSessionHandle: string, runtime: SessionRuntimeDto): void {

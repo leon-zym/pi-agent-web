@@ -236,7 +236,7 @@ export function rebuildProjectionFromMessages(
 							toolName: block.name ?? "",
 							argsText: JSON.stringify(block.arguments ?? {}),
 							args: block.arguments,
-							status: "done" as const,
+							status: "preparing" as const,
 						};
 					}
 					return { type: "text" as const, key, markdown: block.text ?? "", isStreaming: false };
@@ -288,6 +288,24 @@ export function rebuildProjectionFromMessages(
 			applyToolResult(step, result);
 		}
 	}
+
+	// Post-processing pass: converge all tool call statuses against recorded tool results
+	for (const turn of projection.turns) {
+		for (const step of turn.steps) {
+			for (let i = 0; i < step.blocks.length; i++) {
+				const block = step.blocks[i];
+				if (block?.type === "tool_call") {
+					const result = step.toolResults.find((r) => r.toolCallId === block.toolCallId);
+					if (!result) {
+						step.blocks[i] = { ...block, status: "interrupted" };
+					} else {
+						step.blocks[i] = { ...block, status: result.isError ? "error" : "done" };
+					}
+				}
+			}
+		}
+	}
+
 	return projection;
 }
 

@@ -45,11 +45,23 @@ export const en: typeof zhCN = {
 	"status.preparing": "Preparing args",
 	"status.executing": "Executing",
 	"status.skipped": "Skipped, output truncated",
+	"status.interrupted": "Interrupted",
 	"status.thinking": "Thinking…",
 	"status.thought": "Thought",
 	"status.inProgress": "In progress",
 	"status.generatingArgs": "Generating args",
 	"status.notExecuted": "Not executed",
+
+	// Background tab status
+	"tab.running": "[Running]",
+	"tab.waitingUi": "[Waiting]",
+	"tab.done": "[Done]",
+
+	// Audio feedback
+	"audio.muted": "Sound muted",
+	"audio.unmuted": "Sound enabled",
+	"audio.toggle": "Audio chime",
+	"audio.completion": "Completion chime",
 
 	// Workspace / session sidebar
 	"sidebar.brand": "Pi Web",
@@ -355,4 +367,13 @@ export const en: typeof zhCN = {
 	"model.back": "Back",
 	"sidebar.workspaceActions": "Workspace actions",
 	"sidebar.navAria": "Sidebar",
+
+	// Mobile layout
+	"mobile.switcher": "Switch workspace & session",
+	"mobile.workspaces": "Workspaces",
+	"mobile.sessions": "Sessions",
+	"mobile.selectWorkspace": "Select workspace",
+	"mobile.selectSession": "Select session",
+	"mobile.openSwitcher": "Open switcher",
+	"mobile.closeSwitcher": "Close switcher",
 };

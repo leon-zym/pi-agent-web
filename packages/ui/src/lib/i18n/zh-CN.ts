@@ -46,11 +46,23 @@ export const zhCN = {
 	"status.preparing": "生成参数中",
 	"status.executing": "执行中",
 	"status.skipped": "因输出截断未执行",
+	"status.interrupted": "已中断",
 	"status.thinking": "思考中…",
 	"status.thought": "已思考",
 	"status.inProgress": "进行中",
 	"status.generatingArgs": "生成参数",
 	"status.notExecuted": "未执行",
+
+	// Background tab status
+	"tab.running": "[运行中]",
+	"tab.waitingUi": "[待确认]",
+	"tab.done": "[完成]",
+
+	// Audio feedback
+	"audio.muted": "提示音已静音",
+	"audio.unmuted": "提示音已开启",
+	"audio.toggle": "提示音",
+	"audio.completion": "任务完成提示音",
 
 	// Workspace / session sidebar
 	"sidebar.brand": "Pi Web",
@@ -353,4 +365,13 @@ export const zhCN = {
 	"model.back": "返回",
 	"sidebar.workspaceActions": "工作区操作",
 	"sidebar.navAria": "侧栏",
+
+	// Mobile layout
+	"mobile.switcher": "切换工作区与会话",
+	"mobile.workspaces": "工作区",
+	"mobile.sessions": "会话",
+	"mobile.selectWorkspace": "选择工作区",
+	"mobile.selectSession": "选择会话",
+	"mobile.openSwitcher": "打开切换抽屉",
+	"mobile.closeSwitcher": "关闭切换抽屉",
 };

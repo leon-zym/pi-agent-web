@@ -7,10 +7,10 @@ import { SessionHeader } from "./SessionHeader";
  * Center column: session header over the scroll viewport with the
  * persistent composer seat docked at the bottom.
  */
-export function ConversationColumn() {
+export function ConversationColumn({ hideHeader = false }: { hideHeader?: boolean } = {}) {
 	return (
 		<div className="flex h-full min-w-0 flex-col">
-			<SessionHeader />
+			{!hideHeader && <SessionHeader />}
 			<div className="relative min-h-0 flex-1">
 				<ChatViewport />
 				{/* Extension status aggregation strip sits directly above the composer. */}

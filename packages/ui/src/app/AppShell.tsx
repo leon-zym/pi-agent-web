@@ -1,13 +1,18 @@
 import { PanelRightOpen } from "lucide-react";
 import type * as React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { MobileSwitcherSheet } from "../components/mobile/MobileSwitcherSheet";
+import { MobileTopBar } from "../components/mobile/MobileTopBar";
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from "../components/ui/sheet";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../components/ui/tooltip";
 import { ConversationColumn } from "../features/conversation/ConversationColumn";
 import { DetailsPanel } from "../features/details/DetailsPanel";
 import { WorkspaceSidebar } from "../features/sidebar/WorkspaceSidebar";
 import { tt } from "../lib/i18n";
+import { newSession, openSession } from "../lib/session-controller";
 import { cn } from "../lib/utils";
+import { useSessionDirectoryStore } from "../stores/session-directory";
+import { useSessionTransportStore } from "../stores/session-transport";
 import { useViewStore } from "../stores/view";
 
 const SIDEBAR_MIN = 264;
@@ -17,6 +22,7 @@ const DETAILS_MIN = 300;
 const DETAILS_MAX = 520;
 const DETAILS_DEFAULT = 360;
 const CENTER_MIN = 640;
+const MOBILE_BREAKPOINT = 768;
 const RAIL_BREAKPOINT = 1024;
 
 const STORAGE_KEY = "pi-web-shell-widths";
@@ -51,12 +57,24 @@ function clamp(value: number, min: number, max: number): number {
  * details shrinks to 300, then moves into an overlay, and only then may the
  * center drop below 640. The sidebar can be manually reduced to a 56px rail
  * and does so automatically under 1024px.
+ * On <768px viewports, sidebar collapses into MobileTopBar & MobileSwitcherSheet.
  */
 export function AppShell() {
 	const [widths, setWidths] = useState<StoredWidths>(() => loadWidths());
 	const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
 	const [sidebarOpen, setSidebarOpen] = useState(true);
 	const [navigationOpen, setNavigationOpen] = useState(false);
+	const [mobileSwitcherOpen, setMobileSwitcherOpen] = useState(false);
+
+	const workspaces = useSessionDirectoryStore((s) => s.workspaces);
+	const currentWorkspaceHandle = useSessionDirectoryStore((s) => s.currentWorkspaceHandle);
+	const currentSession = useSessionDirectoryStore((s) => s.currentSession);
+	const sessionsByWorkspace = useSessionDirectoryStore((s) => s.sessionsByWorkspace);
+	const currentWorkspace = workspaces.find((w) => w.workspaceHandle === currentWorkspaceHandle);
+	const channel = useSessionTransportStore((state) =>
+		currentSession ? state.sessions[currentSession.sessionHandle] : undefined,
+	);
+
 	const detailsOpen = useViewStore((state) => state.rightPanelOpen);
 	const setDetailsOpen = useViewStore((state) => state.setRightPanelOpen);
 	const dragging = useRef<"sidebar" | "details" | null>(null);
@@ -68,6 +86,26 @@ export function AppShell() {
 		const observer = new ResizeObserver(() => setViewportWidth(window.innerWidth));
 		observer.observe(document.body);
 		return () => observer.disconnect();
+	}, []);
+
+	// visualViewport adaptation to prevent virtual keyboard shift (DESIGN.md 4.3)
+	useEffect(() => {
+		if (typeof window === "undefined") return;
+		const vv = window.visualViewport;
+		if (!vv) return;
+
+		const updateViewport = () => {
+			document.documentElement.style.setProperty("--app-height", `${vv.height}px`);
+			document.documentElement.style.setProperty("--app-top", `${vv.offsetTop}px`);
+		};
+
+		updateViewport();
+		vv.addEventListener("resize", updateViewport);
+		vv.addEventListener("scroll", updateViewport);
+		return () => {
+			vv.removeEventListener("resize", updateViewport);
+			vv.removeEventListener("scroll", updateViewport);
+		};
 	}, []);
 
 	const persist = useCallback((next: StoredWidths) => {
@@ -90,14 +128,15 @@ export function AppShell() {
 		[setDetailsOpen],
 	);
 
+	const isMobile = viewportWidth < MOBILE_BREAKPOINT;
 	const compact = viewportWidth < RAIL_BREAKPOINT;
 	useEffect(() => {
 		if (!compact) setNavigationOpen(false);
 	}, [compact]);
 	const sidebarRail = compact || !sidebarOpen;
-	const sidebarWidth = sidebarRail ? 56 : widths.sidebar;
+	const sidebarWidth = isMobile ? 0 : sidebarRail ? 56 : widths.sidebar;
 
-	const canDockDetails = viewportWidth - sidebarWidth >= CENTER_MIN + DETAILS_MIN;
+	const canDockDetails = !isMobile && viewportWidth - sidebarWidth >= CENTER_MIN + DETAILS_MIN;
 	// Squeeze policy: details yields first. If it cannot retain its minimum
 	// width, it moves into an overlay instead of disappearing.
 	const availableForCenter = viewportWidth - sidebarWidth - (detailsOpen ? widths.details : 0);
@@ -127,20 +166,22 @@ export function AppShell() {
 	};
 
 	return (
-		<div className="flex h-full overflow-hidden bg-base">
-			<div
-				className="min-w-0 overflow-hidden border-r border-border bg-sidebar"
-				style={{ width: sidebarWidth, flexShrink: 0 }}
-			>
-				<WorkspaceSidebar
-					rail={sidebarRail}
-					onToggleRail={compact ? undefined : () => setSidebarOpen((open) => !open)}
-					onOpenNavigation={compact ? () => updateNavigationOpen(true) : undefined}
-					navigationTriggerRef={compact ? navigationTrigger : undefined}
-				/>
-			</div>
+		<div className="flex h-full overflow-hidden bg-base" style={{ height: "var(--app-height, 100%)" }}>
+			{!isMobile && (
+				<div
+					className="min-w-0 overflow-hidden border-r border-border bg-sidebar"
+					style={{ width: sidebarWidth, flexShrink: 0 }}
+				>
+					<WorkspaceSidebar
+						rail={sidebarRail}
+						onToggleRail={compact ? undefined : () => setSidebarOpen((open) => !open)}
+						onOpenNavigation={compact ? () => updateNavigationOpen(true) : undefined}
+						navigationTriggerRef={compact ? navigationTrigger : undefined}
+					/>
+				</div>
+			)}
 
-			{!sidebarRail && (
+			{!isMobile && !sidebarRail && (
 				<button
 					type="button"
 					aria-label={tt("appShell.sidebarWidth")}
@@ -159,8 +200,18 @@ export function AppShell() {
 				/>
 			)}
 
-			<main className="min-w-0 flex-1 overflow-hidden">
-				<ConversationColumn />
+			<main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+				{isMobile && (
+					<MobileTopBar
+						workspace={currentWorkspace}
+						session={currentSession}
+						status={channel?.runtime?.state ?? "dormant"}
+						onOpenSwitcher={() => setMobileSwitcherOpen(true)}
+					/>
+				)}
+				<div className="min-h-0 flex-1 overflow-hidden">
+					<ConversationColumn hideHeader={isMobile} />
+				</div>
 			</main>
 
 			{detailsWidth === 0 && canDockDetails && (
@@ -199,19 +250,21 @@ export function AppShell() {
 			)}
 
 			{/* A docked panel stays mounted at zero width so close/open preserves local state. */}
-			<div
-				className={cn(
-					"min-w-0 shrink-0 overflow-hidden border-l border-border bg-base",
-					detailsWidth === 0 && "hidden",
-				)}
-				style={{ width: detailsWidth }}
-			>
-				{canDockDetails && (
-					<DetailsPanel open={detailsWidth > 0} onToggle={() => setDetailsOpen(!detailsOpen)} />
-				)}
-			</div>
+			{!isMobile && (
+				<div
+					className={cn(
+						"min-w-0 shrink-0 overflow-hidden border-l border-border bg-base",
+						detailsWidth === 0 && "hidden",
+					)}
+					style={{ width: detailsWidth }}
+				>
+					{canDockDetails && (
+						<DetailsPanel open={detailsWidth > 0} onToggle={() => setDetailsOpen(!detailsOpen)} />
+					)}
+				</div>
+			)}
 
-			<Sheet open={compact && navigationOpen} onOpenChange={updateNavigationOpen}>
+			<Sheet open={!isMobile && compact && navigationOpen} onOpenChange={updateNavigationOpen}>
 				<SheetContent
 					ref={navigationDrawer}
 					side="left"
@@ -248,6 +301,20 @@ export function AppShell() {
 					<DetailsPanel open onToggle={() => updateOverlayDetailsOpen(false)} />
 				</SheetContent>
 			</Sheet>
+
+			{isMobile && (
+				<MobileSwitcherSheet
+					open={mobileSwitcherOpen}
+					onOpenChange={setMobileSwitcherOpen}
+					workspaces={workspaces}
+					currentWorkspaceHandle={currentWorkspaceHandle}
+					sessionsByWorkspace={sessionsByWorkspace}
+					currentSessionHandle={currentSession?.sessionHandle}
+					onSelectWorkspace={(handle) => void useSessionDirectoryStore.getState().selectWorkspace(handle)}
+					onSelectSession={(session) => void openSession(session)}
+					onNewSession={() => void newSession()}
+				/>
+			)}
 		</div>
 	);
 }

@@ -21,7 +21,7 @@ export interface UiUserMessage {
 	delivered: boolean;
 }
 
-export type ToolCallStatus = "preparing" | "running" | "done" | "error" | "skipped";
+export type ToolCallStatus = "preparing" | "running" | "done" | "error" | "skipped" | "interrupted";
 
 export type ContentBlock =
 	| { type: "thinking"; key: string; text: string; isStreaming: boolean; redacted?: boolean }

@@ -227,6 +227,24 @@ function upsertToolResult(step: AssistantStep, result: AssistantStep["toolResult
 	return { ...step, blocks, toolResults };
 }
 
+function convergeHangingToolCalls(turn: ProductTurn): ProductTurn {
+	const steps = turn.steps.map((step) => {
+		let modified = false;
+		const blocks = step.blocks.map((block) => {
+			if (block.type === "tool_call" && (block.status === "preparing" || block.status === "running")) {
+				const hasResult = step.toolResults.some((result) => result.toolCallId === block.toolCallId);
+				if (!hasResult) {
+					modified = true;
+					return { ...block, status: "interrupted" as const };
+				}
+			}
+			return block;
+		});
+		return modified ? { ...step, blocks } : step;
+	});
+	return { ...turn, steps };
+}
+
 function upsertStatusRow(state: ConversationProjection, row: StatusRow): ConversationProjection {
 	const existing = state.statusRows.findIndex((r) => r.key === row.key);
 	if (existing === -1) return { ...state, statusRows: [...state.statusRows, row] };
@@ -409,7 +427,7 @@ function handleMessageStart(
 					toolName: block.name ?? "",
 					argsText: JSON.stringify(block.arguments ?? {}),
 					args: block.arguments,
-					status: "done" as const,
+					status: "preparing" as const,
 				};
 			}
 			return { type: "text" as const, key, markdown: block.text ?? "", isStreaming: false };
@@ -551,13 +569,13 @@ function handleMessageEnd(
 	finalTurn = withLastStep(finalTurn, settledStep);
 
 	if (message.stopReason === "error") {
-		finalTurn = {
+		finalTurn = convergeHangingToolCalls({
 			...finalTurn,
 			status: "error",
 			errorMessage: message.errorMessage ?? tt("tail.modelError"),
-		};
+		});
 	} else if (message.stopReason === "aborted") {
-		finalTurn = { ...finalTurn, status: "aborted" };
+		finalTurn = convergeHangingToolCalls({ ...finalTurn, status: "aborted" });
 	}
 
 	return withTurn(ensured.state, finalTurn);
@@ -577,7 +595,9 @@ export function reduceProjection(
 			const settled = {
 				...state,
 				turns: state.turns.map((t) =>
-					t.id === state.activeTurnId && t.status === "running" ? { ...t, status: "settled" as const } : t,
+					t.id === state.activeTurnId && t.status === "running"
+						? convergeHangingToolCalls({ ...t, status: "settled" as const })
+						: t,
 				),
 				activeTurnId: null,
 				replayable: false,
@@ -654,10 +674,17 @@ export function reduceProjection(
 		case "agent_settled": {
 			const turn = activeTurn(state);
 			if (!turn) return { ...state, replayable: true };
-			const status = turn.status === "error" || turn.status === "aborted" ? turn.status : "settled";
-			const startTime = turn.timing?.startTime ?? ctx.now;
+			const convergedTurn = convergeHangingToolCalls(turn);
+			const status =
+				convergedTurn.status === "error" || convergedTurn.status === "aborted"
+					? convergedTurn.status
+					: "settled";
+			const startTime = convergedTurn.timing?.startTime ?? ctx.now;
 			const timing = { startTime, endTime: ctx.now, durationMs: ctx.now - startTime };
-			return withTurn({ ...state, activeTurnId: null, replayable: true }, { ...turn, status, timing });
+			return withTurn(
+				{ ...state, activeTurnId: null, replayable: true },
+				{ ...convergedTurn, status, timing },
+			);
 		}
 
 		case "queue_update":

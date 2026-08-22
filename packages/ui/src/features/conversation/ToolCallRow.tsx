@@ -1,4 +1,13 @@
-import { Check, ChevronRight, CircleAlert, ExternalLink, Loader2, SkipForward, Wrench } from "lucide-react";
+import {
+	Check,
+	ChevronRight,
+	CircleAlert,
+	CircleSlash,
+	ExternalLink,
+	Loader2,
+	SkipForward,
+	Wrench,
+} from "lucide-react";
 import { useMemo, useState } from "react";
 import { stripAnsi } from "../../lib/format";
 import { tt } from "../../lib/i18n";
@@ -21,6 +30,7 @@ const STATUS_ICON: Record<
 	done: { icon: Check, className: "text-success", label: "common.done" },
 	error: { icon: CircleAlert, className: "text-danger", label: "common.error" },
 	skipped: { icon: SkipForward, className: "text-ink-3", label: "status.skipped" },
+	interrupted: { icon: CircleSlash, className: "text-ink-3", label: "status.interrupted" },
 };
 
 const MAX_TOOL_SUMMARY_CHARACTERS = 320;
@@ -145,6 +155,9 @@ export function ToolCallRow({ block, results, stacked, className }: ToolCallRowP
 				</button>
 				{block.status === "skipped" && (
 					<span className="shrink-0 text-[11px] text-ink-3">{tt("status.skipped")}</span>
+				)}
+				{block.status === "interrupted" && (
+					<span className="shrink-0 text-[11px] text-ink-3">{tt("status.interrupted")}</span>
 				)}
 			</div>
 
