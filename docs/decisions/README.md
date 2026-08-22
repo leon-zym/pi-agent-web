@@ -11,7 +11,9 @@ an ADR explains why the contract exists and which alternatives were rejected.
 | [0003](0003-session-channel-control-and-recovery.md) | Multiplexed control, ordering, replay, and recovery |
 | [0004](0004-recoverable-session-deletion.md) | Fenced, identity-bound recoverable deletion |
 | [0005](0005-conversation-rendering.md) | Multi-Session publication and measured renderer decision |
+| [0006](0006-ui-ux-design-system-and-reading-stream.md) | UI/UX design system, reading stream orchestration, and client lifecycle invariants |
 
 New ADRs use: Status, Date, Context, Decision, Consequences, Rejected alternatives, Verification.
 Accepted ADRs are amended or superseded by a later ADR; do not silently reverse them in a handoff or
 temporary note.
+
