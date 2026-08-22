@@ -75,18 +75,18 @@ describe("ConversationToc outline rail", () => {
 		expect(html).toMatch(/data-toc-tick="turn-2"[^>]*data-toc-active="true"/);
 	});
 
-	it("renders a 220px preview bubble with prompt text", () => {
+	it("renders a 220px preview bubble with prompt text when hovered", () => {
 		const html = renderToStaticMarkup(
 			createElement(ConversationToc, {
 				turns: mockTurns,
 				activeTurnId: "turn-1",
+				hoveredTurnId: "turn-1",
 				rightMargin: 300,
 			}),
 		);
 
 		expect(html).toContain("w-[220px]");
 		expect(html).toContain("First prompt about refactoring");
-		expect(html).toContain("Second prompt about adding tests");
 	});
 
 	it("auto-hides with opacity-0 and pointer-events-none when right margin < 240px", () => {

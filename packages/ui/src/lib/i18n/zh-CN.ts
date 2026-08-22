@@ -52,6 +52,7 @@ export const zhCN = {
 	"status.inProgress": "进行中",
 	"status.generatingArgs": "生成参数",
 	"status.notExecuted": "未执行",
+	"reasoning.inspectAria": "在详情面板中查看思考过程",
 
 	// Background tab status
 	"tab.running": "[运行中]",

@@ -51,6 +51,7 @@ export const en: typeof zhCN = {
 	"status.inProgress": "In progress",
 	"status.generatingArgs": "Generating args",
 	"status.notExecuted": "Not executed",
+	"reasoning.inspectAria": "Open reasoning in details panel",
 
 	// Background tab status
 	"tab.running": "[Running]",

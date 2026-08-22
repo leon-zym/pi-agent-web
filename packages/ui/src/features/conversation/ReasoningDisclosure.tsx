@@ -1,6 +1,6 @@
 import { Brain, ChevronRight, ExternalLink } from "lucide-react";
 import { type MouseEvent, useEffect, useRef, useState } from "react";
-import { stripAnsi, tailTeaser } from "../../lib/format";
+import { firstLine, stripAnsi, tailTeaser } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import { useProjectionStore } from "../../stores/projection";
@@ -69,7 +69,7 @@ export function ReasoningDisclosure({
 		}
 	};
 
-	const summary = tailTeaser(displayText);
+	const summary = firstLine(displayText) || tailTeaser(displayText);
 	const isStreaming = status === "streaming";
 	const showSweep = isStreaming && isTail && !expanded;
 
@@ -103,7 +103,7 @@ export function ReasoningDisclosure({
 				</button>
 				<button
 					type="button"
-					aria-label={tt("tool.inspectAria")}
+					aria-label={tt("reasoning.inspectAria")}
 					onClick={handleInspect}
 					className="flex size-6 shrink-0 items-center justify-center rounded-sm text-ink-3 opacity-0 transition-opacity hover:bg-hover hover:text-ink group-hover:opacity-100 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-primary/40"
 				>

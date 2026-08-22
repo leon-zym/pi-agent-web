@@ -6,6 +6,7 @@ import type { ProductTurn } from "../../types/view-models";
 export interface ConversationTocProps {
 	turns: readonly ProductTurn[];
 	activeTurnId?: string | null;
+	hoveredTurnId?: string | null;
 	rightMargin?: number;
 	className?: string;
 }
@@ -41,6 +42,7 @@ function getTurnPrompt(turn: ProductTurn): string {
 export const ConversationToc = memo(function ConversationToc({
 	turns,
 	activeTurnId: controlledActiveTurnId,
+	hoveredTurnId: controlledHoveredTurnId,
 	rightMargin: controlledRightMargin,
 	className,
 }: ConversationTocProps) {
@@ -48,8 +50,11 @@ export const ConversationToc = memo(function ConversationToc({
 	void t;
 	const [observedActiveTurnId, setObservedActiveTurnId] = useState<string | null>(null);
 	const [measuredMargin, setMeasuredMargin] = useState<number>(calculateRightMargin);
+	const [internalHoveredTurnId, setInternalHoveredTurnId] = useState<string | null>(null);
 
 	const activeTurnId = controlledActiveTurnId ?? observedActiveTurnId;
+	const hoveredTurnId =
+		controlledHoveredTurnId !== undefined ? controlledHoveredTurnId : internalHoveredTurnId;
 	const rightMargin = controlledRightMargin ?? measuredMargin;
 	const isVisible = rightMargin >= MIN_RIGHT_MARGIN;
 
@@ -135,6 +140,7 @@ export const ConversationToc = memo(function ConversationToc({
 				{turns.map((turn, index) => {
 					const prompt = getTurnPrompt(turn);
 					const isActive = turn.id === activeTurnId || (!activeTurnId && index === 0);
+					const isHovered = hoveredTurnId === turn.id;
 					const statusLabel = turn.status === "running" ? tt("status.running") : tt("common.done");
 
 					return (
@@ -145,6 +151,10 @@ export const ConversationToc = memo(function ConversationToc({
 								data-toc-active={isActive ? "true" : undefined}
 								aria-label={tt("toc.turn", { n: index + 1 })}
 								onClick={() => scrollToTurn(turn.id)}
+								onMouseEnter={() => setInternalHoveredTurnId(turn.id)}
+								onMouseLeave={() => setInternalHoveredTurnId((cur) => (cur === turn.id ? null : cur))}
+								onFocus={() => setInternalHoveredTurnId(turn.id)}
+								onBlur={() => setInternalHoveredTurnId((cur) => (cur === turn.id ? null : cur))}
 								className={cn(
 									"h-1.5 rounded-full transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none",
 									isActive
@@ -154,16 +164,19 @@ export const ConversationToc = memo(function ConversationToc({
 							/>
 
 							{/* 220px Preview Bubble */}
-							<div
-								data-testid="toc-preview-bubble"
-								className="pointer-events-none absolute top-1/2 right-full z-30 mr-3 hidden w-[220px] max-w-[220px] -translate-y-1/2 rounded-lg border border-border bg-surface p-2.5 text-xs text-ink shadow-lv2 transition-opacity duration-150 group-hover:block group-focus-within:block"
-							>
-								<div className="mb-1 flex items-center justify-between font-mono text-[10px] text-ink-3">
-									<span className="font-semibold text-primary">{tt("toc.turn", { n: index + 1 })}</span>
-									<span className="text-ink-3">{statusLabel}</span>
+							{isHovered && (
+								<div
+									data-testid="toc-preview-bubble"
+									aria-hidden="true"
+									className="pointer-events-none absolute top-1/2 right-full z-30 mr-3 w-[220px] max-w-[220px] -translate-y-1/2 rounded-lg border border-border bg-surface p-2.5 text-xs text-ink shadow-lv2 transition-opacity duration-150"
+								>
+									<div className="mb-1 flex items-center justify-between font-mono text-[10px] text-ink-3">
+										<span className="font-semibold text-primary">{tt("toc.turn", { n: index + 1 })}</span>
+										<span className="text-ink-3">{statusLabel}</span>
+									</div>
+									<p className="line-clamp-3 text-xs leading-relaxed text-ink-2 break-words">{prompt}</p>
 								</div>
-								<p className="line-clamp-3 text-xs leading-relaxed text-ink-2 break-words">{prompt}</p>
-							</div>
+							)}
 						</div>
 					);
 				})}

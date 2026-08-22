@@ -2,7 +2,6 @@ import { PanelRightOpen } from "lucide-react";
 import type * as React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { MobileSwitcherSheet } from "../components/mobile/MobileSwitcherSheet";
-import { MobileTopBar } from "../components/mobile/MobileTopBar";
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from "../components/ui/sheet";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../components/ui/tooltip";
 import { ConversationColumn } from "../features/conversation/ConversationColumn";
@@ -12,7 +11,6 @@ import { tt } from "../lib/i18n";
 import { newSession, openSession } from "../lib/session-controller";
 import { cn } from "../lib/utils";
 import { useSessionDirectoryStore } from "../stores/session-directory";
-import { useSessionTransportStore } from "../stores/session-transport";
 import { useViewStore } from "../stores/view";
 
 const SIDEBAR_MIN = 264;
@@ -70,10 +68,6 @@ export function AppShell() {
 	const currentWorkspaceHandle = useSessionDirectoryStore((s) => s.currentWorkspaceHandle);
 	const currentSession = useSessionDirectoryStore((s) => s.currentSession);
 	const sessionsByWorkspace = useSessionDirectoryStore((s) => s.sessionsByWorkspace);
-	const currentWorkspace = workspaces.find((w) => w.workspaceHandle === currentWorkspaceHandle);
-	const channel = useSessionTransportStore((state) =>
-		currentSession ? state.sessions[currentSession.sessionHandle] : undefined,
-	);
 
 	const detailsOpen = useViewStore((state) => state.rightPanelOpen);
 	const setDetailsOpen = useViewStore((state) => state.setRightPanelOpen);
@@ -134,9 +128,9 @@ export function AppShell() {
 		if (!compact) setNavigationOpen(false);
 	}, [compact]);
 	const sidebarRail = compact || !sidebarOpen;
-	const sidebarWidth = isMobile ? 0 : sidebarRail ? 56 : widths.sidebar;
+	const sidebarWidth = sidebarRail ? 56 : widths.sidebar;
 
-	const canDockDetails = !isMobile && viewportWidth - sidebarWidth >= CENTER_MIN + DETAILS_MIN;
+	const canDockDetails = viewportWidth - sidebarWidth >= CENTER_MIN + DETAILS_MIN;
 	// Squeeze policy: details yields first. If it cannot retain its minimum
 	// width, it moves into an overlay instead of disappearing.
 	const availableForCenter = viewportWidth - sidebarWidth - (detailsOpen ? widths.details : 0);
@@ -167,21 +161,19 @@ export function AppShell() {
 
 	return (
 		<div className="flex h-full overflow-hidden bg-base" style={{ height: "var(--app-height, 100%)" }}>
-			{!isMobile && (
-				<div
-					className="min-w-0 overflow-hidden border-r border-border bg-sidebar"
-					style={{ width: sidebarWidth, flexShrink: 0 }}
-				>
-					<WorkspaceSidebar
-						rail={sidebarRail}
-						onToggleRail={compact ? undefined : () => setSidebarOpen((open) => !open)}
-						onOpenNavigation={compact ? () => updateNavigationOpen(true) : undefined}
-						navigationTriggerRef={compact ? navigationTrigger : undefined}
-					/>
-				</div>
-			)}
+			<div
+				className="min-w-0 overflow-hidden border-r border-border bg-sidebar"
+				style={{ width: sidebarWidth, flexShrink: 0 }}
+			>
+				<WorkspaceSidebar
+					rail={sidebarRail}
+					onToggleRail={compact ? undefined : () => setSidebarOpen((open) => !open)}
+					onOpenNavigation={compact ? () => updateNavigationOpen(true) : undefined}
+					navigationTriggerRef={compact ? navigationTrigger : undefined}
+				/>
+			</div>
 
-			{!isMobile && !sidebarRail && (
+			{!sidebarRail && (
 				<button
 					type="button"
 					aria-label={tt("appShell.sidebarWidth")}
@@ -201,16 +193,8 @@ export function AppShell() {
 			)}
 
 			<main className="flex min-w-0 flex-1 flex-col overflow-hidden">
-				{isMobile && (
-					<MobileTopBar
-						workspace={currentWorkspace}
-						session={currentSession}
-						status={channel?.runtime?.state ?? "dormant"}
-						onOpenSwitcher={() => setMobileSwitcherOpen(true)}
-					/>
-				)}
 				<div className="min-h-0 flex-1 overflow-hidden">
-					<ConversationColumn hideHeader={isMobile} />
+					<ConversationColumn />
 				</div>
 			</main>
 
@@ -250,21 +234,19 @@ export function AppShell() {
 			)}
 
 			{/* A docked panel stays mounted at zero width so close/open preserves local state. */}
-			{!isMobile && (
-				<div
-					className={cn(
-						"min-w-0 shrink-0 overflow-hidden border-l border-border bg-base",
-						detailsWidth === 0 && "hidden",
-					)}
-					style={{ width: detailsWidth }}
-				>
-					{canDockDetails && (
-						<DetailsPanel open={detailsWidth > 0} onToggle={() => setDetailsOpen(!detailsOpen)} />
-					)}
-				</div>
-			)}
+			<div
+				className={cn(
+					"min-w-0 shrink-0 overflow-hidden border-l border-border bg-base",
+					detailsWidth === 0 && "hidden",
+				)}
+				style={{ width: detailsWidth }}
+			>
+				{canDockDetails && (
+					<DetailsPanel open={detailsWidth > 0} onToggle={() => setDetailsOpen(!detailsOpen)} />
+				)}
+			</div>
 
-			<Sheet open={!isMobile && compact && navigationOpen} onOpenChange={updateNavigationOpen}>
+			<Sheet open={compact && navigationOpen} onOpenChange={updateNavigationOpen}>
 				<SheetContent
 					ref={navigationDrawer}
 					side="left"

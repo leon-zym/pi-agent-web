@@ -2,7 +2,6 @@ import { Check, ChevronLeft, ChevronsUpDown, Settings2, Sparkles } from "lucide-
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
 import { Popover, PopoverContent, PopoverTrigger } from "../../components/ui/popover";
-import { SegmentedControl } from "../../components/ui/segmented-control";
 import { displayError, displayLabel } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
@@ -187,21 +186,9 @@ export function ModelSelector() {
 					</div>
 				)}
 				{page === "effort" && (
-					<div className="flex flex-col p-1 gap-2">
+					<div className="flex flex-col p-1 gap-1">
 						<PageHeader title={tt("model.effort")} onBack={() => setPage("root")} />
-						<div className="px-1 pt-1">
-							<SegmentedControl
-								options={thinkingLevels.map((lvl) => ({
-									value: lvl,
-									label: tt(LEVEL_LABEL[lvl] as never),
-								}))}
-								value={currentLevel}
-								onChange={(lvl) => void selectLevel(lvl)}
-								disabled={!canControl}
-								className="w-full justify-stretch [&>button]:flex-1"
-							/>
-						</div>
-						<div className="flex flex-col gap-0.5">
+						<div className="flex flex-col gap-0.5 pt-1">
 							{thinkingLevels.map((level) => (
 								<button
 									key={level}
