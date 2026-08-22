@@ -196,6 +196,13 @@ export const zhCN = {
 	"tool.command": "命令",
 	"tool.output": "输出",
 	"tool.noCommand": "无命令",
+	"toolGroup.toolCalls": "次工具调用",
+	"toolGroup.done": "✓ 完成",
+	"toolGroup.error": "✗ 出错",
+	"diff.cleanCopy": "复制纯净代码",
+	"diff.rawCopy": "复制 Diff",
+	"diff.cleanCopied": "已复制纯净代码",
+	"diff.rawCopied": "已复制 Diff",
 
 	// Turn tail
 	"tail.modelError": "模型返回错误",

@@ -28,4 +28,17 @@ describe("SettledMarkdown image privacy", () => {
 		expect(html).not.toContain("<img");
 		expect(html).not.toContain("href=");
 	});
+
+	it("intercepts language-diff and language-patch code blocks into DiffBlock", () => {
+		const diffMarkdown = "```diff\n@@ -1,2 +1,2 @@\n-old\n+new\n```";
+		const html = renderToStaticMarkup(
+			createElement(SettledMarkdown, {
+				text: diffMarkdown,
+			}),
+		);
+
+		expect(html).toContain("data-diff-block");
+		expect(html).toContain("bg-success-soft/30");
+		expect(html).toContain("bg-danger-soft/30");
+	});
 });

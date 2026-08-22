@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { displayLabel, formatExactDateTime, stripAnsi } from "../src/lib/format";
+import { displayLabel, formatExactDateTime, stripAnsi, tailTeaser } from "../src/lib/format";
 
 it("formats an exact local timestamp through seconds", () => {
 	const timestamp = new Date(2026, 7, 21, 6, 7, 8).getTime();
@@ -33,5 +33,11 @@ describe("stripAnsi", () => {
 
 	it("collapses whitespace for one-line presentation labels", () => {
 		expect(displayLabel("  title\n\u001b[31mred\u001b[0m\tvalue  ")).toBe("title red value");
+	});
+
+	it("extracts tail teaser summary from multiline text", () => {
+		expect(tailTeaser("First thought.\nSecond thought.\nFinal conclusion.")).toBe("Final conclusion.");
+		expect(tailTeaser("  \n  Single line  \n  ")).toBe("Single line");
+		expect(tailTeaser("")).toBe("");
 	});
 });

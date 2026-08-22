@@ -2,6 +2,7 @@ import type { SessionEntry, SessionTreeNode } from "@earendil-works/pi-coding-ag
 import { expectData } from "@pi-agent-web/protocol";
 import {
 	Bot,
+	Brain,
 	Bug,
 	ChevronRight,
 	GitBranch,
@@ -76,6 +77,26 @@ function InspectorView() {
 		return <p className="px-4 py-8 text-center text-[13px] text-ink-3">{tt("details.inspectorEmpty")}</p>;
 	}
 	const block = selected.block;
+	if (block.type === "thinking") {
+		return (
+			<div className="flex h-full flex-col">
+				<div className="flex flex-none items-center gap-2 border-b border-border px-4 py-3">
+					<Brain className="size-4 text-ink-3" />
+					<span className="font-mono text-[13px] font-medium text-ink">{tt("status.thinking")}</span>
+					<div className="flex-1" />
+					<Badge variant={block.isStreaming ? "primary" : "default"}>
+						{block.isStreaming ? tt("status.inProgress") : tt("status.thought")}
+					</Badge>
+				</div>
+				<div
+					data-details-output-region="true"
+					className="scroll-slim flex min-h-0 flex-1 flex-col overflow-y-auto p-4 font-mono text-xs leading-[18px] whitespace-pre-wrap break-words text-ink-2"
+				>
+					{block.text}
+				</div>
+			</div>
+		);
+	}
 	if (block.type !== "tool_call") return null;
 
 	const argsCode = formatToolArguments(block.args, block.argsText);

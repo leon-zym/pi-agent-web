@@ -195,6 +195,13 @@ export const en: typeof zhCN = {
 	"tool.command": "Command",
 	"tool.output": "Output",
 	"tool.noCommand": "No command",
+	"toolGroup.toolCalls": "tool calls",
+	"toolGroup.done": "✓ Done",
+	"toolGroup.error": "✗ Error",
+	"diff.cleanCopy": "Clean copy",
+	"diff.rawCopy": "Copy raw diff",
+	"diff.cleanCopied": "Clean code copied",
+	"diff.rawCopied": "Diff copied",
 
 	// Turn tail
 	"tail.modelError": "Model returned an error",
