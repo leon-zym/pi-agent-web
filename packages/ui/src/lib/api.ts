@@ -75,6 +75,10 @@ export const api = {
 		}),
 	activateWorkspace: (workspaceHandle: string) =>
 		request<NativeWorkspaceDto>(workspacePath(workspaceHandle, "/activate"), { method: "POST" }),
+	searchWorkspaceFiles: (workspaceHandle: string, query = "") =>
+		request<{ files: string[] }>(
+			workspacePath(workspaceHandle, `/files?q=${encodeURIComponent(query)}`),
+		).then((res) => res.files),
 
 	listSessions: (workspaceHandle: string, options: { force?: boolean } = {}) =>
 		request<NativeSessionListDto>(

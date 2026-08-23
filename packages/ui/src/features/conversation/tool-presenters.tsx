@@ -3,6 +3,7 @@ import { stripAnsi } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import type { ContentBlock, UiToolResult } from "../../types/view-models";
+import { DiffBlock } from "./DiffBlock";
 import { HighlightedCode } from "./HighlightedCode";
 
 /**
@@ -110,33 +111,7 @@ function editDiff(ctx: ToolPresenterContext): string | undefined {
 function DiffBody({ diff }: { diff: string }) {
 	return (
 		<section aria-label={tt("tool.diff")}>
-			<pre className="scroll-slim max-h-[360px] overflow-auto rounded-md border border-border bg-surface-2 py-2 font-mono text-xs leading-[18px] text-ink-2">
-				{diff.split("\n").map((line, index) => {
-					const kind =
-						line.startsWith("+") && !line.startsWith("+++")
-							? "add"
-							: line.startsWith("-") && !line.startsWith("---")
-								? "delete"
-								: line.startsWith("@@")
-									? "hunk"
-									: "context";
-					return (
-						<span
-							key={`${String(index)}:${line}`}
-							data-diff-kind={kind}
-							className={cn(
-								"block min-h-[18px] whitespace-pre px-3",
-								kind === "add" && "bg-success/10 text-success",
-								kind === "delete" && "bg-danger/10 text-danger",
-								kind === "hunk" && "text-primary",
-								kind === "context" && "text-ink-3",
-							)}
-						>
-							{line || " "}
-						</span>
-					);
-				})}
-			</pre>
+			<DiffBlock diff={diff} />
 		</section>
 	);
 }
@@ -217,6 +192,43 @@ const grepPresenter: ToolPresenter = {
 	summarize: (ctx) => argString(ctx.block.args, ["pattern"]) ?? "grep",
 };
 
+export interface DiffLineStats {
+	additions: number;
+	deletions: number;
+}
+
+export function extractDiffLineStats(diff?: string | null): DiffLineStats | null {
+	if (!diff) return null;
+	const clean = stripAnsi(diff);
+	let additions = 0;
+	let deletions = 0;
+	const lines = clean.split("\n");
+	for (const line of lines) {
+		if (line.startsWith("+++") || line.startsWith("---")) continue;
+		if (line.startsWith("+")) {
+			additions++;
+		} else if (line.startsWith("-")) {
+			deletions++;
+		}
+	}
+	if (additions === 0 && deletions === 0) return null;
+	return { additions, deletions };
+}
+
+export function toolDiffStats(ctx: ToolPresenterContext): DiffLineStats | null {
+	const diff = editDiff(ctx);
+	if (diff) return extractDiffLineStats(diff);
+	return null;
+}
+
+const writePresenter: ToolPresenter = {
+	summarize: (ctx) => {
+		const path = argString(ctx.block.args, ["TargetFile", "file_path", "path", "filePath"]);
+		const description = argString(ctx.block.args, ["Description", "description"]);
+		return path ? (description ? `${path} · ${description}` : path) : "write";
+	},
+};
+
 const genericPresenter: ToolPresenter = {
 	summarize: (ctx) => {
 		const text =
@@ -230,8 +242,14 @@ const genericPresenter: ToolPresenter = {
 const presenters = new Map<string, ToolPresenter>([
 	["bash", bashPresenter],
 	["read", readPresenter],
+	["read_file", readPresenter],
 	["edit", editPresenter],
+	["edit_file", editPresenter],
+	["write", writePresenter],
+	["write_file", writePresenter],
 	["grep", grepPresenter],
+	["grep_search", grepPresenter],
+	["find_by_name", readPresenter],
 ]);
 
 export function getToolPresenter(toolName: string): ToolPresenter {

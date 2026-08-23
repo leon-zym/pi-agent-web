@@ -14,6 +14,15 @@
    `barrierSeq`。
 6. **本机同源控制面**：只监听 loopback；Cookie、Host、Origin/Fetch Metadata 共同阻止
    任意网页驱动本机 Agent。它不是远程账户或多用户安全边界。
+7. **客户端订阅 LRU 有界淘汰（带 Running 活性守卫）**：单连接活跃订阅上限为 6；
+   **严格仅允许淘汰 `state === 'idle' && persisted` 的会话**；处于 `running`、`waiting_ui`、
+   `starting`、`unpersisted` 的会话常驻订阅，严禁退订。
+8. **悬挂工具状态收敛为 interrupted**：异常崩溃、网络断开或用户 Abort 导致未收到结果的工具调用，
+   视图层统一收敛为 `interrupted` 状态，显示弱化灰色标志，杜绝界面残留永久 Loading 假死。
+9. **乐观 User 消息以 ContentShape 对齐**：前端提交即刻乐观挂载；权威 `message_start` 到达时按
+   `contentShape`（文本特征 + 附件数）与 FIFO 队列匹配回填，消除重复与闪烁。
+10. **柔性幂等退让 (Soft Idempotency)**：针对竞争状态下的 Abort 或已失效 Extension UI 响应，
+    按柔性无操作（Soft No-op）吸收，不弹出侵入式错误 Toast。
 
 ## 拓扑
 
@@ -143,18 +152,33 @@ Pi response 可与事件交错，因此 Gateway 附加 `barrierSeq`。UI 只有�
 应用至该序号后才 resolve 调用者。fork/clone 的 `previousSessionHandle` 只迁移对应 transition
 命令和 channel，不批量改写父 Session 的其他 pending command。
 
-## 前端状态所有权
+## 前端状态所有权与生命周期不变量
 
 | 层 | 所有权 |
 |---|---|
-| `session-transport` | 单 socket、连接状态，以及每 Session runtime/cursor/lease/resync/raw-event 有界窗口 |
+| `session-transport` | 单 socket、连接状态，以及每 Session runtime/cursor/lease/resync/raw-event 有界窗口；管理最多 6 个活跃订阅的 LRU 池与 Running 守卫 |
 | `session-frame-bus` | 按 Session 保序分发；组件不直接订阅 WebSocket |
 | `session-directory` | 原生 Workspace/Session 摘要、selected pointer、请求 generation |
-| `projection` | 按 Session 的 turn/step/block 投影；recent settled projection 可淘汰并从快照重建 |
-| `composer` | 按 Session 的 draft、原子 Slash Command Token、附件、提交状态、delivery mode 与 queue 意图 |
-| `model` / `slash` / `stats` | 按 Session 的 Host 快照与刷新状态 |
-| `extension-ui` | 按 Session/generation 的 dialog、status、widget、title、editor text |
-| `view` | 本地展开、选中工具和详情面板状态；不写回 Pi |
+| `projection` | 按 Session 的 turn/step/block 投影；处理 ContentShape 乐观回填与悬挂工具 interrupted 收敛 |
+| `composer` | 按 Session 的 draft、原子 Slash Command Token、附件、提交状态、70vh 模式、delivery mode 与 queue 意图；管理 prompt 历史 |
+| `model` / `slash` / `stats` | 按 Session 的 Host 快照与刷新状态，动态 thinking levels 分段映射 |
+| `extension-ui` | 按 Session/generation 的 dialog、status、widget、title、editor text；管理 ChatDock 最小化与 QuestionCard |
+| `view` | 本地展开、选中工具、TOC 悬浮轨、移动端 Sheet 与详情面板状态；不写回 Pi |
+
+### 客户端生命周期四大不变量
+
+1. **WebSocket 活跃订阅 LRU 有界淘汰（带 Running 活性守卫）**：
+   - 限制单个客户端 WebSocket 连接的活跃订阅数上限为 `MAX_ACTIVE_SUBSCRIPTIONS = 6`；
+   - **严格活性守卫**：只有当会话满足 `state === 'idle'` 且已落盘持久化（`persisted === true`）时，才允许在超出容量时由 LRU 策略退订；
+   - 任何处于 `running`、`waiting_ui`、`starting` 或 `unpersisted` 的会话严格受保，禁止被意外退订，确保后台 Agent 任务流、Web Audio 提示音与审批弹窗持续生效。
+2. **悬挂工具状态收敛为 `interrupted`**：
+   - 当历史会话加载、当前 Turn 结算或用户触发 Abort 时，若发现仍有尚未收到结果的工具调用，视图层统一将其状态置为 `interrupted`；
+   - 渲染为低调的灰色标记，杜绝永恒 Loading Spinner，同时绝不篡改事实伪造为 `ok`。
+3. **乐观更新回填与 ContentShape 精准对齐**：
+   - 用户发送 Prompt 后，前端立即生成带 `optimistic: true` 标记的 User 消息节点；
+   - 当权威 `message_start` 到达时，通过 `contentShape`（文本特征摘要 + 附件数量）与发送 FIFO 队列严格匹配替换，避免消息重复与跳跃。
+4. **冲突与中断操作的柔性幂等退让 (Soft Idempotency)**：
+   - 用户触发 Abort、取消或提交已过期的 Extension UI 响应时，若后端返回“已结算”、“已过期”或“无进行中任务”等竞态结果，客户端统一按柔性无操作（Soft No-op）吸收，不触发红色错误 Toast。
 
 `stream-pipeline` 消费所有已订阅 Session，而不只消费当前视图。连续文本/thinking/toolcall
 delta 由 per-Session scheduler 合并：可见页用 rAF，hidden 页用有界 timer；结构、错误、settled、
@@ -192,3 +216,4 @@ Promise，关闭开始后所有新 mutation 都被拒绝。
 - 不把浏览器的 selected Session 写成 Pi 的全局“当前 Session”。
 - 不保证无限并发、无限 replay、无限 Markdown 或无限工具输出。
 - 不自动导入、复制、重写或删除用户既有 Pi JSONL。
+

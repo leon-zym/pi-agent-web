@@ -46,11 +46,24 @@ export const zhCN = {
 	"status.preparing": "生成参数中",
 	"status.executing": "执行中",
 	"status.skipped": "因输出截断未执行",
+	"status.interrupted": "已中断",
 	"status.thinking": "思考中…",
 	"status.thought": "已思考",
 	"status.inProgress": "进行中",
 	"status.generatingArgs": "生成参数",
 	"status.notExecuted": "未执行",
+	"reasoning.inspectAria": "在详情面板中查看思考过程",
+
+	// Background tab status
+	"tab.running": "[运行中]",
+	"tab.waitingUi": "[待确认]",
+	"tab.done": "[完成]",
+
+	// Audio feedback
+	"audio.muted": "提示音已静音",
+	"audio.unmuted": "提示音已开启",
+	"audio.toggle": "提示音",
+	"audio.completion": "任务完成提示音",
 
 	// Workspace / session sidebar
 	"sidebar.brand": "Pi Web",
@@ -146,6 +159,15 @@ export const zhCN = {
 	"composer.unknownCommandDesc": "无法识别的 / 命令不会作为普通消息发送",
 	"composer.tooLong": "消息过长",
 	"composer.queueCount": "还有 {count} 条排队消息",
+	"composer.expand70vh": "展开至 70vh 沉浸式编辑",
+	"composer.collapse70vh": "收起 70vh 沉浸式编辑",
+	"composer.deliveryMode": "发送模式",
+	"composer.steerMode": "插队模式",
+	"composer.followUpMode": "排队模式",
+
+	// TOC
+	"toc.title": "对话大纲轨",
+	"toc.turn": "第 {n} 轮对话",
 
 	// Slash menu
 	"slash.extension": "扩展",
@@ -154,6 +176,12 @@ export const zhCN = {
 	"slash.loadingCommands": "正在加载命令…",
 	"slash.noMatch": "没有匹配的命令",
 	"slash.hint": "↑↓ 选择 · Tab/回车补全 · Esc 关闭",
+
+	// Mention menu
+	"mention.title": "文件引用",
+	"mention.loadingFiles": "正在搜索文件…",
+	"mention.noMatch": "没有匹配的文件",
+	"mention.hint": "↑↓ 选择 · Tab/回车补全 · Esc 关闭",
 
 	// Model / thinking
 	"model.select": "选择模型",
@@ -196,6 +224,13 @@ export const zhCN = {
 	"tool.command": "命令",
 	"tool.output": "输出",
 	"tool.noCommand": "无命令",
+	"toolGroup.toolCalls": "次工具调用",
+	"toolGroup.done": "✓ 完成",
+	"toolGroup.error": "✗ 出错",
+	"diff.cleanCopy": "复制纯净代码",
+	"diff.rawCopy": "复制 Diff",
+	"diff.cleanCopied": "已复制纯净代码",
+	"diff.rawCopied": "已复制 Diff",
 
 	// Turn tail
 	"tail.modelError": "模型返回错误",
@@ -240,6 +275,15 @@ export const zhCN = {
 	"ext.input": "输入",
 	"ext.timeoutHint": "扩展设置了超时，超时后将按默认值自动处理。",
 	"ext.error": "扩展出错",
+	"ext.minimize": "最小化到停靠栏",
+	"ext.maximize": "展开对话框",
+	"ext.cancel": "取消",
+	"ext.confirm": "确认",
+	"ext.dockTitle": "待处理扩展交互",
+	"ext.dockDeadline": "剩余 {seconds} 秒",
+	"ext.other": "其他…",
+	"ext.customInput": "自定义输入",
+	"ext.recommended": "推荐",
 
 	// Onboarding
 	"onboarding.title": "配置 Provider API Key",
@@ -322,4 +366,13 @@ export const zhCN = {
 	"model.back": "返回",
 	"sidebar.workspaceActions": "工作区操作",
 	"sidebar.navAria": "侧栏",
+
+	// Mobile layout
+	"mobile.switcher": "切换工作区与会话",
+	"mobile.workspaces": "工作区",
+	"mobile.sessions": "会话",
+	"mobile.selectWorkspace": "选择工作区",
+	"mobile.selectSession": "选择会话",
+	"mobile.openSwitcher": "打开切换抽屉",
+	"mobile.closeSwitcher": "关闭切换抽屉",
 };

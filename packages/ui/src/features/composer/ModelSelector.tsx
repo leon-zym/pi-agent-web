@@ -2,6 +2,7 @@ import { Check, ChevronLeft, ChevronsUpDown, Settings2, Sparkles } from "lucide-
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
 import { Popover, PopoverContent, PopoverTrigger } from "../../components/ui/popover";
+import { SegmentedControl } from "../../components/ui/segmented-control";
 import { displayError, displayLabel } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
@@ -186,25 +187,23 @@ export function ModelSelector() {
 					</div>
 				)}
 				{page === "effort" && (
-					<div className="flex flex-col p-0.5">
+					<div className="flex flex-col p-1 gap-2">
 						<PageHeader title={tt("model.effort")} onBack={() => setPage("root")} />
-						{thinkingLevels.map((level) => (
-							<button
-								key={level}
-								type="button"
-								className={cn(
-									"flex min-h-10 w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-[13px] transition-colors hover:bg-hover lg:min-h-0",
-									currentLevel === level ? "text-primary" : "text-ink",
-								)}
+						<div className="p-1">
+							<SegmentedControl
+								className="w-full justify-between"
+								value={currentLevel}
+								onChange={(level) => void selectLevel(level)}
 								disabled={!canControl}
-								onClick={() => void selectLevel(level)}
-							>
-								<span className="flex-1">{tt(LEVEL_LABEL[level] as never)}</span>
-								{currentLevel === level && <Check className="size-4" />}
-							</button>
-						))}
+								options={thinkingLevels.map((level) => ({
+									value: level,
+									label: tt(LEVEL_LABEL[level] as never),
+								}))}
+							/>
+						</div>
 					</div>
 				)}
+
 				<p className="mt-1 border-t border-border px-2 pt-2 pb-1 text-[11px] leading-4 text-ink-3">
 					{tt(runtimeBusy ? "model.nextRequestBusy" : "model.nextRequest")}
 				</p>

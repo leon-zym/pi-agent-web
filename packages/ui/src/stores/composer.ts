@@ -10,6 +10,13 @@ export interface SlashTrigger {
 	query: string;
 }
 
+export interface MentionTrigger {
+	/** Index in the draft where the "@" token starts. */
+	index: number;
+	/** Current query after the "@" (no whitespace). */
+	query: string;
+}
+
 export interface RecentQueued {
 	text: string;
 	source: "steer" | "follow_up";
@@ -34,6 +41,7 @@ export interface ComposerSnapshot {
 	draft: string;
 	images: ImageContent[];
 	trigger: SlashTrigger | null;
+	mentionTrigger: MentionTrigger | null;
 	command: SlashCommandToken | null;
 	submitState: "plain" | "submitting";
 	activeSubmitId: number | null;
@@ -42,6 +50,7 @@ export interface ComposerSnapshot {
 	deliveryMode: DeliveryMode;
 	queue: { steering: string[]; followUp: string[] };
 	recentQueued: RecentQueued[];
+	isExpanded: boolean;
 }
 
 interface ComposerState extends ComposerSnapshot {
@@ -49,6 +58,8 @@ interface ComposerState extends ComposerSnapshot {
 	activeSessionHandle: string | null;
 	beginSession: (sessionHandle: string | null) => void;
 	forgetSession: (sessionHandle: string) => void;
+	setIsExpanded: (expanded: boolean) => void;
+	setIsExpandedForSession: (sessionHandle: string, expanded: boolean) => void;
 	setDraft: (draft: string) => void;
 	setDraftForSession: (sessionHandle: string, draft: string) => void;
 	setImages: (images: ImageContent[]) => void;
@@ -61,7 +72,10 @@ interface ComposerState extends ComposerSnapshot {
 	) => void;
 	setTrigger: (trigger: SlashTrigger | null) => void;
 	setTriggerForSession: (sessionHandle: string, trigger: SlashTrigger | null) => void;
+	setMentionTrigger: (mentionTrigger: MentionTrigger | null) => void;
+	setMentionTriggerForSession: (sessionHandle: string, mentionTrigger: MentionTrigger | null) => void;
 	setCommand: (command: SlashCommandToken | null) => void;
+
 	setCommandForSession: (sessionHandle: string, command: SlashCommandToken | null) => void;
 	setSubmitState: (state: "plain" | "submitting") => void;
 	setSubmitStateForSession: (sessionHandle: string, state: "plain" | "submitting") => void;
@@ -107,6 +121,7 @@ function emptySnapshot(): ComposerSnapshot {
 		draft: "",
 		images: [],
 		trigger: null,
+		mentionTrigger: null,
 		command: null,
 		submitState: "plain",
 		activeSubmitId: null,
@@ -115,6 +130,7 @@ function emptySnapshot(): ComposerSnapshot {
 		deliveryMode: "auto",
 		queue: { steering: [], followUp: [] },
 		recentQueued: [],
+		isExpanded: false,
 	};
 }
 
@@ -123,6 +139,7 @@ function visible(snapshot: ComposerSnapshot): ComposerSnapshot {
 		draft: snapshot.draft,
 		images: snapshot.images,
 		trigger: snapshot.trigger,
+		mentionTrigger: snapshot.mentionTrigger,
 		command: snapshot.command,
 		submitState: snapshot.submitState,
 		activeSubmitId: snapshot.activeSubmitId,
@@ -131,6 +148,7 @@ function visible(snapshot: ComposerSnapshot): ComposerSnapshot {
 		deliveryMode: snapshot.deliveryMode,
 		queue: snapshot.queue,
 		recentQueued: snapshot.recentQueued,
+		isExpanded: snapshot.isExpanded,
 	};
 }
 
@@ -175,6 +193,14 @@ export const useComposerStore = create<ComposerState>()((set, get) => {
 						: {}),
 				};
 			}),
+
+		setIsExpanded: (isExpanded) => {
+			const handle = get().activeSessionHandle;
+			if (handle) get().setIsExpandedForSession(handle, isExpanded);
+			else set({ isExpanded });
+		},
+		setIsExpandedForSession: (sessionHandle, isExpanded) =>
+			updateSession(sessionHandle, (snapshot) => ({ ...snapshot, isExpanded })),
 
 		setDraft: (draft) => {
 			const handle = get().activeSessionHandle;
@@ -222,6 +248,13 @@ export const useComposerStore = create<ComposerState>()((set, get) => {
 		},
 		setTriggerForSession: (sessionHandle, trigger) =>
 			updateSession(sessionHandle, (snapshot) => ({ ...snapshot, trigger })),
+
+		setMentionTrigger: (mentionTrigger) => {
+			const handle = get().activeSessionHandle;
+			if (handle) get().setMentionTriggerForSession(handle, mentionTrigger);
+		},
+		setMentionTriggerForSession: (sessionHandle, mentionTrigger) =>
+			updateSession(sessionHandle, (snapshot) => ({ ...snapshot, mentionTrigger })),
 
 		setCommand: (command) => {
 			const handle = get().activeSessionHandle;
@@ -314,6 +347,7 @@ export const useComposerStore = create<ComposerState>()((set, get) => {
 				draft: "",
 				images: [],
 				trigger: null,
+				mentionTrigger: null,
 				command: null,
 			})),
 

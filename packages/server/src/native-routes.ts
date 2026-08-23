@@ -154,6 +154,23 @@ export function createNativeRoutes(ctx: NativeRoutesContext): Hono {
 		return c.json(activated.dto);
 	});
 
+	app.get("/workspaces/:workspaceHandle/files", async (c) => {
+		const workspaceHandle = c.req.param("workspaceHandle");
+		const query = c.req.query("q") ?? "";
+		const snapshot = await ctx.catalog.refresh();
+		const workspace = await requireWorkspace(
+			snapshot,
+			ctx.preferences,
+			workspaceHandle,
+			ctx.supervisor.listRuntimes(),
+		);
+		if (!workspace.dto.path || !workspace.dto.available) {
+			throw new NativeRouteError(409, "workspace_unavailable", "workspace is not an available directory");
+		}
+		const files = await walkAndFilterFiles(workspace.dto.path, query);
+		return c.json({ files });
+	});
+
 	app.get("/workspaces/:workspaceHandle/sessions", async (c) => {
 		const workspaceHandle = c.req.param("workspaceHandle");
 		const snapshot = await ctx.catalog.refresh({ force: c.req.query("refresh") === "1" });
@@ -383,6 +400,59 @@ async function validateWorkspacePath(input: string): Promise<string> {
 		);
 	}
 	return canonicalizePathAllowMissing(canonical);
+}
+
+const EXCLUDED_SCAN_DIRS = new Set([".git", "node_modules", "dist", ".pi"]);
+const MAX_SEARCH_RESULTS = 50;
+const MAX_DIRECTORY_SCANS = 300;
+
+async function walkAndFilterFiles(rootPath: string, query: string): Promise<string[]> {
+	const results: string[] = [];
+	const lowerQuery = query.slice(0, 200).toLowerCase().trim();
+	const queue: string[] = [""];
+	let scannedDirs = 0;
+
+	while (queue.length > 0 && results.length < MAX_SEARCH_RESULTS && scannedDirs < MAX_DIRECTORY_SCANS) {
+		const relDir = queue.shift()!;
+		scannedDirs += 1;
+		const fullDir = relDir ? path.join(rootPath, relDir) : rootPath;
+		let entries: fs.Dirent[];
+		try {
+			entries = await fs.promises.readdir(fullDir, { withFileTypes: true });
+		} catch {
+			continue;
+		}
+
+		entries.sort((a, b) => a.name.localeCompare(b.name));
+
+		for (const entry of entries) {
+			if (results.length >= MAX_SEARCH_RESULTS) break;
+			if (EXCLUDED_SCAN_DIRS.has(entry.name)) continue;
+
+			const relPath = relDir ? `${relDir}/${entry.name}` : entry.name;
+			if (entry.isDirectory()) {
+				queue.push(relPath);
+			} else if (entry.isFile()) {
+				if (!lowerQuery || relPath.toLowerCase().includes(lowerQuery)) {
+					results.push(relPath);
+				}
+			} else if (entry.isSymbolicLink()) {
+				try {
+					const fullPath = path.join(fullDir, entry.name);
+					const real = await fs.promises.realpath(fullPath);
+					const stat = await fs.promises.stat(real);
+					if (stat.isFile() && (real === rootPath || real.startsWith(`${rootPath}${path.sep}`))) {
+						if (!lowerQuery || relPath.toLowerCase().includes(lowerQuery)) {
+							results.push(relPath);
+						}
+					}
+				} catch {
+					// Broken or circular symlink - skip safely
+				}
+			}
+		}
+	}
+	return results;
 }
 
 async function projectWorkspaces(

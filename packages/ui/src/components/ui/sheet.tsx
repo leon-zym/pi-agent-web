@@ -19,7 +19,7 @@ function SheetContent({
 	showCloseButton = true,
 	...props
 }: React.ComponentProps<typeof SheetPrimitive.Content> & {
-	side?: "right" | "left";
+	side?: "right" | "left" | "top" | "bottom";
 	showCloseButton?: boolean;
 }) {
 	return (
@@ -31,8 +31,11 @@ function SheetContent({
 			<SheetPrimitive.Content
 				data-slot="sheet-content"
 				className={cn(
-					"fixed inset-y-0 z-50 flex h-full w-80 flex-col overflow-hidden border-border bg-base shadow-lv3 outline-none overscroll-contain",
-					side === "right" ? "right-0 border-l" : "left-0 border-r",
+					"fixed z-50 flex flex-col overflow-hidden border-border bg-base shadow-lv3 outline-none overscroll-contain",
+					side === "right" && "inset-y-0 right-0 h-full w-80 border-l",
+					side === "left" && "inset-y-0 left-0 h-full w-80 border-r",
+					side === "bottom" && "inset-x-0 bottom-0 max-h-[85vh] w-full border-t rounded-t-xl",
+					side === "top" && "inset-x-0 top-0 max-h-[85vh] w-full border-b rounded-b-xl",
 					className,
 				)}
 				{...props}
@@ -69,4 +72,12 @@ function SheetDescription({ className, ...props }: React.ComponentProps<typeof S
 	);
 }
 
-export { Sheet, SheetClose, SheetContent, SheetDescription, SheetTitle };
+function SheetHeader({ className, ...props }: React.ComponentProps<"div">) {
+	return <div data-slot="sheet-header" className={cn("flex flex-col gap-1.5", className)} {...props} />;
+}
+
+function SheetFooter({ className, ...props }: React.ComponentProps<"div">) {
+	return <div data-slot="sheet-footer" className={cn("flex flex-col gap-2 mt-auto", className)} {...props} />;
+}
+
+export { Sheet, SheetClose, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle };

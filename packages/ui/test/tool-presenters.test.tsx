@@ -57,8 +57,8 @@ describe("tool presenters", () => {
 		expect(html).toContain('data-diff-kind="hunk"');
 		expect(html).toContain('data-diff-kind="delete"');
 		expect(html).toContain('data-diff-kind="add"');
-		expect(html).toContain("-old");
-		expect(html).toContain("+new");
+		expect(html).toContain("old");
+		expect(html).toContain("new");
 	});
 
 	it("falls back to the generic body when Pi supplies no diff details", () => {
@@ -147,7 +147,7 @@ describe("tool presenters", () => {
 				]}
 			/>,
 		);
-		expect(failedEdit).toContain("-old");
+		expect(failedEdit).toContain("old");
 		expect(failedEdit.split(editFailure)).toHaveLength(2);
 	});
 
@@ -199,5 +199,51 @@ describe("tool presenters", () => {
 		expect(Buffer.byteLength(command, "utf8")).toBeGreaterThan(2 * 1024 * 1024);
 		expect(html.includes("E2E_BASH_TAIL")).toBe(false);
 		expect(html.length).toBeLessThan(10_000);
+	});
+
+	it("renders line diff badge (+N -M) in ToolCallRow for file modification tools", () => {
+		const html = renderToStaticMarkup(
+			<ToolCallRow
+				block={{
+					type: "tool_call",
+					key: "edit-stats",
+					toolCallId: "call-stats",
+					toolName: "edit",
+					argsText: "",
+					args: { path: "index.ts" },
+					status: "done",
+				}}
+				results={[
+					{
+						toolCallId: "call-stats",
+						toolName: "edit",
+						content: "Applied edit",
+						isError: false,
+						details: { diff: "@@ -1,5 +1,6 @@\n-old\n-deprecated\n+new\n+improved\n+fast\n context" },
+					},
+				]}
+			/>,
+		);
+
+		expect(html).toContain('data-testid="tool-diff-badge"');
+		expect(html).toContain("+3");
+		expect(html).toContain("-2");
+	});
+
+	it("summarizes write tool calls with file path and description", () => {
+		const presenter = getToolPresenter("write");
+		const summary = presenter.summarize({
+			block: {
+				type: "tool_call",
+				key: "write-1",
+				toolCallId: "call-w1",
+				toolName: "write",
+				argsText: "",
+				args: { TargetFile: "src/button.tsx", Description: "Add button component" },
+				status: "done",
+			},
+			results: [],
+		});
+		expect(summary).toBe("src/button.tsx · Add button component");
 	});
 });

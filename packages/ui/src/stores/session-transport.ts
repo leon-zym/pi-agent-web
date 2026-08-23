@@ -60,6 +60,7 @@ const DEFAULT_RECONNECT_BASE_MS = 500;
 const DEFAULT_RECONNECT_MAX_MS = 8_000;
 const MAX_RESYNC_BUFFERED_FRAMES = 1_024;
 const MAX_RESYNC_BUFFERED_BYTES = 1024 * 1024;
+export const MAX_ACTIVE_SUBSCRIPTIONS = 6;
 const MAX_PENDING_EXTENSION_REQUESTS = 256;
 
 type WireSendResult = "sent" | "payload_too_large" | "unavailable";
@@ -202,6 +203,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	);
 	const reconnectBaseMs = Math.max(0, options.reconnectBaseMs ?? DEFAULT_RECONNECT_BASE_MS);
 	const reconnectMaxMs = Math.max(reconnectBaseMs, options.reconnectMaxMs ?? DEFAULT_RECONNECT_MAX_MS);
+	const maxActiveSubscriptions = Math.max(1, options.maxActiveSubscriptions ?? MAX_ACTIVE_SUBSCRIPTIONS);
 	const frameBus = new OrderedSessionFrameBus();
 	const globalBus = new SessionTransportGlobalBus();
 	const pendingCommands = new Map<string, PendingCommand>();
@@ -211,6 +213,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	const claimAttempts = new Set<string>();
 	const baselineRefreshes = new Set<string>();
 	const subscriptionBaselines = new Set<string>();
+	let subscribedLruOrder: string[] = [];
 	let retainedRawEvents: RetainedRawEvent[] = [];
 	let retainedRawEventBytes = 0;
 
@@ -354,9 +357,44 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		}
 	}
 
+	function touchSubscriptionLru(sessionHandle: string): void {
+		const index = subscribedLruOrder.indexOf(sessionHandle);
+		if (index !== -1) {
+			subscribedLruOrder.splice(index, 1);
+		}
+		subscribedLruOrder.push(sessionHandle);
+	}
+
+	function evictSubscriptionLruIfNeeded(incomingSessionHandle: string): void {
+		const state = store.getState();
+		const subscribedSessions = Object.values(state.sessions).filter((s) => s.subscribed);
+		if (subscribedSessions.length < maxActiveSubscriptions) return;
+
+		for (const candidateHandle of [...subscribedLruOrder]) {
+			if (candidateHandle === incomingSessionHandle) continue;
+			const candidate = state.sessions[candidateHandle];
+			if (!candidate?.subscribed) continue;
+
+			const isIdle = candidate.runtime?.state === "idle" || candidate.runtime?.state === "dormant";
+			const isPersisted =
+				candidate.runtime?.sessionFile !== null && candidate.runtime?.sessionFile !== undefined;
+			const hasNoPendingExt = candidate.pendingExtensionRequests.length === 0;
+
+			if (isIdle && isPersisted && hasNoPendingExt) {
+				unsubscribeSession(candidateHandle);
+				break;
+			}
+		}
+	}
+
 	function subscribeSession(sessionHandle: string): void {
 		if (!sessionHandle) return;
-		if (store.getState().sessions[sessionHandle]?.subscribed) return;
+		if (store.getState().sessions[sessionHandle]?.subscribed) {
+			touchSubscriptionLru(sessionHandle);
+			return;
+		}
+		evictSubscriptionLruIfNeeded(sessionHandle);
+		touchSubscriptionLru(sessionHandle);
 		const channel = setChannel(sessionHandle, (current) =>
 			current.subscribed ? current : { ...current, subscribed: true },
 		);
@@ -368,6 +406,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	function unsubscribeSession(sessionHandle: string): void {
 		const channel = store.getState().sessions[sessionHandle];
 		if (!channel?.subscribed) return;
+		const lruIdx = subscribedLruOrder.indexOf(sessionHandle);
+		if (lruIdx !== -1) subscribedLruOrder.splice(lruIdx, 1);
 		setChannel(sessionHandle, (current) => ({
 			...current,
 			subscribed: false,
@@ -1262,6 +1302,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		if (subscriptionBaselines.delete(previousSessionHandle)) subscriptionBaselines.add(sessionHandle);
 		discardRawEvents(sessionHandle, false);
 		if (claimAttempts.delete(previousSessionHandle)) claimAttempts.add(sessionHandle);
+		const prevIdx = subscribedLruOrder.indexOf(previousSessionHandle);
+		if (prevIdx !== -1) subscribedLruOrder.splice(prevIdx, 1);
+		touchSubscriptionLru(sessionHandle);
 		frameBus.rekey(previousSessionHandle, sessionHandle);
 		store.setState({ sessions });
 		const delivery = frameBus.emit(sessionHandle, message, now());
@@ -1304,6 +1347,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		claimAttempts.clear();
 		baselineRefreshes.clear();
 		subscriptionBaselines.clear();
+		subscribedLruOrder = [];
 		retainedRawEvents = [];
 		retainedRawEventBytes = 0;
 		frameBus.clear();

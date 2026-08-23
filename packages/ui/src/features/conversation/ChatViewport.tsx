@@ -5,6 +5,7 @@ import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import { useProjectionStore } from "../../stores/projection";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
+import { ConversationToc } from "./ConversationToc";
 import { EmptyHero } from "./EmptyHero";
 import { StatusRowView } from "./StatusRowView";
 import { TurnView } from "./TurnView";
@@ -120,7 +121,7 @@ export function ChatViewport() {
 		(smooth = false) => {
 			const el = scrollRef.current;
 			if (!el) return;
-			const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+			const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ?? false;
 			el.scrollTo({ top: el.scrollHeight, behavior: smooth && !reduceMotion ? "smooth" : "auto" });
 			pinnedRef.current = true;
 			setPinned(true);
@@ -212,6 +213,8 @@ export function ChatViewport() {
 					</div>
 				)}
 			</div>
+
+			<ConversationToc turns={projection?.turns ?? []} />
 
 			{/* Bottom fade into the composer area. */}
 			<div className="pointer-events-none sticky bottom-0 -mt-10 h-10 bg-gradient-to-t from-base to-transparent" />

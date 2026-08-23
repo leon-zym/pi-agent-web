@@ -1,4 +1,13 @@
-import { Check, ChevronRight, CircleAlert, ExternalLink, Loader2, SkipForward, Wrench } from "lucide-react";
+import {
+	Check,
+	ChevronRight,
+	CircleAlert,
+	CircleSlash,
+	ExternalLink,
+	Loader2,
+	SkipForward,
+	Wrench,
+} from "lucide-react";
 import { useMemo, useState } from "react";
 import { stripAnsi } from "../../lib/format";
 import { tt } from "../../lib/i18n";
@@ -8,7 +17,7 @@ import { useViewStore } from "../../stores/view";
 import type { ContentBlock, UiToolResult } from "../../types/view-models";
 import { formatToolArguments } from "./code-display";
 import { HighlightedCode } from "./HighlightedCode";
-import { getToolPresenter, toolOutputText } from "./tool-presenters";
+import { getToolPresenter, toolDiffStats, toolOutputText } from "./tool-presenters";
 
 type ToolCallBlock = Extract<ContentBlock, { type: "tool_call" }>;
 
@@ -21,6 +30,7 @@ const STATUS_ICON: Record<
 	done: { icon: Check, className: "text-success", label: "common.done" },
 	error: { icon: CircleAlert, className: "text-danger", label: "common.error" },
 	skipped: { icon: SkipForward, className: "text-ink-3", label: "status.skipped" },
+	interrupted: { icon: CircleSlash, className: "text-ink-3", label: "status.interrupted" },
 };
 
 const MAX_TOOL_SUMMARY_CHARACTERS = 320;
@@ -79,22 +89,30 @@ export function ExpandedToolCallBody({ block, results }: { block: ToolCallBlock;
 	);
 }
 
+export interface ToolCallRowProps {
+	block: ToolCallBlock;
+	results: UiToolResult[];
+	stacked?: boolean;
+	className?: string;
+}
+
 /**
  * Tool call as a first-class inline node (never inside markdown):
  * collapsed summary row, two-phase status, inline expansion capped at
  * terminal 224px / code 260px; the full log goes to the right inspector.
  */
-export function ToolCallRow({ block, results }: { block: ToolCallBlock; results: UiToolResult[] }) {
+export function ToolCallRow({ block, results, stacked, className }: ToolCallRowProps) {
 	const [expanded, setExpanded] = useState(false);
 	const presenter = getToolPresenter(block.toolName);
 	const presenterContext = toolContext(block, results);
 	const summary = boundedToolSummary(presenter.summarize(presenterContext));
+	const diffStats = toolDiffStats(presenterContext);
 	const effectiveStatus = results.some((result) => result.isError) ? "error" : block.status;
 	const status = STATUS_ICON[effectiveStatus];
 	const StatusIcon = status.icon;
 
 	return (
-		<div className="flex min-w-0 max-w-full flex-col gap-1">
+		<div className={cn("flex min-w-0 max-w-full flex-col gap-1", stacked && "px-2.5 py-1.5", className)}>
 			<div className="group flex items-center gap-1.5 rounded-sm py-0.5 hover:bg-hover">
 				<button
 					type="button"
@@ -112,12 +130,21 @@ export function ToolCallRow({ block, results }: { block: ToolCallBlock; results:
 					<Wrench className="size-3.5 shrink-0 text-ink-3" />
 					<span className="shrink-0 font-mono text-[13px] text-ink">{block.toolName}</span>
 					{summary && <span className="min-w-0 truncate text-[13px] text-ink-3">· {summary}</span>}
+					{diffStats && (
+						<span
+							data-testid="tool-diff-badge"
+							className="inline-flex shrink-0 items-center gap-1 rounded-xs border border-border bg-surface-2 px-1.5 py-0.5 font-mono text-[11px] font-medium tabular-nums"
+						>
+							<span className="text-success">+{diffStats.additions}</span>
+							<span className="text-danger">-{diffStats.deletions}</span>
+						</span>
+					)}
 					<span className="sr-only">{tt(status.label as never)}</span>
 				</button>
 				<button
 					type="button"
 					aria-label={tt("tool.inspectAria")}
-					className="flex size-6 items-center justify-center rounded-sm text-ink-3 opacity-0 transition-opacity hover:bg-hover hover:text-ink group-hover:opacity-100 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-primary/40"
+					className="flex size-6 shrink-0 items-center justify-center rounded-sm text-ink-3 opacity-0 transition-opacity hover:bg-hover hover:text-ink group-hover:opacity-100 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-primary/40"
 					onClick={() => {
 						const view = useViewStore.getState();
 						const sessionId = useProjectionStore.getState().currentSessionId;
@@ -128,6 +155,9 @@ export function ToolCallRow({ block, results }: { block: ToolCallBlock; results:
 				</button>
 				{block.status === "skipped" && (
 					<span className="shrink-0 text-[11px] text-ink-3">{tt("status.skipped")}</span>
+				)}
+				{block.status === "interrupted" && (
+					<span className="shrink-0 text-[11px] text-ink-3">{tt("status.interrupted")}</span>
 				)}
 			</div>
 

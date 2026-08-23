@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
 	detectSlashTrigger,
 	isSlashCommitKey,
+	resolveComposerKeyAction,
 	resolveRunningSubmitKind,
 	shouldRemoveCommandOnBackspace,
 } from "../src/features/composer/composer-input";
@@ -225,6 +226,149 @@ describe("composer interactions", () => {
 			draft: "draft a",
 			command: skillToken,
 			queue: { steering: ["a", "background"], followUp: [] },
+		});
+	});
+
+	it("tracks 70vh isExpanded state per session and migrates on canonical rekey", () => {
+		const composer = useComposerStore.getState();
+		expect(composer.isExpanded).toBe(false);
+
+		composer.setIsExpanded(true);
+		expect(useComposerStore.getState().isExpanded).toBe(true);
+
+		composer.beginSession("session-b");
+		expect(useComposerStore.getState().isExpanded).toBe(false);
+
+		composer.rekeySession("session-a", "session-a-canonical");
+		composer.beginSession("session-a-canonical");
+		expect(useComposerStore.getState().isExpanded).toBe(true);
+	});
+
+	describe("keybinding arbitration state machine", () => {
+		it("Idle + Normal: Enter sends prompt, Shift+Enter wraps", () => {
+			expect(
+				resolveComposerKeyAction({
+					key: "Enter",
+					running: false,
+					isExpanded: false,
+					deliveryMode: "auto",
+				}),
+			).toEqual({ type: "submit", mode: "prompt" });
+
+			expect(
+				resolveComposerKeyAction({
+					key: "Enter",
+					shiftKey: true,
+					running: false,
+					isExpanded: false,
+					deliveryMode: "auto",
+				}),
+			).toEqual({ type: "newline" });
+		});
+
+		it("Idle + 70vh: Enter wraps, Cmd/Ctrl+Enter sends prompt", () => {
+			expect(
+				resolveComposerKeyAction({
+					key: "Enter",
+					running: false,
+					isExpanded: true,
+					deliveryMode: "auto",
+				}),
+			).toEqual({ type: "newline" });
+
+			expect(
+				resolveComposerKeyAction({
+					key: "Enter",
+					metaKey: true,
+					running: false,
+					isExpanded: true,
+					deliveryMode: "auto",
+				}),
+			).toEqual({ type: "submit", mode: "prompt" });
+
+			expect(
+				resolveComposerKeyAction({
+					key: "Enter",
+					ctrlKey: true,
+					running: false,
+					isExpanded: true,
+					deliveryMode: "auto",
+				}),
+			).toEqual({ type: "submit", mode: "prompt" });
+		});
+
+		it("Running + Normal: Enter steers, Cmd/Ctrl+Enter follow_up", () => {
+			expect(
+				resolveComposerKeyAction({
+					key: "Enter",
+					running: true,
+					isExpanded: false,
+					deliveryMode: "auto",
+				}),
+			).toEqual({ type: "submit", mode: "steer" });
+
+			expect(
+				resolveComposerKeyAction({
+					key: "Enter",
+					metaKey: true,
+					running: true,
+					isExpanded: false,
+					deliveryMode: "auto",
+				}),
+			).toEqual({ type: "submit", mode: "follow_up" });
+
+			expect(
+				resolveComposerKeyAction({
+					key: "Enter",
+					ctrlKey: true,
+					running: true,
+					isExpanded: false,
+					deliveryMode: "auto",
+				}),
+			).toEqual({ type: "submit", mode: "follow_up" });
+		});
+
+		it("Running + 70vh: Enter wraps, Cmd/Ctrl+Enter sends with selected delivery mode", () => {
+			expect(
+				resolveComposerKeyAction({
+					key: "Enter",
+					running: true,
+					isExpanded: true,
+					deliveryMode: "steer",
+				}),
+			).toEqual({ type: "newline" });
+
+			expect(
+				resolveComposerKeyAction({
+					key: "Enter",
+					metaKey: true,
+					running: true,
+					isExpanded: true,
+					deliveryMode: "steer",
+				}),
+			).toEqual({ type: "submit", mode: "steer" });
+
+			expect(
+				resolveComposerKeyAction({
+					key: "Enter",
+					metaKey: true,
+					running: true,
+					isExpanded: true,
+					deliveryMode: "follow_up",
+				}),
+			).toEqual({ type: "submit", mode: "follow_up" });
+		});
+
+		it("ignores Enter while IME composition is active", () => {
+			expect(
+				resolveComposerKeyAction({
+					key: "Enter",
+					composing: true,
+					running: false,
+					isExpanded: false,
+					deliveryMode: "auto",
+				}),
+			).toEqual({ type: "none" });
 		});
 	});
 });

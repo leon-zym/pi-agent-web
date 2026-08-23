@@ -95,6 +95,7 @@ export interface SessionTransportOptions {
 	rawEventGlobalMaxBytes?: number;
 	reconnectBaseMs?: number;
 	reconnectMaxMs?: number;
+	maxActiveSubscriptions?: number;
 	onResyncRequired?: (message: Extract<SessionWsServerMessage, { type: "resync_required" }>) => void;
 }
 

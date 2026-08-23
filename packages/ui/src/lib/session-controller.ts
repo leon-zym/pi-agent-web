@@ -205,15 +205,39 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 	}
 }
 
+const SOFT_IDEMPOTENT_ERRORS = new Set([
+	"no_active_run",
+	"dialog_already_closed",
+	"invalid_dialog_id",
+	"session_idle",
+]);
+
+export function isSoftIdempotentError(error: unknown): boolean {
+	if (!error) return false;
+	const str = typeof error === "string" ? error : error instanceof Error ? error.message : String(error);
+	const lower = str.toLowerCase();
+	for (const code of SOFT_IDEMPOTENT_ERRORS) {
+		if (lower.includes(code)) return true;
+	}
+	return false;
+}
+
 export async function abortCurrentRun(): Promise<void> {
 	const session = useSessionDirectoryStore.getState().currentSession;
 	if (!session) return;
 	try {
-		await sendControlCommand(session.sessionHandle, { type: "abort" });
+		const response = await sendControlCommand(session.sessionHandle, { type: "abort" });
+		if (response.success === false && !isSoftIdempotentError(response.error)) {
+			toast.error(tt("session.abortFailed"), {
+				description: stripAnsi(response.error),
+			});
+		}
 	} catch (error) {
-		toast.error(tt("session.abortFailed"), {
-			description: displayError(error),
-		});
+		if (!isSoftIdempotentError(error)) {
+			toast.error(tt("session.abortFailed"), {
+				description: displayError(error),
+			});
+		}
 	}
 }
 

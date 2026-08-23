@@ -46,17 +46,30 @@ describe("projection cache", () => {
 		expect(state.order).toContain("streaming");
 	});
 
-	it("settles an active turn as an error when its Pi runtime is lost", () => {
+	it("settles an active turn as an error and converges hanging tools when its Pi runtime is lost", () => {
 		const store = useProjectionStore.getState();
 		store.applyEvent("crashed", { type: "agent_start" } as never);
+		store.applyEvent("crashed", {
+			type: "message_start",
+			message: {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "call-crashed", name: "bash", arguments: { command: "sleep 10" } }],
+			},
+		} as never);
 		store.markRuntimeFailure("crashed", "process exited");
 
 		const projection = useProjectionStore.getState().projections.crashed;
 		expect(projection?.activeTurnId).toBeNull();
 		expect(projection?.replayable).toBe(true);
-		expect(projection?.turns.at(-1)).toMatchObject({
+		const lastTurn = projection?.turns.at(-1);
+		expect(lastTurn).toMatchObject({
 			status: "error",
 			errorMessage: "process exited",
+		});
+		expect(lastTurn?.steps[0]?.blocks[0]).toMatchObject({
+			type: "tool_call",
+			toolCallId: "call-crashed",
+			status: "interrupted",
 		});
 	});
 

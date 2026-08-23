@@ -38,6 +38,7 @@ export interface WidgetEntry {
 export interface ExtensionUiSnapshot {
 	generation: number | null;
 	dialogs: PendingDialog[];
+	minimizedDialogIds: Record<string, boolean>;
 	status: Record<string, string>;
 	widgets: Record<string, WidgetEntry>;
 	title: string | null;
@@ -53,6 +54,12 @@ interface ExtensionUiState extends ExtensionUiSnapshot {
 	pushDialog: (dialog: PendingDialog) => void;
 	pushDialogForSession: (sessionHandle: string, dialog: PendingDialogInput) => void;
 	respond: (dialog: PendingDialog, response: RpcExtensionUIResponse) => boolean;
+	toggleMinimize: (id: string) => void;
+	toggleMinimizeForSession: (sessionHandle: string, id: string) => void;
+	minimize: (id: string) => void;
+	minimizeForSession: (sessionHandle: string, id: string) => void;
+	maximize: (id: string) => void;
+	maximizeForSession: (sessionHandle: string, id: string) => void;
 	dismissDialog: (id: string) => void;
 	dismissDialogForSession: (sessionHandle: string, id: string) => void;
 	closeRequestForSession: (sessionHandle: string, requestId: string) => void;
@@ -88,13 +95,22 @@ interface ExtensionUiState extends ExtensionUiSnapshot {
 }
 
 function emptySnapshot(generation: number | null = null): ExtensionUiSnapshot {
-	return { generation, dialogs: [], status: {}, widgets: {}, title: null, editorText: null };
+	return {
+		generation,
+		dialogs: [],
+		minimizedDialogIds: {},
+		status: {},
+		widgets: {},
+		title: null,
+		editorText: null,
+	};
 }
 
 function visible(snapshot: ExtensionUiSnapshot): ExtensionUiSnapshot {
 	return {
 		generation: snapshot.generation,
 		dialogs: snapshot.dialogs,
+		minimizedDialogIds: snapshot.minimizedDialogIds,
 		status: snapshot.status,
 		widgets: snapshot.widgets,
 		title: snapshot.title,
@@ -203,25 +219,70 @@ export const useExtensionUiStore = create<ExtensionUiState>()((set, get) => {
 			return true;
 		},
 
+		toggleMinimize: (id) => {
+			const sessionHandle = get().activeSessionHandle;
+			if (sessionHandle) get().toggleMinimizeForSession(sessionHandle, id);
+		},
+		toggleMinimizeForSession: (sessionHandle, id) =>
+			updateSession(sessionHandle, (snapshot) => ({
+				...snapshot,
+				minimizedDialogIds: {
+					...snapshot.minimizedDialogIds,
+					[id]: !snapshot.minimizedDialogIds[id],
+				},
+			})),
+
+		minimize: (id) => {
+			const sessionHandle = get().activeSessionHandle;
+			if (sessionHandle) get().minimizeForSession(sessionHandle, id);
+		},
+		minimizeForSession: (sessionHandle, id) =>
+			updateSession(sessionHandle, (snapshot) => ({
+				...snapshot,
+				minimizedDialogIds: {
+					...snapshot.minimizedDialogIds,
+					[id]: true,
+				},
+			})),
+
+		maximize: (id) => {
+			const sessionHandle = get().activeSessionHandle;
+			if (sessionHandle) get().maximizeForSession(sessionHandle, id);
+		},
+		maximizeForSession: (sessionHandle, id) =>
+			updateSession(sessionHandle, (snapshot) => {
+				const next = { ...snapshot.minimizedDialogIds };
+				delete next[id];
+				return {
+					...snapshot,
+					minimizedDialogIds: next,
+				};
+			}),
+
 		dismissDialog: (id) => {
 			const sessionHandle = get().activeSessionHandle;
 			if (sessionHandle) get().dismissDialogForSession(sessionHandle, id);
 		},
 		dismissDialogForSession: (sessionHandle, id) =>
-			updateSession(sessionHandle, (snapshot) => ({
-				...snapshot,
-				dialogs: snapshot.dialogs.filter((dialog) => dialog.request.id !== id),
-			})),
+			updateSession(sessionHandle, (snapshot) => {
+				const nextMinimized = { ...snapshot.minimizedDialogIds };
+				delete nextMinimized[id];
+				return {
+					...snapshot,
+					dialogs: snapshot.dialogs.filter((dialog) => dialog.request.id !== id),
+					minimizedDialogIds: nextMinimized,
+				};
+			}),
 		closeRequestForSession: (sessionHandle, requestId) =>
 			get().dismissDialogForSession(sessionHandle, requestId),
 
 		clearDialogs: () => {
 			const sessionHandle = get().activeSessionHandle;
 			if (sessionHandle) get().clearDialogsForSession(sessionHandle);
-			else set({ dialogs: [] });
+			else set({ dialogs: [], minimizedDialogIds: {} });
 		},
 		clearDialogsForSession: (sessionHandle) =>
-			updateSession(sessionHandle, (snapshot) => ({ ...snapshot, dialogs: [] })),
+			updateSession(sessionHandle, (snapshot) => ({ ...snapshot, dialogs: [], minimizedDialogIds: {} })),
 
 		applyStatus: (key, text) => {
 			const sessionHandle = get().activeSessionHandle;
@@ -289,7 +350,12 @@ export const useExtensionUiStore = create<ExtensionUiState>()((set, get) => {
 		},
 
 		replaceRequestsForSession: (sessionHandle, generation, requests, receivedAt = Date.now()) => {
-			let snapshot = emptySnapshot(generation);
+			const current = get().bySession[sessionHandle];
+			const preservedMinimized = current?.generation === generation ? current.minimizedDialogIds : {};
+			let snapshot: ExtensionUiSnapshot = {
+				...emptySnapshot(generation),
+				minimizedDialogIds: preservedMinimized,
+			};
 			for (const request of requests) {
 				switch (request.method) {
 					case "select":

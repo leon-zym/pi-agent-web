@@ -1,8 +1,9 @@
-import { Brain, ChevronRight } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
-import { firstLine, lastLine, stripAnsi } from "../../lib/format";
+import { Brain, ChevronRight, ExternalLink } from "lucide-react";
+import { type MouseEvent, useEffect, useRef, useState } from "react";
+import { firstLine, stripAnsi, tailTeaser } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
+import { useProjectionStore } from "../../stores/projection";
 import { useViewStore } from "../../stores/view";
 
 export interface ReasoningDisclosureProps {
@@ -10,73 +11,130 @@ export interface ReasoningDisclosureProps {
 	status: "streaming" | "settled" | "interrupted";
 	isTail: boolean;
 	defaultOpen?: boolean;
+	blockKey?: string;
+	onInspect?: () => void;
 }
 
 /**
- * Compact 24px reasoning row (DESIGN.md): streaming shows the newest line
- * with a 2.6s light sweep; settled collapses back to the first-line summary.
- * Pure props only, no socket access.
+ * 2-Stage In-Place Fold for Thinking (DESIGN.md Section 5.2):
+ * - Streaming: 5-line scrollable window (max-h-[110px]), auto-scrolled to bottom,
+ *   with 2.6s .thinking-sweep signature motion.
+ * - Settled: Collapses into tail teaser summary by default using CSS Grid transition.
+ * - In-place expand/collapse: Clicking card toggles full reasoning text inline.
+ * - Secondary action: Micro ExternalLink button in upper right to inspect in DetailsPanel.
  */
-export function ReasoningDisclosure({ text, status, isTail, defaultOpen }: ReasoningDisclosureProps) {
+export function ReasoningDisclosure({
+	text,
+	status,
+	isTail,
+	defaultOpen,
+	blockKey,
+	onInspect,
+}: ReasoningDisclosureProps) {
 	const displayText = stripAnsi(text);
-	const open = useViewStore((s) =>
-		defaultOpen !== undefined ? defaultOpen : s.expandedThinking["thinking:"],
+	const storeOpen = useViewStore((s) =>
+		defaultOpen !== undefined
+			? defaultOpen
+			: blockKey
+				? s.expandedThinking[blockKey]
+				: s.expandedThinking["thinking:"],
 	);
 	const [localOpen, setLocalOpen] = useState<boolean | null>(null);
-	const expanded = localOpen ?? open ?? false;
-	const summaryRef = useRef<HTMLSpanElement>(null);
+	const expanded = localOpen ?? storeOpen ?? false;
+	const scrollRef = useRef<HTMLDivElement>(null);
 
-	// While streaming, keep the summary pinned to the newest line.
+	// Auto-scroll to bottom on streaming text append
 	useEffect(() => {
-		if (status === "streaming" && expanded === false && summaryRef.current) {
-			summaryRef.current.scrollLeft = summaryRef.current.scrollWidth;
+		if (status === "streaming" && scrollRef.current) {
+			scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
 		}
-	}, [displayText, status, expanded]);
+	}, [displayText, status]);
 
 	const toggle = () => {
 		if (localOpen === null) {
-			setLocalOpen(!(open ?? false));
+			setLocalOpen(!(storeOpen ?? false));
 		} else {
 			setLocalOpen(!localOpen);
 		}
 	};
 
-	const summary = status === "streaming" ? lastLine(displayText) : firstLine(displayText);
-	const showSweep = status === "streaming" && isTail && !expanded;
+	const handleInspect = (e: MouseEvent) => {
+		e.stopPropagation();
+		if (onInspect) {
+			onInspect();
+		} else {
+			const view = useViewStore.getState();
+			const sessionId = useProjectionStore.getState().currentSessionId;
+			view.selectTool(sessionId ?? "", blockKey ?? "thinking");
+		}
+	};
+
+	const summary = firstLine(displayText) || tailTeaser(displayText);
+	const isStreaming = status === "streaming";
+	const showSweep = isStreaming && isTail && !expanded;
 
 	return (
-		<div className="flex flex-col">
-			<button
-				type="button"
-				aria-expanded={expanded}
-				onClick={toggle}
+		<div className="flex min-w-0 max-w-full flex-col">
+			<div
 				className={cn(
-					"group flex h-6 items-center gap-1.5 rounded-sm text-left outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-primary/40",
+					"group flex h-6 items-center gap-1.5 rounded-sm hover:bg-hover",
 					showSweep && "thinking-sweep",
 				)}
 			>
-				<ChevronRight
-					className={cn(
-						"size-3.5 shrink-0 text-ink-3 transition-transform duration-200",
-						expanded && "rotate-90",
-					)}
-				/>
-				<Brain className="size-3.5 shrink-0 text-ink-3" />
-				<span
-					ref={summaryRef}
-					className={cn("min-w-0 flex-1 truncate text-[13px] leading-6 text-ink-3", "font-mono")}
+				<button
+					type="button"
+					aria-expanded={expanded}
+					onClick={toggle}
+					className="flex min-w-0 flex-1 items-center gap-1.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
 				>
-					{summary || (status === "streaming" ? tt("status.thinking") : tt("status.thought"))}
-				</span>
-				<span className="pr-1 text-[11px] text-ink-3/70">
-					{status === "streaming" ? tt("status.inProgress") : ""}
-				</span>
-			</button>
-			{expanded && (
-				<div className="mt-1.5 ml-[22px] border-l border-border pl-3">
-					<p className="text-[13px] leading-[22px] whitespace-pre-wrap break-words text-ink-2">
-						{displayText}
-					</p>
+					<ChevronRight
+						className={cn(
+							"size-3.5 shrink-0 text-ink-3 transition-transform duration-200",
+							expanded && "rotate-90",
+						)}
+					/>
+					<Brain className="size-3.5 shrink-0 text-ink-3" />
+					<span className={cn("min-w-0 flex-1 truncate text-[13px] leading-6 text-ink-3 font-mono")}>
+						{isStreaming ? tt("status.thinking") : summary || tt("status.thought")}
+					</span>
+					<span className="shrink-0 pr-1 text-[11px] text-ink-3/70">
+						{isStreaming ? tt("status.inProgress") : ""}
+					</span>
+				</button>
+				<button
+					type="button"
+					aria-label={tt("reasoning.inspectAria")}
+					onClick={handleInspect}
+					className="flex size-6 shrink-0 items-center justify-center rounded-sm text-ink-3 opacity-0 transition-opacity hover:bg-hover hover:text-ink group-hover:opacity-100 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-primary/40"
+				>
+					<ExternalLink className="size-3.5" />
+				</button>
+			</div>
+
+			{isStreaming && (
+				<div
+					ref={scrollRef}
+					data-testid="thinking-stream-window"
+					className="scroll-slim mt-1.5 ml-[22px] max-h-[110px] overflow-y-auto border-l border-border pl-3 font-mono text-xs leading-[20px] whitespace-pre-wrap break-words text-ink-3"
+				>
+					{displayText}
+				</div>
+			)}
+
+			{!isStreaming && (
+				<div
+					className={cn(
+						"grid transition-[grid-template-rows] duration-200 ease-out",
+						expanded ? "grid-rows-[1fr]" : "grid-rows-[0fr]",
+					)}
+				>
+					<div className="overflow-hidden">
+						<div className="mt-1.5 ml-[22px] border-l border-border pl-3">
+							<p className="font-mono text-[13px] leading-[22px] whitespace-pre-wrap break-words text-ink-2">
+								{displayText}
+							</p>
+						</div>
+					</div>
 				</div>
 			)}
 		</div>

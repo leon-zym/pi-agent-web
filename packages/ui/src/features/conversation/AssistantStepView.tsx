@@ -5,6 +5,7 @@ import type { AssistantStep, ContentBlock } from "../../types/view-models";
 import { MarkdownBlock } from "./MarkdownBlock";
 import { ReasoningDisclosure } from "./ReasoningDisclosure";
 import { ToolCallRow } from "./ToolCallRow";
+import { ToolGroupView } from "./ToolGroupView";
 
 const EMPTY_RESULTS: import("../../types/view-models").UiToolResult[] = [];
 
@@ -21,6 +22,7 @@ const BlockView = memo(function BlockView({
 		case "thinking":
 			return (
 				<ReasoningDisclosure
+					blockKey={block.key}
 					text={block.text}
 					status={block.isStreaming ? "streaming" : "settled"}
 					isTail={isLast && block.isStreaming}
@@ -35,9 +37,14 @@ const BlockView = memo(function BlockView({
 	}
 });
 
+type GroupedBlockItem =
+	| { type: "single"; block: ContentBlock; isLast: boolean }
+	| { type: "tool_group"; key: string; tools: Array<Extract<ContentBlock, { type: "tool_call" }>> };
+
 /**
  * One assistant response step: blocks in source order, then tool results.
  * Text blocks sit on the 748px reading axis; no bubble (DESIGN.md).
+ * When settled, >2 consecutive tool calls are aggregated into a ToolGroupView.
  */
 export const AssistantStepView = memo(function AssistantStepView({
 	step,
@@ -55,6 +62,63 @@ export const AssistantStepView = memo(function AssistantStepView({
 		return index;
 	}, [step.toolResults]);
 
+	const stepDurationMs = useMemo(() => {
+		if (step.timing?.startTime && step.timing?.endTime) {
+			return Math.max(0, step.timing.endTime - step.timing.startTime);
+		}
+		return undefined;
+	}, [step.timing]);
+
+	const groupedItems = useMemo<GroupedBlockItem[]>(() => {
+		if (!step.isSettled) {
+			return step.blocks.map((block, index) => ({
+				type: "single",
+				block,
+				isLast: index === step.blocks.length - 1,
+			}));
+		}
+
+		const items: GroupedBlockItem[] = [];
+		let currentToolGroup: Array<Extract<ContentBlock, { type: "tool_call" }>> = [];
+
+		const flushToolGroup = () => {
+			if (currentToolGroup.length === 0) return;
+			if (currentToolGroup.length > 2) {
+				items.push({
+					type: "tool_group",
+					key: `group:${currentToolGroup[0]!.key}`,
+					tools: currentToolGroup,
+				});
+			} else {
+				for (let i = 0; i < currentToolGroup.length; i++) {
+					items.push({
+						type: "single",
+						block: currentToolGroup[i]!,
+						isLast: false,
+					});
+				}
+			}
+			currentToolGroup = [];
+		};
+
+		for (let i = 0; i < step.blocks.length; i++) {
+			const block = step.blocks[i]!;
+			if (block.type === "tool_call") {
+				currentToolGroup.push(block);
+			} else {
+				flushToolGroup();
+				items.push({
+					type: "single",
+					block,
+					isLast: i === step.blocks.length - 1,
+				});
+			}
+		}
+		flushToolGroup();
+
+		return items;
+	}, [step.blocks, step.isSettled]);
+
 	if (step.blocks.length === 0 && step.toolResults.length === 0) {
 		// Streaming gap between turns: show a working indicator line.
 		return (
@@ -67,18 +131,32 @@ export const AssistantStepView = memo(function AssistantStepView({
 
 	return (
 		<div className={cn("flex min-w-0 max-w-full flex-col gap-3")}>
-			{step.blocks.map((block, index) => (
-				<BlockView
-					key={block.key}
-					block={block}
-					results={
-						block.type === "tool_call"
-							? (resultsByToolCallId.get(block.toolCallId) ?? EMPTY_RESULTS)
-							: EMPTY_RESULTS
-					}
-					isLast={index === step.blocks.length - 1}
-				/>
-			))}
+			{groupedItems.map((item) => {
+				if (item.type === "tool_group") {
+					return (
+						<ToolGroupView
+							key={item.key}
+							tools={item.tools}
+							resultsByToolCallId={resultsByToolCallId}
+							durationMs={stepDurationMs}
+						/>
+					);
+				}
+
+				const block = item.block;
+				return (
+					<BlockView
+						key={block.key}
+						block={block}
+						results={
+							block.type === "tool_call"
+								? (resultsByToolCallId.get(block.toolCallId) ?? EMPTY_RESULTS)
+								: EMPTY_RESULTS
+						}
+						isLast={item.isLast}
+					/>
+				);
+			})}
 		</div>
 	);
 });

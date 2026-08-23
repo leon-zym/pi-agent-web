@@ -9,10 +9,13 @@ export { formatRelativeTimeLocal as formatRelativeTime } from "./i18n";
 export function formatDuration(ms: number): string {
 	if (!Number.isFinite(ms) || ms < 0) return "--";
 	if (ms < 1000) return `${Math.round(ms)}ms`;
-	const seconds = Math.floor(ms / 1000);
-	if (seconds < 60) return `${seconds}s`;
+	const seconds = ms / 1000;
+	if (seconds < 60) {
+		const formatted = seconds >= 10 ? `${Math.round(seconds)}` : `${Number(seconds.toFixed(1))}`;
+		return `${formatted}s`;
+	}
 	const minutes = Math.floor(seconds / 60);
-	const rest = seconds % 60;
+	const rest = Math.floor(seconds % 60);
 	return `${minutes}m ${rest.toString().padStart(2, "0")}s`;
 }
 
@@ -148,4 +151,18 @@ export function lastLine(text: string): string {
 		}
 	}
 	return text.trim();
+}
+
+/**
+ * Tail teaser summary for thinking settlement (DESIGN.md):
+ * extracts the last meaningful line or conclusion paragraph.
+ */
+export function tailTeaser(text: string): string {
+	const clean = stripAnsi(text).trim();
+	if (!clean) return "";
+	const lines = clean
+		.split("\n")
+		.map((l) => l.trim())
+		.filter((l) => l.length > 0);
+	return lines[lines.length - 1] ?? "";
 }

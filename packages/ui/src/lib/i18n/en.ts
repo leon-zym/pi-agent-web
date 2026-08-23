@@ -45,11 +45,24 @@ export const en: typeof zhCN = {
 	"status.preparing": "Preparing args",
 	"status.executing": "Executing",
 	"status.skipped": "Skipped, output truncated",
+	"status.interrupted": "Interrupted",
 	"status.thinking": "Thinking…",
 	"status.thought": "Thought",
 	"status.inProgress": "In progress",
 	"status.generatingArgs": "Generating args",
 	"status.notExecuted": "Not executed",
+	"reasoning.inspectAria": "Open reasoning in details panel",
+
+	// Background tab status
+	"tab.running": "[Running]",
+	"tab.waitingUi": "[Waiting]",
+	"tab.done": "[Done]",
+
+	// Audio feedback
+	"audio.muted": "Sound muted",
+	"audio.unmuted": "Sound enabled",
+	"audio.toggle": "Audio chime",
+	"audio.completion": "Completion chime",
 
 	// Workspace / session sidebar
 	"sidebar.brand": "Pi Web",
@@ -145,6 +158,15 @@ export const en: typeof zhCN = {
 	"composer.unknownCommandDesc": "Unrecognized / commands are never sent as plain prompts",
 	"composer.tooLong": "Message is too long",
 	"composer.queueCount": "{count} more queued messages",
+	"composer.expand70vh": "Expand to 70vh immersive editor",
+	"composer.collapse70vh": "Collapse 70vh immersive editor",
+	"composer.deliveryMode": "Delivery mode",
+	"composer.steerMode": "Steer mode",
+	"composer.followUpMode": "Follow-up mode",
+
+	// TOC
+	"toc.title": "Conversation Outline",
+	"toc.turn": "Turn {n}",
 
 	// Slash menu
 	"slash.extension": "Extensions",
@@ -153,6 +175,12 @@ export const en: typeof zhCN = {
 	"slash.loadingCommands": "Loading commands…",
 	"slash.noMatch": "No matching commands",
 	"slash.hint": "↑↓ Select · Tab/Enter complete · Esc close",
+
+	// Mention menu
+	"mention.title": "File Mention",
+	"mention.loadingFiles": "Searching files…",
+	"mention.noMatch": "No matching files",
+	"mention.hint": "↑↓ Navigate · Tab/Enter insert · Esc dismiss",
 
 	// Model / thinking
 	"model.select": "Select model",
@@ -195,6 +223,13 @@ export const en: typeof zhCN = {
 	"tool.command": "Command",
 	"tool.output": "Output",
 	"tool.noCommand": "No command",
+	"toolGroup.toolCalls": "tool calls",
+	"toolGroup.done": "✓ Done",
+	"toolGroup.error": "✗ Error",
+	"diff.cleanCopy": "Clean copy",
+	"diff.rawCopy": "Copy raw diff",
+	"diff.cleanCopied": "Clean code copied",
+	"diff.rawCopied": "Diff copied",
 
 	// Turn tail
 	"tail.modelError": "Model returned an error",
@@ -239,6 +274,15 @@ export const en: typeof zhCN = {
 	"ext.input": "Input",
 	"ext.timeoutHint": "The extension set a timeout; it falls back to the default value.",
 	"ext.error": "Extension error",
+	"ext.minimize": "Minimize to dock",
+	"ext.maximize": "Expand dialog",
+	"ext.cancel": "Cancel",
+	"ext.confirm": "Confirm",
+	"ext.dockTitle": "Pending extension request",
+	"ext.dockDeadline": "{seconds}s remaining",
+	"ext.other": "Other…",
+	"ext.customInput": "Custom input",
+	"ext.recommended": "Recommended",
 
 	// Onboarding
 	"onboarding.title": "Configure a provider API key",
@@ -324,4 +368,13 @@ export const en: typeof zhCN = {
 	"model.back": "Back",
 	"sidebar.workspaceActions": "Workspace actions",
 	"sidebar.navAria": "Sidebar",
+
+	// Mobile layout
+	"mobile.switcher": "Switch workspace & session",
+	"mobile.workspaces": "Workspaces",
+	"mobile.sessions": "Sessions",
+	"mobile.selectWorkspace": "Select workspace",
+	"mobile.selectSession": "Select session",
+	"mobile.openSwitcher": "Open switcher",
+	"mobile.closeSwitcher": "Close switcher",
 };
