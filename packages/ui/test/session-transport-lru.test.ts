@@ -285,4 +285,30 @@ describe("Active WebSocket Subscription LRU Pool with Liveness Guard", () => {
 			expect(sessions[`session-${i}`]?.subscribed).toBe(true);
 		}
 	});
+
+	it("evicts dormant historical sessions when pool exceeds capacity", () => {
+		const { controller, sockets } = harness();
+		controller.store.getState().connect();
+		sockets[0]?.onopen?.();
+
+		// Subscribe 6 dormant historical sessions
+		for (let i = 1; i <= 6; i++) {
+			const handle = `session-${i}`;
+			controller.store.getState().subscribeSession(handle);
+			controller.ingestServerMessage({
+				type: "runtime_state",
+				runtime: {
+					...idlePersistedRuntime(handle),
+					state: "dormant",
+				},
+			});
+		}
+
+		// Subscribe 7th session
+		controller.store.getState().subscribeSession("session-7");
+
+		const sessions = controller.store.getState().sessions;
+		expect(sessions["session-1"]?.subscribed).toBe(false); // LRU dormant session evicted
+		expect(sessions["session-7"]?.subscribed).toBe(true);
+	});
 });

@@ -194,7 +194,7 @@ export function AppShell() {
 
 			<main className="flex min-w-0 flex-1 flex-col overflow-hidden">
 				<div className="min-h-0 flex-1 overflow-hidden">
-					<ConversationColumn />
+					<ConversationColumn isMobile={isMobile} onOpenSwitcher={() => setMobileSwitcherOpen(true)} />
 				</div>
 			</main>
 

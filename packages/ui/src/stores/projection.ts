@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { type ConversationProjection, createEmptyProjection } from "../types/view-models";
 import { useComposerStore } from "./composer";
-import { reduceProjection } from "./projection-reducer";
+import { convergeHangingToolCalls, reduceProjection } from "./projection-reducer";
 import { sessionTransport } from "./session-transport";
 
 const MAX_CACHED_SESSIONS = 3;
@@ -91,7 +91,7 @@ export const useProjectionStore = create<ProjectionState>()((set, get) => ({
 						turn.id === projection.activeTurnId
 							? (() => {
 									const startTime = turn.timing?.startTime ?? now;
-									return {
+									const failedTurn = {
 										...turn,
 										status: "error" as const,
 										errorMessage: error,
@@ -102,6 +102,7 @@ export const useProjectionStore = create<ProjectionState>()((set, get) => ({
 											durationMs: Math.max(0, now - startTime),
 										},
 									};
+									return convergeHangingToolCalls(failedTurn);
 								})()
 							: turn,
 					),

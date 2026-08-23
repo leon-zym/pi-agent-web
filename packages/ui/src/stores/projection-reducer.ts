@@ -227,7 +227,7 @@ function upsertToolResult(step: AssistantStep, result: AssistantStep["toolResult
 	return { ...step, blocks, toolResults };
 }
 
-function convergeHangingToolCalls(turn: ProductTurn): ProductTurn {
+export function convergeHangingToolCalls(turn: ProductTurn): ProductTurn {
 	const steps = turn.steps.map((step) => {
 		let modified = false;
 		const blocks = step.blocks.map((block) => {
