@@ -408,7 +408,7 @@ const MAX_DIRECTORY_SCANS = 300;
 
 async function walkAndFilterFiles(rootPath: string, query: string): Promise<string[]> {
 	const results: string[] = [];
-	const lowerQuery = query.toLowerCase().trim();
+	const lowerQuery = query.slice(0, 200).toLowerCase().trim();
 	const queue: string[] = [""];
 	let scannedDirs = 0;
 
@@ -432,9 +432,22 @@ async function walkAndFilterFiles(rootPath: string, query: string): Promise<stri
 			const relPath = relDir ? `${relDir}/${entry.name}` : entry.name;
 			if (entry.isDirectory()) {
 				queue.push(relPath);
-			} else if (entry.isFile() || entry.isSymbolicLink()) {
+			} else if (entry.isFile()) {
 				if (!lowerQuery || relPath.toLowerCase().includes(lowerQuery)) {
 					results.push(relPath);
+				}
+			} else if (entry.isSymbolicLink()) {
+				try {
+					const fullPath = path.join(fullDir, entry.name);
+					const real = await fs.promises.realpath(fullPath);
+					const stat = await fs.promises.stat(real);
+					if (stat.isFile() && (real === rootPath || real.startsWith(`${rootPath}${path.sep}`))) {
+						if (!lowerQuery || relPath.toLowerCase().includes(lowerQuery)) {
+							results.push(relPath);
+						}
+					}
+				} catch {
+					// Broken or circular symlink - skip safely
 				}
 			}
 		}

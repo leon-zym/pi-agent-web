@@ -188,7 +188,12 @@ export function ComposerSeat() {
 
 	const onKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
 		if (!canControl) return;
-		if (trigger && !composing) {
+		const isComposing =
+			composing ||
+			Boolean((event.nativeEvent as KeyboardEvent).isComposing) ||
+			event.keyCode === 229;
+
+		if (trigger && !isComposing) {
 			if (event.key === "ArrowDown" || event.key === "ArrowUp") {
 				event.preventDefault();
 				slashMenuRef.current?.move(event.key === "ArrowDown" ? 1 : -1);
@@ -205,7 +210,7 @@ export function ComposerSeat() {
 				return;
 			}
 		}
-		if (mentionTrigger && !composing) {
+		if (mentionTrigger && !isComposing) {
 			if (event.key === "ArrowDown" || event.key === "ArrowUp") {
 				event.preventDefault();
 				fileMentionMenuRef.current?.move(event.key === "ArrowDown" ? 1 : -1);
@@ -217,9 +222,10 @@ export function ComposerSeat() {
 				return;
 			}
 			if (isMentionCommitKey(event)) {
-				event.preventDefault();
-				fileMentionMenuRef.current?.commitHighlighted();
-				return;
+				if (fileMentionMenuRef.current?.commitHighlighted()) {
+					event.preventDefault();
+					return;
+				}
 			}
 		}
 		if (
@@ -227,7 +233,7 @@ export function ComposerSeat() {
 				hasCommand: command !== null,
 				draft,
 				key: event.key,
-				composing,
+				composing: isComposing,
 				selectionStart: event.currentTarget.selectionStart,
 				selectionEnd: event.currentTarget.selectionEnd,
 			})
@@ -238,7 +244,7 @@ export function ComposerSeat() {
 		}
 
 		// Shell-style ArrowUp / ArrowDown history penetration
-		if (!trigger && !mentionTrigger && !composing && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+		if (!trigger && !mentionTrigger && !isComposing && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
 			if (history.onKeyDown(event)) {
 				return;
 			}
@@ -250,7 +256,7 @@ export function ComposerSeat() {
 			shiftKey: event.shiftKey,
 			metaKey: event.metaKey,
 			ctrlKey: event.ctrlKey,
-			composing,
+			composing: isComposing,
 			running,
 			isExpanded,
 			deliveryMode,
@@ -273,6 +279,7 @@ export function ComposerSeat() {
 		if (!el) return;
 		const value = el.value;
 		const cursor = el.selectionStart ?? value.length;
+		history.resetHistoryIndex();
 		setDraft(value);
 		setTrigger(command ? null : detectSlashTrigger(value, cursor));
 		setMentionTrigger(detectMentionTrigger(value, cursor));
