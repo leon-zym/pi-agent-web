@@ -189,9 +189,7 @@ export function ComposerSeat() {
 	const onKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
 		if (!canControl) return;
 		const isComposing =
-			composing ||
-			Boolean((event.nativeEvent as KeyboardEvent).isComposing) ||
-			event.keyCode === 229;
+			composing || Boolean((event.nativeEvent as KeyboardEvent).isComposing) || event.keyCode === 229;
 
 		if (trigger && !isComposing) {
 			if (event.key === "ArrowDown" || event.key === "ArrowUp") {
@@ -244,7 +242,12 @@ export function ComposerSeat() {
 		}
 
 		// Shell-style ArrowUp / ArrowDown history penetration
-		if (!trigger && !mentionTrigger && !isComposing && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+		if (
+			!trigger &&
+			!mentionTrigger &&
+			!isComposing &&
+			(event.key === "ArrowUp" || event.key === "ArrowDown")
+		) {
 			if (history.onKeyDown(event)) {
 				return;
 			}

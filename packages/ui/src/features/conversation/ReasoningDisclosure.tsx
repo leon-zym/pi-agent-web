@@ -69,7 +69,7 @@ export function ReasoningDisclosure({
 		}
 	};
 
-	const summary = tailTeaser(displayText) || firstLine(displayText);
+	const summary = firstLine(displayText) || tailTeaser(displayText);
 	const isStreaming = status === "streaming";
 	const showSweep = isStreaming && isTail && !expanded;
 

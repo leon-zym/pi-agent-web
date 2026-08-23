@@ -13,7 +13,7 @@ export interface ParsedOption {
 	isRecommended: boolean;
 }
 
-const RECOMMENDED_REGEX = /\s*[(（\[]\s*(recommended|推荐)\s*[)）\]]\s*/i;
+const RECOMMENDED_REGEX = /\s*[(（[]\s*(recommended|推荐)\s*[)）\]]\s*/i;
 
 export function parseOptionText(option: string): ParsedOption {
 	const isRecommended = RECOMMENDED_REGEX.test(option);

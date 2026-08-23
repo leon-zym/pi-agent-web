@@ -375,8 +375,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			const candidate = state.sessions[candidateHandle];
 			if (!candidate?.subscribed) continue;
 
-			const isIdle =
-				candidate.runtime?.state === "idle" || candidate.runtime?.state === "dormant";
+			const isIdle = candidate.runtime?.state === "idle" || candidate.runtime?.state === "dormant";
 			const isPersisted =
 				candidate.runtime?.sessionFile !== null && candidate.runtime?.sessionFile !== undefined;
 			const hasNoPendingExt = candidate.pendingExtensionRequests.length === 0;
