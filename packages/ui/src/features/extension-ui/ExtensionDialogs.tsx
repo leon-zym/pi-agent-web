@@ -52,6 +52,7 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 	});
 
 	const cancel = () => {
+		if (useExtensionUiStore.getState().minimizedDialogIds[request.id]) return;
 		if (useExtensionUiStore.getState().dialogs.some((d) => d.request.id === request.id)) {
 			respond(dialog, { type: "extension_ui_response", id: request.id, cancelled: true });
 		}

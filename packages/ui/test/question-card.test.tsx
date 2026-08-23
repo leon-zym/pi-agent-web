@@ -23,6 +23,12 @@ describe("QuestionCard component and option parsing", () => {
 			isRecommended: true,
 		});
 
+		expect(parseOptionText("全量架构优化（推荐）")).toEqual({
+			raw: "全量架构优化（推荐）",
+			label: "全量架构优化",
+			isRecommended: true,
+		});
+
 		expect(parseOptionText("Standard mode")).toEqual({
 			raw: "Standard mode",
 			label: "Standard mode",

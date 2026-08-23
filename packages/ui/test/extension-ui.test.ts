@@ -200,6 +200,14 @@ describe("Session-scoped extension UI", () => {
 		store.minimize("dlg-1");
 		expect(useExtensionUiStore.getState().minimizedDialogIds["dlg-1"]).toBe(true);
 
+		// Snapshot in same generation preserves minimized state
+		store.replaceRequestsForSession("session-a", 1, [request("dlg-1"), request("dlg-2")]);
+		expect(useExtensionUiStore.getState().minimizedDialogIds["dlg-1"]).toBe(true);
+
+		// Snapshot in new generation resets minimized state
+		store.replaceRequestsForSession("session-a", 2, [request("dlg-1")]);
+		expect(useExtensionUiStore.getState().minimizedDialogIds["dlg-1"]).toBeUndefined();
+
 		store.dismissDialog("dlg-1");
 		expect(useExtensionUiStore.getState().minimizedDialogIds["dlg-1"]).toBeUndefined();
 	});

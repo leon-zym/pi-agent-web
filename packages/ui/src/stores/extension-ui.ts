@@ -350,7 +350,12 @@ export const useExtensionUiStore = create<ExtensionUiState>()((set, get) => {
 		},
 
 		replaceRequestsForSession: (sessionHandle, generation, requests, receivedAt = Date.now()) => {
-			let snapshot = emptySnapshot(generation);
+			const current = get().bySession[sessionHandle];
+			const preservedMinimized = current?.generation === generation ? current.minimizedDialogIds : {};
+			let snapshot: ExtensionUiSnapshot = {
+				...emptySnapshot(generation),
+				minimizedDialogIds: preservedMinimized,
+			};
 			for (const request of requests) {
 				switch (request.method) {
 					case "select":
