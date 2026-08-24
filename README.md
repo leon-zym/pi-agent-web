@@ -175,3 +175,7 @@ docs/
 - [简体中文](README.zh-CN.md): Chinese README
 
 Files under `docs/notes/` and `tmp/` are ignored working material, not current product contracts.
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for vulnerability reporting.
