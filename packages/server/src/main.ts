@@ -5,7 +5,11 @@ import type { Socket } from "node:net";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { type ServerType, serve } from "@hono/node-server";
-import { createGatewayAccessControl, type GatewayAccessControl } from "./access-control.js";
+import {
+	createGatewayAccessControl,
+	createGatewayAccessDenialReporter,
+	type GatewayAccessControl,
+} from "./access-control.js";
 import { assertLoopbackHost, ENV_SESSION_DIR, loadConfig, type ServerConfig } from "./config.js";
 import { NativeSessionCatalog, sessionHandleForCanonicalFile } from "./native-session-catalog.js";
 import { RecoverableSessionTrash } from "./recoverable-session-trash.js";
@@ -79,7 +83,13 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 	const config: ServerConfig = { ...loadConfig(), ...options.config };
 	assertLoopbackHost(config.host);
 	fs.mkdirSync(config.webDataDir, { recursive: true, mode: 0o700 });
-	const accessControl = createGatewayAccessControl(randomBytes(32).toString("base64url"));
+	const reportAccessDenial = createGatewayAccessDenialReporter(({ reason, suppressed }) => {
+		const summary = suppressed > 0 ? ` (${String(suppressed)} additional denials suppressed)` : "";
+		log("warn", `Gateway access denied: ${reason}${summary}`);
+	});
+	const accessControl = createGatewayAccessControl(randomBytes(32).toString("base64url"), {
+		onDenied: reportAccessDenial,
+	});
 
 	let runtime: ResolvedPi;
 	let runtimeWarning: string | undefined;

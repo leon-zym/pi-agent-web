@@ -13,7 +13,6 @@ const agentDir = path.join(tempRoot, "agent");
 const sessionRootDir = path.join(tempRoot, "sessions");
 const webDataDir = path.join(tempRoot, "web-data");
 const fakePiPath = path.join(import.meta.dirname, "fixtures", "session-runtime-pi.mjs");
-const viteOrigin = "http://localhost:5173";
 
 let handle: ServerHandle;
 let base: string;
@@ -22,7 +21,7 @@ let workspaceHandle: string;
 let workspaceRealpath: string;
 
 function authenticatedHeaders(): Record<string, string> {
-	return { Origin: viteOrigin, Cookie: cookie };
+	return { Origin: base, Cookie: cookie };
 }
 
 async function controlledDelete(sessionHandle: string): Promise<{
@@ -92,7 +91,7 @@ beforeAll(async () => {
 	if (!address || typeof address === "string") throw new Error("server did not expose a TCP address");
 	base = `http://127.0.0.1:${String(address.port)}`;
 
-	const bootstrap = await fetch(`${base}/api/v1/bootstrap`, { headers: { Origin: viteOrigin } });
+	const bootstrap = await fetch(`${base}/api/v1/bootstrap`, { headers: { Origin: base } });
 	const setCookie = bootstrap.headers.get("set-cookie");
 	if (!setCookie) throw new Error("bootstrap did not set a session cookie");
 	cookie = setCookie.split(";", 1)[0] ?? "";

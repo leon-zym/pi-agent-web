@@ -24,7 +24,7 @@ let workspaceHandle: string;
 let sessionHandle: string;
 let sessionGeneration: number;
 
-function authenticatedHeaders(origin = viteOrigin): Record<string, string> {
+function authenticatedHeaders(origin = base): Record<string, string> {
 	return { Origin: origin, Cookie: cookie };
 }
 
@@ -86,7 +86,7 @@ beforeAll(async () => {
 	if (!address || typeof address === "string") throw new Error("server did not expose a TCP address");
 	base = `http://127.0.0.1:${String(address.port)}`;
 
-	const bootstrap = await fetch(`${base}/api/v1/bootstrap`, { headers: { Origin: viteOrigin } });
+	const bootstrap = await fetch(`${base}/api/v1/bootstrap`, { headers: { Origin: base } });
 	expect(bootstrap.status).toBe(200);
 	expect(await bootstrap.json()).toEqual({ ok: true });
 	const setCookie = bootstrap.headers.get("set-cookie");
@@ -122,17 +122,35 @@ describe("gateway access control", () => {
 		await expect(startServer({ config: { host: "0.0.0.0" } })).rejects.toThrow("PI_WEB_HOST");
 	});
 
-	it("boots from an allowed Vite origin without exposing the session secret", async () => {
+	it("boots only from the Gateway origin without exposing the session secret", async () => {
 		expect(cookie).toMatch(/^pi_web_session=/);
 		expect(cookie).not.toContain("undefined");
 		const sessionCookie = (
-			await fetch(`${base}/api/v1/bootstrap`, { headers: { Origin: viteOrigin } })
+			await fetch(`${base}/api/v1/bootstrap`, { headers: { Origin: base } })
 		).headers.get("set-cookie");
 		expect(sessionCookie).toContain("HttpOnly");
 		expect(sessionCookie).toContain("SameSite=Strict");
+		expect((await fetch(`${base}/api/v1/bootstrap`, { headers: { Origin: viteOrigin } })).status).toBe(403);
+	});
+
+	it("rejects a production cross-port origin even when it presents a valid cookie", async () => {
 		expect(
-			(await fetch(`${base}/api/v1/bootstrap`, { headers: { Origin: "http://[::1]:5173" } })).status,
-		).toBe(200);
+			(
+				await fetch(`${base}/api/v1/workspaces`, {
+					headers: { Origin: viteOrigin, Cookie: cookie },
+				})
+			).status,
+		).toBe(403);
+
+		const WebSocketCtor = (await import("ws")).default;
+		const socket = new WebSocketCtor(`${base.replace("http", "ws")}/api/v1/ws`, {
+			headers: { Origin: viteOrigin, Cookie: cookie },
+		});
+		const status = await new Promise<number | undefined>((resolve) => {
+			socket.once("unexpected-response", (_request, response) => resolve(response.statusCode));
+			socket.once("error", () => resolve(undefined));
+		});
+		expect(status).toBe(403);
 	});
 
 	it("accepts browser same-origin GET requests that omit Origin", async () => {
@@ -172,7 +190,7 @@ describe("gateway access control", () => {
 	});
 
 	it("rejects REST calls without a matching cookie and origin", async () => {
-		expect((await fetch(`${base}/api/v1/workspaces`, { headers: { Origin: viteOrigin } })).status).toBe(403);
+		expect((await fetch(`${base}/api/v1/workspaces`, { headers: { Origin: base } })).status).toBe(403);
 		expect(
 			(
 				await fetch(`${base}/api/v1/workspaces`, {
@@ -295,7 +313,7 @@ describe("gateway access control", () => {
 	it("rejects unauthorized websocket upgrades and policy-violating frames", async () => {
 		const WebSocketCtor = (await import("ws")).default;
 		const unauthorized = new WebSocketCtor(`${base.replace("http", "ws")}/api/v1/ws`, {
-			headers: { Origin: viteOrigin },
+			headers: { Origin: base },
 		});
 		const status = await new Promise<number | undefined>((resolve) => {
 			unauthorized.once("unexpected-response", (_request, response) => resolve(response.statusCode));
