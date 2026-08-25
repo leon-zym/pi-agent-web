@@ -9,9 +9,9 @@ A local, Session-native web workbench for Pi Coding Agent's RPC mode.
 - `docs/protocol.md` — verified Pi RPC facts and the REST/WebSocket contract.
 - `docs/ui-ux.md` — user-visible interaction and accessibility rules.
 - `docs/development.md` — toolchain, test layers, CI, packaging, and release checks.
-- `docs/roadmap.md` — completed recovery scope and bounded follow-up Issues.
 - `docs/decisions/` — accepted architecture decisions and rejected alternatives.
 - `DESIGN.md` — visual contract for every surface.
+- GitHub [Issues](https://github.com/leon-zym/pi-agent-web/issues) — backlog, sequencing, and completion status.
 
 `docs/notes/` and `tmp/` are ignored working material, not current product contracts. Promote durable
 facts into the tracked documents above. Never reference files outside this repository from code or

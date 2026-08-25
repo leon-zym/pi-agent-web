@@ -158,7 +158,7 @@ docs/
 - [协议](docs/protocol.md)：已验证的 Pi RPC 事实与浏览器/网关契约
 - [UI 与 UX](docs/ui-ux.md)：交互、可访问性与响应式行为
 - [开发](docs/development.md)：测试层级、CI、打包与发布门禁
-- [路线图](docs/roadmap.md)：本轮恢复完成项与有边界的后续 Issue
+- [GitHub Issues](https://github.com/leon-zym/pi-agent-web/issues)：待办、排序与完成状态
 - [架构决策](docs/decisions/README.md)：已接受的决策与被拒绝的替代方案
 - [视觉设计](DESIGN.md)：视觉变量与组件规则
 - [English](README.md)：英文 README

@@ -14,9 +14,9 @@
    `barrierSeq`。
 6. **本机同源控制面**：只监听 loopback；Cookie、Host、Origin/Fetch Metadata 共同阻止
    任意网页驱动本机 Agent。它不是远程账户或多用户安全边界。
-7. **客户端订阅 LRU 有界淘汰（带 Running 活性守卫）**：单连接活跃订阅上限为 6；
-   **严格仅允许淘汰 `state === 'idle' && persisted` 的会话**；处于 `running`、`waiting_ui`、
-   `starting`、`unpersisted` 的会话常驻订阅，严禁退订。
+7. **客户端订阅 LRU admission target（带 Running 活性守卫）**：单连接 idle/persisted 订阅的软目标为 6；
+   **严格仅允许淘汰 `state === 'idle' || state === 'dormant'` 且已持久化、无待处理 Extension 请求的会话**；
+   处于 `running`、`waiting_ui`、`starting`、`unpersisted` 的会话常驻订阅，受保护会话可能使活跃数暂时超过目标。
 8. **悬挂工具状态收敛为 interrupted**：异常崩溃、网络断开或用户 Abort 导致未收到结果的工具调用，
    视图层统一收敛为 `interrupted` 状态，显示弱化灰色标志，杜绝界面残留永久 Loading 假死。
 9. **乐观 User 消息以 ContentShape 对齐**：前端提交即刻乐观挂载；权威 `message_start` 到达时按
@@ -156,7 +156,7 @@ Pi response 可与事件交错，因此 Gateway 附加 `barrierSeq`。UI 只有�
 
 | 层 | 所有权 |
 |---|---|
-| `session-transport` | 单 socket、连接状态，以及每 Session runtime/cursor/lease/resync/raw-event 有界窗口；管理最多 6 个活跃订阅的 LRU 池与 Running 守卫 |
+| `session-transport` | 单 socket、连接状态，以及每 Session runtime/cursor/lease/resync/raw-event 有界窗口；以 6 个活跃订阅为软 admission target，保护运行中 Session，并管理 LRU 淘汰 |
 | `session-frame-bus` | 按 Session 保序分发；组件不直接订阅 WebSocket |
 | `session-directory` | 原生 Workspace/Session 摘要、selected pointer、请求 generation |
 | `projection` | 按 Session 的 turn/step/block 投影；处理 ContentShape 乐观回填与悬挂工具 interrupted 收敛 |
@@ -167,10 +167,10 @@ Pi response 可与事件交错，因此 Gateway 附加 `barrierSeq`。UI 只有�
 
 ### 客户端生命周期四大不变量
 
-1. **WebSocket 活跃订阅 LRU 有界淘汰（带 Running 活性守卫）**：
-   - 限制单个客户端 WebSocket 连接的活跃订阅数上限为 `MAX_ACTIVE_SUBSCRIPTIONS = 6`；
-   - **严格活性守卫**：只有当会话满足 `state === 'idle'` 且已落盘持久化（`persisted === true`）时，才允许在超出容量时由 LRU 策略退订；
-   - 任何处于 `running`、`waiting_ui`、`starting` 或 `unpersisted` 的会话严格受保，禁止被意外退订，确保后台 Agent 任务流、Web Audio 提示音与审批弹窗持续生效。
+1. **WebSocket 活跃订阅 admission target（带 Running 活性守卫）**：
+   - `MAX_ACTIVE_SUBSCRIPTIONS = 6` 是单连接 idle/persisted 订阅的软目标，不是所有状态下的硬上限；
+   - **严格活性守卫**：达到目标后，只有 `state === 'idle'` 或 `dormant`、已落盘持久化且没有待处理 Extension 请求的会话才允许由 LRU 策略退订；
+   - `running`、`waiting_ui`、`starting` 或 `unpersisted` 会话受保护，因此受保护会话可能使活跃数暂时超过目标。
 2. **悬挂工具状态收敛为 `interrupted`**：
    - 当历史会话加载、当前 Turn 结算或用户触发 Abort 时，若发现仍有尚未收到结果的工具调用，视图层统一将其状态置为 `interrupted`；
    - 渲染为低调的灰色标记，杜绝永恒 Loading Spinner，同时绝不篡改事实伪造为 `ok`。
@@ -216,4 +216,3 @@ Promise，关闭开始后所有新 mutation 都被拒绝。
 - 不把浏览器的 selected Session 写成 Pi 的全局“当前 Session”。
 - 不保证无限并发、无限 replay、无限 Markdown 或无限工具输出。
 - 不自动导入、复制、重写或删除用户既有 Pi JSONL。
-

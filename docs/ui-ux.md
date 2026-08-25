@@ -23,9 +23,9 @@ selected Session 只是显示指针，不能被误写成 Gateway 或 Pi 的唯�
 选择 Session 时按标准流水线执行：恢复该 Session 的本地 Store 视图 $\to$ 订阅 WebSocket Channel $\to$ 在 Baseline 同步完成后按需 Claim 控制权。离开 Session 时：
 
 - **骨架屏平滑过渡**：新建与尚无 Projection 的历史 Session 先呈现骨架屏（Skeleton）；只有 Authoritative 空快照才能展示 First-turn 引导页。新建请求开始时旧对话立即退出可见树，迟到的 Create Response 不得把用户从后来选中的 Session 抢回。
-- **WebSocket 订阅 LRU 有界淘汰（带 Running 活性守卫）**：
-  - 单个客户端 WebSocket 连接的活跃会话订阅池上限为 `MAX_ACTIVE_SUBSCRIPTIONS = 6`；
-  - **前置活性守卫**：**仅允许淘汰 `state === "idle"` 且已持久化的会话**。处于 `running`、`waiting_ui`、`starting`、`unpersisted` 的会话必须常驻订阅，严禁退订，确保后台任务流、音频提示与审批弹窗持续生效。
+- **WebSocket 订阅 LRU admission target（带 Running 活性守卫）**：
+  - `MAX_ACTIVE_SUBSCRIPTIONS = 6` 是 idle/persisted 订阅的软 admission target，不是所有状态下的硬上限；
+  - **前置活性守卫**：达到目标后，仅允许淘汰 `state === "idle"` 或 `"dormant"`、已持久化且没有待处理 Extension 请求的会话。处于 `running`、`waiting_ui`、`starting`、`unpersisted` 的会话必须常驻订阅，受保护会话可能使活跃数暂时超过目标，确保后台任务流、音频提示与审批弹窗持续生效。
 - **瞬态收敛 (Transient Abandon)**：离开未落盘、idle、无草稿/Command Tag/附件及处理、queue、对话或 Extension UI 的 Session 时，使用 exact generation + fencing token 请求 Transient Abandon，Gateway 仅停止并清理内存 Runtime，绝不误删文件。
 - **崩溃结算与状态隔离**：进程 Crash 时先将当前 Step/Turn 结算为可见错误，再释放资源；Draft、附件、模型配置、命令目录、Token 用量与 Extension UI 完全按 `sessionHandle` 隔离。
 
@@ -131,7 +131,7 @@ Composer Visual Seat 固定于 Center 底部，同一 DOM 延续焦点，数据�
 
 ### 7.5 渐进式流式 Markdown 与 32KB/64KB 熔断降级
 - 流式生成期间渐进渲染标题、粗斜体、列表与代码块外框，消除从纯文本到富文本的跳闪；
-- 当代码块超过 32KB 字符（`MAX_SYNTAX_HIGHLIGHT_CHARACTERS`）或 64KB UTF-8 字节时，自动降级为轻量原生 `<pre><code>` 文本容器，确保长代码不阻塞渲染主线程。
+- 当代码块超过 32KB 字符（`MAX_SYNTAX_HIGHLIGHT_CHARACTERS`）或 64KB UTF-8 字节时，跳过高亮与 DiffBlock，降级为轻量原生 `<pre><code>` 文本容器；这只限制高亮开销，不等同于完整 Markdown 解析或浏览器主线程预算。
 
 ---
 
@@ -176,15 +176,3 @@ Composer Visual Seat 固定于 Center 底部，同一 DOM 延续焦点，数据�
   - 保证所有触控热区 $\ge 40\text{px}$；
   - 基于 `window.visualViewport` 动态计算 `--app-height` 与 `--app-top`，消除软键盘遮挡。
 - **可访问性与键盘导航**：全局 `focus-visible` 光环，`<Kbd>` 按键提示，Tab 顺序与视觉一致，Escape 关闭顶层浮层，`prefers-reduced-motion` 关闭呼吸灯与位移。
-
----
-
-## 12. 有意延后 (Deferred Intentionally)
-
-以下特性在当前阶段保持有意延后：
-- **显式强制 Controller Takeover**：需要单独的跨连接 Fencing 与运行中语义设计，不作为普通按钮提供。
-- **跨会话全局全文检索与 Trajectory 树**：需要独立的持久化倒排索引与后台索引引擎。
-- **Recoverable Trash 的可视化还原/清空 UI**：当前只承诺安全移动到本地垃圾桶并保证文件不被损毁。
-- **Turn 虚拟化与定制 Markdown 解析引擎**：需待生产环境 Benchmark 出现实际 DOM 瓶颈时再引入，不提前增加复杂度。
-
-*(注：`@file` 工作区文件提及、Extension UI ChatDock 浮动坞、Conversation TOC 大纲轨及移动端 Bottom Sheet 触控抽屉已正式纳入当前规范体系，不再列入延后清单。)*

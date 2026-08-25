@@ -150,7 +150,7 @@ Pi Agent Web 是**安静、精确、高生产力**的本地 Agent 工作台：
 
 ### 5.5 渐进式流式 Markdown 与 32KB/64KB 熔断降级
 - 流式生成期间渐进渲染标题、粗斜体、列表与代码块外框，消除从纯文本到富文本的突兀跳闪。
-- **熔断降级规范**：严格复用 `code-display.ts` 规范，当代码块字符超过 32KB（`MAX_SYNTAX_HIGHLIGHT_CHARACTERS`）或 64KB UTF-8 字节时，自动降级为轻量原生 `<pre><code>` 文本容器，确保长代码不阻塞主线程。
+- **熔断降级规范**：严格复用 `code-display.ts` 规范，当代码块字符超过 32KB（`MAX_SYNTAX_HIGHLIGHT_CHARACTERS`）或 64KB UTF-8 字节时，跳过高亮与 DiffBlock，降级为轻量原生 `<pre><code>` 文本容器；这只限制高亮开销，不是完整 Markdown 解析或主线程预算证明。
 
 ### 5.6 对话微缩大纲轨 (Conversation TOC)
 - 主阅读列右侧悬浮纵向微缩进度条，每轮 User Turn 对应一个小刻度线。
@@ -242,9 +242,9 @@ Pi Agent Web 是**安静、精确、高生产力**的本地 Agent 工作台：
 
 ## 9. 客户端生命周期与健壮性契约
 
-### 9.1 WebSocket 订阅 LRU 有界淘汰（带 Running 活性守卫）
-- 单 WebSocket 活跃订阅上限为 `MAX_ACTIVE_SUBSCRIPTIONS = 6`；
-- **前置活性守卫**：**仅允许淘汰 `state === "idle"` 且已持久化的会话**。处于 `running`、`waiting_ui`、`starting`、`unpersisted` 的会话必须常驻订阅，严禁退订，确保后台任务与通知持续生效。
+### 9.1 WebSocket 订阅 LRU admission target（带 Running 活性守卫）
+- `MAX_ACTIVE_SUBSCRIPTIONS = 6` 是 idle/persisted 订阅的软 admission target，不是所有状态下的硬上限；
+- **前置活性守卫**：达到目标后，仅允许淘汰 `state === "idle"` 或 `"dormant"`、已持久化且没有待处理 Extension 请求的会话。处于 `running`、`waiting_ui`、`starting`、`unpersisted` 的会话必须常驻订阅，受保护会话可能使活跃数暂时超过目标。
 
 ### 9.2 悬挂工具状态收敛
 - 进程崩溃、网络断开或用户 Abort 导致未返回结果的工具调用，视图层统一收敛为 `interrupted` 状态，显示弱化灰色标记，杜绝永恒 Loading Spinner。
@@ -269,4 +269,3 @@ Pi Agent Web 是**安静、精确、高生产力**的本地 Agent 工作台：
 2. **完整生命周期状态**：empty、loading、no-model、running、waiting_ui、observer、crashed、reconnect/resync、error。
 3. **极值内容压力**：超长中英文标题、超长路径、大尺寸图片、超长 Markdown/代码、50+ 工具连续调用、后台 Session 并发更新。
 4. **自动化工程守卫**：运行 `node scripts/check-style.mjs` 与 `pnpm lint` 零错误通过。
-
