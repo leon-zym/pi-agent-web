@@ -198,6 +198,6 @@ test(e2e): cover concurrent native Sessions
 docs: record Session runtime decisions
 ```
 
-临时审计、benchmark raw output 与进度台账可以放 gitignored `tmp/`。决定延期的永久产品工作建
-GitHub Issue，包含用户问题、成功条件、非目标、安全/性能边界与测试层级；不要把一次性 audit 原样
-提交为公共契约。
+临时审计与 benchmark raw output 可以放 gitignored `tmp/`。GitHub Issues 是唯一的待办、排序与完成
+状态来源；决定延期的永久产品工作建 GitHub Issue，包含用户问题、成功条件、非目标、安全/性能边界与
+测试层级。不要在仓库内维护第二份待办清单，也不要把一次性 audit 原样提交为公共契约。

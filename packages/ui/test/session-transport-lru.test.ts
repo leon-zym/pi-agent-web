@@ -96,8 +96,8 @@ function unpersistedRuntime(sessionHandle: string): SessionRuntimeDto {
 	};
 }
 
-describe("Active WebSocket Subscription LRU Pool with Liveness Guard", () => {
-	it("exports MAX_ACTIVE_SUBSCRIPTIONS = 6", () => {
+describe("Active WebSocket Subscription LRU admission target with liveness guard", () => {
+	it("exports the soft MAX_ACTIVE_SUBSCRIPTIONS target as 6", () => {
 		expect(MAX_ACTIVE_SUBSCRIPTIONS).toBe(6);
 	});
 
@@ -261,7 +261,7 @@ describe("Active WebSocket Subscription LRU Pool with Liveness Guard", () => {
 		expect(sessions["session-7"]?.subscribed).toBe(true);
 	});
 
-	it("does not evict any session if all active sessions are running or non-evictable", () => {
+	it("allows protected sessions to exceed the soft target when no safe eviction exists", () => {
 		const { controller, sockets } = harness();
 		controller.store.getState().connect();
 		sockets[0]?.onopen?.();

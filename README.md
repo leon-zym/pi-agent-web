@@ -169,7 +169,7 @@ docs/
 - [Protocol](docs/protocol.md): verified Pi RPC facts and the browser/gateway contract
 - [UI and UX](docs/ui-ux.md): interaction, accessibility, and responsive behavior
 - [Development](docs/development.md): test layers, CI, packaging, and release checks
-- [Roadmap](docs/roadmap.md): completed recovery scope and bounded follow-up Issues
+- [GitHub Issues](https://github.com/leon-zym/pi-agent-web/issues): backlog, sequencing, and completion status
 - [Architecture decisions](docs/decisions/README.md): accepted decisions and rejected alternatives
 - [Visual design](DESIGN.md): visual tokens and component rules
 - [简体中文](README.zh-CN.md): Chinese README

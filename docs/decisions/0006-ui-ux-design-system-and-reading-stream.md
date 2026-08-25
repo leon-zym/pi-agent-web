@@ -1,6 +1,6 @@
 # ADR 0006: UI/UX design system, reading stream orchestration, and client lifecycle invariants
 
-- Status: Accepted
+- Status: Accepted (amended 2026-08-25)
 - Date: 2026-08-22
 
 ## Context
@@ -51,9 +51,15 @@ As the workbench scales to handle complex agent interactions and multi-session c
 - Mobile (`<768px`): 48px `MobileTopBar`, `MobileSwitcherSheet` bottom drawer with $\ge 40\text{px}$ touch targets, and `visualViewport` dynamic height calculation to prevent software keyboard occlusion.
 - Multi-Sensory: Native Web Audio API 120ms sine chime (440Hz $\to$ 880Hz) on completion/approval requests, coupled with dynamic background tab titles and favicon indicator dots.
 
-### 8. Active WS Subscription LRU Pool with Running Liveness Guard
-- Bound active subscriptions per WebSocket connection to `MAX_ACTIVE_SUBSCRIPTIONS = 6`.
-- **Strict Liveness Guard**: Eviction is strictly restricted to sessions where `state === 'idle' && persisted === true`. Sessions in `running`, `waiting_ui`, `starting`, or `unpersisted` states are guaranteed permanent subscription until settled.
+### 8. Active WS Subscription Admission Target with Running Liveness Guard
+- Treat `MAX_ACTIVE_SUBSCRIPTIONS = 6` as a soft admission target for idle/persisted subscriptions,
+  not as a hard connection-wide ceiling.
+- When the target is reached, eviction is restricted to persisted `idle`/`dormant` sessions with no
+  pending Extension request. Sessions in `running`, `waiting_ui`, `starting`, or `unpersisted`
+  states are protected and may temporarily take the connection above the target.
+- This UI policy does not provide a total memory budget or an admission response when every candidate
+  is protected. Cross-layer resource ceilings and an observable degraded state are not part of the
+  current client policy.
 
 ### 9. Hanging Tool Convergence to `interrupted`
 - Any incomplete tool call discovered upon session load, step settlement, or abort converges to an explicit `interrupted` status (muted gray badge), preventing infinite loading spinners without faking success.
@@ -66,7 +72,8 @@ As the workbench scales to handle complex agent interactions and multi-session c
 - Delivers a quiet, uncluttered, high-density workbench interface true to the Linear / ShadCN visual philosophy.
 - Eliminates execution blindness during tool streaming while preventing transcript clutter once settled.
 - Solves modal deadlocks by enabling users to review historical code while handling Extension approvals.
-- Guarantees bounded client memory usage across dozens of open tabs without breaking background tasks or audio notifications.
+- Keeps idle subscription pressure target-bounded without breaking background tasks or audio notifications;
+  it does not claim a hard browser-memory bound while protected sessions exceed the target.
 - Automates design system compliance via `scripts/check-style.mjs`.
 
 ## Rejected Alternatives
@@ -81,4 +88,5 @@ As the workbench scales to handle complex agent interactions and multi-session c
 
 - `scripts/check-style.mjs` enforces zero design-system anti-patterns.
 - Reducer and projection tests verify `interrupted` tool convergence, `contentShape` reconciliation, and `soft idempotency`.
-- Performance benchmarks (`conversation-performance.bench.ts`) confirm smooth rendering and bounded memory consumption.
+- Performance benchmarks (`conversation-performance.bench.ts`) report reducer/scheduler path timing and
+  fairness only. They do not establish browser main-thread, retained-DOM, heap, or long-history budgets.

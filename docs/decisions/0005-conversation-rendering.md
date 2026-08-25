@@ -1,6 +1,6 @@
 # ADR 0005: Coalesce Session streams and defer renderer replacement
 
-- Status: Accepted
+- Status: Accepted (amended 2026-08-25)
 - Date: 2026-08-21
 
 ## Context
@@ -24,12 +24,15 @@ selection, scrolling, accessibility, and bundle cost.
   budgets bound the queue, and every ready Session receives work in the same flush cycle.
 - Preserve references for unchanged turns/steps/blocks; memoize turn, step, and user-message
   surfaces. Index tool results by call id instead of filtering the full result list per block.
-- During streaming, render the changing Markdown tail as selectable plain text. Once settled,
-  lazy-load the full GFM/code renderer so the large parser is absent from the initial application
-  chunk.
-- Do not adopt Markstream React 2.0.0 in the current release. Any future renderer must enter behind
-  an adapter and pass the same security, semantics, style, accessibility, scroll, selection, and
-  browser tests before replacing the settled renderer.
+- Keep the full Markdown adapter behind a lazy boundary. The current implementation also uses the
+  ReactMarkdown/GFM path while a text block is streaming, with a selectable plain-text fallback
+  until that lazy chunk is ready. Syntax highlighting and custom diff rendering remain behind the
+  explicit character/UTF-8 byte circuit breakers. This preserves semantic Markdown during a live
+  reply, but reparses the current buffer on each published update; it is not evidence of bounded
+  browser parse or layout cost.
+- Markstream React 2.0.0 is not part of the current renderer. A renderer replacement must enter
+  behind an adapter and pass the same security, semantics, style, accessibility, scroll, selection,
+  and browser tests before replacing the settled renderer.
 - Do not add turn virtualization until profiles after these changes show retained DOM/layout, not
   parsing or publication, is the remaining primary bottleneck.
 
@@ -43,7 +46,8 @@ On the same local benchmark fixture:
   888/271 kB gzip to 562/172 kB, with a separate 336/102 kB Markdown chunk.
 - A 64 KiB GFM/code fixture costs roughly 130–180 ms in the current Node SSR
   parse/highlight/render proxy. This flags a browser long-task risk; it is not itself a Chromium
-  mount/layout/paint measurement and is not claimed as solved by lazy loading.
+  mount/layout/paint measurement and is not claimed as solved by lazy loading or the streaming
+  circuit breakers.
 - Markstream parsed/mounted the same shape substantially faster in an isolated `<pre>` setup, but
   its lazy JavaScript and CSS were about twice the current Markdown chunk footprint. Equivalent
   syntax highlighting was absent, stable-prefix reuse required explicit options and was disabled by
@@ -52,11 +56,11 @@ On the same local benchmark fixture:
 ## Consequences
 
 Streaming and multi-Session background work become bounded and responsive without changing the
-event model. Initial application load no longer pays for Markdown parsing. The SSR proxy shows that
-a very large settled Markdown block may produce a browser main-thread long task; future work must
-first measure production Chromium mount/layout/paint, then evaluate progressive/idle settlement or
-a fully equivalent renderer adapter. The risk must remain visible in benchmarks and an Issue rather
-than being hidden by a typewriter effect.
+event model. Initial application load no longer pays for Markdown parsing. The current streaming
+adapter keeps rich Markdown semantics, but every published text buffer remains a potential parse
+cost; the SSR proxy shows that a very large block may produce a browser main-thread long task.
+The current measurements do not establish production Chromium mount/layout/paint budgets, and the
+risk remains visible in benchmarks rather than being hidden by a typewriter effect.
 
 ## Rejected alternatives
 
@@ -70,6 +74,8 @@ than being hidden by a typewriter effect.
 ## Verification
 
 `session-event-scheduler.test.ts`, `projection-reducer.test.ts`, `projection.test.ts`,
-`conversation-performance.bench.ts`, and packaged multi-Session browser tests cover ordering,
-boundaries, hidden-tab publication, fairness, projection stability, background completion, and the
-measured hot paths. Renderer replacement requires additional long-Markdown browser and a11y gates.
+`markdown-block.test.tsx`, `settled-markdown.test.tsx`, `conversation-performance.bench.ts`, and
+packaged multi-Session browser tests cover ordering, boundaries, hidden-tab publication, fairness,
+projection stability, background completion, renderer circuit breakers, and the measured hot paths.
+Renderer replacement or a claim of performance completeness requires additional long-Markdown
+browser and a11y gates.
