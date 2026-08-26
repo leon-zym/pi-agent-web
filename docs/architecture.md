@@ -220,6 +220,18 @@ observer, recovers exact baselines one at a time, and pins those channels above 
 target. The selected Session requests controller ownership only after an authoritative baseline and
 a fresh matching lease snapshot exist.
 
+Persistence reconciliation has three states: persisted, unpersisted, and unknown. A matching native
+catalog row proves persistence. Its absence does not prove that a Session is unpersisted because the
+directory may filter a materialized empty Session. Runtime evidence is accepted only when
+`{serverEpoch, workspaceId, sessionHandle, generation}` matches the current inventory entry. A new
+incarnation invalidates earlier persistence evidence and returns the overlay row to unknown.
+
+Automatic initial creation waits while a relevant hot Runtime remains unknown. If exact recovery for
+that identity becomes degraded and manual-only, the Browser stops waiting without creating a Session;
+the user may still choose New Session explicitly. Automatic startup and explicit New Session calls
+share one in-flight create operation per Workspace within one Browser. The Gateway Workspace
+reservation remains the file-identity serialization boundary across requests.
+
 The directory merges durable native rows with the ephemeral hot overlay by Session handle. This
 allows multiple unpersisted hot Runtimes to remain visible across reload while preventing duplicate
 rows for persisted Sessions. A full inventory removal removes the overlay and ends desired hot

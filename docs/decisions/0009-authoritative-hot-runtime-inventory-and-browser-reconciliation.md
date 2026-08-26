@@ -52,7 +52,11 @@ though they are intentionally absent from snapshots.
 7. Browser bootstrap waits for the initial inventory before reconciling the REST directory or
    creating a Session. The directory load is fenced to the same online Gateway epoch. Revision
    changes within that epoch do not restart bootstrap; the newest same-epoch replacement is applied
-   independently. An epoch or connection change retries the bootstrap boundary.
+   independently. An epoch or connection change retries the bootstrap boundary. Automatic initial
+   creation waits while any relevant hot identity has unknown persistence. A matching degraded,
+   manual-only recovery ends that wait without creating a Session, while an explicit New Session
+   remains available. Automatic and explicit creation share one in-flight create operation per
+   Workspace within one Browser.
 8. The Browser treats every inventory entry as a desired background observer. Desired identities
    are tracked per handle, exact requests are single-flight per handle, and fresh exact baseline
    recovery is globally serialized. A stale attempt cannot clear a newer desired identity. A
@@ -64,7 +68,11 @@ though they are intentionally absent from snapshots.
 10. The Session directory merges durable catalog rows and the full-replacement hot overlay by
     handle. This exposes multiple unpersisted hot Sessions without duplicating persisted rows.
     Loaded Workspace counts use the merged rows. Unloaded counts preserve the known durable total
-    and add only entries known to be unpersisted.
+    and add only entries known to be unpersisted. A catalog match proves persistence, but catalog
+    absence does not prove that a Session is unpersisted because the directory may filter a
+    materialized empty Session. Runtime persistence evidence is accepted only when its complete
+    `{serverEpoch, workspaceId, sessionHandle, generation}` identity matches the current inventory;
+    otherwise its persistence remains unknown.
 11. Transient cleanup is provenance-sensitive. Only an unpersisted Session created by the current
     Browser may use transient abandon after exact baseline, lease, controller, idle, and untouched
     checks succeed. A recovered hot-only Session may be released but is never inferred safe to

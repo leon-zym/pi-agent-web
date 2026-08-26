@@ -13,9 +13,13 @@ selected Session 只是显示指针，不能被误写成 Gateway 或 Pi 的唯�
 - **Startup reconciliation before creation**: After hello, the Browser waits for the authoritative
   initial hot Runtime inventory, then loads the REST directory under the same connection epoch. It
   resumes an eligible hot transient for the default Workspace before creating a fresh empty Session,
-  and it never opens the first dormant history row automatically. Inventory revisions may continue
-  changing during the REST load without trapping the page in its bootstrap skeleton. A new epoch
-  restarts reconciliation.
+  and it never opens the first dormant history row automatically. An inventory-only row has unknown
+  persistence until the native catalog contains it or a full-identity Runtime baseline resolves it.
+  Automatic creation waits for that result. A matching degraded, manual-only recovery leaves the
+  Workspace empty instead of creating another Session, while the user can still choose New Session.
+  Automatic and explicit creation share one in-flight request per Workspace. Inventory revisions may
+  continue changing during the REST load without trapping the page in its bootstrap skeleton. A new
+  epoch restarts reconciliation.
 - **Durable history plus hot overlay**: The Sidebar merges native catalog rows with every current hot
   Runtime by Session handle. Persisted entries are deduplicated, while multiple unpersisted hot-only
   Sessions remain visible across reload. The overlay is process state, not history. A local empty
@@ -24,7 +28,8 @@ selected Session 只是显示指针，不能被误写成 Gateway 或 Pi 的唯�
 - **Workspace counts**: Once a Workspace catalog is loaded, its badge shows the deduplicated merged
   row count. Before that catalog is loaded, the badge preserves the known durable count and adds only
   hot rows known to be unpersisted, because a persisted hot row may already be included in the REST
-  total.
+  total. Catalog absence is not evidence that a hot row is unpersisted. Runtime persistence counts
+  only when its epoch, Workspace, handle, and generation match the current inventory identity.
 - **多感官与后台 Tab 感知**：
   - **轻柔提示音**：任务执行完成或触发 Extension UI 等待确认时，通过 Web Audio API 播放 120ms 正弦升调提示音（440Hz $\to$ 880Hz），可在偏好设置中一键静音；
   - **动态标题与 Favicon 徽标**：页面处于后台标签页时，根据 Session 状态动态更新 `document.title`（如 `[运行中] Pi Agent Web`、`[待确认] Pi Agent Web`）并在 Favicon 绘制状态红点/蓝点。
