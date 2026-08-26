@@ -14,7 +14,44 @@ export interface GatewayAccessControl {
 	createSessionCookie: () => string;
 }
 
-const DEV_ORIGINS = new Set(["http://localhost:5173", "http://127.0.0.1:5173", "http://[::1]:5173"]);
+export type GatewayAccessDenial =
+	| "invalid_target"
+	| "invalid_origin"
+	| "cross_origin"
+	| "missing_same_origin_metadata"
+	| "invalid_session_cookie";
+
+export interface GatewayAccessControlOptions {
+	onDenied?: (reason: GatewayAccessDenial) => void;
+}
+
+export interface GatewayAccessDenialReport {
+	reason: GatewayAccessDenial;
+	suppressed: number;
+}
+
+export function createGatewayAccessDenialReporter(
+	report: (entry: GatewayAccessDenialReport) => void,
+	options: { intervalMs?: number; now?: () => number } = {},
+): (reason: GatewayAccessDenial) => void {
+	const intervalMs = options.intervalMs ?? 1_000;
+	if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+		throw new Error("Gateway access denial report interval must be positive");
+	}
+	const now = options.now ?? (() => performance.now());
+	let lastReportAt = Number.NEGATIVE_INFINITY;
+	let suppressed = 0;
+	return (reason) => {
+		const current = now();
+		if (current - lastReportAt < intervalMs) {
+			suppressed += 1;
+			return;
+		}
+		report({ reason, suppressed });
+		lastReportAt = current;
+		suppressed = 0;
+	};
+}
 
 function headerValue(headers: HeadersInput, name: string): string | undefined {
 	if (isHeaderBag(headers)) return headers.get(name) ?? undefined;
@@ -47,6 +84,9 @@ function requestOrigin(headers: HeadersInput): string | undefined {
 	if (!host) return undefined;
 	try {
 		const parsed = new URL(`http://${host}`);
+		if (parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) {
+			return undefined;
+		}
 		return isLoopbackHost(parsed.hostname) ? parsed.origin : undefined;
 	} catch {
 		return undefined;
@@ -76,19 +116,39 @@ function isSameOriginFetch(headers: HeadersInput): boolean {
 	return headerValue(headers, "sec-fetch-site") === "same-origin";
 }
 
-export function createGatewayAccessControl(sessionSecret: string): GatewayAccessControl {
-	const isAllowedOrigin = (headers: HeadersInput): boolean => {
+export function createGatewayAccessControl(
+	sessionSecret: string,
+	options: GatewayAccessControlOptions = {},
+): GatewayAccessControl {
+	const originDenial = (headers: HeadersInput): GatewayAccessDenial | undefined => {
 		const targetOrigin = requestOrigin(headers);
-		if (!targetOrigin) return false;
-		const origin = normalizedOrigin(headerValue(headers, "origin"));
-		if (!origin) return isSameOriginFetch(headers);
-		return origin === targetOrigin || DEV_ORIGINS.has(origin);
+		if (!targetOrigin) return "invalid_target";
+		const rawOrigin = headerValue(headers, "origin");
+		if (!rawOrigin) return isSameOriginFetch(headers) ? undefined : "missing_same_origin_metadata";
+		const origin = normalizedOrigin(rawOrigin);
+		if (!origin) return "invalid_origin";
+		return origin === targetOrigin ? undefined : "cross_origin";
+	};
+	const isAllowedOrigin = (headers: HeadersInput): boolean => {
+		const denial = originDenial(headers);
+		if (denial) options.onDenied?.(denial);
+		return denial === undefined;
 	};
 
 	return {
 		isAllowedOrigin,
-		isAuthorized: (headers) =>
-			isAllowedOrigin(headers) && matchesSecret(readCookie(headers, SESSION_COOKIE_NAME), sessionSecret),
+		isAuthorized: (headers) => {
+			const denial = originDenial(headers);
+			if (denial) {
+				options.onDenied?.(denial);
+				return false;
+			}
+			if (!matchesSecret(readCookie(headers, SESSION_COOKIE_NAME), sessionSecret)) {
+				options.onDenied?.("invalid_session_cookie");
+				return false;
+			}
+			return true;
+		},
 		createSessionCookie: () => `${SESSION_COOKIE_NAME}=${sessionSecret}; Path=/; HttpOnly; SameSite=Strict`,
 	};
 }

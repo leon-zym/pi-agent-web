@@ -119,6 +119,12 @@ try {
 		if (!bootstrap.ok || !cookie) throw new Error("Bootstrap did not issue a session cookie");
 		const response = await fetch(`${origin}/api/v1/health`, { headers: { Origin: origin, Cookie: cookie } });
 		if (!response.ok) throw new Error(`Health check failed with ${String(response.status)}`);
+		const crossPort = await fetch(`${origin}/api/v1/health`, {
+			headers: { Origin: "http://localhost:5173", Cookie: cookie },
+		});
+		if (crossPort.status !== 403) {
+			throw new Error(`Packaged REST accepted a cross-port Origin with status ${String(crossPort.status)}`);
+		}
 		const spa = await fetch(origin);
 		if (!spa.ok || !(await spa.text()).includes('<div id="root"></div>')) {
 			throw new Error("Packaged SPA was not served from the CLI port");
@@ -133,6 +139,18 @@ try {
 				socket.close();
 				resolve();
 			});
+			socket.once("error", reject);
+		});
+		await new Promise((resolve, reject) => {
+			const socket = new WebSocket(`${origin.replace("http", "ws")}/api/v1/ws`, {
+				headers: { Origin: "http://localhost:5173", Cookie: cookie },
+			});
+			socket.once("unexpected-response", (_request, rejected) => {
+				rejected.resume();
+				if (rejected.statusCode === 403) resolve();
+				else reject(new Error(`Packaged WebSocket rejection returned ${String(rejected.statusCode)}`));
+			});
+			socket.once("open", () => reject(new Error("Packaged WebSocket accepted a cross-port Origin")));
 			socket.once("error", reject);
 		});
 	} finally {

@@ -26,6 +26,14 @@ test("packaged app bootstraps and renders the workbench without browser errors",
 
 	await page.goto(harness.origin, { waitUntil: "domcontentloaded" });
 	expect((await bootstrapResponse).status()).toBe(200);
+	const sameOrigin = await page.context().request.get(`${harness.origin}/api/v1/health`, {
+		headers: { Origin: harness.origin },
+	});
+	expect(sameOrigin.status()).toBe(200);
+	const crossPort = await page.context().request.get(`${harness.origin}/api/v1/health`, {
+		headers: { Origin: "http://localhost:5173" },
+	});
+	expect(crossPort.status()).toBe(403);
 	await expect(page.locator("#root > div")).toBeVisible();
 	await expect(page.getByRole("navigation", { name: /^(Sidebar|侧栏)$/ })).toBeVisible();
 	await expect(page.locator("main")).toBeVisible();

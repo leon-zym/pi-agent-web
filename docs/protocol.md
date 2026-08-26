@@ -82,14 +82,19 @@ partial 并标记已停止。零 delta 的 assistant start/end 是合法序列�
 ## 2. 本地访问控制
 
 Gateway 只接受 `127.0.0.1`、`localhost` 或 `::1` listener。浏览器先请求
-`GET /api/v1/bootstrap`；Gateway 校验 Host 与允许的 loopback Origin 后写入启动期随机的
+`GET /api/v1/bootstrap`；Gateway 校验 loopback Host 与完全相同的 Origin 后写入启动期随机的
 HttpOnly、SameSite=Strict Cookie。
 
 其余 REST 与 WebSocket upgrade 必须带 Cookie：
 
-- 有 `Origin` 时必须与允许的 loopback origin 匹配；
+- 有 `Origin` 时必须与请求 Host 推导出的 Origin 完全一致，包括 hostname 与 port；
 - 浏览器同源 GET 缺少 `Origin` 时必须有 `Sec-Fetch-Site: same-origin`；
 - Host 本身也必须是 loopback，防止 DNS rebinding 用恶意域名同源读取本机数据。
+
+开发模式不扩大 Gateway allowlist。Vite 先按自己的 Host/Origin 或 Fetch Metadata 拒绝跨 Origin
+请求，再把允许的 REST 与 WebSocket 请求改写为固定的 Gateway Origin；生产或打包启动会拒绝所有
+`:5173` Origin，即使请求已携带有效 Cookie。Gateway 拒绝日志按时间窗汇总，只记录稳定原因码与
+抑制计数，不记录 Cookie 或 session secret。
 
 这层保护用于阻止普通网页跨站驱动 localhost，不是面向远程用户、敌对本机进程或共享账户的
 认证系统。

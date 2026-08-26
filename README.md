@@ -17,9 +17,12 @@ header; a small preference store keeps presentation and discovery hints only.
 
 The gateway is a single-user, same-origin control surface that listens only on loopback addresses.
 After the bootstrap request issues an HttpOnly cookie, all other REST and WebSocket requests require
-it and are checked against the loopback Host plus Origin or Fetch Metadata. These checks are intended for local browser use, not
-for a hosted service, LAN deployment, remote accounts, multi-user collaboration, or isolation from
-a hostile local user. Do not expose `pi-web` through a public reverse proxy.
+it and are checked against the loopback Host plus the exact same Origin or Fetch Metadata. Development
+traffic reaches the gateway through Vite's same-origin proxy, which rejects cross-origin callers
+before rewriting the request; production never trusts Vite's port.
+These checks are intended for local browser use, not for a hosted service, LAN deployment, remote
+accounts, multi-user collaboration, or isolation from a hostile local user. Do not expose `pi-web`
+through a public reverse proxy.
 
 Provider credentials, extensions, settings, and JSONL history remain in the user's Pi installation.
 This repository does not bundle them, and credential-free CI does not need them.
@@ -97,7 +100,9 @@ pnpm dev
 ```
 
 Development mode starts the gateway on `:3000` and Vite on `:5173` by default. Open the loopback
-URL printed by Vite, add a local Workspace, then open an existing native Session or create one.
+URL printed by Vite, add a local Workspace, then open an existing native Session or create one. Vite
+proxies API and WebSocket traffic as gateway-origin requests; `:5173` is not a trusted production
+Origin.
 
 Build the SPA before starting the single-port CLI:
 

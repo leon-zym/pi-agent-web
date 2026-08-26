@@ -1,22 +1,79 @@
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
-import { defineConfig } from "vite";
+import { defineConfig, type ProxyOptions } from "vite";
 
 // Dev: vite serves the SPA on 5173 and proxies REST + WS to the gateway on 3000.
+export const DEV_GATEWAY_ORIGIN = "http://127.0.0.1:3000";
+
+function isLoopbackHost(hostname: string): boolean {
+	return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+}
+
+function normalizedLoopbackOrigin(value: string | undefined): string | undefined {
+	if (!value) return undefined;
+	try {
+		const parsed = new URL(value);
+		if (parsed.protocol !== "http:" || !isLoopbackHost(parsed.hostname) || parsed.origin !== value) {
+			return undefined;
+		}
+		return parsed.origin;
+	} catch {
+		return undefined;
+	}
+}
+
+function requestLoopbackOrigin(host: string | undefined): string | undefined {
+	if (!host) return undefined;
+	try {
+		const parsed = new URL(`http://${host}`);
+		if (
+			parsed.username ||
+			parsed.password ||
+			parsed.pathname !== "/" ||
+			parsed.search ||
+			parsed.hash ||
+			!isLoopbackHost(parsed.hostname)
+		) {
+			return undefined;
+		}
+		return parsed.origin;
+	} catch {
+		return undefined;
+	}
+}
+
+const rejectCrossOriginProxyRequest: NonNullable<ProxyOptions["bypass"]> = (request, _response) => {
+	const targetOrigin = requestLoopbackOrigin(request.headers.host);
+	const rawOrigin = request.headers.origin;
+	const allowed = rawOrigin
+		? targetOrigin !== undefined && normalizedLoopbackOrigin(rawOrigin) === targetOrigin
+		: request.headers["sec-fetch-site"] === "same-origin" && targetOrigin !== undefined;
+	return allowed ? undefined : false;
+};
+
+export function createGatewayProxy(gatewayOrigin: string): Record<string, ProxyOptions> {
+	return {
+		"/api/v1/ws": {
+			bypass: rejectCrossOriginProxyRequest,
+			target: gatewayOrigin.replace("http:", "ws:"),
+			changeOrigin: true,
+			headers: { Origin: gatewayOrigin },
+			ws: true,
+		},
+		"/api": {
+			bypass: rejectCrossOriginProxyRequest,
+			target: gatewayOrigin,
+			changeOrigin: true,
+			headers: { Origin: gatewayOrigin },
+		},
+	};
+}
+
 export default defineConfig({
 	plugins: [react(), tailwindcss()],
 	server: {
 		port: 5173,
-		proxy: {
-			"/api/v1/ws": {
-				target: "ws://127.0.0.1:3000",
-				ws: true,
-			},
-			"/api": {
-				target: "http://127.0.0.1:3000",
-				changeOrigin: true,
-			},
-		},
+		proxy: createGatewayProxy(DEV_GATEWAY_ORIGIN),
 	},
 	build: {
 		outDir: "dist",

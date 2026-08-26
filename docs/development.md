@@ -13,6 +13,10 @@ pnpm build                  # 四个 package 的发行产物
 pnpm start                  # build 后由 pi-web 提供单端口 SPA/REST/WS
 ```
 
+Vite 只接受同源的 `/api` 与 `/api/v1/ws` 请求，再代理到 `127.0.0.1:3000` 并把 Host/Origin 收敛为
+Gateway 同源值；Gateway 本身没有开发端口 allowlist，因此 production/packaged 启动不会信任
+`:5173`。
+
 根 `pnpm start` 参数放在 `--` 之后，例如：
 
 ```bash

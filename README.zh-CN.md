@@ -15,9 +15,11 @@ Pi JSONL 始终是持久化事实来源。Pi Agent Web 不会把 Workspace 或 S
 ## 本地预览边界
 
 网关是单用户、本机同源控制面，只监听 loopback 地址。bootstrap 请求签发 HttpOnly Cookie 后，
-其余 REST 与 WebSocket 请求必须携带该 Cookie，并校验 loopback Host 以及 Origin 或 Fetch Metadata。这些措施面向本机浏览器
-使用，不能替代托管服务、局域网部署、远程账户、多用户协作或敌对本机用户隔离。不要通过公网反向
-代理暴露 `pi-web`。
+其余 REST 与 WebSocket 请求必须携带该 Cookie，并校验 loopback Host 以及完全相同的 Origin 或
+Fetch Metadata。开发流量通过 Vite 的同源代理进入网关；代理会先拒绝跨 Origin 调用，再改写请求，
+而生产环境从不信任 Vite 端口。这些措施面向
+本机浏览器使用，不能替代托管服务、局域网部署、远程账户、多用户协作或敌对本机用户隔离。不要
+通过公网反向代理暴露 `pi-web`。
 
 Provider 凭据、扩展、设置和 JSONL 历史仍留在用户自己的 Pi 安装中。本仓库不会打包这些内容，无
 凭据 CI 也不需要读取它们。
@@ -89,7 +91,8 @@ pnpm dev
 ```
 
 开发模式默认启动 `:3000` 上的网关和 `:5173` 上的 Vite。打开 Vite 输出的 loopback 地址，添加
-本地 Workspace，然后打开已有原生 Session 或新建 Session。
+本地 Workspace，然后打开已有原生 Session 或新建 Session。Vite 只把来访同源的 API 与 WebSocket
+改写为网关同源请求；`:5173` 不是生产环境的受信 Origin。
 
 启动单端口 CLI 前，先构建 SPA：
 
