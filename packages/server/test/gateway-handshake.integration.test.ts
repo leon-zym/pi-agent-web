@@ -162,7 +162,7 @@ describe("Gateway WebSocket hello negotiation", () => {
 
 		await expect(frame).resolves.toMatchObject({
 			type: "server_hello",
-			protocol: { major: 1, minor: 0 },
+			protocol: { major: 1, minor: 1 },
 			serverBuild: "0.1.0-test",
 			serverEpoch: "gateway-epoch-test",
 			piVersion: "0.84.2",

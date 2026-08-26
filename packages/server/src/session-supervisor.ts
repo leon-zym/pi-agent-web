@@ -4,14 +4,21 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type {
 	ExtensionUiResponseDto,
+	HotRuntimeInventoryDto,
+	HotRuntimeInventoryEntryDto,
 	SessionCommandDto,
 	SessionCommandResponseDto,
+	SessionRuntimeIdentityDto,
 } from "@pi-agent-web/protocol";
-import { RpcError } from "@pi-agent-web/protocol";
+import { RpcError, SESSION_HOT_RUNTIME_INVENTORY_MAX_ITEMS } from "@pi-agent-web/protocol";
 import type { ProbedPiRuntime } from "./resolver.js";
 import { canonicalizePathAllowMissing } from "./session-layout-resolver.js";
 import type { SessionLiveProjectionLimits } from "./session-live-projection.js";
-import { type SessionIdentityTransitionCommit, SessionRuntime } from "./session-runtime.js";
+import {
+	type SessionHotRuntimeObservation,
+	type SessionIdentityTransitionCommit,
+	SessionRuntime,
+} from "./session-runtime.js";
 import {
 	type ExistingSessionTarget,
 	HOST_MANAGED_COMMANDS,
@@ -54,6 +61,7 @@ export interface SessionSupervisorOptions {
 	envForWorkspace?: (cwd: string) => Record<string, string>;
 	resolveSession: (sessionHandle: string) => Promise<ExistingSessionTarget | undefined>;
 	broadcast: (message: SessionSupervisorMessage) => void;
+	onHotRuntimeInventory?: (inventory: HotRuntimeInventoryDto) => void;
 	log?: (level: "info" | "warn" | "error", message: string) => void;
 	readyTimeoutMs?: number;
 	replayLimit?: number;
@@ -118,16 +126,26 @@ export class SessionSupervisor {
 	private workspaceCreations = new Map<string, number>();
 	private reaper: NodeJS.Timeout;
 	private poolTail: Promise<void> = Promise.resolve();
+	private hotInventoryRevision = 0;
+	private hotInventoryEntries: HotRuntimeInventoryEntryDto[] = [];
+	private hotInventorySignature = "[]";
+	private hotInventoryRefreshScheduled = false;
 	private closed = false;
 	private closePromise: Promise<void> | null = null;
 
 	constructor(opts: SessionSupervisorOptions) {
 		this.serverEpoch = opts.serverEpoch ?? randomUUID();
+		const configuredMaxHotRuntimes = Number.isFinite(opts.maxHotRuntimes)
+			? Math.floor(opts.maxHotRuntimes ?? 8)
+			: 8;
 		this.opts = {
 			...opts,
 			readyTimeoutMs: opts.readyTimeoutMs ?? 10_000,
 			replayLimit: opts.replayLimit ?? 1_024,
-			maxHotRuntimes: Math.max(1, opts.maxHotRuntimes ?? 8),
+			maxHotRuntimes: Math.min(
+				SESSION_HOT_RUNTIME_INVENTORY_MAX_ITEMS,
+				Math.max(1, configuredMaxHotRuntimes),
+			),
 			idleTtlMs: opts.idleTtlMs ?? 10 * 60_000,
 			transientIdleTtlMs: Math.max(
 				0,
@@ -153,6 +171,15 @@ export class SessionSupervisor {
 
 	getRuntime(sessionHandle: string): SessionRuntimeSnapshot | undefined {
 		return this.runtimes.get(this.resolveAlias(sessionHandle))?.snapshot();
+	}
+
+	getHotRuntimeInventory(): HotRuntimeInventoryDto {
+		return {
+			type: "hot_runtime_inventory",
+			serverEpoch: this.serverEpoch,
+			revision: this.hotInventoryRevision,
+			runtimes: this.hotInventoryEntries.map((entry) => ({ ...entry })),
+		};
 	}
 
 	async activate(sessionHandle: string): Promise<SessionRuntimeSnapshot> {
@@ -209,6 +236,7 @@ export class SessionSupervisor {
 					throw new RpcError("new_session", "canonical_session_already_active");
 				}
 				this.rekeyRuntime(temporaryHandle, runtime, true);
+				this.commitHotRuntimeInventoryIfChanged();
 				this.safeBroadcast({ type: "session_directory_changed", workspaceId: request.workspaceId });
 			});
 		} catch (error) {
@@ -225,6 +253,27 @@ export class SessionSupervisor {
 	async subscribe(sessionHandle: string, cursor?: ReplayCursor): Promise<ReplayResult> {
 		const runtime = await this.ensureRuntime(sessionHandle);
 		return runtime.getReplay(sessionHandle, cursor);
+	}
+
+	async subscribeHotExact(expected: SessionRuntimeIdentityDto, cursor?: ReplayCursor): Promise<ReplayResult> {
+		return this.withPoolLock(async () => {
+			this.assertOpen();
+			const runtime = this.runtimes.get(expected.sessionHandle);
+			if (!runtime) throw new RpcError("session_subscribe", "hot_runtime_not_found");
+			const observation = runtime.captureHotRuntimeObservation();
+			if (!observation) throw new RpcError("session_subscribe", "hot_runtime_not_found");
+			if (!this.matchesHotRuntimeIdentity(observation, expected)) {
+				throw new RpcError("session_subscribe", "hot_runtime_identity_changed");
+			}
+			const baseline = runtime.getReplay(expected.sessionHandle, cursor);
+			if (
+				this.runtimes.get(expected.sessionHandle) !== runtime ||
+				!runtime.isHotRuntimeObservationCurrent(observation)
+			) {
+				throw new RpcError("session_subscribe", "hot_runtime_identity_changed");
+			}
+			return baseline;
+		});
 	}
 
 	async claim(sessionHandle: string, connectionId: string): Promise<SessionLeaseSnapshot> {
@@ -650,12 +699,15 @@ export class SessionSupervisor {
 		await Promise.allSettled([...this.deletionOperations]);
 		await this.withPoolLock(async () => {});
 		await Promise.all([...new Set(this.runtimes.values())].map((runtime) => runtime.stop()));
-		this.leases.clear();
-		this.aliases.clear();
-		this.deletionReservations.clear();
-		this.workspaceTransitions.clear();
-		this.workspaceCreations.clear();
-		this.runtimes.clear();
+		await this.withPoolLock(async () => {
+			this.leases.clear();
+			this.aliases.clear();
+			this.deletionReservations.clear();
+			this.workspaceTransitions.clear();
+			this.workspaceCreations.clear();
+			this.runtimes.clear();
+			this.commitHotRuntimeInventoryIfChanged();
+		});
 	}
 
 	notifyAuthChanged(workspaceId?: string): void {
@@ -815,6 +867,7 @@ export class SessionSupervisor {
 			initialGeneration,
 			commandTimeoutFor: this.opts.commandTimeoutFor,
 			emit: (message) => this.safeBroadcast(message),
+			onHotSetChanged: () => this.scheduleHotRuntimeInventoryRefresh(),
 			onCrash: (runtime) => this.handleCrash(runtime),
 			commitIdentityTransition: (runtime, transition) => this.commitIdentityTransition(runtime, transition),
 			log: this.opts.log,
@@ -858,6 +911,7 @@ export class SessionSupervisor {
 					previousSessionHandle,
 					runtime: committedRuntime,
 				});
+				this.commitHotRuntimeInventoryIfChanged();
 				this.safeBroadcast({ type: "runtime_state", runtime: runtime.snapshot() });
 				this.safeBroadcast({ type: "session_directory_changed", workspaceId: runtime.workspaceId });
 				throw error;
@@ -868,6 +922,7 @@ export class SessionSupervisor {
 				previousSessionHandle,
 				runtime: runtime.snapshot(),
 			});
+			this.commitHotRuntimeInventoryIfChanged();
 			for (const message of stagedMessages) this.safeBroadcast(message);
 			this.safeBroadcast({ type: "session_directory_changed", workspaceId: runtime.workspaceId });
 		});
@@ -1113,6 +1168,71 @@ export class SessionSupervisor {
 
 	private isEvictable(runtime: SessionRuntime): boolean {
 		return runtime.canEvict && !this.leases.has(runtime.sessionHandle);
+	}
+
+	private matchesHotRuntimeIdentity(
+		observation: SessionHotRuntimeObservation,
+		expected: SessionRuntimeIdentityDto,
+	): boolean {
+		const entry = observation.entry;
+		return (
+			expected.serverEpoch === this.serverEpoch &&
+			entry.serverEpoch === expected.serverEpoch &&
+			entry.sessionHandle === expected.sessionHandle &&
+			entry.workspaceId === expected.workspaceId &&
+			entry.generation === expected.generation
+		);
+	}
+
+	private scheduleHotRuntimeInventoryRefresh(): void {
+		if (this.hotInventoryRefreshScheduled) return;
+		this.hotInventoryRefreshScheduled = true;
+		void this.withPoolLock(async () => {
+			this.hotInventoryRefreshScheduled = false;
+			this.commitHotRuntimeInventoryIfChanged();
+		}).catch((error) => {
+			this.hotInventoryRefreshScheduled = false;
+			this.log("error", `Hot Runtime inventory refresh failed: ${String(error)}`);
+		});
+	}
+
+	private commitHotRuntimeInventoryIfChanged(): void {
+		const entries: HotRuntimeInventoryEntryDto[] = [];
+		const seen = new Set<SessionRuntime>();
+		for (const [trackedHandle, runtime] of this.runtimes) {
+			if (seen.has(runtime)) continue;
+			seen.add(runtime);
+			if (trackedHandle.startsWith("pending_")) continue;
+			const observation = runtime.captureHotRuntimeObservation();
+			if (!observation) continue;
+			if (observation.entry.sessionHandle === trackedHandle) {
+				entries.push({ ...observation.entry });
+				continue;
+			}
+			const previous = this.hotInventoryEntries.find((entry) => entry.sessionHandle === trackedHandle);
+			if (previous) entries.push({ ...previous });
+		}
+		entries.sort((left, right) => {
+			if (left.sessionHandle !== right.sessionHandle) {
+				return left.sessionHandle < right.sessionHandle ? -1 : 1;
+			}
+			if (left.workspaceId === right.workspaceId) return 0;
+			return left.workspaceId < right.workspaceId ? -1 : 1;
+		});
+		const signature = JSON.stringify(entries);
+		if (signature === this.hotInventorySignature) return;
+		if (this.hotInventoryRevision >= Number.MAX_SAFE_INTEGER) {
+			throw new RpcError("hot_runtime_inventory", "hot_runtime_inventory_revision_exhausted");
+		}
+		this.hotInventorySignature = signature;
+		this.hotInventoryEntries = entries;
+		this.hotInventoryRevision += 1;
+		const inventory = this.getHotRuntimeInventory();
+		try {
+			this.opts.onHotRuntimeInventory?.(inventory);
+		} catch (error) {
+			this.log("error", `Hot Runtime inventory publish failed: ${String(error)}`);
+		}
 	}
 
 	private async withPoolLock<T>(operation: () => Promise<T>): Promise<T> {
