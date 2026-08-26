@@ -69,7 +69,13 @@ test("a 52-tool trajectory and 64 KiB settled response survive background naviga
 		.getByRole("button", { name: /^(New session|新建会话)$/ })
 		.first()
 		.click();
-	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(0);
+	const freshCurrent = page.locator('[data-session-row][data-current="true"]');
+	await expect(freshCurrent).toHaveCount(1);
+	await expect(foregroundRow).toHaveAttribute("data-current", "false");
+	await expect(freshCurrent).not.toContainText(FOREGROUND_PROMPT);
+	await expect(
+		page.locator("header").getByRole("button", { name: /^(Empty session|空会话)$/ }),
+	).toBeVisible();
 	await expect(page.locator("textarea")).toBeEnabled();
 	await sendPrompt(page, STRESS_PROMPT);
 
@@ -80,6 +86,8 @@ test("a 52-tool trajectory and 64 KiB settled response survive background naviga
 		.toMatchObject({ toolCount: 26 });
 	const stressRow = page.locator("[data-session-row]").filter({ hasText: STRESS_PROMPT });
 	await expect(stressRow).toHaveCount(1);
+	await expect(stressRow).toHaveAttribute("data-current", "true");
+	await expect(foregroundRow).toHaveAttribute("data-current", "false");
 	const toolRows = main.locator('button[aria-expanded="false"]').filter({ hasText: "synthetic-tool-" });
 	await expect(toolRows).toHaveCount(26);
 	await foregroundRow.getByRole("button").first().click();
@@ -285,7 +293,11 @@ test("reload restores one known Session across active text and tool checkpoints"
 	await expect(page.locator("main")).toBeVisible();
 	let knownSession = page.locator("[data-session-row]").filter({ hasText: RELOAD_PROMPT });
 	await expect(knownSession).toHaveCount(1);
-	await knownSession.getByRole("button").first().click();
+	if ((await knownSession.getAttribute("data-current")) !== "true") {
+		await knownSession.getByRole("button").first().click();
+	}
+	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(1);
+	await expect(knownSession).toHaveAttribute("data-current", "true");
 
 	let restoredMain = page.locator("main");
 	await expect(restoredMain.getByText(RELOAD_PARTIAL_TEXT, { exact: true })).toHaveCount(1);
@@ -328,7 +340,11 @@ test("reload restores one known Session across active text and tool checkpoints"
 	await expect(page.locator("main")).toBeVisible();
 	knownSession = page.locator("[data-session-row]").filter({ hasText: RELOAD_PROMPT });
 	await expect(knownSession).toHaveCount(1);
-	await knownSession.getByRole("button").first().click();
+	if ((await knownSession.getAttribute("data-current")) !== "true") {
+		await knownSession.getByRole("button").first().click();
+	}
+	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(1);
+	await expect(knownSession).toHaveAttribute("data-current", "true");
 
 	restoredMain = page.locator("main");
 	await expect(restoredMain.getByText(RELOAD_PARTIAL_TEXT, { exact: true })).toHaveCount(1);

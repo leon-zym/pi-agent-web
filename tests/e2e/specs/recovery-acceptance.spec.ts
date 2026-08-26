@@ -50,7 +50,7 @@ async function openFreshSurface(page: Page, harness: ProductionHarness): Promise
 	await page.goto(harness.origin, { waitUntil: "domcontentloaded" });
 	await expect(page.locator("#root > div")).toBeVisible();
 	await expect(page.locator("textarea")).toBeEnabled();
-	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(0);
+	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(1);
 	await expect(
 		page.locator("header").getByRole("button", { name: /^(Empty session|空会话)$/ }),
 	).toBeVisible();
@@ -134,7 +134,7 @@ test("fresh boot and navigation never select or flash historical content", async
 	await secondary.click();
 	await expect(secondary).toHaveAttribute("aria-expanded", "true");
 	await expect(activeTitle).toBeVisible();
-	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(0);
+	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(1);
 	await secondary.click();
 	await expect(secondary).toHaveAttribute("aria-expanded", "false");
 	await expect(activeTitle).toBeVisible();
@@ -175,7 +175,7 @@ test("fresh boot and navigation never select or flash historical content", async
 		page.locator("header").getByRole("button", { name: /^(Empty session|空会话)$/ }),
 	).toBeVisible();
 	await expect(page.getByText(/^(Start your first turn|开始你的第一轮对话)$/)).toBeVisible();
-	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(0);
+	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(1);
 	await historicalRow(page).getByRole("button").first().click();
 	await expect(page.locator("main").getByText(HISTORICAL_REPLY, { exact: true })).toBeVisible();
 	await expect
@@ -199,7 +199,7 @@ test("fresh boot and navigation never select or flash historical content", async
 		.first()
 		.click();
 	await expect(page.locator("textarea")).toHaveValue("E2E retained local draft");
-	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(0);
+	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(1);
 
 	await expectNoPageOverflow(page);
 	expect(errors.console).toEqual([]);
@@ -277,8 +277,11 @@ test("export, Bash, Inspect, Events, and the conversation tree expose complete s
 	await expect(page.getByText(/Forked a new session|已从该消息分叉出新会话/)).toBeVisible();
 	await expect(page.getByText(/^(Fork failed|分叉失败)$/)).toHaveCount(0);
 	await expect(page.locator("textarea")).toBeEnabled();
-	await expect(inspectParentRow).toHaveAttribute("data-current", "false");
-	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(0);
+	const inspectDormantParentRow = page
+		.locator('[data-session-row][data-current="false"]')
+		.filter({ hasText: INSPECT_PROMPT });
+	await expect(inspectDormantParentRow).toHaveCount(1);
+	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(1);
 
 	await page.locator("textarea").fill(FORK_CHILD_PROMPT);
 	await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
@@ -288,7 +291,7 @@ test("export, Bash, Inspect, Events, and the conversation tree expose complete s
 	const forkChildRow = page.locator("[data-session-row]").filter({ hasText: FORK_CHILD_PROMPT });
 	await expect(forkChildRow).toHaveCount(1);
 	await expect(forkChildRow).toHaveAttribute("data-current", "true");
-	await expect(inspectParentRow).toHaveAttribute("data-current", "false");
+	await expect(inspectDormantParentRow).toHaveCount(1);
 	await expect
 		.poll(async () => (await listSessions(harness)).filter((session) => session.messageCount > 0).length)
 		.toBe(3);

@@ -3,6 +3,7 @@ import { expect, test } from "../fixtures/test";
 
 interface HelloOverride {
 	clientBuild: string;
+	maxServerFrameBytes?: number;
 	major: number;
 	minor: number;
 }
@@ -24,6 +25,9 @@ async function overrideClientHello(page: Page, override: HelloOverride): Promise
 						if (frame.type === "client_hello") {
 							frame.clientBuild = helloOverride.clientBuild;
 							frame.protocol = { major: helloOverride.major, minor: helloOverride.minor };
+							if (helloOverride.maxServerFrameBytes !== undefined) {
+								frame.limits = { maxServerFrameBytes: helloOverride.maxServerFrameBytes };
+							}
 							nativeSend(JSON.stringify(frame));
 							return;
 						}
@@ -79,7 +83,12 @@ function observeSockets(page: Page): {
 }
 
 test("a real browser negotiates an independently versioned client hello", async ({ page, harness }) => {
-	await overrideClientHello(page, { clientBuild: "7.3.1-browser-test", major: 1, minor: 7 });
+	await overrideClientHello(page, {
+		clientBuild: "7.3.1-browser-test",
+		major: 1,
+		minor: 7,
+		maxServerFrameBytes: 1024 * 1024,
+	});
 	const observed = observeSockets(page);
 
 	await page.goto(harness.origin, { waitUntil: "domcontentloaded" });
@@ -87,16 +96,24 @@ test("a real browser negotiates an independently versioned client hello", async 
 	await expect
 		.poll(() => observed.received.find((frame) => frame.type === "server_hello"))
 		.toMatchObject({
-			protocol: { major: 1, minor: 0 },
+			protocol: { major: 1, minor: 1 },
 			serverBuild: "0.1.0",
 			piVersion: "0.84.2",
 			adapterId: "legacy-rpc-v1",
-			capabilities: ["rpc.commands", "rpc.events", "rpc.extension_ui", "session.multiplex"],
+			capabilities: [
+				"rpc.commands",
+				"rpc.events",
+				"rpc.extension_ui",
+				"session.multiplex",
+				"session.hot_runtime_inventory",
+			],
+			limits: { maxSnapshotFrameBytes: 1024 * 1024 },
 		});
 	expect(observed.sent[0]).toMatchObject({
 		type: "client_hello",
 		clientBuild: "7.3.1-browser-test",
 		protocol: { major: 1, minor: 7 },
+		limits: { maxServerFrameBytes: 1024 * 1024 },
 	});
 });
 
