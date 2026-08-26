@@ -15,6 +15,7 @@ import { Textarea } from "../../components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
 import { displayLabel, stripAnsi } from "../../lib/format";
 import { tt } from "../../lib/i18n";
+import { isSessionControlReady } from "../../lib/session-capabilities";
 import { type PendingDialog, useExtensionUiStore } from "../../stores/extension-ui";
 import { useSessionTransportStore } from "../../stores/session-transport";
 import { QuestionCard } from "./QuestionCard";
@@ -30,7 +31,7 @@ export function ExtensionDialogs() {
 	const dialog = dialogs.find((d) => !minimizedDialogIds[d.request.id]);
 	const canControl = useSessionTransportStore((state) => {
 		const channel = dialog ? state.sessions[dialog.sessionHandle] : undefined;
-		return Boolean(channel?.lease.isController && channel.lease.fencingToken);
+		return isSessionControlReady(channel);
 	});
 	if (!dialog || !canControl) return null;
 	return <DialogView key={dialog.request.id} dialog={dialog} />;
@@ -48,7 +49,7 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 	const minimize = useExtensionUiStore((s) => s.minimize);
 	const canControl = useSessionTransportStore((state) => {
 		const channel = state.sessions[dialog.sessionHandle];
-		return Boolean(channel?.lease.isController && channel.lease.fencingToken);
+		return isSessionControlReady(channel);
 	});
 
 	const cancel = () => {

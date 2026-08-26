@@ -6,8 +6,23 @@ const storeHarness = vi.hoisted(() => ({
 	transport: {
 		sessions: {
 			"session-a": {
+				subscribed: true,
+				baselineAuthoritative: true,
+				generation: 1,
 				lease: { isController: true, fencingToken: "tok-1" },
-				runtime: { state: "running" },
+				runtime: {
+					serverEpoch: "epoch-a",
+					workspaceId: "workspace-a",
+					sessionHandle: "session-a",
+					generation: 1,
+					state: "running",
+				},
+				freshLeaseBaseline: {
+					serverEpoch: "epoch-a",
+					workspaceId: "workspace-a",
+					sessionHandle: "session-a",
+					generation: 1,
+				},
 			},
 		},
 	},

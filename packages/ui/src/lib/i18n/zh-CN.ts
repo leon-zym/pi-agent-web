@@ -349,6 +349,14 @@ export const zhCN = {
 	"system.summaryRetrying": "正在重试摘要生成",
 	"system.summaryDone": "摘要生成完成",
 
+	// Session resync recovery
+	"resync.syncing": "正在同步此 Session",
+	"resync.syncingDescription": "正在核对最新状态，实时更新暂时暂停。",
+	"resync.degraded": "Session 同步需要处理",
+	"resync.degradedDescription": "自动恢复已在四次尝试后停止。",
+	"resync.stale": "同步完成前，此处显示的对话内容可能已过时。",
+	"resync.manualRetry": "重试同步",
+
 	// Chat viewport
 	"chatViewport.backToBottom": "回到最新消息",
 	"appShell.sidebarWidth": "调整侧栏宽度",

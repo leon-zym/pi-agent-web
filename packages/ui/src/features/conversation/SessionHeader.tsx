@@ -42,7 +42,11 @@ import {
 	stripAnsi,
 } from "../../lib/format";
 import { tt } from "../../lib/i18n";
-import { type SessionDeleteBlockReason, sessionDeleteCapability } from "../../lib/session-capabilities";
+import {
+	isSessionControlReady,
+	type SessionDeleteBlockReason,
+	sessionDeleteCapability,
+} from "../../lib/session-capabilities";
 import { deleteSession, renameSession, sendControlCommand } from "../../lib/session-controller";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { useSessionTransportStore } from "../../stores/session-transport";
@@ -101,7 +105,7 @@ export function SessionHeader() {
 	const channel = useSessionTransportStore((state) =>
 		sessionHandle ? state.sessions[sessionHandle] : undefined,
 	);
-	const canControl = Boolean(channel?.lease.isController && channel.lease.fencingToken);
+	const canControl = isSessionControlReady(channel);
 	const processStatus = channel?.runtime;
 	const setRightPanelMode = useViewStore((s) => s.setRightPanelMode);
 	const setRightPanelOpen = useViewStore((s) => s.setRightPanelOpen);

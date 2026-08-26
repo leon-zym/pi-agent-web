@@ -48,7 +48,11 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/too
 import { api } from "../../lib/api";
 import { displayError, displayLabel, formatRelativeTime } from "../../lib/format";
 import { tt } from "../../lib/i18n";
-import { type SessionDeleteBlockReason, sessionDeleteCapability } from "../../lib/session-capabilities";
+import {
+	isSessionControlReady,
+	type SessionDeleteBlockReason,
+	sessionDeleteCapability,
+} from "../../lib/session-capabilities";
 import { deleteSession, newSession, openSession, renameSession } from "../../lib/session-controller";
 import { useTheme } from "../../lib/use-theme";
 import { cn } from "../../lib/utils";
@@ -123,12 +127,7 @@ function SessionRow({ session, current, comfortable = false, onSelect }: Session
 		return (queue?.steering.length ?? 0) + (queue?.followUp.length ?? 0);
 	});
 	const runtime = channel?.runtime ?? session.runtime;
-	const exactLease = Boolean(
-		channel?.subscribed &&
-			channel.generation !== null &&
-			channel.lease.isController &&
-			channel.lease.fencingToken,
-	);
+	const exactLease = isSessionControlReady(channel);
 	const status: SessionStatus =
 		projection?.turns.at(-1)?.status === "error" ? "error" : (runtime?.state ?? "dormant");
 	const canRename = current && exactLease;

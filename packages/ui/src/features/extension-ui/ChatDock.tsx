@@ -5,6 +5,7 @@ import { Button } from "../../components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
 import { displayLabel, stripAnsi } from "../../lib/format";
 import { tt } from "../../lib/i18n";
+import { isSessionControlReady } from "../../lib/session-capabilities";
 import { cn } from "../../lib/utils";
 import { type PendingDialog, useExtensionUiStore } from "../../stores/extension-ui";
 import { useSessionTransportStore } from "../../stores/session-transport";
@@ -24,7 +25,7 @@ export function ChatDock() {
 
 	const canControl = useSessionTransportStore((state) => {
 		const channel = activeDialog ? state.sessions[activeDialog.sessionHandle] : undefined;
-		return Boolean(channel?.lease.isController && channel.lease.fencingToken);
+		return isSessionControlReady(channel);
 	});
 
 	if (!activeDialog || !canControl) return null;

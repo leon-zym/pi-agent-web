@@ -5,6 +5,7 @@ import type { SessionChannelState } from "../src/stores/session-transport";
 
 function runtime(state: SessionRuntimeDto["state"] = "idle", recoverable = true): SessionRuntimeDto {
 	return {
+		serverEpoch: "test-server-epoch",
 		sessionHandle: "session-a",
 		workspaceId: "workspace-a",
 		nativeSessionId: "native-a",
@@ -40,11 +41,14 @@ function channel(value = runtime()): SessionChannelState {
 		controllerIntent: true,
 		runtime: value,
 		generation: 1,
+		baselineAuthoritative: true,
+		freshLeaseBaseline: value,
 		lastSeq: 0,
 		projectedSeq: 0,
 		lease: { isController: true, fencingToken: "fence" },
 		pendingExtensionRequests: [],
 		resync: null,
+		recovery: null,
 		rawEvents: [],
 	};
 }

@@ -28,6 +28,7 @@ function workspace(workspaceHandle: string, available = true): NativeWorkspaceDt
 
 function runtime(sessionHandle: string, workspaceHandle: string): SessionRuntimeDto {
 	return {
+		serverEpoch: "test-server-epoch",
 		sessionHandle,
 		workspaceId: workspaceHandle,
 		nativeSessionId: `native-${sessionHandle}`,
@@ -462,6 +463,9 @@ describe("Session-scoped controls", () => {
 					generation: 3,
 					lastSeq: 0,
 					projectedSeq: 0,
+					baselineAuthoritative: true,
+					freshLeaseBaseline: runtime("session-a", "workspace-a"),
+					recovery: null,
 					lease: { isController: true, fencingToken: "fence-a" },
 					pendingExtensionRequests: [],
 					resync: null,
@@ -498,6 +502,9 @@ describe("Session-scoped controls", () => {
 					generation: 3,
 					lastSeq: 0,
 					projectedSeq: 0,
+					baselineAuthoritative: true,
+					freshLeaseBaseline: crashedRuntime,
+					recovery: null,
 					lease: { isController: true, fencingToken: "fence-crashed" },
 					pendingExtensionRequests: [],
 					resync: null,

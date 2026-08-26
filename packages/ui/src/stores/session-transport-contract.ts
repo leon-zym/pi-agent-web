@@ -4,12 +4,13 @@ import type {
 	GatewayProtocolVersionDto,
 	SessionCommandDto,
 	SessionCommandResponseDto,
-	SessionReplayCursorDto,
 	SessionReplayFrameDto,
 	SessionRuntimeDto,
+	SessionRuntimeIdentityDto,
 	SessionWsServerMessage,
 } from "@pi-agent-web/protocol";
 import type { StoreApi } from "zustand/vanilla";
+import type { SessionResyncState as SessionRecoveryState, SessionResyncClock } from "../lib/session-resync";
 import type { OrderedSessionFrameBus, SessionTransportGlobalBus } from "./session-frame-bus";
 
 export type SessionTransportConnectionState = "idle" | "connecting" | "online" | "offline" | "incompatible";
@@ -31,6 +32,8 @@ export interface SessionResyncState {
 
 export interface SessionRawEventRecord {
 	receivedAt: number;
+	serverEpoch: string;
+	workspaceId: string;
 	generation: number;
 	seq: number;
 	eventType: string;
@@ -44,6 +47,10 @@ export interface SessionChannelState {
 	controllerIntent: boolean;
 	runtime: SessionRuntimeDto | null;
 	generation: number | null;
+	/** Mutations fail closed until one guarded Session snapshot has committed. */
+	baselineAuthoritative: boolean;
+	/** Exact runtime incarnation whose latest subscribe/catch-up lease_status has committed. */
+	freshLeaseBaseline: SessionRuntimeIdentityDto | null;
 	/** Highest sequence retained for replay, or covered by the active resync snapshot barrier. */
 	lastSeq: number;
 	/** Highest sequence synchronously applied or durably accepted by the projection pipeline. */
@@ -51,7 +58,21 @@ export interface SessionChannelState {
 	lease: SessionLeaseState;
 	pendingExtensionRequests: ExtensionUiRequestDto[];
 	resync: SessionResyncState | null;
+	recovery: SessionRecoveryState | null;
 	rawEvents: SessionRawEventRecord[];
+}
+
+export function hasFreshLeaseBaseline(channel: SessionChannelState | undefined): boolean {
+	const runtime = channel?.runtime;
+	const baseline = channel?.freshLeaseBaseline;
+	return Boolean(
+		runtime &&
+			baseline &&
+			runtime.serverEpoch === baseline.serverEpoch &&
+			runtime.workspaceId === baseline.workspaceId &&
+			runtime.sessionHandle === baseline.sessionHandle &&
+			runtime.generation === baseline.generation,
+	);
 }
 
 export class SessionTransportError extends Error {
@@ -100,6 +121,8 @@ export interface SessionTransportOptions {
 	clientBuild?: string;
 	protocolVersion?: GatewayProtocolVersionDto;
 	onResyncRequired?: (message: Extract<SessionWsServerMessage, { type: "resync_required" }>) => void;
+	resyncClock?: SessionResyncClock;
+	resyncRandom?: () => number;
 }
 
 export interface SessionTransportState {
@@ -119,7 +142,7 @@ export interface SessionTransportState {
 		timeoutMs?: number,
 	) => Promise<SessionCommandResponseDto>;
 	sendExtensionUiResponse: (sessionHandle: string, response: ExtensionUiResponseDto) => boolean;
-	completeResync: (sessionHandle: string, cursor?: SessionReplayCursorDto) => void;
+	manualRetryResync: (sessionHandle: string) => boolean;
 }
 
 export interface SessionTransportController {
@@ -130,6 +153,8 @@ export interface SessionTransportController {
 	ingestServerMessage: (message: SessionWsServerMessage) => void;
 	/** Confirm that deferred projection work has applied every retained frame through lastSeq. */
 	confirmProjectionDelivery: (sessionHandle: string, generation: number) => boolean;
+	/** True only while the matching resync attempt is projecting its guarded snapshot suffix. */
+	isSnapshotSuffixProjectionPending: (sessionHandle: string, generation: number) => boolean;
 	/** Fail closed and request a cursorless baseline after deferred projection work throws. */
 	reportProjectionFailure: (sessionHandle: string, generation: number, error?: unknown) => boolean;
 	dispose: () => void;

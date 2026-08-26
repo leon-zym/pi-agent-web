@@ -351,6 +351,14 @@ export const en: typeof zhCN = {
 	"system.summaryRetrying": "Retrying summary generation",
 	"system.summaryDone": "Summary complete",
 
+	// Session resync recovery
+	"resync.syncing": "Syncing this Session",
+	"resync.syncingDescription": "Live activity is paused while the latest state is verified.",
+	"resync.degraded": "Session sync needs attention",
+	"resync.degradedDescription": "Automatic recovery stopped after four attempts.",
+	"resync.stale": "The conversation shown here may be out of date until sync completes.",
+	"resync.manualRetry": "Retry sync",
+
 	// Chat viewport
 	"chatViewport.backToBottom": "Back to latest",
 	"appShell.sidebarWidth": "Resize sidebar",

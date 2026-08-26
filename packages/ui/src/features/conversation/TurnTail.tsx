@@ -4,6 +4,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 import { displayError, formatCost, formatDuration, formatTokens, stripAnsi } from "../../lib/format";
 import { tt } from "../../lib/i18n";
+import { isSessionControlReady } from "../../lib/session-capabilities";
 import { forkFromEntry, sendReadCommand } from "../../lib/session-controller";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { useSessionTransportStore } from "../../stores/session-transport";
@@ -19,7 +20,7 @@ export function TurnTail({ turn }: { turn: ProductTurn }) {
 	const sessionHandle = useSessionDirectoryStore((s) => s.currentSession?.sessionHandle ?? null);
 	const canControl = useSessionTransportStore((state) => {
 		const channel = sessionHandle ? state.sessions[sessionHandle] : undefined;
-		return Boolean(channel?.lease.isController && channel.lease.fencingToken);
+		return isSessionControlReady(channel);
 	});
 
 	const copyTurn = async () => {

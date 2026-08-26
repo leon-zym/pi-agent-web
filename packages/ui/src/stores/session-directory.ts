@@ -7,7 +7,7 @@ import { useExtensionUiStore } from "./extension-ui";
 import { useModelDirectoryStore } from "./model-directory";
 import { useProjectionStore } from "./projection";
 import { useSessionStatsStore } from "./session-stats";
-import { sessionTransport } from "./session-transport";
+import { hasFreshLeaseBaseline, sessionTransport } from "./session-transport";
 import { useSlashCommandsStore } from "./slash-commands";
 import { useViewStore } from "./view";
 
@@ -170,9 +170,16 @@ function releasableSessionState(sessionHandle: string): boolean {
 }
 
 function releaseSessionChannel(sessionHandle: string): void {
-	if (!releasableSessionState(sessionHandle)) return;
 	const transport = sessionTransport.store.getState();
-	const runtime = transport.sessions[sessionHandle]?.runtime;
+	const channel = transport.sessions[sessionHandle];
+	if (
+		!channel?.subscribed ||
+		!channel.baselineAuthoritative ||
+		!hasFreshLeaseBaseline(channel) ||
+		!releasableSessionState(sessionHandle)
+	)
+		return;
+	const runtime = channel.runtime;
 	// The gateway cannot see browser-only drafts or attachments. Keep the lease for an
 	// unmaterialized Session while local content exists so its orphan reaper cannot
 	// discard the only runtime that still owns that draft's future Session identity.
@@ -189,6 +196,8 @@ function transientManagement(sessionHandle: string): {
 	const channel = sessionTransport.store.getState().sessions[sessionHandle];
 	if (
 		!channel?.subscribed ||
+		!channel.baselineAuthoritative ||
+		!hasFreshLeaseBaseline(channel) ||
 		channel.generation === null ||
 		!channel.lease.isController ||
 		!channel.lease.fencingToken ||
@@ -293,6 +302,8 @@ function abandonUntouchedView(sessionHandle: string): boolean {
 /** Re-run background lifecycle admission after an async composer operation settles. */
 export function reconcileHiddenSessionLifecycle(sessionHandle: string): void {
 	if (useSessionDirectoryStore.getState().currentSession?.sessionHandle === sessionHandle) return;
+	const channel = sessionTransport.store.getState().sessions[sessionHandle];
+	if (!channel?.subscribed || !channel.baselineAuthoritative || !hasFreshLeaseBaseline(channel)) return;
 	if (abandonUntouchedView(sessionHandle)) return;
 	releaseSessionChannel(sessionHandle);
 }

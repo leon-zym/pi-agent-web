@@ -13,7 +13,7 @@ import type { ImageContent } from "../types/pi-types";
 import { api } from "./api";
 import { displayError, stripAnsi } from "./format";
 import { tt } from "./i18n";
-import { sessionDeleteCapability } from "./session-capabilities";
+import { isSessionControlReady, sessionDeleteCapability } from "./session-capabilities";
 import { sendControlCommand } from "./session-command";
 
 export { sendControlCommand, sendControlExtensionUiResponse, sendReadCommand } from "./session-command";
@@ -37,9 +37,9 @@ function currentSessionHandle(): string {
 function controllerChannel(sessionHandle: string) {
 	const channel = sessionTransport.store.getState().sessions[sessionHandle];
 	if (
-		!channel?.subscribed ||
+		!channel ||
+		!isSessionControlReady(channel) ||
 		channel.generation === null ||
-		!channel.lease.isController ||
 		!channel.lease.fencingToken
 	) {
 		throw new Error(tt("lease.readOnly"));
