@@ -122,6 +122,9 @@ function SessionRow({ session, current, comfortable = false, onSelect }: Session
 	const channel = useSessionTransportStore((state) => state.sessions[session.sessionHandle]);
 	const projection = useProjectionStore((state) => state.projections[session.sessionHandle]);
 	const unread = useSessionDirectoryStore((state) => Boolean(state.unreadBySession[session.sessionHandle]));
+	const inventoryState = useSessionDirectoryStore(
+		(state) => state.hotRuntimeStateBySession[session.sessionHandle],
+	);
 	const queuedCount = useComposerStore((state) => {
 		const queue = state.bySession[session.sessionHandle]?.queue;
 		return (queue?.steering.length ?? 0) + (queue?.followUp.length ?? 0);
@@ -129,7 +132,7 @@ function SessionRow({ session, current, comfortable = false, onSelect }: Session
 	const runtime = channel?.runtime ?? session.runtime;
 	const exactLease = isSessionControlReady(channel);
 	const status: SessionStatus =
-		projection?.turns.at(-1)?.status === "error" ? "error" : (runtime?.state ?? "dormant");
+		projection?.turns.at(-1)?.status === "error" ? "error" : (runtime?.state ?? inventoryState ?? "dormant");
 	const canRename = current && exactLease;
 	const deleteCapability = sessionDeleteCapability(session, channel);
 	const empty = session.messageCount === 0 && !session.name && !session.firstMessage;

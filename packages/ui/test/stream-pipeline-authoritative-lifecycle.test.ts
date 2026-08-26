@@ -86,6 +86,7 @@ function prepareHiddenRecovery() {
 		currentWorkspaceHandle: "workspace-a",
 		currentSession: target,
 		sessionsByWorkspace: { "workspace-a": [target] },
+		locallyCreatedTransientSessions: { [SESSION_HANDLE]: true },
 		selectedSessionByWorkspace: { "workspace-a": target.sessionHandle },
 	});
 	useComposerStore.getState().beginSession(SESSION_HANDLE);

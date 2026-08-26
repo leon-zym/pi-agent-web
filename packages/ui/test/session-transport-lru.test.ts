@@ -1,5 +1,6 @@
 import type {
 	GatewayClientHelloDto,
+	HotRuntimeInventoryDto,
 	SessionRuntimeDto,
 	SessionWsClientMessage,
 } from "@pi-agent-web/protocol";
@@ -34,18 +35,32 @@ function open(socket: FakeSocket | undefined): void {
 	socket.onmessage?.({
 		data: JSON.stringify({
 			type: "server_hello",
-			protocol: { major: 1, minor: 0 },
+			protocol: { major: 1, minor: 1 },
 			serverBuild: "test-server",
 			serverEpoch: "test-epoch",
 			piVersion: "0.84.2",
 			adapterId: "legacy-rpc-v1",
-			capabilities: ["rpc.commands", "rpc.events", "rpc.extension_ui", "session.multiplex"],
+			capabilities: [
+				"rpc.commands",
+				"rpc.events",
+				"rpc.extension_ui",
+				"session.multiplex",
+				"session.hot_runtime_inventory",
+			],
 			limits: {
 				maxClientFrameBytes: 8 * 1024 * 1024,
 				maxSnapshotFrameBytes: 32 * 1024 * 1024,
 				maxExtensionRequests: 256,
 			},
 		}),
+	});
+	socket.onmessage?.({
+		data: JSON.stringify({
+			type: "hot_runtime_inventory",
+			serverEpoch: "test-epoch",
+			revision: 0,
+			runtimes: [],
+		} satisfies HotRuntimeInventoryDto),
 	});
 }
 
@@ -125,6 +140,38 @@ function unpersistedRuntime(sessionHandle: string): SessionRuntimeDto {
 }
 
 describe("Active WebSocket Subscription LRU admission target with liveness guard", () => {
+	it("pins every authoritative hot Runtime even above the ordinary LRU target", () => {
+		const { controller, sockets } = harness({ maxActiveSubscriptions: 2 });
+		controller.store.getState().connect();
+		open(sockets[0]);
+		const socket = sockets[0];
+		if (!socket) throw new Error("transport did not create a socket");
+		socket.onmessage?.({
+			data: JSON.stringify({
+				type: "hot_runtime_inventory",
+				serverEpoch: "test-epoch",
+				revision: 1,
+				runtimes: Array.from({ length: 7 }, (_, index) => ({
+					serverEpoch: "test-epoch",
+					sessionHandle: `hot-${String(index)}`,
+					workspaceId: "ws-1",
+					generation: 1,
+					state: "idle" as const,
+				})),
+			} satisfies HotRuntimeInventoryDto),
+		});
+
+		expect(
+			Object.values(controller.store.getState().sessions).filter(({ subscribed }) => subscribed),
+		).toHaveLength(7);
+		expect(socket.sent.filter(({ type }) => type === "session_unsubscribe")).toEqual([]);
+		expect(
+			socket.sent.filter(
+				(message) => message.type === "session_subscribe" && message.expectedHotRuntime !== undefined,
+			),
+		).toHaveLength(1);
+	});
+
 	it("exports the soft MAX_ACTIVE_SUBSCRIPTIONS target as 6", () => {
 		expect(MAX_ACTIVE_SUBSCRIPTIONS).toBe(6);
 	});

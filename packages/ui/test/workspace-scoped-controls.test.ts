@@ -1,4 +1,5 @@
 import type {
+	HotRuntimeInventoryDto,
 	NativeSessionCreateDto,
 	NativeSessionDto,
 	NativeWorkspaceDto,
@@ -84,6 +85,72 @@ afterEach(() => {
 });
 
 describe("Session-scoped controls", () => {
+	it("merges every recovered hot Runtime into its Workspace without duplicating durable rows", () => {
+		const durable = session("session-durable", "workspace-a");
+		useSessionDirectoryStore.setState({
+			currentWorkspaceHandle: "workspace-a",
+			sessionsByWorkspace: { "workspace-a": [durable] },
+		});
+		const inventory = {
+			type: "hot_runtime_inventory",
+			serverEpoch: "test-server-epoch",
+			revision: 1,
+			runtimes: [
+				...Array.from({ length: 7 }, (_, index) => ({
+					serverEpoch: "test-server-epoch",
+					sessionHandle: index === 0 ? durable.sessionHandle : `hot-${String(index)}`,
+					workspaceId: "workspace-a",
+					generation: 1,
+					state: "idle" as const,
+				})),
+			],
+		} satisfies HotRuntimeInventoryDto;
+
+		useSessionDirectoryStore.getState().applyHotRuntimeInventory(inventory);
+
+		const visible = selectCurrentWorkspaceSessions(useSessionDirectoryStore.getState());
+		expect(visible).toHaveLength(7);
+		expect(selectCurrentWorkspaceSessions(useSessionDirectoryStore.getState())).toBe(visible);
+		expect(
+			selectCurrentWorkspaceSessions(useSessionDirectoryStore.getState()).filter(
+				(candidate) => candidate.sessionHandle === durable.sessionHandle,
+			),
+		).toHaveLength(1);
+		expect(useSessionDirectoryStore.getState().hotRuntimeStateBySession["hot-1"]).toBe("idle");
+	});
+
+	it("resumes a recovered unpersisted hot Runtime instead of auto-creating after reload", async () => {
+		const createSession = vi.spyOn(api, "createSession");
+		const { subscribeSession, claimSession } = isolateTransportActions();
+		useSessionDirectoryStore.setState({
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: null,
+			sessionsByWorkspace: { "workspace-a": [] },
+			hotSessionsByWorkspace: {},
+		});
+		useSessionDirectoryStore.getState().applyHotRuntimeInventory({
+			type: "hot_runtime_inventory",
+			serverEpoch: "test-server-epoch",
+			revision: 1,
+			runtimes: [
+				{
+					serverEpoch: "test-server-epoch",
+					sessionHandle: "recovered-hot",
+					workspaceId: "workspace-a",
+					generation: 1,
+					state: "idle",
+				},
+			],
+		});
+
+		await newSession();
+
+		expect(createSession).not.toHaveBeenCalled();
+		expect(useSessionDirectoryStore.getState().currentSession?.sessionHandle).toBe("recovered-hot");
+		expect(subscribeSession).toHaveBeenCalledWith("recovered-hot");
+		expect(claimSession).toHaveBeenCalledWith("recovered-hot");
+	});
+
 	it("keeps the empty Workspace Session snapshot referentially stable for React", () => {
 		const state = useSessionDirectoryStore.getState();
 		useSessionDirectoryStore.setState({ currentWorkspaceHandle: null, sessionsByWorkspace: {} });
