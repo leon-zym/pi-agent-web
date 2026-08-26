@@ -795,7 +795,7 @@ export function WorkspaceSidebar({
 							const catalogLoaded = Object.hasOwn(durableSessionsByWorkspace, workspace.workspaceHandle);
 							const unpersistedHotCount = new Set(
 								(hotSessionsByWorkspace[workspace.workspaceHandle] ?? [])
-									.filter((session) => !session.persisted)
+									.filter((session) => session.runtime?.recoverable === false)
 									.map((session) => session.sessionHandle),
 							).size;
 							return (

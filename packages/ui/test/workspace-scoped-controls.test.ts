@@ -119,6 +119,38 @@ describe("Session-scoped controls", () => {
 		expect(useSessionDirectoryStore.getState().hotRuntimeStateBySession["hot-1"]).toBe("idle");
 	});
 
+	it("does not resume a catalog-proven persisted hot placeholder before its exact baseline arrives", () => {
+		const persisted = session("persisted-hot", "workspace-a");
+		useSessionDirectoryStore.setState({
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: null,
+			sessionsByWorkspace: {},
+			hotSessionsByWorkspace: {},
+		});
+		useSessionDirectoryStore.getState().applyHotRuntimeInventory({
+			type: "hot_runtime_inventory",
+			serverEpoch: "test-server-epoch",
+			revision: 1,
+			runtimes: [
+				{
+					serverEpoch: "test-server-epoch",
+					sessionHandle: persisted.sessionHandle,
+					workspaceId: persisted.workspaceHandle,
+					generation: 1,
+					state: "idle",
+				},
+			],
+		});
+		// Startup loads the native catalog after the inventory while exact recovery is still serialized.
+		useSessionDirectoryStore.setState({ sessionsByWorkspace: { "workspace-a": [persisted] } });
+
+		expect(
+			useSessionDirectoryStore.getState().hotSessionsByWorkspace["workspace-a"]?.[0]?.runtime,
+		).toBeNull();
+		expect(useSessionDirectoryStore.getState().resumeTransientSession("workspace-a")).toBe(false);
+		expect(useSessionDirectoryStore.getState().currentSession).toBeNull();
+	});
+
 	it("resumes a recovered unpersisted hot Runtime instead of auto-creating after reload", async () => {
 		const createSession = vi.spyOn(api, "createSession");
 		const { subscribeSession, claimSession } = isolateTransportActions();

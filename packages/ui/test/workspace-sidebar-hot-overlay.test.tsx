@@ -136,4 +136,44 @@ describe("WorkspaceSidebar hot runtime overlay", () => {
 		expect(html).toMatch(/Unloaded transient workspace<\/span><span[^>]*>11<\/span>/);
 		expect(html).toMatch(/Unloaded persisted workspace<\/span><span[^>]*>10<\/span>/);
 	});
+
+	it("does not double-count an inventory placeholder before its exact Runtime baseline arrives", () => {
+		const workspace: NativeWorkspaceDto = {
+			workspaceHandle: "workspace-inventory-only",
+			path: "/tmp/workspace-inventory-only",
+			available: true,
+			pinned: false,
+			displayName: "Unloaded inventory workspace",
+			lastOpenedAt: null,
+			sessionCount: 10,
+			hasNativeHistory: true,
+		};
+		useSessionDirectoryStore.setState({
+			workspaces: [workspace],
+			currentWorkspaceHandle: null,
+			currentSession: null,
+			sessionsByWorkspace: {},
+			hotSessionsByWorkspace: {},
+			hotRuntimeStateBySession: {},
+			searchQuery: "",
+		});
+		useSessionDirectoryStore.getState().applyHotRuntimeInventory({
+			type: "hot_runtime_inventory",
+			serverEpoch: "epoch-sidebar",
+			revision: 1,
+			runtimes: [
+				{
+					serverEpoch: "epoch-sidebar",
+					sessionHandle: "persisted-hot-awaiting-baseline",
+					workspaceId: workspace.workspaceHandle,
+					generation: 1,
+					state: "idle",
+				},
+			],
+		});
+
+		const html = renderToStaticMarkup(createElement(WorkspaceSidebar, { rail: false }));
+
+		expect(html).toMatch(/Unloaded inventory workspace<\/span><span[^>]*>10<\/span>/);
+	});
 });

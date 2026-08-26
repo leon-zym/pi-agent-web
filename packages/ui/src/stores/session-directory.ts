@@ -716,7 +716,14 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 			get().selectSession(retained);
 			return true;
 		}
-		const recovered = state.hotSessionsByWorkspace[workspaceHandle]?.find((session) => !session.persisted);
+		const durableSessions = state.sessionsByWorkspace[workspaceHandle];
+		const recovered = state.hotSessionsByWorkspace[workspaceHandle]?.find(
+			(session) =>
+				!session.persisted &&
+				(session.runtime?.recoverable === false ||
+					(durableSessions !== undefined &&
+						!durableSessions.some((durable) => durable.sessionHandle === session.sessionHandle))),
+		);
 		if (!recovered) return false;
 		get().selectSession(recovered);
 		return true;
