@@ -13,6 +13,10 @@ const FOREGROUND_PROMPT = "E2E_STRESS_FOREGROUND";
 const OBSERVER_PROMPT = "E2E_A_SLOW_OBSERVER";
 const RECONNECT_PROMPT = "E2E_A_SLOW_RECONNECT";
 const EXTENSION_PROMPT = "E2E_EXTENSION_CONFIRM";
+const RELOAD_PROMPT = "E2E_RELOAD_ACTIVE_STATE";
+const RELOAD_PARTIAL_TEXT = "E2E_RELOAD_PARTIAL_TEXT";
+const RELOAD_TOOL_PARTIAL = "E2E_RELOAD_TOOL_PARTIAL";
+const RELOAD_TOOL_COMPLETE = "E2E_RELOAD_TOOL_COMPLETE";
 
 async function openWorkbench(page: Page, harness: ProductionHarness): Promise<void> {
 	await page.goto(harness.origin, { waitUntil: "domcontentloaded" });
@@ -208,6 +212,7 @@ test("an interrupted socket resyncs a completed stream without duplicates or mis
 	page,
 	harness,
 }) => {
+	test.slow();
 	const errors = observePageErrors(page);
 	await installWebSocketDropControl(page);
 	const sockets: WebSocket[] = [];
@@ -243,6 +248,156 @@ test("an interrupted socket resyncs a completed stream without duplicates or mis
 	await expect(turn.getByText(RECONNECT_PROMPT, { exact: true })).toHaveCount(1);
 	await expect(turn.getByText(`E2E_REPLY:${RECONNECT_PROMPT}`, { exact: true })).toHaveCount(1);
 	expect(promptEvents(harness, RECONNECT_PROMPT)).toHaveLength(1);
+	expect(errors.console).toEqual([]);
+	expect(errors.page).toEqual([]);
+});
+
+test("reload restores one known Session across active text and tool checkpoints", async ({
+	page,
+	harness,
+}) => {
+	const errors = observePageErrors(page);
+	await openWorkbench(page, harness);
+	await sendPrompt(page, RELOAD_PROMPT);
+	await expect
+		.poll(() =>
+			fixtureEvent(
+				harness,
+				(event) => event.type === "reload_text_checkpoint" && event.text === RELOAD_PROMPT,
+			),
+		)
+		.toBeTruthy();
+
+	const main = page.locator("main");
+	await expect(main.getByText(RELOAD_PARTIAL_TEXT, { exact: true })).toHaveCount(1);
+	await expect(
+		main.locator('[data-markdown-streaming="true"]').filter({ hasText: RELOAD_PARTIAL_TEXT }),
+	).toHaveCount(1);
+	await expect(page.locator("header").getByText(/^(Running|运行中)$/)).toBeVisible();
+	await expect(main.locator("button[aria-expanded]").filter({ hasText: "E2E_RELOAD_TOOL" })).toHaveCount(0);
+	await expect(page.getByRole("dialog", { name: "Reload checkpoint approval" })).toHaveCount(0);
+	await expect(main.getByText("E2E_RELOAD_SETTLED", { exact: true })).toHaveCount(0);
+	expect(
+		fixtureEvent(harness, (event) => event.type === "settled" && event.text === RELOAD_PROMPT),
+	).toBeUndefined();
+
+	await page.reload({ waitUntil: "domcontentloaded" });
+	await expect(page.locator("main")).toBeVisible();
+	let knownSession = page.locator("[data-session-row]").filter({ hasText: RELOAD_PROMPT });
+	await expect(knownSession).toHaveCount(1);
+	await knownSession.getByRole("button").first().click();
+
+	let restoredMain = page.locator("main");
+	await expect(restoredMain.getByText(RELOAD_PARTIAL_TEXT, { exact: true })).toHaveCount(1);
+	await expect(
+		restoredMain.locator('[data-markdown-streaming="true"]').filter({ hasText: RELOAD_PARTIAL_TEXT }),
+	).toHaveCount(1);
+	await expect(page.locator("header").getByText(/^(Running|运行中)$/)).toBeVisible();
+	await expect(
+		restoredMain.locator("button[aria-expanded]").filter({ hasText: "E2E_RELOAD_TOOL" }),
+	).toHaveCount(0);
+	await expect(page.getByRole("dialog", { name: "Reload checkpoint approval" })).toHaveCount(0);
+	await expect(restoredMain.getByText("E2E_RELOAD_SETTLED", { exact: true })).toHaveCount(0);
+
+	harness.releasePrompt(RELOAD_PROMPT);
+	await expect
+		.poll(() =>
+			fixtureEvent(
+				harness,
+				(event) => event.type === "reload_tool_checkpoint" && event.text === RELOAD_PROMPT,
+			),
+		)
+		.toBeTruthy();
+
+	const checkpointTool = restoredMain.locator("button[aria-expanded]").filter({ hasText: "E2E_RELOAD_TOOL" });
+	await expect(checkpointTool).toHaveCount(1);
+	await expect(checkpointTool).toContainText(/(Executing|执行中)/);
+	let checkpointDialog = page.getByRole("dialog", { name: "Reload checkpoint approval" });
+	await expect(checkpointDialog).toHaveCount(1);
+	await checkpointDialog.getByRole("button", { name: /^(Minimize to dock|最小化到停靠栏)$/ }).click();
+	const checkpointDock = page.getByTestId("chat-dock");
+	await expect(checkpointDock).toHaveCount(1);
+	await checkpointTool.click();
+	await expect(checkpointTool.locator("xpath=../following-sibling::div")).toContainText(RELOAD_TOOL_PARTIAL);
+	await checkpointTool.click();
+	await checkpointDock.getByRole("button", { name: /^(Expand dialog|展开对话框)$/ }).click();
+	checkpointDialog = page.getByRole("dialog", { name: "Reload checkpoint approval" });
+	await expect(checkpointDialog).toHaveCount(1);
+
+	await page.reload({ waitUntil: "domcontentloaded" });
+	await expect(page.locator("main")).toBeVisible();
+	knownSession = page.locator("[data-session-row]").filter({ hasText: RELOAD_PROMPT });
+	await expect(knownSession).toHaveCount(1);
+	await knownSession.getByRole("button").first().click();
+
+	restoredMain = page.locator("main");
+	await expect(restoredMain.getByText(RELOAD_PARTIAL_TEXT, { exact: true })).toHaveCount(1);
+	let restoredDialog = page.getByRole("dialog", { name: "Reload checkpoint approval" });
+	await expect(restoredDialog).toHaveCount(1);
+	await restoredDialog.getByRole("button", { name: /^(Minimize to dock|最小化到停靠栏)$/ }).click();
+	const restoredDock = page.getByTestId("chat-dock");
+	await expect(restoredDock).toHaveCount(1);
+
+	const runningTool = restoredMain.locator("button[aria-expanded]").filter({ hasText: "E2E_RELOAD_TOOL" });
+	await expect(runningTool).toHaveCount(1);
+	await runningTool.click();
+	await expect
+		.soft(runningTool.locator("xpath=../following-sibling::div"))
+		.toContainText(RELOAD_TOOL_PARTIAL, { timeout: 3_000 });
+	await expect.soft(runningTool).toContainText(/(Executing|执行中)/, { timeout: 3_000 });
+	await expect.soft(runningTool).not.toContainText(/(Interrupted|已中断)/, { timeout: 3_000 });
+	expect(
+		fixtureEvent(harness, (event) => event.type === "settled" && event.text === RELOAD_PROMPT),
+	).toBeUndefined();
+	await expect(restoredMain.getByText("E2E_RELOAD_SETTLED", { exact: true })).toHaveCount(0);
+
+	await restoredDock.getByRole("button", { name: /^(Expand dialog|展开对话框)$/ }).click();
+	restoredDialog = page.getByRole("dialog", { name: "Reload checkpoint approval" });
+	await expect(restoredDialog).toHaveCount(1);
+	const confirm = restoredDialog.locator("button").filter({ hasText: /^(Confirm|确认)$/ });
+	await expect(confirm).toBeEnabled();
+	await confirm.click();
+	await expect(restoredDialog).toBeHidden();
+	await expect
+		.poll(() =>
+			fixtureEvent(harness, (event) => event.type === "extension_response" && event.text === RELOAD_PROMPT),
+		)
+		.toMatchObject({ confirmed: true });
+	harness.releasePrompt(RELOAD_PROMPT);
+	await expect
+		.poll(() => fixtureEvent(harness, (event) => event.type === "settled" && event.text === RELOAD_PROMPT))
+		.toMatchObject({ label: "E2E_RELOAD_SETTLED" });
+	await expect(restoredMain.getByText("E2E_RELOAD_SETTLED", { exact: true })).toHaveCount(1);
+	await expect
+		.soft(runningTool.locator("xpath=../following-sibling::div"))
+		.toContainText(RELOAD_TOOL_COMPLETE, { timeout: 3_000 });
+	await expect
+		.soft(runningTool)
+		.not.toContainText(/(Executing|执行中|Interrupted|已中断)/, { timeout: 3_000 });
+	const lifecycleEvents = harness.piEvents().filter((event) => event.text === RELOAD_PROMPT);
+	for (const eventType of ["extension_response", "reload_text_released", "reload_tool_released"] as const) {
+		expect(
+			lifecycleEvents.filter((event) => event.type === eventType),
+			eventType,
+		).toHaveLength(1);
+	}
+	const orderedTypes = [
+		"reload_text_released",
+		"reload_tool_checkpoint",
+		"extension_response",
+		"reload_tool_released",
+		"settled",
+	] as const;
+	const orderedIndexes = orderedTypes.map((eventType) =>
+		lifecycleEvents.findIndex((event) => event.type === eventType),
+	);
+	for (let index = 1; index < orderedIndexes.length; index += 1) {
+		expect(
+			orderedIndexes[index - 1],
+			`${orderedTypes[index - 1]} before ${orderedTypes[index]}`,
+		).toBeLessThan(orderedIndexes[index] ?? -1);
+	}
+	expect(promptEvents(harness, RELOAD_PROMPT)).toHaveLength(1);
 	expect(errors.console).toEqual([]);
 	expect(errors.page).toEqual([]);
 });

@@ -275,6 +275,26 @@ function scheduleSlowFinish(run, text, callback) {
 	check();
 }
 
+function scheduleConsumedRelease(run, text, eventType, callback) {
+	if (!controlDir) {
+		schedule(run, slowDelayMs, callback);
+		return;
+	}
+	const releaseFile = path.join(controlDir, `${encodeURIComponent(text)}.release`);
+	const check = () => {
+		schedule(run, 25, () => {
+			if (!fs.existsSync(releaseFile)) {
+				check();
+				return;
+			}
+			fs.unlinkSync(releaseFile);
+			record(eventType, { commandId: run.command.id, text });
+			callback();
+		});
+	};
+	check();
+}
+
 function streamComplexPrompt(command, text, user, userEntryId) {
 	const thinking =
 		"\u001b[36mInspecting synthetic workspace\u001b[0m\nComparing the implementation with the requested behavior.";
@@ -815,6 +835,17 @@ function streamExtensionPrompt(command, text, user, userEntryId) {
 
 function finishExtensionPrompt(response) {
 	const run = activeRun;
+	if (run?.kind === "reload-checkpoint" && response.id === run.requestId) {
+		run.extensionResponse = response;
+		record("extension_response", {
+			commandId: run.command.id,
+			text: run.text,
+			confirmed: response.confirmed === true,
+			cancelled: response.cancelled === true,
+		});
+		finishReloadCheckpointPrompt(run);
+		return;
+	}
 	if (run?.kind !== "extension" || response.id !== run.requestId) return;
 	const confirmed = response.confirmed === true;
 	const cancelled = response.cancelled === true;
@@ -835,6 +866,171 @@ function finishExtensionPrompt(response) {
 	send({ type: "agent_settled" });
 	record("settled", { commandId: run.command.id, text: run.text, label });
 	activeRun = null;
+}
+
+function finishReloadCheckpointPrompt(run) {
+	if (activeRun !== run || !run.toolReleased || !run.extensionResponse) return;
+	const confirmed = run.extensionResponse.confirmed === true;
+	const toolOutput = confirmed ? "E2E_RELOAD_TOOL_COMPLETE" : "E2E_RELOAD_TOOL_CANCELLED";
+	const toolDetails = { exitCode: confirmed ? 0 : 1, synthetic: true };
+	send({
+		type: "tool_execution_end",
+		toolCallId: run.toolCallId,
+		toolName: "bash",
+		result: { content: toolOutput, details: toolDetails },
+		isError: !confirmed,
+	});
+	const toolResult = {
+		...toolResultMessage(run.toolCallId, toolDetails, Date.now(), "bash", toolOutput),
+		isError: !confirmed,
+	};
+	send({ type: "message_start", message: toolResult });
+	send({ type: "message_end", message: toolResult });
+	messages.push(toolResult);
+	const toolResultEntryId = persistMessage(toolResult, run.toolUseEntryId);
+
+	const finalText = confirmed ? "E2E_RELOAD_SETTLED" : "E2E_RELOAD_CANCELLED";
+	const final = assistantMessage(finalText);
+	send({ type: "message_start", message: final });
+	send({ type: "message_end", message: final });
+	send({ type: "turn_end", message: final, toolResults: [toolResult] });
+	messages.push(final);
+	persistMessage(final, toolResultEntryId);
+	send({ type: "agent_end", messages: [run.user, run.toolUse, toolResult, final], willRetry: false });
+	send({ type: "agent_settled" });
+	record("settled", { commandId: run.command.id, text: run.text, label: finalText });
+	activeRun = null;
+}
+
+function enterReloadToolCheckpoint(run) {
+	if (activeRun !== run || !run.textReleased) return;
+	const partialText = "E2E_RELOAD_PARTIAL_TEXT";
+	const toolPartial = "E2E_RELOAD_TOOL_PARTIAL";
+	const toolArgs = { command: "printf 'E2E_RELOAD_TOOL'" };
+	const toolCall = { type: "toolCall", id: run.toolCallId, name: "bash", arguments: toolArgs };
+	send({
+		type: "message_update",
+		usage: run.pending.usage,
+		assistantMessageEvent: { type: "text_end", contentIndex: 0, content: partialText },
+	});
+	send({
+		type: "message_update",
+		usage: run.pending.usage,
+		assistantMessageEvent: { type: "toolcall_start", contentIndex: 1 },
+	});
+	send({
+		type: "message_update",
+		usage: run.pending.usage,
+		assistantMessageEvent: {
+			type: "toolcall_delta",
+			contentIndex: 1,
+			delta: JSON.stringify(toolArgs),
+		},
+	});
+	const toolUse = assistantMessageWithContent([{ type: "text", text: partialText }, toolCall], "toolUse");
+	send({
+		type: "message_update",
+		usage: toolUse.usage,
+		assistantMessageEvent: { type: "toolcall_end", contentIndex: 1, toolCall },
+	});
+	send({ type: "message_end", message: toolUse });
+	messages.push(toolUse);
+	run.toolUse = toolUse;
+	run.toolUseEntryId = persistMessage(toolUse, run.userEntryId);
+
+	send({ type: "tool_execution_start", toolCallId: run.toolCallId, toolName: "bash", args: toolArgs });
+	send({
+		type: "tool_execution_update",
+		toolCallId: run.toolCallId,
+		toolName: "bash",
+		args: toolArgs,
+		partialResult: { text: toolPartial },
+	});
+	send({
+		type: "extension_ui_request",
+		id: run.requestId,
+		method: "confirm",
+		title: "Reload checkpoint approval",
+		message: "Resume the held synthetic run?",
+	});
+	record("reload_tool_checkpoint", {
+		commandId: run.command.id,
+		text: run.text,
+		partialText,
+		toolCallId: run.toolCallId,
+		toolPartial,
+		requestId: run.requestId,
+	});
+	scheduleConsumedRelease(run, run.text, "reload_tool_released", () => {
+		run.toolReleased = true;
+		finishReloadCheckpointPrompt(run);
+	});
+}
+
+function streamReloadCheckpointPrompt(command, text, user, userEntryId) {
+	const partialText = "E2E_RELOAD_PARTIAL_TEXT";
+	const toolCallId = `${sessionId}-reload-bash`;
+	const requestId = `${sessionId}-reload-confirm`;
+	const run = {
+		kind: "reload-checkpoint",
+		command,
+		label: "reload-checkpoint",
+		timers: [],
+		assembled: partialText,
+		user,
+		userEntryId,
+		toolCallId,
+		requestId,
+		text,
+		toolUse: null,
+		toolUseEntryId: null,
+		pending: null,
+		textReleased: false,
+		toolReleased: false,
+		extensionResponse: null,
+	};
+	activeRun = run;
+	record("prompt", {
+		commandId: command.id,
+		text,
+		imageCount: 0,
+		imageMimeTypes: [],
+		imageChars: 0,
+		slow: true,
+		reloadCheckpoint: true,
+	});
+
+	send({ type: "agent_start" });
+	send({ type: "turn_start" });
+	send({ type: "message_start", message: user });
+	send({ type: "message_end", message: user });
+	send({ type: "session_info_changed" });
+	const pending = assistantMessageWithContent([], "pending");
+	run.pending = pending;
+	send({ type: "message_start", message: pending });
+	respond(command);
+
+	schedule(run, 25, () => {
+		send({
+			type: "message_update",
+			usage: pending.usage,
+			assistantMessageEvent: { type: "text_start", contentIndex: 0 },
+		});
+		send({
+			type: "message_update",
+			usage: pending.usage,
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: partialText },
+		});
+		record("reload_text_checkpoint", {
+			commandId: command.id,
+			text,
+			partialText,
+		});
+		scheduleConsumedRelease(run, text, "reload_text_released", () => {
+			run.textReleased = true;
+			enterReloadToolCheckpoint(run);
+		});
+	});
 }
 
 function streamPrompt(command) {
@@ -865,6 +1061,10 @@ function streamPrompt(command) {
 	}
 	if (text === "E2E_EXTENSION_CONFIRM" && images.length === 0) {
 		streamExtensionPrompt(command, text, user, userEntryId);
+		return;
+	}
+	if (text === "E2E_RELOAD_ACTIVE_STATE" && images.length === 0) {
+		streamReloadCheckpointPrompt(command, text, user, userEntryId);
 		return;
 	}
 
