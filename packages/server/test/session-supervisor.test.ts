@@ -2,10 +2,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { legacyRpcV1Adapter } from "../src/legacy-rpc-v1.js";
 import { canonicalizeSessionFile, sessionHandleForFile } from "../src/native-session-catalog.js";
 import type { PiHostAdapter } from "../src/pi-host-adapter.js";
+import type { SessionLiveProjectionLimits } from "../src/session-live-projection.js";
 import type { SessionRuntime } from "../src/session-runtime.js";
 import type {
 	ExistingSessionTarget,
@@ -57,11 +58,13 @@ function createHarness(options: {
 	extensionStateMaxBytes?: number;
 	extensionStateMaxItems?: number;
 	pendingDialogLimit?: number;
+	projectionLimits?: Partial<SessionLiveProjectionLimits>;
 	restartBaseDelayMs?: number;
 	maxAutoRestarts?: number;
 	idleTtlMs?: number;
 	transientIdleTtlMs?: number;
 	env?: Record<string, string>;
+	envForWorkspace?: (cwd: string) => Record<string, string>;
 	commandTimeoutFor?: (commandType: string) => number;
 	adapter?: PiHostAdapter;
 }) {
@@ -69,6 +72,7 @@ function createHarness(options: {
 	const targets = new Map(options.targets.map((target) => [target.sessionHandle, target]));
 	const adapter = options.adapter ?? legacyRpcV1Adapter;
 	const supervisor = new SessionSupervisor({
+		serverEpoch: "session-supervisor-test-epoch",
 		resolved: {
 			command: process.execPath,
 			args: [fixturePath],
@@ -81,6 +85,7 @@ function createHarness(options: {
 			capabilities: adapter.capabilities,
 		},
 		env: options.env,
+		envForWorkspace: options.envForWorkspace,
 		resolveSession: async (sessionHandle) => targets.get(sessionHandle),
 		broadcast: (message) => messages.push(message),
 		maxHotRuntimes: options.maxHotRuntimes ?? 8,
@@ -90,6 +95,7 @@ function createHarness(options: {
 		extensionStateMaxBytes: options.extensionStateMaxBytes,
 		extensionStateMaxItems: options.extensionStateMaxItems,
 		pendingDialogLimit: options.pendingDialogLimit,
+		projectionLimits: options.projectionLimits,
 		commandTimeoutFor: options.commandTimeoutFor,
 		restartBaseDelayMs: options.restartBaseDelayMs ?? 5,
 		maxAutoRestarts: options.maxAutoRestarts,
@@ -110,12 +116,723 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
 	throw new Error("condition did not settle before timeout");
 }
 
+async function waitForAsync(predicate: () => Promise<boolean>, timeoutMs = 2_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (await predicate()) return;
+		await new Promise<void>((resolve) => setTimeout(resolve, 5));
+	}
+	throw new Error("condition did not settle before timeout");
+}
+
+function trackRuntimeDeadlines(delayMs = 500): {
+	timers: Set<ReturnType<typeof setTimeout>>;
+	nativeSetTimeout: typeof setTimeout;
+	restore: () => void;
+} {
+	const timers = new Set<ReturnType<typeof setTimeout>>();
+	const nativeSetTimeout = globalThis.setTimeout;
+	const nativeClearTimeout = globalThis.clearTimeout;
+	const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+		callback: (...args: unknown[]) => void,
+		delay?: number,
+		...args: unknown[]
+	) => {
+		let timer: ReturnType<typeof setTimeout>;
+		timer = nativeSetTimeout(
+			(...callbackArgs: unknown[]) => {
+				timers.delete(timer);
+				callback(...callbackArgs);
+			},
+			delay,
+			...args,
+		);
+		if (delay === delayMs) timers.add(timer);
+		return timer;
+	}) as typeof setTimeout);
+	const clearTimeoutSpy = vi.spyOn(globalThis, "clearTimeout").mockImplementation(((
+		timer: ReturnType<typeof setTimeout>,
+	) => {
+		timers.delete(timer);
+		return nativeClearTimeout(timer);
+	}) as typeof clearTimeout);
+	return {
+		timers,
+		nativeSetTimeout,
+		restore: () => {
+			clearTimeoutSpy.mockRestore();
+			setTimeoutSpy.mockRestore();
+		},
+	};
+}
+
 afterEach(async () => {
 	await Promise.all(supervisors.splice(0).map((supervisor) => supervisor.stopAll()));
 	for (const root of temporaryRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
 describe("SessionSupervisor", () => {
+	it("builds generation zero from get_messages before committing buffered product domains", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "authoritative-startup");
+		const { supervisor } = createHarness({
+			targets: [target],
+			env: { PI_WEB_FIXTURE_STARTUP_PROJECTION_DOMAINS: "1" },
+		});
+
+		const initial = await supervisor.subscribe(target.sessionHandle);
+		expect(supervisor.serverEpoch).toBe("session-supervisor-test-epoch");
+		expect(initial).toMatchObject({
+			type: "resync_required",
+			reason: "initial",
+			runtime: { serverEpoch: supervisor.serverEpoch, lastSeq: 6 },
+			snapshot: {
+				serverEpoch: supervisor.serverEpoch,
+				baseSeq: 0,
+				asOfSeq: 6,
+			},
+		});
+		if (initial.type !== "resync_required") throw new Error("initial subscription did not resync");
+		expect(initial.snapshot.projectionEvents.map((frame) => frame.event.type)).toEqual([
+			"agent_start",
+			"message_update",
+			"message_update",
+			"tool_execution_start",
+			"tool_execution_update",
+		]);
+		expect(initial.snapshot.pendingExtensionRequests).toEqual([
+			expect.objectContaining({ id: "startup-domain-dialog", method: "confirm" }),
+		]);
+
+		const staleEpoch = await supervisor.subscribe(target.sessionHandle, {
+			serverEpoch: "previous-server-epoch",
+			generation: initial.runtime.generation,
+			seq: initial.runtime.lastSeq,
+		});
+		expect(staleEpoch).toMatchObject({ type: "resync_required", reason: "server_epoch_changed" });
+	});
+
+	it("fails a projection overflow without publishing or entering an automatic restart loop", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "projection-overflow");
+		const { supervisor, messages } = createHarness({
+			targets: [target],
+			env: { PI_WEB_FIXTURE_STARTUP_PROJECTION_DOMAINS: "1" },
+			projectionLimits: { maxLiveEventBytes: 1 },
+		});
+
+		await expect(supervisor.activate(target.sessionHandle)).rejects.toThrow("session_snapshot_overflow");
+		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "crashed");
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({
+			generation: 1,
+			lastSeq: 0,
+			state: "crashed",
+			error: "session_snapshot_overflow",
+		});
+		expect(messages.some((message) => message.type === "event")).toBe(false);
+		await new Promise<void>((resolve) => setTimeout(resolve, 25));
+		expect(supervisor.getRuntime(target.sessionHandle)?.generation).toBe(1);
+		await expect(supervisor.activate(target.sessionHandle)).rejects.toThrow("session_snapshot_overflow");
+	});
+
+	it("preflights aggregate wire bounds before ready and releases the hot slot on failure", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		const healthyCwd = path.join(root, "healthy-workspace");
+		fs.mkdirSync(cwd);
+		fs.mkdirSync(healthyCwd);
+		const oversized = createNativeSession(root, cwd, "aggregate-overflow");
+		const healthy = createNativeSession(root, healthyCwd, "aggregate-healthy");
+		const { supervisor, messages } = createHarness({
+			targets: [oversized, healthy],
+			maxHotRuntimes: 1,
+			maxAutoRestarts: 0,
+			envForWorkspace: (workspaceCwd): Record<string, string> =>
+				workspaceCwd === cwd ? { PI_WEB_FIXTURE_AGGREGATE_SNAPSHOT_ITEMS: "1" } : {},
+		});
+
+		await expect(supervisor.activate(oversized.sessionHandle)).rejects.toThrow("session_snapshot_overflow");
+		await waitFor(() => supervisor.getRuntime(oversized.sessionHandle)?.state === "crashed");
+		expect(supervisor.isActive(oversized.sessionHandle)).toBe(false);
+		expect(messages).toContainEqual(
+			expect.objectContaining({
+				type: "runtime_state",
+				runtime: expect.objectContaining({ state: "crashed", error: "session_snapshot_overflow" }),
+			}),
+		);
+		await expect(supervisor.activate(healthy.sessionHandle)).resolves.toMatchObject({ state: "idle" });
+	});
+
+	it("synchronously terminalizes a live aggregate overflow and cancels owned dialog callbacks", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		const healthyCwd = path.join(root, "healthy-workspace");
+		fs.mkdirSync(cwd);
+		fs.mkdirSync(healthyCwd);
+		const overflowed = createNativeSession(root, cwd, "live-aggregate-overflow");
+		const healthy = createNativeSession(root, healthyCwd, "live-aggregate-healthy");
+		const { supervisor, messages } = createHarness({
+			targets: [overflowed, healthy],
+			maxHotRuntimes: 1,
+			maxAutoRestarts: 0,
+		});
+		const lease = await supervisor.claim(overflowed.sessionHandle, "controller");
+		const before = supervisor.getRuntime(overflowed.sessionHandle)!;
+		await supervisor.sendCommand(
+			overflowed.sessionHandle,
+			{ type: "prompt", message: "live-aggregate-overflow" },
+			{
+				connectionId: "controller",
+				expectedGeneration: before.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		await waitFor(() => (supervisor.getRuntime(overflowed.sessionHandle)?.lastSeq ?? 0) >= 8);
+
+		const uncaught: unknown[] = [];
+		const unhandled: unknown[] = [];
+		const onUncaught = (error: unknown) => uncaught.push(error);
+		const onUnhandled = (error: unknown) => unhandled.push(error);
+		process.on("uncaughtException", onUncaught);
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			await expect(supervisor.subscribe(overflowed.sessionHandle)).rejects.toThrow(
+				"session_snapshot_overflow",
+			);
+			const terminal = supervisor.getRuntime(overflowed.sessionHandle)!;
+			expect(terminal).toMatchObject({ state: "crashed", error: "session_snapshot_overflow" });
+			expect(supervisor.getPendingExtensionRequests(overflowed.sessionHandle)).toEqual([]);
+			const terminalSeq = terminal.lastSeq;
+			const terminalMessageCount = messages.length;
+			await new Promise<void>((resolve) => setTimeout(resolve, 350));
+			expect(supervisor.getRuntime(overflowed.sessionHandle)?.lastSeq).toBe(terminalSeq);
+			expect(
+				messages.slice(terminalMessageCount).some((message) => message.type === "extension_ui_closed"),
+			).toBe(false);
+			expect(uncaught).toEqual([]);
+			expect(unhandled).toEqual([]);
+			await waitFor(() => !supervisor.isActive(overflowed.sessionHandle));
+			await expect(supervisor.activate(healthy.sessionHandle)).resolves.toMatchObject({ state: "idle" });
+		} finally {
+			process.off("uncaughtException", onUncaught);
+			process.off("unhandledRejection", onUnhandled);
+		}
+	});
+
+	it("compacts settled projection suffixes so normal turns can cross 4096 structural events", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "idle-base-compaction");
+		const { supervisor } = createHarness({ targets: [target], maxAutoRestarts: 0 });
+		const lease = await supervisor.claim(target.sessionHandle, "controller");
+
+		for (let turn = 0; turn < 5; turn += 1) {
+			const runtime = supervisor.getRuntime(target.sessionHandle)!;
+			await supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "prompt", message: "structural-burst" },
+				{
+					connectionId: "controller",
+					expectedGeneration: runtime.generation,
+					fencingToken: lease.fencingToken,
+				},
+			);
+			await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "idle", 5_000);
+		}
+
+		const current = supervisor.getRuntime(target.sessionHandle)!;
+		expect(current.state).toBe("idle");
+		expect(current.error).toBeUndefined();
+		expect(current.lastSeq).toBeGreaterThan(4_096);
+		const initial = await supervisor.subscribe(target.sessionHandle);
+		if (initial.type !== "resync_required") throw new Error("initial subscription did not resync");
+		expect(initial.snapshot.baseSeq).toBeGreaterThan(0);
+		expect(initial.snapshot.projectionEvents.length).toBeLessThan(4_096);
+	});
+
+	it("discards an idle base compaction response when a newer event crosses its CAS waterline", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "idle-base-cas");
+		const { supervisor } = createHarness({
+			targets: [target],
+			env: { PI_WEB_FIXTURE_COMPACTION_RACE: "1" },
+			projectionLimits: { maxLiveEventItems: 8 },
+		});
+		const lease = await supervisor.claim(target.sessionHandle, "controller");
+		const runtime = supervisor.getRuntime(target.sessionHandle)!;
+
+		await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "prompt", message: "fast" },
+			{
+				connectionId: "controller",
+				expectedGeneration: runtime.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		await waitForAsync(async () => {
+			const initial = await supervisor.subscribe(target.sessionHandle);
+			return (
+				initial.type === "resync_required" &&
+				initial.snapshot.projectionEvents.some((frame) => frame.event.type === "turn_start")
+			);
+		});
+		await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+		const initial = await supervisor.subscribe(target.sessionHandle);
+		if (initial.type !== "resync_required") throw new Error("initial subscription did not resync");
+		expect(initial.snapshot.baseSeq).toBeLessThan(initial.snapshot.asOfSeq);
+		expect(initial.snapshot.projectionEvents.at(-1)?.event.type).toBe("turn_start");
+	});
+
+	it("waits for projection high-water before fetching a large settled base", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "idle-base-high-water");
+		const marker = path.join(root, "get-messages.log");
+		const { supervisor } = createHarness({
+			targets: [target],
+			projectionLimits: { maxLiveEventItems: 40 },
+			env: {
+				PI_WEB_FIXTURE_GET_MESSAGES_MARKER: marker,
+				PI_WEB_FIXTURE_LARGE_SETTLED_BASE: "1",
+			},
+		});
+		const lease = await supervisor.claim(target.sessionHandle, "controller");
+
+		for (let turn = 0; turn < 4; turn += 1) {
+			const runtime = supervisor.getRuntime(target.sessionHandle)!;
+			await supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "prompt", message: "small-structural-turn" },
+				{
+					connectionId: "controller",
+					expectedGeneration: runtime.generation,
+					fencingToken: lease.fencingToken,
+				},
+			);
+			await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "idle");
+			await new Promise<void>((resolve) => setTimeout(resolve, 20));
+		}
+		expect(fs.readFileSync(marker, "utf8").trim().split("\n")).toHaveLength(1);
+
+		const runtime = supervisor.getRuntime(target.sessionHandle)!;
+		await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "prompt", message: "small-structural-turn" },
+			{
+				connectionId: "controller",
+				expectedGeneration: runtime.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		await waitFor(() => fs.readFileSync(marker, "utf8").trim().split("\n").length === 2);
+	});
+
+	it("admits a 2048-event turn after a 2047-event suffix and bounds the next 2050-event turn", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "turn-item-budget");
+		const { supervisor } = createHarness({ targets: [target], maxAutoRestarts: 0 });
+		const lease = await supervisor.claim(target.sessionHandle, "controller");
+		const sendTurn = async (structuralCount: number) => {
+			const runtime = supervisor.getRuntime(target.sessionHandle)!;
+			await supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "prompt", message: `structural-count:${String(structuralCount)}` },
+				{
+					connectionId: "controller",
+					expectedGeneration: runtime.generation,
+					fencingToken: lease.fencingToken,
+				},
+			);
+		};
+
+		await sendTurn(2_044);
+		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "idle", 5_000);
+		let initial = await supervisor.subscribe(target.sessionHandle);
+		if (initial.type !== "resync_required") throw new Error("initial subscription did not resync");
+		expect(initial.snapshot.projectionEvents).toHaveLength(2_047);
+
+		await sendTurn(2_045);
+		await waitForAsync(async () => {
+			initial = await supervisor.subscribe(target.sessionHandle);
+			return initial.type === "resync_required" && initial.snapshot.baseSeq === 4_095;
+		}, 5_000);
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({ state: "idle", lastSeq: 4_095 });
+
+		await sendTurn(2_047);
+		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "crashed", 5_000);
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({
+			state: "crashed",
+			error: "session_snapshot_overflow",
+			lastSeq: 6_143,
+		});
+	});
+
+	it("enforces a half-ceiling active-turn byte budget before the 8 MiB live suffix overflows", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "turn-byte-budget");
+		const { supervisor } = createHarness({ targets: [target], maxAutoRestarts: 0 });
+		const lease = await supervisor.claim(target.sessionHandle, "controller");
+		const runtime = supervisor.getRuntime(target.sessionHandle)!;
+
+		await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "prompt", message: "byte-turn:9" },
+			{
+				connectionId: "controller",
+				expectedGeneration: runtime.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "crashed", 5_000);
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({
+			state: "crashed",
+			error: "session_snapshot_overflow",
+		});
+	});
+
+	it("holds the next work command until a delayed high-water compaction restores headroom", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "turn-headroom-wait");
+		const getMessagesMarker = path.join(root, "get-messages.log");
+		const promptMarker = path.join(root, "prompts.log");
+		const { supervisor } = createHarness({
+			targets: [target],
+			projectionLimits: { maxLiveEventItems: 8 },
+			env: {
+				PI_WEB_FIXTURE_COMPACTION_DELAY_MS: "200",
+				PI_WEB_FIXTURE_GET_MESSAGES_MARKER: getMessagesMarker,
+				PI_WEB_FIXTURE_PROMPT_MARKER: promptMarker,
+			},
+		});
+		const lease = await supervisor.claim(target.sessionHandle, "controller");
+		const sendSmallTurn = () => {
+			const runtime = supervisor.getRuntime(target.sessionHandle)!;
+			return supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "prompt", message: "small-structural-turn" },
+				{
+					connectionId: "controller",
+					expectedGeneration: runtime.generation,
+					fencingToken: lease.fencingToken,
+				},
+			);
+		};
+
+		await sendSmallTurn();
+		await waitFor(() => fs.readFileSync(getMessagesMarker, "utf8").trim().split("\n").length === 2);
+		const second = sendSmallTurn();
+		await new Promise<void>((resolve) => setTimeout(resolve, 50));
+		expect(fs.readFileSync(promptMarker, "utf8").trim().split("\n")).toHaveLength(1);
+		await second;
+		expect(fs.readFileSync(promptMarker, "utf8").trim().split("\n")).toHaveLength(2);
+	});
+
+	it("atomically reserves two half-turns and rejects a third concurrent follow-up before Pi", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "concurrent-turn-reservations");
+		const promptMarker = path.join(root, "prompts.log");
+		const { supervisor } = createHarness({
+			targets: [target],
+			maxAutoRestarts: 0,
+			env: { PI_WEB_FIXTURE_PROMPT_MARKER: promptMarker },
+		});
+		const lease = await supervisor.claim(target.sessionHandle, "controller");
+		const runtime = supervisor.getRuntime(target.sessionHandle)!;
+		const sendHalfTurn = () =>
+			supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "follow_up", message: "structural-count:2045" },
+				{
+					connectionId: "controller",
+					expectedGeneration: runtime.generation,
+					fencingToken: lease.fencingToken,
+				},
+			);
+
+		const results = await Promise.allSettled([sendHalfTurn(), sendHalfTurn(), sendHalfTurn()]);
+		expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(2);
+		const rejected = results.filter((result) => result.status === "rejected");
+		expect(rejected).toHaveLength(1);
+		expect(String(rejected[0]?.reason)).toContain("session_snapshot_headroom_unavailable");
+		await waitFor(() => fs.readFileSync(promptMarker, "utf8").trim().split("\n").length === 2);
+		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "idle", 5_000);
+		expect(supervisor.getRuntime(target.sessionHandle)?.error).toBeUndefined();
+	});
+
+	it("releases failed and aborted turn reservations before rekey admission", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "reservation-cleanup-rekey");
+		const { supervisor, messages } = createHarness({ targets: [target] });
+		const lease = await supervisor.claim(target.sessionHandle, "controller");
+		let runtime = supervisor.getRuntime(target.sessionHandle)!;
+
+		const failed = await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "follow_up", message: "follow-up-failure" },
+			{
+				connectionId: "controller",
+				expectedGeneration: runtime.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		expect(failed.response.success).toBe(false);
+
+		const deadlines = trackRuntimeDeadlines();
+		try {
+			await supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "follow_up", message: "queued-never-starts" },
+				{
+					connectionId: "controller",
+					expectedGeneration: runtime.generation,
+					fencingToken: lease.fencingToken,
+				},
+			);
+			expect(deadlines.timers.size).toBe(1);
+			await supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "abort" },
+				{
+					connectionId: "controller",
+					expectedGeneration: runtime.generation,
+					fencingToken: lease.fencingToken,
+				},
+			);
+
+			const cloned = await supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "clone" },
+				{
+					connectionId: "controller",
+					expectedGeneration: runtime.generation,
+					fencingToken: lease.fencingToken,
+				},
+			);
+			expect(cloned.previousSessionHandle).toBe(target.sessionHandle);
+			runtime = supervisor.getRuntime(cloned.sessionHandle)!;
+			expect(runtime.generation).toBeGreaterThan(1);
+			expect(deadlines.timers.size).toBe(0);
+			const messagesAfterRekey = messages.length;
+			await new Promise<void>((resolve) => deadlines.nativeSetTimeout(resolve, 600));
+			expect(messages).toHaveLength(messagesAfterRekey);
+		} finally {
+			deadlines.restore();
+		}
+	});
+
+	it("keeps post-abort reservations beyond a delayed abort response causal cutoff", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "abort-reservation-cutoff");
+		const abortMarker = path.join(root, "abort.log");
+		const { supervisor } = createHarness({
+			targets: [target],
+			env: {
+				PI_WEB_FIXTURE_ABORT_MARKER: abortMarker,
+				PI_WEB_FIXTURE_ABORT_RESPONSE_DELAY_MS: "100",
+			},
+		});
+		const lease = await supervisor.claim(target.sessionHandle, "controller");
+		const send = (message: string) => {
+			const runtime = supervisor.getRuntime(target.sessionHandle)!;
+			return supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "follow_up", message },
+				{
+					connectionId: "controller",
+					expectedGeneration: runtime.generation,
+					fencingToken: lease.fencingToken,
+				},
+			);
+		};
+
+		await send("queued-never-starts");
+		const runtime = supervisor.getRuntime(target.sessionHandle)!;
+		const abort = supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "abort" },
+			{
+				connectionId: "controller",
+				expectedGeneration: runtime.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		await waitFor(() => fs.existsSync(abortMarker));
+		await send("queued-never-starts");
+		await abort;
+		await send("queued-never-starts");
+		await expect(send("queued-never-starts")).rejects.toThrow("session_snapshot_headroom_unavailable");
+	});
+
+	it("keeps reservation ids strictly monotonic beyond Number.MAX_SAFE_INTEGER", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "large-reservation-cutoff");
+		const abortMarker = path.join(root, "abort.log");
+		const { supervisor } = createHarness({
+			targets: [target],
+			env: {
+				PI_WEB_FIXTURE_ABORT_MARKER: abortMarker,
+				PI_WEB_FIXTURE_ABORT_RESPONSE_DELAY_MS: "100",
+			},
+		});
+		const lease = await supervisor.claim(target.sessionHandle, "controller");
+		const runtime = supervisor.getRuntime(target.sessionHandle)!;
+		const runtimeInstance = (supervisor as unknown as { runtimes: Map<string, SessionRuntime> }).runtimes.get(
+			target.sessionHandle,
+		)!;
+		const internals = runtimeInstance as unknown as {
+			nextTurnReservationId: number | bigint;
+			pendingTurnReservations: Map<symbol, { id: number | bigint }>;
+		};
+		internals.nextTurnReservationId =
+			typeof internals.nextTurnReservationId === "bigint"
+				? BigInt(Number.MAX_SAFE_INTEGER)
+				: Number.MAX_SAFE_INTEGER;
+		const send = (message: string) =>
+			supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "follow_up", message },
+				{
+					connectionId: "controller",
+					expectedGeneration: runtime.generation,
+					fencingToken: lease.fencingToken,
+				},
+			);
+
+		await send("queued-never-starts");
+		const firstReservationId = [...internals.pendingTurnReservations.values()][0]?.id;
+		const abort = supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "abort" },
+			{
+				connectionId: "controller",
+				expectedGeneration: runtime.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		await waitFor(() => fs.existsSync(abortMarker));
+		await send("queued-never-starts");
+		const secondReservationId = [...internals.pendingTurnReservations.values()][1]?.id;
+		await abort;
+		expect(firstReservationId).toBeDefined();
+		expect(secondReservationId).toBeDefined();
+		expect(secondReservationId! > firstReservationId!).toBe(true);
+		await send("queued-never-starts");
+		await expect(send("queued-never-starts")).rejects.toThrow("session_snapshot_headroom_unavailable");
+	});
+
+	it("keeps reservations accepted after a stale empty queue update watermark", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "queue-reservation-cutoff");
+		const { supervisor, messages } = createHarness({
+			targets: [target],
+			env: { PI_WEB_FIXTURE_STALE_QUEUE_DELAY_MS: "250" },
+		});
+		const lease = await supervisor.claim(target.sessionHandle, "controller");
+		const send = (message: string) => {
+			const runtime = supervisor.getRuntime(target.sessionHandle)!;
+			return supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "follow_up", message },
+				{
+					connectionId: "controller",
+					expectedGeneration: runtime.generation,
+					fencingToken: lease.fencingToken,
+				},
+			);
+		};
+		const queueEvents = () =>
+			messages.filter((message) => message.type === "event" && message.event.type === "queue_update");
+
+		const runtime = supervisor.getRuntime(target.sessionHandle)!;
+		await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "set_model", provider: "fixture", modelId: "stale-queue-clear" },
+			{
+				connectionId: "controller",
+				expectedGeneration: runtime.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		await waitFor(() =>
+			queueEvents().some(
+				(message) =>
+					message.type === "event" &&
+					message.event.type === "queue_update" &&
+					message.event.steering.length === 1,
+			),
+		);
+		await send("queued-never-starts");
+		await waitFor(() =>
+			queueEvents().some(
+				(message) =>
+					message.type === "event" &&
+					message.event.type === "queue_update" &&
+					message.event.steering.length === 0,
+			),
+		);
+		await expect(send("queued-never-starts")).rejects.toThrow("session_snapshot_headroom_unavailable");
+	});
+
+	it("cancels every no-start reservation deadline when the runtime stops", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "reservation-deadline-stop");
+		const { supervisor, messages } = createHarness({ targets: [target] });
+		const lease = await supervisor.claim(target.sessionHandle, "controller");
+		const runtime = supervisor.getRuntime(target.sessionHandle)!;
+		const send = (delayMs: number) =>
+			supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "follow_up", message: `queued-never-starts:${delayMs}` },
+				{
+					connectionId: "controller",
+					expectedGeneration: runtime.generation,
+					fencingToken: lease.fencingToken,
+				},
+			);
+
+		const deadlines = trackRuntimeDeadlines();
+		try {
+			await Promise.all([send(100), send(150)]);
+			expect(deadlines.timers.size).toBe(2);
+			await supervisor.stop(target.sessionHandle);
+			const messageCountAfterStop = messages.length;
+			expect(deadlines.timers.size).toBe(0);
+			await new Promise<void>((resolve) => deadlines.nativeSetTimeout(resolve, 600));
+			expect(messages).toHaveLength(messageCountAfterStop);
+			expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({ state: "dormant" });
+		} finally {
+			deadlines.restore();
+		}
+	});
+
 	it("uses the runtime-selected adapter for Session process arguments and decoding", async () => {
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace");
@@ -357,14 +1074,66 @@ describe("SessionSupervisor", () => {
 			reason: "initial",
 		});
 		expect(
-			await supervisor.subscribe(target.sessionHandle, { generation: current.generation, seq: 0 }),
+			await supervisor.subscribe(target.sessionHandle, {
+				serverEpoch: supervisor.serverEpoch,
+				generation: current.generation,
+				seq: 0,
+			}),
 		).toMatchObject({ type: "resync_required", reason: "gap" });
 		const replay = await supervisor.subscribe(target.sessionHandle, {
+			serverEpoch: supervisor.serverEpoch,
 			generation: current.generation,
 			seq: current.lastSeq - 1,
 		});
 		expect(replay.type).toBe("replay");
 		if (replay.type === "replay") expect(replay.frames).toHaveLength(1);
+	});
+
+	it("omits notify from replay and turns a cursor crossing its transient seq into a snapshot gap", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "notify-replay-gap");
+		const { supervisor, messages } = createHarness({ targets: [target] });
+		const lease = await supervisor.claim(target.sessionHandle, "controller");
+		const before = supervisor.getRuntime(target.sessionHandle)!;
+
+		await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "prompt", message: "notify-then-event" },
+			{
+				connectionId: "controller",
+				expectedGeneration: before.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "idle");
+		const notify = messages.find(
+			(message) => message.type === "extension_ui_request" && message.request.method === "notify",
+		);
+		if (notify?.type !== "extension_ui_request") throw new Error("notify was not published live");
+
+		const crossed = await supervisor.subscribe(target.sessionHandle, {
+			serverEpoch: supervisor.serverEpoch,
+			generation: before.generation,
+			seq: before.lastSeq,
+		});
+		expect(crossed).toMatchObject({ type: "resync_required", reason: "gap" });
+
+		const suffix = await supervisor.subscribe(target.sessionHandle, {
+			serverEpoch: supervisor.serverEpoch,
+			generation: before.generation,
+			seq: notify.seq,
+		});
+		if (suffix.type !== "replay") throw new Error("post-notify cursor did not replay its suffix");
+		expect(
+			suffix.frames.some(
+				(frame) => frame.type === "extension_ui_request" && frame.request.method === "notify",
+			),
+		).toBe(false);
+		expect(suffix.frames.map((frame) => frame.seq)).toEqual(
+			Array.from({ length: suffix.frames.length }, (_, index) => notify.seq + index + 1),
+		);
 	});
 
 	it("bounds replay bytes independently across large multi-Session event streams", async () => {
@@ -397,11 +1166,13 @@ describe("SessionSupervisor", () => {
 			await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "idle");
 			const current = supervisor.getRuntime(target.sessionHandle)!;
 			const expired = await supervisor.subscribe(target.sessionHandle, {
+				serverEpoch: supervisor.serverEpoch,
 				generation: current.generation,
 				seq: 0,
 			});
 			expect(expired).toMatchObject({ type: "resync_required", reason: "gap" });
 			const retained = await supervisor.subscribe(target.sessionHandle, {
+				serverEpoch: supervisor.serverEpoch,
 				generation: current.generation,
 				seq: current.lastSeq - 2,
 			});
@@ -529,13 +1300,82 @@ describe("SessionSupervisor", () => {
 
 		await supervisor.activate(target.sessionHandle);
 		const replay = await supervisor.subscribe(target.sessionHandle);
-		expect(replay.extensionRequests).toHaveLength(4);
+		if (replay.type !== "resync_required") throw new Error("initial subscription did not resync");
+		expect(replay.snapshot.stickyExtensionState).toHaveLength(4);
 		expect(
-			replay.extensionRequests.map((request) =>
+			replay.snapshot.stickyExtensionState.map((request) =>
 				request.method === "setStatus" ? request.statusKey : request.method,
 			),
 		).toEqual(["status-8", "status-9", "status-10", "status-11"]);
-		expect(Buffer.byteLength(JSON.stringify(replay.extensionRequests))).toBeLessThan(4_096);
+		expect(Buffer.byteLength(JSON.stringify(replay.snapshot.stickyExtensionState))).toBeLessThan(4_096);
+	});
+
+	it("uses one 256-item sticky authority and publishes explicit clears for live eviction", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "sticky-authority");
+		const { supervisor, messages } = createHarness({
+			targets: [target],
+			env: { PI_WEB_FIXTURE_STICKY_COUNT: "257" },
+			maxAutoRestarts: 0,
+		});
+
+		await expect(supervisor.activate(target.sessionHandle)).resolves.toMatchObject({ state: "idle" });
+		const initial = await supervisor.subscribe(target.sessionHandle);
+		if (initial.type !== "resync_required") throw new Error("initial subscription did not resync");
+		expect(initial.snapshot.stickyExtensionState).toHaveLength(256);
+		expect(initial.snapshot.stickyExtensionState[0]).toMatchObject({
+			method: "setStatus",
+			statusKey: "status-1",
+		});
+		expect(
+			messages.some(
+				(message) =>
+					message.type === "extension_ui_request" &&
+					message.request.method === "setStatus" &&
+					message.request.statusKey === "status-0" &&
+					message.request.statusText === undefined,
+			),
+		).toBe(true);
+		const liveStatuses = new Map<string, string>();
+		for (const message of messages) {
+			if (message.type !== "extension_ui_request" || message.request.method !== "setStatus") continue;
+			if (message.request.statusText === undefined) liveStatuses.delete(message.request.statusKey);
+			else liveStatuses.set(message.request.statusKey, message.request.statusText);
+		}
+		expect([...liveStatuses.keys()]).toEqual(
+			initial.snapshot.stickyExtensionState.flatMap((request) =>
+				request.method === "setStatus" ? [request.statusKey] : [],
+			),
+		);
+	});
+
+	it("clears an existing sticky key when an oversized replacement cannot be snapshotted", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "sticky-oversized-replacement");
+		const { supervisor, messages } = createHarness({
+			targets: [target],
+			extensionStateMaxBytes: 256,
+			env: { PI_WEB_FIXTURE_STICKY_REPLACEMENT_BYTES: "1024" },
+		});
+
+		await supervisor.activate(target.sessionHandle);
+		const initial = await supervisor.subscribe(target.sessionHandle);
+		if (initial.type !== "resync_required") throw new Error("initial subscription did not resync");
+		expect(initial.snapshot.stickyExtensionState).toEqual([]);
+		const replacementFrames = messages.filter(
+			(message) =>
+				message.type === "extension_ui_request" &&
+				message.request.method === "setStatus" &&
+				message.request.statusKey === "replacement",
+		);
+		expect(replacementFrames.at(-1)).toMatchObject({
+			type: "extension_ui_request",
+			request: { statusText: undefined },
+		});
 	});
 
 	it("fails closed when extensions exceed the pending dialog budget", async () => {
@@ -586,6 +1426,43 @@ describe("SessionSupervisor", () => {
 		const after = supervisor.getRuntime(target.sessionHandle)!;
 		expect(after.sessionFile).toBe(target.sessionFile);
 		expect(after.nativeSessionId).toBe(target.nativeSessionId);
+	});
+
+	it("rebuilds an overflowed runtime on manual restart without an unhandled rejection", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "overflow-restart");
+		const marker = path.join(root, "overflow-marker");
+		const { supervisor } = createHarness({
+			targets: [target],
+			projectionLimits: { maxLiveEventItems: 8 },
+			maxAutoRestarts: 0,
+			env: { PI_WEB_FIXTURE_OVERFLOW_MARKER: marker },
+		});
+		const lease = await supervisor.claim(target.sessionHandle, "controller");
+		const before = supervisor.getRuntime(target.sessionHandle)!;
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			await supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "prompt", message: "overflow-once" },
+				{
+					connectionId: "controller",
+					expectedGeneration: before.generation,
+					fencingToken: lease.fencingToken,
+				},
+			);
+			await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "crashed");
+			const restarted = await supervisor.restart(target.sessionHandle);
+			expect(restarted).toMatchObject({ state: "idle", generation: before.generation + 1 });
+			await new Promise<void>((resolve) => setTimeout(resolve, 25));
+			expect(unhandled).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
 	});
 
 	it("keeps protocol-incompatible runtimes terminal and never auto-restarts them", async () => {
@@ -785,7 +1662,9 @@ describe("SessionSupervisor", () => {
 		expect(fs.existsSync(created.sessionFile)).toBe(false);
 		expect(supervisor.getRuntime(created.sessionHandle)).toBeUndefined();
 		expect(supervisor.leaseFor(created.sessionHandle, "controller")).toEqual({
+			serverEpoch: supervisor.serverEpoch,
 			sessionHandle: created.sessionHandle,
+			generation: 0,
 			isController: false,
 		});
 		expect(messages).toContainEqual({ type: "session_directory_changed", workspaceId: "workspace" });

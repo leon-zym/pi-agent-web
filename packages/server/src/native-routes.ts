@@ -31,6 +31,7 @@ export interface RecoverableTrashTarget {
 }
 
 export interface NativeRouteSupervisor {
+	readonly serverEpoch: string;
 	listRuntimes(): SessionRuntimeSnapshot[];
 	getRuntime(sessionHandle: string): SessionRuntimeSnapshot | undefined;
 	createSession(request: CreateSessionRequest): Promise<SessionRuntimeSnapshot>;
@@ -319,7 +320,9 @@ export function createNativeRoutes(ctx: NativeRoutesContext): Hono {
 		const snapshot = await ctx.catalog.refresh();
 		await requireSession(snapshot, ctx, workspaceHandle, sessionHandle);
 		const runtime = runtimeForWorkspace(ctx.supervisor, sessionHandle, workspaceHandle);
-		return c.json(runtime ?? dormantRuntime(snapshot, workspaceHandle, sessionHandle));
+		return c.json(
+			runtime ?? dormantRuntime(snapshot, ctx.supervisor.serverEpoch, workspaceHandle, sessionHandle),
+		);
 	});
 
 	app.onError((error, c) => {
@@ -674,12 +677,14 @@ async function requireSession(
 
 function dormantRuntime(
 	snapshot: NativeSessionCatalogSnapshot,
+	serverEpoch: string,
 	workspaceHandle: string,
 	sessionHandle: string,
 ): SessionRuntimeSnapshot {
 	const session = persistedSessionForWorkspace(snapshot, sessionHandle, workspaceHandle);
 	if (!session) throw notFound("session_not_found", "session not found");
 	return {
+		serverEpoch,
 		sessionHandle,
 		workspaceId: workspaceHandle,
 		nativeSessionId: session.nativeSessionId,

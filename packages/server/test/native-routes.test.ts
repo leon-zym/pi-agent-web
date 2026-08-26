@@ -83,6 +83,7 @@ function writeSession(
 }
 
 class FakeSupervisor implements NativeRouteSupervisor {
+	readonly serverEpoch = "native-routes-test-epoch";
 	readonly runtimes = new Map<string, SessionRuntimeSnapshot>();
 	readonly active = new Set<string>();
 	readonly createRequests: CreateSessionRequest[] = [];
@@ -105,6 +106,7 @@ class FakeSupervisor implements NativeRouteSupervisor {
 		const nativeSessionId = `new-${String(this.createRequests.length)}`;
 		const sessionFile = canonicalizeSessionFile(path.join(request.sessionDir, `${nativeSessionId}.jsonl`));
 		const runtime: SessionRuntimeSnapshot = {
+			serverEpoch: this.serverEpoch,
 			sessionHandle: sessionHandleForFile(sessionFile),
 			workspaceId: request.workspaceId,
 			nativeSessionId,
@@ -787,6 +789,7 @@ describe("native REST routes", () => {
 		const dormant = await app.request(`/workspaces/${workspaceHandle}/sessions/${sessionHandle}/process`);
 		expect(dormant.status).toBe(200);
 		expect(await json(dormant)).toMatchObject({
+			serverEpoch: supervisor.serverEpoch,
 			sessionHandle,
 			workspaceId: workspaceHandle,
 			state: "dormant",

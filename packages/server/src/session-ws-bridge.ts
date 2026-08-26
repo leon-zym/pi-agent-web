@@ -11,6 +11,7 @@ import {
 	SESSION_WS_SERVER_MAX_BYTES,
 	type SessionCommandDto,
 	type SessionCommandResponseDto,
+	type SessionReplayCursorDto,
 	type SessionReplayFrameDto,
 	type SessionRuntimeDto,
 	type SessionWsClientMessage,
@@ -72,7 +73,6 @@ interface BashCommandIdMapping {
 
 export interface SessionWsBridgeOptions {
 	supervisor: SessionSupervisor;
-	serverEpoch: string;
 	serverBuild: string;
 	runtime: {
 		version: string;
@@ -106,7 +106,7 @@ export class SessionWsBridge {
 	constructor(opts: SessionWsBridgeOptions) {
 		this.supervisor = opts.supervisor;
 		this.log = opts.log ?? (() => {});
-		this.serverEpoch = opts.serverEpoch;
+		this.serverEpoch = opts.supervisor.serverEpoch;
 		this.serverBuild = opts.serverBuild;
 		this.runtime = opts.runtime;
 		this.helloTimeoutMs = Math.max(1, opts.helloTimeoutMs ?? 5_000);
@@ -402,7 +402,7 @@ export class SessionWsBridge {
 	private async subscribe(
 		connection: ConnectionState,
 		sessionHandle: string,
-		cursor?: { generation: number; seq: number },
+		cursor?: SessionReplayCursorDto,
 	): Promise<void> {
 		const lifecycleEpoch = connection.epoch;
 		const catchUp = this.beginCatchUp(connection, sessionHandle);
@@ -433,6 +433,7 @@ export class SessionWsBridge {
 			if (catchUp.requestedHandle !== resolvedHandle) {
 				this.send(connection, {
 					type: "session_rekeyed",
+					serverEpoch: this.serverEpoch,
 					previousSessionHandle: catchUp.requestedHandle,
 					runtime: result.runtime,
 				});
@@ -441,19 +442,15 @@ export class SessionWsBridge {
 			if (result.type === "resync_required") {
 				this.send(connection, {
 					type: "resync_required",
+					serverEpoch: this.serverEpoch,
 					sessionHandle: resolvedHandle,
 					runtime: result.runtime,
-					reason: result.reason,
+					reason: result.reason === "server_epoch_changed" ? "epoch_changed" : result.reason,
 				});
+				this.send(connection, result.snapshot);
 			} else {
 				for (const frame of result.frames) this.send(connection, frame as SessionReplayFrameDto);
 			}
-			this.send(connection, {
-				type: "extension_ui_snapshot",
-				sessionHandle: resolvedHandle,
-				generation: result.runtime.generation,
-				requests: result.extensionRequests,
-			});
 			this.sendLease(connection, this.supervisor.leaseFor(resolvedHandle, connection.connectionId));
 
 			if (!this.isCurrentCatchUp(connection, catchUp, lifecycleEpoch)) return;
@@ -734,6 +731,7 @@ export class SessionWsBridge {
 			});
 			this.send(connection, {
 				type: "response",
+				serverEpoch: result.serverEpoch,
 				sessionHandle: result.sessionHandle,
 				generation: result.generation,
 				barrierSeq: result.barrierSeq,
@@ -770,6 +768,7 @@ export class SessionWsBridge {
 			});
 			this.send(connection, {
 				type: "extension_ui_result",
+				serverEpoch: this.serverEpoch,
 				sessionHandle: message.sessionHandle,
 				generation: message.expectedGeneration,
 				requestId: message.response.id,
@@ -788,6 +787,7 @@ export class SessionWsBridge {
 		const runtime = this.supervisor.getRuntime(message.sessionHandle);
 		this.send(connection, {
 			type: "response",
+			serverEpoch: this.serverEpoch,
 			sessionHandle: runtime?.sessionHandle ?? message.sessionHandle,
 			generation: runtime?.generation ?? message.expectedGeneration ?? 0,
 			barrierSeq: runtime?.lastSeq ?? 0,
@@ -809,6 +809,7 @@ export class SessionWsBridge {
 	): void {
 		this.send(connection, {
 			type: "session_error",
+			serverEpoch: this.serverEpoch,
 			sessionHandle,
 			operation,
 			error: this.errorText(error),
@@ -893,7 +894,7 @@ export class SessionWsBridge {
 		this.sendPayload(
 			connection,
 			this.payloadForConnection(connection, message),
-			message.type === "response" && message.response.command === "get_messages",
+			message.type === "session_snapshot",
 		);
 	}
 
@@ -996,7 +997,9 @@ export class SessionWsBridge {
 
 interface SessionLeaseSnapshot {
 	type: "lease_status";
+	serverEpoch: string;
 	sessionHandle: string;
+	generation: number;
 	isController: boolean;
 	fencingToken?: string;
 }

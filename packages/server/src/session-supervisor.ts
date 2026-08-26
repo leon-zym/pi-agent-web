@@ -10,6 +10,7 @@ import type {
 import { RpcError } from "@pi-agent-web/protocol";
 import type { ProbedPiRuntime } from "./resolver.js";
 import { canonicalizePathAllowMissing } from "./session-layout-resolver.js";
+import type { SessionLiveProjectionLimits } from "./session-live-projection.js";
 import { type SessionIdentityTransitionCommit, SessionRuntime } from "./session-runtime.js";
 import {
 	type ExistingSessionTarget,
@@ -47,6 +48,7 @@ export interface CreateSessionRequest {
 }
 
 export interface SessionSupervisorOptions {
+	serverEpoch?: string;
 	resolved: ProbedPiRuntime;
 	env?: Record<string, string>;
 	envForWorkspace?: (cwd: string) => Record<string, string>;
@@ -60,6 +62,7 @@ export interface SessionSupervisorOptions {
 	extensionStateMaxBytes?: number;
 	extensionStateMaxItems?: number;
 	pendingDialogLimit?: number;
+	projectionLimits?: Partial<SessionLiveProjectionLimits>;
 	commandTimeoutFor?: (commandType: string) => number;
 	maxHotRuntimes?: number;
 	idleTtlMs?: number;
@@ -88,6 +91,7 @@ interface Alias {
  * crash budgets, replay, and capacity are isolated per Session handle.
  */
 export class SessionSupervisor {
+	readonly serverEpoch: string;
 	private readonly opts: Required<
 		Pick<
 			SessionSupervisorOptions,
@@ -118,6 +122,7 @@ export class SessionSupervisor {
 	private closePromise: Promise<void> | null = null;
 
 	constructor(opts: SessionSupervisorOptions) {
+		this.serverEpoch = opts.serverEpoch ?? randomUUID();
 		this.opts = {
 			...opts,
 			readyTimeoutMs: opts.readyTimeoutMs ?? 10_000,
@@ -180,7 +185,9 @@ export class SessionSupervisor {
 			await this.ensureCapacity();
 			this.assertOpen();
 			this.runtimes.set(temporaryHandle, runtime);
-			void runtime.start();
+			void runtime.start().catch(() => {
+				// The awaited call below owns the startup error.
+			});
 		});
 		try {
 			await runtime.start();
@@ -217,7 +224,7 @@ export class SessionSupervisor {
 
 	async subscribe(sessionHandle: string, cursor?: ReplayCursor): Promise<ReplayResult> {
 		const runtime = await this.ensureRuntime(sessionHandle);
-		return runtime.getReplay(cursor);
+		return runtime.getReplay(sessionHandle, cursor);
 	}
 
 	async claim(sessionHandle: string, connectionId: string): Promise<SessionLeaseSnapshot> {
@@ -231,11 +238,22 @@ export class SessionSupervisor {
 			}
 			const existing = this.leases.get(handle);
 			if (existing && existing.connectionId !== connectionId) {
-				return { sessionHandle: handle, isController: false };
+				return {
+					serverEpoch: this.serverEpoch,
+					sessionHandle: handle,
+					generation: runtime.generation,
+					isController: false,
+				};
 			}
 			const lease = existing ?? { connectionId, fencingToken: randomUUID() };
 			this.leases.set(handle, lease);
-			return { sessionHandle: handle, isController: true, fencingToken: lease.fencingToken };
+			return {
+				serverEpoch: this.serverEpoch,
+				sessionHandle: handle,
+				generation: runtime.generation,
+				isController: true,
+				fencingToken: lease.fencingToken,
+			};
 		});
 	}
 
@@ -260,9 +278,16 @@ export class SessionSupervisor {
 	leaseFor(sessionHandle: string, connectionId: string): SessionLeaseSnapshot {
 		const handle = this.resolveAlias(sessionHandle);
 		const lease = this.leases.get(handle);
+		const generation = this.runtimes.get(handle)?.generation ?? 0;
 		return lease?.connectionId === connectionId
-			? { sessionHandle: handle, isController: true, fencingToken: lease.fencingToken }
-			: { sessionHandle: handle, isController: false };
+			? {
+					serverEpoch: this.serverEpoch,
+					sessionHandle: handle,
+					generation,
+					isController: true,
+					fencingToken: lease.fencingToken,
+				}
+			: { serverEpoch: this.serverEpoch, sessionHandle: handle, generation, isController: false };
 	}
 
 	async sendCommand(
@@ -288,6 +313,7 @@ export class SessionSupervisor {
 				try {
 					const result = await runtime.sendIdentityTransition(command, context.expectedGeneration, admit);
 					return {
+						serverEpoch: this.serverEpoch,
 						sessionHandle: runtime.sessionHandle,
 						generation: runtime.generation,
 						barrierSeq: runtime.lastSeq,
@@ -302,6 +328,7 @@ export class SessionSupervisor {
 			const response = await runtime.send(command, context.expectedGeneration, admit);
 			const verifiedResponse = await attachExportHtmlUrl(command, response, runtime.cwd);
 			return {
+				serverEpoch: this.serverEpoch,
 				sessionHandle: runtime.sessionHandle,
 				generation: runtime.generation,
 				barrierSeq: runtime.lastSeq,
@@ -335,7 +362,9 @@ export class SessionSupervisor {
 		const existing = this.runtimes.get(handle);
 		if (!existing) return this.activate(handle);
 
+		let runtime = existing;
 		let release: (() => void) | undefined;
+		let starting: Promise<void> | undefined;
 		await this.withPoolLock(async () => {
 			this.assertOpen();
 			if (this.deletionReservations.has(handle)) throw new RpcError("restart", "session_deleting");
@@ -350,14 +379,29 @@ export class SessionSupervisor {
 			}
 			this.clearRestart(existing.sessionHandle);
 			this.crashTimes.delete(existing.sessionHandle);
+			if (existing.snapshotOverflowed) {
+				const target = existing.rebuildTarget();
+				if (!target) throw new RpcError("restart", "unpersisted_session_cannot_be_recovered");
+				await existing.stop();
+				if (this.runtimes.get(handle) !== existing) {
+					throw new RpcError("restart", "session_runtime_not_tracked");
+				}
+				runtime = this.createRuntime(target, existing.generation);
+				this.runtimes.set(handle, runtime);
+			}
 			await this.ensureCapacity();
 			this.assertOpen();
-			release = existing.reserve();
-			void existing.start();
+			release = runtime.reserve();
+			starting = runtime.start();
+			void starting.catch(() => {
+				// The awaited call below owns the startup error. Attaching the handler
+				// here keeps capacity reservation and rejection observation atomic.
+			});
 		});
 		try {
-			await existing.start();
-			return existing.snapshot();
+			if (!starting) throw new RpcError("restart", "session_restart_not_started");
+			await starting;
+			return runtime.snapshot();
 		} finally {
 			release?.();
 		}
@@ -658,7 +702,10 @@ export class SessionSupervisor {
 				await this.ensureCapacity();
 				this.assertOpen();
 				this.runtimes.set(handle, runtime);
-				void runtime.start();
+				void runtime.start().catch(() => {
+					// The awaited call below owns the activation error. This eager call only
+					// starts work while the capacity reservation is still held.
+				});
 			});
 			const selected = this.runtimes.get(handle) ?? runtime;
 			try {
@@ -701,7 +748,9 @@ export class SessionSupervisor {
 				}
 				await this.ensureCapacity();
 				this.assertOpen();
-				void runtime.start();
+				void runtime.start().catch(() => {
+					// The awaited call below owns the activation error.
+				});
 			}
 			release = runtime.reserve();
 		});
@@ -730,7 +779,9 @@ export class SessionSupervisor {
 				}
 				await this.ensureCapacity();
 				this.assertOpen();
-				void runtime.start();
+				void runtime.start().catch(() => {
+					// The awaited call below owns the activation error.
+				});
 			}
 			release = runtime.reserve();
 		});
@@ -741,8 +792,12 @@ export class SessionSupervisor {
 		}
 	}
 
-	private createRuntime(target: ExistingSessionTarget | NewSessionTarget): SessionRuntime {
+	private createRuntime(
+		target: ExistingSessionTarget | NewSessionTarget,
+		initialGeneration?: number,
+	): SessionRuntime {
 		return new SessionRuntime({
+			serverEpoch: this.serverEpoch,
 			target,
 			resolved: this.opts.resolved,
 			env: {
@@ -756,6 +811,8 @@ export class SessionSupervisor {
 			extensionStateMaxBytes: this.opts.extensionStateMaxBytes,
 			extensionStateMaxItems: this.opts.extensionStateMaxItems,
 			pendingDialogLimit: this.opts.pendingDialogLimit,
+			projectionLimits: this.opts.projectionLimits,
+			initialGeneration,
 			commandTimeoutFor: this.opts.commandTimeoutFor,
 			emit: (message) => this.safeBroadcast(message),
 			onCrash: (runtime) => this.handleCrash(runtime),
@@ -792,6 +849,7 @@ export class SessionSupervisor {
 			this.rekeyRuntime(previousSessionHandle, runtime, false);
 			this.safeBroadcast({
 				type: "session_rekeyed",
+				serverEpoch: this.serverEpoch,
 				previousSessionHandle,
 				runtime: runtime.snapshot(),
 			});

@@ -24,6 +24,7 @@ function argument(name) {
 const requestedFile = argument("--session");
 const requestedId = argument("--session-id");
 const requestedDir = argument("--session-dir");
+const checkpointDir = process.env.PI_WEB_FIXTURE_CHECKPOINT_DIR;
 
 let sessionFile;
 let sessionId;
@@ -34,6 +35,7 @@ let pendingBash;
 let pendingBashTimer;
 let startupFloodSent = false;
 let initialStateRequest = true;
+let getMessagesRequestCount = 0;
 const usage = {
 	input: 1,
 	output: 1,
@@ -42,6 +44,23 @@ const usage = {
 	totalTokens: 2,
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
+
+if (process.env.PI_WEB_FIXTURE_AGGREGATE_SNAPSHOT_ITEMS === "1") {
+	for (let index = 0; index < 6; index += 1) {
+		messages.push({
+			role: "toolResult",
+			toolCallId: `aggregate-${String(index)}`,
+			toolName: "fixture",
+			content: [{ type: "text", text: "aggregate" }],
+			details: Array.from({ length: 5 }, () => Array.from({ length: 9_000 }, () => false)),
+			isError: false,
+			timestamp: Date.now(),
+		});
+	}
+}
+if (process.env.PI_WEB_FIXTURE_LARGE_SETTLED_BASE === "1") {
+	messages.push(assistantMessage("b".repeat(512 * 1024)));
+}
 
 function state() {
 	return {
@@ -165,6 +184,23 @@ function sendStartupExtensionState() {
 			statusText: undefined,
 		});
 	}
+	const replacementBytes = configuredBytes("PI_WEB_FIXTURE_STICKY_REPLACEMENT_BYTES");
+	if (replacementBytes > 0) {
+		send({
+			type: "extension_ui_request",
+			id: "sticky-replacement-small",
+			method: "setStatus",
+			statusKey: "replacement",
+			statusText: "small",
+		});
+		send({
+			type: "extension_ui_request",
+			id: "sticky-replacement-large",
+			method: "setStatus",
+			statusKey: "replacement",
+			statusText: "x".repeat(replacementBytes),
+		});
+	}
 	const dialogCount = configuredCount("PI_WEB_FIXTURE_DIALOG_COUNT");
 	for (let index = 0; index < dialogCount; index += 1) {
 		send({
@@ -175,6 +211,41 @@ function sendStartupExtensionState() {
 			message: `dialog-${String(index)}`,
 		});
 	}
+}
+
+function sendStartupProjectionDomains() {
+	if (process.env.PI_WEB_FIXTURE_STARTUP_PROJECTION_DOMAINS !== "1") return;
+	send({ type: "agent_start" });
+	send({
+		type: "message_update",
+		usage,
+		assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "startup-plan" },
+	});
+	send({
+		type: "message_update",
+		usage,
+		assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: "startup-text" },
+	});
+	send({
+		type: "tool_execution_start",
+		toolCallId: "startup-tool",
+		toolName: "read",
+		args: { path: "README.md" },
+	});
+	send({
+		type: "tool_execution_update",
+		toolCallId: "startup-tool",
+		toolName: "read",
+		args: { path: "README.md" },
+		partialResult: { text: "partial" },
+	});
+	send({
+		type: "extension_ui_request",
+		id: "startup-domain-dialog",
+		method: "confirm",
+		title: "Confirm",
+		message: "startup-domain-dialog",
+	});
 }
 
 function sendLargeExtensionRequest(id, bytes) {
@@ -188,10 +259,128 @@ function sendLargeExtensionRequest(id, bytes) {
 	});
 }
 
+function checkpointReleaseFile(stage) {
+	if (!checkpointDir) return undefined;
+	return path.join(checkpointDir, `${sessionId}-${stage}.release`);
+}
+
+function afterCheckpointRelease(stage, callback) {
+	const releaseFile = checkpointReleaseFile(stage);
+	if (!releaseFile) {
+		setTimeout(callback, 250);
+		return;
+	}
+	const poll = () => {
+		if (fs.existsSync(releaseFile)) {
+			callback();
+			return;
+		}
+		setTimeout(poll, 5);
+	};
+	poll();
+}
+
+function streamSnapshotCheckpoint(command, stage) {
+	const stages = ["thinking", "text", "tool", "dialog"];
+	const stageIndex = stages.indexOf(stage);
+	if (stageIndex === -1) {
+		errorResponse(command, "unknown snapshot checkpoint");
+		return;
+	}
+	const toolCallId = `checkpoint-tool-${sessionId}`;
+	const toolArgs = { path: "checkpoint.txt" };
+	send({ type: "agent_start" });
+	response(command);
+	send({
+		type: "message_update",
+		usage,
+		assistantMessageEvent: {
+			type: "thinking_delta",
+			contentIndex: 0,
+			delta: "checkpoint-thinking",
+		},
+	});
+	if (stageIndex >= 1) {
+		send({
+			type: "message_update",
+			usage,
+			assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: "checkpoint-text" },
+		});
+	}
+	if (stageIndex >= 2) {
+		send({
+			type: "message_update",
+			usage,
+			assistantMessageEvent: { type: "toolcall_start", contentIndex: 2 },
+		});
+		send({
+			type: "message_update",
+			usage,
+			assistantMessageEvent: {
+				type: "toolcall_delta",
+				contentIndex: 2,
+				delta: JSON.stringify(toolArgs),
+			},
+		});
+		send({
+			type: "message_update",
+			usage,
+			assistantMessageEvent: {
+				type: "toolcall_end",
+				contentIndex: 2,
+				toolCall: { type: "toolCall", id: toolCallId, name: "read", arguments: toolArgs },
+			},
+		});
+		send({ type: "tool_execution_start", toolCallId, toolName: "read", args: toolArgs });
+		send({
+			type: "tool_execution_update",
+			toolCallId,
+			toolName: "read",
+			args: toolArgs,
+			partialResult: { text: "checkpoint-tool-partial" },
+		});
+	}
+	if (stageIndex >= 3) {
+		send({
+			type: "extension_ui_request",
+			id: `checkpoint-dialog-${sessionId}`,
+			method: "confirm",
+			title: "Checkpoint dialog",
+			message: "checkpoint-dialog",
+		});
+	}
+	afterCheckpointRelease(stage, () => {
+		if (stageIndex >= 2) {
+			send({
+				type: "tool_execution_end",
+				toolCallId,
+				toolName: "read",
+				result: { content: "checkpoint-tool-complete" },
+				isError: false,
+			});
+		}
+		send({
+			type: "message_update",
+			usage,
+			assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: "-released" },
+		});
+		messages.push(assistantMessage(`checkpoint-${stage}-settled`));
+		send({ type: "agent_end", messages: [], willRetry: false });
+		send({ type: "agent_settled" });
+	});
+}
+
 function streamPrompt(command) {
 	const text = command.message;
+	if (process.env.PI_WEB_FIXTURE_PROMPT_MARKER) {
+		fs.appendFileSync(process.env.PI_WEB_FIXTURE_PROMPT_MARKER, `${String(text)}\n`);
+	}
 	messages.push({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() });
 	if (process.env.PI_WEB_FIXTURE_SKIP_PROMPT_PERSIST !== "1") ensurePersisted();
+	if (typeof text === "string" && text.startsWith("snapshot-checkpoint:")) {
+		streamSnapshotCheckpoint(command, text.slice("snapshot-checkpoint:".length));
+		return;
+	}
 	if (text === "protocol-incompatible") {
 		response(command);
 		send({ type: "queue_update", steering: "malformed", followUp: [] });
@@ -225,6 +414,78 @@ function streamPrompt(command) {
 	}
 	send({ type: "agent_start" });
 	response(command);
+	if (text === "notify-then-event") {
+		send({
+			type: "extension_ui_request",
+			id: `notify-${sessionId}`,
+			method: "notify",
+			message: "transient-notify",
+			notifyType: "info",
+		});
+		send({ type: "turn_start" });
+		messages.push(assistantMessage("notify-settled"));
+		send({ type: "agent_end", messages: [], willRetry: false });
+		send({ type: "agent_settled" });
+		return;
+	}
+	if (text === "small-structural-turn") {
+		send({ type: "turn_start" });
+		messages.push(assistantMessage("small-structural-turn"));
+		send({ type: "agent_end", messages: [], willRetry: false });
+		send({ type: "agent_settled" });
+		return;
+	}
+	if (typeof text === "string" && text.startsWith("structural-count:")) {
+		const count = Number(text.slice("structural-count:".length));
+		for (let index = 0; index < count; index += 1) send({ type: "turn_start" });
+		messages.push(assistantMessage(text));
+		send({ type: "agent_end", messages: [], willRetry: false });
+		send({ type: "agent_settled" });
+		return;
+	}
+	if (typeof text === "string" && text.startsWith("byte-turn:")) {
+		const count = Number(text.slice("byte-turn:".length));
+		for (let index = 0; index < count; index += 1) {
+			send({
+				type: "message_update",
+				usage,
+				assistantMessageEvent: {
+					type: "text_delta",
+					contentIndex: index,
+					delta: "x".repeat(512 * 1024),
+				},
+			});
+		}
+		messages.push(assistantMessage(text));
+		send({ type: "agent_end", messages: [], willRetry: false });
+		send({ type: "agent_settled" });
+		return;
+	}
+	if (text === "live-aggregate-overflow") {
+		send({
+			type: "extension_ui_request",
+			id: `aggregate-dialog-${sessionId}`,
+			method: "confirm",
+			title: "Aggregate overflow",
+			message: "must be synchronously cleared",
+			timeout: 300,
+		});
+		for (let index = 0; index < 6; index += 1) {
+			send({
+				type: "message_end",
+				message: {
+					role: "toolResult",
+					toolCallId: `live-aggregate-${String(index)}`,
+					toolName: "fixture",
+					content: [{ type: "text", text: "aggregate" }],
+					details: Array.from({ length: 5 }, () => Array.from({ length: 9_000 }, () => false)),
+					isError: false,
+					timestamp: Date.now(),
+				},
+			});
+		}
+		return;
+	}
 	if (text === "large-events") {
 		const bytes = configuredBytes("PI_WEB_FIXTURE_EVENT_BYTES") || 512;
 		for (let index = 0; index < 6; index += 1) {
@@ -238,6 +499,21 @@ function streamPrompt(command) {
 		send({ type: "agent_end", messages: [], willRetry: false });
 		send({ type: "agent_settled" });
 		return;
+	}
+	if (text === "structural-burst") {
+		for (let index = 0; index < 900; index += 1) send({ type: "turn_start" });
+		messages.push(assistantMessage(`structural-burst-${String(messages.length)}`));
+		send({ type: "agent_end", messages: [], willRetry: false });
+		send({ type: "agent_settled" });
+		return;
+	}
+	if (text === "overflow-once") {
+		const marker = process.env.PI_WEB_FIXTURE_OVERFLOW_MARKER;
+		if (marker && !fs.existsSync(marker)) {
+			fs.writeFileSync(marker, "overflowed\n");
+			for (let index = 0; index < 12; index += 1) send({ type: "turn_start" });
+			return;
+		}
 	}
 	if (text === "open-dialog") {
 		send({
@@ -329,6 +605,7 @@ function handleLine(line) {
 			if (!startupFloodSent) {
 				startupFloodSent = true;
 				sendStartupExtensionState();
+				sendStartupProjectionDomains();
 				sendLargeExtensionRequest(
 					`startup-flood-${sessionId}`,
 					configuredBytes("PI_WEB_FIXTURE_STARTUP_FRAME_BYTES"),
@@ -356,6 +633,25 @@ function handleLine(line) {
 			response(command, state());
 			return;
 		case "get_messages":
+			getMessagesRequestCount += 1;
+			if (process.env.PI_WEB_FIXTURE_GET_MESSAGES_MARKER) {
+				fs.appendFileSync(
+					process.env.PI_WEB_FIXTURE_GET_MESSAGES_MARKER,
+					`${String(getMessagesRequestCount)}\n`,
+				);
+			}
+			if (process.env.PI_WEB_FIXTURE_COMPACTION_RACE === "1" && getMessagesRequestCount === 2) {
+				setTimeout(() => send({ type: "turn_start" }), 5);
+				setTimeout(() => response(command, { messages }), 30);
+				return;
+			}
+			if (process.env.PI_WEB_FIXTURE_COMPACTION_DELAY_MS && getMessagesRequestCount === 2) {
+				setTimeout(
+					() => response(command, { messages }),
+					Number(process.env.PI_WEB_FIXTURE_COMPACTION_DELAY_MS),
+				);
+				return;
+			}
 			response(command, { messages });
 			return;
 		case "get_commands":
@@ -367,6 +663,15 @@ function handleLine(line) {
 				errorResponse(command, `fixture ${command.type} failure`);
 				return;
 			}
+			if (command.type === "set_model" && command.modelId === "stale-queue-clear") {
+				response(command, { id: command.modelId, name: command.modelId, provider: command.provider });
+				send({ type: "queue_update", steering: ["queued"], followUp: [] });
+				setTimeout(
+					() => send({ type: "queue_update", steering: [], followUp: [] }),
+					Number(process.env.PI_WEB_FIXTURE_STALE_QUEUE_DELAY_MS ?? 100),
+				);
+				return;
+			}
 			response(
 				command,
 				command.type === "set_model"
@@ -376,6 +681,31 @@ function handleLine(line) {
 			return;
 		case "prompt":
 			streamPrompt(command);
+			return;
+		case "follow_up":
+			if (command.message === "follow-up-failure") {
+				errorResponse(command, "fixture follow_up failure");
+				return;
+			}
+			if (command.message === "queued-never-starts") {
+				response(command);
+				return;
+			}
+			if (command.message.startsWith("queued-never-starts:")) {
+				setTimeout(() => response(command), Number(command.message.split(":")[1]));
+				return;
+			}
+			streamPrompt(command);
+			return;
+		case "abort":
+			if (process.env.PI_WEB_FIXTURE_ABORT_MARKER) {
+				fs.appendFileSync(process.env.PI_WEB_FIXTURE_ABORT_MARKER, "abort\n");
+			}
+			if (process.env.PI_WEB_FIXTURE_ABORT_RESPONSE_DELAY_MS) {
+				setTimeout(() => response(command), Number(process.env.PI_WEB_FIXTURE_ABORT_RESPONSE_DELAY_MS));
+				return;
+			}
+			response(command);
 			return;
 		case "export_html": {
 			const outputPath =

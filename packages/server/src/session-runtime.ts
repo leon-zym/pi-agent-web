@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type {
@@ -6,14 +7,27 @@ import type {
 	ProductSessionEventDto,
 	SessionCommandDto,
 	SessionCommandResponseDto,
+	SessionSnapshotDto,
 	SessionStateDto,
 } from "@pi-agent-web/protocol";
-import { commandTimeoutMs, RpcError } from "@pi-agent-web/protocol";
+import {
+	commandTimeoutMs,
+	expectCommandData,
+	isSessionSnapshotDto,
+	RpcError,
+	SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS,
+} from "@pi-agent-web/protocol";
 import { canonicalizeSessionFile, sessionHandleForCanonicalFile } from "./native-session-catalog.js";
 import type { PiProcessExitInfo } from "./pi-process.js";
 import { PiProcess } from "./pi-process.js";
 import type { ProbedPiRuntime } from "./resolver.js";
 import { canonicalizePathAllowMissing } from "./session-layout-resolver.js";
+import {
+	SessionLiveProjection,
+	type SessionLiveProjectionIdentity,
+	SessionLiveProjectionLimitError,
+	type SessionLiveProjectionLimits,
+} from "./session-live-projection.js";
 import {
 	type ExistingSessionTarget,
 	eventSettlesWork,
@@ -31,7 +45,7 @@ const STICKY_EXTENSION_METHODS = new Set(["setStatus", "setWidget", "setTitle", 
 const DEFAULT_REPLAY_MAX_BYTES = 8 * 1024 * 1024;
 const DEFAULT_TRANSIENT_BUFFER_MAX_BYTES = 4 * 1024 * 1024;
 const DEFAULT_EXTENSION_STATE_MAX_BYTES = 512 * 1024;
-const DEFAULT_EXTENSION_STATE_MAX_ITEMS = 128;
+const DEFAULT_EXTENSION_STATE_MAX_ITEMS = SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS;
 const DEFAULT_PENDING_DIALOG_LIMIT = 32;
 
 type BufferedFrame =
@@ -45,6 +59,13 @@ type BufferedFrame =
 
 interface PendingDialog {
 	request: ExtensionUiRequestDto;
+	timer: NodeJS.Timeout | null;
+}
+
+interface PendingTurnReservation {
+	id: bigint;
+	generation: number;
+	processToken: number;
 	timer: NodeJS.Timeout | null;
 }
 
@@ -70,6 +91,7 @@ export interface SessionIdentityTransitionCommit {
 }
 
 export interface SessionRuntimeOptions {
+	serverEpoch: string;
 	target: SessionTarget;
 	resolved: ProbedPiRuntime;
 	env?: Record<string, string>;
@@ -80,6 +102,8 @@ export interface SessionRuntimeOptions {
 	extensionStateMaxBytes?: number;
 	extensionStateMaxItems?: number;
 	pendingDialogLimit?: number;
+	projectionLimits?: Partial<SessionLiveProjectionLimits>;
+	initialGeneration?: number;
 	commandTimeoutFor?: (commandType: string) => number;
 	emit: (message: SessionSupervisorMessage) => void;
 	onCrash: (runtime: SessionRuntime) => void;
@@ -125,20 +149,29 @@ export class SessionRuntime {
 	private replay: SessionReplayFrame[] = [];
 	private replayFrameBytes: number[] = [];
 	private replayBytes = 0;
+	private lastTransientSeq = 0;
 	private pendingDialogs = new Map<string, PendingDialog>();
+	private pendingTurnReservations = new Map<symbol, PendingTurnReservation>();
+	private nextTurnReservationId = 0n;
+	private queueReservationReleaseCutoff = 0n;
 	private stickyExtension = new Map<string, ExtensionUiRequestDto>();
 	private activeQueueDepth = 0;
+	private activeTurnProjectionItems = 0;
+	private activeTurnProjectionBytes = 0;
+	private activeTurnHeadroomReserved = false;
 	private agentBusy = false;
 	private compactionBusy = false;
 	private inFlight = 0;
 	private reservations = 0;
 	private commandTail: Promise<void> = Promise.resolve();
-	private awaitingWorkStart = false;
-	private workStartTimer: NodeJS.Timeout | null = null;
 	private manuallyStopped = true;
 	private terminalProtocolIncompatible = false;
 	private sessionFileIdentityVerified = false;
 	private hasConversationIntent = false;
+	private liveProjection: SessionLiveProjection | null = null;
+	private snapshotOverflow = false;
+	private idleBaseCompactionPromise: Promise<void> | null = null;
+	private deferredStartupEmits: SessionSupervisorMessage[] | null = null;
 
 	sessionHandle: string;
 	readonly workspaceId: string;
@@ -178,6 +211,7 @@ export class SessionRuntime {
 		this.cwd = target.cwd;
 		this.nativeSessionId = target.nativeSessionId;
 		this.sessionFile = target.kind === "existing" ? target.sessionFile : null;
+		this.generation = opts.initialGeneration ?? 0;
 		// Catalog-resolved existing targets are frozen again during ready. This
 		// initial trust only keeps a failed startup tracked for bounded recovery;
 		// unpersisted new/fork targets explicitly reset it until Header validation.
@@ -194,6 +228,22 @@ export class SessionRuntime {
 
 	get protocolIncompatible(): boolean {
 		return this.terminalProtocolIncompatible;
+	}
+
+	get snapshotOverflowed(): boolean {
+		return this.snapshotOverflow;
+	}
+
+	rebuildTarget(): ExistingSessionTarget | null {
+		if (!this.sessionFile || !this.recoverable) return null;
+		return {
+			kind: "existing",
+			sessionHandle: this.sessionHandle,
+			workspaceId: this.workspaceId,
+			cwd: this.cwd,
+			sessionFile: this.sessionFile,
+			nativeSessionId: this.nativeSessionId,
+		};
 	}
 
 	get recoverable(): boolean {
@@ -244,6 +294,7 @@ export class SessionRuntime {
 
 	snapshot(): SessionRuntimeSnapshot {
 		return {
+			serverEpoch: this.opts.serverEpoch,
 			sessionHandle: this.sessionHandle,
 			workspaceId: this.workspaceId,
 			nativeSessionId: this.nativeSessionId,
@@ -260,6 +311,9 @@ export class SessionRuntime {
 
 	/** Start or reuse this exact Session target. */
 	start(): Promise<void> {
+		if (this.snapshotOverflow) {
+			return Promise.reject(new RpcError("session_start", "session_snapshot_overflow"));
+		}
 		if (this.terminalProtocolIncompatible) {
 			return Promise.reject(new RpcError("session_start", "protocol_incompatible"));
 		}
@@ -291,13 +345,12 @@ export class SessionRuntime {
 		this.failedProcessToken = null;
 		this.generation += 1;
 		this.lastSeq = 0;
+		this.liveProjection = null;
 		this.clearReplay();
 		this.startupReady = false;
 		this.startupFrames = [];
 		this.startupFrameBytes = 0;
 		this.stickyExtension.clear();
-		this.clearWorkStartGrace();
-		this.awaitingWorkStart = false;
 		this.error = undefined;
 		this.setState("starting");
 
@@ -317,15 +370,31 @@ export class SessionRuntime {
 
 		try {
 			await proc.start();
+			await this.initializeProjectionBase(processToken, proc);
+			this.deferredStartupEmits = [];
+			this.setState(this.pendingDialogs.size > 0 ? "waiting_ui" : "idle");
+			this.flushFrames(this.startupFrames);
+			this.startupFrames = [];
+			this.startupFrameBytes = 0;
+			this.assertWireSnapshotFits();
+			this.startupReady = true;
+			const startupEmits = this.deferredStartupEmits ?? [];
+			this.deferredStartupEmits = null;
+			for (const message of startupEmits) this.opts.emit(message);
+			this.opts.emit({ type: "runtime_state", runtime: this.snapshot() });
+			this.log("info", `Pi runtime ready for ${this.sessionHandle}`);
 		} catch (error) {
+			this.deferredStartupEmits = null;
+			const normalized = this.normalizeProjectionError(error);
+			if (proc.running) await proc.stop().catch(() => {});
 			if (this.failedProcessToken !== processToken) {
 				this.handleFailure(processToken, {
 					code: null,
 					signal: null,
-					stderrTail: error instanceof Error ? error.message : String(error),
+					stderrTail: normalized instanceof Error ? normalized.message : String(normalized),
 				});
 			}
-			throw error;
+			throw normalized;
 		}
 	}
 
@@ -403,12 +472,21 @@ export class SessionRuntime {
 			sessionFile: canonicalFile,
 			nativeSessionId: state.sessionId,
 		};
-		this.startupReady = true;
-		this.setState(this.pendingDialogs.size > 0 ? "waiting_ui" : "idle");
-		this.flushFrames(this.startupFrames);
-		this.startupFrames = [];
-		this.startupFrameBytes = 0;
-		this.log("info", `Pi runtime ready for ${this.sessionHandle}`);
+	}
+
+	private async initializeProjectionBase(processToken: number, proc: PiProcess): Promise<void> {
+		const response = await proc.send({ type: "get_messages" }, this.timeoutFor("get_messages"));
+		if (processToken !== this.processToken || this.proc !== proc) {
+			throw new RpcError("get_messages", "session_generation_stale");
+		}
+		const { messages } = expectCommandData(response, "get_messages");
+		this.liveProjection = new SessionLiveProjection({
+			identity: this.projectionIdentity(),
+			settledMessages: messages,
+			baseSeq: 0,
+			runtimePhase: this.pendingDialogs.size > 0 ? "waiting_ui" : "idle",
+			limits: this.opts.projectionLimits,
+		});
 	}
 
 	async send(
@@ -420,30 +498,61 @@ export class SessionRuntime {
 		const admitted = await this.withCommandAdmission(async () => {
 			this.assertGeneration(command.type, expectedGeneration);
 			admit();
+			const expectsWork = commandMayStartWork(command.type);
+			const turnReleaseCutoff = commandReleasesQueuedWork(command.type)
+				? this.nextTurnReservationId
+				: undefined;
+			let turnReservation: symbol | undefined;
+			if (expectsWork) {
+				await this.ensureProjectionHeadroomForWork(command.type);
+				this.assertGeneration(command.type, expectedGeneration);
+				admit();
+				turnReservation = this.reservePendingTurn();
+			}
 			const proc = this.proc;
-			if (!proc?.running) throw new RpcError(command.type, "pi process is not running");
+			if (!proc?.running) {
+				if (turnReservation) this.releasePendingTurn(turnReservation);
+				throw new RpcError(command.type, "pi process is not running");
+			}
 			this.inFlight += 1;
 			// Once user content reaches a live Pi process, a timeout or malformed
 			// response cannot prove that Pi rejected it. Retain the runtime unless
 			// the Session later materializes and becomes independently recoverable.
 			if (commandCarriesConversation(command.type)) this.hasConversationIntent = true;
-			const expectsWork = commandMayStartWork(command.type);
-			if (expectsWork) this.beginWorkStartGrace();
+			if (expectsWork) this.setState("running");
 			this.touch();
+			let response: Promise<SessionCommandResponseDto>;
+			try {
+				response = proc.send(command, timeoutMs ?? this.timeoutFor(command.type));
+			} catch (error) {
+				this.inFlight = Math.max(0, this.inFlight - 1);
+				if (turnReservation) this.releasePendingTurn(turnReservation);
+				if (expectsWork) this.refreshOperationalState();
+				throw error;
+			}
 			return {
 				expectsWork,
-				response: proc.send(command, timeoutMs ?? this.timeoutFor(command.type)),
+				turnReservation,
+				turnReleaseCutoff,
+				response,
 			};
 		});
 		try {
 			const response = await admitted.response;
-			if (admitted.expectsWork) this.finishWorkCommandResponse(response.success === true);
+			if (admitted.expectsWork && admitted.turnReservation) {
+				this.finishWorkCommandResponse(response.success === true, admitted.turnReservation);
+			}
+			if (response.success === true && admitted.turnReleaseCutoff !== undefined) {
+				this.releasePendingTurnsThrough(admitted.turnReleaseCutoff);
+				this.refreshOperationalState();
+			}
 			return response;
 		} catch (error) {
-			if (admitted.expectsWork) this.cancelWorkStartGrace();
+			if (admitted.turnReservation) this.releasePendingTurn(admitted.turnReservation);
+			if (admitted.expectsWork) this.refreshOperationalState();
 			throw error;
 		} finally {
-			this.inFlight -= 1;
+			this.inFlight = Math.max(0, this.inFlight - 1);
 			this.refreshOperationalState();
 			this.touch();
 		}
@@ -518,6 +627,7 @@ export class SessionRuntime {
 					},
 				});
 				if (!applied) throw new RpcError(command.type, "transition identity was not committed");
+				await this.initializeProjectionBase(this.processToken, proc);
 				this.flushTransitionFrames();
 				return { response, previousSessionHandle };
 			} catch (error) {
@@ -535,7 +645,7 @@ export class SessionRuntime {
 				}
 				throw error;
 			} finally {
-				this.inFlight -= 1;
+				this.inFlight = Math.max(0, this.inFlight - 1);
 				this.transitionStage = null;
 				this.refreshOperationalState();
 				this.touch();
@@ -589,31 +699,82 @@ export class SessionRuntime {
 		this.opts.target = target;
 		this.generation += 1;
 		this.lastSeq = 0;
+		this.liveProjection = null;
 		this.clearReplay();
 		this.stickyExtension.clear();
+		this.clearPendingTurnReservations();
+		this.activeTurnProjectionItems = 0;
+		this.activeTurnProjectionBytes = 0;
+		this.activeTurnHeadroomReserved = false;
 		this.error = undefined;
 		this.state = this.pendingDialogs.size > 0 ? "waiting_ui" : "idle";
 		this.touch();
 	}
 
-	getReplay(cursor?: ReplayCursor): ReplayResult {
+	getReplay(requestedHandle: string, cursor?: ReplayCursor): ReplayResult {
 		const runtime = this.snapshot();
-		const extensionRequests = this.getPendingExtensionRequests();
-		if (!cursor) return { type: "resync_required", runtime, reason: "initial", extensionRequests };
-		if (cursor.generation !== this.generation)
-			return { type: "resync_required", runtime, reason: "generation_changed", extensionRequests };
-		if (cursor.seq < 0 || cursor.seq > this.lastSeq)
-			return { type: "resync_required", runtime, reason: "invalid_cursor", extensionRequests };
-		if (cursor.seq === this.lastSeq) return { type: "replay", runtime, frames: [], extensionRequests };
+		const resync = (reason: Extract<ReplayResult, { type: "resync_required" }>["reason"]): ReplayResult => ({
+			type: "resync_required",
+			runtime,
+			reason,
+			snapshot: this.sessionSnapshot(),
+		});
+		if (!cursor) return resync("initial");
+		if (cursor.serverEpoch !== this.opts.serverEpoch) return resync("server_epoch_changed");
+		if (requestedHandle !== this.sessionHandle) return resync("generation_changed");
+		if (cursor.generation !== this.generation) return resync("generation_changed");
+		if (cursor.seq < 0 || cursor.seq > this.lastSeq) return resync("invalid_cursor");
+		if (cursor.seq === this.lastSeq) return { type: "replay", runtime, frames: [] };
+		if (cursor.seq < this.lastTransientSeq) return resync("gap");
 		const oldestSeq = this.replay[0]?.seq ?? this.lastSeq + 1;
-		if (cursor.seq < oldestSeq - 1)
-			return { type: "resync_required", runtime, reason: "gap", extensionRequests };
+		if (cursor.seq < oldestSeq - 1) return resync("gap");
 		return {
 			type: "replay",
 			runtime,
 			frames: this.replay.filter((frame) => frame.seq > cursor.seq),
-			extensionRequests,
 		};
+	}
+
+	sessionSnapshot(): SessionSnapshotDto {
+		const snapshot = this.buildSessionSnapshot();
+		if (!isSessionSnapshotDto(snapshot)) {
+			this.terminalizeSnapshotOverflow();
+			throw new RpcError("session_snapshot", "session_snapshot_overflow");
+		}
+		return snapshot;
+	}
+
+	private buildSessionSnapshot(): unknown {
+		const projection = this.liveProjection?.snapshot();
+		if (!projection || projection.asOfSeq !== this.lastSeq) {
+			throw new RpcError("session_snapshot", "session_snapshot_unavailable");
+		}
+		return structuredClone({
+			type: "session_snapshot" as const,
+			snapshotId: randomUUID(),
+			serverEpoch: projection.serverEpoch,
+			sessionHandle: projection.sessionHandle,
+			workspaceId: projection.workspaceId,
+			generation: projection.generation,
+			baseSeq: projection.baseSeq,
+			asOfSeq: projection.asOfSeq,
+			runtime: { ...this.snapshot(), state: projection.runtimePhase },
+			settledMessages: projection.settledMessages,
+			projectionEvents: projection.projectionEvents,
+			queue: projection.queue,
+			pendingExtensionRequests: [...this.pendingDialogs.values()].map((entry) => entry.request),
+			stickyExtensionState: [...this.stickyExtension.values()],
+		});
+	}
+
+	private assertWireSnapshotFits(): void {
+		if (isSessionSnapshotDto(this.buildSessionSnapshot())) return;
+		if (this.startupReady) this.terminalizeSnapshotOverflow();
+		else {
+			this.snapshotOverflow = true;
+			this.error = "session_snapshot_overflow";
+		}
+		throw new RpcError("session_snapshot", "session_snapshot_overflow");
 	}
 
 	getPendingExtensionRequests(): ExtensionUiRequestDto[] {
@@ -642,23 +803,16 @@ export class SessionRuntime {
 		if (this.stopPromise) return this.stopPromise;
 		this.manuallyStopped = true;
 		this.processToken += 1;
-		this.clearWorkStartGrace();
-		this.awaitingWorkStart = false;
-		this.closeAllDialogs("process_lost");
-		this.clearReplay();
 		const proc = this.proc;
 		const starting = this.startPromise;
 		this.proc = null;
+		this.clearOwnedOperationalState(!this.snapshotOverflow);
 		let stopping!: Promise<void>;
 		stopping = (async () => {
 			try {
 				await proc?.stop();
 				if (starting) await Promise.allSettled([starting]);
 				this.finishProcessFinalization();
-				this.agentBusy = false;
-				this.compactionBusy = false;
-				this.activeQueueDepth = 0;
-				this.transitionStage = null;
 				this.setState("dormant");
 			} finally {
 				if (this.stopPromise === stopping) this.stopPromise = null;
@@ -676,7 +830,16 @@ export class SessionRuntime {
 
 	private applyEventState(event: ProductSessionEventDto): void {
 		if (event.type === "queue_update") {
+			const previousQueueDepth = this.activeQueueDepth;
 			this.activeQueueDepth = event.steering.length + event.followUp.length;
+			if (this.activeQueueDepth > 0 && this.nextTurnReservationId > this.queueReservationReleaseCutoff) {
+				this.queueReservationReleaseCutoff = this.nextTurnReservationId;
+			}
+			if (previousQueueDepth > 0 && this.activeQueueDepth === 0 && !this.agentBusy) {
+				this.releasePendingTurnsThrough(this.queueReservationReleaseCutoff);
+				this.queueReservationReleaseCutoff = 0n;
+				this.refreshOperationalState();
+			}
 		}
 		if (event.type === "compaction_start") {
 			this.compactionBusy = true;
@@ -686,17 +849,25 @@ export class SessionRuntime {
 			if (event.willRetry) this.agentBusy = true;
 			this.refreshOperationalState();
 		} else if (eventStartsWork(event)) {
-			this.clearWorkStartGrace();
-			this.awaitingWorkStart = false;
+			if (!this.agentBusy) {
+				this.consumePendingTurn();
+				this.activeTurnHeadroomReserved = true;
+			}
 			this.agentBusy = true;
 			this.setState("running");
 		} else if (eventSettlesWork(event)) {
-			this.clearWorkStartGrace();
-			this.awaitingWorkStart = false;
 			this.agentBusy = false;
+			this.activeTurnProjectionItems = 0;
+			this.activeTurnProjectionBytes = 0;
+			this.activeTurnHeadroomReserved = false;
+			if (this.activeQueueDepth === 0 && this.queueReservationReleaseCutoff > 0n) {
+				this.releasePendingTurnsThrough(this.queueReservationReleaseCutoff);
+				this.queueReservationReleaseCutoff = 0n;
+			}
 			this.refreshOperationalState();
 		}
 		this.touch();
+		if (this.state === "idle") this.maybeCompactIdleProjectionBase();
 	}
 
 	private handleExtensionRequest(processToken: number, request: ExtensionUiRequestDto): void {
@@ -729,7 +900,6 @@ export class SessionRuntime {
 	private trackDialog(request: ExtensionUiRequestDto, processToken: number, publishState: boolean): void {
 		this.closeDialog(request.id, "replaced");
 		const requestBytes = extensionRequestBytes(request);
-		this.evictStickyUntilFits(requestBytes, 1);
 		if (
 			this.pendingDialogs.size >= this.opts.pendingDialogLimit ||
 			!this.extensionStateFits(requestBytes, 1)
@@ -746,39 +916,11 @@ export class SessionRuntime {
 		if (publishState) this.setState("waiting_ui");
 	}
 
-	private rememberStickyRequest(request: ExtensionUiRequestDto): void {
-		let key = request.method;
-		if (request.method === "setStatus") key += `:${request.statusKey}`;
-		if (request.method === "setWidget") key += `:${request.widgetKey}`;
-		this.stickyExtension.delete(key);
-		if (
-			(request.method === "setStatus" && request.statusText === undefined) ||
-			(request.method === "setWidget" && request.widgetLines === undefined)
-		) {
-			return;
-		}
-		const requestBytes = extensionRequestBytes(request);
-		this.evictStickyUntilFits(requestBytes, 1);
-		if (!this.extensionStateFits(requestBytes, 1)) {
-			this.log("warn", `Dropping oversized sticky extension state for ${this.sessionHandle}`);
-			return;
-		}
-		this.stickyExtension.set(key, request);
-	}
-
 	private extensionStateFits(extraBytes: number, extraItems: number): boolean {
 		return (
 			this.extensionStateBytes() + extraBytes <= this.opts.extensionStateMaxBytes &&
 			this.pendingDialogs.size + this.stickyExtension.size + extraItems <= this.opts.extensionStateMaxItems
 		);
-	}
-
-	private evictStickyUntilFits(extraBytes: number, extraItems: number): void {
-		while (this.stickyExtension.size > 0 && !this.extensionStateFits(extraBytes, extraItems)) {
-			const oldestKey = this.stickyExtension.keys().next().value as string | undefined;
-			if (!oldestKey) break;
-			this.stickyExtension.delete(oldestKey);
-		}
 	}
 
 	private extensionStateBytes(): number {
@@ -811,8 +953,7 @@ export class SessionRuntime {
 		// runtime state derived from it. A background client may unsubscribe as
 		// soon as it observes `idle`; publishing `idle` first would therefore
 		// discard the `agent_settled` frame that made the runtime idle.
-		this.emitFrame(frame);
-		this.applyFrameState(frame);
+		this.publishFrame(frame);
 	}
 
 	private flushFrames(frames: BufferedFrame[]): void {
@@ -824,9 +965,66 @@ export class SessionRuntime {
 			) {
 				continue;
 			}
-			this.emitFrame(frame);
-			this.applyFrameState(frame);
+			this.publishFrame(frame);
 		}
+	}
+
+	private publishFrame(frame: BufferedFrame): void {
+		if (frame.type === "extension_ui_request" && STICKY_EXTENSION_METHODS.has(frame.request.method)) {
+			this.publishStickyRequest(frame.request);
+			return;
+		}
+		this.emitFrame(frame);
+		this.applyFrameState(frame);
+	}
+
+	private publishStickyRequest(request: ExtensionUiRequestDto): void {
+		const key = stickyRequestKey(request);
+		if (stickyRequestClearsState(request)) {
+			this.emitFrame({ type: "extension_ui_request", request }, () => {
+				this.stickyExtension.delete(key);
+			});
+			return;
+		}
+
+		const requestBytes = extensionRequestBytes(request);
+		const candidate = new Map(this.stickyExtension);
+		candidate.delete(key);
+		while (candidate.size > 0 && !this.extensionStateCandidateFits(candidate, requestBytes, 1)) {
+			const oldestKey = candidate.keys().next().value as string | undefined;
+			if (!oldestKey) break;
+			const oldest = candidate.get(oldestKey);
+			if (!oldest) break;
+			this.emitFrame({ type: "extension_ui_request", request: stickyClearRequest(oldest) }, () => {
+				this.stickyExtension.delete(oldestKey);
+			});
+			candidate.delete(oldestKey);
+		}
+		if (!this.extensionStateCandidateFits(candidate, requestBytes, 1)) {
+			this.emitFrame({ type: "extension_ui_request", request: stickyClearRequest(request) }, () => {
+				this.stickyExtension.delete(key);
+			});
+			this.log("warn", `Dropping oversized sticky extension state for ${this.sessionHandle}`);
+			return;
+		}
+		this.emitFrame({ type: "extension_ui_request", request }, () => {
+			this.stickyExtension.delete(key);
+			this.stickyExtension.set(key, request);
+		});
+	}
+
+	private extensionStateCandidateFits(
+		sticky: ReadonlyMap<string, ExtensionUiRequestDto>,
+		extraBytes: number,
+		extraItems: number,
+	): boolean {
+		let bytes = extraBytes;
+		for (const request of sticky.values()) bytes += extensionRequestBytes(request);
+		for (const { request } of this.pendingDialogs.values()) bytes += extensionRequestBytes(request);
+		return (
+			bytes <= this.opts.extensionStateMaxBytes &&
+			this.pendingDialogs.size + sticky.size + extraItems <= this.opts.extensionStateMaxItems
+		);
 	}
 
 	private applyFrameState(frame: BufferedFrame): void {
@@ -835,7 +1033,6 @@ export class SessionRuntime {
 			return;
 		}
 		if (frame.type === "extension_ui_closed") return;
-		if (STICKY_EXTENSION_METHODS.has(frame.request.method)) this.rememberStickyRequest(frame.request);
 		if (BLOCKING_DIALOG_METHODS.has(frame.request.method) && this.pendingDialogs.has(frame.request.id)) {
 			this.setState("waiting_ui");
 		}
@@ -848,32 +1045,62 @@ export class SessionRuntime {
 		this.transitionStage.bytes = 0;
 	}
 
-	private emitFrame(frame: BufferedFrame): void {
-		this.lastSeq += 1;
+	private emitFrame(frame: BufferedFrame, afterProjectionCommit?: () => void): void {
+		const projection = this.liveProjection;
+		if (!projection) throw new RpcError("session_snapshot", "session_snapshot_unavailable");
+		let seq: number;
+		let turnBudget: { items: number; bytes: number } | undefined;
+		try {
+			if (frame.type === "event") {
+				const reset = !this.agentBusy && eventStartsWork(frame.event);
+				const items = (reset ? 0 : this.activeTurnProjectionItems) + 1;
+				const bytes =
+					(reset ? 0 : this.activeTurnProjectionBytes) + projection.activeTurnEventBytes(frame.event);
+				const limit = projection.activeTurnBudget();
+				if (items > limit.maxItems || bytes > limit.maxBytes) {
+					throw new SessionLiveProjectionLimitError("live_events");
+				}
+				turnBudget = { items, bytes };
+			}
+			seq = projection.commit(this.projectionIdentity(), frame, this.state);
+		} catch (error) {
+			throw this.normalizeProjectionError(error);
+		}
+		if (turnBudget) {
+			this.activeTurnProjectionItems = turnBudget.items;
+			this.activeTurnProjectionBytes = turnBudget.bytes;
+		}
+		afterProjectionCommit?.();
 		const envelope: SessionReplayFrame = {
 			...frame,
+			serverEpoch: this.opts.serverEpoch,
 			sessionHandle: this.sessionHandle,
 			workspaceId: this.workspaceId,
 			generation: this.generation,
-			seq: this.lastSeq,
+			seq,
 		} as SessionReplayFrame;
 		const bytes = Buffer.byteLength(JSON.stringify(envelope));
-		this.replay.push(envelope);
-		this.replayFrameBytes.push(bytes);
-		this.replayBytes += bytes;
-		let removeCount = 0;
-		while (
-			this.replay.length - removeCount > this.opts.replayLimit ||
-			this.replayBytes > this.opts.replayMaxBytes
-		) {
-			this.replayBytes -= this.replayFrameBytes[removeCount] ?? 0;
-			removeCount += 1;
+		if (isReplayableFrame(frame)) {
+			this.replay.push(envelope);
+			this.replayFrameBytes.push(bytes);
+			this.replayBytes += bytes;
+			let removeCount = 0;
+			while (
+				this.replay.length - removeCount > this.opts.replayLimit ||
+				this.replayBytes > this.opts.replayMaxBytes
+			) {
+				this.replayBytes -= this.replayFrameBytes[removeCount] ?? 0;
+				removeCount += 1;
+			}
+			if (removeCount > 0) {
+				this.replay.splice(0, removeCount);
+				this.replayFrameBytes.splice(0, removeCount);
+			}
+		} else {
+			this.lastTransientSeq = seq;
 		}
-		if (removeCount > 0) {
-			this.replay.splice(0, removeCount);
-			this.replayFrameBytes.splice(0, removeCount);
-		}
-		this.opts.emit(envelope);
+		this.lastSeq = seq;
+		this.emitSupervisorMessage(envelope);
 	}
 
 	private handleFailure(processToken: number, info: PiProcessExitInfo): void {
@@ -881,21 +1108,16 @@ export class SessionRuntime {
 		this.failedProcessToken = processToken;
 		this.proc = null;
 		this.finishProcessFinalization();
-		this.startupFrames = [];
-		this.startupFrameBytes = 0;
-		this.transitionStage = null;
-		this.clearWorkStartGrace();
-		this.awaitingWorkStart = false;
-		this.closeAllDialogs("process_lost");
-		this.clearReplay();
-		this.agentBusy = false;
-		this.compactionBusy = false;
-		this.activeQueueDepth = 0;
+		this.clearOwnedOperationalState(!this.snapshotOverflow);
 		this.terminalProtocolIncompatible = info.reason === "protocol_incompatible";
-		this.error = this.terminalProtocolIncompatible ? "protocol_incompatible" : this.describeFailure(info);
+		this.error = this.snapshotOverflow
+			? "session_snapshot_overflow"
+			: this.terminalProtocolIncompatible
+				? "protocol_incompatible"
+				: this.describeFailure(info);
 		this.setState("crashed");
 		this.log("error", `Pi runtime crashed for ${this.sessionHandle}: ${this.error}`);
-		if (!this.manuallyStopped) this.opts.onCrash(this);
+		if (!this.manuallyStopped && !this.snapshotOverflow) this.opts.onCrash(this);
 	}
 
 	private describeFailure(info: PiProcessExitInfo): string {
@@ -912,16 +1134,26 @@ export class SessionRuntime {
 	private closeDialog(
 		requestId: string,
 		reason: Extract<BufferedFrame, { type: "extension_ui_closed" }>["reason"],
+		emit = true,
 	): void {
 		const dialog = this.pendingDialogs.get(requestId);
 		if (!dialog) return;
-		if (dialog.timer) clearTimeout(dialog.timer);
-		this.pendingDialogs.delete(requestId);
-		if (this.startupReady) this.emitFrame({ type: "extension_ui_closed", requestId, reason });
+		const commitClose = () => {
+			if (dialog.timer) clearTimeout(dialog.timer);
+			this.pendingDialogs.delete(requestId);
+		};
+		if (emit && this.startupReady) {
+			this.emitFrame({ type: "extension_ui_closed", requestId, reason }, commitClose);
+		} else {
+			commitClose();
+		}
 	}
 
-	private closeAllDialogs(reason: Extract<BufferedFrame, { type: "extension_ui_closed" }>["reason"]): void {
-		for (const requestId of [...this.pendingDialogs.keys()]) this.closeDialog(requestId, reason);
+	private closeAllDialogs(
+		reason: Extract<BufferedFrame, { type: "extension_ui_closed" }>["reason"],
+		emit = true,
+	): void {
+		for (const requestId of [...this.pendingDialogs.keys()]) this.closeDialog(requestId, reason, emit);
 	}
 
 	private expireDialog(processToken: number, requestId: string): void {
@@ -937,9 +1169,10 @@ export class SessionRuntime {
 	private setState(state: SessionRuntimeSnapshot["state"]): void {
 		if (this.state === state && state !== "starting") return;
 		this.state = state;
+		this.liveProjection?.setRuntimePhase(this.projectionIdentity(), state);
 		this.touch();
 		if (!this.startupReady && state !== "starting" && state !== "crashed" && state !== "dormant") return;
-		this.opts.emit({ type: "runtime_state", runtime: this.snapshot() });
+		this.emitSupervisorMessage({ type: "runtime_state", runtime: this.snapshot() });
 	}
 
 	private touch(): void {
@@ -951,10 +1184,10 @@ export class SessionRuntime {
 		if (this.state !== "idle") return this.state;
 		if (this.agentBusy) return "agent";
 		if (this.compactionBusy) return "compaction";
-		if (this.awaitingWorkStart) return "agent_start";
 		if (this.activeQueueDepth > 0) return "queue";
 		if (this.inFlight > 0) return "command";
 		if (this.pendingDialogs.size > 0) return "dialog";
+		if (this.pendingTurnReservations.size > 0) return "turn_reservation";
 		if (this.transitioning) return "transition";
 		return null;
 	}
@@ -962,39 +1195,129 @@ export class SessionRuntime {
 	private refreshOperationalState(): void {
 		if (!this.startupReady || !this.running) return;
 		if (this.pendingDialogs.size > 0) this.setState("waiting_ui");
-		else if (this.agentBusy || this.compactionBusy || this.awaitingWorkStart) this.setState("running");
-		else this.setState("idle");
+		else if (this.agentBusy || this.compactionBusy || this.pendingTurnReservations.size > 0)
+			this.setState("running");
+		else {
+			this.setState("idle");
+			this.maybeCompactIdleProjectionBase();
+		}
 	}
 
-	private beginWorkStartGrace(): void {
-		this.clearWorkStartGrace();
-		this.awaitingWorkStart = true;
-		this.setState("running");
+	private maybeCompactIdleProjectionBase(): void {
+		if (this.idleBaseCompactionPromise || this.identityTransitionBlocker() !== null) return;
+		const projection = this.liveProjection;
+		const proc = this.proc;
+		if (!projection || !proc?.running || !projection.shouldCompactIdleBase()) return;
+		const token = projection.beginIdleBaseCompaction();
+		if (!token || token.expectedAsOfSeq === projection.snapshot().baseSeq) return;
+		const processToken = this.processToken;
+		let compaction!: Promise<void>;
+		compaction = (async () => {
+			const response = await proc.send({ type: "get_messages" }, this.timeoutFor("get_messages"));
+			if (processToken !== this.processToken || this.proc !== proc || this.liveProjection !== projection)
+				return;
+			const { messages } = expectCommandData(response, "get_messages");
+			if (projection.commitIdleBaseCompaction(token, messages)) this.assertWireSnapshotFits();
+		})()
+			.catch((error) => {
+				const normalized = this.normalizeProjectionError(error);
+				if (normalized instanceof RpcError && normalized.message.includes("session_snapshot_overflow")) {
+					return;
+				}
+				this.log(
+					"warn",
+					`Unable to compact Session snapshot base for ${this.sessionHandle}: ${String(error)}`,
+				);
+			})
+			.finally(() => {
+				if (this.idleBaseCompactionPromise === compaction) this.idleBaseCompactionPromise = null;
+			});
+		this.idleBaseCompactionPromise = compaction;
 	}
 
-	private finishWorkCommandResponse(success: boolean): void {
+	private async ensureProjectionHeadroomForWork(commandType: string): Promise<void> {
+		if (this.idleBaseCompactionPromise) await this.idleBaseCompactionPromise;
+		const capacity = () =>
+			this.liveProjection?.hasActiveTurnReservationCapacity({
+				pendingReservations: this.pendingTurnReservations.size + 1,
+				activeTurnItems: this.activeTurnProjectionItems,
+				activeTurnBytes: this.activeTurnProjectionBytes,
+				reserveActiveTurn: this.activeTurnHeadroomReserved,
+			}) === true;
+		if (capacity()) return;
+		this.maybeCompactIdleProjectionBase();
+		if (this.idleBaseCompactionPromise) await this.idleBaseCompactionPromise;
+		if (!capacity()) {
+			throw new RpcError(commandType, "session_snapshot_headroom_unavailable");
+		}
+	}
+
+	private finishWorkCommandResponse(success: boolean, reservation: symbol): void {
 		if (!success) {
-			this.cancelWorkStartGrace();
+			this.releasePendingTurn(reservation);
+			this.refreshOperationalState();
 			return;
 		}
-		if (!this.awaitingWorkStart) return;
-		this.workStartTimer = setTimeout(() => {
-			this.workStartTimer = null;
-			this.awaitingWorkStart = false;
-			this.refreshOperationalState();
+		const pending = this.pendingTurnReservations.get(reservation);
+		if (pending && !pending.timer) this.schedulePendingTurnExpiry(reservation);
+	}
+
+	private reservePendingTurn(): symbol {
+		const token = Symbol("pending-turn");
+		this.nextTurnReservationId += 1n;
+		this.pendingTurnReservations.set(token, {
+			id: this.nextTurnReservationId,
+			generation: this.generation,
+			processToken: this.processToken,
+			timer: null,
+		});
+		return token;
+	}
+
+	private consumePendingTurn(): void {
+		const token = this.pendingTurnReservations.keys().next().value as symbol | undefined;
+		if (token) this.releasePendingTurn(token);
+	}
+
+	private releasePendingTurn(token: symbol): void {
+		const reservation = this.pendingTurnReservations.get(token);
+		if (!reservation) return;
+		if (reservation.timer) clearTimeout(reservation.timer);
+		this.pendingTurnReservations.delete(token);
+	}
+
+	private schedulePendingTurnExpiry(token: symbol): void {
+		const reservation = this.pendingTurnReservations.get(token);
+		if (!reservation) return;
+		reservation.timer = setTimeout(() => {
+			if (
+				this.pendingTurnReservations.get(token) !== reservation ||
+				reservation.generation !== this.generation ||
+				reservation.processToken !== this.processToken ||
+				!this.running
+			) {
+				return;
+			}
+			reservation.timer = null;
+			if (!this.agentBusy && this.activeQueueDepth === 0) {
+				this.releasePendingTurn(token);
+				this.refreshOperationalState();
+				return;
+			}
+			this.schedulePendingTurnExpiry(token);
 		}, 500);
-		this.workStartTimer.unref?.();
+		reservation.timer.unref?.();
 	}
 
-	private cancelWorkStartGrace(): void {
-		this.clearWorkStartGrace();
-		this.awaitingWorkStart = false;
-		this.refreshOperationalState();
+	private clearPendingTurnReservations(): void {
+		for (const token of [...this.pendingTurnReservations.keys()]) this.releasePendingTurn(token);
+		this.queueReservationReleaseCutoff = 0n;
 	}
 
-	private clearWorkStartGrace(): void {
-		if (this.workStartTimer) clearTimeout(this.workStartTimer);
-		this.workStartTimer = null;
+	private releasePendingTurnsThrough(cutoff: bigint): void {
+		for (const [token, reservation] of this.pendingTurnReservations) {
+			if (reservation.id <= cutoff) this.releasePendingTurn(token);
+		}
 	}
 
 	private finishProcessFinalization(): void {
@@ -1007,12 +1330,90 @@ export class SessionRuntime {
 		this.replay = [];
 		this.replayFrameBytes = [];
 		this.replayBytes = 0;
+		this.lastTransientSeq = 0;
 	}
 
 	private assertGeneration(command: string, expectedGeneration: number): void {
 		if (expectedGeneration !== this.generation) {
 			throw new RpcError(command, "session_generation_stale");
 		}
+	}
+
+	private projectionIdentity(): SessionLiveProjectionIdentity {
+		return {
+			serverEpoch: this.opts.serverEpoch,
+			sessionHandle: this.sessionHandle,
+			workspaceId: this.workspaceId,
+			generation: this.generation,
+		};
+	}
+
+	private normalizeProjectionError(error: unknown): unknown {
+		if (!(error instanceof SessionLiveProjectionLimitError)) return error;
+		if (this.startupReady) this.terminalizeSnapshotOverflow();
+		else {
+			this.snapshotOverflow = true;
+			this.error = "session_snapshot_overflow";
+		}
+		return new RpcError("session_snapshot", "session_snapshot_overflow");
+	}
+
+	private terminalizeSnapshotOverflow(): void {
+		if (this.snapshotOverflow && this.state === "crashed") return;
+		this.snapshotOverflow = true;
+		this.error = "session_snapshot_overflow";
+		this.manuallyStopped = true;
+		this.processToken += 1;
+		const proc = this.proc;
+		const starting = this.startPromise;
+		this.proc = null;
+		this.clearOwnedOperationalState(false);
+		this.startupReady = false;
+		this.state = "crashed";
+		this.liveProjection = null;
+		this.touch();
+		if (proc && !this.stopPromise) {
+			let stopping!: Promise<void>;
+			stopping = (async () => {
+				try {
+					await proc.stop();
+					if (starting) await Promise.allSettled([starting]);
+					this.finishProcessFinalization();
+				} catch (error) {
+					this.log("warn", `Unable to stop overflowed Session ${this.sessionHandle}: ${String(error)}`);
+				} finally {
+					if (this.stopPromise === stopping) this.stopPromise = null;
+				}
+			})();
+			this.stopPromise = stopping;
+		}
+		this.emitSupervisorMessage({ type: "runtime_state", runtime: this.snapshot() });
+	}
+
+	private clearOwnedOperationalState(emitDialogCloses: boolean): void {
+		this.startupFrames = [];
+		this.startupFrameBytes = 0;
+		this.transitionStage = null;
+		this.closeAllDialogs("process_lost", emitDialogCloses);
+		this.pendingDialogs.clear();
+		this.clearPendingTurnReservations();
+		this.stickyExtension.clear();
+		this.clearReplay();
+		this.agentBusy = false;
+		this.compactionBusy = false;
+		this.activeQueueDepth = 0;
+		this.activeTurnProjectionItems = 0;
+		this.activeTurnProjectionBytes = 0;
+		this.activeTurnHeadroomReserved = false;
+		this.inFlight = 0;
+	}
+
+	private emitSupervisorMessage(message: SessionSupervisorMessage): void {
+		if (this.deferredStartupEmits) {
+			this.deferredStartupEmits.push(message);
+			return;
+		}
+		this.opts.emit(message);
 	}
 
 	private async withCommandAdmission<T>(operation: () => Promise<T>): Promise<T> {
@@ -1043,6 +1444,10 @@ function commandCarriesConversation(commandType: string): boolean {
 	return commandMayStartWork(commandType) || commandType === "bash";
 }
 
+function commandReleasesQueuedWork(commandType: string): boolean {
+	return commandType === "abort" || commandType === "abort_retry";
+}
+
 function transitionWasCancelled(response: SessionCommandResponseDto): boolean {
 	if (response.success !== true || !("data" in response)) return false;
 	const data = response.data;
@@ -1053,8 +1458,34 @@ function bufferedFrameBytes(frame: BufferedFrame): number {
 	return Buffer.byteLength(JSON.stringify(frame));
 }
 
+function isReplayableFrame(frame: BufferedFrame): boolean {
+	return !(frame.type === "extension_ui_request" && frame.request.method === "notify");
+}
+
 function extensionRequestBytes(request: ExtensionUiRequestDto): number {
 	return Buffer.byteLength(JSON.stringify(request));
+}
+
+function stickyRequestKey(request: ExtensionUiRequestDto): string {
+	if (request.method === "setStatus") return `setStatus:${request.statusKey}`;
+	if (request.method === "setWidget") return `setWidget:${request.widgetKey}`;
+	return request.method;
+}
+
+function stickyRequestClearsState(request: ExtensionUiRequestDto): boolean {
+	return (
+		(request.method === "setStatus" && request.statusText === undefined) ||
+		(request.method === "setWidget" && request.widgetLines === undefined)
+	);
+}
+
+function stickyClearRequest(request: ExtensionUiRequestDto): ExtensionUiRequestDto {
+	const id = `evicted:${randomUUID()}`;
+	if (request.method === "setStatus") return { ...request, id, statusText: undefined };
+	if (request.method === "setWidget") return { ...request, id, widgetLines: undefined };
+	if (request.method === "setTitle") return { ...request, id, title: "" };
+	if (request.method === "set_editor_text") return { ...request, id, text: "" };
+	throw new RpcError("extension_ui_request", "invalid_sticky_extension_method");
 }
 
 function inspectFrozenSessionFile(sessionFile: string): FrozenSessionFileIdentity {

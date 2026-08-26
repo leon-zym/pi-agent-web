@@ -114,6 +114,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 
 	let bridge!: SessionWsBridge;
 	const supervisor = new SessionSupervisor({
+		serverEpoch,
 		resolved: runtime,
 		envForWorkspace: (cwd) => layoutResolver.normalizedChildEnvForWorkspace(cwd),
 		resolveSession: async (sessionHandle) => {
@@ -147,7 +148,6 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 	bridge = new SessionWsBridge({
 		supervisor,
 		log,
-		serverEpoch,
 		serverBuild: "0.1.0",
 		runtime: {
 			version: runtime.version,
