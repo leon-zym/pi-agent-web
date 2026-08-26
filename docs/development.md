@@ -165,8 +165,10 @@ Real Pi/provider 与人工视觉检查只在本地 release 执行，不能成为
 
 Runtime 由 `@pi-agent-web/protocol`、`server`、`ui`、`cli` 四包组成。`test:pack` 在临时目录创建
 tarball，检查 LICENSE/repository 元数据、拒绝残留 `workspace:*`；安装后由 bin 与等价本地 npx
-验证 `--help`，再由 bin 以 fake Pi 路径启动单端口 Gateway、SPA 与 WebSocket。真实 fake child/RPC
-启动由 `test:smoke` 验证。Build 在 tsc 前清理 `dist`，避免删除源码后孤儿 JS 泄漏进 tarball。
+验证 `--help`。随后从安装目录外、受控且没有 `pi` 的 PATH 启动绝对 CLI entry，断言 Gateway 发现
+发行依赖的 bundled Pi、readiness/hello 元数据正确，并实际创建空 Session 完成 `get_state`。
+确定性的 fake child/RPC 路径由 `test:smoke` 验证。Build 在 tsc 前清理 `dist`，避免删除源码后
+孤儿 JS 泄漏进 tarball。
 
 公开源码与发布 npm 包是两个门槛。除非 registry 中真的存在对应版本，不要把
 `npx --yes @pi-agent-web/cli` 写成可用安装方式。
@@ -189,8 +191,8 @@ PI_WEB_RUN_E2E=1 pnpm test:e2e:real  # 有 credential 的显式 compatibility ga
 
 - Biome tabs、110 columns、文件末尾换行；comments English。
 - UI copy 先加 `src/lib/i18n/zh-CN.ts` id，再在 `en.ts` 同形镜像；非 React 模块用 `tt()`。
-- Pi RPC types 来自 upstream package；Browser↔Gateway DTO 与 guards 只来自 protocol；UI 不 import
-  server runtime。
+- 上游 Pi wire types 只能停留在 server adapter/native integration；Browser↔Gateway DTO、decoders
+  与 guards 由 protocol 自有，protocol/UI 不依赖任何 `@earendil-works/pi-*` package。
 - Components 只读 stores；socket ingestion 留在 transport/frame bus/pipeline。
 - Conventional Commits，按可验证切片提交，例如：
 

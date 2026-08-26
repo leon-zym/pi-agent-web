@@ -104,9 +104,9 @@ pnpm start
 pnpm start -- --pi-path /path/to/rpc-entry.js --port 3100 --no-open
 ```
 
-`pi-web` 的 `--host` 只接受 `127.0.0.1`、`localhost` 或 `::1`。它依次从 `--pi-path` / `PI_PATH`、
-`PATH` 中的 `pi`，以及已安装 Pi 包的专用 `rpc-entry.js` 解析运行时。常用参数有 `--pi-path`、
-`--host`、`--port`、`--no-open` 和 `--help`。
+`pi-web` 的 `--host` 只接受 `127.0.0.1`、`localhost` 或 `::1`。默认使用并验证随发行包安装的精确
+Pi 依赖，不会被 `PATH` 中无关的 `pi` 覆盖。`--pi-path` / `PI_PATH` 是 expert override，也必须通过
+相同的版本/能力探测。常用参数有 `--pi-path`、`--host`、`--port`、`--no-open` 和 `--help`。
 
 命名边界有意保留：`pi-agent-web` 是仓库、服务和 `@pi-agent-web/*` 软件包命名空间；`pi-web` 是
 面向用户的命令。

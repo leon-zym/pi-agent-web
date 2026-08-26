@@ -23,6 +23,8 @@
    `contentShape`（文本特征 + 附件数）与 FIFO 队列匹配回填，消除重复与闪烁。
 10. **柔性幂等退让 (Soft Idempotency)**：针对竞争状态下的 Abort 或已失效 Extension UI 响应，
     按柔性无操作（Soft No-op）吸收，不弹出侵入式错误 Toast。
+11. **版本化 Host 边界**：发行清单中的 Pi runtime 必须在启动期通过版本/能力探测；Browser 只消费
+    产品自有 DTO，并在任何 Session frame 前完成 Gateway hello 协商。
 
 ## 拓扑
 
@@ -42,8 +44,9 @@ Node Gateway · Hono + ws
   ├─ Native REST routes
   ├─ SessionWsBridge (multiplexing, catch-up, id mapping, backpressure)
   └─ SessionSupervisor (bounded hot-runtime pool)
-         ├─ SessionRuntime A ─ PiProcess A ─ pi --mode rpc --session A.jsonl
-         ├─ SessionRuntime B ─ PiProcess B ─ pi --mode rpc --session B.jsonl
+         ├─ PiHostAdapter (probe, capabilities, strict normalization)
+         ├─ SessionRuntime A ─ PiProcess A ─ Pi RPC ─ session A.jsonl
+         ├─ SessionRuntime B ─ PiProcess B ─ Pi RPC ─ session B.jsonl
          └─ dormant Session C ─ no process
                                       │
                                       └─ Pi settings, credentials, extensions, JSONL history
@@ -106,6 +109,7 @@ Header、名称、计数、时间和截断首条消息，不复制完整对话�
   controller 主动离开时可用 exact generation/fencing 的 transient abandon 提前完成同一收敛；
 - generation 在进程生命周期或身份迁移时递增，所有旧 mutation 都被拒绝；
 - crash 在滚动窗口内有限重试，超预算保留 crashed 状态供显式恢复；
+- adapter 发现未知权威字段或畸形嵌套数据时进入 `protocol_incompatible` 终态，不自动重启；
 - POSIX 子进程使用独立进程组，显式停止与异常退出都会清理残留后代，再允许新进程启动。
 
 同一 Workspace 的多个 Session 可以并发。Workspace reservation 只覆盖文件身份敏感的 create、
@@ -113,7 +117,8 @@ fork/clone commit 与 delete 窗口，避免两个进程同时拥有同一 JSONL
 
 ## 订阅、控制与命令
 
-订阅是只读操作，会激活 Runtime 并建立 catch-up baseline。一个连接可以订阅和控制多个
+连接必须先用 `client_hello` / `server_hello` 协商协议 major/minor、能力与上限；major 不兼容是
+不重连的终态。订阅是只读操作，会激活 Runtime 并建立 catch-up baseline。一个连接可以订阅和控制多个
 Session；不同连接也能各自控制不同 Session。同一 Session 同时只有一个 controller：
 
 - `get_*` 只读 RPC 不需要 lease；
@@ -205,7 +210,11 @@ Trash 在 rename 前后绑定 canonical path、Header id/cwd 与文件 dev/ino/s
 
 ## 启动与关停
 
-`startServer` 只有在 HTTP `listening` 后才 resolve；bind 失败会清理已创建资源。关闭顺序先停止
+`startServer` 先按 server package export 解析并探测发行清单 pin 的 Pi；`--pi-path` / `PI_PATH` 是
+唯一显式 override，cwd 与 `PATH` 不参与默认选择。探测失败时启动直接失败。`/health/live` 只表示
+Gateway 进程存活，`/health/ready` 表示 Pi 版本、adapter 与能力已验证。
+
+HTTP server 只有在 `listening` 后才 resolve；bind 失败会清理已创建资源。关闭顺序先停止
 新 ingress，给 HTTP/WS 一个短的有界 grace，随后 terminate/destroy 残留连接，等待 activation、
 delete 和 pool transaction，停止所有 Pi 进程，最后释放 preferences 文件锁。重复 close 共享同一
 Promise，关闭开始后所有新 mutation 都被拒绝。

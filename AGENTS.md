@@ -20,7 +20,7 @@ public documentation.
 ## Package and module boundaries
 
 - `packages/protocol`: browser-safe DTOs, strict runtime guards, shared read-only command policy,
-  and command deadlines. It must never import Node APIs.
+  and command deadlines. It must never import Node APIs or upstream Pi packages.
 - `packages/server`: Node gateway (Hono + ws).
   - Process path: `jsonl` → `pi-process` → `session-runtime` → `session-supervisor` →
     `session-ws-bridge`.
@@ -53,6 +53,8 @@ human-facing command. Do not perform a repository-wide rename between them.
 - One authenticated WebSocket carries multiple Session channels. Subscription, lease, fencing
   token, generation, seq, replay/resync, command ids, and Extension UI state are isolated per
   Session.
+- Every WebSocket begins with versioned client/server hello negotiation. Protocol-major mismatch is
+  terminal. The server epoch is negotiated now; replay/cursor fencing is completed under Issue #17.
 - Read-only RPC commands do not require a controller lease. Every mutation and Extension response
   requires the exact generation and current fencing token. Gap or uncertain identity always fails
   closed; never silently repair a cursor or accept a nullable generation.

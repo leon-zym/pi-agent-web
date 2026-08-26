@@ -221,9 +221,22 @@ Workspace cwd 解析；Gateway 必须让 Catalog 与 child 看到相同结果。
 
 ## 7. Pi runtime 解析
 
-1. `--pi-path` / `PI_PATH`：本项目约定，可指向 executable、安装目录或 rpc entry；
-2. `PATH` 中的全局 `pi`；
-3. 已安装 `@earendil-works/pi-coding-agent` 的 `dist/rpc-entry.js`，包括常见 Homebrew 布局探测。
+1. `--pi-path` / `PI_PATH`：唯一显式 expert override，可指向 executable、Pi package 目录或 rpc entry；
+2. 否则从 server 模块上下文解析发行依赖的 `@earendil-works/pi-coding-agent/rpc-entry` export。
+
+默认路径不读取启动 cwd、`PATH` 或 Homebrew Cellar。选中项先执行 3 秒/4 KiB 有界的 `--version`
+probe，再以 exact version compatibility matrix 校验 adapter 与必需 capabilities。发行依赖版本、Pi
+package manifest 与 probe 输出必须一致；失败使用稳定且不含路径/凭据的诊断码。
+
+Pi stdout 先由 `legacy-rpc-v1` adapter 完整解码为产品 DTO。响应按 command 校验 nested data，事件与
+Extension UI 按 discriminant、UTF-8 bytes、item count、safe number 与 JSON depth 校验。显式列入
+non-authoritative allowlist 的 frame 可忽略；其他未知或畸形权威 frame 进入单一
+`protocol_incompatible` 终态。
+
+WebSocket 第一帧必须是 `client_hello`。成功的 `server_hello` 包含 Gateway protocol major/minor、
+server build/epoch、Pi version、adapter id、能力交集与协商上限；major 不匹配返回稳定
+`protocol_error` 后关闭，UI 不再自动重连。`/api/v1/health/live` 与 `/api/v1/health/ready` 分别表示
+进程存活与 Pi Host 可用；旧 `/health` 是 readiness alias。
 
 子进程继承现有 Pi 配置、Provider credentials、extensions 与环境变量；本项目不把这些内容打入
 四个发行 tarball。
