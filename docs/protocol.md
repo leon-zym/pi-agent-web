@@ -143,7 +143,7 @@ unpersisted、无 command/dialog/transition reservation。停止进程后若目�
 
 | `type` | 必填字段 | 语义 |
 |---|---|---|
-| `session_subscribe` | `sessionHandle`, optional `{serverEpoch,generation,seq}` cursor | 激活/订阅并获取 baseline 与 replay/resync |
+| `session_subscribe` | `sessionHandle`, optional `{serverEpoch,generation,seq}` cursor, optional `expectedHotRuntime` | Ordinary subscribe activates on demand; an exact expected identity observes only a Runtime that is still hot |
 | `session_unsubscribe` | `sessionHandle` | 停止该连接的事件消费；不停止 Pi |
 | `session_claim` | `sessionHandle` | 尝试取得该 Session 的 controller lease |
 | `session_release` | `sessionHandle` | 释放该连接持有的 Session lease |
@@ -170,6 +170,7 @@ Prompt/steer/follow_up 文本按 UTF-8 编码后上限 1 MiB。可以是 image-o
 | `extension_ui_result` | epoch, handle, generation, request id, accepted/no_dialog/not_running | 只确认 response admission；closed 帧负责全体收敛 |
 | `extension_ui_closed` | sequenced request id + reason | 所有订阅者删除对话框或 semantic request |
 | `session_rekeyed` | epoch, previous handle + authoritative runtime | new/fork/clone 或 catch-up identity 迁移 |
+| `hot_runtime_inventory` | epoch, monotonic revision, exact Runtime entries | Bounded full replacement of current hot Pi process ownership |
 | `session_error` | epoch, handle, operation, error | subscribe/claim/release/extension response 错误 |
 | `session_directory_changed` | workspace id | 触发该 Workspace 的 forced native catalog refresh |
 | `auth_changed` | optional workspace id | 重新获取模型/认证状态 |
@@ -197,6 +198,45 @@ requests 与 sticky Extension state。UI 原子替换 Session-scoped projection 
 Pi response 到达时 Gateway 记录 `barrierSeq`。UI 必须先应用同 generation 中不大于该序号的事件，
 再 resolve command。这个规则适用于所有普通 response。`get_messages` 只是一条普通只读命令；它的
 response 不建立 resync baseline，也不推进 `asOfSeq`。
+
+### Hot Runtime inventory and exact observation
+
+The current Browser requires the negotiated `session.hot_runtime_inventory` capability. Both peers
+must select protocol minor 1 or later and admit the 1 MiB inventory ceiling. A successful
+`server_hello` is followed by the initial `hot_runtime_inventory`; Session traffic is not admitted
+before hello negotiation completes. A missing capability, invalid version selection, or frame limit
+that cannot carry the inventory is terminal for this Browser connection.
+
+`hot_runtime_inventory` is a full replacement, not a delta. It contains at most 256 unique Session
+handles, has a canonical JSON ceiling of 1 MiB, and carries one `serverEpoch` plus a monotonically
+increasing safe-integer `revision`. Every entry repeats the same epoch and contains the exact
+`workspaceId`, `sessionHandle`, positive `generation`, and one of `starting`, `idle`, `running`, or
+`waiting_ui`. A new epoch resets revision comparison. Crashed and dormant Sessions are absent.
+
+When `session_subscribe.expectedHotRuntime` is present, its complete identity must match the outer
+handle and a currently live Supervisor observation. This form is only-if-hot: it never starts a Pi
+process and never falls back to ordinary activation. Identity loss produces an explicit subscribe
+error. A cursor remains fully epoch-aware, so a stale but structurally valid cursor receives the
+normal epoch, generation, or range resync result rather than local repair.
+
+Exact catch-up is transactional. The Supervisor captures and revalidates the process observation,
+and the Bridge installs the runtime baseline, replay or snapshot, lease snapshot, and buffered suffix
+as one subscription transition. Failure leaves an existing live subscription and lease intact.
+Repeated exact subscribe for an already live identity is a silent no-op. A connection admits at
+most 256 concurrent exact operations; the Browser serializes fresh exact baselines so one legal
+oversized snapshot cannot be multiplied across its outbound queue.
+
+Inventory publication is fenced when a catch-up contains a pending rekey. A connection retains only
+the newest deferred full replacement. On a successful identity transition, observers see the rekey
+before the canonical child inventory and staged child frames. If the staged commit fails after
+identity commit, they see the rekey, the inventory removal, and one terminal Runtime result, with no
+staged child frames released.
+
+Snapshots still exclude `notify`. During exact hot catch-up, the Bridge separately journals fresh
+non-replayable notifications that occur in the catch-up window. The Browser delivers each such
+notification once under a bounded full-identity dedupe key, including when its seq is not greater
+than the snapshot `asOfSeq`. This side-effect delivery does not advance or repair projection seq and
+does not change the ordinary replay-gap rule above.
 
 ### 有界性与 backpressure
 
@@ -254,10 +294,14 @@ Extension UI 按 discriminant、UTF-8 bytes、item count、safe number 与 JSON 
 non-authoritative allowlist 的 frame 可忽略；其他未知或畸形权威 frame 进入单一
 `protocol_incompatible` 终态。
 
-WebSocket 第一帧必须是 `client_hello`。成功的 `server_hello` 包含 Gateway protocol major/minor、
-server build/epoch、Pi version、adapter id、能力交集与协商上限；major 不匹配返回稳定
-`protocol_error` 后关闭，UI 不再自动重连。`/api/v1/health/live` 与 `/api/v1/health/ready` 分别表示
-进程存活与 Pi Host 可用；旧 `/health` 是 readiness alias。
+The first WebSocket frame must be `client_hello`. A successful `server_hello` carries the Gateway
+protocol major and minor, server build and epoch, Pi version, adapter id, capability intersection,
+and negotiated limits. A major mismatch returns a stable `protocol_error` and closes the connection;
+the UI does not reconnect automatically. Client and Gateway validate their directional base RPC and
+multiplex capabilities. The Browser additionally requires `session.hot_runtime_inventory` and uses
+the shared negotiation helper to validate minor selection and the server frame ceiling.
+`/api/v1/health/live` reports process liveness, `/api/v1/health/ready` reports Pi Host readiness, and
+the legacy `/health` endpoint remains a readiness alias.
 
 子进程继承现有 Pi 配置、Provider credentials、extensions 与环境变量；本项目不把这些内容打入
 四个发行 tarball。

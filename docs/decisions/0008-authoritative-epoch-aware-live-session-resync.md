@@ -46,7 +46,9 @@ dialog closure, and ordinary response barrier decisions remain in force.
    suffix with `seq > asOfSeq`.
 6. `notify` is delivered once as a transient live effect. A replay range that omits a notification
    contains a sequence gap and must use snapshot resync. It cannot be presented as contiguous
-   replay.
+   replay. A fresh exact-hot catch-up may separately journal notifications produced during its
+   transaction for bounded, identity-scoped, exact-once Browser delivery. That journal is not part
+   of the snapshot or projection waterline.
 7. Ordinary command responses retain `barrierSeq`, and the Browser resolves them only after its
    projection reaches that barrier. `get_messages` has no special resync role and cannot advance
    the snapshot waterline.
@@ -67,11 +69,12 @@ dialog closure, and ordinary response barrier decisions remain in force.
    pending reservation occur atomically in the serialized command-admission boundary, before Pi
    receives the command. The reservation becomes active when the Agent starts and is released on
    failure, cancellation, settlement, stop, or rekey.
-10. Restoring a known Session after a hard reload is part of
-    [Issue #17](https://github.com/leon-zym/pi-agent-web/issues/17). Discovering every hot Runtime
-    after a new Browser connection requires the Gateway inventory and reconciliation contract in
-    [Issue #32](https://github.com/leon-zym/pi-agent-web/issues/32). Dormant history continues to use
-    the existing Pi activation path.
+10. Restoring a known Session after a hard reload uses this snapshot contract. Discovering which
+    independent Session channels need that restoration after a new Browser connection uses the
+    authoritative inventory and exact-observation contract in
+    [ADR 0009](0009-authoritative-hot-runtime-inventory-and-browser-reconciliation.md). Inventory
+    selection does not change snapshot contents, cursor validation, or waterline rules. Dormant
+    history continues to use the existing Pi activation path.
 
 ## Consequences
 
@@ -108,6 +111,7 @@ rolling over a larger Turn belongs to [Issue #8](https://github.com/leon-zym/pi-
   pending and sticky Extension state, notification exclusion, atomic commit failure, replay gaps,
   epoch restart, generation changes, rekey, and snapshot overflow.
 - UI tests cover atomic snapshot replacement, contiguous suffix application, mutation gating,
-  bounded recovery, degraded state, and manual retry.
+  bounded recovery, degraded state, manual retry, and identity-scoped notification dedupe during
+  exact-hot catch-up.
 - Packaged Browser tests reload during partial text, a running tool, and blocking Extension UI, then
   verify exact-once convergence after settlement with no console or page errors.
