@@ -847,12 +847,28 @@ export class SessionSupervisor {
 
 			transition.apply();
 			this.rekeyRuntime(previousSessionHandle, runtime, false);
+			const committedRuntime = runtime.snapshot();
+			let stagedMessages: SessionSupervisorMessage[];
+			try {
+				stagedMessages = transition.commitStaged();
+			} catch (error) {
+				this.safeBroadcast({
+					type: "session_rekeyed",
+					serverEpoch: this.serverEpoch,
+					previousSessionHandle,
+					runtime: committedRuntime,
+				});
+				this.safeBroadcast({ type: "runtime_state", runtime: runtime.snapshot() });
+				this.safeBroadcast({ type: "session_directory_changed", workspaceId: runtime.workspaceId });
+				throw error;
+			}
 			this.safeBroadcast({
 				type: "session_rekeyed",
 				serverEpoch: this.serverEpoch,
 				previousSessionHandle,
 				runtime: runtime.snapshot(),
 			});
+			for (const message of stagedMessages) this.safeBroadcast(message);
 			this.safeBroadcast({ type: "session_directory_changed", workspaceId: runtime.workspaceId });
 		});
 	}

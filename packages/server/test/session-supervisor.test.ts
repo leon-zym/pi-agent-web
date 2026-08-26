@@ -7,7 +7,7 @@ import { legacyRpcV1Adapter } from "../src/legacy-rpc-v1.js";
 import { canonicalizeSessionFile, sessionHandleForFile } from "../src/native-session-catalog.js";
 import type { PiHostAdapter } from "../src/pi-host-adapter.js";
 import type { SessionLiveProjectionLimits } from "../src/session-live-projection.js";
-import type { SessionRuntime } from "../src/session-runtime.js";
+import type { SessionIdentityTransitionCommit, SessionRuntime } from "../src/session-runtime.js";
 import type {
 	ExistingSessionTarget,
 	SessionRuntimeSnapshot,
@@ -51,6 +51,7 @@ function createNativeSession(root: string, cwd: string, nativeSessionId: string)
 
 function createHarness(options: {
 	targets: ExistingSessionTarget[];
+	onBroadcast?: (message: SessionSupervisorMessage) => void;
 	maxHotRuntimes?: number;
 	replayLimit?: number;
 	replayMaxBytes?: number;
@@ -87,7 +88,10 @@ function createHarness(options: {
 		env: options.env,
 		envForWorkspace: options.envForWorkspace,
 		resolveSession: async (sessionHandle) => targets.get(sessionHandle),
-		broadcast: (message) => messages.push(message),
+		broadcast: (message) => {
+			messages.push(message);
+			options.onBroadcast?.(message);
+		},
 		maxHotRuntimes: options.maxHotRuntimes ?? 8,
 		replayLimit: options.replayLimit ?? 32,
 		replayMaxBytes: options.replayMaxBytes,
@@ -2411,6 +2415,301 @@ describe("SessionSupervisor", () => {
 			sessionHandle: result.sessionHandle,
 			generation: result.generation,
 		});
+	});
+
+	it("makes the child snapshot available before publishing its rekey", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const parent = createNativeSession(root, cwd, "snapshot-ready-parent");
+		let supervisor!: SessionSupervisor;
+		let immediateSubscribe: Promise<unknown> | undefined;
+		({ supervisor } = createHarness({
+			targets: [parent],
+			onBroadcast: (message) => {
+				if (message.type === "session_rekeyed") {
+					immediateSubscribe = supervisor.subscribe(message.runtime.sessionHandle);
+				}
+			},
+		}));
+		const lease = await supervisor.claim(parent.sessionHandle, "connection");
+		const before = supervisor.getRuntime(parent.sessionHandle)!;
+
+		const result = await supervisor.sendCommand(
+			parent.sessionHandle,
+			{ type: "clone" },
+			{
+				connectionId: "connection",
+				expectedGeneration: before.generation,
+				fencingToken: lease.fencingToken!,
+			},
+		);
+
+		expect(immediateSubscribe).toBeDefined();
+		await expect(immediateSubscribe).resolves.toMatchObject({
+			type: "resync_required",
+			runtime: {
+				sessionHandle: result.sessionHandle,
+				generation: result.generation,
+			},
+			snapshot: {
+				sessionHandle: result.sessionHandle,
+				generation: result.generation,
+				asOfSeq: 0,
+			},
+		});
+	});
+
+	it("publishes a rekey only after retained child dialogs reach the snapshot waterline", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const parent = createNativeSession(root, cwd, "dialog-waterline-parent");
+		let supervisor!: SessionSupervisor;
+		let immediateSubscribe: Promise<unknown> | undefined;
+		const harness = createHarness({
+			targets: [parent],
+			env: { PI_WEB_FIXTURE_TRANSITION_DIALOG_AFTER_BASE: "1" },
+			onBroadcast: (message) => {
+				if (message.type === "session_rekeyed") {
+					immediateSubscribe = supervisor.subscribe(message.runtime.sessionHandle);
+				}
+			},
+		});
+		supervisor = harness.supervisor;
+		const lease = await supervisor.claim(parent.sessionHandle, "connection");
+		const before = supervisor.getRuntime(parent.sessionHandle)!;
+
+		await supervisor.sendCommand(
+			parent.sessionHandle,
+			{ type: "clone" },
+			{
+				connectionId: "connection",
+				expectedGeneration: before.generation,
+				fencingToken: lease.fencingToken!,
+			},
+		);
+
+		const baseline = await immediateSubscribe;
+		expect(baseline).toMatchObject({ type: "resync_required" });
+		if (!baseline || typeof baseline !== "object" || !("snapshot" in baseline)) {
+			throw new Error("immediate child subscription did not produce a snapshot baseline");
+		}
+		const snapshot = baseline.snapshot as {
+			asOfSeq: number;
+			runtime: { lastSeq: number };
+			pendingExtensionRequests: Array<{ id: string }>;
+		};
+		const dialogId = `transition-dialog-dialog-waterline-parent-clone`;
+		const baselineDialogs = snapshot.pendingExtensionRequests.filter((request) => request.id === dialogId);
+		const suffixDialogs = harness.messages.filter(
+			(message) =>
+				message.type === "extension_ui_request" &&
+				message.request.id === dialogId &&
+				message.seq > snapshot.asOfSeq,
+		);
+		expect(baselineDialogs).toHaveLength(1);
+		expect(snapshot.asOfSeq).toBeGreaterThan(0);
+		expect(snapshot.asOfSeq).toBe(snapshot.runtime.lastSeq);
+		expect(baselineDialogs.length + suffixDialogs.length).toBe(1);
+	});
+
+	it("publishes one rekey before terminal state when staged child projection commit overflows", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const parent = createNativeSession(root, cwd, "staged-overflow-parent");
+		const lifecycleMarker = path.join(root, "lifecycle.log");
+		const { supervisor, messages } = createHarness({
+			targets: [parent],
+			maxAutoRestarts: 0,
+			projectionLimits: { maxExtensionItems: 0 },
+			env: {
+				PI_WEB_FIXTURE_LIFECYCLE_MARKER: lifecycleMarker,
+				PI_WEB_FIXTURE_TRANSITION_DIALOG_AFTER_BASE: "1",
+			},
+		});
+		const lease = await supervisor.claim(parent.sessionHandle, "connection");
+		const before = supervisor.getRuntime(parent.sessionHandle)!;
+
+		await expect(
+			supervisor.sendCommand(
+				parent.sessionHandle,
+				{ type: "clone" },
+				{
+					connectionId: "connection",
+					expectedGeneration: before.generation,
+					fencingToken: lease.fencingToken!,
+				},
+			),
+		).rejects.toThrow("session_snapshot_overflow");
+
+		const child = supervisor.listRuntimes().find((runtime) => runtime.sessionHandle !== parent.sessionHandle);
+		expect(child).toBeDefined();
+		const rekeys = messages.filter((message) => message.type === "session_rekeyed");
+		expect(rekeys).toHaveLength(1);
+		expect(rekeys[0]).toMatchObject({
+			previousSessionHandle: parent.sessionHandle,
+			runtime: { sessionHandle: child?.sessionHandle, state: "waiting_ui" },
+		});
+		const rekeyIndex = messages.indexOf(rekeys[0]!);
+		const terminalIndex = messages.findIndex(
+			(message) =>
+				message.type === "runtime_state" &&
+				message.runtime.sessionHandle === child?.sessionHandle &&
+				(message.runtime.state === "crashed" || message.runtime.state === "dormant"),
+		);
+		expect(rekeyIndex).toBeGreaterThanOrEqual(0);
+		expect(terminalIndex).toBeGreaterThan(rekeyIndex);
+		expect(
+			messages.filter(
+				(message) =>
+					message.type === "extension_ui_request" &&
+					message.request.id.startsWith("transition-dialog-staged-overflow-parent-clone"),
+			),
+		).toEqual([]);
+		expect(child).toMatchObject({ state: "crashed", error: "session_snapshot_overflow" });
+		expect(supervisor.isActive(child!.sessionHandle)).toBe(false);
+		if (process.platform !== "win32") {
+			const childPid = Number(fs.readFileSync(lifecycleMarker, "utf8").match(/^start:(\d+)$/m)?.[1]);
+			expect(Number.isSafeInteger(childPid)).toBe(true);
+			expect(() => process.kill(childPid, 0)).toThrow();
+		}
+
+		const reopenedParent = await supervisor.activate(parent.sessionHandle);
+		expect(reopenedParent.nativeSessionId).toBe("staged-overflow-parent");
+		expect(reopenedParent.sessionHandle).toBe(parent.sessionHandle);
+	});
+
+	it("rejects a child identity commit when its process dies after loading the base", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const parent = createNativeSession(root, cwd, "stale-process-parent");
+		const { supervisor, messages } = createHarness({ targets: [parent], maxAutoRestarts: 0 });
+		const lease = await supervisor.claim(parent.sessionHandle, "connection");
+		const before = supervisor.getRuntime(parent.sessionHandle)!;
+		const internal = supervisor as unknown as {
+			commitIdentityTransition: (
+				runtime: SessionRuntime,
+				transition: SessionIdentityTransitionCommit,
+			) => Promise<void>;
+		};
+		const originalCommit = internal.commitIdentityTransition.bind(supervisor);
+		let signalCommitEntered!: () => void;
+		const commitEntered = new Promise<void>((resolve) => {
+			signalCommitEntered = resolve;
+		});
+		let releaseCommit!: () => void;
+		const commitGate = new Promise<void>((resolve) => {
+			releaseCommit = resolve;
+		});
+		internal.commitIdentityTransition = async (...args) => {
+			signalCommitEntered();
+			await commitGate;
+			return originalCommit(...args);
+		};
+
+		const clone = supervisor.sendCommand(
+			parent.sessionHandle,
+			{ type: "clone" },
+			{
+				connectionId: "connection",
+				expectedGeneration: before.generation,
+				fencingToken: lease.fencingToken!,
+			},
+		);
+		void clone.catch(() => {});
+		await commitEntered;
+		await supervisor.stop(parent.sessionHandle);
+		releaseCommit();
+
+		await expect(clone).rejects.toThrow("session_generation_stale");
+		expect(messages.some((message) => message.type === "session_rekeyed")).toBe(false);
+		expect(supervisor.listRuntimes()).toEqual([
+			expect.objectContaining({
+				sessionHandle: parent.sessionHandle,
+				state: "dormant",
+			}),
+		]);
+	});
+
+	it("synchronizes the child projection phase after a staged dialog expires before identity apply", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const parent = createNativeSession(root, cwd, "expired-dialog-parent");
+		const { supervisor, messages } = createHarness({
+			targets: [parent],
+			env: {
+				PI_WEB_FIXTURE_TRANSITION_DIALOG_AFTER_BASE: "1",
+				PI_WEB_FIXTURE_TRANSITION_DIALOG_TIMEOUT_MS: "100",
+			},
+		});
+		const lease = await supervisor.claim(parent.sessionHandle, "connection");
+		const before = supervisor.getRuntime(parent.sessionHandle)!;
+		const internal = supervisor as unknown as {
+			commitIdentityTransition: (
+				runtime: SessionRuntime,
+				transition: SessionIdentityTransitionCommit,
+			) => Promise<void>;
+		};
+		const originalCommit = internal.commitIdentityTransition.bind(supervisor);
+		let signalCommitEntered!: () => void;
+		const commitEntered = new Promise<void>((resolve) => {
+			signalCommitEntered = resolve;
+		});
+		let releaseCommit!: () => void;
+		const commitGate = new Promise<void>((resolve) => {
+			releaseCommit = resolve;
+		});
+		internal.commitIdentityTransition = async (...args) => {
+			signalCommitEntered();
+			await commitGate;
+			return originalCommit(...args);
+		};
+
+		const clone = supervisor.sendCommand(
+			parent.sessionHandle,
+			{ type: "clone" },
+			{
+				connectionId: "connection",
+				expectedGeneration: before.generation,
+				fencingToken: lease.fencingToken!,
+			},
+		);
+		void clone.catch(() => {});
+		await commitEntered;
+		expect(supervisor.getPendingExtensionRequests(parent.sessionHandle)).toContainEqual(
+			expect.objectContaining({ id: "transition-dialog-expired-dialog-parent-clone" }),
+		);
+		await waitFor(
+			() =>
+				!supervisor
+					.getPendingExtensionRequests(parent.sessionHandle)
+					?.some((request) => request.id === "transition-dialog-expired-dialog-parent-clone"),
+		);
+		releaseCommit();
+		const result = await clone;
+
+		expect(supervisor.getRuntime(result.sessionHandle)?.state).toBe("idle");
+		const baseline = await supervisor.subscribe(result.sessionHandle);
+		expect(baseline).toMatchObject({
+			type: "resync_required",
+			runtime: { state: "idle" },
+			snapshot: {
+				asOfSeq: 0,
+				runtime: { state: "idle", lastSeq: 0 },
+				pendingExtensionRequests: [],
+			},
+		});
+		expect(
+			messages.filter(
+				(message) =>
+					message.type === "extension_ui_request" &&
+					message.request.id === "transition-dialog-expired-dialog-parent-clone",
+			),
+		).toEqual([]);
 	});
 
 	it("reserves Workspace activation until a fork child identity is committed", async () => {

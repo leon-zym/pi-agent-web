@@ -88,6 +88,8 @@ export interface SessionIdentityTransitionCommit {
 	nextTarget: ExistingSessionTarget;
 	/** Apply the verified identity exactly once while the Supervisor pool lock is held. */
 	apply: () => void;
+	/** Commit staged child frames to one waterline before the rekey becomes observable. */
+	commitStaged: () => SessionSupervisorMessage[];
 }
 
 export interface SessionRuntimeOptions {
@@ -172,6 +174,7 @@ export class SessionRuntime {
 	private snapshotOverflow = false;
 	private idleBaseCompactionPromise: Promise<void> | null = null;
 	private deferredStartupEmits: SessionSupervisorMessage[] | null = null;
+	private deferredTransitionEmits: SessionSupervisorMessage[] | null = null;
 
 	sessionHandle: string;
 	readonly workspaceId: string;
@@ -475,13 +478,21 @@ export class SessionRuntime {
 	}
 
 	private async initializeProjectionBase(processToken: number, proc: PiProcess): Promise<void> {
+		this.liveProjection = await this.loadProjectionBase(processToken, proc, this.projectionIdentity());
+	}
+
+	private async loadProjectionBase(
+		processToken: number,
+		proc: PiProcess,
+		identity: SessionLiveProjectionIdentity,
+	): Promise<SessionLiveProjection> {
 		const response = await proc.send({ type: "get_messages" }, this.timeoutFor("get_messages"));
 		if (processToken !== this.processToken || this.proc !== proc) {
 			throw new RpcError("get_messages", "session_generation_stale");
 		}
 		const { messages } = expectCommandData(response, "get_messages");
-		this.liveProjection = new SessionLiveProjection({
-			identity: this.projectionIdentity(),
+		return new SessionLiveProjection({
+			identity,
 			settledMessages: messages,
 			baseSeq: 0,
 			runtimePhase: this.pendingDialogs.size > 0 ? "waiting_ui" : "idle",
@@ -575,10 +586,12 @@ export class SessionRuntime {
 			if (blocker) throw new RpcError(command.type, `session_busy:${blocker}`);
 			const proc = this.proc;
 			if (!proc?.running) throw new RpcError(command.type, "pi process is not running");
+			const processToken = this.processToken;
 			this.transitionStage = { phase: "awaiting_response", frames: [], bytes: 0 };
 			this.inFlight += 1;
 			const previousSessionHandle = this.sessionHandle;
 			let parentIdentityConfirmed = false;
+			let identityCommitted = false;
 			try {
 				const response = await proc.send(command, this.timeoutFor(command.type));
 				if (response.success !== true) {
@@ -610,6 +623,13 @@ export class SessionRuntime {
 				if (cancelled) {
 					throw new RpcError(command.type, "cancelled transition changed session identity");
 				}
+				const childIdentity: SessionLiveProjectionIdentity = {
+					serverEpoch: this.opts.serverEpoch,
+					sessionHandle: nextTarget.sessionHandle,
+					workspaceId: nextTarget.workspaceId,
+					generation: this.generation + 1,
+				};
+				const childProjection = await this.loadProjectionBase(processToken, proc, childIdentity);
 
 				let applied = false;
 				await this.opts.commitIdentityTransition(this, {
@@ -617,21 +637,40 @@ export class SessionRuntime {
 					nextTarget,
 					apply: () => {
 						if (applied) throw new RpcError(command.type, "transition identity applied twice");
+						if (processToken !== this.processToken || this.proc !== proc || !proc.running) {
+							throw new RpcError(command.type, "session_generation_stale");
+						}
 						if (transition.frozenFile) {
 							assertFrozenSessionFile(transition.frozenFile, nextTarget.nativeSessionId, nextTarget.cwd);
 						} else {
 							assertUnpersistedTransitionTarget(nextTarget);
 						}
+						childProjection.setRuntimePhase(
+							childIdentity,
+							this.pendingDialogs.size > 0 ? "waiting_ui" : "idle",
+						);
 						applied = true;
 						this.adoptTransitionTarget(nextTarget, transition.frozenFile !== null);
+						this.liveProjection = childProjection;
+						identityCommitted = true;
+					},
+					commitStaged: () => {
+						if (!applied || processToken !== this.processToken || this.proc !== proc || !proc.running) {
+							throw new RpcError(command.type, "session_generation_stale");
+						}
+						return this.commitTransitionFrames();
 					},
 				});
 				if (!applied) throw new RpcError(command.type, "transition identity was not committed");
-				await this.initializeProjectionBase(this.processToken, proc);
-				this.flushTransitionFrames();
 				return { response, previousSessionHandle };
 			} catch (error) {
-				if (!parentIdentityConfirmed) {
+				if (identityCommitted) {
+					if (this.transitionStage) {
+						this.transitionStage.frames = [];
+						this.transitionStage.bytes = 0;
+					}
+					await this.stop();
+				} else if (!parentIdentityConfirmed) {
 					// Pi may already own the child identity. Never attribute buffered child
 					// frames to the parent when verification/commit failed.
 					if (this.transitionStage) {
@@ -1045,6 +1084,19 @@ export class SessionRuntime {
 		this.transitionStage.bytes = 0;
 	}
 
+	private commitTransitionFrames(): SessionSupervisorMessage[] {
+		if (this.deferredTransitionEmits) {
+			throw new RpcError("session_transition", "transition_frame_commit_reentered");
+		}
+		this.deferredTransitionEmits = [];
+		try {
+			this.flushTransitionFrames();
+			return this.deferredTransitionEmits;
+		} finally {
+			this.deferredTransitionEmits = null;
+		}
+	}
+
 	private emitFrame(frame: BufferedFrame, afterProjectionCommit?: () => void): void {
 		const projection = this.liveProjection;
 		if (!projection) throw new RpcError("session_snapshot", "session_snapshot_unavailable");
@@ -1411,6 +1463,10 @@ export class SessionRuntime {
 	private emitSupervisorMessage(message: SessionSupervisorMessage): void {
 		if (this.deferredStartupEmits) {
 			this.deferredStartupEmits.push(message);
+			return;
+		}
+		if (this.deferredTransitionEmits) {
+			this.deferredTransitionEmits.push(message);
 			return;
 		}
 		this.opts.emit(message);

@@ -652,6 +652,18 @@ function handleLine(line) {
 				);
 				return;
 			}
+			if (process.env.PI_WEB_FIXTURE_TRANSITION_DIALOG_AFTER_BASE === "1" && getMessagesRequestCount === 2) {
+				send({
+					type: "extension_ui_request",
+					id: `transition-dialog-${sessionId}`,
+					method: "confirm",
+					title: "Transition dialog",
+					message: "transition-dialog",
+					...(process.env.PI_WEB_FIXTURE_TRANSITION_DIALOG_TIMEOUT_MS
+						? { timeout: Number(process.env.PI_WEB_FIXTURE_TRANSITION_DIALOG_TIMEOUT_MS) }
+						: {}),
+				});
+			}
 			response(command, { messages });
 			return;
 		case "get_commands":
