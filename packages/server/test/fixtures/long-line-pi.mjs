@@ -21,7 +21,18 @@ process.stdin.on("data", (chunk) => {
 				id: command.id,
 				command: "get_state",
 				success: true,
-				data: { sessionId: "long-line", sessionFile: "/tmp/long-line.jsonl", thinkingLevel: "off" },
+				data: {
+					sessionId: "long-line",
+					sessionFile: "/tmp/long-line.jsonl",
+					thinkingLevel: "off",
+					isStreaming: false,
+					isCompacting: false,
+					steeringMode: "all",
+					followUpMode: "all",
+					autoCompactionEnabled: true,
+					messageCount: 0,
+					pendingMessageCount: 0,
+				},
 			})}\n`,
 		);
 		setTimeout(() => process.stdout.write("x".repeat(8 * 1024 * 1024 + 1)), 5).unref();

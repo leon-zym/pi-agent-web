@@ -30,6 +30,20 @@ export interface AppContext {
 	preferences: WorkspacePreferences;
 	supervisor: SessionSupervisor;
 	trash: RecoverableSessionTrash;
+	readiness: GatewayReadiness;
+}
+
+export interface GatewayReadiness {
+	ready: boolean;
+	runtime?: {
+		source: "bundled" | "pi-path" | "system" | "homebrew";
+		version: string;
+		adapterId: string;
+		capabilities: readonly string[];
+	};
+	diagnostic?: {
+		code: string;
+	};
 }
 
 export function createApp(ctx: AppContext): Hono {
@@ -51,8 +65,18 @@ export function createApp(ctx: AppContext): Hono {
 		await next();
 	});
 
+	app.get("/api/v1/health/live", (c) => c.json({ ok: true, service: "pi-agent-web", version: "0.1.0" }));
+
+	app.get("/api/v1/health/ready", (c) => {
+		const body = readinessBody(ctx.readiness);
+		return c.json(body, ctx.readiness.ready ? 200 : 503);
+	});
+
+	// Compatibility alias for existing launchers. It intentionally reflects
+	// readiness rather than claiming that a live-but-unusable host is healthy.
 	app.get("/api/v1/health", (c) => {
-		return c.json({ ok: true, service: "pi-agent-web", version: "0.1.0" });
+		const body = readinessBody(ctx.readiness);
+		return c.json(body, ctx.readiness.ready ? 200 : 503);
 	});
 
 	app.post("/api/v1/workspaces/pick-directory", async (c) => {
@@ -105,6 +129,24 @@ export function createApp(ctx: AppContext): Hono {
 	});
 
 	return app;
+}
+
+function readinessBody(readiness: GatewayReadiness): {
+	ok: boolean;
+	ready: boolean;
+	service: "pi-agent-web";
+	version: "0.1.0";
+	runtime?: GatewayReadiness["runtime"];
+	diagnostic?: GatewayReadiness["diagnostic"];
+} {
+	return {
+		ok: readiness.ready,
+		ready: readiness.ready,
+		service: "pi-agent-web",
+		version: "0.1.0",
+		...(readiness.runtime ? { runtime: readiness.runtime } : {}),
+		...(readiness.diagnostic ? { diagnostic: readiness.diagnostic } : {}),
+	};
 }
 function errorText(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);

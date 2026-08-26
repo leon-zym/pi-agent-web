@@ -155,8 +155,13 @@ describe("pi process integration (real runtime)", () => {
 		expect(response.success).toBe(true);
 	});
 
-	it("rejects an unknown command with success:false", async () => {
-		const response = await proc.send({ type: "bogus_command" as never });
-		expect(response.success).toBe(false);
+	it("fails closed when Pi answers an out-of-contract command discriminant", async () => {
+		await expect(proc.send({ type: "bogus_command" as never })).rejects.toMatchObject({
+			name: "PiProtocolIncompatibleError",
+			diagnostic: expect.objectContaining({
+				code: "protocol_incompatible",
+				reason: "malformed_response",
+			}),
+		});
 	});
 });

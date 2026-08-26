@@ -420,6 +420,26 @@ if (!RUN_REAL_E2E) {
 			COMMAND_TIMEOUT_MS,
 			"WebSocket open",
 		);
+		await timeout(
+			new Promise<void>((resolve, reject) => {
+				ws?.once("message", (raw) => {
+					const frame = JSON.parse(raw.toString()) as { type?: string };
+					if (frame.type === "server_hello") resolve();
+					else reject(new Error("Gateway rejected real-E2E client hello"));
+				});
+				ws?.send(
+					JSON.stringify({
+						type: "client_hello",
+						protocol: { major: 1, minor: 0 },
+						clientBuild: "real-e2e",
+						capabilities: ["rpc.commands", "rpc.events", "rpc.extension_ui", "session.multiplex"],
+						limits: { maxServerFrameBytes: 68 * 1024 * 1024 },
+					}),
+				);
+			}),
+			COMMAND_TIMEOUT_MS,
+			"WebSocket hello",
+		);
 		const client = new MultiplexClient(ws);
 		const [sessionA, sessionB] = await Promise.all([client.attach(runtimeA), client.attach(runtimeB)]);
 

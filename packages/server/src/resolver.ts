@@ -1,210 +1,310 @@
-import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
+import { createLegacyRpcV1Adapter, legacyRpcV1Adapter } from "./legacy-rpc-v1.js";
+import { type PiCapability, type PiHostAdapter, PiHostProbeError } from "./pi-host-adapter.js";
 
-const execFileAsync = promisify(execFile);
+export type { PiCapability } from "./pi-host-adapter.js";
+
+const PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
+const PI_RPC_ENTRY_SPECIFIER = `${PI_PACKAGE_NAME}/rpc-entry`;
+const DEFAULT_PROBE_TIMEOUT_MS = 3_000;
+const DEFAULT_PROBE_MAX_OUTPUT_BYTES = 4 * 1024;
+const EXACT_SEMVER = /^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/;
+
+/** Stable, non-sensitive reasons why a selected Pi runtime is unavailable. */
+export type PiRuntimeDiagnosticCode =
+	| "pi_runtime_missing"
+	| "pi_probe_spawn_failed"
+	| "pi_probe_timeout"
+	| "pi_probe_nonzero_exit"
+	| "pi_probe_output_invalid"
+	| "pi_probe_output_oversized"
+	| "pi_version_mismatch"
+	| "pi_version_unsupported"
+	| "pi_capability_missing"
+	| "protocol_incompatible";
+
+export class PiRuntimeDiagnosticError extends Error {
+	readonly code: PiRuntimeDiagnosticCode;
+
+	constructor(code: PiRuntimeDiagnosticCode, message: string, options?: ErrorOptions) {
+		super(message, options);
+		this.name = "PiRuntimeDiagnosticError";
+		this.code = code;
+	}
+}
+
+export interface PiCompatibility {
+	version: string;
+	status: "current" | "candidate";
+	adapterId: "legacy-rpc-v1";
+	capabilities: readonly PiCapability[];
+}
+
+const LEGACY_RPC_CAPABILITIES = [
+	"session.create",
+	"session.open",
+	"session.fork",
+	"session.clone",
+	"rpc.commands",
+	"rpc.events",
+	"rpc.extension_ui",
+] as const satisfies readonly PiCapability[];
 
 /**
- * Three-tier Pi runtime resolution (see docs/architecture.md):
- * 1. PI_PATH env var / --pi-path CLI arg (pi-web's own convention; pi source
- *    has no such variable).
- * 2. The global "pi" command on PATH (seamlessly inherits ~/.pi config and
- *    extensions).
- * 3. Bundled fallback: @earendil-works/pi-coding-agent's dist/rpc-entry.js.
- *
- * The fallback entry MUST be dist/rpc-entry.js (the dedicated RPC entry),
- * not dist/cli.js.
+ * Exact versions reviewed against the adapter fixtures. Candidate means that
+ * the version is compatible as an explicit override, not that distributions
+ * may silently replace their pinned current runtime with it.
  */
+export const PI_COMPATIBILITY_MATRIX: Readonly<Record<string, PiCompatibility>> = Object.freeze({
+	"0.84.2": Object.freeze({
+		version: "0.84.2",
+		status: "current",
+		adapterId: "legacy-rpc-v1",
+		capabilities: Object.freeze([...LEGACY_RPC_CAPABILITIES]),
+	}),
+	"0.84.3": Object.freeze({
+		version: "0.84.3",
+		status: "candidate",
+		adapterId: "legacy-rpc-v1",
+		capabilities: Object.freeze([...LEGACY_RPC_CAPABILITIES, "rpc.toolcall_identity"] as const),
+	}),
+});
+
+export const REQUIRED_PI_CAPABILITIES = Object.freeze([
+	"session.create",
+	"session.open",
+	"session.fork",
+	"session.clone",
+	"rpc.commands",
+	"rpc.events",
+	"rpc.extension_ui",
+] as const satisfies readonly PiCapability[]);
 
 export interface ResolvedPi {
-	/** Executable for spawn */
+	/** Executable for Session process spawn. */
 	command: string;
-	/** Extra args (excluding spawn options like cwd/stdio) */
+	/** RPC entry arguments, excluding Session-specific arguments. */
 	args: string[];
-	/** Resolution source, for diagnostics and UI display */
+	/** Resolution source; only pi-path is an expert override. */
 	source: "pi-path" | "system" | "bundled" | "homebrew";
+	/** Internal diagnostic label. Never expose it from health endpoints. */
 	label: string;
+	/** Concrete adapter selected by a validated production runtime. */
+	adapter?: PiHostAdapter;
+}
+
+export interface ProbedPiRuntime extends ResolvedPi {
+	adapter: PiHostAdapter;
+	version: string;
+	adapterId: PiCompatibility["adapterId"];
+	compatibilityStatus: PiCompatibility["status"];
+	capabilities: readonly PiCapability[];
+}
+
+interface RuntimeCandidate extends ResolvedPi {
+	versionArgs: string[];
+	adapter: PiHostAdapter;
+	/** Package manifest version, when the selected target belongs to a package. */
+	packageVersion?: string;
 }
 
 export interface ResolveOptions {
 	env?: NodeJS.ProcessEnv;
 	piPath?: string;
-	/** Base directory used to locate the bundled dependency fallback. */
+	probeTimeoutMs?: number;
+	probeMaxOutputBytes?: number;
+	requiredCapabilities?: readonly PiCapability[];
+	/** @deprecated Bundled resolution is module-relative and intentionally ignores cwd. */
 	baseDir?: string;
-	/** Homebrew Cellar roots, overridable by deterministic resolver tests. */
+	/** @deprecated No implicit Homebrew lookup occurs. */
 	homebrewRoots?: string[];
+	/** Deterministic package-export seam for resolver tests. */
+	bundledEntryUrl?: string | URL;
+	/** Deterministic distribution-manifest seam for compatibility tests. */
+	expectedBundledVersion?: string;
 }
 
-function exists(p: string): boolean {
+interface PackageManifest {
+	name?: unknown;
+	version?: unknown;
+	bin?: unknown;
+	dependencies?: Record<string, unknown>;
+	exports?: Record<string, unknown>;
+}
+
+function diagnostic(
+	code: PiRuntimeDiagnosticCode,
+	message: string,
+	cause?: unknown,
+): PiRuntimeDiagnosticError {
+	return new PiRuntimeDiagnosticError(code, message, cause === undefined ? undefined : { cause });
+}
+
+function exists(filePath: string): boolean {
 	try {
-		return fs.existsSync(p);
+		return fs.existsSync(filePath);
 	} catch {
 		return false;
 	}
 }
 
-function tryHomebrewEntries(
-	env: NodeJS.ProcessEnv,
-	roots = [
-		"/opt/homebrew/Cellar/pi-coding-agent",
-		"/usr/local/Cellar/pi-coding-agent",
-		path.join(env.HOME ?? "", "homebrew/Cellar/pi-coding-agent"),
-	],
-): string[] {
-	const found: string[] = [];
-	for (const root of roots) {
-		if (!exists(root)) continue;
-		try {
-			for (const ver of fs.readdirSync(root)) {
-				const entry = path.join(
-					root,
-					ver,
-					"libexec",
-					"lib",
-					"node_modules",
-					"@earendil-works",
-					"pi-coding-agent",
-					"dist",
-					"rpc-entry.js",
-				);
-				if (exists(entry)) found.push(entry);
-			}
-		} catch {
-			// Unreadable dir: skip.
-		}
+function readManifest(filePath: string): PackageManifest | null {
+	try {
+		const value: unknown = JSON.parse(fs.readFileSync(filePath, "utf8"));
+		return typeof value === "object" && value !== null && !Array.isArray(value)
+			? (value as PackageManifest)
+			: null;
+	} catch {
+		return null;
 	}
-	return found;
 }
 
-function resolveBundledEntry(
-	env: NodeJS.ProcessEnv,
-	baseDir?: string,
-	homebrewRoots?: string[],
-): string | null {
-	const candidates: string[] = [];
-	const bundled = findBundledEntry(baseDir ?? path.resolve(import.meta.dirname, ".."));
-	if (bundled) candidates.push(bundled);
-	// Homebrew Cellar fallback (verified formula layout).
-	candidates.push(...tryHomebrewEntries(env, homebrewRoots));
-
-	for (const candidate of candidates) {
-		if (candidate && exists(candidate)) return candidate;
-	}
-	return null;
+interface PiPackageInfo {
+	root: string;
+	version: string;
+	cliEntry: string;
 }
 
-function findBundledEntry(baseDir: string): string | null {
-	let dir = path.resolve(baseDir);
+function packageManifestForEntry(entry: string): PiPackageInfo | null {
+	let dir = path.dirname(path.resolve(entry));
 	for (;;) {
-		const entry = path.join(
-			dir,
-			"node_modules",
-			"@earendil-works",
-			"pi-coding-agent",
-			"dist",
-			"rpc-entry.js",
-		);
-		if (exists(entry)) return entry;
+		const manifest = readManifest(path.join(dir, "package.json"));
+		if (manifest?.name === PI_PACKAGE_NAME && typeof manifest.version === "string") {
+			const binTarget =
+				typeof manifest.bin === "string"
+					? manifest.bin
+					: typeof manifest.bin === "object" && manifest.bin !== null && !Array.isArray(manifest.bin)
+						? (manifest.bin as Record<string, unknown>).pi
+						: undefined;
+			if (typeof binTarget !== "string") return null;
+			const cliEntry = path.resolve(dir, binTarget);
+			const relative = path.relative(dir, cliEntry);
+			if (relative.startsWith("..") || path.isAbsolute(relative) || !exists(cliEntry)) return null;
+			return { root: dir, version: manifest.version, cliEntry };
+		}
 		const parent = path.dirname(dir);
 		if (parent === dir) return null;
 		dir = parent;
 	}
 }
 
-async function whichPi(env: NodeJS.ProcessEnv): Promise<string | null> {
-	const pathVar = env.PATH ?? "";
-	const exts = process.platform === "win32" ? [".cmd", ".exe", ""] : [""];
-	const dirs = pathVar.split(path.delimiter).filter(Boolean);
-	for (const dir of dirs) {
-		for (const ext of exts) {
-			const candidate = path.resolve(dir, `pi${ext}`);
-			if (exists(candidate)) {
-				try {
-					fs.accessSync(candidate, fs.constants.X_OK);
-					return candidate;
-				} catch {
-					// exists but not executable: keep looking
-				}
-			}
-		}
+function declaredDistributionPiVersion(): string {
+	const manifest = readManifest(path.resolve(import.meta.dirname, "..", "package.json"));
+	const version = manifest?.dependencies?.[PI_PACKAGE_NAME];
+	if (typeof version !== "string" || !EXACT_SEMVER.test(version)) {
+		throw diagnostic(
+			"pi_version_mismatch",
+			"The server distribution does not declare an exact Pi runtime version.",
+		);
 	}
-	return null;
+	return version;
 }
 
-/**
- * Resolve the Pi runtime. Throws with remediation hints when all three tiers miss.
- */
-export async function resolvePiRuntime(options: ResolveOptions = {}): Promise<ResolvedPi> {
-	const env = options.env ?? process.env;
-
-	// Tier 1: PI_PATH / --pi-path (custom convention)
-	const explicitPath = options.piPath ?? env.PI_PATH;
-	if (explicitPath) {
-		return resolveExplicitPath(explicitPath);
+function resolveBundledCandidate(options: ResolveOptions): RuntimeCandidate {
+	let entryUrl: string;
+	try {
+		entryUrl = String(options.bundledEntryUrl ?? import.meta.resolve(PI_RPC_ENTRY_SPECIFIER));
+	} catch (error) {
+		throw diagnostic(
+			"pi_runtime_missing",
+			"The bundled Pi runtime package export could not be resolved.",
+			error,
+		);
 	}
 
-	// Tier 2: global pi on PATH
-	const systemPi = await whichPi(env);
-	if (systemPi) {
-		return {
-			command: systemPi,
-			args: ["--mode", "rpc"],
-			source: "system",
-			label: `system pi (${systemPi})`,
-		};
+	let entry: string;
+	try {
+		entry = fileURLToPath(entryUrl);
+	} catch (error) {
+		throw diagnostic(
+			"pi_runtime_missing",
+			"The bundled Pi runtime package export is not a local file.",
+			error,
+		);
+	}
+	if (!exists(entry)) {
+		throw diagnostic("pi_runtime_missing", "The bundled Pi runtime entry is missing.");
 	}
 
-	// Tier 3: bundled dependency / homebrew fallback
-	const entry = resolveBundledEntry(env, options.baseDir, options.homebrewRoots);
-	if (entry) {
-		return {
-			command: process.execPath,
-			args: [entry],
-			source: entry.includes("Cellar") ? "homebrew" : "bundled",
-			label: `bundled runtime (${entry})`,
-		};
+	const packageInfo = packageManifestForEntry(entry);
+	if (!packageInfo) {
+		throw diagnostic("pi_version_mismatch", "The bundled Pi runtime entry has no valid package manifest.");
+	}
+	const expectedVersion = options.expectedBundledVersion ?? declaredDistributionPiVersion();
+	if (packageInfo.version !== expectedVersion) {
+		throw diagnostic(
+			"pi_version_mismatch",
+			`The bundled Pi runtime package version does not match the distribution manifest (${expectedVersion}).`,
+		);
 	}
 
-	throw new Error(
-		[
-			"Unable to locate the Pi Coding Agent runtime. Satisfy any of:",
-			"  1. set PI_PATH (or pass --pi-path) to the pi executable;",
-			"  2. install the global pi command on PATH;",
-			"  3. install @earendil-works/pi-coding-agent (or the Homebrew pi-coding-agent formula).",
-		].join("\n"),
-	);
+	return {
+		command: process.execPath,
+		args: [entry],
+		versionArgs: [packageInfo.cliEntry, "--version"],
+		packageVersion: packageInfo.version,
+		adapter: legacyRpcV1Adapter,
+		source: "bundled",
+		label: `bundled runtime (${entry})`,
+	};
 }
 
-function resolveExplicitPath(piPath: string): ResolvedPi {
-	const resolved = path.resolve(expandHome(piPath));
-	if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
-		// Directory installs must expose Pi's dedicated RPC entry point.
-		for (const rel of [
-			"dist/rpc-entry.js",
-			"lib/node_modules/@earendil-works/pi-coding-agent/dist/rpc-entry.js",
-		]) {
-			const candidate = path.join(resolved, rel);
-			if (exists(candidate)) {
-				return {
-					command: process.execPath,
-					args: [candidate],
-					source: "pi-path",
-					label: `PI_PATH (${candidate})`,
-				};
-			}
+function exportedEntryFromPackageRoot(packageRoot: string): string | null {
+	const manifest = readManifest(path.join(packageRoot, "package.json"));
+	if (manifest?.name !== PI_PACKAGE_NAME) return null;
+	const rpcExport = manifest.exports?.["./rpc-entry"];
+	const target =
+		typeof rpcExport === "string"
+			? rpcExport
+			: typeof rpcExport === "object" && rpcExport !== null && !Array.isArray(rpcExport)
+				? (rpcExport as Record<string, unknown>).import
+				: undefined;
+	if (typeof target !== "string" || !target.startsWith("./")) return null;
+	const entry = path.resolve(packageRoot, target);
+	const relative = path.relative(packageRoot, entry);
+	if (relative.startsWith("..") || path.isAbsolute(relative) || !exists(entry)) return null;
+	return entry;
+}
+
+function resolveExplicitPath(piPath: string, env: NodeJS.ProcessEnv): RuntimeCandidate {
+	const resolved = path.resolve(expandHome(piPath, env));
+	if (exists(resolved) && fs.statSync(resolved).isDirectory()) {
+		const packageRoots = [
+			resolved,
+			path.join(resolved, "lib", "node_modules", "@earendil-works", "pi-coding-agent"),
+		];
+		for (const packageRoot of packageRoots) {
+			const entry = exportedEntryFromPackageRoot(packageRoot);
+			if (!entry) continue;
+			const packageInfo = packageManifestForEntry(entry);
+			if (!packageInfo) continue;
+			return {
+				command: process.execPath,
+				args: [entry],
+				versionArgs: [packageInfo.cliEntry, "--version"],
+				packageVersion: packageInfo.version,
+				adapter: legacyRpcV1Adapter,
+				source: "pi-path",
+				label: `PI_PATH (${entry})`,
+			};
 		}
-		throw new Error(`PI_PATH directory has no dist/rpc-entry.js: ${resolved}`);
+		throw diagnostic("pi_runtime_missing", "The PI_PATH directory has no exported Pi RPC entry.");
 	}
 
 	if (!exists(resolved)) {
-		throw new Error(`PI_PATH does not exist: ${resolved}`);
+		throw diagnostic("pi_runtime_missing", "The configured PI_PATH does not exist.");
 	}
 
 	if (resolved.endsWith(".js") || resolved.endsWith(".mjs") || resolved.endsWith(".cjs")) {
+		const packageInfo = packageManifestForEntry(resolved);
 		return {
 			command: process.execPath,
 			args: [resolved],
+			versionArgs: [packageInfo?.cliEntry ?? resolved, "--version"],
+			...(packageInfo ? { packageVersion: packageInfo.version } : {}),
+			adapter: legacyRpcV1Adapter,
 			source: "pi-path",
 			label: `PI_PATH (${resolved})`,
 		};
@@ -213,21 +313,111 @@ function resolveExplicitPath(piPath: string): ResolvedPi {
 	return {
 		command: resolved,
 		args: ["--mode", "rpc"],
+		versionArgs: ["--version"],
+		adapter: legacyRpcV1Adapter,
 		source: "pi-path",
 		label: `PI_PATH (${resolved})`,
 	};
 }
 
-function expandHome(p: string): string {
-	if (p === "~") return process.env.HOME ?? p;
-	if (p.startsWith("~/")) return path.join(process.env.HOME ?? "", p.slice(2));
-	return p;
+function expandHome(value: string, env: NodeJS.ProcessEnv): string {
+	if (value === "~") return env.HOME ?? value;
+	if (value.startsWith("~/")) return path.join(env.HOME ?? "", value.slice(2));
+	return value;
 }
 
-/** For CLI display/diagnostics: which runtime will be used. */
+function mapProbeError(error: unknown): never {
+	if (!(error instanceof PiHostProbeError)) throw error;
+	const diagnostics = {
+		spawn_failed: ["pi_probe_spawn_failed", "The Pi runtime version probe could not start."],
+		timeout: ["pi_probe_timeout", "The Pi runtime version probe timed out."],
+		nonzero_exit: ["pi_probe_nonzero_exit", "The Pi runtime version probe exited unsuccessfully."],
+		output_invalid: ["pi_probe_output_invalid", "The Pi runtime version probe returned an invalid version."],
+		output_oversized: [
+			"pi_probe_output_oversized",
+			"The Pi runtime version probe exceeded its output limit.",
+		],
+	} as const satisfies Record<PiHostProbeError["kind"], readonly [PiRuntimeDiagnosticCode, string]>;
+	const [code, message] = diagnostics[error.kind];
+	throw diagnostic(code, message, error);
+}
+
+export function compatibilityForPiVersion(version: string): PiCompatibility | undefined {
+	return PI_COMPATIBILITY_MATRIX[version];
+}
+
+export function assertRequiredPiCapabilities(
+	compatibility: PiCompatibility,
+	required: readonly PiCapability[] = REQUIRED_PI_CAPABILITIES,
+): void {
+	const available = new Set(compatibility.capabilities);
+	const missing = required.filter((capability) => !available.has(capability));
+	if (missing.length > 0) {
+		throw diagnostic(
+			"pi_capability_missing",
+			`The Pi runtime is missing required adapter capabilities: ${missing.join(", ")}.`,
+		);
+	}
+}
+
+export async function probePiRuntime(
+	candidate: RuntimeCandidate,
+	options: ResolveOptions = {},
+): Promise<ProbedPiRuntime> {
+	let version: string;
+	try {
+		version = await candidate.adapter.probeVersion({
+			command: candidate.command,
+			args: candidate.versionArgs,
+			env: options.env ? { ...process.env, ...options.env } : process.env,
+			timeoutMs: options.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS,
+			maxOutputBytes: options.probeMaxOutputBytes ?? DEFAULT_PROBE_MAX_OUTPUT_BYTES,
+		});
+	} catch (error) {
+		mapProbeError(error);
+	}
+	if (candidate.packageVersion !== undefined && candidate.packageVersion !== version) {
+		throw diagnostic(
+			"pi_version_mismatch",
+			"The Pi runtime package manifest and executable version do not match.",
+		);
+	}
+	const compatibility = compatibilityForPiVersion(version);
+	if (!compatibility) {
+		throw diagnostic(
+			"pi_version_unsupported",
+			`Pi runtime ${version} is not supported by this Gateway build.`,
+		);
+	}
+	assertRequiredPiCapabilities(compatibility, options.requiredCapabilities);
+	const adapter = createLegacyRpcV1Adapter(version, compatibility.capabilities);
+	return {
+		command: candidate.command,
+		args: candidate.args,
+		source: candidate.source,
+		label: candidate.label,
+		adapter,
+		version,
+		adapterId: compatibility.adapterId,
+		compatibilityStatus: compatibility.status,
+		capabilities: adapter.capabilities,
+	};
+}
+
+/**
+ * Resolve and validate a Pi runtime before it can own a Session process.
+ * Explicit PI_PATH is an expert override; PATH and cwd never shadow the
+ * distribution-owned package export.
+ */
+export async function resolvePiRuntime(options: ResolveOptions = {}): Promise<ProbedPiRuntime> {
+	const env = options.env ?? process.env;
+	const explicitPath = options.piPath ?? env.PI_PATH;
+	const candidate = explicitPath ? resolveExplicitPath(explicitPath, env) : resolveBundledCandidate(options);
+	return probePiRuntime(candidate, options);
+}
+
+/** For CLI display/diagnostics: which validated runtime will be used. */
 export async function describePiRuntime(options: ResolveOptions = {}): Promise<string> {
 	const resolved = await resolvePiRuntime(options);
-	return `${resolved.source}: ${resolved.command} ${resolved.args.join(" ")}`;
+	return `${resolved.source}: Pi ${resolved.version} (${resolved.adapterId})`;
 }
-
-export { execFileAsync };

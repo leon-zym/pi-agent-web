@@ -33,6 +33,17 @@ async function openSocket(): Promise<import("ws").WebSocket> {
 		ws.once("open", resolve);
 		ws.once("error", reject);
 	});
+	const hello = frameFor(ws, (frame) => frame.type === "server_hello");
+	ws.send(
+		JSON.stringify({
+			type: "client_hello",
+			protocol: { major: 1, minor: 0 },
+			clientBuild: "workspace-control-test",
+			capabilities: ["rpc.commands", "rpc.events", "rpc.extension_ui", "session.multiplex"],
+			limits: { maxServerFrameBytes: 68 * 1024 * 1024 },
+		}),
+	);
+	await hello;
 	return ws;
 }
 

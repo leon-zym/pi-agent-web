@@ -2,9 +2,13 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import type { RpcCommand, RpcExtensionUIResponse, RpcResponse } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionUiResponseDto,
+	SessionCommandDto,
+	SessionCommandResponseDto,
+} from "@pi-agent-web/protocol";
 import { RpcError } from "@pi-agent-web/protocol";
-import type { ResolvedPi } from "./resolver.js";
+import type { ProbedPiRuntime } from "./resolver.js";
 import { canonicalizePathAllowMissing } from "./session-layout-resolver.js";
 import { type SessionIdentityTransitionCommit, SessionRuntime } from "./session-runtime.js";
 import {
@@ -43,7 +47,7 @@ export interface CreateSessionRequest {
 }
 
 export interface SessionSupervisorOptions {
-	resolved: ResolvedPi;
+	resolved: ProbedPiRuntime;
 	env?: Record<string, string>;
 	envForWorkspace?: (cwd: string) => Record<string, string>;
 	resolveSession: (sessionHandle: string) => Promise<ExistingSessionTarget | undefined>;
@@ -263,7 +267,7 @@ export class SessionSupervisor {
 
 	async sendCommand(
 		sessionHandle: string,
-		command: RpcCommand,
+		command: SessionCommandDto,
 		context: SessionCommandContext,
 	): Promise<SessionCommandResult> {
 		if (HOST_MANAGED_COMMANDS.has(command.type)) {
@@ -310,7 +314,7 @@ export class SessionSupervisor {
 
 	async sendExtensionUiResponse(
 		sessionHandle: string,
-		response: RpcExtensionUIResponse,
+		response: ExtensionUiResponseDto,
 		context: SessionCommandContext,
 	): Promise<"accepted" | "no_dialog" | "not_running"> {
 		this.assertOpen();
@@ -337,6 +341,9 @@ export class SessionSupervisor {
 			if (this.deletionReservations.has(handle)) throw new RpcError("restart", "session_deleting");
 			if (!existing.recoverable) {
 				throw new RpcError("restart", "unpersisted_session_cannot_be_recovered");
+			}
+			if (existing.protocolIncompatible) {
+				throw new RpcError("restart", "protocol_incompatible");
 			}
 			if (existing.state !== "crashed" && existing.state !== "dormant") {
 				throw new RpcError("restart", "session_restart_requires_inactive_runtime");
@@ -912,6 +919,10 @@ export class SessionSupervisor {
 
 	private handleCrash(runtime: SessionRuntime): void {
 		if (this.closed) return;
+		if (runtime.protocolIncompatible) {
+			this.log("warn", `Not restarting protocol-incompatible Session ${runtime.sessionHandle}`);
+			return;
+		}
 		if (!runtime.recoverable) {
 			this.log("warn", `Not restarting unpersisted Session ${runtime.sessionHandle}`);
 			return;
@@ -1079,10 +1090,10 @@ function sessionPathEntryExists(sessionFile: string): boolean {
 }
 
 async function attachExportHtmlUrl(
-	command: RpcCommand,
-	response: RpcResponse,
+	command: SessionCommandDto,
+	response: SessionCommandResponseDto,
 	cwd: string,
-): Promise<RpcResponse> {
+): Promise<SessionCommandResponseDto> {
 	if (command.type !== "export_html" || response.success !== true || response.command !== "export_html") {
 		return response;
 	}
@@ -1114,5 +1125,5 @@ async function attachExportHtmlUrl(
 			path: exportedPath,
 			url: pathToFileURL(exportedPath).href,
 		},
-	} as RpcResponse;
+	} as SessionCommandResponseDto;
 }

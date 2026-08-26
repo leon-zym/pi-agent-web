@@ -1,16 +1,18 @@
 import fs from "node:fs";
 import path from "node:path";
 import type {
-	RpcCommand,
-	RpcExtensionUIRequest,
-	RpcExtensionUIResponse,
-	RpcResponse,
-	RpcSessionState,
-} from "@earendil-works/pi-coding-agent";
-import { commandTimeoutMs, type PiWebSessionEvent, RpcError } from "@pi-agent-web/protocol";
+	ExtensionUiRequestDto,
+	ExtensionUiResponseDto,
+	ProductSessionEventDto,
+	SessionCommandDto,
+	SessionCommandResponseDto,
+	SessionStateDto,
+} from "@pi-agent-web/protocol";
+import { commandTimeoutMs, RpcError } from "@pi-agent-web/protocol";
 import { canonicalizeSessionFile, sessionHandleForCanonicalFile } from "./native-session-catalog.js";
+import type { PiProcessExitInfo } from "./pi-process.js";
 import { PiProcess } from "./pi-process.js";
-import type { ResolvedPi } from "./resolver.js";
+import type { ProbedPiRuntime } from "./resolver.js";
 import { canonicalizePathAllowMissing } from "./session-layout-resolver.js";
 import {
 	type ExistingSessionTarget,
@@ -33,8 +35,8 @@ const DEFAULT_EXTENSION_STATE_MAX_ITEMS = 128;
 const DEFAULT_PENDING_DIALOG_LIMIT = 32;
 
 type BufferedFrame =
-	| { type: "event"; event: PiWebSessionEvent }
-	| { type: "extension_ui_request"; request: RpcExtensionUIRequest }
+	| { type: "event"; event: ProductSessionEventDto }
+	| { type: "extension_ui_request"; request: ExtensionUiRequestDto }
 	| {
 			type: "extension_ui_closed";
 			requestId: string;
@@ -42,7 +44,7 @@ type BufferedFrame =
 	  };
 
 interface PendingDialog {
-	request: RpcExtensionUIRequest;
+	request: ExtensionUiRequestDto;
 	timer: NodeJS.Timeout | null;
 }
 
@@ -69,7 +71,7 @@ export interface SessionIdentityTransitionCommit {
 
 export interface SessionRuntimeOptions {
 	target: SessionTarget;
-	resolved: ResolvedPi;
+	resolved: ProbedPiRuntime;
 	env?: Record<string, string>;
 	readyTimeoutMs?: number;
 	replayLimit?: number;
@@ -124,7 +126,7 @@ export class SessionRuntime {
 	private replayFrameBytes: number[] = [];
 	private replayBytes = 0;
 	private pendingDialogs = new Map<string, PendingDialog>();
-	private stickyExtension = new Map<string, RpcExtensionUIRequest>();
+	private stickyExtension = new Map<string, ExtensionUiRequestDto>();
 	private activeQueueDepth = 0;
 	private agentBusy = false;
 	private compactionBusy = false;
@@ -134,6 +136,7 @@ export class SessionRuntime {
 	private awaitingWorkStart = false;
 	private workStartTimer: NodeJS.Timeout | null = null;
 	private manuallyStopped = true;
+	private terminalProtocolIncompatible = false;
 	private sessionFileIdentityVerified = false;
 	private hasConversationIntent = false;
 
@@ -187,6 +190,10 @@ export class SessionRuntime {
 
 	get transitioning(): boolean {
 		return this.transitionStage !== null;
+	}
+
+	get protocolIncompatible(): boolean {
+		return this.terminalProtocolIncompatible;
 	}
 
 	get recoverable(): boolean {
@@ -253,6 +260,9 @@ export class SessionRuntime {
 
 	/** Start or reuse this exact Session target. */
 	start(): Promise<void> {
+		if (this.terminalProtocolIncompatible) {
+			return Promise.reject(new RpcError("session_start", "protocol_incompatible"));
+		}
 		if (this.stopPromise) {
 			const stopping = this.stopPromise;
 			return stopping.then(() => this.start());
@@ -295,6 +305,7 @@ export class SessionRuntime {
 			cwd: this.cwd,
 			resolved: this.opts.resolved,
 			args: this.spawnArguments(),
+			adapter: this.opts.resolved.adapter,
 			env: this.opts.env,
 			readyTimeoutMs: this.opts.readyTimeoutMs,
 			onReady: (state) => this.handleReady(processToken, state),
@@ -320,14 +331,21 @@ export class SessionRuntime {
 
 	private spawnArguments(): string[] {
 		const target = this.opts.target;
+		const adapter = this.opts.resolved.adapter;
 		if (target.kind === "new" && this.sessionFile === null) {
-			return ["--session-id", target.nativeSessionId, "--session-dir", target.sessionDir];
+			return adapter.createSessionArguments({
+				nativeSessionId: target.nativeSessionId,
+				sessionDir: target.sessionDir,
+			});
 		}
 		if (!this.sessionFile) throw new RpcError("start", "session target has no file");
-		return ["--session", this.sessionFile, "--session-dir", path.dirname(this.sessionFile)];
+		return adapter.openSessionArguments({
+			sessionFile: this.sessionFile,
+			sessionDir: path.dirname(this.sessionFile),
+		});
 	}
 
-	private handleReady(processToken: number, state: RpcSessionState | undefined): void {
+	private handleReady(processToken: number, state: SessionStateDto): void {
 		if (processToken !== this.processToken) return;
 		if (!state?.sessionFile) throw new RpcError("get_state", "Pi did not expose a persisted session target");
 		const canonicalFile = canonicalizeSessionFile(state.sessionFile);
@@ -394,11 +412,11 @@ export class SessionRuntime {
 	}
 
 	async send(
-		command: RpcCommand,
+		command: SessionCommandDto,
 		expectedGeneration: number,
 		admit: () => void,
 		timeoutMs?: number,
-	): Promise<RpcResponse> {
+	): Promise<SessionCommandResponseDto> {
 		const admitted = await this.withCommandAdmission(async () => {
 			this.assertGeneration(command.type, expectedGeneration);
 			admit();
@@ -437,10 +455,10 @@ export class SessionRuntime {
 	 * `get_state` verifies it. Blocking veto dialogs remain deliverable.
 	 */
 	async sendIdentityTransition(
-		command: RpcCommand,
+		command: SessionCommandDto,
 		expectedGeneration: number,
 		admit: () => void,
-	): Promise<{ response: RpcResponse; previousSessionHandle?: string }> {
+	): Promise<{ response: SessionCommandResponseDto; previousSessionHandle?: string }> {
 		return this.withCommandAdmission(async () => {
 			this.assertGeneration(command.type, expectedGeneration);
 			admit();
@@ -464,12 +482,12 @@ export class SessionRuntime {
 				if (
 					stateResponse.success !== true ||
 					stateResponse.command !== "get_state" ||
-					!(stateResponse.data as RpcSessionState).sessionFile
+					!(stateResponse.data as SessionStateDto).sessionFile
 				) {
 					throw new RpcError(command.type, "unable to verify forked session identity");
 				}
 
-				const transition = this.transitionTarget(stateResponse.data as RpcSessionState);
+				const transition = this.transitionTarget(stateResponse.data as SessionStateDto);
 				const nextTarget = transition.target;
 				const cancelled = transitionWasCancelled(response);
 				if (nextTarget.sessionHandle === previousSessionHandle) {
@@ -529,7 +547,7 @@ export class SessionRuntime {
 		return this.opts.commandTimeoutFor?.(commandType) ?? commandTimeoutMs(commandType);
 	}
 
-	private transitionTarget(state: RpcSessionState): {
+	private transitionTarget(state: SessionStateDto): {
 		target: ExistingSessionTarget;
 		frozenFile: FrozenSessionFileIdentity | null;
 	} {
@@ -598,12 +616,12 @@ export class SessionRuntime {
 		};
 	}
 
-	getPendingExtensionRequests(): RpcExtensionUIRequest[] {
+	getPendingExtensionRequests(): ExtensionUiRequestDto[] {
 		const pending = [...this.pendingDialogs.values()].map((entry) => entry.request);
 		return [...this.stickyExtension.values(), ...pending];
 	}
 
-	sendExtensionUiResponse(response: RpcExtensionUIResponse): "accepted" | "no_dialog" | "not_running" {
+	sendExtensionUiResponse(response: ExtensionUiResponseDto): "accepted" | "no_dialog" | "not_running" {
 		if (!this.pendingDialogs.has(response.id)) return "no_dialog";
 		if (!this.proc?.running) {
 			this.closeDialog(response.id, "process_lost");
@@ -650,13 +668,13 @@ export class SessionRuntime {
 		return stopping;
 	}
 
-	private handleEvent(processToken: number, event: PiWebSessionEvent): void {
+	private handleEvent(processToken: number, event: ProductSessionEventDto): void {
 		if (processToken !== this.processToken) return;
 		this.verifyMaterializedSessionFile();
 		this.enqueueFrame({ type: "event", event });
 	}
 
-	private applyEventState(event: PiWebSessionEvent): void {
+	private applyEventState(event: ProductSessionEventDto): void {
 		if (event.type === "queue_update") {
 			this.activeQueueDepth = event.steering.length + event.followUp.length;
 		}
@@ -681,7 +699,7 @@ export class SessionRuntime {
 		this.touch();
 	}
 
-	private handleExtensionRequest(processToken: number, request: RpcExtensionUIRequest): void {
+	private handleExtensionRequest(processToken: number, request: ExtensionUiRequestDto): void {
 		if (processToken !== this.processToken) return;
 		this.verifyMaterializedSessionFile();
 		if (BLOCKING_DIALOG_METHODS.has(request.method)) {
@@ -708,7 +726,7 @@ export class SessionRuntime {
 		this.sessionFileIdentityVerified = true;
 	}
 
-	private trackDialog(request: RpcExtensionUIRequest, processToken: number, publishState: boolean): void {
+	private trackDialog(request: ExtensionUiRequestDto, processToken: number, publishState: boolean): void {
 		this.closeDialog(request.id, "replaced");
 		const requestBytes = extensionRequestBytes(request);
 		this.evictStickyUntilFits(requestBytes, 1);
@@ -728,7 +746,7 @@ export class SessionRuntime {
 		if (publishState) this.setState("waiting_ui");
 	}
 
-	private rememberStickyRequest(request: RpcExtensionUIRequest): void {
+	private rememberStickyRequest(request: ExtensionUiRequestDto): void {
 		let key = request.method;
 		if (request.method === "setStatus") key += `:${request.statusKey}`;
 		if (request.method === "setWidget") key += `:${request.widgetKey}`;
@@ -858,10 +876,7 @@ export class SessionRuntime {
 		this.opts.emit(envelope);
 	}
 
-	private handleFailure(
-		processToken: number,
-		info: { code: number | null; signal: NodeJS.Signals | null; stderrTail: string },
-	): void {
+	private handleFailure(processToken: number, info: PiProcessExitInfo): void {
 		if (processToken !== this.processToken || this.failedProcessToken === processToken) return;
 		this.failedProcessToken = processToken;
 		this.proc = null;
@@ -876,17 +891,14 @@ export class SessionRuntime {
 		this.agentBusy = false;
 		this.compactionBusy = false;
 		this.activeQueueDepth = 0;
-		this.error = this.describeFailure(info);
+		this.terminalProtocolIncompatible = info.reason === "protocol_incompatible";
+		this.error = this.terminalProtocolIncompatible ? "protocol_incompatible" : this.describeFailure(info);
 		this.setState("crashed");
 		this.log("error", `Pi runtime crashed for ${this.sessionHandle}: ${this.error}`);
 		if (!this.manuallyStopped) this.opts.onCrash(this);
 	}
 
-	private describeFailure(info: {
-		code: number | null;
-		signal: NodeJS.Signals | null;
-		stderrTail: string;
-	}): string {
+	private describeFailure(info: PiProcessExitInfo): string {
 		const cause =
 			info.code !== null
 				? `exit code ${String(info.code)}`
@@ -1031,7 +1043,7 @@ function commandCarriesConversation(commandType: string): boolean {
 	return commandMayStartWork(commandType) || commandType === "bash";
 }
 
-function transitionWasCancelled(response: RpcResponse): boolean {
+function transitionWasCancelled(response: SessionCommandResponseDto): boolean {
 	if (response.success !== true || !("data" in response)) return false;
 	const data = response.data;
 	return typeof data === "object" && data !== null && (data as { cancelled?: unknown }).cancelled === true;
@@ -1041,7 +1053,7 @@ function bufferedFrameBytes(frame: BufferedFrame): number {
 	return Buffer.byteLength(JSON.stringify(frame));
 }
 
-function extensionRequestBytes(request: RpcExtensionUIRequest): number {
+function extensionRequestBytes(request: ExtensionUiRequestDto): number {
 	return Buffer.byteLength(JSON.stringify(request));
 }
 

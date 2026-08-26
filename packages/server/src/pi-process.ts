@@ -1,14 +1,27 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
 import type {
-	RpcCommand,
-	RpcExtensionUIRequest,
-	RpcExtensionUIResponse,
-	RpcResponse,
-	RpcSessionState,
-} from "@earendil-works/pi-coding-agent";
-import { type PiWebSessionEvent, RpcError } from "@pi-agent-web/protocol";
-import { attachJsonlLineReader, MAX_JSONL_LINE_BYTES, MAX_JSONL_SNAPSHOT_LINE_BYTES } from "./jsonl.js";
+	ExtensionUiRequestDto,
+	ExtensionUiResponseDto,
+	ProductSessionEventDto,
+	SessionCommandDto,
+	SessionCommandResponseDto,
+	SessionCommandTypeDto,
+	SessionStateDto,
+} from "@pi-agent-web/protocol";
+import { RpcError } from "@pi-agent-web/protocol";
+import {
+	attachJsonlLineReader,
+	JsonlLineTooLongError,
+	MAX_JSONL_LINE_BYTES,
+	MAX_JSONL_SNAPSHOT_LINE_BYTES,
+} from "./jsonl.js";
+import { legacyRpcV1Adapter } from "./legacy-rpc-v1.js";
+import {
+	type PiHostAdapter,
+	PiProtocolIncompatibleError,
+	type PiRuntimeDiagnostic,
+} from "./pi-host-adapter.js";
 import type { ResolvedPi } from "./resolver.js";
 
 /**
@@ -38,10 +51,19 @@ export interface PiProcessOptions {
 	stderrMaxBytes?: number;
 	/** Bounded allowance for Pi's single-line get_messages response. */
 	snapshotLineMaxBytes?: number;
-	onEvent?: (event: PiWebSessionEvent) => void;
-	onExtensionUiRequest?: (request: RpcExtensionUIRequest) => void;
-	onExit?: (info: { code: number | null; signal: NodeJS.Signals | null; stderrTail: string }) => void;
-	onReady?: (initialState: RpcSessionState | undefined) => void;
+	adapter?: PiHostAdapter;
+	onEvent?: (event: ProductSessionEventDto) => void;
+	onExtensionUiRequest?: (request: ExtensionUiRequestDto) => void;
+	onExit?: (info: PiProcessExitInfo) => void;
+	onReady?: (initialState: SessionStateDto) => void;
+}
+
+export interface PiProcessExitInfo {
+	code: number | null;
+	signal: NodeJS.Signals | null;
+	stderrTail: string;
+	reason?: "protocol_incompatible";
+	diagnostic?: PiRuntimeDiagnostic;
 }
 
 export class ProcessExitedError extends Error {
@@ -60,8 +82,8 @@ export class ProcessExitedError extends Error {
 }
 
 interface PendingRequest {
-	command: string;
-	resolve: (r: RpcResponse) => void;
+	command: SessionCommandTypeDto;
+	resolve: (r: SessionCommandResponseDto) => void;
 	reject: (e: Error) => void;
 	timer: NodeJS.Timeout;
 }
@@ -79,181 +101,8 @@ const UNEXPECTED_GROUP_KILL_GRACE_MS = 100;
 
 type UnknownFrame = Record<string, unknown>;
 
-class InvalidPiProtocolFrameError extends Error {
-	constructor(kind: string, detail: string) {
-		super(`invalid Pi ${kind} frame: ${detail}`);
-		this.name = "InvalidPiProtocolFrameError";
-	}
-}
-
 function isRecord(value: unknown): value is UnknownFrame {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isStringArray(value: unknown): value is string[] {
-	return Array.isArray(value) && value.every((entry) => typeof entry === "string");
-}
-
-function isFiniteNumber(value: unknown): value is number {
-	return typeof value === "number" && Number.isFinite(value);
-}
-
-function isOptionalFiniteNumber(value: unknown): boolean {
-	return value === undefined || isFiniteNumber(value);
-}
-
-function isOptionalString(value: unknown): boolean {
-	return value === undefined || typeof value === "string";
-}
-
-function isRpcResponseFrame(
-	frame: UnknownFrame,
-): frame is UnknownFrame & RpcResponse & { id: string; command: string } {
-	return (
-		frame.type === "response" &&
-		typeof frame.id === "string" &&
-		typeof frame.command === "string" &&
-		typeof frame.success === "boolean" &&
-		(frame.success || typeof frame.error === "string")
-	);
-}
-
-function isExtensionUiRequestFrame(frame: UnknownFrame): frame is UnknownFrame & RpcExtensionUIRequest {
-	if (
-		frame.type !== "extension_ui_request" ||
-		typeof frame.id !== "string" ||
-		typeof frame.method !== "string" ||
-		!isOptionalFiniteNumber(frame.timeout)
-	) {
-		return false;
-	}
-	if (isFiniteNumber(frame.timeout) && frame.timeout < 0) return false;
-
-	switch (frame.method) {
-		case "select":
-			return typeof frame.title === "string" && isStringArray(frame.options);
-		case "confirm":
-			return typeof frame.title === "string" && typeof frame.message === "string";
-		case "input":
-			return typeof frame.title === "string" && isOptionalString(frame.placeholder);
-		case "editor":
-			return typeof frame.title === "string" && isOptionalString(frame.prefill);
-		case "notify":
-			return (
-				typeof frame.message === "string" &&
-				(frame.notifyType === undefined ||
-					frame.notifyType === "info" ||
-					frame.notifyType === "warning" ||
-					frame.notifyType === "error")
-			);
-		case "setStatus":
-			return typeof frame.statusKey === "string" && isOptionalString(frame.statusText);
-		case "setWidget":
-			return (
-				typeof frame.widgetKey === "string" &&
-				(frame.widgetLines === undefined || isStringArray(frame.widgetLines)) &&
-				(frame.widgetPlacement === undefined ||
-					frame.widgetPlacement === "aboveEditor" ||
-					frame.widgetPlacement === "belowEditor")
-			);
-		case "setTitle":
-			return typeof frame.title === "string";
-		case "set_editor_text":
-			return typeof frame.text === "string";
-		default:
-			return false;
-	}
-}
-
-function isAgentMessage(value: unknown): boolean {
-	return isRecord(value) && typeof value.role === "string" && "content" in value;
-}
-
-function hasRetryFields(frame: UnknownFrame): boolean {
-	return (
-		isFiniteNumber(frame.attempt) &&
-		isFiniteNumber(frame.maxAttempts) &&
-		isFiniteNumber(frame.delayMs) &&
-		typeof frame.errorMessage === "string"
-	);
-}
-
-function isPiEventFrame(frame: UnknownFrame): frame is UnknownFrame & PiWebSessionEvent {
-	switch (frame.type) {
-		case "agent_start":
-		case "agent_settled":
-		case "turn_start":
-		case "summarization_retry_finished":
-			return true;
-		case "agent_end":
-			return (
-				Array.isArray(frame.messages) &&
-				frame.messages.every(isAgentMessage) &&
-				typeof frame.willRetry === "boolean"
-			);
-		case "turn_end":
-			return isAgentMessage(frame.message) && Array.isArray(frame.toolResults);
-		case "message_start":
-		case "message_end":
-			return isAgentMessage(frame.message);
-		case "message_update":
-			return (
-				isRecord(frame.usage) &&
-				isRecord(frame.assistantMessageEvent) &&
-				typeof frame.assistantMessageEvent.type === "string"
-			);
-		case "tool_execution_start":
-		case "tool_execution_update":
-			return typeof frame.toolCallId === "string" && typeof frame.toolName === "string";
-		case "tool_execution_end":
-			return (
-				typeof frame.toolCallId === "string" &&
-				typeof frame.toolName === "string" &&
-				typeof frame.isError === "boolean"
-			);
-		case "queue_update":
-			return isStringArray(frame.steering) && isStringArray(frame.followUp);
-		case "compaction_start":
-			return frame.reason === "manual" || frame.reason === "threshold" || frame.reason === "overflow";
-		case "entry_appended":
-			return isRecord(frame.entry);
-		case "session_info_changed":
-			return isOptionalString(frame.name);
-		case "thinking_level_changed":
-			return typeof frame.level === "string";
-		case "compaction_end":
-			return (
-				(frame.reason === "manual" || frame.reason === "threshold" || frame.reason === "overflow") &&
-				typeof frame.aborted === "boolean" &&
-				typeof frame.willRetry === "boolean" &&
-				isOptionalString(frame.errorMessage)
-			);
-		case "auto_retry_start":
-		case "summarization_retry_scheduled":
-			return hasRetryFields(frame);
-		case "auto_retry_end":
-			return (
-				typeof frame.success === "boolean" &&
-				isFiniteNumber(frame.attempt) &&
-				isOptionalString(frame.finalError)
-			);
-		case "summarization_retry_attempt_start":
-			return (
-				frame.source === "branchSummary" ||
-				(frame.source === "compaction" &&
-					(frame.reason === "manual" || frame.reason === "threshold" || frame.reason === "overflow"))
-			);
-		case "bash_execution_update":
-			return isOptionalString(frame.id) && typeof frame.delta === "string";
-		case "extension_error":
-			return (
-				typeof frame.extensionPath === "string" &&
-				typeof frame.event === "string" &&
-				typeof frame.error === "string"
-			);
-		default:
-			return false;
-	}
 }
 
 export class PiProcess {
@@ -269,6 +118,7 @@ export class PiProcess {
 	private ready: Promise<void> | null = null;
 	private readyTimer: NodeJS.Timeout | undefined;
 	private writeTail: Promise<void> = Promise.resolve();
+	private readonly adapter: PiHostAdapter;
 	private opts: Required<
 		Pick<PiProcessOptions, "stderrMaxBytes" | "commandTimeoutMs" | "readyTimeoutMs" | "snapshotLineMaxBytes">
 	> &
@@ -276,6 +126,7 @@ export class PiProcess {
 
 	constructor(opts: PiProcessOptions) {
 		this.cwd = opts.cwd;
+		this.adapter = opts.adapter ?? legacyRpcV1Adapter;
 		this.opts = {
 			...opts,
 			readyTimeoutMs: opts.readyTimeoutMs ?? 10_000,
@@ -355,7 +206,7 @@ export class PiProcess {
 
 		this.detach = attachJsonlLineReader(child.stdout!, (line) => this.handleLine(line), {
 			maxLineBytes: () => this.currentJsonlLineBudget(),
-			onError: (error) => this.handleProtocolFailure(identity, error),
+			onError: (error) => this.handleProtocolFailure(identity, this.normalizeFramingError(error)),
 		});
 
 		child.once("exit", (code, signal) => {
@@ -392,11 +243,9 @@ export class PiProcess {
 				readyTimeout,
 			]);
 			clearTimeout(this.readyTimer);
-			const initialState =
-				stateResponse.success === true && stateResponse.command === "get_state"
-					? (stateResponse.data as RpcSessionState)
-					: undefined;
-			this.opts.onReady?.(initialState);
+			if (stateResponse.success === false) throw new RpcError("get_state", stateResponse.error);
+			if (stateResponse.command !== "get_state") throw new RpcError("get_state", "unexpected ready response");
+			this.opts.onReady?.(stateResponse.data);
 		} catch (error) {
 			clearTimeout(this.readyTimer);
 			this.ready = null;
@@ -411,22 +260,25 @@ export class PiProcess {
 
 	/** Send a command and wait for its response frame (auto id, echoed back).
 	 * success:false responses resolve normally; callers check via expectData. */
-	send(command: RpcCommand, timeoutMs?: number): Promise<RpcResponse> {
+	send(command: SessionCommandDto, timeoutMs?: number): Promise<SessionCommandResponseDto> {
 		const id = command.id ?? this.nextId();
 		return this.sendRaw({ ...command, id }, timeoutMs);
 	}
 
 	/** Send a no-response protocol frame (extension_ui_response etc.). */
-	sendNoResponse(obj: RpcExtensionUIResponse): void {
+	sendNoResponse(obj: ExtensionUiResponseDto): void {
 		const identity = this.spawnIdentity;
-		void this.write(obj).catch((error) => {
+		void this.write(this.adapter.encodeExtensionUiResponse(obj)).catch((error) => {
 			if (identity) {
 				this.handleProtocolFailure(identity, error instanceof Error ? error : new Error(String(error)));
 			}
 		});
 	}
 
-	private sendRaw(obj: RpcCommand & { id: string }, timeoutMs?: number): Promise<RpcResponse> {
+	private sendRaw(
+		obj: SessionCommandDto & { id: string },
+		timeoutMs?: number,
+	): Promise<SessionCommandResponseDto> {
 		if (!this.leaderRunning || this.spawnIdentity?.unexpectedFinalization) {
 			return Promise.reject(new Error("pi process is not running"));
 		}
@@ -434,13 +286,13 @@ export class PiProcess {
 			return Promise.reject(new RpcError(obj.type, `duplicate pending command id: ${obj.id}`));
 		}
 		const timeout = timeoutMs ?? this.opts.commandTimeoutMs;
-		return new Promise<RpcResponse>((resolve, reject) => {
+		return new Promise<SessionCommandResponseDto>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.pending.delete(obj.id);
 				reject(new Error(`command timed out (${timeout / 1000}s): ${obj.type}`));
 			}, timeout);
 			this.pending.set(obj.id, { command: obj.type, resolve, reject, timer });
-			void this.write(obj).catch((error) => {
+			void this.write(this.adapter.encodeCommand(obj)).catch((error) => {
 				clearTimeout(timer);
 				this.pending.delete(obj.id);
 				reject(error instanceof Error ? error : new Error(String(error)));
@@ -464,18 +316,26 @@ export class PiProcess {
 
 	private handleProtocolFailure(identity: SpawnIdentity, error: Error): void {
 		if (this.stopped || this.spawnIdentity !== identity) return;
+		const protocol = error instanceof PiProtocolIncompatibleError ? error.diagnostic : undefined;
 		this.beginUnexpectedFinalization(identity, error, {
 			code: null,
 			signal: null,
 			stderrTail: `${this.stderrTail}\n${error.message}`,
+			...(protocol ? { reason: "protocol_incompatible" as const, diagnostic: protocol } : {}),
 		});
 	}
 
-	private beginUnexpectedFinalization(
-		identity: SpawnIdentity,
-		error: Error,
-		info: { code: number | null; signal: NodeJS.Signals | null; stderrTail: string },
-	): void {
+	private normalizeFramingError(error: Error): Error {
+		if (!(error instanceof JsonlLineTooLongError)) return error;
+		return new PiProtocolIncompatibleError({
+			code: "protocol_incompatible",
+			adapterId: this.adapter.id,
+			frameKind: "frame",
+			reason: "oversized_frame",
+		});
+	}
+
+	private beginUnexpectedFinalization(identity: SpawnIdentity, error: Error, info: PiProcessExitInfo): void {
 		if (this.spawnIdentity !== identity || identity.unexpectedFinalization) return;
 		const finalization = this.finalizeUnexpectedExit(identity, error, info);
 		identity.unexpectedFinalization = finalization;
@@ -487,7 +347,7 @@ export class PiProcess {
 	private async finalizeUnexpectedExit(
 		identity: SpawnIdentity,
 		error: Error,
-		info: { code: number | null; signal: NodeJS.Signals | null; stderrTail: string },
+		info: PiProcessExitInfo,
 	): Promise<void> {
 		if (this.spawnIdentity === identity) {
 			this.rejectAll(error);
@@ -587,21 +447,28 @@ export class PiProcess {
 			data = JSON.parse(line);
 		} catch {
 			if (exceedsOrdinaryLimit) {
-				throw new InvalidPiProtocolFrameError(
-					"frame",
-					`oversized non-snapshot JSONL line exceeds the ${String(MAX_JSONL_LINE_BYTES)} byte limit`,
-				);
+				throw new PiProtocolIncompatibleError({
+					code: "protocol_incompatible",
+					adapterId: this.adapter.id,
+					frameKind: "frame",
+					reason: "oversized_frame",
+				});
 			}
 			// Dirty line: tolerated and dropped (rpc-client.ts:305-311).
 			return;
 		}
 		if (exceedsOrdinaryLimit && !this.isPendingSnapshotResponse(data)) {
-			throw new InvalidPiProtocolFrameError(
-				"frame",
-				`oversized non-snapshot JSONL line exceeds the ${String(MAX_JSONL_LINE_BYTES)} byte limit`,
-			);
+			throw new PiProtocolIncompatibleError({
+				code: "protocol_incompatible",
+				adapterId: this.adapter.id,
+				frameKind: "frame",
+				reason: "oversized_frame",
+			});
 		}
-		if (typeof data !== "object" || data === null) return;
+		if (typeof data !== "object" || data === null) {
+			this.adapter.decodeUnsolicited(data);
+			return;
+		}
 		const frame = data as Record<string, unknown>;
 
 		if (frame.type === "response") {
@@ -609,44 +476,27 @@ export class PiProcess {
 			if (id) {
 				const pending = this.pending.get(id);
 				if (pending) {
-					if (!isRpcResponseFrame(frame)) {
-						throw new InvalidPiProtocolFrameError("response", "missing command or success fields");
-					}
-					if (frame.command !== pending.command) {
-						throw new InvalidPiProtocolFrameError(
-							"response",
-							`command mismatch (expected ${pending.command}, received ${frame.command})`,
-						);
-					}
+					const response = this.adapter.decodeResponse(frame, pending.command);
 					this.pending.delete(id);
 					clearTimeout(pending.timer);
-					pending.resolve(frame);
+					pending.resolve(response);
 					return;
 				}
 			}
-			// Response with no pending request: drop (never treat as an event).
+			// Late or unknown-id responses are ignorable only after their complete
+			// command-specific shape has been validated by the adapter.
+			this.adapter.decodeOrphanedResponse(frame);
 			return;
 		}
 
-		if (frame.type === "extension_ui_request") {
-			if (!isExtensionUiRequestFrame(frame)) {
-				throw new InvalidPiProtocolFrameError("Extension UI request", "invalid method payload");
-			}
-			this.opts.onExtensionUiRequest?.(frame);
-			return;
-		}
-
-		if (typeof frame.type === "string") {
-			if (!isPiEventFrame(frame)) {
-				throw new InvalidPiProtocolFrameError("event", `unknown or malformed type ${frame.type}`);
-			}
-			this.opts.onEvent?.(frame);
-		}
+		const decoded = this.adapter.decodeUnsolicited(frame);
+		if (decoded.kind === "event") this.opts.onEvent?.(decoded.event);
+		if (decoded.kind === "extension_ui_request") this.opts.onExtensionUiRequest?.(decoded.request);
 	}
 
-	private isPendingSnapshotResponse(data: unknown): data is UnknownFrame & RpcResponse {
-		if (!isRecord(data) || !isRpcResponseFrame(data) || data.command !== "get_messages") return false;
-		return this.pending.get(data.id)?.command === "get_messages";
+	private isPendingSnapshotResponse(data: unknown): data is UnknownFrame {
+		if (!isRecord(data) || data.type !== "response" || data.command !== "get_messages") return false;
+		return typeof data.id === "string" && this.pending.get(data.id)?.command === "get_messages";
 	}
 
 	private rejectAll(error: Error): void {

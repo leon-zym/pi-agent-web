@@ -4,8 +4,9 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
-import type { RpcCommand, RpcResponse } from "@earendil-works/pi-coding-agent";
 import type {
+	SessionCommandDto,
+	SessionCommandResponseDto,
 	SessionRuntimeDto,
 	SessionWsClientMessage,
 	SessionWsServerMessage,
@@ -13,6 +14,7 @@ import type {
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import { MAX_JSONL_SNAPSHOT_LINE_BYTES } from "../src/jsonl.js";
+import { legacyRpcV1Adapter } from "../src/legacy-rpc-v1.js";
 import { canonicalizeSessionFile, sessionHandleForFile } from "../src/native-session-catalog.js";
 import type { ExistingSessionTarget } from "../src/session-runtime-types.js";
 import { SessionSupervisor } from "../src/session-supervisor.js";
@@ -176,7 +178,7 @@ function snapshotResponse(textBytes: number): SessionWsServerMessage {
 			data: {
 				messages: [{ role: "assistant", content: [{ type: "text", text: "x".repeat(textBytes) }] }],
 			},
-		} as RpcResponse,
+		} as unknown as SessionCommandResponseDto,
 	};
 }
 
@@ -193,6 +195,11 @@ function bridgeConnection(bridge: SessionWsBridge): {
 	return { connection, send: internals.send.bind(bridge) };
 }
 
+function markBridgeConnectionHelloComplete(bridge: SessionWsBridge): void {
+	const { connection } = bridgeConnection(bridge);
+	(connection as { helloComplete: boolean }).helloComplete = true;
+}
+
 async function createHarness(
 	targets: ExistingSessionTarget[],
 	options: { replayLimit?: number } = {},
@@ -206,6 +213,11 @@ async function createHarness(
 			args: [fixturePath],
 			source: "pi-path",
 			label: "session runtime fixture",
+			adapter: legacyRpcV1Adapter,
+			version: "0.84.2",
+			adapterId: "legacy-rpc-v1",
+			compatibilityStatus: "current",
+			capabilities: legacyRpcV1Adapter.capabilities,
 		},
 		resolveSession: async (sessionHandle) => targetMap.get(sessionHandle),
 		broadcast: (message) => bridge.broadcast(message),
@@ -215,6 +227,13 @@ async function createHarness(
 	});
 	bridge = new SessionWsBridge({
 		supervisor,
+		serverEpoch: "session-ws-bridge-test-epoch",
+		serverBuild: "0.1.0-test",
+		runtime: {
+			version: "0.84.2",
+			adapterId: "legacy-rpc-v1",
+			capabilities: ["rpc.commands", "rpc.events", "rpc.extension_ui", "session.multiplex"],
+		},
 		heartbeatIntervalMs: 60_000,
 		log: (_level, message) => connectionEvents.push(message),
 	});
@@ -251,6 +270,23 @@ async function openClient(harness: Harness): Promise<ClientProbe> {
 		ws.once("open", resolve);
 		ws.once("error", reject);
 	});
+	const hello = new Promise<Record<string, unknown>>((resolve, reject) => {
+		const timeout = setTimeout(() => reject(new Error("server_hello timed out")), 2_000);
+		ws.once("message", (raw) => {
+			clearTimeout(timeout);
+			resolve(JSON.parse(raw.toString()) as Record<string, unknown>);
+		});
+	});
+	ws.send(
+		JSON.stringify({
+			type: "client_hello",
+			protocol: { major: 1, minor: 0 },
+			clientBuild: "0.1.0-test",
+			capabilities: ["rpc.commands", "rpc.events", "rpc.extension_ui", "session.multiplex"],
+			limits: { maxServerFrameBytes: MAX_JSONL_SNAPSHOT_LINE_BYTES + MAX_SESSION_WS_BUFFERED_BYTES },
+		}),
+	);
+	if ((await hello).type !== "server_hello") throw new Error("Gateway rejected test client hello");
 	const probe = new ClientProbe(ws);
 	harness.clients.push(probe);
 	return probe;
@@ -294,7 +330,7 @@ async function command(
 	client: ClientProbe,
 	sessionHandle: string,
 	expectedGeneration: number,
-	rpcCommand: RpcCommand,
+	rpcCommand: SessionCommandDto,
 	fencingToken?: string,
 ): Promise<ResponseFrame> {
 	const mark = client.mark();
@@ -895,6 +931,7 @@ describe("SessionWsBridge", () => {
 		};
 		const socket = new NonClosingSocket();
 		harness.bridge.wss.emit("connection", socket as unknown as WebSocket, {} as http.IncomingMessage);
+		markBridgeConnectionHelloComplete(harness.bridge);
 		socket.emit(
 			"message",
 			Buffer.from(JSON.stringify({ type: "session_subscribe", sessionHandle: target.sessionHandle })),
@@ -924,6 +961,7 @@ describe("SessionWsBridge", () => {
 		const harness = await createHarness([]);
 		const socket = new NonClosingSocket();
 		harness.bridge.wss.emit("connection", socket as unknown as WebSocket, {} as http.IncomingMessage);
+		markBridgeConnectionHelloComplete(harness.bridge);
 		socket.bufferedAmount = MAX_SESSION_WS_BUFFERED_BYTES + 1;
 
 		harness.bridge.broadcast({ type: "auth_changed" });
@@ -937,6 +975,7 @@ describe("SessionWsBridge", () => {
 		const harness = await createHarness([]);
 		const socket = new ControlledSendSocket();
 		harness.bridge.wss.emit("connection", socket as unknown as WebSocket, {} as http.IncomingMessage);
+		markBridgeConnectionHelloComplete(harness.bridge);
 		const { connection, send } = bridgeConnection(harness.bridge);
 
 		send(connection, {
@@ -956,6 +995,7 @@ describe("SessionWsBridge", () => {
 		const socket = new ControlledSendSocket();
 		socket.deferNextSend();
 		harness.bridge.wss.emit("connection", socket as unknown as WebSocket, {} as http.IncomingMessage);
+		markBridgeConnectionHelloComplete(harness.bridge);
 		const { connection, send } = bridgeConnection(harness.bridge);
 
 		send(connection, { type: "auth_changed" });
@@ -975,6 +1015,7 @@ describe("SessionWsBridge", () => {
 		const socket = new ControlledSendSocket();
 		socket.deferNextSend();
 		harness.bridge.wss.emit("connection", socket as unknown as WebSocket, {} as http.IncomingMessage);
+		markBridgeConnectionHelloComplete(harness.bridge);
 		const { connection, send } = bridgeConnection(harness.bridge);
 		const backlogFrame = (suffix: string): SessionWsServerMessage => ({
 			type: "session_error",
@@ -999,6 +1040,7 @@ describe("SessionWsBridge", () => {
 		const socket = new ControlledSendSocket();
 		socket.deferNextSend();
 		harness.bridge.wss.emit("connection", socket as unknown as WebSocket, {} as http.IncomingMessage);
+		markBridgeConnectionHelloComplete(harness.bridge);
 		const { connection, send } = bridgeConnection(harness.bridge);
 
 		send(connection, snapshotResponse(2_000_000));
@@ -1366,7 +1408,7 @@ describe("SessionWsBridge", () => {
 								},
 							],
 						},
-					} as RpcResponse,
+					} as unknown as SessionCommandResponseDto,
 				};
 			};
 
