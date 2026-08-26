@@ -1,6 +1,17 @@
+import fs from "node:fs";
+
+if (process.argv.includes("--version")) {
+	process.stdout.write("0.84.2\n");
+	process.exit(0);
+}
+
 let buffer = "";
 let sessionId = "fake-session";
 let sessionFile = "/tmp/fake-session.jsonl";
+
+if (process.env.PI_WEB_FAKE_ARGV_MARKER) {
+	fs.writeFileSync(process.env.PI_WEB_FAKE_ARGV_MARKER, JSON.stringify(process.argv.slice(2)));
+}
 
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -16,6 +27,21 @@ process.stdin.on("data", (chunk) => {
 
 function send(frame) {
 	process.stdout.write(`${JSON.stringify(frame)}\n`);
+}
+
+function state() {
+	return {
+		sessionId,
+		sessionFile,
+		thinkingLevel: "off",
+		isStreaming: false,
+		isCompacting: false,
+		steeringMode: "all",
+		followUpMode: "all",
+		autoCompactionEnabled: true,
+		messageCount: 0,
+		pendingMessageCount: 0,
+	};
 }
 
 function handleLine(line) {
@@ -35,7 +61,7 @@ function handleLine(line) {
 				id: command.id,
 				command: command.type,
 				success: true,
-				data: { sessionId, sessionFile, thinkingLevel: "off", argv: process.argv.slice(2) },
+				data: state(),
 			});
 			return;
 		case "get_commands":
@@ -56,7 +82,24 @@ function handleLine(line) {
 				id: command.id,
 				command: command.type,
 				success: true,
-				data: { messages: [{ role: "assistant", content: [{ type: "text", text }] }] },
+				data: {
+					messages: [
+						{
+							role: "assistant",
+							content: [{ type: "text", text }],
+							usage: {
+								input: 0,
+								output: 0,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 0,
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							},
+							stopReason: "stop",
+							timestamp: Date.now(),
+						},
+					],
+				},
 			});
 			return;
 		}
@@ -109,6 +152,7 @@ function handleLine(line) {
 			send({ type: "response", id: command.id, command: command.type, success: true });
 			return;
 		case "get_last_assistant_text":
+			if (command.id === "same-id") return;
 			send({ type: "response", command: command.type, success: true, data: { text: "missing id" } });
 			return;
 		default:

@@ -1,4 +1,4 @@
-import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type { SessionEventDto } from "@pi-agent-web/protocol";
 import { describe, expect, it } from "vitest";
 import { rebuildProjectionFromMessages } from "../src/stores/projection";
 import { reduceProjection } from "../src/stores/projection-reducer";
@@ -76,7 +76,7 @@ describe("hanging tool status convergence", () => {
 					contentIndex: 0,
 					toolCall: { type: "toolCall", id: "call-prep", name: "read_file", arguments: { path: "foo.txt" } },
 				},
-			} as Extract<JsonAgentSessionEvent, { type: "message_update" }>,
+			} as Extract<SessionEventDto, { type: "message_update" }>,
 			ctx,
 		);
 

@@ -1,10 +1,9 @@
 import type {
-	RpcCommand,
-	RpcExtensionUIRequest,
-	RpcExtensionUIResponse,
-	RpcResponse,
-} from "@earendil-works/pi-coding-agent";
-import type {
+	ExtensionUiRequestDto,
+	ExtensionUiResponseDto,
+	GatewayProtocolVersionDto,
+	SessionCommandDto,
+	SessionCommandResponseDto,
 	SessionReplayCursorDto,
 	SessionReplayFrameDto,
 	SessionRuntimeDto,
@@ -13,7 +12,7 @@ import type {
 import type { StoreApi } from "zustand/vanilla";
 import type { OrderedSessionFrameBus, SessionTransportGlobalBus } from "./session-frame-bus";
 
-export type SessionTransportConnectionState = "idle" | "connecting" | "online" | "offline";
+export type SessionTransportConnectionState = "idle" | "connecting" | "online" | "offline" | "incompatible";
 
 export interface SessionLeaseState {
 	isController: boolean;
@@ -50,7 +49,7 @@ export interface SessionChannelState {
 	/** Highest sequence synchronously applied or durably accepted by the projection pipeline. */
 	projectedSeq: number;
 	lease: SessionLeaseState;
-	pendingExtensionRequests: RpcExtensionUIRequest[];
+	pendingExtensionRequests: ExtensionUiRequestDto[];
 	resync: SessionResyncState | null;
 	rawEvents: SessionRawEventRecord[];
 }
@@ -95,7 +94,11 @@ export interface SessionTransportOptions {
 	rawEventGlobalMaxBytes?: number;
 	reconnectBaseMs?: number;
 	reconnectMaxMs?: number;
+	helloTimeoutMs?: number;
 	maxActiveSubscriptions?: number;
+	/** UI build identity is diagnostic only; compatibility is negotiated by protocolVersion. */
+	clientBuild?: string;
+	protocolVersion?: GatewayProtocolVersionDto;
 	onResyncRequired?: (message: Extract<SessionWsServerMessage, { type: "resync_required" }>) => void;
 }
 
@@ -110,8 +113,12 @@ export interface SessionTransportState {
 	invalidateSessionSnapshot: (sessionHandle: string) => boolean;
 	claimSession: (sessionHandle: string) => boolean;
 	releaseSession: (sessionHandle: string) => boolean;
-	sendCommand: (sessionHandle: string, command: RpcCommand, timeoutMs?: number) => Promise<RpcResponse>;
-	sendExtensionUiResponse: (sessionHandle: string, response: RpcExtensionUIResponse) => boolean;
+	sendCommand: (
+		sessionHandle: string,
+		command: SessionCommandDto,
+		timeoutMs?: number,
+	) => Promise<SessionCommandResponseDto>;
+	sendExtensionUiResponse: (sessionHandle: string, response: ExtensionUiResponseDto) => boolean;
 	completeResync: (sessionHandle: string, cursor?: SessionReplayCursorDto) => void;
 }
 

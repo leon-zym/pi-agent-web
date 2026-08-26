@@ -1,4 +1,4 @@
-import { expectData } from "@pi-agent-web/protocol";
+import { expectCommandData } from "@pi-agent-web/protocol";
 import {
 	Check,
 	ChevronRight,
@@ -135,7 +135,7 @@ export function SessionHeader() {
 		let result: ExportHtmlResult;
 		try {
 			const response = await sendControlCommand(sessionHandle, { type: "export_html" });
-			result = parseExportHtmlResult(expectData(response));
+			result = parseExportHtmlResult(expectCommandData(response, "export_html"));
 		} catch (error) {
 			toast.error(tt("header.exportFailed"), {
 				description: displayError(error),

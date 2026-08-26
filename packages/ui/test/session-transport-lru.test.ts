@@ -1,4 +1,8 @@
-import type { SessionRuntimeDto, SessionWsClientMessage } from "@pi-agent-web/protocol";
+import type {
+	GatewayClientHelloDto,
+	SessionRuntimeDto,
+	SessionWsClientMessage,
+} from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	createSessionTransport,
@@ -13,15 +17,36 @@ class FakeSocket implements SessionWebSocket {
 	onclose: (() => void) | null = null;
 	onerror: (() => void) | null = null;
 	onmessage: ((event: { data: unknown }) => void) | null = null;
-	readonly sent: SessionWsClientMessage[] = [];
+	readonly sent: Array<SessionWsClientMessage | GatewayClientHelloDto> = [];
 
 	send(data: string): void {
-		this.sent.push(JSON.parse(data) as SessionWsClientMessage);
+		this.sent.push(JSON.parse(data) as SessionWsClientMessage | GatewayClientHelloDto);
 	}
 	close(): void {
 		this.readyState = 3;
 		this.onclose?.();
 	}
+}
+
+function open(socket: FakeSocket | undefined): void {
+	if (!socket) throw new Error("transport did not create a socket");
+	socket.onopen?.();
+	socket.onmessage?.({
+		data: JSON.stringify({
+			type: "server_hello",
+			protocol: { major: 1, minor: 0 },
+			serverBuild: "test-server",
+			serverEpoch: "test-epoch",
+			piVersion: "0.84.2",
+			adapterId: "legacy-rpc-v1",
+			capabilities: ["rpc.commands", "rpc.events", "rpc.extension_ui", "session.multiplex"],
+			limits: {
+				maxClientFrameBytes: 8 * 1024 * 1024,
+				maxSnapshotFrameBytes: 32 * 1024 * 1024,
+				maxExtensionRequests: 256,
+			},
+		}),
+	});
 }
 
 interface Harness {
@@ -104,7 +129,7 @@ describe("Active WebSocket Subscription LRU admission target with liveness guard
 	it("allows up to MAX_ACTIVE_SUBSCRIPTIONS without eviction", () => {
 		const { controller, sockets } = harness();
 		controller.store.getState().connect();
-		sockets[0]?.onopen?.();
+		open(sockets[0]);
 
 		for (let i = 1; i <= 6; i++) {
 			const handle = `session-${i}`;
@@ -124,7 +149,7 @@ describe("Active WebSocket Subscription LRU admission target with liveness guard
 	it("evicts the least recently used idle persisted session when capacity exceeds limit", () => {
 		const { controller, sockets } = harness();
 		controller.store.getState().connect();
-		sockets[0]?.onopen?.();
+		open(sockets[0]);
 
 		// Subscribe session-1 to session-6
 		for (let i = 1; i <= 6; i++) {
@@ -161,7 +186,7 @@ describe("Active WebSocket Subscription LRU admission target with liveness guard
 	it("does not evict running sessions even if they are LRU (Liveness Guard)", () => {
 		const { controller, sockets } = harness();
 		controller.store.getState().connect();
-		sockets[0]?.onopen?.();
+		open(sockets[0]);
 
 		// session-1 is running
 		controller.store.getState().subscribeSession("session-1");
@@ -196,7 +221,7 @@ describe("Active WebSocket Subscription LRU admission target with liveness guard
 	it("does not evict unpersisted sessions (transient sessions)", () => {
 		const { controller, sockets } = harness();
 		controller.store.getState().connect();
-		sockets[0]?.onopen?.();
+		open(sockets[0]);
 
 		// session-1 is unpersisted
 		controller.store.getState().subscribeSession("session-1");
@@ -227,7 +252,7 @@ describe("Active WebSocket Subscription LRU admission target with liveness guard
 	it("does not evict sessions with pending extension requests", () => {
 		const { controller, sockets } = harness();
 		controller.store.getState().connect();
-		sockets[0]?.onopen?.();
+		open(sockets[0]);
 
 		// session-1 has pending extension UI request
 		controller.store.getState().subscribeSession("session-1");
@@ -264,7 +289,7 @@ describe("Active WebSocket Subscription LRU admission target with liveness guard
 	it("allows protected sessions to exceed the soft target when no safe eviction exists", () => {
 		const { controller, sockets } = harness();
 		controller.store.getState().connect();
-		sockets[0]?.onopen?.();
+		open(sockets[0]);
 
 		// All 6 sessions are running
 		for (let i = 1; i <= 6; i++) {
@@ -289,7 +314,7 @@ describe("Active WebSocket Subscription LRU admission target with liveness guard
 	it("evicts dormant historical sessions when pool exceeds capacity", () => {
 		const { controller, sockets } = harness();
 		controller.store.getState().connect();
-		sockets[0]?.onopen?.();
+		open(sockets[0]);
 
 		// Subscribe 6 dormant historical sessions
 		for (let i = 1; i <= 6; i++) {

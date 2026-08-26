@@ -2,6 +2,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+if (process.argv.includes("--version")) {
+	process.stdout.write("0.84.2\n");
+	process.exit(0);
+}
+
 let inputBuffer = "";
 let entrySequence = 0;
 let activeRun = null;
@@ -326,7 +331,7 @@ function streamComplexPrompt(command, text, user, userEntryId) {
 	});
 
 	send({ type: "agent_start" });
-	send({ type: "turn_start", turnIndex: 0, timestamp: Date.now() });
+	send({ type: "turn_start" });
 	send({ type: "message_start", message: user });
 	send({ type: "message_end", message: user });
 	send({ type: "session_info_changed" });
@@ -337,47 +342,40 @@ function streamComplexPrompt(command, text, user, userEntryId) {
 		let partial = assistantMessageWithContent([], "pending");
 		send({
 			type: "message_update",
-			message: partial,
 			usage: partial.usage,
-			assistantMessageEvent: { type: "thinking_start", contentIndex: 0, partial },
+			assistantMessageEvent: { type: "thinking_start", contentIndex: 0 },
 		});
 		partial = assistantMessageWithContent([{ type: "thinking", thinking }], "pending");
 		send({
 			type: "message_update",
-			message: partial,
 			usage: partial.usage,
-			assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: thinking, partial },
+			assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: thinking },
 		});
 		send({
 			type: "message_update",
-			message: partial,
 			usage: partial.usage,
-			assistantMessageEvent: { type: "thinking_end", contentIndex: 0, content: thinking, partial },
+			assistantMessageEvent: { type: "thinking_end", contentIndex: 0, content: thinking },
 		});
 		send({
 			type: "message_update",
-			message: partial,
 			usage: partial.usage,
-			assistantMessageEvent: { type: "toolcall_start", contentIndex: 1, partial },
+			assistantMessageEvent: { type: "toolcall_start", contentIndex: 1 },
 		});
 		const toolArgsText = JSON.stringify(toolArgs);
 		send({
 			type: "message_update",
-			message: partial,
 			usage: partial.usage,
 			assistantMessageEvent: {
 				type: "toolcall_delta",
 				contentIndex: 1,
 				delta: toolArgsText,
-				partial,
 			},
 		});
 		const toolUse = assistantMessageWithContent([{ type: "thinking", thinking }, toolCall], "toolUse");
 		send({
 			type: "message_update",
-			message: toolUse,
 			usage: toolUse.usage,
-			assistantMessageEvent: { type: "toolcall_end", contentIndex: 1, toolCall, partial: toolUse },
+			assistantMessageEvent: { type: "toolcall_end", contentIndex: 1, toolCall },
 		});
 		send({ type: "message_end", message: toolUse });
 		messages.push(toolUse);
@@ -409,25 +407,22 @@ function streamComplexPrompt(command, text, user, userEntryId) {
 		send({ type: "message_start", message: emptyFinal });
 		send({
 			type: "message_update",
-			message: emptyFinal,
 			usage: emptyFinal.usage,
-			assistantMessageEvent: { type: "text_start", contentIndex: 0, partial: emptyFinal },
+			assistantMessageEvent: { type: "text_start", contentIndex: 0 },
 		});
 		const final = assistantMessageWithContent([{ type: "text", text: markdown }], "stop");
 		send({
 			type: "message_update",
-			message: final,
 			usage: final.usage,
-			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: markdown, partial: final },
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: markdown },
 		});
 		send({
 			type: "message_update",
-			message: final,
 			usage: final.usage,
-			assistantMessageEvent: { type: "text_end", contentIndex: 0, content: markdown, partial: final },
+			assistantMessageEvent: { type: "text_end", contentIndex: 0, content: markdown },
 		});
 		send({ type: "message_end", message: final });
-		send({ type: "turn_end", turnIndex: 0, message: final, toolResults: [toolResult] });
+		send({ type: "turn_end", message: final, toolResults: [toolResult] });
 		messages.push(final);
 		persistMessage(final, toolResultEntryId);
 		send({ type: "agent_end", messages: [user, toolUse, toolResult, final], willRetry: false });
@@ -458,7 +453,7 @@ function streamInspectPrompt(command, text, user, userEntryId) {
 	});
 
 	send({ type: "agent_start" });
-	send({ type: "turn_start", turnIndex: 0, timestamp: Date.now() });
+	send({ type: "turn_start" });
 	send({ type: "message_start", message: user });
 	send({ type: "message_end", message: user });
 	send({ type: "session_info_changed" });
@@ -469,27 +464,23 @@ function streamInspectPrompt(command, text, user, userEntryId) {
 	schedule(run, 25, () => {
 		send({
 			type: "message_update",
-			message: pending,
 			usage: pending.usage,
-			assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, partial: pending },
+			assistantMessageEvent: { type: "toolcall_start", contentIndex: 0 },
 		});
 		send({
 			type: "message_update",
-			message: pending,
 			usage: pending.usage,
 			assistantMessageEvent: {
 				type: "toolcall_delta",
 				contentIndex: 0,
 				delta: JSON.stringify(toolArgs),
-				partial: pending,
 			},
 		});
 		const toolUse = assistantMessageWithContent([toolCall], "toolUse");
 		send({
 			type: "message_update",
-			message: toolUse,
 			usage: toolUse.usage,
-			assistantMessageEvent: { type: "toolcall_end", contentIndex: 0, toolCall, partial: toolUse },
+			assistantMessageEvent: { type: "toolcall_end", contentIndex: 0, toolCall },
 		});
 		send({ type: "message_end", message: toolUse });
 		messages.push(toolUse);
@@ -526,7 +517,7 @@ function streamInspectPrompt(command, text, user, userEntryId) {
 		const final = assistantMessage("E2E_INSPECT_COMPLETE");
 		send({ type: "message_start", message: final });
 		send({ type: "message_end", message: final });
-		send({ type: "turn_end", turnIndex: 0, message: final, toolResults: [toolResult] });
+		send({ type: "turn_end", message: final, toolResults: [toolResult] });
 		messages.push(final);
 		persistMessage(final, resultEntryId);
 		send({ type: "agent_end", messages: [user, toolUse, toolResult, final], willRetry: false });
@@ -634,27 +625,23 @@ function emitStressTool(run, index) {
 	send({ type: "message_start", message: partial });
 	send({
 		type: "message_update",
-		message: partial,
 		usage: partial.usage,
-		assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, partial },
+		assistantMessageEvent: { type: "toolcall_start", contentIndex: 0 },
 	});
 	send({
 		type: "message_update",
-		message: partial,
 		usage: partial.usage,
 		assistantMessageEvent: {
 			type: "toolcall_delta",
 			contentIndex: 0,
 			delta: JSON.stringify(args),
-			partial,
 		},
 	});
 	partial = assistantMessageWithContent([toolCall], "toolUse");
 	send({
 		type: "message_update",
-		message: partial,
 		usage: partial.usage,
-		assistantMessageEvent: { type: "toolcall_end", contentIndex: 0, toolCall, partial },
+		assistantMessageEvent: { type: "toolcall_end", contentIndex: 0, toolCall },
 	});
 	send({ type: "message_end", message: partial });
 	messages.push(partial);
@@ -736,7 +723,7 @@ function streamStressPrompt(command, text, user, userEntryId) {
 	});
 
 	send({ type: "agent_start" });
-	send({ type: "turn_start", turnIndex: 0, timestamp: Date.now() });
+	send({ type: "turn_start" });
 	send({ type: "message_start", message: user });
 	send({ type: "message_end", message: user });
 	send({ type: "session_info_changed" });
@@ -752,25 +739,22 @@ function streamStressPrompt(command, text, user, userEntryId) {
 			send({ type: "message_start", message: pending });
 			send({
 				type: "message_update",
-				message: pending,
 				usage: pending.usage,
-				assistantMessageEvent: { type: "text_start", contentIndex: 0, partial: pending },
+				assistantMessageEvent: { type: "text_start", contentIndex: 0 },
 			});
 			const final = assistantMessageWithContent([{ type: "text", text: markdown }], "stop");
 			send({
 				type: "message_update",
-				message: final,
 				usage: final.usage,
-				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: markdown, partial: final },
+				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: markdown },
 			});
 			send({
 				type: "message_update",
-				message: final,
 				usage: final.usage,
-				assistantMessageEvent: { type: "text_end", contentIndex: 0, content: markdown, partial: final },
+				assistantMessageEvent: { type: "text_end", contentIndex: 0, content: markdown },
 			});
 			send({ type: "message_end", message: final });
-			send({ type: "turn_end", turnIndex: 0, message: final, toolResults: run.toolResults });
+			send({ type: "turn_end", message: final, toolResults: run.toolResults });
 			messages.push(final);
 			run.agentMessages.push(final);
 			persistMessage(final, run.parentEntryId);
@@ -812,7 +796,7 @@ function streamExtensionPrompt(command, text, user, userEntryId) {
 		extension: true,
 	});
 	send({ type: "agent_start" });
-	send({ type: "turn_start", turnIndex: 0, timestamp: Date.now() });
+	send({ type: "turn_start" });
 	send({ type: "message_start", message: user });
 	send({ type: "message_end", message: user });
 	send({ type: "session_info_changed" });
@@ -844,7 +828,7 @@ function finishExtensionPrompt(response) {
 	const final = assistantMessage(label);
 	send({ type: "message_start", message: final });
 	send({ type: "message_end", message: final });
-	send({ type: "turn_end", turnIndex: 0, message: final, toolResults: [] });
+	send({ type: "turn_end", message: final, toolResults: [] });
 	messages.push(final);
 	persistMessage(final, run.userEntryId);
 	send({ type: "agent_end", messages: [run.user, final], willRetry: false });
@@ -907,7 +891,7 @@ function streamPrompt(command) {
 	});
 
 	send({ type: "agent_start" });
-	send({ type: "turn_start", turnIndex: 0, timestamp: Date.now() });
+	send({ type: "turn_start" });
 	send({ type: "message_start", message: user });
 	send({ type: "message_end", message: user });
 	send({ type: "session_info_changed" });
@@ -919,7 +903,6 @@ function streamPrompt(command) {
 		const partial = assistantMessage(run.assembled);
 		send({
 			type: "message_update",
-			message: partial,
 			usage: partial.usage,
 			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: firstDelta },
 		});
@@ -931,13 +914,12 @@ function streamPrompt(command) {
 		const partial = assistantMessage(run.assembled);
 		send({
 			type: "message_update",
-			message: partial,
 			usage: partial.usage,
 			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: finalDelta },
 		});
 		const final = assistantMessage(label);
 		send({ type: "message_end", message: final });
-		send({ type: "turn_end", turnIndex: 0, message: final, toolResults: [] });
+		send({ type: "turn_end", message: final, toolResults: [] });
 		messages.push(final);
 		persistMessage(final, run.userEntryId);
 		send({ type: "agent_end", messages: [user, final], willRetry: false });
@@ -958,7 +940,7 @@ function abortRun(command) {
 	clearRunTimers(run);
 	const final = { ...assistantMessage(run.assembled), stopReason: "aborted" };
 	send({ type: "message_end", message: final });
-	send({ type: "turn_end", turnIndex: 0, message: final, toolResults: [] });
+	send({ type: "turn_end", message: final, toolResults: [] });
 	send({ type: "agent_end", messages: [], willRetry: false });
 	send({ type: "agent_settled" });
 	record("aborted", { commandId: run.command.id });
@@ -983,7 +965,19 @@ function handleLine(line) {
 	record("command", { commandId: command.id, commandType: command.type });
 	switch (command.type) {
 		case "get_state": {
-			const state = { sessionId, sessionFile, model: currentModel, thinkingLevel };
+			const state = {
+				sessionId,
+				sessionFile,
+				model: currentModel,
+				thinkingLevel,
+				isStreaming: activeRun !== null,
+				isCompacting: false,
+				steeringMode: "all",
+				followUpMode: "all",
+				autoCompactionEnabled: true,
+				messageCount: messages.length,
+				pendingMessageCount: 0,
+			};
 			if (requestedFile && existingStateDelayMs > 0 && !delayedExistingState) {
 				delayedExistingState = true;
 				setTimeout(() => respond(command, state), existingStateDelayMs);
@@ -1042,14 +1036,27 @@ function handleLine(line) {
 			return;
 		case "get_session_stats":
 			respond(command, {
-				messageCount: messages.length,
+				sessionId,
+				sessionFile,
+				userMessages: messages.filter((message) => message.role === "user").length,
+				assistantMessages: messages.filter((message) => message.role === "assistant").length,
+				toolCalls: messages.reduce(
+					(count, message) =>
+						count +
+						(message.role === "assistant"
+							? message.content.filter((content) => content.type === "toolCall").length
+							: 0),
+					0,
+				),
+				toolResults: messages.filter((message) => message.role === "toolResult").length,
+				totalMessages: messages.length,
 				tokens: recoveryFeatures
 					? { input: 32_000, output: 12_000, cacheRead: 0, cacheWrite: 0, total: 44_000 }
 					: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 },
 				cost: 0,
 				contextUsage: recoveryFeatures
 					? { tokens: 44_000, contextWindow: 128_000, percent: 34.375 }
-					: { tokens: null, contextWindow: null, percent: null },
+					: { tokens: null, contextWindow: 128_000, percent: null },
 			});
 			return;
 		case "export_html": {

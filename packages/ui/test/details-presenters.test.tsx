@@ -1,4 +1,4 @@
-import type { JsonAgentSessionEvent, SessionTreeNode } from "@earendil-works/pi-coding-agent";
+import type { ProductSessionEventDto, SessionTreeNodeDto } from "@pi-agent-web/protocol";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import {
@@ -16,7 +16,7 @@ const event = {
 	generation: 7,
 	seq: 42,
 	eventType: "agent_start",
-	payload: { type: "agent_start", privateMarker: "only-in-payload" } as JsonAgentSessionEvent,
+	payload: { type: "agent_start", privateMarker: "only-in-payload" } as ProductSessionEventDto,
 } satisfies SessionRawEventRecord;
 
 describe("details panel presenters", () => {
@@ -66,7 +66,7 @@ describe("details panel presenters", () => {
 	});
 
 	it("keeps branch folding and Fork as keyboard-focusable native controls", () => {
-		const child: SessionTreeNode = {
+		const child: SessionTreeNodeDto = {
 			entry: {
 				type: "message",
 				id: "child",
@@ -76,7 +76,7 @@ describe("details panel presenters", () => {
 			},
 			children: [],
 		};
-		const root: SessionTreeNode = {
+		const root: SessionTreeNodeDto = {
 			entry: {
 				type: "message",
 				id: "root",
@@ -103,7 +103,7 @@ describe("details panel presenters", () => {
 	});
 
 	it("uses a hidden layout spacer instead of an unnamed disabled control for a leaf", () => {
-		const leaf: SessionTreeNode = {
+		const leaf: SessionTreeNodeDto = {
 			entry: {
 				type: "message",
 				id: "leaf",

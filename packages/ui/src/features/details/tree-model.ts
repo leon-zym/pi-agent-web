@@ -1,4 +1,4 @@
-import type { SessionEntry, SessionTreeNode } from "@earendil-works/pi-coding-agent";
+import type { SessionEntryDto, SessionTreeNodeDto } from "@pi-agent-web/protocol";
 import { displayLabel } from "../../lib/format";
 import { presentUserMessage, serializePresentedUserMessage } from "../../lib/user-message-presentation";
 
@@ -7,7 +7,7 @@ export type ConversationTreeLoadStatus = "loading" | "ready" | "error";
 export interface ConversationTreeSnapshot {
 	sessionHandle: string | null;
 	status: ConversationTreeLoadStatus;
-	tree: SessionTreeNode[];
+	tree: SessionTreeNodeDto[];
 	leafId: string | null;
 	error?: string;
 }
@@ -18,7 +18,7 @@ interface TreeGutter {
 }
 
 export interface ConversationTreeRow {
-	node: SessionTreeNode;
+	node: SessionTreeNodeDto;
 	depth: number;
 	prefix: string;
 	isOnActivePath: boolean;
@@ -46,7 +46,7 @@ export function visibleConversationTreeSnapshot(
 	return snapshot.sessionHandle === sessionHandle ? snapshot : pendingConversationTreeSnapshot(sessionHandle);
 }
 
-export function activeTreeEntryIds(tree: SessionTreeNode[], leafId: string | null): Set<string> {
+export function activeTreeEntryIds(tree: SessionTreeNodeDto[], leafId: string | null): Set<string> {
 	if (!leafId) return new Set();
 	const parentById = new Map<string, string | null>();
 	const stack = [...tree];
@@ -69,7 +69,7 @@ export function activeTreeEntryIds(tree: SessionTreeNode[], leafId: string | nul
 	return activeIds;
 }
 
-function hasAssistantText(entry: SessionEntry): boolean {
+function hasAssistantText(entry: SessionEntryDto): boolean {
 	if (entry.type !== "message" || entry.message.role !== "assistant") return true;
 	const content = (entry.message as { content?: unknown }).content;
 	if (!Array.isArray(content)) return typeof content === "string" && content.trim().length > 0;
@@ -85,7 +85,7 @@ function hasAssistantText(entry: SessionEntry): boolean {
 	);
 }
 
-function visibleByDefault(node: SessionTreeNode, leafId: string | null): boolean {
+function visibleByDefault(node: SessionTreeNodeDto, leafId: string | null): boolean {
 	const entry = node.entry;
 	if (entry.id === leafId) return true;
 	if (
@@ -149,17 +149,17 @@ function buildTreePrefix({
  * chain stays on one visual axis. Indentation grows only at actual branches.
  */
 export function flattenConversationTree(
-	tree: SessionTreeNode[],
+	tree: SessionTreeNodeDto[],
 	leafId: string | null,
 	collapsedIds: ReadonlySet<string> = new Set(),
 ): ConversationTreeRow[] {
 	const activePathIds = activeTreeEntryIds(tree, leafId);
-	const orderedNodes: SessionTreeNode[] = [];
-	const allById = new Map<string, SessionTreeNode>();
+	const orderedNodes: SessionTreeNodeDto[] = [];
+	const allById = new Map<string, SessionTreeNodeDto>();
 	const orderedRoots = [...tree].sort(
 		(a, b) => Number(activePathIds.has(b.entry.id)) - Number(activePathIds.has(a.entry.id)),
 	);
-	const stack: SessionTreeNode[] = [];
+	const stack: SessionTreeNodeDto[] = [];
 	for (let index = orderedRoots.length - 1; index >= 0; index -= 1) {
 		const root = orderedRoots[index];
 		if (root) stack.push(root);
@@ -303,8 +303,8 @@ export function flattenConversationTree(
 }
 
 export function resolvedTreeNodeLabel(
-	node: SessionTreeNode,
-	fallback: (entry: SessionEntry) => string,
+	node: SessionTreeNodeDto,
+	fallback: (entry: SessionEntryDto) => string,
 ): string {
 	const label = node.label?.trim();
 	return label

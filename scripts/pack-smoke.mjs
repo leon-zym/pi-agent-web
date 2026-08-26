@@ -13,7 +13,7 @@ fs.mkdirSync(tarballDir);
 fs.mkdirSync(installDir);
 
 function run(command, args, cwd = root) {
-	const result = spawnSync(command, args, { cwd, encoding: "utf8", stdio: "pipe" });
+	const result = spawnSync(command, args, { cwd, encoding: "utf8", stdio: "pipe", timeout: 120_000 });
 	if (result.status !== 0) {
 		throw new Error(`${command} ${args.join(" ")} failed:\n${result.stdout}\n${result.stderr}`);
 	}
@@ -47,11 +47,47 @@ function waitForOutput(child, pattern, timeoutMs = 10_000) {
 	});
 }
 
+function waitForChildExit(child, timeoutMs) {
+	if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+	return new Promise((resolve) => {
+		const onExit = () => finish(true);
+		const timer = setTimeout(() => finish(false), timeoutMs);
+		const finish = (exited) => {
+			clearTimeout(timer);
+			child.off("exit", onExit);
+			resolve(exited);
+		};
+		child.once("exit", onExit);
+	});
+}
+
 async function closeChild(child) {
-	if (child.exitCode !== null) return;
-	const exited = new Promise((resolve) => child.once("exit", resolve));
+	if (child.exitCode !== null || child.signalCode !== null) return;
 	child.kill("SIGTERM");
-	await exited;
+	if (await waitForChildExit(child, 2_000)) return;
+	child.kill("SIGKILL");
+	if (!(await waitForChildExit(child, 2_000))) throw new Error("Packaged CLI did not exit after SIGKILL");
+}
+
+function waitForSocket(socket, setup, timeoutMessage, timeoutMs = 10_000) {
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		const finish = (error) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			if (error) reject(error);
+			else resolve();
+		};
+		const timer = setTimeout(() => {
+			try {
+				socket.terminate();
+			} finally {
+				finish(new Error(timeoutMessage));
+			}
+		}, timeoutMs);
+		setup(finish);
+	});
 }
 
 try {
@@ -99,17 +135,23 @@ try {
 	run(bin, ["--help"], installDir);
 	run("npx", ["--prefix", installDir, "--no-install", "pi-web", "--help"], installDir);
 
-	const fakePiPath = path.join(tempRoot, "fake-rpc.mjs");
-	fs.writeFileSync(fakePiPath, "process.stdin.resume();\n", "utf8");
-	const child = spawn(bin, ["--pi-path", fakePiPath, "--host", "127.0.0.1", "--port", "0", "--no-open"], {
-		cwd: installDir,
+	const cliEntry = path.join(installDir, "node_modules", "@pi-agent-web", "cli", "dist", "cli.js");
+	const externalWorkspace = path.join(tempRoot, "external-workspace");
+	const emptyBinDir = path.join(tempRoot, "empty-bin");
+	fs.mkdirSync(externalWorkspace);
+	fs.mkdirSync(emptyBinDir);
+	const packagedEnv = {
+		...process.env,
+		PATH: emptyBinDir,
+		PI_CODING_AGENT_DIR: path.join(tempRoot, "agent"),
+		PI_CODING_AGENT_SESSION_DIR: path.join(tempRoot, "sessions"),
+		PI_WEB_DATA_DIR: path.join(tempRoot, "web-data"),
+	};
+	delete packagedEnv.PI_PATH;
+	const child = spawn(process.execPath, [cliEntry, "--host", "127.0.0.1", "--port", "0", "--no-open"], {
+		cwd: externalWorkspace,
 		stdio: ["ignore", "pipe", "pipe"],
-		env: {
-			...process.env,
-			PI_CODING_AGENT_DIR: path.join(tempRoot, "agent"),
-			PI_CODING_AGENT_SESSION_DIR: path.join(tempRoot, "sessions"),
-			PI_WEB_DATA_DIR: path.join(tempRoot, "web-data"),
-		},
+		env: packagedEnv,
 	});
 	try {
 		const match = await waitForOutput(child, /listening on http:\/\/127\.0\.0\.1:(\d+)/);
@@ -117,8 +159,41 @@ try {
 		const bootstrap = await fetch(`${origin}/api/v1/bootstrap`, { headers: { Origin: origin } });
 		const cookie = bootstrap.headers.get("set-cookie")?.split(";", 1)[0];
 		if (!bootstrap.ok || !cookie) throw new Error("Bootstrap did not issue a session cookie");
-		const response = await fetch(`${origin}/api/v1/health`, { headers: { Origin: origin, Cookie: cookie } });
+		const response = await fetch(`${origin}/api/v1/health/ready`, {
+			headers: { Origin: origin, Cookie: cookie },
+		});
 		if (!response.ok) throw new Error(`Health check failed with ${String(response.status)}`);
+		const readiness = await response.json();
+		if (
+			readiness?.ready !== true ||
+			readiness?.runtime?.source !== "bundled" ||
+			readiness?.runtime?.version !== "0.84.2" ||
+			readiness?.runtime?.adapterId !== "legacy-rpc-v1"
+		) {
+			throw new Error(`Packaged Gateway selected an unexpected runtime: ${JSON.stringify(readiness)}`);
+		}
+		const workspaceResponse = await fetch(`${origin}/api/v1/workspaces`, {
+			method: "POST",
+			headers: { Origin: origin, Cookie: cookie, "Content-Type": "application/json" },
+			body: JSON.stringify({ path: externalWorkspace }),
+		});
+		if (!workspaceResponse.ok) {
+			throw new Error(`Packaged workspace creation failed with ${String(workspaceResponse.status)}`);
+		}
+		const workspace = await workspaceResponse.json();
+		const sessionResponse = await fetch(
+			`${origin}/api/v1/workspaces/${encodeURIComponent(workspace.workspaceHandle)}/sessions`,
+			{ method: "POST", headers: { Origin: origin, Cookie: cookie } },
+		);
+		if (!sessionResponse.ok) {
+			throw new Error(
+				`Packaged Session activation failed with ${String(sessionResponse.status)}: ${await sessionResponse.text()}`,
+			);
+		}
+		const session = await sessionResponse.json();
+		if (session?.runtime?.state !== "idle") {
+			throw new Error(`Packaged Session did not complete Pi readiness: ${JSON.stringify(session)}`);
+		}
 		const crossPort = await fetch(`${origin}/api/v1/health`, {
 			headers: { Origin: "http://localhost:5173", Cookie: cookie },
 		});
@@ -131,28 +206,54 @@ try {
 		}
 		const requireFromInstall = createRequire(path.join(installDir, "package.json"));
 		const WebSocket = requireFromInstall("ws");
-		await new Promise((resolve, reject) => {
-			const socket = new WebSocket(`${origin.replace("http", "ws")}/api/v1/ws`, {
-				headers: { Origin: origin, Cookie: cookie },
-			});
-			socket.once("open", () => {
-				socket.close();
-				resolve();
-			});
-			socket.once("error", reject);
+		const helloSocket = new WebSocket(`${origin.replace("http", "ws")}/api/v1/ws`, {
+			headers: { Origin: origin, Cookie: cookie },
 		});
-		await new Promise((resolve, reject) => {
-			const socket = new WebSocket(`${origin.replace("http", "ws")}/api/v1/ws`, {
-				headers: { Origin: "http://localhost:5173", Cookie: cookie },
-			});
-			socket.once("unexpected-response", (_request, rejected) => {
-				rejected.resume();
-				if (rejected.statusCode === 403) resolve();
-				else reject(new Error(`Packaged WebSocket rejection returned ${String(rejected.statusCode)}`));
-			});
-			socket.once("open", () => reject(new Error("Packaged WebSocket accepted a cross-port Origin")));
-			socket.once("error", reject);
+		await waitForSocket(
+			helloSocket,
+			(finish) => {
+				const socket = helloSocket;
+				socket.once("open", () => {
+					socket.send(
+						JSON.stringify({
+							type: "client_hello",
+							protocol: { major: 1, minor: 0 },
+							clientBuild: "pack-smoke",
+							capabilities: ["rpc.commands", "rpc.events", "rpc.extension_ui", "session.multiplex"],
+							limits: { maxServerFrameBytes: 68 * 1024 * 1024 },
+						}),
+					);
+				});
+				socket.once("message", (raw) => {
+					const hello = JSON.parse(raw.toString());
+					if (hello.type !== "server_hello" || hello.serverEpoch === undefined) {
+						finish(new Error(`Packaged WebSocket did not negotiate hello: ${raw.toString()}`));
+						return;
+					}
+					socket.close();
+					finish();
+				});
+				socket.once("error", finish);
+			},
+			"Packaged WebSocket hello timed out",
+		);
+		const rejectedSocket = new WebSocket(`${origin.replace("http", "ws")}/api/v1/ws`, {
+			headers: { Origin: "http://localhost:5173", Cookie: cookie },
 		});
+		await waitForSocket(
+			rejectedSocket,
+			(finish) => {
+				const socket = rejectedSocket;
+				socket.once("unexpected-response", (_request, rejected) => {
+					rejected.resume();
+					if (rejected.statusCode === 403) finish();
+					else finish(new Error(`Packaged WebSocket rejection returned ${String(rejected.statusCode)}`));
+				});
+				socket.once("open", () => finish(new Error("Packaged WebSocket accepted a cross-port Origin")));
+				socket.once("error", finish);
+			},
+			"Packaged cross-origin WebSocket check timed out",
+		);
 	} finally {
 		await closeChild(child);
 	}

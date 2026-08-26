@@ -24,6 +24,12 @@ const descendantScript = exitMarker
 const descendant = spawn(process.execPath, ["-e", descendantScript, ...(exitMarker ? [exitMarker] : [])], {
 	stdio: "ignore",
 });
+if (process.env.PI_WEB_PROCESS_GROUP_PID_MARKER) {
+	fs.writeFileSync(
+		process.env.PI_WEB_PROCESS_GROUP_PID_MARKER,
+		JSON.stringify({ leaderPid: process.pid, descendantPid: descendant.pid }),
+	);
+}
 let buffer = "";
 let protocolFailureScheduled = false;
 
@@ -49,7 +55,7 @@ process.stdin.on("data", (chunk) => {
 					id: command.id,
 					command: "get_last_assistant_text",
 					success: true,
-					data: "leader exiting",
+					data: { text: "leader exiting" },
 				})}\n`,
 				() => {
 					fs.writeFileSync(`${exitMarker}.leader`, String(process.pid));
@@ -69,8 +75,13 @@ process.stdin.on("data", (chunk) => {
 					sessionId: "group-session",
 					sessionFile: "/tmp/group-session.jsonl",
 					thinkingLevel: "off",
-					leaderPid: process.pid,
-					descendantPid: descendant.pid,
+					isStreaming: false,
+					isCompacting: false,
+					steeringMode: "all",
+					followUpMode: "all",
+					autoCompactionEnabled: true,
+					messageCount: 0,
+					pendingMessageCount: 0,
 				},
 			})}\n`,
 			() => {

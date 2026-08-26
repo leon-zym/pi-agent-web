@@ -114,9 +114,10 @@ pnpm start
 pnpm start -- --pi-path /path/to/rpc-entry.js --port 3100 --no-open
 ```
 
-`pi-web` accepts `127.0.0.1`, `localhost`, or `::1` as `--host`. It resolves Pi from
-`--pi-path` / `PI_PATH`, then `pi` on `PATH`, then an installed Pi package's dedicated
-`rpc-entry.js`. Common options are `--pi-path`, `--host`, `--port`, `--no-open`, and `--help`.
+`pi-web` accepts `127.0.0.1`, `localhost`, or `::1` as `--host`. By default it uses and validates
+the exact Pi dependency installed with the distribution; an unrelated `pi` on `PATH` is ignored.
+`--pi-path` / `PI_PATH` is an expert override and must pass the same version/capability probe. Common
+options are `--pi-path`, `--host`, `--port`, `--no-open`, and `--help`.
 
 The naming boundary is intentional: `pi-agent-web` is the repository, service, and
 `@pi-agent-web/*` package namespace; `pi-web` is the user-facing command.

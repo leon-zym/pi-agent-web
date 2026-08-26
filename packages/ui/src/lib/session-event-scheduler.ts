@@ -1,4 +1,4 @@
-import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type { SessionEventDto } from "@pi-agent-web/protocol";
 
 export const HIDDEN_SESSION_FLUSH_MS = 100;
 export const MAX_PENDING_CHARACTERS_PER_SESSION = 256 * 1024;
@@ -6,7 +6,7 @@ export const MAX_PENDING_CHARACTERS_TOTAL = 1024 * 1024;
 export const MAX_PENDING_REDUCER_EVENTS_PER_SESSION = 64;
 export const MAX_PENDING_REDUCER_EVENTS_TOTAL = 512;
 
-export type StreamMessageUpdate = Extract<JsonAgentSessionEvent, { type: "message_update" }>;
+export type StreamMessageUpdate = Extract<SessionEventDto, { type: "message_update" }>;
 type AssistantMessageDelta = Extract<
 	StreamMessageUpdate["assistantMessageEvent"],
 	{ type: "text_delta" | "thinking_delta" | "toolcall_delta" }
@@ -88,7 +88,7 @@ function describeDelta(event: StreamMessageUpdate): DeltaDescriptor | null {
 	}
 }
 
-export function isCoalescibleMessageUpdate(event: JsonAgentSessionEvent): event is CoalescibleMessageUpdate {
+export function isCoalescibleMessageUpdate(event: SessionEventDto): event is CoalescibleMessageUpdate {
 	return event.type === "message_update" && describeDelta(event) !== null;
 }
 

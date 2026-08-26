@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -18,6 +18,10 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<voi
 		await new Promise<void>((resolve) => setTimeout(resolve, 5));
 	}
 	throw new Error("condition did not settle before timeout");
+}
+
+function processGroupPids(marker: string): { leaderPid: number; descendantPid: number } {
+	return JSON.parse(readFileSync(marker, "utf8")) as { leaderPid: number; descendantPid: number };
 }
 
 describe("PiProcess response correlation", () => {
@@ -42,17 +46,25 @@ describe("PiProcess response correlation", () => {
 		if (cleanupDir !== undefined) await rm(cleanupDir, { recursive: true, force: true });
 	});
 
-	it("drops a response without id and settles the caller through its timeout", async () => {
+	it("fails closed on a response without a correlating id", async () => {
+		const exits: Array<{ reason?: string; diagnostic?: { reason: string } }> = [];
 		proc = new PiProcess({
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			commandTimeoutMs: 50,
+			onExit: (info) => exits.push(info),
 		});
 		await proc.start();
 
-		await expect(proc.send({ id: "missing-id", type: "get_last_assistant_text" }, 50)).rejects.toThrow(
-			"command timed out",
-		);
+		await expect(proc.send({ id: "missing-id", type: "get_last_assistant_text" }, 50)).rejects.toMatchObject({
+			name: "PiProtocolIncompatibleError",
+			diagnostic: { reason: "malformed_response" },
+		});
+		await waitFor(() => exits.length === 1);
+		expect(exits[0]).toMatchObject({
+			reason: "protocol_incompatible",
+			diagnostic: { reason: "malformed_response" },
+		});
 	});
 
 	it("rejects duplicate process-local pending ids instead of overwriting the first request", async () => {
@@ -70,7 +82,11 @@ describe("PiProcess response correlation", () => {
 	});
 
 	it("isolates a malformed typed event as a child protocol failure", async () => {
-		const exits: Array<{ stderrTail: string }> = [];
+		const exits: Array<{
+			stderrTail: string;
+			reason?: string;
+			diagnostic?: { frameKind: string; reason: string; frameType?: string };
+		}> = [];
 		const events: string[] = [];
 		proc = new PiProcess({
 			cwd: process.cwd(),
@@ -80,11 +96,15 @@ describe("PiProcess response correlation", () => {
 		});
 		await proc.start();
 
-		await expect(proc.send({ type: "prompt", message: "malformed-event" })).rejects.toThrow(
-			"invalid Pi event frame",
-		);
+		await expect(proc.send({ type: "prompt", message: "malformed-event" })).rejects.toMatchObject({
+			name: "PiProtocolIncompatibleError",
+			diagnostic: { frameKind: "event", reason: "malformed_event", frameType: "queue_update" },
+		});
 		await waitFor(() => exits.length === 1);
-		expect(exits[0]?.stderrTail).toContain("invalid Pi event frame");
+		expect(exits[0]).toMatchObject({
+			reason: "protocol_incompatible",
+			diagnostic: { frameKind: "event", reason: "malformed_event", frameType: "queue_update" },
+		});
 		expect(events).toEqual([]);
 		expect(proc.running).toBe(false);
 	});
@@ -116,6 +136,8 @@ describe("PiProcess response correlation", () => {
 	});
 
 	it("appends a session target without mutating the resolved runtime arguments", async () => {
+		tempDir = await mkdtemp(path.join(tmpdir(), "pi-web-argv-"));
+		const argvMarker = path.join(tempDir, "argv.json");
 		const resolved = {
 			command: process.execPath,
 			args: [fakePiPath, "--mode", "rpc"],
@@ -126,15 +148,22 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved,
 			args: ["--session", "/tmp/native.jsonl"],
+			env: { PI_WEB_FAKE_ARGV_MARKER: argvMarker },
 		});
 		await proc.start();
 
-		const state = expectData(await proc.send({ type: "get_state" })) as { argv: string[] };
-		expect(state.argv).toEqual(["--mode", "rpc", "--session", "/tmp/native.jsonl"]);
+		expect(JSON.parse(readFileSync(argvMarker, "utf8"))).toEqual([
+			"--mode",
+			"rpc",
+			"--session",
+			"/tmp/native.jsonl",
+		]);
 		expect(resolved.args).toEqual([fakePiPath, "--mode", "rpc"]);
 	});
 
 	it.runIf(process.platform !== "win32")("stops descendants in Pi's detached process group", async () => {
+		tempDir = await mkdtemp(path.join(tmpdir(), "pi-web-process-group-stop-"));
+		const pidMarker = path.join(tempDir, "pids.json");
 		proc = new PiProcess({
 			cwd: process.cwd(),
 			resolved: {
@@ -143,9 +172,10 @@ describe("PiProcess response correlation", () => {
 				source: "pi-path",
 				label: "group Pi",
 			},
+			env: { PI_WEB_PROCESS_GROUP_PID_MARKER: pidMarker },
 		});
 		await proc.start();
-		const state = expectData(await proc.send({ type: "get_state" })) as { descendantPid: number };
+		const state = processGroupPids(pidMarker);
 		descendantPid = state.descendantPid;
 
 		await proc.stop();
@@ -157,6 +187,7 @@ describe("PiProcess response correlation", () => {
 		async () => {
 			tempDir = await mkdtemp(path.join(tmpdir(), "pi-web-process-group-"));
 			const marker = path.join(tempDir, "descendant-survived");
+			const pidMarker = path.join(tempDir, "pids.json");
 			const unhandledRejections: unknown[] = [];
 			const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
 			process.on("unhandledRejection", onUnhandledRejection);
@@ -174,13 +205,14 @@ describe("PiProcess response correlation", () => {
 						source: "pi-path",
 						label: "group Pi",
 					},
-					env: { PI_WEB_PROCESS_GROUP_EXIT_MARKER: marker },
+					env: {
+						PI_WEB_PROCESS_GROUP_EXIT_MARKER: marker,
+						PI_WEB_PROCESS_GROUP_PID_MARKER: pidMarker,
+					},
 					onExit: (info) => resolveExit?.(info),
 				});
 				await proc.start();
-				const state = expectData(await proc.send({ type: "get_state" })) as {
-					descendantPid: number;
-				};
+				const state = processGroupPids(pidMarker);
 				descendantPid = state.descendantPid;
 
 				await proc.send({ type: "get_last_assistant_text" });
@@ -201,6 +233,7 @@ describe("PiProcess response correlation", () => {
 		async () => {
 			tempDir = await mkdtemp(path.join(tmpdir(), "pi-web-process-group-reuse-"));
 			const marker = path.join(tempDir, "descendant-survived");
+			const pidMarker = path.join(tempDir, "pids.json");
 			let resolveExit: (() => void) | undefined;
 			const exited = new Promise<void>((resolve) => {
 				resolveExit = resolve;
@@ -213,14 +246,14 @@ describe("PiProcess response correlation", () => {
 					source: "pi-path",
 					label: "group Pi",
 				},
-				env: { PI_WEB_PROCESS_GROUP_EXIT_MARKER: marker },
+				env: {
+					PI_WEB_PROCESS_GROUP_EXIT_MARKER: marker,
+					PI_WEB_PROCESS_GROUP_PID_MARKER: pidMarker,
+				},
 				onExit: () => resolveExit?.(),
 			});
 			await proc.start();
-			const state = expectData(await proc.send({ type: "get_state" })) as {
-				leaderPid: number;
-				descendantPid: number;
-			};
+			const state = processGroupPids(pidMarker);
 			descendantPid = state.descendantPid;
 
 			const realKill = process.kill.bind(process);
@@ -247,6 +280,7 @@ describe("PiProcess response correlation", () => {
 		async () => {
 			tempDir = await mkdtemp(path.join(tmpdir(), "pi-web-process-group-barrier-"));
 			const marker = path.join(tempDir, "descendant-survived");
+			const pidMarker = path.join(tempDir, "pids.json");
 			let resolveExit: (() => void) | undefined;
 			const exited = new Promise<void>((resolve) => {
 				resolveExit = resolve;
@@ -262,13 +296,12 @@ describe("PiProcess response correlation", () => {
 				env: {
 					PI_WEB_PROCESS_GROUP_EXIT_MARKER: marker,
 					PI_WEB_PROCESS_GROUP_IGNORE_TERM: "1",
+					PI_WEB_PROCESS_GROUP_PID_MARKER: pidMarker,
 				},
 				onExit: () => resolveExit?.(),
 			});
 			await proc.start();
-			const state = expectData(await proc.send({ type: "get_state" })) as {
-				descendantPid: number;
-			};
+			const state = processGroupPids(pidMarker);
 			descendantPid = state.descendantPid;
 
 			await proc.send({ type: "get_last_assistant_text" });
@@ -296,14 +329,22 @@ describe("PiProcess response correlation", () => {
 		async () => {
 			tempDir = await mkdtemp(path.join(tmpdir(), "pi-web-process-group-protocol-"));
 			const marker = path.join(tempDir, "descendant-survived");
-			let initialState: { descendantPid: number } | undefined;
+			const pidMarker = path.join(tempDir, "pids.json");
 			let resolveExit:
-				| ((info: { code: number | null; signal: NodeJS.Signals | null; stderrTail: string }) => void)
+				| ((info: {
+						code: number | null;
+						signal: NodeJS.Signals | null;
+						stderrTail: string;
+						reason?: string;
+						diagnostic?: { reason: string };
+				  }) => void)
 				| undefined;
 			const exited = new Promise<{
 				code: number | null;
 				signal: NodeJS.Signals | null;
 				stderrTail: string;
+				reason?: string;
+				diagnostic?: { reason: string };
 			}>((resolve) => {
 				resolveExit = resolve;
 			});
@@ -317,28 +358,29 @@ describe("PiProcess response correlation", () => {
 				},
 				env: {
 					PI_WEB_PROCESS_GROUP_EXIT_MARKER: marker,
+					PI_WEB_PROCESS_GROUP_PID_MARKER: pidMarker,
 					PI_WEB_PROCESS_GROUP_PROTOCOL_FAILURE: "1",
-				},
-				onReady: (state) => {
-					initialState = state as unknown as typeof initialState;
 				},
 				onExit: (info) => resolveExit?.(info),
 			});
 			await proc.start();
-			expect(initialState).toBeDefined();
-			descendantPid = initialState?.descendantPid;
+			const state = processGroupPids(pidMarker);
+			descendantPid = state.descendantPid;
 
 			const info = await exited;
-			expect(info.stderrTail).toContain("JSONL line exceeds");
+			expect(info).toMatchObject({
+				reason: "protocol_incompatible",
+				diagnostic: { reason: "oversized_frame" },
+			});
 			expect(proc.running).toBe(false);
-			expect(() => process.kill(initialState!.descendantPid, 0)).toThrow();
+			expect(() => process.kill(state.descendantPid, 0)).toThrow();
 			await new Promise<void>((resolve) => setTimeout(resolve, 350));
 			expect(existsSync(marker)).toBe(false);
 		},
 	);
 
 	it("terminates a process that emits an oversized JSONL line", async () => {
-		const failures: string[] = [];
+		const failures: Array<{ stderrTail: string; reason?: string; diagnostic?: { reason: string } }> = [];
 		proc = new PiProcess({
 			cwd: process.cwd(),
 			resolved: {
@@ -347,12 +389,15 @@ describe("PiProcess response correlation", () => {
 				source: "pi-path",
 				label: "long line Pi",
 			},
-			onExit: (info) => failures.push(info.stderrTail),
+			onExit: (info) => failures.push(info),
 		});
 		await proc.start();
 		await waitFor(() => failures.length === 1);
 		await waitFor(() => !proc?.running);
-		expect(failures[0]).toContain("JSONL line exceeds");
+		expect(failures[0]).toMatchObject({
+			reason: "protocol_incompatible",
+			diagnostic: { reason: "oversized_frame" },
+		});
 	});
 
 	it("accepts a bounded get_messages snapshot above the ordinary JSONL line budget", async () => {
@@ -423,7 +468,12 @@ describe("PiProcess response correlation", () => {
 		});
 
 		try {
-			expect(() => internals.handleLine(line())).toThrow("oversized non-snapshot JSONL line");
+			expect(() => internals.handleLine(line())).toThrowError(
+				expect.objectContaining({
+					name: "PiProtocolIncompatibleError",
+					diagnostic: expect.objectContaining({ frameKind: "frame", reason: "oversized_frame" }),
+				}),
+			);
 		} finally {
 			for (const timer of timers) clearTimeout(timer);
 		}
@@ -440,9 +490,10 @@ describe("PiProcess response correlation", () => {
 		});
 		await proc.start();
 
-		await expect(proc.send({ type: "get_messages" }, 1_000)).rejects.toThrow(
-			"JSONL line exceeds the 1024 byte limit",
-		);
+		await expect(proc.send({ type: "get_messages" }, 1_000)).rejects.toMatchObject({
+			name: "PiProtocolIncompatibleError",
+			diagnostic: { reason: "oversized_frame" },
+		});
 		await waitFor(() => failures.length === 1);
 		expect(proc.running).toBe(false);
 	});

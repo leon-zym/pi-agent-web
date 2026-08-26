@@ -1,5 +1,9 @@
-import type { RpcExtensionUIRequest, RpcResponse } from "@earendil-works/pi-coding-agent";
-import { type PiWebSessionEvent, READ_ONLY_RPC_COMMAND_TYPES } from "@pi-agent-web/protocol";
+import type {
+	ExtensionUiRequestDto,
+	ProductSessionEventDto,
+	SessionCommandResponseDto,
+} from "@pi-agent-web/protocol";
+import { READ_ONLY_RPC_COMMAND_TYPES } from "@pi-agent-web/protocol";
 
 export type SessionRuntimeState = "starting" | "idle" | "running" | "waiting_ui" | "crashed" | "dormant";
 
@@ -46,10 +50,10 @@ interface SessionEnvelopeBase {
 }
 
 export type SessionReplayFrame =
-	| (SessionEnvelopeBase & { type: "event"; event: PiWebSessionEvent })
+	| (SessionEnvelopeBase & { type: "event"; event: ProductSessionEventDto })
 	| (SessionEnvelopeBase & {
 			type: "extension_ui_request";
-			request: RpcExtensionUIRequest;
+			request: ExtensionUiRequestDto;
 	  })
 	| (SessionEnvelopeBase & {
 			type: "extension_ui_closed";
@@ -78,13 +82,13 @@ export type ReplayResult =
 			type: "replay";
 			runtime: SessionRuntimeSnapshot;
 			frames: SessionReplayFrame[];
-			extensionRequests: RpcExtensionUIRequest[];
+			extensionRequests: ExtensionUiRequestDto[];
 	  }
 	| {
 			type: "resync_required";
 			runtime: SessionRuntimeSnapshot;
 			reason: "initial" | "generation_changed" | "gap" | "invalid_cursor";
-			extensionRequests: RpcExtensionUIRequest[];
+			extensionRequests: ExtensionUiRequestDto[];
 	  };
 
 export interface SessionCommandResult {
@@ -92,7 +96,7 @@ export interface SessionCommandResult {
 	generation: number;
 	/** Last event sequence observed when the Pi response was received. */
 	barrierSeq: number;
-	response: RpcResponse;
+	response: SessionCommandResponseDto;
 	previousSessionHandle?: string;
 }
 
@@ -108,7 +112,7 @@ export const READ_ONLY_COMMANDS = READ_ONLY_RPC_COMMAND_TYPES;
 export const HOST_MANAGED_COMMANDS = new Set(["new_session", "switch_session"]);
 export const IDENTITY_TRANSITION_COMMANDS = new Set(["fork", "clone"]);
 
-export function eventStartsWork(event: PiWebSessionEvent): boolean {
+export function eventStartsWork(event: ProductSessionEventDto): boolean {
 	return (
 		event.type === "agent_start" ||
 		event.type === "turn_start" ||
@@ -117,6 +121,6 @@ export function eventStartsWork(event: PiWebSessionEvent): boolean {
 	);
 }
 
-export function eventSettlesWork(event: PiWebSessionEvent): boolean {
+export function eventSettlesWork(event: ProductSessionEventDto): boolean {
 	return event.type === "agent_settled";
 }

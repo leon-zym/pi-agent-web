@@ -1,4 +1,4 @@
-import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type { SessionEventDto } from "@pi-agent-web/protocol";
 import { beforeEach, describe, expect, it } from "vitest";
 import { useProjectionStore } from "../src/stores/projection";
 
@@ -98,7 +98,7 @@ describe("projection cache", () => {
 					type: "message_update",
 					usage,
 					assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x" },
-				}) as JsonAgentSessionEvent,
+				}) as SessionEventDto,
 		);
 		let commits = 0;
 		const unsubscribe = useProjectionStore.subscribe(() => {

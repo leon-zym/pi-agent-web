@@ -3,7 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { legacyRpcV1Adapter } from "../src/legacy-rpc-v1.js";
 import { canonicalizeSessionFile, sessionHandleForFile } from "../src/native-session-catalog.js";
+import type { PiHostAdapter } from "../src/pi-host-adapter.js";
 import type { SessionRuntime } from "../src/session-runtime.js";
 import type {
 	ExistingSessionTarget,
@@ -61,15 +63,22 @@ function createHarness(options: {
 	transientIdleTtlMs?: number;
 	env?: Record<string, string>;
 	commandTimeoutFor?: (commandType: string) => number;
+	adapter?: PiHostAdapter;
 }) {
 	const messages: SessionSupervisorMessage[] = [];
 	const targets = new Map(options.targets.map((target) => [target.sessionHandle, target]));
+	const adapter = options.adapter ?? legacyRpcV1Adapter;
 	const supervisor = new SessionSupervisor({
 		resolved: {
 			command: process.execPath,
 			args: [fixturePath],
 			source: "pi-path",
 			label: "session runtime fixture",
+			adapter,
+			version: "0.84.2",
+			adapterId: "legacy-rpc-v1",
+			compatibilityStatus: "current",
+			capabilities: adapter.capabilities,
 		},
 		env: options.env,
 		resolveSession: async (sessionHandle) => targets.get(sessionHandle),
@@ -107,6 +116,27 @@ afterEach(async () => {
 });
 
 describe("SessionSupervisor", () => {
+	it("uses the runtime-selected adapter for Session process arguments and decoding", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "selected-adapter");
+		let openCalls = 0;
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			openSessionArguments(input) {
+				openCalls += 1;
+				return legacyRpcV1Adapter.openSessionArguments(input);
+			},
+		};
+		const { supervisor } = createHarness({ targets: [target], adapter });
+
+		await supervisor.claim(target.sessionHandle, "connection");
+
+		expect(openCalls).toBe(1);
+		expect(supervisor.getRuntime(target.sessionHandle)?.state).toBe("idle");
+	});
+
 	it("turns a validated relative HTML export path into a pasteable file URL", async () => {
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace #1 中文");
@@ -556,6 +586,39 @@ describe("SessionSupervisor", () => {
 		const after = supervisor.getRuntime(target.sessionHandle)!;
 		expect(after.sessionFile).toBe(target.sessionFile);
 		expect(after.nativeSessionId).toBe(target.nativeSessionId);
+	});
+
+	it("keeps protocol-incompatible runtimes terminal and never auto-restarts them", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "protocol-incompatible");
+		const marker = path.join(root, "lifecycle.log");
+		const { supervisor } = createHarness({
+			targets: [target],
+			restartBaseDelayMs: 5,
+			env: { PI_WEB_FIXTURE_LIFECYCLE_MARKER: marker },
+		});
+		const lease = await supervisor.claim(target.sessionHandle, "connection");
+		const before = supervisor.getRuntime(target.sessionHandle)!;
+
+		await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "prompt", message: "protocol-incompatible" },
+			{
+				connectionId: "connection",
+				expectedGeneration: before.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+
+		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "crashed");
+		await new Promise<void>((resolve) => setTimeout(resolve, 75));
+		const terminal = supervisor.getRuntime(target.sessionHandle)!;
+		expect(terminal.error).toBe("protocol_incompatible");
+		expect(terminal.generation).toBe(before.generation);
+		expect(fs.readFileSync(marker, "utf8").match(/^start:/gm)).toHaveLength(1);
+		await expect(supervisor.restart(target.sessionHandle)).rejects.toThrow("protocol_incompatible");
 	});
 
 	it.runIf(process.platform !== "win32")(
@@ -1555,6 +1618,11 @@ describe("SessionSupervisor", () => {
 				args: [fixturePath],
 				source: "pi-path",
 				label: "session runtime fixture",
+				adapter: legacyRpcV1Adapter,
+				version: "0.84.2",
+				adapterId: "legacy-rpc-v1",
+				compatibilityStatus: "current",
+				capabilities: legacyRpcV1Adapter.capabilities,
 			},
 			resolveSession: async () => {
 				await resolveGate;

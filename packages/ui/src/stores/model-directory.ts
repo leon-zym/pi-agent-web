@@ -1,14 +1,13 @@
-import { expectData } from "@pi-agent-web/protocol";
+import { expectCommandData, type ModelDto, type ThinkingLevelDto } from "@pi-agent-web/protocol";
 import { create } from "zustand";
-import type { ModelLite, ThinkingLevel } from "../types/pi-types";
 import { sessionTransport } from "./session-transport";
 
 export interface ModelSnapshot {
-	models: ModelLite[];
-	byProvider: Record<string, ModelLite[]>;
+	models: ModelDto[];
+	byProvider: Record<string, ModelDto[]>;
 	currentModel: { provider: string; modelId: string } | null;
-	thinkingLevels: ThinkingLevel[];
-	currentThinkingLevel: ThinkingLevel | null;
+	thinkingLevels: ThinkingLevelDto[];
+	currentThinkingLevel: ThinkingLevelDto | null;
 	loadedAt: number | null;
 	loading: boolean;
 	error?: string;
@@ -20,16 +19,16 @@ interface ModelDirectoryState extends ModelSnapshot {
 	beginSession: (sessionHandle: string | null) => void;
 	forgetSession: (sessionHandle: string) => void;
 	/** Host-reported state is the only truth (get_state), never a stale cross-Session response. */
-	applyState: (state: { model?: ModelLite; thinkingLevel: ThinkingLevel }) => void;
+	applyState: (state: { model?: ModelDto; thinkingLevel: ThinkingLevelDto }) => void;
 	applyStateForSession: (
 		sessionHandle: string,
-		state: { model?: ModelLite; thinkingLevel: ThinkingLevel },
+		state: { model?: ModelDto; thinkingLevel: ThinkingLevelDto },
 	) => void;
-	applyThinkingLevel: (sessionHandle: string, level: ThinkingLevel) => void;
-	applyThinkingLevelForSession: (sessionHandle: string, level: ThinkingLevel) => void;
+	applyThinkingLevel: (sessionHandle: string, level: ThinkingLevelDto) => void;
+	applyThinkingLevelForSession: (sessionHandle: string, level: ThinkingLevelDto) => void;
 	refresh: (sessionHandle: string) => Promise<void>;
 	selectModel: (sessionHandle: string, provider: string, modelId: string) => Promise<void>;
-	selectThinkingLevel: (sessionHandle: string, level: ThinkingLevel) => Promise<void>;
+	selectThinkingLevel: (sessionHandle: string, level: ThinkingLevelDto) => Promise<void>;
 }
 
 const refreshGeneration = new Map<string, number>();
@@ -141,10 +140,10 @@ export const useModelDirectoryStore = create<ModelDirectoryState>()((set, get) =
 					transport.sendCommand(sessionHandle, { type: "get_available_thinking_levels" }),
 				]);
 				if (!isLatest(refreshGeneration, sessionHandle, generation)) return;
-				const { models } = expectData(modelsResponse) as { models: ModelLite[] };
-				const state = expectData(stateResponse) as { model?: ModelLite; thinkingLevel: ThinkingLevel };
-				const { levels } = expectData(levelsResponse) as { levels: ThinkingLevel[] };
-				const byProvider: Record<string, ModelLite[]> = {};
+				const { models } = expectCommandData(modelsResponse, "get_available_models");
+				const state = expectCommandData(stateResponse, "get_state");
+				const { levels } = expectCommandData(levelsResponse, "get_available_thinking_levels");
+				const byProvider: Record<string, ModelDto[]> = {};
 				for (const model of models) {
 					const group = byProvider[model.provider] ?? [];
 					group.push(model);
@@ -175,7 +174,7 @@ export const useModelDirectoryStore = create<ModelDirectoryState>()((set, get) =
 			const response = await sessionTransport.store
 				.getState()
 				.sendCommand(sessionHandle, { type: "set_model", provider, modelId });
-			const model = expectData(response) as ModelLite;
+			const model = expectCommandData(response, "set_model");
 			if (!isLatest(modelSelectionGeneration, sessionHandle, generation)) return;
 			updateSession(sessionHandle, (snapshot) => ({
 				...snapshot,

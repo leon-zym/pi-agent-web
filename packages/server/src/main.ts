@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import type { Socket } from "node:net";
 import path from "node:path";
@@ -13,7 +13,7 @@ import {
 import { assertLoopbackHost, ENV_SESSION_DIR, loadConfig, type ServerConfig } from "./config.js";
 import { NativeSessionCatalog, sessionHandleForCanonicalFile } from "./native-session-catalog.js";
 import { RecoverableSessionTrash } from "./recoverable-session-trash.js";
-import { type ResolvedPi, resolvePiRuntime } from "./resolver.js";
+import { type ProbedPiRuntime, resolvePiRuntime } from "./resolver.js";
 import { createApp } from "./routes.js";
 import { SessionLayoutResolver } from "./session-layout-resolver.js";
 import { SessionSupervisor } from "./session-supervisor.js";
@@ -43,7 +43,7 @@ export interface ServerHandle {
 	preferences: WorkspacePreferences;
 	trash: RecoverableSessionTrash;
 	config: ServerConfig;
-	runtime: ResolvedPi;
+	runtime: ProbedPiRuntime;
 	accessControl: GatewayAccessControl;
 	close: () => Promise<void>;
 }
@@ -82,6 +82,9 @@ function openBrowser(host: string, port: number): void {
 export async function startServer(options: StartServerOptions = {}): Promise<ServerHandle> {
 	const config: ServerConfig = { ...loadConfig(), ...options.config };
 	assertLoopbackHost(config.host);
+	const runtime = await resolvePiRuntime({ piPath: options.piPath });
+	log("info", `Pi runtime resolved: ${runtime.source} Pi ${runtime.version} (${runtime.adapterId})`);
+	const serverEpoch = randomUUID();
 	fs.mkdirSync(config.webDataDir, { recursive: true, mode: 0o700 });
 	const reportAccessDenial = createGatewayAccessDenialReporter(({ reason, suppressed }) => {
 		const summary = suppressed > 0 ? ` (${String(suppressed)} additional denials suppressed)` : "";
@@ -90,17 +93,6 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 	const accessControl = createGatewayAccessControl(randomBytes(32).toString("base64url"), {
 		onDenied: reportAccessDenial,
 	});
-
-	let runtime: ResolvedPi;
-	let runtimeWarning: string | undefined;
-	try {
-		runtime = await resolvePiRuntime({ piPath: options.piPath, baseDir: process.cwd() });
-		log("info", `Pi runtime resolved: ${runtime.label}`);
-	} catch (error) {
-		runtimeWarning = errorText(error);
-		log("error", runtimeWarning);
-		runtime = { command: "pi", args: ["--mode", "rpc"], source: "system", label: "unresolved" };
-	}
 
 	const layoutEnv: NodeJS.ProcessEnv = { ...process.env };
 	if (Object.hasOwn(options.config ?? {}, "sessionRootDir")) {
@@ -152,7 +144,17 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 		broadcast: (message) => bridge.broadcast(message),
 		log,
 	});
-	bridge = new SessionWsBridge({ supervisor, log });
+	bridge = new SessionWsBridge({
+		supervisor,
+		log,
+		serverEpoch,
+		serverBuild: "0.1.0",
+		runtime: {
+			version: runtime.version,
+			adapterId: runtime.adapterId,
+			capabilities: [...runtime.capabilities, "session.multiplex"],
+		},
+	});
 
 	const app = createApp({
 		accessControl,
@@ -162,6 +164,15 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 		preferences,
 		supervisor,
 		trash,
+		readiness: {
+			ready: true,
+			runtime: {
+				source: runtime.source,
+				version: runtime.version,
+				adapterId: runtime.adapterId,
+				capabilities: runtime.capabilities,
+			},
+		},
 	});
 	serveStaticApp(app, options.staticDir);
 
@@ -189,7 +200,6 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 		throw new Error("gateway did not expose a TCP address after listening");
 	}
 	log("info", `pi-agent-web server listening on http://${config.host}:${address.port}`);
-	if (runtimeWarning) log("warn", runtimeWarning);
 	if (options.openInBrowser) openBrowser(config.host, address.port);
 
 	server.on("upgrade", (request, socket, head) => {

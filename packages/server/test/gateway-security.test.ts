@@ -35,6 +35,25 @@ async function openSocket(headers: Record<string, string>): Promise<import("ws")
 		ws.once("open", resolve);
 		ws.once("error", reject);
 	});
+	const hello = new Promise<void>((resolve, reject) => {
+		const timeout = setTimeout(() => reject(new Error("server hello timed out")), 10_000);
+		ws.once("message", (raw) => {
+			clearTimeout(timeout);
+			const frame = JSON.parse(raw.toString()) as { type?: string };
+			if (frame.type === "server_hello") resolve();
+			else reject(new Error("Gateway rejected client hello"));
+		});
+	});
+	ws.send(
+		JSON.stringify({
+			type: "client_hello",
+			protocol: { major: 1, minor: 0 },
+			clientBuild: "gateway-security-test",
+			capabilities: ["rpc.commands", "rpc.events", "rpc.extension_ui", "session.multiplex"],
+			limits: { maxServerFrameBytes: 68 * 1024 * 1024 },
+		}),
+	);
+	await hello;
 	return ws;
 }
 

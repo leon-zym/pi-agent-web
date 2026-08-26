@@ -1,3 +1,4 @@
+import type { SlashCommandDto } from "@pi-agent-web/protocol";
 import { describe, expect, it } from "vitest";
 import {
 	buildSlashMenuGroups,
@@ -8,9 +9,8 @@ import {
 	resolveRawSlashCommand,
 	selectSlashCommand,
 } from "../src/features/composer/slash-menu-model";
-import type { RpcSlashCommand } from "../src/types/pi-types";
 
-function command(name: string, source: RpcSlashCommand["source"]): RpcSlashCommand {
+function command(name: string, source: SlashCommandDto["source"]): SlashCommandDto {
 	return { name, source, sourceInfo: {} };
 }
 

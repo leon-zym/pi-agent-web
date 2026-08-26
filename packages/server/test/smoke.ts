@@ -56,6 +56,25 @@ try {
 		ws.once("open", resolve);
 		ws.once("error", reject);
 	});
+	const hello = new Promise<void>((resolve, reject) => {
+		const timeout = setTimeout(() => reject(new Error("server hello timed out")), 10_000);
+		ws.once("message", (raw) => {
+			const frame = JSON.parse(raw.toString()) as { type?: string };
+			if (frame.type !== "server_hello") return reject(new Error("Gateway rejected client hello"));
+			clearTimeout(timeout);
+			resolve();
+		});
+	});
+	ws.send(
+		JSON.stringify({
+			type: "client_hello",
+			protocol: { major: 1, minor: 0 },
+			clientBuild: "smoke",
+			capabilities: ["rpc.commands", "rpc.events", "rpc.extension_ui", "session.multiplex"],
+			limits: { maxServerFrameBytes: 68 * 1024 * 1024 },
+		}),
+	);
+	await hello;
 	const subscribed = new Promise<void>((resolve, reject) => {
 		const timeout = setTimeout(() => reject(new Error("Session subscribe timed out")), 10_000);
 		ws.on("message", (raw) => {

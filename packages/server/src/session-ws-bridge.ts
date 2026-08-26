@@ -1,9 +1,16 @@
 import { randomUUID } from "node:crypto";
-import type { RpcCommand, RpcResponse } from "@earendil-works/pi-coding-agent";
 import {
+	GATEWAY_PROTOCOL_VERSION,
+	GATEWAY_REQUIRED_CAPABILITIES,
+	type GatewayProtocolErrorDto,
+	type GatewayServerHelloDto,
+	isGatewayClientHello,
 	isSessionWsClientMessage,
 	RpcError,
 	SESSION_WS_CLIENT_MAX_BYTES,
+	SESSION_WS_SERVER_MAX_BYTES,
+	type SessionCommandDto,
+	type SessionCommandResponseDto,
 	type SessionReplayFrameDto,
 	type SessionRuntimeDto,
 	type SessionWsClientMessage,
@@ -11,7 +18,6 @@ import {
 } from "@pi-agent-web/protocol";
 import type { WebSocket } from "ws";
 import { WebSocketServer } from "ws";
-import { MAX_JSONL_SNAPSHOT_LINE_BYTES } from "./jsonl.js";
 import type { SessionSupervisorMessage } from "./session-runtime-types.js";
 import type { SessionSupervisor } from "./session-supervisor.js";
 
@@ -33,6 +39,9 @@ interface ConnectionState {
 	alive: boolean;
 	closed: boolean;
 	epoch: number;
+	helloComplete: boolean;
+	helloTimer?: NodeJS.Timeout;
+	negotiatedMaxServerFrameBytes: number;
 }
 
 interface OutboundPayload {
@@ -63,13 +72,21 @@ interface BashCommandIdMapping {
 
 export interface SessionWsBridgeOptions {
 	supervisor: SessionSupervisor;
+	serverEpoch: string;
+	serverBuild: string;
+	runtime: {
+		version: string;
+		adapterId: string;
+		capabilities: readonly string[];
+	};
 	heartbeatIntervalMs?: number;
+	helloTimeoutMs?: number;
 	log?: (level: "info" | "warn" | "error", message: string) => void;
 }
 
 export const MAX_SESSION_WS_IN_FLIGHT_COMMANDS = 32;
 export const MAX_SESSION_WS_BUFFERED_BYTES = 1024 * 1024;
-const MAX_SESSION_WS_SNAPSHOT_RESPONSE_BYTES = MAX_JSONL_SNAPSHOT_LINE_BYTES + MAX_SESSION_WS_BUFFERED_BYTES;
+const MAX_SESSION_WS_SNAPSHOT_RESPONSE_BYTES = SESSION_WS_SERVER_MAX_BYTES;
 
 /** Multiplexes one browser socket across any number of independent Sessions. */
 export class SessionWsBridge {
@@ -78,6 +95,10 @@ export class SessionWsBridge {
 	private readonly connections = new Set<ConnectionState>();
 	private readonly heartbeatTimer: NodeJS.Timeout;
 	private readonly log: (level: "info" | "warn" | "error", message: string) => void;
+	private readonly serverEpoch: string;
+	private readonly serverBuild: string;
+	private readonly runtime: SessionWsBridgeOptions["runtime"];
+	private readonly helloTimeoutMs: number;
 	private requestCounter = 0;
 	private closePromise: Promise<void> | null = null;
 	private readonly bashCommandIds = new Map<string, BashCommandIdMapping>();
@@ -85,6 +106,10 @@ export class SessionWsBridge {
 	constructor(opts: SessionWsBridgeOptions) {
 		this.supervisor = opts.supervisor;
 		this.log = opts.log ?? (() => {});
+		this.serverEpoch = opts.serverEpoch;
+		this.serverBuild = opts.serverBuild;
+		this.runtime = opts.runtime;
+		this.helloTimeoutMs = Math.max(1, opts.helloTimeoutMs ?? 5_000);
 		this.wss = new WebSocketServer({ noServer: true, maxPayload: SESSION_WS_CLIENT_MAX_BYTES });
 		this.wss.on("connection", (ws) => this.handleConnection(ws));
 		this.wss.on("error", (error) => this.log("error", `ws server error: ${String(error)}`));
@@ -141,7 +166,7 @@ export class SessionWsBridge {
 		}
 		const sharedPayload = JSON.stringify(message satisfies SessionWsServerMessage);
 		for (const connection of this.connections) {
-			if (connection.closed) continue;
+			if (connection.closed || !connection.helloComplete) continue;
 			const payload = this.payloadForConnection(connection, message, sharedPayload);
 			const sessionHandle = this.broadcastSessionHandle(message);
 			if (!sessionHandle) {
@@ -215,8 +240,19 @@ export class SessionWsBridge {
 			alive: true,
 			closed: false,
 			epoch: 0,
+			helloComplete: false,
+			negotiatedMaxServerFrameBytes: MAX_SESSION_WS_SNAPSHOT_RESPONSE_BYTES,
 		};
 		this.connections.add(connection);
+		connection.helloTimer = setTimeout(() => {
+			if (connection.closed || connection.helloComplete) return;
+			try {
+				connection.ws.close(1008, "client hello timeout");
+			} finally {
+				this.disconnect(connection);
+			}
+		}, this.helloTimeoutMs);
+		connection.helloTimer.unref?.();
 		this.log("info", `ws connected (${this.connections.size} open)`);
 
 		ws.on("pong", () => {
@@ -249,6 +285,10 @@ export class SessionWsBridge {
 			this.closeForPolicyViolation(connection, "invalid JSON");
 			return;
 		}
+		if (!connection.helloComplete) {
+			this.handleClientHello(connection, value);
+			return;
+		}
 		if (!isSessionWsClientMessage(value)) {
 			this.closeForPolicyViolation(connection, "invalid client frame");
 			return;
@@ -274,6 +314,88 @@ export class SessionWsBridge {
 			case "extension_ui_response":
 				await this.handleExtensionUiResponse(connection, message);
 				return;
+		}
+	}
+
+	private handleClientHello(connection: ConnectionState, value: unknown): void {
+		if (!isGatewayClientHello(value)) {
+			const code =
+				typeof value === "object" && value !== null && "type" in value && value.type === "client_hello"
+					? "invalid_hello"
+					: "hello_required";
+			this.sendProtocolErrorAndClose(connection, code);
+			return;
+		}
+		if (value.protocol.major !== GATEWAY_PROTOCOL_VERSION.major) {
+			this.sendProtocolErrorAndClose(connection, "protocol_major_unsupported");
+			return;
+		}
+
+		const requestedCapabilities = new Set(value.capabilities);
+		if (
+			GATEWAY_REQUIRED_CAPABILITIES.some(
+				(capability) =>
+					!requestedCapabilities.has(capability) || !this.runtime.capabilities.includes(capability),
+			)
+		) {
+			this.sendProtocolErrorAndClose(connection, "capability_unsupported");
+			return;
+		}
+		connection.helloComplete = true;
+		if (connection.helloTimer) clearTimeout(connection.helloTimer);
+		connection.helloTimer = undefined;
+		connection.negotiatedMaxServerFrameBytes = Math.min(
+			value.limits.maxServerFrameBytes,
+			MAX_SESSION_WS_SNAPSHOT_RESPONSE_BYTES,
+		);
+		const negotiatedCapabilities = this.runtime.capabilities.filter((capability) =>
+			requestedCapabilities.has(capability),
+		);
+		const hello: GatewayServerHelloDto = {
+			type: "server_hello",
+			protocol: {
+				major: GATEWAY_PROTOCOL_VERSION.major,
+				minor: Math.min(value.protocol.minor, GATEWAY_PROTOCOL_VERSION.minor),
+			},
+			serverBuild: this.serverBuild,
+			serverEpoch: this.serverEpoch,
+			piVersion: this.runtime.version,
+			adapterId: this.runtime.adapterId,
+			capabilities: negotiatedCapabilities,
+			limits: {
+				maxClientFrameBytes: SESSION_WS_CLIENT_MAX_BYTES,
+				maxSnapshotFrameBytes: connection.negotiatedMaxServerFrameBytes,
+				maxExtensionRequests: 128,
+			},
+		};
+		this.sendPayload(connection, JSON.stringify(hello));
+	}
+
+	private sendProtocolErrorAndClose(
+		connection: ConnectionState,
+		code: GatewayProtocolErrorDto["code"],
+	): void {
+		if (connection.closed) return;
+		const message: GatewayProtocolErrorDto = {
+			type: "protocol_error",
+			code,
+			supported: {
+				major: GATEWAY_PROTOCOL_VERSION.major,
+				minMinor: 0,
+				maxMinor: GATEWAY_PROTOCOL_VERSION.minor,
+			},
+		};
+		try {
+			connection.ws.send(JSON.stringify(message), () => {
+				if (connection.closed) return;
+				try {
+					connection.ws.close(1008, "protocol incompatible");
+				} finally {
+					this.disconnect(connection);
+				}
+			});
+		} catch {
+			this.disconnect(connection);
 		}
 	}
 
@@ -445,6 +567,10 @@ export class SessionWsBridge {
 	): void {
 		if (!connection.catchUps.has(catchUp) || connection.closed) return;
 		const bytes = Buffer.byteLength(payload);
+		if (connection.helloComplete && bytes > connection.negotiatedMaxServerFrameBytes) {
+			this.closeForPolicyViolation(connection, "frame exceeds negotiated client limit");
+			return;
+		}
 		catchUp.buffered.push({ message, payload });
 		catchUp.bufferedBytes += bytes;
 		connection.catchUpBufferedBytes += bytes;
@@ -596,7 +722,7 @@ export class SessionWsBridge {
 		const internalId = this.nextInternalId(connection);
 		const clientId = message.command.id;
 		connection.pendingCommands.add(internalId);
-		const command = { ...message.command, id: internalId } as RpcCommand;
+		const command = { ...message.command, id: internalId } as SessionCommandDto;
 		if (command.type === "bash" && clientId) {
 			this.bashCommandIds.set(internalId, { connectionId: connection.connectionId, clientId });
 		}
@@ -694,14 +820,21 @@ export class SessionWsBridge {
 		return `bridge-${connection.connectionId}-${this.requestCounter.toString(36)}`;
 	}
 
-	private restoreClientId(response: RpcResponse, clientId: string | undefined): RpcResponse {
+	private restoreClientId(
+		response: SessionCommandResponseDto,
+		clientId: string | undefined,
+	): SessionCommandResponseDto {
 		const { id: _internalId, ...rest } = response;
-		return clientId ? ({ ...rest, id: clientId } as RpcResponse) : (rest as RpcResponse);
+		return clientId
+			? ({ ...rest, id: clientId } as SessionCommandResponseDto)
+			: (rest as SessionCommandResponseDto);
 	}
 
 	private disconnect(connection: ConnectionState): void {
 		if (connection.closed) return;
 		connection.closed = true;
+		if (connection.helloTimer) clearTimeout(connection.helloTimer);
+		connection.helloTimer = undefined;
 		connection.epoch += 1;
 		this.connections.delete(connection);
 		for (const catchUp of [...connection.catchUps]) this.cancelCatchUp(connection, catchUp);
@@ -792,6 +925,10 @@ export class SessionWsBridge {
 		if (connection.closed) return;
 		if (connection.ws.readyState !== connection.ws.OPEN) return;
 		const bytes = Buffer.byteLength(payload);
+		if (connection.helloComplete && bytes > connection.negotiatedMaxServerFrameBytes) {
+			this.closeForPolicyViolation(connection, "frame exceeds negotiated client limit");
+			return;
+		}
 		const oversizedSnapshot = allowOversizedSnapshot && bytes > MAX_SESSION_WS_BUFFERED_BYTES;
 		if (bytes > MAX_SESSION_WS_BUFFERED_BYTES && !oversizedSnapshot) {
 			this.closeForPolicyViolation(connection, "oversized WebSocket frame");

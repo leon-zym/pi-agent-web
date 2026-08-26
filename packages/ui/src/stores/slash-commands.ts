@@ -1,10 +1,9 @@
-import { expectData } from "@pi-agent-web/protocol";
+import { expectCommandData, type SlashCommandDto } from "@pi-agent-web/protocol";
 import { create } from "zustand";
-import type { RpcSlashCommand } from "../types/pi-types";
 import { sessionTransport } from "./session-transport";
 
 export interface SlashCommandSnapshot {
-	commands: RpcSlashCommand[];
+	commands: SlashCommandDto[];
 	loadedAt: number | null;
 	loading: boolean;
 }
@@ -87,7 +86,7 @@ export const useSlashCommandsStore = create<SlashCommandsState>()((set) => {
 					.getState()
 					.sendCommand(sessionHandle, { type: "get_commands" });
 				if (!isLatestRefresh(sessionHandle, generation)) return;
-				const { commands } = expectData(response) as { commands: RpcSlashCommand[] };
+				const { commands } = expectCommandData(response, "get_commands");
 				updateSession(sessionHandle, () => ({ commands, loadedAt: Date.now(), loading: false }));
 			} catch {
 				if (!isLatestRefresh(sessionHandle, generation)) return;

@@ -1,17 +1,17 @@
+import type { SlashCommandDto } from "@pi-agent-web/protocol";
 import type { SlashCommandToken, SlashTrigger } from "../../stores/composer";
-import type { RpcSlashCommand } from "../../types/pi-types";
 
-const SOURCE_ORDER: RpcSlashCommand["source"][] = ["extension", "prompt", "skill"];
+const SOURCE_ORDER: SlashCommandDto["source"][] = ["extension", "prompt", "skill"];
 
 export interface SlashMenuItem {
-	command: RpcSlashCommand;
+	command: SlashCommandDto;
 	displayName: string;
 	score: number;
 	index: number;
 }
 
 export interface SlashMenuGroup {
-	source: RpcSlashCommand["source"];
+	source: SlashCommandDto["source"];
 	items: SlashMenuItem[];
 }
 
@@ -29,12 +29,12 @@ export function fuzzyScore(query: string, name: string): number {
 	return queryIndex === lowerQuery.length ? 20 - lowerName.length : -1;
 }
 
-function displayName(command: RpcSlashCommand): string {
+function displayName(command: SlashCommandDto): string {
 	return command.name.startsWith("skill:") ? command.name.slice(6) : command.name;
 }
 
 /** Build the exact order rendered by the grouped listbox. */
-export function buildSlashMenuGroups(commands: RpcSlashCommand[], query: string): SlashMenuGroup[] {
+export function buildSlashMenuGroups(commands: SlashCommandDto[], query: string): SlashMenuGroup[] {
 	const normalizedQuery = query.toLowerCase();
 	let index = 0;
 	const result: SlashMenuGroup[] = [];
@@ -98,7 +98,7 @@ export function selectSlashCommand(
 /** Parse an exact raw invocation at submit time so it cannot bypass the atomic token model. */
 export function resolveRawSlashCommand(
 	draft: string,
-	commands: RpcSlashCommand[],
+	commands: SlashCommandDto[],
 ): { command: SlashCommandToken; draft: string } | null {
 	const match = draft.match(/^\s*\/([^\s]+)(?:\s+([\s\S]*))?$/);
 	if (!match?.[1]) return null;

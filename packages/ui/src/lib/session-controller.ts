@@ -1,5 +1,5 @@
-import type { RpcResponse } from "@earendil-works/pi-coding-agent";
-import { expectData, type NativeSessionDto } from "@pi-agent-web/protocol";
+import type { SessionCommandResponseDto } from "@pi-agent-web/protocol";
+import { expectCommandData, type NativeSessionDto } from "@pi-agent-web/protocol";
 import { toast } from "sonner";
 import { serializeComposerMessage, useComposerStore } from "../stores/composer";
 import { useProjectionStore } from "../stores/projection";
@@ -171,7 +171,7 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 
 	const images = submitted.images.length > 0 ? submitted.images : undefined;
 	try {
-		let response: RpcResponse;
+		let response: SessionCommandResponseDto;
 		if (resolvedKind === "steer" || resolvedKind === "follow_up") {
 			composer.recordQueuedForSession(sessionHandle, text, resolvedKind);
 			response = await sendControlCommand(sessionHandle, {
@@ -245,8 +245,8 @@ export async function forkFromEntry(entryId: string): Promise<void> {
 	try {
 		const sessionHandle = currentSessionHandle();
 		const response = await sendControlCommand(sessionHandle, { type: "fork", entryId });
-		const data = expectData(response) as { cancelled?: boolean } | undefined;
-		if (data?.cancelled) {
+		const data = expectCommandData(response, "fork");
+		if (data.cancelled) {
 			toast.info(tt("session.forkCancelled"));
 			return;
 		}

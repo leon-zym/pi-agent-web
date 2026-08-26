@@ -1,6 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 
+if (process.argv.includes("--version")) {
+	process.stdout.write("0.84.2\n");
+	process.exit(0);
+}
+
 const lifecycleMarker = process.env.PI_WEB_FIXTURE_LIFECYCLE_MARKER;
 if (lifecycleMarker) {
 	fs.appendFileSync(lifecycleMarker, `start:${process.pid}\n`);
@@ -37,6 +42,31 @@ const usage = {
 	totalTokens: 2,
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
+
+function state() {
+	return {
+		sessionId,
+		sessionFile,
+		thinkingLevel: "off",
+		isStreaming: false,
+		isCompacting: false,
+		steeringMode: "all",
+		followUpMode: "all",
+		autoCompactionEnabled: true,
+		messageCount: messages.length,
+		pendingMessageCount: 0,
+	};
+}
+
+function assistantMessage(text) {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text }],
+		usage,
+		stopReason: "stop",
+		timestamp: Date.now(),
+	};
+}
 
 if (requestedFile) {
 	sessionFile = path.resolve(requestedFile);
@@ -162,6 +192,11 @@ function streamPrompt(command) {
 	const text = command.message;
 	messages.push({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() });
 	if (process.env.PI_WEB_FIXTURE_SKIP_PROMPT_PERSIST !== "1") ensurePersisted();
+	if (text === "protocol-incompatible") {
+		response(command);
+		send({ type: "queue_update", steering: "malformed", followUp: [] });
+		return;
+	}
 	if (text === "open-dialog-no-agent" || text === "open-dialog-timeout" || text === "open-dialog-crash") {
 		send({
 			type: "extension_ui_request",
@@ -182,8 +217,7 @@ function streamPrompt(command) {
 			send({
 				type: "message_update",
 				usage,
-				message: { role: "assistant", content: [{ type: "text", text: sessionId }] },
-				assistantMessageEvent: { type: "text_delta", delta: sessionId },
+				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: sessionId },
 			});
 			send({ type: "agent_settled" });
 		}, 100);
@@ -198,8 +232,7 @@ function streamPrompt(command) {
 			send({
 				type: "message_update",
 				usage,
-				message: { role: "assistant", content: [{ type: "text", text: payload }] },
-				assistantMessageEvent: { type: "text_delta", delta: payload },
+				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: payload },
 			});
 		}
 		send({ type: "agent_end", messages: [], willRetry: false });
@@ -229,12 +262,11 @@ function streamPrompt(command) {
 		send({
 			type: "message_update",
 			usage,
-			message: { role: "assistant", content: [{ type: "text", text: sessionId }] },
-			assistantMessageEvent: { type: "text_delta", delta: sessionId },
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: sessionId },
 		});
 	}, delay);
 	setTimeout(() => {
-		messages.push({ role: "assistant", content: [{ type: "text", text: sessionId }], timestamp: Date.now() });
+		messages.push(assistantMessage(sessionId));
 		send({ type: "agent_end", messages: [], willRetry: false });
 		send({ type: "agent_settled" });
 	}, delay + 10);
@@ -277,12 +309,11 @@ function transition(command) {
 		send({
 			type: "message_update",
 			usage,
-			message: { role: "assistant", content: [{ type: "text", text: sessionId }] },
-			assistantMessageEvent: { type: "text_delta", delta: sessionId },
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: sessionId },
 		});
 	}
 	if (process.env.PI_WEB_FIXTURE_DROP_TRANSITION_RESPONSE === "1") return;
-	response(command, command.type === "fork" ? { text: "forked", cancelled: false } : undefined);
+	response(command, command.type === "fork" ? { text: "forked", cancelled: false } : { cancelled: false });
 }
 
 function handleLine(line) {
@@ -312,20 +343,17 @@ function handleLine(line) {
 				initialStateRequest = false;
 				const readyDelay = Number(process.env.PI_WEB_FIXTURE_READY_DELAY_MS);
 				if (Number.isFinite(readyDelay) && readyDelay > 0) {
-					setTimeout(() => response(command, { sessionId, sessionFile, thinkingLevel: "off" }), readyDelay);
+					setTimeout(() => response(command, state()), readyDelay);
 					return;
 				}
 			}
 			if (delayNextTransitionState) {
 				delayNextTransitionState = false;
 				const delay = Number(process.env.PI_WEB_FIXTURE_TRANSITION_STATE_DELAY_MS);
-				setTimeout(
-					() => response(command, { sessionId, sessionFile, thinkingLevel: "off" }),
-					Number.isFinite(delay) ? delay : 100,
-				);
+				setTimeout(() => response(command, state()), Number.isFinite(delay) ? delay : 100);
 				return;
 			}
-			response(command, { sessionId, sessionFile, thinkingLevel: "off" });
+			response(command, state());
 			return;
 		case "get_messages":
 			response(command, { messages });
@@ -339,7 +367,12 @@ function handleLine(line) {
 				errorResponse(command, `fixture ${command.type} failure`);
 				return;
 			}
-			response(command);
+			response(
+				command,
+				command.type === "set_model"
+					? { id: command.modelId, name: command.modelId, provider: command.provider }
+					: undefined,
+			);
 			return;
 		case "prompt":
 			streamPrompt(command);
@@ -374,7 +407,7 @@ function handleLine(line) {
 		case "abort_bash":
 			if (pendingBashTimer) clearTimeout(pendingBashTimer);
 			if (pendingBash) {
-				response(pendingBash, { output: "", exitCode: null, cancelled: true, truncated: false });
+				response(pendingBash, { output: "", cancelled: true, truncated: false });
 				pendingBash = undefined;
 				pendingBashTimer = undefined;
 			}
@@ -390,7 +423,11 @@ function handleLine(line) {
 				willRetry,
 				...(command.customInstructions === "failure" ? { errorMessage: "fixture failure" } : {}),
 			});
-			response(command);
+			response(command, {
+				summary: "fixture summary",
+				firstKeptEntryId: "fixture-entry",
+				tokensBefore: 2,
+			});
 			if (willRetry) setTimeout(() => send({ type: "agent_settled" }), 100);
 			return;
 		}
