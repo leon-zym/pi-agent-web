@@ -5,6 +5,7 @@ import type { Socket } from "node:net";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { type ServerType, serve } from "@hono/node-server";
+import { GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY } from "@pi-agent-web/protocol";
 import {
 	createGatewayAccessControl,
 	createGatewayAccessDenialReporter,
@@ -143,6 +144,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 			};
 		},
 		broadcast: (message) => bridge.broadcast(message),
+		onHotRuntimeInventory: (inventory) => bridge.broadcastHotRuntimeInventory(inventory),
 		log,
 	});
 	bridge = new SessionWsBridge({
@@ -152,7 +154,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 		runtime: {
 			version: runtime.version,
 			adapterId: runtime.adapterId,
-			capabilities: [...runtime.capabilities, "session.multiplex"],
+			capabilities: [...runtime.capabilities, "session.multiplex", GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY],
 		},
 	});
 

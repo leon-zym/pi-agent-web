@@ -54,6 +54,20 @@ export interface CreateSessionRequest {
 	requestedNativeSessionId?: string;
 }
 
+export interface HotRuntimeSubscriptionToken {
+	readonly kind: "hot_runtime_subscription";
+}
+
+export type HotRuntimeSubscriptionResult = ReplayResult & {
+	observationToken: HotRuntimeSubscriptionToken;
+};
+
+interface HotRuntimeSubscriptionObservation {
+	runtime: SessionRuntime;
+	expected: SessionRuntimeIdentityDto;
+	observation: SessionHotRuntimeObservation;
+}
+
 export interface SessionSupervisorOptions {
 	serverEpoch?: string;
 	resolved: ProbedPiRuntime;
@@ -99,6 +113,10 @@ interface Alias {
  * crash budgets, replay, and capacity are isolated per Session handle.
  */
 export class SessionSupervisor {
+	private readonly hotRuntimeSubscriptionObservations = new WeakMap<
+		HotRuntimeSubscriptionToken,
+		HotRuntimeSubscriptionObservation
+	>();
 	readonly serverEpoch: string;
 	private readonly opts: Required<
 		Pick<
@@ -255,7 +273,10 @@ export class SessionSupervisor {
 		return runtime.getReplay(sessionHandle, cursor);
 	}
 
-	async subscribeHotExact(expected: SessionRuntimeIdentityDto, cursor?: ReplayCursor): Promise<ReplayResult> {
+	async subscribeHotExact(
+		expected: SessionRuntimeIdentityDto,
+		cursor?: ReplayCursor,
+	): Promise<HotRuntimeSubscriptionResult> {
 		return this.withPoolLock(async () => {
 			this.assertOpen();
 			const runtime = this.runtimes.get(expected.sessionHandle);
@@ -272,8 +293,29 @@ export class SessionSupervisor {
 			) {
 				throw new RpcError("session_subscribe", "hot_runtime_identity_changed");
 			}
-			return baseline;
+			const observationToken = Object.freeze({
+				kind: "hot_runtime_subscription" as const,
+			});
+			this.hotRuntimeSubscriptionObservations.set(observationToken, {
+				runtime,
+				expected: { ...expected },
+				observation,
+			});
+			return { ...baseline, observationToken };
 		});
+	}
+
+	/** Consume an exact-hot observation immediately before its baseline becomes visible. */
+	revalidateHotExactSubscription(token: HotRuntimeSubscriptionToken): boolean {
+		const captured = this.hotRuntimeSubscriptionObservations.get(token);
+		this.hotRuntimeSubscriptionObservations.delete(token);
+		if (!captured) return false;
+		const current = this.runtimes.get(captured.expected.sessionHandle);
+		return (
+			current === captured.runtime &&
+			this.matchesHotRuntimeIdentity(captured.observation, captured.expected) &&
+			current.isHotRuntimeObservationCurrent(captured.observation)
+		);
 	}
 
 	async claim(sessionHandle: string, connectionId: string): Promise<SessionLeaseSnapshot> {

@@ -5,11 +5,16 @@ import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import type {
+	HotRuntimeInventoryDto,
 	SessionCommandDto,
 	SessionCommandResponseDto,
 	SessionRuntimeDto,
 	SessionWsClientMessage,
 	SessionWsServerMessage,
+} from "@pi-agent-web/protocol";
+import {
+	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+	SESSION_HOT_RUNTIME_INVENTORY_MAX_BYTES,
 } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
@@ -18,7 +23,11 @@ import { legacyRpcV1Adapter } from "../src/legacy-rpc-v1.js";
 import { canonicalizeSessionFile, sessionHandleForFile } from "../src/native-session-catalog.js";
 import type { ExistingSessionTarget } from "../src/session-runtime-types.js";
 import { SessionSupervisor } from "../src/session-supervisor.js";
-import { MAX_SESSION_WS_BUFFERED_BYTES, SessionWsBridge } from "../src/session-ws-bridge.js";
+import {
+	MAX_SESSION_WS_BUFFERED_BYTES,
+	MAX_SESSION_WS_IN_FLIGHT_EXACT_SUBSCRIPTIONS,
+	SessionWsBridge,
+} from "../src/session-ws-bridge.js";
 
 const fixturePath = path.join(import.meta.dirname, "fixtures", "session-runtime-pi.mjs");
 const TEST_SERVER_EPOCH = "session-ws-bridge-test-epoch";
@@ -229,6 +238,15 @@ function markBridgeConnectionHelloComplete(bridge: SessionWsBridge): void {
 	(connection as { helloComplete: boolean }).helloComplete = true;
 }
 
+function markBridgeConnectionInventoryNegotiated(bridge: SessionWsBridge): void {
+	const { connection } = bridgeConnection(bridge);
+	Object.assign(connection as object, {
+		helloComplete: true,
+		hotInventoryNegotiated: true,
+		hotInventoryRevision: -1,
+	});
+}
+
 async function createHarness(
 	targets: ExistingSessionTarget[],
 	options: { replayLimit?: number; serverEpoch?: string; env?: Record<string, string> } = {},
@@ -252,6 +270,7 @@ async function createHarness(
 		resolveSession: async (sessionHandle) => targetMap.get(sessionHandle),
 		env: options.env,
 		broadcast: (message) => bridge.broadcast(message),
+		onHotRuntimeInventory: (inventory) => bridge.broadcastHotRuntimeInventory(inventory),
 		replayLimit: options.replayLimit ?? 32,
 		readyTimeoutMs: 2_000,
 		idleTtlMs: 60_000,
@@ -262,7 +281,13 @@ async function createHarness(
 		runtime: {
 			version: "0.84.2",
 			adapterId: "legacy-rpc-v1",
-			capabilities: ["rpc.commands", "rpc.events", "rpc.extension_ui", "session.multiplex"],
+			capabilities: [
+				"rpc.commands",
+				"rpc.events",
+				"rpc.extension_ui",
+				"session.multiplex",
+				GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+			],
 		},
 		heartbeatIntervalMs: 60_000,
 		log: (_level, message) => connectionEvents.push(message),
@@ -319,6 +344,41 @@ async function openClient(harness: Harness): Promise<ClientProbe> {
 	if ((await hello).type !== "server_hello") throw new Error("Gateway rejected test client hello");
 	const probe = new ClientProbe(ws);
 	harness.clients.push(probe);
+	return probe;
+}
+
+async function openInventoryClient(
+	harness: Harness,
+	overrides: {
+		minor?: number;
+		capability?: boolean;
+		maxServerFrameBytes?: number;
+	} = {},
+): Promise<ClientProbe> {
+	const ws = new WebSocket(harness.url);
+	await new Promise<void>((resolve, reject) => {
+		ws.once("open", resolve);
+		ws.once("error", reject);
+	});
+	const probe = new ClientProbe(ws);
+	harness.clients.push(probe);
+	ws.send(
+		JSON.stringify({
+			type: "client_hello",
+			protocol: { major: 1, minor: overrides.minor ?? 1 },
+			clientBuild: "0.1.0-inventory-test",
+			capabilities: [
+				"rpc.commands",
+				"rpc.events",
+				"rpc.extension_ui",
+				"session.multiplex",
+				...(overrides.capability === false ? [] : [GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY]),
+			],
+			limits: {
+				maxServerFrameBytes: overrides.maxServerFrameBytes ?? SESSION_HOT_RUNTIME_INVENTORY_MAX_BYTES,
+			},
+		}),
+	);
 	return probe;
 }
 
@@ -401,6 +461,809 @@ afterEach(async () => {
 });
 
 describe("SessionWsBridge", () => {
+	it("sends hello then the initial full hot inventory only after 1.1 capability negotiation", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "inventory-initial");
+		const harness = await createHarness([target]);
+		await harness.supervisor.activate(target.sessionHandle);
+		const client = await openInventoryClient(harness);
+		const frames = client.frames as unknown as Array<Record<string, unknown>>;
+		const inventory = await eventually(() => frames.find((frame) => frame.type === "hot_runtime_inventory"));
+
+		expect(frames.slice(0, 2).map((frame) => frame.type)).toEqual(["server_hello", "hot_runtime_inventory"]);
+		expect(frames[0]).toMatchObject({
+			type: "server_hello",
+			protocol: { major: 1, minor: 1 },
+			capabilities: expect.arrayContaining([GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY]),
+		});
+		expect(inventory).toMatchObject({
+			serverEpoch: TEST_SERVER_EPOCH,
+			runtimes: [expect.objectContaining({ sessionHandle: target.sessionHandle, state: "idle" })],
+		});
+	});
+
+	it("gates inventory by minor, capability, and full-frame receive ceiling", async () => {
+		const harness = await createHarness([]);
+		for (const client of [
+			await openInventoryClient(harness, { minor: 0 }),
+			await openInventoryClient(harness, { capability: false }),
+		]) {
+			const frames = client.frames as unknown as Array<Record<string, unknown>>;
+			await eventually(() => frames.find((frame) => frame.type === "server_hello"));
+			await new Promise<void>((resolve) => setTimeout(resolve, 20));
+			expect(frames.some((frame) => frame.type === "hot_runtime_inventory")).toBe(false);
+		}
+		const undersized = await openInventoryClient(harness, {
+			maxServerFrameBytes: SESSION_HOT_RUNTIME_INVENTORY_MAX_BYTES - 1,
+		});
+		const frames = undersized.frames as unknown as Array<Record<string, unknown>>;
+		await eventually(() => frames.find((frame) => frame.type === "protocol_error"));
+		expect(frames.some((frame) => frame.type === "server_hello")).toBe(false);
+	});
+
+	it("broadcasts full revisions to two sockets and unregisters a disconnected watcher", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "inventory-two-sockets");
+		const harness = await createHarness([target]);
+		const left = await openInventoryClient(harness);
+		const right = await openInventoryClient(harness);
+		const leftFrames = left.frames as unknown as HotRuntimeInventoryDto[];
+		const rightFrames = right.frames as unknown as HotRuntimeInventoryDto[];
+		await eventually(() => leftFrames.find((frame) => frame.type === "hot_runtime_inventory"));
+		await eventually(() => rightFrames.find((frame) => frame.type === "hot_runtime_inventory"));
+
+		await harness.supervisor.activate(target.sessionHandle);
+		const leftHot = await eventually(() =>
+			leftFrames.find((frame) => frame.type === "hot_runtime_inventory" && frame.runtimes.length === 1),
+		);
+		const rightHot = await eventually(() =>
+			rightFrames.find((frame) => frame.type === "hot_runtime_inventory" && frame.runtimes.length === 1),
+		);
+		expect(rightHot.revision).toBe(leftHot.revision);
+
+		await left.close();
+		const leftCount = leftFrames.length;
+		await harness.supervisor.stop(target.sessionHandle);
+		await eventually(() =>
+			rightFrames.find(
+				(frame) =>
+					frame.type === "hot_runtime_inventory" &&
+					frame.revision > rightHot.revision &&
+					frame.runtimes.length === 0,
+			),
+		);
+		expect(leftFrames).toHaveLength(leftCount);
+	});
+
+	it("uses exact-hot catch-up without activation and preserves stale cursor reasons", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const active = createNativeSession(root, cwd, "inventory-exact-active");
+		const dormant = createNativeSession(root, cwd, "inventory-exact-dormant");
+		const lifecycleMarker = path.join(root, "lifecycle.log");
+		const harness = await createHarness([active, dormant], {
+			env: { PI_WEB_FIXTURE_LIFECYCLE_MARKER: lifecycleMarker },
+		});
+		await harness.supervisor.activate(active.sessionHandle);
+		const client = await openInventoryClient(harness);
+		const inventoryFrames = client.frames as unknown as HotRuntimeInventoryDto[];
+		const inventory = await eventually(() =>
+			inventoryFrames.find((frame) => frame.type === "hot_runtime_inventory" && frame.runtimes.length === 1),
+		);
+		const hot = inventory.runtimes[0]!;
+		const mismatchMark = client.mark();
+		client.send({
+			type: "session_subscribe",
+			sessionHandle: hot.sessionHandle,
+			expectedHotRuntime: {
+				serverEpoch: hot.serverEpoch,
+				sessionHandle: hot.sessionHandle,
+				workspaceId: hot.workspaceId,
+				generation: hot.generation + 1,
+			},
+		});
+		await client.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+				frame.type === "session_error" && frame.error.includes("hot_runtime_identity_changed"),
+			mismatchMark,
+		);
+		const mark = client.mark();
+		client.send({
+			type: "session_subscribe",
+			sessionHandle: hot.sessionHandle,
+			expectedHotRuntime: {
+				serverEpoch: hot.serverEpoch,
+				sessionHandle: hot.sessionHandle,
+				workspaceId: hot.workspaceId,
+				generation: hot.generation,
+			},
+			cursor: { serverEpoch: "stale-epoch", generation: hot.generation, seq: 0 },
+		});
+		await client.waitForFrame((frame): frame is LeaseFrame => frame.type === "lease_status", mark);
+		expect(client.frames.slice(mark)).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ type: "resync_required", reason: "epoch_changed" }),
+				expect.objectContaining({ type: "lease_status", isController: false }),
+			]),
+		);
+
+		const startsBefore = fs.readFileSync(lifecycleMarker, "utf8").match(/^start:/gm)?.length ?? 0;
+		client.send({
+			type: "session_subscribe",
+			sessionHandle: dormant.sessionHandle,
+			expectedHotRuntime: {
+				serverEpoch: TEST_SERVER_EPOCH,
+				sessionHandle: dormant.sessionHandle,
+				workspaceId: dormant.workspaceId,
+				generation: 1,
+			},
+		});
+		await client.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+				frame.type === "session_error" && frame.error.includes("hot_runtime_not_found"),
+			mark,
+		);
+		const startsAfter = fs.readFileSync(lifecycleMarker, "utf8").match(/^start:/gm)?.length ?? 0;
+		expect(startsAfter).toBe(startsBefore);
+	});
+
+	it("fails an exact-hot catch-up closed when the observed Runtime rekeys", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const parent = createNativeSession(root, cwd, "inventory-exact-rekey");
+		const harness = await createHarness([parent]);
+		const owner = await openClient(harness);
+		const ownerSubscription = await subscribe(owner, parent.sessionHandle);
+		const ownerLease = await claim(owner, parent.sessionHandle);
+		const observer = await openInventoryClient(harness);
+		const inventoryFrames = observer.frames as unknown as HotRuntimeInventoryDto[];
+		const inventory = await eventually(() =>
+			inventoryFrames.find((frame) => frame.type === "hot_runtime_inventory" && frame.runtimes.length === 1),
+		);
+		const hot = inventory.runtimes[0]!;
+		const originalSubscribeHotExact = harness.supervisor.subscribeHotExact.bind(harness.supervisor);
+		let entered: (() => void) | undefined;
+		const subscribeEntered = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		harness.supervisor.subscribeHotExact = async (expected, cursor) => {
+			entered?.();
+			await gate;
+			return originalSubscribeHotExact(expected, cursor);
+		};
+		const mark = observer.mark();
+		observer.send({
+			type: "session_subscribe",
+			sessionHandle: hot.sessionHandle,
+			expectedHotRuntime: {
+				serverEpoch: hot.serverEpoch,
+				sessionHandle: hot.sessionHandle,
+				workspaceId: hot.workspaceId,
+				generation: hot.generation,
+			},
+		});
+		await subscribeEntered;
+		const child = await command(
+			owner,
+			parent.sessionHandle,
+			ownerSubscription.runtime.generation,
+			{ id: "exact-rekey-race", type: "clone" },
+			ownerLease.fencingToken,
+		);
+		release?.();
+		await observer.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+				frame.type === "session_error" && frame.error.includes("hot_runtime_not_found"),
+			mark,
+		);
+		const racedFrames = observer.frames.slice(mark);
+		const rekeyIndex = racedFrames.findIndex(
+			(frame) => frame.type === "session_rekeyed" && frame.runtime.sessionHandle === child.sessionHandle,
+		);
+		const childInventoryIndex = racedFrames.findIndex(
+			(frame) =>
+				frame.type === "hot_runtime_inventory" &&
+				frame.runtimes.some((runtime) => runtime.sessionHandle === child.sessionHandle),
+		);
+		expect(rekeyIndex).toBeGreaterThanOrEqual(0);
+		expect(childInventoryIndex).toBeGreaterThan(rekeyIndex);
+		expect(
+			racedFrames.some(
+				(frame) => frame.type === "runtime_state" && frame.runtime.sessionHandle === child.sessionHandle,
+			),
+		).toBe(false);
+	});
+
+	it("fails an exact-hot catch-up closed across stop and restart", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "inventory-exact-restart");
+		const harness = await createHarness([target]);
+		await harness.supervisor.activate(target.sessionHandle);
+		const observer = await openInventoryClient(harness);
+		const inventoryFrames = observer.frames as unknown as HotRuntimeInventoryDto[];
+		const inventory = await eventually(() =>
+			inventoryFrames.find((frame) => frame.type === "hot_runtime_inventory" && frame.runtimes.length === 1),
+		);
+		const hot = inventory.runtimes[0]!;
+		const originalSubscribeHotExact = harness.supervisor.subscribeHotExact.bind(harness.supervisor);
+		let entered: (() => void) | undefined;
+		const subscribeEntered = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		harness.supervisor.subscribeHotExact = async (expected, cursor) => {
+			entered?.();
+			await gate;
+			return originalSubscribeHotExact(expected, cursor);
+		};
+		const mark = observer.mark();
+		observer.send({
+			type: "session_subscribe",
+			sessionHandle: hot.sessionHandle,
+			expectedHotRuntime: {
+				serverEpoch: hot.serverEpoch,
+				sessionHandle: hot.sessionHandle,
+				workspaceId: hot.workspaceId,
+				generation: hot.generation,
+			},
+		});
+		await subscribeEntered;
+		await harness.supervisor.stop(target.sessionHandle);
+		const restarted = await harness.supervisor.restart(target.sessionHandle);
+		release?.();
+		await observer.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+				frame.type === "session_error" && frame.error.includes("hot_runtime_identity_changed"),
+			mark,
+		);
+		expect(
+			observer.frames
+				.slice(mark)
+				.some((frame) => frame.type === "runtime_state" && frame.runtime.generation === restarted.generation),
+		).toBe(false);
+	});
+
+	it("treats exact-hot subscribe for an existing claimed live member as an idempotent no-op", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "inventory-exact-preserve-live");
+		const harness = await createHarness([target]);
+		const client = await openInventoryClient(harness);
+		const subscription = await subscribe(client, target.sessionHandle);
+		const lease = await claim(client, target.sessionHandle);
+		if (!lease.fencingToken) throw new Error("claimed fixture lease did not include a fencing token");
+
+		const operationMark = client.mark();
+		client.send({
+			type: "session_subscribe",
+			sessionHandle: target.sessionHandle,
+			expectedHotRuntime: {
+				serverEpoch: TEST_SERVER_EPOCH,
+				sessionHandle: target.sessionHandle,
+				workspaceId: target.workspaceId,
+				generation: subscription.runtime.generation + 1,
+			},
+		});
+		const response = await command(
+			client,
+			target.sessionHandle,
+			subscription.runtime.generation,
+			{ id: "exact-failure-preserves-live", type: "prompt", message: "small-structural-turn" },
+			lease.fencingToken,
+		);
+		expect(response.response.success).toBe(true);
+		await client.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "event" }> =>
+				frame.type === "event" && frame.event.type === "agent_settled",
+			operationMark,
+		);
+		expect(client.frames.slice(operationMark).some((frame) => frame.type === "session_error")).toBe(false);
+		expect(
+			client.frames
+				.slice(operationMark)
+				.filter((frame) => frame.type === "event" && frame.event.type === "agent_settled"),
+		).toHaveLength(1);
+	});
+
+	it("allows only one fresh exact-hot transaction per handle", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "inventory-exact-single-flight");
+		const harness = await createHarness([target]);
+		await harness.supervisor.activate(target.sessionHandle);
+		const observer = await openInventoryClient(harness);
+		const inventory = await eventually(() =>
+			(observer.frames as unknown as HotRuntimeInventoryDto[]).find(
+				(frame) => frame.type === "hot_runtime_inventory" && frame.runtimes.length === 1,
+			),
+		);
+		const hot = inventory.runtimes[0]!;
+		const expectedHotRuntime = {
+			serverEpoch: hot.serverEpoch,
+			sessionHandle: hot.sessionHandle,
+			workspaceId: hot.workspaceId,
+			generation: hot.generation,
+		};
+		const originalSubscribeHotExact = harness.supervisor.subscribeHotExact.bind(harness.supervisor);
+		let calls = 0;
+		let entered: (() => void) | undefined;
+		const firstEntered = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		harness.supervisor.subscribeHotExact = async (expected, cursor) => {
+			calls += 1;
+			entered?.();
+			await gate;
+			return originalSubscribeHotExact(expected, cursor);
+		};
+
+		observer.send({
+			type: "session_subscribe",
+			sessionHandle: hot.sessionHandle,
+			expectedHotRuntime,
+		});
+		await firstEntered;
+		const secondMark = observer.mark();
+		observer.send({
+			type: "session_subscribe",
+			sessionHandle: hot.sessionHandle,
+			expectedHotRuntime,
+		});
+		setTimeout(() => release?.(), 50);
+		await observer.waitForFrame(
+			(frame): frame is LeaseFrame =>
+				frame.type === "lease_status" && frame.sessionHandle === hot.sessionHandle,
+			secondMark,
+		);
+		expect(calls).toBe(1);
+		expect(observer.frames.slice(secondMark).some((frame) => frame.type === "session_error")).toBe(false);
+	});
+
+	it("delivers a non-replayable notify exactly once during fresh exact-hot catch-up", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "inventory-exact-notify");
+		const harness = await createHarness([target]);
+		const owner = await openClient(harness);
+		const ownerSubscription = await subscribe(owner, target.sessionHandle);
+		const ownerLease = await claim(owner, target.sessionHandle);
+		const observer = await openInventoryClient(harness);
+		const inventory = await eventually(() =>
+			(observer.frames as unknown as HotRuntimeInventoryDto[]).find(
+				(frame) => frame.type === "hot_runtime_inventory" && frame.runtimes.length === 1,
+			),
+		);
+		const hot = inventory.runtimes[0]!;
+		const originalSubscribeHotExact = harness.supervisor.subscribeHotExact.bind(harness.supervisor);
+		let entered: (() => void) | undefined;
+		const subscribeEntered = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		harness.supervisor.subscribeHotExact = async (expected, cursor) => {
+			entered?.();
+			await gate;
+			return originalSubscribeHotExact(expected, cursor);
+		};
+
+		const mark = observer.mark();
+		observer.send({
+			type: "session_subscribe",
+			sessionHandle: hot.sessionHandle,
+			expectedHotRuntime: {
+				serverEpoch: hot.serverEpoch,
+				sessionHandle: hot.sessionHandle,
+				workspaceId: hot.workspaceId,
+				generation: hot.generation,
+			},
+		});
+		await subscribeEntered;
+		await command(
+			owner,
+			target.sessionHandle,
+			ownerSubscription.runtime.generation,
+			{ id: "notify-during-exact", type: "prompt", message: "notify-then-event" },
+			ownerLease.fencingToken,
+		);
+		release?.();
+		await observer.waitForFrame(
+			(frame): frame is LeaseFrame =>
+				frame.type === "lease_status" && frame.sessionHandle === hot.sessionHandle,
+			mark,
+		);
+		expect(
+			observer.frames
+				.slice(mark)
+				.filter(
+					(frame) =>
+						frame.type === "extension_ui_request" && frame.request.id === `notify-${target.nativeSessionId}`,
+				),
+		).toHaveLength(1);
+	});
+
+	it("caps fresh exact-hot transactions per connection before Supervisor admission", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "inventory-exact-inflight-cap");
+		const harness = await createHarness([target]);
+		const observer = await openInventoryClient(harness);
+		const originalSubscribeHotExact = harness.supervisor.subscribeHotExact.bind(harness.supervisor);
+		let calls = 0;
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		harness.supervisor.subscribeHotExact = async (expected, cursor) => {
+			calls += 1;
+			await gate;
+			return originalSubscribeHotExact(expected, cursor);
+		};
+		const identity = (index: number) => ({
+			serverEpoch: TEST_SERVER_EPOCH,
+			sessionHandle: `${target.sessionHandle}-${String(index)}`,
+			workspaceId: target.workspaceId,
+			generation: 1,
+		});
+		expect(MAX_SESSION_WS_IN_FLIGHT_EXACT_SUBSCRIPTIONS).toBeLessThanOrEqual(256);
+		for (let index = 0; index < MAX_SESSION_WS_IN_FLIGHT_EXACT_SUBSCRIPTIONS; index += 1) {
+			const expectedHotRuntime = identity(index);
+			observer.send({
+				type: "session_subscribe",
+				sessionHandle: expectedHotRuntime.sessionHandle,
+				expectedHotRuntime,
+			});
+		}
+		await eventually(() => calls === MAX_SESSION_WS_IN_FLIGHT_EXACT_SUBSCRIPTIONS);
+		const mark = observer.mark();
+		const overflow = identity(MAX_SESSION_WS_IN_FLIGHT_EXACT_SUBSCRIPTIONS);
+		observer.send({
+			type: "session_subscribe",
+			sessionHandle: overflow.sessionHandle,
+			expectedHotRuntime: overflow,
+		});
+		setTimeout(() => release?.(), 50);
+		await observer.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+				frame.type === "session_error" &&
+				frame.sessionHandle === overflow.sessionHandle &&
+				frame.error.includes("too_many_in_flight_exact_subscriptions"),
+			mark,
+		);
+		expect(calls).toBe(MAX_SESSION_WS_IN_FLIGHT_EXACT_SUBSCRIPTIONS);
+	});
+
+	it("holds exact-hot admission capacity until Supervisor promises settle after unsubscribe", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "inventory-exact-operation-cap");
+		const harness = await createHarness([target]);
+		await harness.supervisor.activate(target.sessionHandle);
+		const observer = await openInventoryClient(harness);
+		const inventory = await eventually(() =>
+			(observer.frames as unknown as HotRuntimeInventoryDto[]).find(
+				(frame) => frame.type === "hot_runtime_inventory" && frame.runtimes.length === 1,
+			),
+		);
+		const hot = inventory.runtimes[0]!;
+		const originalSubscribeHotExact = harness.supervisor.subscribeHotExact.bind(harness.supervisor);
+		let calls = 0;
+		let completed = 0;
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		harness.supervisor.subscribeHotExact = async (expected, cursor) => {
+			calls += 1;
+			await gate;
+			try {
+				return await originalSubscribeHotExact(expected, cursor);
+			} finally {
+				completed += 1;
+			}
+		};
+		const identity = (index: number) => ({
+			serverEpoch: TEST_SERVER_EPOCH,
+			sessionHandle: `${target.sessionHandle}-operation-${String(index)}`,
+			workspaceId: target.workspaceId,
+			generation: hot.generation,
+		});
+		for (let index = 0; index < MAX_SESSION_WS_IN_FLIGHT_EXACT_SUBSCRIPTIONS; index += 1) {
+			const expectedHotRuntime = identity(index);
+			observer.send({
+				type: "session_subscribe",
+				sessionHandle: expectedHotRuntime.sessionHandle,
+				expectedHotRuntime,
+			});
+			observer.send({ type: "session_unsubscribe", sessionHandle: expectedHotRuntime.sessionHandle });
+		}
+		await eventually(() => calls === MAX_SESSION_WS_IN_FLIGHT_EXACT_SUBSCRIPTIONS);
+		const mark = observer.mark();
+		const overflow = identity(MAX_SESSION_WS_IN_FLIGHT_EXACT_SUBSCRIPTIONS);
+		observer.send({
+			type: "session_subscribe",
+			sessionHandle: overflow.sessionHandle,
+			expectedHotRuntime: overflow,
+		});
+		setTimeout(() => release?.(), 50);
+		await observer.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+				frame.type === "session_error" &&
+				frame.sessionHandle === overflow.sessionHandle &&
+				frame.error.includes("too_many_in_flight_exact_subscriptions"),
+			mark,
+		);
+		expect(calls).toBe(MAX_SESSION_WS_IN_FLIGHT_EXACT_SUBSCRIPTIONS);
+		await eventually(() => completed === MAX_SESSION_WS_IN_FLIGHT_EXACT_SUBSCRIPTIONS);
+
+		const recoveryMark = observer.mark();
+		observer.send({
+			type: "session_subscribe",
+			sessionHandle: hot.sessionHandle,
+			expectedHotRuntime: {
+				serverEpoch: hot.serverEpoch,
+				sessionHandle: hot.sessionHandle,
+				workspaceId: hot.workspaceId,
+				generation: hot.generation,
+			},
+		});
+		await observer.waitForFrame(
+			(frame): frame is LeaseFrame =>
+				frame.type === "lease_status" && frame.sessionHandle === hot.sessionHandle,
+			recoveryMark,
+		);
+		expect(calls).toBe(MAX_SESSION_WS_IN_FLIGHT_EXACT_SUBSCRIPTIONS + 1);
+	});
+
+	it("does not release admitted exact-hot capacity when its connection disconnects", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "inventory-exact-disconnect-cap");
+		const harness = await createHarness([target]);
+		await harness.supervisor.activate(target.sessionHandle);
+		const observer = await openInventoryClient(harness);
+		const inventory = await eventually(() =>
+			(observer.frames as unknown as HotRuntimeInventoryDto[]).find(
+				(frame) => frame.type === "hot_runtime_inventory" && frame.runtimes.length === 1,
+			),
+		);
+		const hot = inventory.runtimes[0]!;
+		const { connection } = bridgeConnection(harness.bridge);
+		const operationState = connection as { admittedExactOperations?: number };
+		const originalSubscribeHotExact = harness.supervisor.subscribeHotExact.bind(harness.supervisor);
+		let entered: (() => void) | undefined;
+		const subscribeEntered = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		harness.supervisor.subscribeHotExact = async (expected, cursor) => {
+			entered?.();
+			await gate;
+			return originalSubscribeHotExact(expected, cursor);
+		};
+		observer.send({
+			type: "session_subscribe",
+			sessionHandle: hot.sessionHandle,
+			expectedHotRuntime: {
+				serverEpoch: hot.serverEpoch,
+				sessionHandle: hot.sessionHandle,
+				workspaceId: hot.workspaceId,
+				generation: hot.generation,
+			},
+		});
+		await subscribeEntered;
+		expect(operationState.admittedExactOperations).toBe(1);
+		await observer.close();
+		expect(operationState.admittedExactOperations).toBe(1);
+		release?.();
+		await eventually(() => operationState.admittedExactOperations === 0);
+	});
+
+	it("treats exact-hot subscribe during a slow ordinary catch-up as an idempotent no-op", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "inventory-exact-preserve-catchup");
+		const harness = await createHarness([target], {
+			env: { PI_WEB_FIXTURE_READY_DELAY_MS: "400" },
+		});
+		const activation = harness.supervisor.activate(target.sessionHandle);
+		void activation.catch(() => {});
+		const observer = await openInventoryClient(harness);
+		const inventory = await eventually(() =>
+			(observer.frames as HotRuntimeInventoryDto[]).find(
+				(frame) =>
+					frame.type === "hot_runtime_inventory" &&
+					frame.runtimes.some(
+						(runtime) => runtime.sessionHandle === target.sessionHandle && runtime.state === "starting",
+					),
+			),
+		);
+		const hot = inventory.runtimes.find((runtime) => runtime.sessionHandle === target.sessionHandle)!;
+		const originalSubscribe = harness.supervisor.subscribe.bind(harness.supervisor);
+		let ordinaryEntered: (() => void) | undefined;
+		const entered = new Promise<void>((resolve) => {
+			ordinaryEntered = resolve;
+		});
+		let baselineCaptured: (() => void) | undefined;
+		const captured = new Promise<void>((resolve) => {
+			baselineCaptured = resolve;
+		});
+		let releaseOrdinary: (() => void) | undefined;
+		const ordinaryGate = new Promise<void>((resolve) => {
+			releaseOrdinary = resolve;
+		});
+		let firstSubscribe = true;
+		harness.supervisor.subscribe = async (sessionHandle, cursor) => {
+			if (!firstSubscribe) return originalSubscribe(sessionHandle, cursor);
+			firstSubscribe = false;
+			ordinaryEntered?.();
+			const result = await originalSubscribe(sessionHandle, cursor);
+			baselineCaptured?.();
+			await ordinaryGate;
+			return result;
+		};
+
+		const ordinaryMark = observer.mark();
+		observer.send({ type: "session_subscribe", sessionHandle: target.sessionHandle });
+		await entered;
+		observer.send({
+			type: "session_subscribe",
+			sessionHandle: target.sessionHandle,
+			expectedHotRuntime: {
+				serverEpoch: hot.serverEpoch,
+				sessionHandle: hot.sessionHandle,
+				workspaceId: hot.workspaceId,
+				generation: hot.generation,
+			},
+		});
+		await activation;
+		await captured;
+
+		const owner = await openClient(harness);
+		const ownerSubscription = await subscribe(owner, target.sessionHandle);
+		const ownerLease = await claim(owner, target.sessionHandle);
+		await command(
+			owner,
+			target.sessionHandle,
+			ownerSubscription.runtime.generation,
+			{ id: "ordinary-catchup-suffix", type: "prompt", message: "small-structural-turn" },
+			ownerLease.fencingToken,
+		);
+		const current = await eventually(() => {
+			const runtime = harness.supervisor.getRuntime(target.sessionHandle);
+			return runtime?.state === "idle" && runtime.lastSeq > 0 ? runtime : undefined;
+		});
+		releaseOrdinary?.();
+		const lease = await observer.waitForFrame(
+			(frame): frame is LeaseFrame =>
+				frame.type === "lease_status" && frame.sessionHandle === target.sessionHandle,
+			ordinaryMark,
+		);
+		expect(lease.isController).toBe(false);
+		expect(observer.frames.slice(ordinaryMark).some((frame) => frame.type === "session_error")).toBe(false);
+		const sequences = observer.frames
+			.slice(ordinaryMark)
+			.flatMap((frame) => (frame.type === "event" ? [frame.seq] : []));
+		expect(sequences).toEqual(Array.from({ length: current.lastSeq }, (_value, index) => index + 1));
+	});
+
+	it("rejects exact-hot subscribe unless inventory observation was negotiated", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "inventory-exact-capability-gate");
+		const harness = await createHarness([target]);
+		const runtime = await harness.supervisor.activate(target.sessionHandle);
+		for (const client of [
+			await openInventoryClient(harness, { minor: 0 }),
+			await openInventoryClient(harness, { capability: false }),
+		]) {
+			await eventually(() =>
+				(client.frames as unknown as Array<{ type: string }>).find((frame) => frame.type === "server_hello"),
+			);
+			const mark = client.mark();
+			client.send({
+				type: "session_subscribe",
+				sessionHandle: target.sessionHandle,
+				expectedHotRuntime: {
+					serverEpoch: TEST_SERVER_EPOCH,
+					sessionHandle: target.sessionHandle,
+					workspaceId: target.workspaceId,
+					generation: runtime.generation,
+				},
+			});
+			await client.waitForFrame(
+				(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+					frame.type === "session_error" && frame.error.includes("hot_runtime_inventory_not_negotiated"),
+				mark,
+			);
+			expect(client.frames.slice(mark).some((frame) => frame.type === "runtime_state")).toBe(false);
+		}
+	});
+
+	it("revalidates exact Pi ownership after baseline capture and before publishing it", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "inventory-exact-post-return-race");
+		const harness = await createHarness([target]);
+		await harness.supervisor.activate(target.sessionHandle);
+		const observer = await openInventoryClient(harness);
+		const inventory = await eventually(() =>
+			(observer.frames as HotRuntimeInventoryDto[]).find(
+				(frame) => frame.type === "hot_runtime_inventory" && frame.runtimes.length === 1,
+			),
+		);
+		const hot = inventory.runtimes[0]!;
+		const originalSubscribeHotExact = harness.supervisor.subscribeHotExact.bind(harness.supervisor);
+		let baselineReturned: (() => void) | undefined;
+		const returned = new Promise<void>((resolve) => {
+			baselineReturned = resolve;
+		});
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		harness.supervisor.subscribeHotExact = async (expected, cursor) => {
+			const result = await originalSubscribeHotExact(expected, cursor);
+			baselineReturned?.();
+			await gate;
+			return result;
+		};
+
+		const mark = observer.mark();
+		observer.send({
+			type: "session_subscribe",
+			sessionHandle: target.sessionHandle,
+			expectedHotRuntime: {
+				serverEpoch: hot.serverEpoch,
+				sessionHandle: hot.sessionHandle,
+				workspaceId: hot.workspaceId,
+				generation: hot.generation,
+			},
+		});
+		await returned;
+		await harness.supervisor.stop(target.sessionHandle);
+		release?.();
+		await observer.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+				frame.type === "session_error" && frame.error.includes("hot_runtime_identity_changed"),
+			mark,
+		);
+		expect(observer.frames.slice(mark).some((frame) => frame.type === "runtime_state")).toBe(false);
+	});
+
 	it("bounds shutdown when a peer never completes the close handshake", async () => {
 		const harness = await createHarness([]);
 		const client = await openClient(harness);
@@ -820,7 +1683,7 @@ describe("SessionWsBridge", () => {
 		const parent = createNativeSession(root, cwd, "catch-up-rekey");
 		const harness = await createHarness([parent]);
 		const owner = await openClient(harness);
-		const observer = await openClient(harness);
+		const observer = await openInventoryClient(harness);
 		const ownerSubscription = await subscribe(owner, parent.sessionHandle);
 		const ownerLease = await claim(owner, parent.sessionHandle);
 		const originalSubscribe = harness.supervisor.subscribe.bind(harness.supervisor);
@@ -891,6 +1754,17 @@ describe("SessionWsBridge", () => {
 				runtime: expect.objectContaining({ sessionHandle: grandchild.sessionHandle }),
 			},
 		]);
+		const racedFrames = observer.frames.slice(observerMark);
+		const rekeyIndex = racedFrames.findIndex(
+			(frame) => frame.type === "session_rekeyed" && frame.runtime.sessionHandle === grandchild.sessionHandle,
+		);
+		const inventoryIndex = racedFrames.findIndex(
+			(frame) =>
+				frame.type === "hot_runtime_inventory" &&
+				frame.runtimes.some((runtime) => runtime.sessionHandle === grandchild.sessionHandle),
+		);
+		expect(rekeyIndex).toBeGreaterThanOrEqual(0);
+		expect(inventoryIndex).toBeGreaterThan(rekeyIndex);
 	});
 
 	it("gives concurrent parent subscribers one exact rekey before the resolved baseline", async () => {
@@ -1278,6 +2152,65 @@ describe("SessionWsBridge", () => {
 		expect(socket.sentBytes).toEqual([]);
 		expect(socket.closeCalls).toEqual([{ code: 1008, reason: "policy violation" }]);
 		expect(harness.connectionEvents).toContainEqual(expect.stringContaining("oversized WebSocket frame"));
+	});
+
+	it("applies ordinary frame and backlog ceilings to hot inventory refreshes", async () => {
+		const harness = await createHarness([]);
+		const socket = new ControlledSendSocket();
+		socket.deferNextSend();
+		harness.bridge.wss.emit("connection", socket as unknown as WebSocket, {} as http.IncomingMessage);
+		markBridgeConnectionInventoryNegotiated(harness.bridge);
+
+		harness.bridge.broadcastHotRuntimeInventory({
+			type: "hot_runtime_inventory",
+			serverEpoch: TEST_SERVER_EPOCH,
+			revision: 1,
+			runtimes: [],
+		});
+		harness.bridge.broadcastHotRuntimeInventory({
+			type: "hot_runtime_inventory",
+			serverEpoch: TEST_SERVER_EPOCH,
+			revision: 2,
+			runtimes: [
+				{
+					serverEpoch: TEST_SERVER_EPOCH,
+					sessionHandle: "queued-hot",
+					workspaceId: "queued-workspace",
+					generation: 1,
+					state: "idle",
+				},
+			],
+		});
+		expect(socket.sentBytes).toHaveLength(1);
+		expect(socket.closeCalls).toEqual([]);
+		socket.releaseDeferredSend();
+		await eventually(() => socket.sentBytes.length === 2);
+		expect(socket.closeCalls).toEqual([]);
+
+		const oversizedHarness = await createHarness([]);
+		const oversizedSocket = new ControlledSendSocket();
+		oversizedHarness.bridge.wss.emit(
+			"connection",
+			oversizedSocket as unknown as WebSocket,
+			{} as http.IncomingMessage,
+		);
+		markBridgeConnectionInventoryNegotiated(oversizedHarness.bridge);
+		oversizedHarness.bridge.broadcastHotRuntimeInventory({
+			type: "hot_runtime_inventory",
+			serverEpoch: TEST_SERVER_EPOCH,
+			revision: 1,
+			runtimes: [
+				{
+					serverEpoch: TEST_SERVER_EPOCH,
+					sessionHandle: "x".repeat(MAX_SESSION_WS_BUFFERED_BYTES),
+					workspaceId: "oversized-workspace",
+					generation: 1,
+					state: "idle",
+				},
+			],
+		});
+		expect(oversizedSocket.sentBytes).toEqual([]);
+		expect(oversizedSocket.closeCalls).toEqual([{ code: 1008, reason: "policy violation" }]);
 	});
 
 	it("queues one near-limit atomic Session snapshot behind an in-flight frame", async () => {
