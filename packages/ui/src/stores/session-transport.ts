@@ -1,14 +1,18 @@
-import type {
-	RpcCommand,
-	RpcExtensionUIRequest,
-	RpcExtensionUIResponse,
-	RpcResponse,
-} from "@earendil-works/pi-coding-agent";
 import {
 	commandTimeoutMs,
+	type ExtensionUiRequestDto,
+	type ExtensionUiResponseDto,
+	GATEWAY_PROTOCOL_VERSION,
+	GATEWAY_REQUIRED_CAPABILITIES,
+	type GatewayClientHelloDto,
+	isGatewayProtocolError,
+	isGatewayServerHello,
 	isReadOnlyRpcCommand,
 	isSessionWsServerMessage,
 	SESSION_WS_CLIENT_MAX_BYTES,
+	SESSION_WS_SERVER_MAX_BYTES,
+	type SessionCommandDto,
+	type SessionCommandResponseDto,
 	type SessionReplayCursorDto,
 	type SessionReplayFrameDto,
 	type SessionWsClientMessage,
@@ -58,10 +62,13 @@ const DEFAULT_RAW_EVENT_GLOBAL_LIMIT = 1_000;
 const DEFAULT_RAW_EVENT_GLOBAL_MAX_BYTES = 8 * 1024 * 1024;
 const DEFAULT_RECONNECT_BASE_MS = 500;
 const DEFAULT_RECONNECT_MAX_MS = 8_000;
+const DEFAULT_HELLO_TIMEOUT_MS = 5_000;
 const MAX_RESYNC_BUFFERED_FRAMES = 1_024;
 const MAX_RESYNC_BUFFERED_BYTES = 1024 * 1024;
 export const MAX_ACTIVE_SUBSCRIPTIONS = 6;
 const MAX_PENDING_EXTENSION_REQUESTS = 256;
+const CLIENT_BUILD = "0.1.0";
+const CLIENT_CAPABILITIES = [...GATEWAY_REQUIRED_CAPABILITIES];
 
 type WireSendResult = "sent" | "payload_too_large" | "unavailable";
 
@@ -71,9 +78,9 @@ interface PendingCommand {
 	id: string;
 	sessionHandle: string;
 	generation: number;
-	commandType: RpcCommand["type"];
+	commandType: SessionCommandDto["type"];
 	response?: ResponseMessage;
-	resolve: (response: RpcResponse) => void;
+	resolve: (response: SessionCommandResponseDto) => void;
 	reject: (error: Error) => void;
 	timer: ReturnType<typeof setTimeout>;
 }
@@ -109,18 +116,18 @@ function defaultSocketFactory(url: string): SessionWebSocket {
 	return new WebSocket(url) as unknown as SessionWebSocket;
 }
 
-function commandWithId(command: RpcCommand, id: string): RpcCommand {
-	return { ...command, id } as RpcCommand;
+function commandWithId(command: SessionCommandDto, id: string): SessionCommandDto {
+	return { ...command, id } as SessionCommandDto;
 }
 
-function isMutation(command: RpcCommand): boolean {
+function isMutation(command: SessionCommandDto): boolean {
 	return !isReadOnlyRpcCommand(command);
 }
 
 function replaceExtensionRequest(
-	requests: RpcExtensionUIRequest[],
-	request: RpcExtensionUIRequest,
-): RpcExtensionUIRequest[] {
+	requests: ExtensionUiRequestDto[],
+	request: ExtensionUiRequestDto,
+): ExtensionUiRequestDto[] {
 	const semanticKey = extensionRequestSemanticKey(request);
 	if (semanticKey === null) return requests;
 	return [
@@ -131,7 +138,7 @@ function replaceExtensionRequest(
 	].slice(-MAX_PENDING_EXTENSION_REQUESTS);
 }
 
-function extensionRequestSemanticKey(request: RpcExtensionUIRequest): string | null {
+function extensionRequestSemanticKey(request: ExtensionUiRequestDto): string | null {
 	switch (request.method) {
 		case "select":
 		case "confirm":
@@ -151,16 +158,16 @@ function extensionRequestSemanticKey(request: RpcExtensionUIRequest): string | n
 	}
 }
 
-function normalizeExtensionRequests(requests: RpcExtensionUIRequest[]): RpcExtensionUIRequest[] {
-	let normalized: RpcExtensionUIRequest[] = [];
+function normalizeExtensionRequests(requests: ExtensionUiRequestDto[]): ExtensionUiRequestDto[] {
+	let normalized: ExtensionUiRequestDto[] = [];
 	for (const request of requests) normalized = replaceExtensionRequest(normalized, request);
 	return normalized;
 }
 
 function applyReplayExtensionState(
-	requests: RpcExtensionUIRequest[],
+	requests: ExtensionUiRequestDto[],
 	message: SessionReplayFrameDto,
-): RpcExtensionUIRequest[] {
+): ExtensionUiRequestDto[] {
 	if (message.type === "extension_ui_request") return replaceExtensionRequest(requests, message.request);
 	if (message.type === "extension_ui_closed") {
 		return requests.filter((request) => request.id !== message.requestId);
@@ -168,7 +175,7 @@ function applyReplayExtensionState(
 	return requests;
 }
 
-function isIdentityTransitionCommand(commandType: RpcCommand["type"]): boolean {
+function isIdentityTransitionCommand(commandType: SessionCommandDto["type"]): boolean {
 	return commandType === "fork" || commandType === "clone";
 }
 
@@ -203,7 +210,16 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	);
 	const reconnectBaseMs = Math.max(0, options.reconnectBaseMs ?? DEFAULT_RECONNECT_BASE_MS);
 	const reconnectMaxMs = Math.max(reconnectBaseMs, options.reconnectMaxMs ?? DEFAULT_RECONNECT_MAX_MS);
+	const helloTimeoutMs = Math.max(1, options.helloTimeoutMs ?? DEFAULT_HELLO_TIMEOUT_MS);
 	const maxActiveSubscriptions = Math.max(1, options.maxActiveSubscriptions ?? MAX_ACTIVE_SUBSCRIPTIONS);
+	const protocolVersion = options.protocolVersion ?? GATEWAY_PROTOCOL_VERSION;
+	const clientHello: GatewayClientHelloDto = {
+		type: "client_hello",
+		protocol: protocolVersion,
+		clientBuild: options.clientBuild ?? CLIENT_BUILD,
+		capabilities: CLIENT_CAPABILITIES,
+		limits: { maxServerFrameBytes: SESSION_WS_SERVER_MAX_BYTES },
+	};
 	const frameBus = new OrderedSessionFrameBus();
 	const globalBus = new SessionTransportGlobalBus();
 	const pendingCommands = new Map<string, PendingCommand>();
@@ -219,10 +235,13 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 
 	let socket: SessionWebSocket | null = null;
 	let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	let helloTimer: ReturnType<typeof setTimeout> | null = null;
 	let reconnectAttempt = 0;
 	let reconnectEnabled = false;
 	let commandCounter = 0;
 	let disposed = false;
+	let negotiatedMaxClientFrameBytes = SESSION_WS_CLIENT_MAX_BYTES;
+	let negotiatedMaxServerFrameBytes = SESSION_WS_SERVER_MAX_BYTES;
 
 	const store = createStore<SessionTransportState>()(() => ({
 		connectionState: "idle",
@@ -254,7 +273,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	}
 
 	function connect(): void {
-		if (disposed) return;
+		if (disposed || store.getState().connectionState === "incompatible") return;
 		reconnectEnabled = true;
 		openSocket();
 	}
@@ -274,12 +293,17 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		socket = next;
 		next.onopen = () => {
 			if (socket !== next || disposed) return;
-			reconnectAttempt = 0;
-			store.setState({ connectionState: "online" });
-			for (const channel of Object.values(store.getState().sessions)) {
-				if (!channel.subscribed) continue;
-				const cursor = validCursor(channel);
-				sendSubscription(channel.sessionHandle, cursor);
+			try {
+				next.send(JSON.stringify(clientHello));
+				helloTimer = setTimeout(() => enterIncompatible(next), helloTimeoutMs);
+			} catch {
+				socket = null;
+				try {
+					next.close();
+				} finally {
+					handleDisconnected();
+					if (reconnectEnabled) scheduleReconnect();
+				}
 			}
 		};
 		next.onclose = () => {
@@ -293,15 +317,75 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		};
 		next.onmessage = (event) => {
 			if (socket !== next) return;
-			let value: unknown;
-			try {
-				value = JSON.parse(String(event.data));
-			} catch {
+			const raw = String(event.data);
+			if (new TextEncoder().encode(raw).byteLength > negotiatedMaxServerFrameBytes) {
+				enterIncompatible(next);
 				return;
 			}
-			if (!isSessionWsServerMessage(value)) return;
+			let value: unknown;
+			try {
+				value = JSON.parse(raw);
+			} catch {
+				enterIncompatible(next);
+				return;
+			}
+			if (isGatewayProtocolError(value)) {
+				enterIncompatible(next);
+				return;
+			}
+			if (isGatewayServerHello(value)) {
+				if (
+					value.protocol.major !== protocolVersion.major ||
+					value.protocol.minor > protocolVersion.minor ||
+					value.limits.maxSnapshotFrameBytes > clientHello.limits.maxServerFrameBytes ||
+					GATEWAY_REQUIRED_CAPABILITIES.some((capability) => !value.capabilities.includes(capability))
+				) {
+					enterIncompatible(next);
+					return;
+				}
+				if (store.getState().connectionState !== "connecting") {
+					enterIncompatible(next);
+					return;
+				}
+				clearHelloTimer();
+				negotiatedMaxClientFrameBytes = Math.min(
+					SESSION_WS_CLIENT_MAX_BYTES,
+					value.limits.maxClientFrameBytes,
+				);
+				negotiatedMaxServerFrameBytes = value.limits.maxSnapshotFrameBytes;
+				reconnectAttempt = 0;
+				store.setState({ connectionState: "online" });
+				for (const channel of Object.values(store.getState().sessions)) {
+					if (!channel.subscribed) continue;
+					const cursor = validCursor(channel);
+					sendSubscription(channel.sessionHandle, cursor);
+				}
+				return;
+			}
+			if (store.getState().connectionState !== "online" || !isSessionWsServerMessage(value)) {
+				enterIncompatible(next);
+				return;
+			}
 			ingestServerMessage(value);
 		};
+	}
+
+	function enterIncompatible(current: SessionWebSocket): void {
+		reconnectEnabled = false;
+		clearReconnectTimer();
+		clearHelloTimer();
+		if (socket === current) socket = null;
+		current.onopen = null;
+		current.onclose = null;
+		current.onerror = null;
+		current.onmessage = null;
+		rejectAllPending(new SessionTransportError("unavailable", "Gateway protocol is incompatible"));
+		resetDisconnectedState("incompatible");
+		try {
+			current.close();
+		} catch {
+			// The terminal state is already recorded.
+		}
 	}
 
 	function scheduleReconnect(): void {
@@ -317,6 +401,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	function disconnect(): void {
 		reconnectEnabled = false;
 		clearReconnectTimer();
+		clearHelloTimer();
 		const current = socket;
 		socket = null;
 		if (current) {
@@ -339,8 +424,21 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		reconnectTimer = null;
 	}
 
+	function clearHelloTimer(): void {
+		if (!helloTimer) return;
+		clearTimeout(helloTimer);
+		helloTimer = null;
+	}
+
 	function handleDisconnected(): void {
 		rejectAllPending(new SessionTransportError("disconnected"));
+		resetDisconnectedState("offline");
+	}
+
+	function resetDisconnectedState(connectionState: "offline" | "incompatible"): void {
+		clearHelloTimer();
+		negotiatedMaxClientFrameBytes = SESSION_WS_CLIENT_MAX_BYTES;
+		negotiatedMaxServerFrameBytes = SESSION_WS_SERVER_MAX_BYTES;
 		claimAttempts.clear();
 		baselineRefreshes.clear();
 		subscriptionBaselines.clear();
@@ -351,7 +449,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			sessions[sessionHandle] = { ...channel, lease: { isController: false } };
 			if (channel.lease.isController || channel.lease.fencingToken) lostLeases.push(sessionHandle);
 		}
-		store.setState({ connectionState: "offline", sessions });
+		store.setState({ connectionState, sessions });
 		for (const sessionHandle of lostLeases) {
 			frameBus.emit(sessionHandle, { type: "lease_status", sessionHandle, isController: false }, receivedAt);
 		}
@@ -476,9 +574,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 
 	function sendCommand(
 		sessionHandle: string,
-		command: RpcCommand,
+		command: SessionCommandDto,
 		timeoutMs = commandTimeoutMs(command.type),
-	): Promise<RpcResponse> {
+	): Promise<SessionCommandResponseDto> {
 		const channel = store.getState().sessions[sessionHandle];
 		if (!channel?.subscribed) {
 			return Promise.reject(new SessionTransportError("session_not_subscribed"));
@@ -499,7 +597,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			return Promise.reject(new SessionTransportError("duplicate_command_id"));
 		}
 		const generation = channel.generation;
-		return new Promise<RpcResponse>((resolve, reject) => {
+		return new Promise<SessionCommandResponseDto>((resolve, reject) => {
 			const timer = setTimeout(
 				() => {
 					pendingCommands.delete(id);
@@ -527,7 +625,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		});
 	}
 
-	function sendExtensionUiResponse(sessionHandle: string, response: RpcExtensionUIResponse): boolean {
+	function sendExtensionUiResponse(sessionHandle: string, response: ExtensionUiResponseDto): boolean {
 		const channel = store.getState().sessions[sessionHandle];
 		if (
 			!channel?.subscribed ||
@@ -549,7 +647,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 
 	function sendWire(message: SessionWsClientMessage): WireSendResult {
 		if (!socket || socket.readyState !== SOCKET_OPEN) return "unavailable";
-		if (sessionWsClientMessageBytes(message) > SESSION_WS_CLIENT_MAX_BYTES) {
+		if (sessionWsClientMessageBytes(message) > negotiatedMaxClientFrameBytes) {
 			return "payload_too_large";
 		}
 		try {

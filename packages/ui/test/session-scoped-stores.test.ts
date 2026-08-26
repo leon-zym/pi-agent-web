@@ -1,4 +1,4 @@
-import type { RpcCommand, RpcResponse, SessionStats } from "@earendil-works/pi-coding-agent";
+import type { SessionCommandDto, SessionCommandResponseDto, SessionStatsDto } from "@pi-agent-web/protocol";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { useComposerStore } from "../src/stores/composer";
 import { useModelDirectoryStore } from "../src/stores/model-directory";
@@ -8,8 +8,8 @@ import { useSlashCommandsStore } from "../src/stores/slash-commands";
 
 const originalTransport = sessionTransport.store.getState();
 
-function response(command: string, data: unknown): RpcResponse {
-	return { type: "response", command, success: true, data } as RpcResponse;
+function response(command: string, data: unknown): SessionCommandResponseDto {
+	return { type: "response", command, success: true, data } as SessionCommandResponseDto;
 }
 
 function model(sessionHandle: string) {
@@ -106,7 +106,7 @@ describe("Session-scoped UI stores", () => {
 			releaseA = resolve;
 		});
 		sessionTransport.store.setState({
-			sendCommand: async (sessionHandle: string, command: RpcCommand) => {
+			sendCommand: async (sessionHandle: string, command: SessionCommandDto) => {
 				if (sessionHandle === "session-a") await aGate;
 				const currentModel = model(sessionHandle);
 				if (command.type === "get_available_models") {
@@ -159,9 +159,9 @@ describe("Session-scoped UI stores", () => {
 		const aGate = new Promise<void>((resolve) => {
 			releaseA = resolve;
 		});
-		const calls: Array<{ sessionHandle: string; command: RpcCommand }> = [];
+		const calls: Array<{ sessionHandle: string; command: SessionCommandDto }> = [];
 		sessionTransport.store.setState({
-			sendCommand: async (sessionHandle: string, command: RpcCommand) => {
+			sendCommand: async (sessionHandle: string, command: SessionCommandDto) => {
 				calls.push({ sessionHandle, command });
 				if (sessionHandle === "session-a" && command.type === "set_model") await aGate;
 				return response(command.type, model(sessionHandle));
@@ -203,9 +203,9 @@ describe("Session-scoped UI stores", () => {
 			releaseA = resolve;
 		});
 		sessionTransport.store.setState({
-			sendCommand: async (sessionHandle: string, command: RpcCommand) => {
+			sendCommand: async (sessionHandle: string, command: SessionCommandDto) => {
 				if (sessionHandle === "session-a") await aGate;
-				return response(command.type, { sessionHandle } as unknown as SessionStats);
+				return response(command.type, { sessionHandle } as unknown as SessionStatsDto);
 			},
 		});
 

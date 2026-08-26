@@ -1,16 +1,21 @@
-import type {
-	JsonAgentSessionEvent,
-	RpcExtensionUIRequest,
-	RpcResponse,
-} from "@earendil-works/pi-coding-agent";
 import {
+	type ExtensionUiRequestDto,
+	GATEWAY_PROTOCOL_VERSION,
+	type GatewayClientHelloDto,
+	type GatewayProtocolErrorDto,
+	type GatewayServerHelloDto,
+	type NativeSessionDto,
+	type ProductSessionEventDto,
 	SESSION_WS_CLIENT_MAX_BYTES,
+	SESSION_WS_SERVER_MAX_BYTES,
+	type SessionCommandResponseDto,
 	type SessionReplayFrameDto,
 	type SessionRuntimeDto,
 	type SessionWsClientMessage,
 	type SessionWsServerMessage,
 } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { sessionDeleteCapability } from "../src/lib/session-capabilities";
 import { isCoalescibleMessageUpdate } from "../src/lib/session-event-scheduler";
 import {
 	createSessionTransport,
@@ -30,19 +35,22 @@ class FakeSocket implements SessionWebSocket {
 	onclose: (() => void) | null = null;
 	onerror: (() => void) | null = null;
 	onmessage: ((event: { data: unknown }) => void) | null = null;
-	readonly sent: SessionWsClientMessage[] = [];
+	readonly sent: Array<SessionWsClientMessage | GatewayClientHelloDto> = [];
+	throwOnSend = false;
 
 	send(data: string): void {
+		if (this.throwOnSend) throw new Error("send failed");
 		if (this.readyState !== 1) throw new Error("socket is not open");
-		this.sent.push(JSON.parse(data) as SessionWsClientMessage);
+		this.sent.push(JSON.parse(data) as SessionWsClientMessage | GatewayClientHelloDto);
 	}
 
-	open(): void {
+	open(negotiate = true): void {
 		this.readyState = 1;
 		this.onopen?.();
+		if (negotiate) this.serverMessage(serverHello());
 	}
 
-	serverMessage(message: SessionWsServerMessage): void {
+	serverMessage(message: SessionWsServerMessage | GatewayServerHelloDto | GatewayProtocolErrorDto): void {
 		this.onmessage?.({ data: JSON.stringify(message) });
 	}
 
@@ -55,6 +63,24 @@ class FakeSocket implements SessionWebSocket {
 		this.readyState = 3;
 		this.onclose?.();
 	}
+}
+
+function serverHello(overrides: Partial<GatewayServerHelloDto> = {}): GatewayServerHelloDto {
+	return {
+		type: "server_hello",
+		protocol: GATEWAY_PROTOCOL_VERSION,
+		serverBuild: "9.7.0-independent-server",
+		serverEpoch: "test-server-epoch",
+		piVersion: "0.84.2",
+		adapterId: "legacy-rpc-v1",
+		capabilities: ["rpc.commands", "rpc.events", "rpc.extension_ui", "session.multiplex"],
+		limits: {
+			maxClientFrameBytes: 8 * 1024 * 1024,
+			maxSnapshotFrameBytes: 32 * 1024 * 1024,
+			maxExtensionRequests: 256,
+		},
+		...overrides,
+	};
 }
 
 interface Harness {
@@ -71,6 +97,9 @@ function harness(
 		rawEventGlobalLimit?: number;
 		rawEventGlobalMaxBytes?: number;
 		reconnectBaseMs?: number;
+		helloTimeoutMs?: number;
+		clientBuild?: string;
+		protocolVersion?: { major: number; minor: number };
 		onResyncRequired?: (message: Extract<SessionWsServerMessage, { type: "resync_required" }>) => void;
 	} = {},
 ): Harness {
@@ -119,18 +148,18 @@ function eventFrame(
 		workspaceId: "workspace-a",
 		generation,
 		seq,
-		event: { type: "agent_start" } as JsonAgentSessionEvent,
+		event: { type: "agent_start" } as ProductSessionEventDto,
 	};
 }
 
-function extensionRequest(id: string): RpcExtensionUIRequest {
+function extensionRequest(id: string): ExtensionUiRequestDto {
 	return {
 		type: "extension_ui_request",
 		id,
 		method: "confirm",
 		title: id,
 		message: id,
-	} as RpcExtensionUIRequest;
+	} as ExtensionUiRequestDto;
 }
 
 function successResponse(
@@ -140,6 +169,26 @@ function successResponse(
 	command: string,
 	barrierSeq = 0,
 ): Extract<SessionWsServerMessage, { type: "response" }> {
+	const data =
+		command === "get_state"
+			? {
+					thinkingLevel: "medium",
+					isStreaming: false,
+					isCompacting: false,
+					steeringMode: "all",
+					followUpMode: "all",
+					sessionId: sessionHandle,
+					autoCompactionEnabled: true,
+					messageCount: 0,
+					pendingMessageCount: 0,
+				}
+			: command === "get_messages"
+				? { messages: [] }
+				: command === "fork"
+					? { text: "", cancelled: false }
+					: command === "clone"
+						? { cancelled: false }
+						: undefined;
 	return {
 		type: "response",
 		sessionHandle,
@@ -150,7 +199,8 @@ function successResponse(
 			type: "response",
 			command,
 			success: true,
-		} as RpcResponse,
+			...(data === undefined ? {} : { data }),
+		} as SessionCommandResponseDto,
 	};
 }
 
@@ -158,7 +208,7 @@ function extensionFrame(
 	sessionHandle: string,
 	generation: number,
 	seq: number,
-	request: RpcExtensionUIRequest,
+	request: ExtensionUiRequestDto,
 ): Extract<SessionReplayFrameDto, { type: "extension_ui_request" }> {
 	return {
 		type: "extension_ui_request",
@@ -208,6 +258,196 @@ function sentCommand(socket: FakeSocket, id: string) {
 afterEach(() => {
 	for (const controller of controllers.splice(0)) controller.dispose();
 	vi.useRealTimers();
+});
+
+describe("session transport Gateway negotiation", () => {
+	it("sends client_hello first and waits for an independently-versioned server hello", () => {
+		const h = harness({ clientBuild: "2.4.1-independent-ui" });
+		h.controller.store.getState().connect();
+		const socket = h.sockets[0];
+		if (!socket) throw new Error("transport did not create a socket");
+		h.controller.store.getState().subscribeSession("session-a");
+
+		socket.open(false);
+		expect(socket.sent[0]).toEqual({
+			type: "client_hello",
+			protocol: GATEWAY_PROTOCOL_VERSION,
+			clientBuild: "2.4.1-independent-ui",
+			capabilities: ["rpc.commands", "rpc.events", "rpc.extension_ui", "session.multiplex"],
+			limits: { maxServerFrameBytes: SESSION_WS_SERVER_MAX_BYTES },
+		});
+		expect(h.controller.store.getState().connectionState).toBe("connecting");
+		expect(socket.sent.filter(({ type }) => type === "session_subscribe")).toEqual([]);
+
+		socket.serverMessage(serverHello({ serverBuild: "99.0.0-independent-server" }));
+		expect(h.controller.store.getState().connectionState).toBe("online");
+		expect(socket.sent.filter(({ type }) => type === "session_subscribe")).toEqual([
+			{ type: "session_subscribe", sessionHandle: "session-a" },
+		]);
+	});
+
+	it("enters a terminal incompatible state for a mismatched server protocol major", () => {
+		vi.useFakeTimers();
+		const h = harness({ reconnectBaseMs: 5 });
+		h.controller.store.getState().connect();
+		const socket = h.sockets[0];
+		if (!socket) throw new Error("transport did not create a socket");
+		socket.open(false);
+		socket.serverMessage(serverHello({ protocol: { major: 2, minor: 0 } }));
+
+		expect(h.controller.store.getState().connectionState).toBe("incompatible");
+		vi.advanceTimersByTime(60_000);
+		h.controller.store.getState().connect();
+		expect(h.sockets).toHaveLength(1);
+	});
+
+	it("rejects a server minor newer than the client requested", () => {
+		const h = harness({ protocolVersion: { major: 1, minor: 3 } });
+		h.controller.store.getState().connect();
+		const socket = h.sockets[0];
+		if (!socket) throw new Error("transport did not create a socket");
+		socket.open(false);
+		socket.serverMessage(serverHello({ protocol: { major: 1, minor: 4 } }));
+
+		expect(h.controller.store.getState().connectionState).toBe("incompatible");
+	});
+
+	it("treats a Gateway protocol_error as terminal and does not reconnect", () => {
+		vi.useFakeTimers();
+		const h = harness({ reconnectBaseMs: 5 });
+		h.controller.store.getState().connect();
+		const socket = h.sockets[0];
+		if (!socket) throw new Error("transport did not create a socket");
+		socket.open(false);
+		socket.serverMessage({
+			type: "protocol_error",
+			code: "protocol_major_unsupported",
+			supported: { major: 1, minMinor: 0, maxMinor: 0 },
+		});
+
+		expect(h.controller.store.getState().connectionState).toBe("incompatible");
+		vi.advanceTimersByTime(60_000);
+		expect(h.sockets).toHaveLength(1);
+	});
+
+	it("fails closed when the Host never completes hello or sends a malformed first frame", () => {
+		vi.useFakeTimers();
+		const timedOut = harness({ helloTimeoutMs: 25, reconnectBaseMs: 5 });
+		timedOut.controller.store.getState().connect();
+		const timeoutSocket = timedOut.sockets[0];
+		if (!timeoutSocket) throw new Error("transport did not create a socket");
+		timeoutSocket.open(false);
+		vi.advanceTimersByTime(25);
+		expect(timedOut.controller.store.getState().connectionState).toBe("incompatible");
+		vi.advanceTimersByTime(60_000);
+		timedOut.controller.store.getState().connect();
+		expect(timedOut.sockets).toHaveLength(1);
+
+		const malformed = harness();
+		malformed.controller.store.getState().connect();
+		const malformedSocket = malformed.sockets[0];
+		if (!malformedSocket) throw new Error("transport did not create a socket");
+		malformedSocket.open(false);
+		malformedSocket.onmessage?.({ data: "not-json" });
+		expect(malformed.controller.store.getState().connectionState).toBe("incompatible");
+	});
+
+	it("retries when sending client_hello fails", () => {
+		vi.useFakeTimers();
+		const h = harness({ reconnectBaseMs: 5 });
+		h.controller.store.getState().connect();
+		const socket = h.sockets[0];
+		if (!socket) throw new Error("transport did not create a socket");
+		socket.throwOnSend = true;
+		socket.open(false);
+
+		expect(h.controller.store.getState().connectionState).toBe("offline");
+		vi.advanceTimersByTime(5);
+		expect(h.sockets).toHaveLength(2);
+	});
+
+	it("requires negotiated capabilities and an honored server-frame limit", () => {
+		const missingCapability = harness();
+		missingCapability.controller.store.getState().connect();
+		const capabilitySocket = missingCapability.sockets[0];
+		if (!capabilitySocket) throw new Error("transport did not create a socket");
+		capabilitySocket.open(false);
+		capabilitySocket.serverMessage(
+			serverHello({ capabilities: ["rpc.commands", "rpc.events", "session.multiplex"] }),
+		);
+		expect(missingCapability.controller.store.getState().connectionState).toBe("incompatible");
+
+		const excessiveLimit = harness();
+		excessiveLimit.controller.store.getState().connect();
+		const limitSocket = excessiveLimit.sockets[0];
+		if (!limitSocket) throw new Error("transport did not create a socket");
+		limitSocket.open(false);
+		limitSocket.serverMessage(
+			serverHello({
+				limits: {
+					maxClientFrameBytes: 8 * 1024 * 1024,
+					maxSnapshotFrameBytes: 66 * 1024 * 1024,
+					maxExtensionRequests: 256,
+				},
+			}),
+		);
+		expect(excessiveLimit.controller.store.getState().connectionState).toBe("incompatible");
+	});
+
+	it("accepts a valid history snapshot above the former 32 MiB ceiling", async () => {
+		const h = harness();
+		h.controller.store.getState().connect();
+		const socket = h.sockets[0];
+		if (!socket) throw new Error("transport did not create a socket");
+		socket.open(false);
+		socket.serverMessage(
+			serverHello({
+				limits: {
+					maxClientFrameBytes: SESSION_WS_CLIENT_MAX_BYTES,
+					maxSnapshotFrameBytes: SESSION_WS_SERVER_MAX_BYTES,
+					maxExtensionRequests: 256,
+				},
+			}),
+		);
+		subscribeAndPrime(h, "session-large");
+		const pending = h.controller.store
+			.getState()
+			.sendCommand("session-large", { id: "large-history", type: "get_messages" });
+		const frame: Extract<SessionWsServerMessage, { type: "response" }> = {
+			type: "response",
+			sessionHandle: "session-large",
+			generation: 1,
+			barrierSeq: 0,
+			response: {
+				id: "large-history",
+				type: "response",
+				command: "get_messages",
+				success: true,
+				data: {
+					messages: [
+						{
+							role: "assistant",
+							content: [{ type: "text", text: "x".repeat(33 * 1024 * 1024) }],
+							usage: {
+								input: 0,
+								output: 0,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 0,
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							},
+							stopReason: "stop",
+							timestamp: 1,
+						},
+					],
+				},
+			},
+		};
+		socket.serverMessage(frame);
+
+		await expect(pending).resolves.toMatchObject({ id: "large-history", success: true });
+		expect(h.controller.store.getState().connectionState).toBe("online");
+	});
 });
 
 describe("session transport multiplexing", () => {
@@ -475,18 +715,20 @@ describe("session transport replay and recovery", () => {
 		});
 	});
 
-	it("does not acknowledge a malformed Pi event when a projection listener fails", async () => {
+	it("treats a malformed authoritative Gateway event as terminal", async () => {
 		const h = harness();
 		const socket = connect(h);
 		subscribeAndPrime(h, "session-a");
 		subscribeAndPrime(h, "session-b");
 		const observed: string[] = [];
+		const leaseStates: boolean[] = [];
 		h.controller.frameBus.subscribe("session-a", ({ message }) => {
 			if (message.type !== "event" || message.event.type !== "message_update") return;
 			isCoalescibleMessageUpdate(message.event);
 		});
 		h.controller.frameBus.subscribe("session-a", ({ message }) => {
 			if (message.type === "event") observed.push(`a:${String(message.seq)}`);
+			if (message.type === "lease_status") leaseStates.push(message.isController);
 		});
 		h.controller.frameBus.subscribe("session-b", ({ message }) => {
 			if (message.type === "event") observed.push(`b:${String(message.seq)}`);
@@ -495,61 +737,46 @@ describe("session transport replay and recovery", () => {
 		const affected = h.controller.store
 			.getState()
 			.sendCommand("session-a", { id: "affected-barrier", type: "get_state" });
-		let affectedSettled = false;
-		affected.then(() => {
-			affectedSettled = true;
+		socket.serverMessage({
+			type: "lease_status",
+			sessionHandle: "session-a",
+			isController: true,
+			fencingToken: "lease-before-incompatible",
 		});
+		expect(
+			sessionDeleteCapability(
+				{ persisted: true, runtime: runtime("session-a") } as NativeSessionDto,
+				h.controller.store.getState().sessions["session-a"],
+			),
+		).toEqual({ allowed: true, reason: null });
 		socket.serverMessage(successResponse("session-a", 1, "affected-barrier", "get_state", 1));
 		const malformed = {
 			...eventFrame("session-a", 1, 1),
 			event: { type: "message_update", usage: {} },
 		} as unknown as SessionWsServerMessage;
 		socket.serverMessage(malformed);
-		await Promise.resolve();
+		await expect(affected).rejects.toMatchObject({ code: "unavailable" });
 
-		expect(observed).toEqual(["a:1"]);
-		expect(affectedSettled).toBe(false);
+		expect(observed).toEqual([]);
+		expect(h.controller.store.getState().connectionState).toBe("incompatible");
 		expect(h.controller.store.getState().sessions["session-a"]?.lastSeq).toBe(0);
 		expect(h.controller.store.getState().sessions["session-a"]?.projectedSeq).toBe(0);
-		expect(h.controller.store.getState().sessions["session-a"]?.resync).toMatchObject({
-			barrierSeq: 0,
-			bufferedFrameCount: 0,
-			requiresFreshBaseline: true,
-		});
-		expect(socket.sent.at(-1)).toEqual({ type: "session_subscribe", sessionHandle: "session-a" });
-
-		socket.serverMessage(eventFrame("session-b", 1, 1));
-		expect(observed).toEqual(["a:1", "b:1"]);
-		expect(h.controller.store.getState().sessions["session-b"]?.lastSeq).toBe(1);
-
-		socket.serverMessage({ type: "runtime_state", runtime: runtime("session-a", 1, 1) });
-		socket.serverMessage({
-			type: "resync_required",
-			sessionHandle: "session-a",
-			runtime: runtime("session-a", 1, 1),
-			reason: "initial",
-		});
-		socket.serverMessage({
-			type: "extension_ui_snapshot",
-			sessionHandle: "session-a",
-			generation: 1,
-			requests: [],
-		});
-		const snapshot = h.controller.store
-			.getState()
-			.sendCommand("session-a", { id: "delivery-recovery", type: "get_messages" });
-		socket.serverMessage(successResponse("session-a", 1, "delivery-recovery", "get_messages", 1));
-		await expect(snapshot).resolves.toMatchObject({ id: "delivery-recovery", success: true });
-		h.controller.store.getState().completeResync("session-a");
-		await expect(affected).resolves.toMatchObject({ id: "affected-barrier", success: true });
-		expect(h.controller.store.getState().sessions["session-a"]?.projectedSeq).toBe(1);
+		expect(h.controller.store.getState().sessions["session-a"]?.resync).toBeNull();
+		expect(h.controller.store.getState().sessions["session-a"]?.lease).toEqual({ isController: false });
+		expect(leaseStates).toEqual([true, false]);
+		expect(
+			sessionDeleteCapability(
+				{ persisted: true, runtime: runtime("session-a") } as NativeSessionDto,
+				h.controller.store.getState().sessions["session-a"],
+			),
+		).toEqual({ allowed: false, reason: "controller_required" });
 	});
 
 	it("does not expose a resync consumer until the atomic subscription baseline is complete", async () => {
 		const h = harness();
 		const socket = connect(h);
 		h.controller.store.getState().subscribeSession("session-a");
-		const snapshots: Array<Promise<RpcResponse>> = [];
+		const snapshots: Array<Promise<SessionCommandResponseDto>> = [];
 		h.controller.frameBus.subscribe("session-a", ({ message }) => {
 			if (message.type !== "resync_required") return;
 			snapshots.push(
@@ -914,7 +1141,7 @@ describe("session transport replay and recovery", () => {
 			runtime: runtime("session-a", 1, 0),
 			reason: "gap",
 		});
-		const snapshots: Array<Promise<RpcResponse>> = [];
+		const snapshots: Array<Promise<SessionCommandResponseDto>> = [];
 		h.controller.frameBus.subscribe("session-a", ({ message }) => {
 			if (message.type !== "resync_required") return;
 			snapshots.push(
@@ -1135,7 +1362,7 @@ describe("session transport replay and recovery", () => {
 		connect(h);
 		subscribeAndPrime(h, "session-a");
 		let seq = 0;
-		const ingest = (request: RpcExtensionUIRequest) => {
+		const ingest = (request: ExtensionUiRequestDto) => {
 			seq += 1;
 			h.controller.ingestServerMessage(extensionFrame("session-a", 1, seq, request));
 		};
@@ -1610,7 +1837,9 @@ describe("session transport commands and identity", () => {
 		const socket = connect(h);
 		h.controller.store.getState().subscribeSession("session-a");
 		expect(h.controller.store.getState().claimSession("session-a")).toBe(true);
-		expect(socket.sent).toEqual([{ type: "session_subscribe", sessionHandle: "session-a" }]);
+		expect(socket.sent.filter(({ type }) => type !== "client_hello")).toEqual([
+			{ type: "session_subscribe", sessionHandle: "session-a" },
+		]);
 
 		const initial = runtime("session-a", 1, 0);
 		socket.serverMessage({ type: "runtime_state", runtime: initial });

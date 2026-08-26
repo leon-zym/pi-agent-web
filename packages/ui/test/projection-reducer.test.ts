@@ -1,4 +1,4 @@
-import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type { SessionEventDto } from "@pi-agent-web/protocol";
 import { describe, expect, it } from "vitest";
 import { reduceProjection } from "../src/stores/projection-reducer";
 import { createEmptyProjection } from "../src/types/view-models";
@@ -20,19 +20,19 @@ const usage = {
 function textDelta(
 	contentIndex: number,
 	delta: string,
-): Extract<JsonAgentSessionEvent, { type: "message_update" }> {
+): Extract<SessionEventDto, { type: "message_update" }> {
 	return {
 		type: "message_update",
 		usage,
 		assistantMessageEvent: { type: "text_delta", contentIndex, delta },
-	} as Extract<JsonAgentSessionEvent, { type: "message_update" }>;
+	} as Extract<SessionEventDto, { type: "message_update" }>;
 }
 
 function finalAssistant(
 	text: string,
 	stopReason = "stop",
 	content?: unknown,
-): Extract<JsonAgentSessionEvent, { type: "message_end" }> {
+): Extract<SessionEventDto, { type: "message_end" }> {
 	return {
 		type: "message_end",
 		message: {
@@ -45,7 +45,7 @@ function finalAssistant(
 			stopReason,
 			timestamp: 0,
 		},
-	} as Extract<JsonAgentSessionEvent, { type: "message_end" }>;
+	} as Extract<SessionEventDto, { type: "message_end" }>;
 }
 
 const ctx = { now: 1000 };
@@ -149,7 +149,7 @@ describe("projection reducer", () => {
 				type: "message_update",
 				usage,
 				assistantMessageEvent: { type: "toolcall_start", contentIndex: 1 },
-			} as Extract<JsonAgentSessionEvent, { type: "message_update" }>,
+			} as Extract<SessionEventDto, { type: "message_update" }>,
 			ctx,
 		);
 		p = reduceProjection(
@@ -162,7 +162,7 @@ describe("projection reducer", () => {
 					contentIndex: 1,
 					toolCall: { type: "toolCall", id: "call-1", name: "bash", arguments: { command: "ls" } },
 				},
-			} as Extract<JsonAgentSessionEvent, { type: "message_update" }>,
+			} as Extract<SessionEventDto, { type: "message_update" }>,
 			ctx,
 		);
 		const tool = () => p.turns[0]?.steps[0]?.blocks[1];

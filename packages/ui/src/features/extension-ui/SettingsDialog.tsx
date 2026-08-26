@@ -1,5 +1,4 @@
-import type { RpcSessionState } from "@earendil-works/pi-coding-agent";
-import { expectData } from "@pi-agent-web/protocol";
+import { expectCommandData, type SessionStateDto } from "@pi-agent-web/protocol";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { Button } from "../../components/ui/button";
@@ -73,7 +72,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 		return Boolean(channel?.lease.isController && channel.lease.fencingToken);
 	});
 	const [state, setState] = useState<Pick<
-		RpcSessionState,
+		SessionStateDto,
 		"autoCompactionEnabled" | "steeringMode" | "followUpMode"
 	> | null>(null);
 	const { preference, set: setTheme } = useTheme();
@@ -86,7 +85,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 			.getState()
 			.sendCommand(sessionHandle, { type: "get_state" })
 			.then((response) => {
-				const data = expectData(response) as RpcSessionState;
+				const data = expectCommandData(response, "get_state");
 				if (cancelled) return;
 				setState({
 					autoCompactionEnabled: data.autoCompactionEnabled,

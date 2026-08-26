@@ -1,4 +1,4 @@
-import type { RpcExtensionUIRequest } from "@earendil-works/pi-coding-agent";
+import type { ExtensionUiRequestDto } from "@pi-agent-web/protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useComposerStore } from "../src/stores/composer";
 import { useExtensionUiStore } from "../src/stores/extension-ui";
@@ -95,7 +95,7 @@ describe("Session-scoped extension UI", () => {
 	});
 
 	it("atomically replaces sticky snapshot state without replaying notifications", () => {
-		const requests: RpcExtensionUIRequest[] = [
+		const requests: ExtensionUiRequestDto[] = [
 			request("blocking"),
 			{
 				type: "extension_ui_request",

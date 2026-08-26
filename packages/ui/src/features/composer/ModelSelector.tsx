@@ -1,3 +1,4 @@
+import type { ThinkingLevelDto } from "@pi-agent-web/protocol";
 import { Check, ChevronLeft, ChevronsUpDown, Settings2, Sparkles } from "lucide-react";
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
@@ -67,11 +68,11 @@ export function ModelSelector() {
 		}
 	};
 
-	const selectLevel = async (level: string) => {
+	const selectLevel = async (level: ThinkingLevelDto) => {
 		const sessionHandle = useSessionDirectoryStore.getState().currentSession?.sessionHandle;
 		if (!sessionHandle) return;
 		try {
-			await useModelDirectoryStore.getState().selectThinkingLevel(sessionHandle, level as never);
+			await useModelDirectoryStore.getState().selectThinkingLevel(sessionHandle, level);
 			setPage("root");
 		} catch (error) {
 			toast.error(tt("model.effortSwitchFailed"), {

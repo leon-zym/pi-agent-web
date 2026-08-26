@@ -1,4 +1,4 @@
-import { expectData } from "@pi-agent-web/protocol";
+import { expectCommandData } from "@pi-agent-web/protocol";
 import { Check, CircleAlert, Copy, GitFork, OctagonX } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
@@ -40,7 +40,7 @@ export function TurnTail({ turn }: { turn: ProductTurn }) {
 		if (!sessionHandle) return;
 		try {
 			const response = await sendReadCommand(sessionHandle, { type: "get_fork_messages" });
-			const { messages } = expectData(response) as { messages: Array<{ entryId: string; text: string }> };
+			const { messages } = expectCommandData(response, "get_fork_messages");
 			const last = messages[messages.length - 1];
 			if (!last) {
 				toast.info(tt("tail.noForkMessages"));

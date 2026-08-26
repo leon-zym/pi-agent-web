@@ -1,19 +1,30 @@
-/**
- * Browser-safe WebSocket and REST DTOs shared by the gateway and UI.
- * This package deliberately depends only on public Pi protocol type exports.
- */
+/** Browser-safe, product-owned WebSocket and REST DTOs shared by the gateway and UI. */
+import {
+	isExtensionUiRequestDto,
+	isExtensionUiResponseDto,
+	isProductSessionEventDto,
+	isSessionCommandResponseDto,
+} from "./product-decoders.js";
 import type {
-	JsonAgentSessionEvent,
-	RpcCommand,
-	RpcExtensionUIRequest,
-	RpcExtensionUIResponse,
-	RpcResponse,
-} from "@earendil-works/pi-coding-agent";
+	ExtensionUiRequestDto,
+	ExtensionUiResponseDto,
+	ProductSessionEventDto,
+	SessionCommandDataMap,
+	SessionCommandDto,
+	SessionCommandResponseDto,
+	SessionCommandTypeDto,
+} from "./product-dto.js";
+
+export * from "./gateway-handshake.js";
+export * from "./product-decoders.js";
+export * from "./product-dto.js";
 
 const MAX_IDENTIFIER_LENGTH = 256;
 const MAX_PATH_LENGTH = 8192;
 export const SESSION_TEXT_MAX_BYTES = 1024 * 1024;
 export const SESSION_WS_CLIENT_MAX_BYTES = 8 * 1024 * 1024;
+/** Maximum negotiated Gateway-to-browser frame, including a bounded history snapshot envelope. */
+export const SESSION_WS_SERVER_MAX_BYTES = 65 * 1024 * 1024;
 export const SESSION_IMAGE_MAX_COUNT = 16;
 export const SESSION_IMAGE_MAX_BASE64_CHARS = 2 * 1024 * 1024;
 export const SESSION_IMAGE_TOTAL_MAX_BASE64_CHARS = 6 * 1024 * 1024;
@@ -95,7 +106,7 @@ function isPromptLikeCommand(value: UnknownRecord, allowStreamingBehavior: boole
 	);
 }
 
-function isRpcCommand(value: unknown): value is RpcCommand {
+function isRpcCommand(value: unknown): value is SessionCommandDto {
 	if (!isRecord(value) || !isString(value.type, 64)) return false;
 
 	switch (value.type) {
@@ -131,7 +142,10 @@ function isRpcCommand(value: unknown): value is RpcCommand {
 				isString(value.modelId)
 			);
 		case "set_thinking_level":
-			return hasCommandPrefix(value, ["level"]) && isString(value.level, 64);
+			return (
+				hasCommandPrefix(value, ["level"]) &&
+				["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(value.level))
+			);
 		case "set_steering_mode":
 		case "set_follow_up_mode":
 			return hasCommandPrefix(value, ["mode"]) && (value.mode === "all" || value.mode === "one-at-a-time");
@@ -170,20 +184,6 @@ function isRpcCommand(value: unknown): value is RpcCommand {
 	}
 }
 
-function isExtensionUiResponse(value: unknown): value is RpcExtensionUIResponse {
-	if (!isRecord(value) || value.type !== "extension_ui_response" || !isString(value.id)) return false;
-	const variants = [
-		value.value !== undefined &&
-			hasOnlyKeys(value, ["type", "id", "value"]) &&
-			isBoundedString(value.value, SESSION_TEXT_MAX_BYTES),
-		value.confirmed !== undefined &&
-			hasOnlyKeys(value, ["type", "id", "confirmed"]) &&
-			typeof value.confirmed === "boolean",
-		value.cancelled === true && hasOnlyKeys(value, ["type", "id", "cancelled"]),
-	];
-	return variants.some(Boolean);
-}
-
 // ============================================================================
 // Session runtime WebSocket protocol
 // ============================================================================
@@ -199,14 +199,14 @@ export type SessionWsClientMessage =
 			sessionHandle: string;
 			expectedGeneration: number;
 			fencingToken?: string;
-			command: RpcCommand;
+			command: SessionCommandDto;
 	  }
 	| {
 			type: "extension_ui_response";
 			sessionHandle: string;
 			expectedGeneration: number;
 			fencingToken: string;
-			response: RpcExtensionUIResponse;
+			response: ExtensionUiResponseDto;
 	  }
 	| { type: "session_subscribe"; sessionHandle: string; cursor?: SessionReplayCursorDto }
 	| { type: "session_unsubscribe"; sessionHandle: string }
@@ -244,7 +244,7 @@ export function isSessionWsClientMessage(value: unknown): value is SessionWsClie
 				hasOnlyKeys(value, ["type", "sessionHandle", "expectedGeneration", "fencingToken", "response"]) &&
 				isGeneration(value.expectedGeneration) &&
 				isString(value.fencingToken) &&
-				isExtensionUiResponse(value.response)
+				isExtensionUiResponseDto(value.response)
 			);
 		case "session_subscribe":
 			return (
@@ -275,7 +275,7 @@ export interface ExtensionErrorEvent {
 	error: string;
 }
 
-export type PiWebSessionEvent = JsonAgentSessionEvent | ExtensionErrorEvent;
+export type PiWebSessionEvent = ProductSessionEventDto;
 
 /**
  * Gateway command deadlines. Pi owns execution; these bounds only prevent an
@@ -324,7 +324,7 @@ export const READ_ONLY_RPC_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_tree",
 ]);
 
-export function isReadOnlyRpcCommand(command: Pick<RpcCommand, "type"> | string): boolean {
+export function isReadOnlyRpcCommand(command: Pick<SessionCommandDto, "type"> | string): boolean {
 	return READ_ONLY_RPC_COMMAND_TYPES.has(typeof command === "string" ? command : command.type);
 }
 
@@ -355,7 +355,7 @@ export type SessionReplayFrameDto =
 	| (SessionServerEnvelopeBase & { type: "event"; event: PiWebSessionEvent })
 	| (SessionServerEnvelopeBase & {
 			type: "extension_ui_request";
-			request: RpcExtensionUIRequest;
+			request: ExtensionUiRequestDto;
 	  })
 	| (SessionServerEnvelopeBase & {
 			type: "extension_ui_closed";
@@ -369,7 +369,7 @@ export type SessionWsServerMessage =
 			sessionHandle: string;
 			generation: number;
 			barrierSeq: number;
-			response: RpcResponse;
+			response: SessionCommandResponseDto;
 			previousSessionHandle?: string;
 	  }
 	| SessionReplayFrameDto
@@ -390,7 +390,7 @@ export type SessionWsServerMessage =
 			type: "extension_ui_snapshot";
 			sessionHandle: string;
 			generation: number;
-			requests: RpcExtensionUIRequest[];
+			requests: ExtensionUiRequestDto[];
 	  }
 	| {
 			type: "extension_ui_result";
@@ -440,15 +440,6 @@ function hasSessionEnvelope(value: UnknownRecord): boolean {
 	);
 }
 
-function isExtensionUiRequestShallow(value: unknown): value is RpcExtensionUIRequest {
-	return (
-		isRecord(value) &&
-		value.type === "extension_ui_request" &&
-		isString(value.id) &&
-		isString(value.method, 64)
-	);
-}
-
 /** Validate gateway-to-browser Session frames before they enter UI state. */
 export function isSessionWsServerMessage(value: unknown): value is SessionWsServerMessage {
 	if (!isRecord(value) || !isString(value.type, 64)) return false;
@@ -462,9 +453,9 @@ export function isSessionWsServerMessage(value: unknown): value is SessionWsServ
 		case "auth_changed":
 			return value.workspaceId === undefined || isString(value.workspaceId);
 		case "event":
-			return hasSessionEnvelope(value) && isRecord(value.event) && isString(value.event.type, 64);
+			return hasSessionEnvelope(value) && isProductSessionEventDto(value.event);
 		case "extension_ui_request":
-			return hasSessionEnvelope(value) && isExtensionUiRequestShallow(value.request);
+			return hasSessionEnvelope(value) && isExtensionUiRequestDto(value.request);
 		case "extension_ui_closed":
 			return (
 				hasSessionEnvelope(value) &&
@@ -476,11 +467,7 @@ export function isSessionWsServerMessage(value: unknown): value is SessionWsServ
 				isString(value.sessionHandle) &&
 				isGeneration(value.generation) &&
 				isGeneration(value.barrierSeq) &&
-				isRecord(value.response) &&
-				value.response.type === "response" &&
-				(value.response.id === undefined || isString(value.response.id)) &&
-				isString(value.response.command, 64) &&
-				typeof value.response.success === "boolean"
+				isSessionCommandResponseDto(value.response)
 			);
 		case "lease_status":
 			return (
@@ -499,7 +486,7 @@ export function isSessionWsServerMessage(value: unknown): value is SessionWsServ
 				isString(value.sessionHandle) &&
 				isGeneration(value.generation) &&
 				Array.isArray(value.requests) &&
-				value.requests.every(isExtensionUiRequestShallow)
+				value.requests.every(isExtensionUiRequestDto)
 			);
 		case "extension_ui_result":
 			return (
@@ -586,7 +573,9 @@ export class RpcError extends Error {
 	}
 }
 
-export function isErrorResponse(response: RpcResponse): response is Extract<RpcResponse, { success: false }> {
+export function isErrorResponse(
+	response: SessionCommandResponseDto,
+): response is Extract<SessionCommandResponseDto, { success: false }> {
 	return response.type === "response" && response.success === false;
 }
 
@@ -594,8 +583,20 @@ export function isErrorResponse(response: RpcResponse): response is Extract<RpcR
  * Extract data from a success response and throw RpcError on a failed response.
  * Responses without a data payload return undefined.
  */
-export function expectData(response: RpcResponse): unknown {
+export function expectData(response: SessionCommandResponseDto): unknown {
 	if (response.type !== "response") throw new RpcError("<no-command>", "not a response frame");
 	if (response.success === false) throw new RpcError(response.command, response.error);
 	return "data" in response ? (response as { data: unknown }).data : undefined;
+}
+
+/** Extract the product-owned data shape for an expected command. */
+export function expectCommandData<K extends SessionCommandTypeDto>(
+	response: SessionCommandResponseDto,
+	command: K,
+): SessionCommandDataMap[K] {
+	if (response.command !== command) {
+		throw new RpcError(response.command, `expected ${command} response, received ${response.command}`);
+	}
+	if (response.success === false) throw new RpcError(response.command, response.error);
+	return ("data" in response ? response.data : undefined) as SessionCommandDataMap[K];
 }

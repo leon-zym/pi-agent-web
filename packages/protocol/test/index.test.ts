@@ -1,7 +1,7 @@
-import type { RpcResponse } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 import {
 	commandTimeoutMs,
+	expectCommandData,
 	expectData,
 	isErrorResponse,
 	isReadOnlyRpcCommand,
@@ -11,6 +11,7 @@ import {
 	SESSION_IMAGE_MAX_BASE64_CHARS,
 	SESSION_TEXT_MAX_BYTES,
 	SESSION_WS_CLIENT_MAX_BYTES,
+	type SessionCommandResponseDto,
 	sessionWsClientMessageBytes,
 } from "../src/index.js";
 
@@ -22,10 +23,24 @@ describe("protocol response helpers", () => {
 			command: "get_state",
 			success: true,
 			data: { sessionId: "session-1" },
-		} as RpcResponse;
+		} as SessionCommandResponseDto;
 
 		expect(expectData(response)).toEqual({ sessionId: "session-1" });
 		expect(isErrorResponse(response)).toBe(false);
+	});
+
+	it("extracts typed data only for the matching command", () => {
+		const response = {
+			type: "response",
+			command: "get_messages",
+			success: true,
+			data: { messages: [] },
+		} satisfies SessionCommandResponseDto;
+
+		expect(expectCommandData(response, "get_messages")).toEqual({ messages: [] });
+		expect(() => expectCommandData(response, "get_state")).toThrow(
+			"expected get_state response, received get_messages",
+		);
 	});
 
 	it("preserves command context for failed responses", () => {
@@ -35,7 +50,7 @@ describe("protocol response helpers", () => {
 			command: "get_messages",
 			success: false,
 			error: "not ready",
-		} as RpcResponse;
+		} as SessionCommandResponseDto;
 
 		expect(isErrorResponse(response)).toBe(true);
 		expect(() => expectData(response)).toThrow(RpcError);

@@ -1,5 +1,4 @@
-import type { SessionEntry, SessionTreeNode } from "@earendil-works/pi-coding-agent";
-import { expectData } from "@pi-agent-web/protocol";
+import { expectCommandData, type SessionEntryDto } from "@pi-agent-web/protocol";
 import {
 	Bot,
 	Brain,
@@ -170,7 +169,7 @@ export function InspectorCodeSections({
 	);
 }
 
-function entryLabel(entry: SessionEntry): string {
+function entryLabel(entry: SessionEntryDto): string {
 	switch (entry.type) {
 		case "message": {
 			const message = entry.message;
@@ -221,7 +220,7 @@ function entryLabel(entry: SessionEntry): string {
 	}
 }
 
-function entryIcon(entry: SessionEntry) {
+function entryIcon(entry: SessionEntryDto) {
 	if (entry.type === "message" && entry.message.role === "user") return MessageSquare;
 	if (entry.type === "message" && entry.message.role === "assistant") return Bot;
 	if (entry.type === "model_change" || entry.type === "thinking_level_change") return ListTree;
@@ -363,7 +362,7 @@ function TreeView() {
 			const response = await sessionTransport.store
 				.getState()
 				.sendCommand(targetSessionHandle, { type: "get_tree" });
-			const data = expectData(response) as { tree: SessionTreeNode[]; leafId: string | null };
+			const data = expectCommandData(response, "get_tree");
 			if (
 				request !== requestRef.current ||
 				useSessionDirectoryStore.getState().currentSession?.sessionHandle !== targetSessionHandle
@@ -416,8 +415,8 @@ function TreeView() {
 			const response = await sessionTransport.store
 				.getState()
 				.sendCommand(targetSessionHandle, { type: "fork", entryId });
-			const data = expectData(response) as { cancelled?: boolean } | undefined;
-			if (data?.cancelled) {
+			const data = expectCommandData(response, "fork");
+			if (data.cancelled) {
 				toast.info(tt("session.forkCancelled"));
 				return;
 			}

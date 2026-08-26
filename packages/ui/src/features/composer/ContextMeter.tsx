@@ -1,4 +1,4 @@
-import type { SessionStats } from "@earendil-works/pi-coding-agent";
+import type { SessionStatsDto } from "@pi-agent-web/protocol";
 import { useMemo } from "react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
 import { formatCost, formatTokens } from "../../lib/format";
@@ -99,7 +99,7 @@ export type ContextDisplay =
 	| { kind: "unavailable" }
 	| { kind: "ready"; tokens: number; percent: number; window: number | null };
 
-export function resolveContextDisplay(stats: SessionStats | null, pending = false): ContextDisplay {
+export function resolveContextDisplay(stats: SessionStatsDto | null, pending = false): ContextDisplay {
 	if (!stats) return { kind: pending ? "loading" : "unavailable" };
 	const usage = stats.contextUsage;
 	if (

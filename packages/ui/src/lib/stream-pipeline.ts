@@ -1,4 +1,8 @@
-import { expectData, type SessionRuntimeDto, type SessionWsServerMessage } from "@pi-agent-web/protocol";
+import {
+	expectCommandData,
+	type SessionRuntimeDto,
+	type SessionWsServerMessage,
+} from "@pi-agent-web/protocol";
 import { toast } from "sonner";
 import { migrateComposerHistory } from "../features/composer/use-composer-history";
 import { useComposerStore } from "../stores/composer";
@@ -250,7 +254,7 @@ function currentMessageIdentity(sessionHandle: string, generation: number): stri
 
 function applyLiveUsage(
 	sessionHandle: string,
-	event: Extract<import("@earendil-works/pi-coding-agent").JsonAgentSessionEvent, { type: "message_update" }>,
+	event: Extract<import("@pi-agent-web/protocol").SessionEventDto, { type: "message_update" }>,
 ): void {
 	useSessionStatsStore.getState().applyLiveUsageForSession(sessionHandle, {
 		input: event.usage.input,
@@ -329,7 +333,7 @@ async function performResync(
 		const response = await sessionTransport.store
 			.getState()
 			.sendCommand(sessionHandle, { type: "get_messages" });
-		const { messages } = expectData(response) as { messages: unknown[] };
+		const { messages } = expectCommandData(response, "get_messages");
 		const channel = sessionTransport.store.getState().sessions[sessionHandle];
 		if (
 			!channel?.resync ||

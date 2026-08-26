@@ -1,9 +1,9 @@
-import type { SessionStats } from "@earendil-works/pi-coding-agent";
+import type { SessionStatsDto } from "@pi-agent-web/protocol";
 import { describe, expect, it } from "vitest";
 import { resolveContextDisplay } from "../src/features/composer/ContextMeter";
 
-function stats(contextUsage: unknown): SessionStats {
-	return { contextUsage } as unknown as SessionStats;
+function stats(contextUsage: unknown): SessionStatsDto {
+	return { contextUsage } as unknown as SessionStatsDto;
 }
 
 describe("context meter states", () => {

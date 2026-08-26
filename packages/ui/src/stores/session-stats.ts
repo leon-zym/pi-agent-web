@@ -1,5 +1,4 @@
-import type { SessionStats } from "@earendil-works/pi-coding-agent";
-import { expectData } from "@pi-agent-web/protocol";
+import { expectCommandData, type SessionStatsDto } from "@pi-agent-web/protocol";
 import { create } from "zustand";
 import { sessionTransport } from "./session-transport";
 
@@ -18,7 +17,7 @@ export interface LiveSessionUsage {
 }
 
 export interface SessionStatsSnapshot {
-	stats: SessionStats | null;
+	stats: SessionStatsDto | null;
 	/** Live usage from message_update (cumulative); converges at message_end. */
 	liveUsage: LiveSessionUsage | null;
 }
@@ -102,7 +101,7 @@ export const useSessionStatsStore = create<SessionStatsState>()((set, get) => {
 					.getState()
 					.sendCommand(sessionHandle, { type: "get_session_stats" });
 				if (refreshGeneration.get(sessionHandle) !== generation) return;
-				const stats = expectData(response) as SessionStats;
+				const stats = expectCommandData(response, "get_session_stats");
 				updateSession(sessionHandle, (snapshot) => ({
 					stats,
 					liveUsage:

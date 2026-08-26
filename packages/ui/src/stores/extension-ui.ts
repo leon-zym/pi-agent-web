@@ -1,10 +1,10 @@
-import type { RpcExtensionUIRequest, RpcExtensionUIResponse } from "@earendil-works/pi-coding-agent";
+import type { ExtensionUiRequestDto, ExtensionUiResponseDto } from "@pi-agent-web/protocol";
 import { create } from "zustand";
 import { useComposerStore } from "./composer";
 import { sessionTransport } from "./session-transport";
 
 export type DialogRequest = Extract<
-	RpcExtensionUIRequest,
+	ExtensionUiRequestDto,
 	{ method: "select" | "confirm" | "input" | "editor" }
 >;
 
@@ -53,7 +53,7 @@ interface ExtensionUiState extends ExtensionUiSnapshot {
 	resetSessionForGeneration: (sessionHandle: string, generation: number) => void;
 	pushDialog: (dialog: PendingDialog) => void;
 	pushDialogForSession: (sessionHandle: string, dialog: PendingDialogInput) => void;
-	respond: (dialog: PendingDialog, response: RpcExtensionUIResponse) => boolean;
+	respond: (dialog: PendingDialog, response: ExtensionUiResponseDto) => boolean;
 	toggleMinimize: (id: string) => void;
 	toggleMinimizeForSession: (sessionHandle: string, id: string) => void;
 	minimize: (id: string) => void;
@@ -82,14 +82,14 @@ interface ExtensionUiState extends ExtensionUiSnapshot {
 	) => void;
 	applyRequestForSession: (
 		sessionHandle: string,
-		request: RpcExtensionUIRequest,
+		request: ExtensionUiRequestDto,
 		generation: number,
 		receivedAt?: number,
 	) => void;
 	replaceRequestsForSession: (
 		sessionHandle: string,
 		generation: number,
-		requests: RpcExtensionUIRequest[],
+		requests: ExtensionUiRequestDto[],
 		receivedAt?: number,
 	) => void;
 }

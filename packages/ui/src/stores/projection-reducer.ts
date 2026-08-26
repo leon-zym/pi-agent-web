@@ -1,4 +1,4 @@
-import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type { SessionEventDto } from "@pi-agent-web/protocol";
 import { tt } from "../lib/i18n";
 import { presentUserMessage, serializePresentedUserMessage } from "../lib/user-message-presentation";
 import type {
@@ -260,7 +260,7 @@ function upsertStatusRow(state: ConversationProjection, row: StatusRow): Convers
 function handleMessageUpdate(
 	state: ConversationProjection,
 	ctx: ReducerContext,
-	event: Extract<JsonAgentSessionEvent, { type: "message_update" }>,
+	event: Extract<SessionEventDto, { type: "message_update" }>,
 ): ConversationProjection {
 	const ensured = ensureTurn(state, ctx);
 	// Attach deltas to the step created by turn_start; create one defensively
@@ -373,7 +373,7 @@ function handleMessageUpdate(
 function handleMessageStart(
 	state: ConversationProjection,
 	ctx: ReducerContext,
-	event: Extract<JsonAgentSessionEvent, { type: "message_start" }>,
+	event: Extract<SessionEventDto, { type: "message_start" }>,
 ): ConversationProjection {
 	const message = event.message as { role?: string; content: unknown };
 
@@ -468,7 +468,7 @@ function handleMessageStart(
 function handleMessageEnd(
 	state: ConversationProjection,
 	ctx: ReducerContext,
-	event: Extract<JsonAgentSessionEvent, { type: "message_end" }>,
+	event: Extract<SessionEventDto, { type: "message_end" }>,
 ): ConversationProjection {
 	const message = event.message as {
 		role?: string;
@@ -586,7 +586,7 @@ function handleMessageEnd(
 
 export function reduceProjection(
 	state: ConversationProjection,
-	event: JsonAgentSessionEvent,
+	event: SessionEventDto,
 	ctx: ReducerContext,
 ): ConversationProjection {
 	switch (event.type) {
