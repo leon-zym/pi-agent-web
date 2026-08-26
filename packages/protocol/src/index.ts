@@ -1,4 +1,11 @@
 /** Browser-safe, product-owned WebSocket and REST DTOs shared by the gateway and UI. */
+
+import {
+	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+	GATEWAY_PROTOCOL_VERSION,
+	type GatewayClientHelloDto,
+	type GatewayServerHelloDto,
+} from "./gateway-handshake.js";
 import {
 	isExtensionUiRequestDto,
 	isExtensionUiResponseDto,
@@ -34,6 +41,9 @@ export const SESSION_SNAPSHOT_MAX_QUEUE_ITEMS = 10_000;
 export const SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS = 256;
 export const SESSION_SNAPSHOT_MAX_DEPTH = 48;
 export const SESSION_SNAPSHOT_MAX_ITEMS = 250_000;
+export const SESSION_HOT_RUNTIME_INVENTORY_MAX_ITEMS = 256;
+/** Covers the worst canonical JSON envelope for 256 maximum escaped identities. */
+export const SESSION_HOT_RUNTIME_INVENTORY_MAX_BYTES = 1024 * 1024;
 export const SESSION_IMAGE_MAX_COUNT = 16;
 export const SESSION_IMAGE_MAX_BASE64_CHARS = 2 * 1024 * 1024;
 export const SESSION_IMAGE_TOTAL_MAX_BASE64_CHARS = 6 * 1024 * 1024;
@@ -84,6 +94,10 @@ export function sessionWsServerMessageBytes(value: unknown): number {
 
 function hasOnlyKeys(value: UnknownRecord, allowed: readonly string[]): boolean {
 	return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+function hasOwnProperties(value: UnknownRecord, required: readonly string[]): boolean {
+	return required.every((key) => Object.hasOwn(value, key));
 }
 
 function hasCommandPrefix(value: UnknownRecord, allowed: readonly string[]): boolean {
@@ -230,7 +244,12 @@ export type SessionWsClientMessage =
 			fencingToken: string;
 			response: ExtensionUiResponseDto;
 	  }
-	| { type: "session_subscribe"; sessionHandle: string; cursor?: SessionReplayCursorDto }
+	| {
+			type: "session_subscribe";
+			sessionHandle: string;
+			cursor?: SessionReplayCursorDto;
+			expectedHotRuntime?: SessionRuntimeIdentityDto;
+	  }
 	| { type: "session_unsubscribe"; sessionHandle: string }
 	| { type: "session_claim"; sessionHandle: string }
 	| { type: "session_release"; sessionHandle: string };
@@ -242,6 +261,7 @@ function isGeneration(value: unknown): value is number {
 export function isSessionReplayCursorDto(value: unknown): value is SessionReplayCursorDto {
 	return (
 		isRecord(value) &&
+		hasOwnProperties(value, ["serverEpoch", "generation", "seq"]) &&
 		hasOnlyKeys(value, ["serverEpoch", "generation", "seq"]) &&
 		isString(value.serverEpoch, 128) &&
 		isGeneration(value.generation) &&
@@ -270,10 +290,9 @@ export function isSessionWsClientMessage(value: unknown): value is SessionWsClie
 				isExtensionUiResponseDto(value.response)
 			);
 		case "session_subscribe":
-			return (
-				hasOnlyKeys(value, ["type", "sessionHandle", "cursor"]) &&
-				(value.cursor === undefined || isSessionReplayCursorDto(value.cursor))
-			);
+			if (!isSessionSubscribeMessage(value)) return false;
+			if (value.expectedHotRuntime === undefined) return true;
+			return isCanonicalSessionSubscribeMessage(value);
 		case "session_unsubscribe":
 		case "session_claim":
 		case "session_release":
@@ -358,6 +377,70 @@ export interface SessionRuntimeIdentityDto {
 	sessionHandle: string;
 	workspaceId: string;
 	generation: number;
+}
+
+export type HotRuntimeStateDto = Extract<
+	SessionRuntimeStateDto,
+	"starting" | "idle" | "running" | "waiting_ui"
+>;
+
+export interface HotRuntimeInventoryEntryDto extends SessionRuntimeIdentityDto {
+	state: HotRuntimeStateDto;
+}
+
+export interface HotRuntimeInventoryDto {
+	type: "hot_runtime_inventory";
+	serverEpoch: string;
+	revision: number;
+	runtimes: HotRuntimeInventoryEntryDto[];
+}
+
+export type HotRuntimeInventoryNegotiation =
+	| { negotiated: true }
+	| {
+			negotiated: false;
+			reason:
+				| "protocol_major_unsupported"
+				| "protocol_minor_unsupported"
+				| "protocol_selection_invalid"
+				| "capability_missing"
+				| "gateway_capability_missing"
+				| "server_frame_selection_invalid"
+				| "server_frame_limit_too_small";
+	  };
+
+export function negotiateHotRuntimeInventory(
+	clientHello: GatewayClientHelloDto,
+	serverHello: GatewayServerHelloDto,
+): HotRuntimeInventoryNegotiation {
+	if (
+		clientHello.protocol.major !== GATEWAY_PROTOCOL_VERSION.major ||
+		serverHello.protocol.major !== GATEWAY_PROTOCOL_VERSION.major
+	) {
+		return { negotiated: false, reason: "protocol_major_unsupported" };
+	}
+	if (clientHello.protocol.minor < 1 || serverHello.protocol.minor < 1) {
+		return { negotiated: false, reason: "protocol_minor_unsupported" };
+	}
+	if (serverHello.protocol.minor !== Math.min(clientHello.protocol.minor, GATEWAY_PROTOCOL_VERSION.minor)) {
+		return { negotiated: false, reason: "protocol_selection_invalid" };
+	}
+	if (!clientHello.capabilities.includes(GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY)) {
+		return { negotiated: false, reason: "capability_missing" };
+	}
+	if (!serverHello.capabilities.includes(GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY)) {
+		return { negotiated: false, reason: "gateway_capability_missing" };
+	}
+	if (serverHello.limits.maxSnapshotFrameBytes > clientHello.limits.maxServerFrameBytes) {
+		return { negotiated: false, reason: "server_frame_selection_invalid" };
+	}
+	if (
+		clientHello.limits.maxServerFrameBytes < SESSION_HOT_RUNTIME_INVENTORY_MAX_BYTES ||
+		serverHello.limits.maxSnapshotFrameBytes < SESSION_HOT_RUNTIME_INVENTORY_MAX_BYTES
+	) {
+		return { negotiated: false, reason: "server_frame_limit_too_small" };
+	}
+	return { negotiated: true };
 }
 
 export interface SessionRuntimeDto extends SessionRuntimeIdentityDto {
@@ -485,6 +568,7 @@ export type SessionWsServerMessage =
 			outcome: "accepted" | "no_dialog" | "not_running";
 	  }
 	| SessionRekeyedDto
+	| HotRuntimeInventoryDto
 	| {
 			type: "session_error";
 			serverEpoch: string;
@@ -504,6 +588,51 @@ export function isSessionRuntimeIdentityDto(value: unknown): value is SessionRun
 		isString(value.workspaceId) &&
 		isGeneration(value.generation)
 	);
+}
+
+function isExactHotRuntimeIdentityDto(value: unknown): value is SessionRuntimeIdentityDto {
+	return (
+		isRecord(value) &&
+		hasOwnProperties(value, ["serverEpoch", "sessionHandle", "workspaceId", "generation"]) &&
+		isSessionRuntimeIdentityDto(value) &&
+		value.generation > 0
+	);
+}
+
+function isSessionSubscribeMessage(value: UnknownRecord): boolean {
+	if (
+		!hasOwnProperties(value, ["type", "sessionHandle"]) ||
+		!hasOnlyKeys(value, ["type", "sessionHandle", "cursor", "expectedHotRuntime"]) ||
+		(value.cursor !== undefined && !Object.hasOwn(value, "cursor")) ||
+		(value.cursor !== undefined && !isSessionReplayCursorDto(value.cursor))
+	) {
+		return false;
+	}
+	if (value.expectedHotRuntime === undefined) return true;
+	if (!Object.hasOwn(value, "expectedHotRuntime")) return false;
+	if (!isExactHotRuntimeIdentityDto(value.expectedHotRuntime)) return false;
+	if (value.expectedHotRuntime.sessionHandle !== value.sessionHandle) return false;
+	return true;
+}
+
+function isCanonicalSessionSubscribeMessage(value: unknown): boolean {
+	const serialized = boundedCanonicalJson(value, {
+		maxBytes: SESSION_WS_CLIENT_MAX_BYTES,
+		maxDepth: 4,
+		maxItems: 32,
+	});
+	if (serialized === null) return false;
+	try {
+		const canonical = JSON.parse(serialized);
+		return (
+			isRecord(canonical) &&
+			canonical.type === "session_subscribe" &&
+			isString(canonical.sessionHandle) &&
+			isSessionSubscribeMessage(canonical)
+		);
+	} catch {
+		return false;
+	}
 }
 
 export function isSessionRuntimeDto(value: unknown): value is SessionRuntimeDto {
@@ -603,14 +732,20 @@ function canonicalJsonChildren(value: object): unknown[] | null {
 	return children;
 }
 
-function boundedCanonicalSnapshotJson(value: unknown): string | null {
+interface CanonicalJsonLimits {
+	maxBytes: number;
+	maxDepth: number;
+	maxItems: number;
+}
+
+function boundedCanonicalJson(value: unknown, limits: CanonicalJsonLimits): string | null {
 	const stack: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
 	const seen = new Set<object>();
 	let items = 0;
 	let stringBytes = 0;
 	while (stack.length > 0) {
 		const current = stack.pop();
-		if (!current || current.depth > SESSION_SNAPSHOT_MAX_DEPTH || ++items > SESSION_SNAPSHOT_MAX_ITEMS) {
+		if (!current || current.depth > limits.maxDepth || ++items > limits.maxItems) {
 			return null;
 		}
 		const candidate = current.value;
@@ -621,7 +756,7 @@ function boundedCanonicalSnapshotJson(value: unknown): string | null {
 		}
 		if (typeof candidate === "string") {
 			stringBytes += UTF8_ENCODER.encode(candidate).byteLength;
-			if (stringBytes > SESSION_SNAPSHOT_MAX_BYTES) return null;
+			if (stringBytes > limits.maxBytes) return null;
 			continue;
 		}
 		if (typeof candidate !== "object" || seen.has(candidate)) return null;
@@ -633,9 +768,66 @@ function boundedCanonicalSnapshotJson(value: unknown): string | null {
 	try {
 		const serialized = JSON.stringify(value);
 		if (typeof serialized !== "string") return null;
-		return UTF8_ENCODER.encode(serialized).byteLength <= SESSION_SNAPSHOT_MAX_BYTES ? serialized : null;
+		return UTF8_ENCODER.encode(serialized).byteLength <= limits.maxBytes ? serialized : null;
 	} catch {
 		return null;
+	}
+}
+
+function boundedCanonicalSnapshotJson(value: unknown): string | null {
+	return boundedCanonicalJson(value, {
+		maxBytes: SESSION_SNAPSHOT_MAX_BYTES,
+		maxDepth: SESSION_SNAPSHOT_MAX_DEPTH,
+		maxItems: SESSION_SNAPSHOT_MAX_ITEMS,
+	});
+}
+
+function isCanonicalHotRuntimeInventoryDto(value: unknown): value is HotRuntimeInventoryDto {
+	if (
+		!isRecord(value) ||
+		!hasOwnProperties(value, ["type", "serverEpoch", "revision", "runtimes"]) ||
+		!hasOnlyKeys(value, ["type", "serverEpoch", "revision", "runtimes"]) ||
+		value.type !== "hot_runtime_inventory" ||
+		!isString(value.serverEpoch, 128) ||
+		!isGeneration(value.revision) ||
+		!Array.isArray(value.runtimes) ||
+		value.runtimes.length > SESSION_HOT_RUNTIME_INVENTORY_MAX_ITEMS
+	) {
+		return false;
+	}
+	const handles = new Set<string>();
+	for (const runtime of value.runtimes) {
+		if (
+			!isRecord(runtime) ||
+			!hasOwnProperties(runtime, ["serverEpoch", "sessionHandle", "workspaceId", "generation", "state"]) ||
+			!hasOnlyKeys(runtime, ["serverEpoch", "sessionHandle", "workspaceId", "generation", "state"]) ||
+			!isString(runtime.serverEpoch, 128) ||
+			runtime.serverEpoch !== value.serverEpoch ||
+			!isString(runtime.sessionHandle) ||
+			!isString(runtime.workspaceId) ||
+			!isGeneration(runtime.generation) ||
+			runtime.generation === 0 ||
+			!["starting", "idle", "running", "waiting_ui"].includes(String(runtime.state)) ||
+			handles.has(runtime.sessionHandle)
+		) {
+			return false;
+		}
+		handles.add(runtime.sessionHandle);
+	}
+	return true;
+}
+
+export function isHotRuntimeInventoryDto(value: unknown): value is HotRuntimeInventoryDto {
+	const serialized = boundedCanonicalJson(value, {
+		maxBytes: SESSION_HOT_RUNTIME_INVENTORY_MAX_BYTES,
+		maxDepth: 4,
+		maxItems: SESSION_HOT_RUNTIME_INVENTORY_MAX_ITEMS * 8 + 16,
+	});
+	if (serialized === null) return false;
+	try {
+		return isCanonicalHotRuntimeInventoryDto(JSON.parse(serialized));
+	} catch {
+		return false;
 	}
 }
 
@@ -753,6 +945,8 @@ export function isSessionWsServerMessage(value: unknown): value is SessionWsServ
 	if (value.type === "session_snapshot") return isSessionSnapshotDto(value);
 	if (sessionWsServerMessageBytes(value) > SESSION_WS_SERVER_MAX_BYTES) return false;
 	switch (value.type) {
+		case "hot_runtime_inventory":
+			return isHotRuntimeInventoryDto(value);
 		case "runtime_state":
 			return hasOnlyKeys(value, ["type", "runtime"]) && isSessionRuntimeDto(value.runtime);
 		case "session_rekeyed":
