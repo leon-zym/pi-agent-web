@@ -4,6 +4,7 @@ import {
 	isExtensionUiResponseDto,
 	isProductSessionEventDto,
 	isSessionCommandResponseDto,
+	isSessionMessageDto,
 } from "./product-decoders.js";
 import type {
 	ExtensionUiRequestDto,
@@ -13,6 +14,7 @@ import type {
 	SessionCommandDto,
 	SessionCommandResponseDto,
 	SessionCommandTypeDto,
+	SessionMessageDto,
 } from "./product-dto.js";
 
 export * from "./gateway-handshake.js";
@@ -25,6 +27,13 @@ export const SESSION_TEXT_MAX_BYTES = 1024 * 1024;
 export const SESSION_WS_CLIENT_MAX_BYTES = 8 * 1024 * 1024;
 /** Maximum negotiated Gateway-to-browser frame, including a bounded history snapshot envelope. */
 export const SESSION_WS_SERVER_MAX_BYTES = 65 * 1024 * 1024;
+export const SESSION_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024;
+export const SESSION_SNAPSHOT_MAX_MESSAGES = 10_000;
+export const SESSION_SNAPSHOT_MAX_PROJECTION_EVENTS = 4_096;
+export const SESSION_SNAPSHOT_MAX_QUEUE_ITEMS = 10_000;
+export const SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS = 256;
+export const SESSION_SNAPSHOT_MAX_DEPTH = 48;
+export const SESSION_SNAPSHOT_MAX_ITEMS = 250_000;
 export const SESSION_IMAGE_MAX_COUNT = 16;
 export const SESSION_IMAGE_MAX_BASE64_CHARS = 2 * 1024 * 1024;
 export const SESSION_IMAGE_TOTAL_MAX_BASE64_CHARS = 6 * 1024 * 1024;
@@ -51,6 +60,18 @@ function isBoundedString(value: unknown, maxLength: number): value is string {
 
 /** Exact UTF-8 wire size used by browser WebSocket text frames. */
 export function sessionWsClientMessageBytes(value: unknown): number {
+	try {
+		const serialized = JSON.stringify(value);
+		return typeof serialized === "string"
+			? UTF8_ENCODER.encode(serialized).byteLength
+			: Number.POSITIVE_INFINITY;
+	} catch {
+		return Number.POSITIVE_INFINITY;
+	}
+}
+
+/** Exact UTF-8 wire size used by Gateway-to-browser JSON text frames. */
+export function sessionWsServerMessageBytes(value: unknown): number {
 	try {
 		const serialized = JSON.stringify(value);
 		return typeof serialized === "string"
@@ -189,6 +210,7 @@ function isRpcCommand(value: unknown): value is SessionCommandDto {
 // ============================================================================
 
 export interface SessionReplayCursorDto {
+	serverEpoch: string;
 	generation: number;
 	seq: number;
 }
@@ -217,10 +239,11 @@ function isGeneration(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
-function isReplayCursor(value: unknown): value is SessionReplayCursorDto {
+export function isSessionReplayCursorDto(value: unknown): value is SessionReplayCursorDto {
 	return (
 		isRecord(value) &&
-		hasOnlyKeys(value, ["generation", "seq"]) &&
+		hasOnlyKeys(value, ["serverEpoch", "generation", "seq"]) &&
+		isString(value.serverEpoch, 128) &&
 		isGeneration(value.generation) &&
 		isGeneration(value.seq)
 	);
@@ -249,7 +272,7 @@ export function isSessionWsClientMessage(value: unknown): value is SessionWsClie
 		case "session_subscribe":
 			return (
 				hasOnlyKeys(value, ["type", "sessionHandle", "cursor"]) &&
-				(value.cursor === undefined || isReplayCursor(value.cursor))
+				(value.cursor === undefined || isSessionReplayCursorDto(value.cursor))
 			);
 		case "session_unsubscribe":
 		case "session_claim":
@@ -330,13 +353,17 @@ export function isReadOnlyRpcCommand(command: Pick<SessionCommandDto, "type"> | 
 
 export type SessionRuntimeStateDto = "starting" | "idle" | "running" | "waiting_ui" | "crashed" | "dormant";
 
-export interface SessionRuntimeDto {
+export interface SessionRuntimeIdentityDto {
+	serverEpoch: string;
 	sessionHandle: string;
 	workspaceId: string;
+	generation: number;
+}
+
+export interface SessionRuntimeDto extends SessionRuntimeIdentityDto {
 	nativeSessionId: string;
 	sessionFile: string | null;
 	cwd: string;
-	generation: number;
 	lastSeq: number;
 	state: SessionRuntimeStateDto;
 	lastActivityAt: number;
@@ -344,68 +371,123 @@ export interface SessionRuntimeDto {
 	error?: string;
 }
 
-interface SessionServerEnvelopeBase {
-	sessionHandle: string;
-	workspaceId: string;
-	generation: number;
+export interface SessionSequencedEnvelopeDto extends SessionRuntimeIdentityDto {
 	seq: number;
 }
 
 export type SessionReplayFrameDto =
-	| (SessionServerEnvelopeBase & { type: "event"; event: PiWebSessionEvent })
-	| (SessionServerEnvelopeBase & {
+	| (SessionSequencedEnvelopeDto & { type: "event"; event: PiWebSessionEvent })
+	| (SessionSequencedEnvelopeDto & {
 			type: "extension_ui_request";
 			request: ExtensionUiRequestDto;
 	  })
-	| (SessionServerEnvelopeBase & {
+	| (SessionSequencedEnvelopeDto & {
 			type: "extension_ui_closed";
 			requestId: string;
 			reason: "answered" | "cancelled" | "expired" | "process_lost" | "replaced";
 	  });
 
+export type SessionProjectionEventDto = Extract<SessionReplayFrameDto, { type: "event" }>;
+
+export type BlockingExtensionUiRequestDto = Extract<
+	ExtensionUiRequestDto,
+	{ method: "select" | "confirm" | "input" | "editor" }
+>;
+
+export type StickyExtensionUiRequestDto = Extract<
+	ExtensionUiRequestDto,
+	{ method: "setStatus" | "setWidget" | "setTitle" | "set_editor_text" }
+>;
+
+/**
+ * One bounded, atomic live projection at `asOfSeq`.
+ *
+ * Controller lease/fencing state is connection-local and notifications are
+ * ephemeral, so neither is part of this Session snapshot.
+ */
+export interface SessionSnapshotDto extends SessionRuntimeIdentityDto {
+	type: "session_snapshot";
+	snapshotId: string;
+	baseSeq: number;
+	asOfSeq: number;
+	runtime: SessionRuntimeDto;
+	settledMessages: SessionMessageDto[];
+	projectionEvents: SessionProjectionEventDto[];
+	queue: {
+		steering: string[];
+		followUp: string[];
+	};
+	pendingExtensionRequests: BlockingExtensionUiRequestDto[];
+	stickyExtensionState: StickyExtensionUiRequestDto[];
+}
+
+export interface SessionResponseFrameDto {
+	type: "response";
+	serverEpoch: string;
+	sessionHandle: string;
+	generation: number;
+	barrierSeq: number;
+	response: SessionCommandResponseDto;
+	previousSessionHandle?: string;
+}
+
+export interface SessionLeaseStatusDto {
+	type: "lease_status";
+	serverEpoch: string;
+	sessionHandle: string;
+	generation: number;
+	isController: boolean;
+	fencingToken?: string;
+}
+
+export type SessionResyncReasonDto =
+	| "initial"
+	| "epoch_changed"
+	| "generation_changed"
+	| "gap"
+	| "invalid_cursor";
+
+export interface SessionResyncRequiredDto {
+	type: "resync_required";
+	serverEpoch: string;
+	sessionHandle: string;
+	runtime: SessionRuntimeDto;
+	reason: SessionResyncReasonDto;
+}
+
+export interface SessionRekeyedDto {
+	type: "session_rekeyed";
+	serverEpoch: string;
+	previousSessionHandle: string;
+	runtime: SessionRuntimeDto;
+}
+
 export type SessionWsServerMessage =
-	| {
-			type: "response";
-			sessionHandle: string;
-			generation: number;
-			barrierSeq: number;
-			response: SessionCommandResponseDto;
-			previousSessionHandle?: string;
-	  }
+	| SessionResponseFrameDto
 	| SessionReplayFrameDto
 	| { type: "runtime_state"; runtime: SessionRuntimeDto }
-	| {
-			type: "lease_status";
-			sessionHandle: string;
-			isController: boolean;
-			fencingToken?: string;
-	  }
-	| {
-			type: "resync_required";
-			sessionHandle: string;
-			runtime: SessionRuntimeDto;
-			reason: "initial" | "generation_changed" | "gap" | "invalid_cursor";
-	  }
+	| SessionLeaseStatusDto
+	| SessionResyncRequiredDto
+	| SessionSnapshotDto
 	| {
 			type: "extension_ui_snapshot";
+			serverEpoch: string;
 			sessionHandle: string;
 			generation: number;
 			requests: ExtensionUiRequestDto[];
 	  }
 	| {
 			type: "extension_ui_result";
+			serverEpoch: string;
 			sessionHandle: string;
 			generation: number;
 			requestId: string;
 			outcome: "accepted" | "no_dialog" | "not_running";
 	  }
-	| {
-			type: "session_rekeyed";
-			previousSessionHandle: string;
-			runtime: SessionRuntimeDto;
-	  }
+	| SessionRekeyedDto
 	| {
 			type: "session_error";
+			serverEpoch: string;
 			sessionHandle: string;
 			operation: "subscribe" | "claim" | "release" | "extension_ui_response";
 			error: string;
@@ -413,26 +495,52 @@ export type SessionWsServerMessage =
 	| { type: "session_directory_changed"; workspaceId: string }
 	| { type: "auth_changed"; workspaceId?: string };
 
-function isSessionRuntimeDto(value: unknown): value is SessionRuntimeDto {
+export function isSessionRuntimeIdentityDto(value: unknown): value is SessionRuntimeIdentityDto {
+	return (
+		isRecord(value) &&
+		hasOnlyKeys(value, ["serverEpoch", "sessionHandle", "workspaceId", "generation"]) &&
+		isString(value.serverEpoch, 128) &&
+		isString(value.sessionHandle) &&
+		isString(value.workspaceId) &&
+		isGeneration(value.generation)
+	);
+}
+
+export function isSessionRuntimeDto(value: unknown): value is SessionRuntimeDto {
 	if (!isRecord(value)) return false;
 	return (
+		hasOnlyKeys(value, [
+			"serverEpoch",
+			"sessionHandle",
+			"workspaceId",
+			"nativeSessionId",
+			"sessionFile",
+			"cwd",
+			"generation",
+			"lastSeq",
+			"state",
+			"lastActivityAt",
+			"recoverable",
+			"error",
+		]) &&
+		isString(value.serverEpoch, 128) &&
 		isString(value.sessionHandle) &&
 		isString(value.workspaceId) &&
 		isString(value.nativeSessionId) &&
-		(value.sessionFile === null || typeof value.sessionFile === "string") &&
+		(value.sessionFile === null || isString(value.sessionFile, MAX_PATH_LENGTH)) &&
 		isString(value.cwd, MAX_PATH_LENGTH) &&
 		isGeneration(value.generation) &&
 		isGeneration(value.lastSeq) &&
 		["starting", "idle", "running", "waiting_ui", "crashed", "dormant"].includes(String(value.state)) &&
-		typeof value.lastActivityAt === "number" &&
-		Number.isFinite(value.lastActivityAt) &&
+		isGeneration(value.lastActivityAt) &&
 		typeof value.recoverable === "boolean" &&
-		(value.error === undefined || typeof value.error === "string")
+		(value.error === undefined || isBoundedString(value.error, SESSION_TEXT_MAX_BYTES))
 	);
 }
 
 function hasSessionEnvelope(value: UnknownRecord): boolean {
 	return (
+		isString(value.serverEpoch, 128) &&
 		isString(value.sessionHandle) &&
 		isString(value.workspaceId) &&
 		isGeneration(value.generation) &&
@@ -440,30 +548,272 @@ function hasSessionEnvelope(value: UnknownRecord): boolean {
 	);
 }
 
+function isSameRuntimeIncarnation(
+	left: Pick<SessionRuntimeIdentityDto, "serverEpoch" | "sessionHandle" | "workspaceId" | "generation">,
+	right: Pick<SessionRuntimeIdentityDto, "serverEpoch" | "sessionHandle" | "workspaceId" | "generation">,
+): boolean {
+	return (
+		left.serverEpoch === right.serverEpoch &&
+		left.sessionHandle === right.sessionHandle &&
+		left.workspaceId === right.workspaceId &&
+		left.generation === right.generation
+	);
+}
+
+function canonicalJsonChildren(value: object): unknown[] | null {
+	if (Array.isArray(value)) {
+		if (Object.getPrototypeOf(value) !== Array.prototype) return null;
+		const children: unknown[] = [];
+		let indexedItems = 0;
+		for (const key of Reflect.ownKeys(value)) {
+			if (typeof key !== "string") return null;
+			const descriptor = Object.getOwnPropertyDescriptor(value, key);
+			if (descriptor === undefined) return null;
+			if (!("value" in descriptor)) return null;
+			if (key === "length") {
+				if (descriptor.enumerable) return null;
+				continue;
+			}
+			const index = Number(key);
+			if (
+				!descriptor.enumerable ||
+				!Number.isSafeInteger(index) ||
+				index < 0 ||
+				index >= value.length ||
+				String(index) !== key
+			) {
+				return null;
+			}
+			indexedItems += 1;
+			children.push(descriptor.value);
+		}
+		return indexedItems === value.length ? children : null;
+	}
+
+	const prototype = Object.getPrototypeOf(value);
+	if (prototype !== Object.prototype && prototype !== null) return null;
+	const children: unknown[] = [];
+	for (const key of Reflect.ownKeys(value)) {
+		if (typeof key !== "string") return null;
+		const descriptor = Object.getOwnPropertyDescriptor(value, key);
+		if (descriptor === undefined) return null;
+		if (!descriptor.enumerable || !("value" in descriptor)) return null;
+		children.push(descriptor.value);
+	}
+	return children;
+}
+
+function boundedCanonicalSnapshotJson(value: unknown): string | null {
+	const stack: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
+	const seen = new Set<object>();
+	let items = 0;
+	let stringBytes = 0;
+	while (stack.length > 0) {
+		const current = stack.pop();
+		if (!current || current.depth > SESSION_SNAPSHOT_MAX_DEPTH || ++items > SESSION_SNAPSHOT_MAX_ITEMS) {
+			return null;
+		}
+		const candidate = current.value;
+		if (candidate === null || typeof candidate === "boolean") continue;
+		if (typeof candidate === "number") {
+			if (!Number.isFinite(candidate) || Math.abs(candidate) > Number.MAX_SAFE_INTEGER) return null;
+			continue;
+		}
+		if (typeof candidate === "string") {
+			stringBytes += UTF8_ENCODER.encode(candidate).byteLength;
+			if (stringBytes > SESSION_SNAPSHOT_MAX_BYTES) return null;
+			continue;
+		}
+		if (typeof candidate !== "object" || seen.has(candidate)) return null;
+		seen.add(candidate);
+		const children = canonicalJsonChildren(candidate);
+		if (children === null) return null;
+		for (const child of children) stack.push({ value: child, depth: current.depth + 1 });
+	}
+	try {
+		const serialized = JSON.stringify(value);
+		if (typeof serialized !== "string") return null;
+		return UTF8_ENCODER.encode(serialized).byteLength <= SESSION_SNAPSHOT_MAX_BYTES ? serialized : null;
+	} catch {
+		return null;
+	}
+}
+
+function isProjectionEventDto(value: unknown): value is SessionProjectionEventDto {
+	return (
+		isRecord(value) &&
+		hasOnlyKeys(value, [
+			"type",
+			"serverEpoch",
+			"sessionHandle",
+			"workspaceId",
+			"generation",
+			"seq",
+			"event",
+		]) &&
+		value.type === "event" &&
+		hasSessionEnvelope(value) &&
+		isProductSessionEventDto(value.event)
+	);
+}
+
+function isBlockingExtensionRequest(value: unknown): value is BlockingExtensionUiRequestDto {
+	return isExtensionUiRequestDto(value) && ["select", "confirm", "input", "editor"].includes(value.method);
+}
+
+function isStickyExtensionRequest(value: unknown): value is StickyExtensionUiRequestDto {
+	return (
+		isExtensionUiRequestDto(value) &&
+		["setStatus", "setWidget", "setTitle", "set_editor_text"].includes(value.method)
+	);
+}
+
+function isCanonicalSessionSnapshotDto(value: unknown): value is SessionSnapshotDto {
+	if (
+		!isRecord(value) ||
+		!hasOnlyKeys(value, [
+			"type",
+			"snapshotId",
+			"serverEpoch",
+			"sessionHandle",
+			"workspaceId",
+			"generation",
+			"baseSeq",
+			"asOfSeq",
+			"runtime",
+			"settledMessages",
+			"projectionEvents",
+			"queue",
+			"pendingExtensionRequests",
+			"stickyExtensionState",
+		]) ||
+		value.type !== "session_snapshot" ||
+		!isString(value.snapshotId) ||
+		!isString(value.serverEpoch, 128) ||
+		!isString(value.sessionHandle) ||
+		!isString(value.workspaceId) ||
+		!isGeneration(value.generation) ||
+		!isGeneration(value.baseSeq) ||
+		!isGeneration(value.asOfSeq) ||
+		value.baseSeq > value.asOfSeq ||
+		!isSessionRuntimeDto(value.runtime) ||
+		!isSameRuntimeIncarnation(value as unknown as SessionRuntimeIdentityDto, value.runtime) ||
+		value.runtime.lastSeq !== value.asOfSeq ||
+		!Array.isArray(value.settledMessages) ||
+		value.settledMessages.length > SESSION_SNAPSHOT_MAX_MESSAGES ||
+		!value.settledMessages.every(isSessionMessageDto) ||
+		!Array.isArray(value.projectionEvents) ||
+		value.projectionEvents.length > SESSION_SNAPSHOT_MAX_PROJECTION_EVENTS ||
+		!isRecord(value.queue) ||
+		!hasOnlyKeys(value.queue, ["steering", "followUp"]) ||
+		!Array.isArray(value.queue.steering) ||
+		value.queue.steering.length > SESSION_SNAPSHOT_MAX_QUEUE_ITEMS ||
+		!value.queue.steering.every((item) => isBoundedString(item, SESSION_TEXT_MAX_BYTES)) ||
+		!Array.isArray(value.queue.followUp) ||
+		value.queue.followUp.length > SESSION_SNAPSHOT_MAX_QUEUE_ITEMS ||
+		!value.queue.followUp.every((item) => isBoundedString(item, SESSION_TEXT_MAX_BYTES)) ||
+		!Array.isArray(value.pendingExtensionRequests) ||
+		value.pendingExtensionRequests.length > SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS ||
+		!value.pendingExtensionRequests.every(isBlockingExtensionRequest) ||
+		!Array.isArray(value.stickyExtensionState) ||
+		value.stickyExtensionState.length > SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS ||
+		!value.stickyExtensionState.every(isStickyExtensionRequest)
+	) {
+		return false;
+	}
+
+	let previousSeq = value.baseSeq;
+	for (const event of value.projectionEvents) {
+		if (
+			!isProjectionEventDto(event) ||
+			!isSameRuntimeIncarnation(value as unknown as SessionRuntimeIdentityDto, event) ||
+			event.seq <= previousSeq ||
+			event.seq > value.asOfSeq
+		) {
+			return false;
+		}
+		previousSeq = event.seq;
+	}
+	return true;
+}
+
+export function isSessionSnapshotDto(value: unknown): value is SessionSnapshotDto {
+	const serialized = boundedCanonicalSnapshotJson(value);
+	if (serialized === null) return false;
+	try {
+		return isCanonicalSessionSnapshotDto(JSON.parse(serialized));
+	} catch {
+		return false;
+	}
+}
+
 /** Validate gateway-to-browser Session frames before they enter UI state. */
 export function isSessionWsServerMessage(value: unknown): value is SessionWsServerMessage {
 	if (!isRecord(value) || !isString(value.type, 64)) return false;
+	if (value.type === "session_snapshot") return isSessionSnapshotDto(value);
+	if (sessionWsServerMessageBytes(value) > SESSION_WS_SERVER_MAX_BYTES) return false;
 	switch (value.type) {
 		case "runtime_state":
-			return isSessionRuntimeDto(value.runtime);
+			return hasOnlyKeys(value, ["type", "runtime"]) && isSessionRuntimeDto(value.runtime);
 		case "session_rekeyed":
-			return isString(value.previousSessionHandle) && isSessionRuntimeDto(value.runtime);
+			return (
+				hasOnlyKeys(value, ["type", "serverEpoch", "previousSessionHandle", "runtime"]) &&
+				isString(value.serverEpoch, 128) &&
+				isString(value.previousSessionHandle) &&
+				isSessionRuntimeDto(value.runtime) &&
+				value.serverEpoch === value.runtime.serverEpoch
+			);
 		case "session_directory_changed":
-			return isString(value.workspaceId);
+			return hasOnlyKeys(value, ["type", "workspaceId"]) && isString(value.workspaceId);
 		case "auth_changed":
-			return value.workspaceId === undefined || isString(value.workspaceId);
+			return (
+				hasOnlyKeys(value, ["type", "workspaceId"]) &&
+				(value.workspaceId === undefined || isString(value.workspaceId))
+			);
 		case "event":
-			return hasSessionEnvelope(value) && isProductSessionEventDto(value.event);
+			return isProjectionEventDto(value);
 		case "extension_ui_request":
-			return hasSessionEnvelope(value) && isExtensionUiRequestDto(value.request);
+			return (
+				hasOnlyKeys(value, [
+					"type",
+					"serverEpoch",
+					"sessionHandle",
+					"workspaceId",
+					"generation",
+					"seq",
+					"request",
+				]) &&
+				hasSessionEnvelope(value) &&
+				isExtensionUiRequestDto(value.request)
+			);
 		case "extension_ui_closed":
 			return (
+				hasOnlyKeys(value, [
+					"type",
+					"serverEpoch",
+					"sessionHandle",
+					"workspaceId",
+					"generation",
+					"seq",
+					"requestId",
+					"reason",
+				]) &&
 				hasSessionEnvelope(value) &&
 				isString(value.requestId) &&
 				["answered", "cancelled", "expired", "process_lost", "replaced"].includes(String(value.reason))
 			);
 		case "response":
 			return (
+				hasOnlyKeys(value, [
+					"type",
+					"serverEpoch",
+					"sessionHandle",
+					"generation",
+					"barrierSeq",
+					"response",
+					"previousSessionHandle",
+				]) &&
+				isString(value.serverEpoch, 128) &&
 				isString(value.sessionHandle) &&
 				isGeneration(value.generation) &&
 				isGeneration(value.barrierSeq) &&
@@ -471,25 +821,46 @@ export function isSessionWsServerMessage(value: unknown): value is SessionWsServ
 			);
 		case "lease_status":
 			return (
+				hasOnlyKeys(value, [
+					"type",
+					"serverEpoch",
+					"sessionHandle",
+					"generation",
+					"isController",
+					"fencingToken",
+				]) &&
+				isString(value.serverEpoch, 128) &&
 				isString(value.sessionHandle) &&
+				isGeneration(value.generation) &&
 				typeof value.isController === "boolean" &&
 				(value.fencingToken === undefined || isString(value.fencingToken))
 			);
 		case "resync_required":
 			return (
+				hasOnlyKeys(value, ["type", "serverEpoch", "sessionHandle", "runtime", "reason"]) &&
+				isString(value.serverEpoch, 128) &&
 				isString(value.sessionHandle) &&
 				isSessionRuntimeDto(value.runtime) &&
-				["initial", "generation_changed", "gap", "invalid_cursor"].includes(String(value.reason))
+				value.serverEpoch === value.runtime.serverEpoch &&
+				value.sessionHandle === value.runtime.sessionHandle &&
+				["initial", "epoch_changed", "generation_changed", "gap", "invalid_cursor"].includes(
+					String(value.reason),
+				)
 			);
 		case "extension_ui_snapshot":
 			return (
+				hasOnlyKeys(value, ["type", "serverEpoch", "sessionHandle", "generation", "requests"]) &&
+				isString(value.serverEpoch, 128) &&
 				isString(value.sessionHandle) &&
 				isGeneration(value.generation) &&
 				Array.isArray(value.requests) &&
+				value.requests.length <= SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS &&
 				value.requests.every(isExtensionUiRequestDto)
 			);
 		case "extension_ui_result":
 			return (
+				hasOnlyKeys(value, ["type", "serverEpoch", "sessionHandle", "generation", "requestId", "outcome"]) &&
+				isString(value.serverEpoch, 128) &&
 				isString(value.sessionHandle) &&
 				isGeneration(value.generation) &&
 				isString(value.requestId) &&
@@ -497,9 +868,11 @@ export function isSessionWsServerMessage(value: unknown): value is SessionWsServ
 			);
 		case "session_error":
 			return (
+				hasOnlyKeys(value, ["type", "serverEpoch", "sessionHandle", "operation", "error"]) &&
+				isString(value.serverEpoch, 128) &&
 				isString(value.sessionHandle) &&
 				["subscribe", "claim", "release", "extension_ui_response"].includes(String(value.operation)) &&
-				typeof value.error === "string"
+				isBoundedString(value.error, SESSION_TEXT_MAX_BYTES)
 			);
 		default:
 			return false;

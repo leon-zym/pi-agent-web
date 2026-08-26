@@ -78,7 +78,7 @@ describe("Session runtime browser frame guard", () => {
 			isSessionWsClientMessage({
 				type: "session_subscribe",
 				sessionHandle: "session_native-a",
-				cursor: { generation: 4, seq: 18 },
+				cursor: { serverEpoch: "gateway-epoch-a", generation: 4, seq: 18 },
 			}),
 		).toBe(true);
 		expect(
@@ -209,6 +209,7 @@ describe("Session runtime browser frame guard", () => {
 
 	it("accepts valid Session server frames and rejects malformed runtime envelopes", () => {
 		const runtime = {
+			serverEpoch: "gateway-epoch-a",
 			sessionHandle: "session-native",
 			workspaceId: "workspace-native",
 			nativeSessionId: "native-id",
@@ -224,6 +225,7 @@ describe("Session runtime browser frame guard", () => {
 		expect(
 			isSessionWsServerMessage({
 				type: "extension_ui_snapshot",
+				serverEpoch: runtime.serverEpoch,
 				sessionHandle: runtime.sessionHandle,
 				generation: runtime.generation,
 				requests: [
@@ -240,6 +242,7 @@ describe("Session runtime browser frame guard", () => {
 		expect(
 			isSessionWsServerMessage({
 				type: "extension_ui_result",
+				serverEpoch: runtime.serverEpoch,
 				sessionHandle: runtime.sessionHandle,
 				generation: runtime.generation,
 				requestId: "dialog-1",
@@ -252,6 +255,7 @@ describe("Session runtime browser frame guard", () => {
 		expect(
 			isSessionWsServerMessage({
 				type: "event",
+				serverEpoch: runtime.serverEpoch,
 				sessionHandle: runtime.sessionHandle,
 				workspaceId: runtime.workspaceId,
 				generation: runtime.generation,
