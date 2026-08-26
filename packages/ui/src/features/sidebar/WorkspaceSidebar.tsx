@@ -58,7 +58,11 @@ import { useTheme } from "../../lib/use-theme";
 import { cn } from "../../lib/utils";
 import { useComposerStore } from "../../stores/composer";
 import { useProjectionStore } from "../../stores/projection";
-import { selectCurrentWorkspaceSessions, useSessionDirectoryStore } from "../../stores/session-directory";
+import {
+	selectCurrentWorkspaceSessions,
+	selectVisibleSessionsByWorkspace,
+	useSessionDirectoryStore,
+} from "../../stores/session-directory";
 import { useSessionTransportStore } from "../../stores/session-transport";
 
 type SessionStatus = SessionRuntimeStateDto | "error";
@@ -294,6 +298,7 @@ function SessionRow({ session, current, comfortable = false, onSelect }: Session
 interface WorkspaceGroupProps {
 	workspace: NativeWorkspaceDto;
 	sessions: NativeSessionDto[];
+	sessionCount: number;
 	defaultExpanded: boolean;
 	comfortable?: boolean;
 	onSessionSelect?: () => void;
@@ -302,6 +307,7 @@ interface WorkspaceGroupProps {
 function WorkspaceGroup({
 	workspace,
 	sessions,
+	sessionCount,
 	defaultExpanded,
 	comfortable = false,
 	onSessionSelect,
@@ -379,9 +385,7 @@ function WorkspaceGroup({
 					>
 						{displayLabel(workspace.displayName)}
 					</span>
-					<span className="shrink-0 font-mono text-[11px] text-ink-3 tabular-nums">
-						{workspace.sessionCount}
-					</span>
+					<span className="shrink-0 font-mono text-[11px] text-ink-3 tabular-nums">{sessionCount}</span>
 				</button>
 				<div
 					className={cn(
@@ -579,7 +583,9 @@ export function WorkspaceSidebar({
 }: WorkspaceSidebarProps) {
 	const workspaces = useSessionDirectoryStore((s) => s.workspaces);
 	const sessions = useSessionDirectoryStore(selectCurrentWorkspaceSessions);
-	const sessionsByWorkspace = useSessionDirectoryStore((s) => s.sessionsByWorkspace);
+	const sessionsByWorkspace = useSessionDirectoryStore(selectVisibleSessionsByWorkspace);
+	const durableSessionsByWorkspace = useSessionDirectoryStore((s) => s.sessionsByWorkspace);
+	const hotSessionsByWorkspace = useSessionDirectoryStore((s) => s.hotSessionsByWorkspace);
 	const currentWorkspaceHandle = useSessionDirectoryStore((s) => s.currentWorkspaceHandle);
 	const currentSession = useSessionDirectoryStore((s) => s.currentSession);
 	const searchQuery = useSessionDirectoryStore((s) => s.searchQuery);
@@ -784,16 +790,28 @@ export function WorkspaceSidebar({
 					</div>
 				) : (
 					<div className="flex flex-col gap-0.5">
-						{workspaces.map((workspace) => (
-							<WorkspaceGroup
-								key={workspace.workspaceHandle}
-								workspace={workspace}
-								sessions={sessionsByWorkspace[workspace.workspaceHandle] ?? []}
-								defaultExpanded={workspace.workspaceHandle === currentWorkspaceHandle}
-								comfortable={Boolean(onRequestClose)}
-								onSessionSelect={onSessionSelect}
-							/>
-						))}
+						{workspaces.map((workspace) => {
+							const workspaceSessions = sessionsByWorkspace[workspace.workspaceHandle] ?? [];
+							const catalogLoaded = Object.hasOwn(durableSessionsByWorkspace, workspace.workspaceHandle);
+							const unpersistedHotCount = new Set(
+								(hotSessionsByWorkspace[workspace.workspaceHandle] ?? [])
+									.filter((session) => !session.persisted)
+									.map((session) => session.sessionHandle),
+							).size;
+							return (
+								<WorkspaceGroup
+									key={workspace.workspaceHandle}
+									workspace={workspace}
+									sessions={workspaceSessions}
+									sessionCount={
+										catalogLoaded ? workspaceSessions.length : workspace.sessionCount + unpersistedHotCount
+									}
+									defaultExpanded={workspace.workspaceHandle === currentWorkspaceHandle}
+									comfortable={Boolean(onRequestClose)}
+									onSessionSelect={onSessionSelect}
+								/>
+							);
+						})}
 					</div>
 				)}
 			</div>
