@@ -18,12 +18,20 @@ import { hasFreshLeaseBaseline, sessionTransport } from "./session-transport";
 import { useSlashCommandsStore } from "./slash-commands";
 import { useViewStore } from "./view";
 
-interface SessionDirectoryState {
+export type HotSessionPersistenceFact =
+	| { status: "unknown"; source: "inventory" }
+	| { status: "persisted"; source: "catalog" | "runtime" }
+	| { status: "unpersisted"; source: "runtime" };
+
+export type HotTransientResumeStatus = "ready" | "pending" | "none";
+
+export interface SessionDirectoryState {
 	workspaces: NativeWorkspaceDto[];
 	currentWorkspaceHandle: string | null;
 	sessionsByWorkspace: Record<string, NativeSessionDto[]>;
 	hotSessionsByWorkspace: Record<string, NativeSessionDto[]>;
 	hotRuntimeStateBySession: Record<string, HotRuntimeStateDto>;
+	hotRuntimeIdentityBySession: Record<string, HotRuntimeInventoryEntryDto>;
 	currentSession: NativeSessionDto | null;
 	retainedTransientByWorkspace: Record<string, NativeSessionDto>;
 	locallyCreatedTransientSessions: Record<string, true>;
@@ -42,6 +50,7 @@ interface SessionDirectoryState {
 	reloadSessions: (workspaceHandle?: string, options?: { force?: boolean }) => Promise<NativeSessionDto[]>;
 	selectSession: (session: NativeSessionDto | null) => void;
 	resumeTransientSession: (workspaceHandle: string) => boolean;
+	hotTransientResumeStatus: (workspaceHandle: string) => HotTransientResumeStatus;
 	beginSessionCreation: (workspaceHandle: string) => number;
 	completeSessionCreation: (token: number, session: NativeSessionDto) => boolean;
 	failSessionCreation: (token: number) => boolean;
@@ -135,6 +144,52 @@ function hotRuntimeState(runtime: SessionRuntimeDto): HotRuntimeStateDto | undef
 		runtime.state === "waiting_ui"
 		? runtime.state
 		: undefined;
+}
+
+function runtimeMatchesHotIdentity(
+	runtime: SessionRuntimeDto,
+	identity: HotRuntimeInventoryEntryDto,
+): boolean {
+	return (
+		runtime.serverEpoch === identity.serverEpoch &&
+		runtime.workspaceId === identity.workspaceId &&
+		runtime.sessionHandle === identity.sessionHandle &&
+		runtime.generation === identity.generation
+	);
+}
+
+export function resolveHotSessionPersistence(
+	session: NativeSessionDto,
+	identity: HotRuntimeInventoryEntryDto | undefined,
+	durableSessions: NativeSessionDto[] | undefined,
+): HotSessionPersistenceFact {
+	if (durableSessions?.some((durable) => durable.sessionHandle === session.sessionHandle)) {
+		return { status: "persisted", source: "catalog" };
+	}
+	if (session.runtime && (!identity || runtimeMatchesHotIdentity(session.runtime, identity))) {
+		return {
+			status: session.runtime.recoverable ? "persisted" : "unpersisted",
+			source: "runtime",
+		};
+	}
+	return { status: "unknown", source: "inventory" };
+}
+
+function hotTransientResumeStatus(
+	state: SessionDirectoryState,
+	workspaceHandle: string,
+): HotTransientResumeStatus {
+	let pending = false;
+	for (const session of state.hotSessionsByWorkspace[workspaceHandle] ?? []) {
+		const fact = resolveHotSessionPersistence(
+			session,
+			state.hotRuntimeIdentityBySession[session.sessionHandle],
+			state.sessionsByWorkspace[workspaceHandle],
+		);
+		if (fact.status === "unpersisted") return "ready";
+		if (fact.status === "unknown") pending = true;
+	}
+	return pending ? "pending" : "none";
 }
 
 function mergeVisibleSessions(durable: NativeSessionDto[], hot: NativeSessionDto[]): NativeSessionDto[] {
@@ -427,6 +482,7 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 	sessionsByWorkspace: {},
 	hotSessionsByWorkspace: {},
 	hotRuntimeStateBySession: {},
+	hotRuntimeIdentityBySession: {},
 	currentSession: null,
 	retainedTransientByWorkspace: {},
 	locallyCreatedTransientSessions: {},
@@ -528,7 +584,9 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 		const locallyCreatedTransientSessions = { ...get().locallyCreatedTransientSessions };
 		for (const session of hotSessions) delete locallyCreatedTransientSessions[session.sessionHandle];
 		const hotRuntimeStateBySession = { ...get().hotRuntimeStateBySession };
+		const hotRuntimeIdentityBySession = { ...get().hotRuntimeIdentityBySession };
 		for (const session of hotSessions) delete hotRuntimeStateBySession[session.sessionHandle];
+		for (const session of hotSessions) delete hotRuntimeIdentityBySession[session.sessionHandle];
 		if (get().currentWorkspaceHandle === workspaceHandle) {
 			set({
 				currentWorkspaceHandle: null,
@@ -539,6 +597,7 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 				retainedTransientByWorkspace,
 				hotSessionsByWorkspace,
 				hotRuntimeStateBySession,
+				hotRuntimeIdentityBySession,
 				locallyCreatedTransientSessions,
 			});
 			activateSessionView(null);
@@ -550,6 +609,7 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 				retainedTransientByWorkspace,
 				hotSessionsByWorkspace,
 				hotRuntimeStateBySession,
+				hotRuntimeIdentityBySession,
 				locallyCreatedTransientSessions,
 			});
 		}
@@ -703,31 +763,34 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 
 	resumeTransientSession: (workspaceHandle) => {
 		const state = get();
+		const isExplicitlyUnpersisted = (session: NativeSessionDto) =>
+			resolveHotSessionPersistence(
+				session,
+				state.hotRuntimeIdentityBySession[session.sessionHandle],
+				state.sessionsByWorkspace[workspaceHandle],
+			).status === "unpersisted";
 		const current = state.currentSession;
 		if (
 			current?.workspaceHandle === workspaceHandle &&
-			!current.persisted &&
+			isExplicitlyUnpersisted(current) &&
 			hasLocalTransientContent(current.sessionHandle)
 		) {
 			return true;
 		}
 		const retained = state.retainedTransientByWorkspace[workspaceHandle];
-		if (retained) {
+		if (retained && isExplicitlyUnpersisted(retained)) {
 			get().selectSession(retained);
 			return true;
 		}
-		const durableSessions = state.sessionsByWorkspace[workspaceHandle];
-		const recovered = state.hotSessionsByWorkspace[workspaceHandle]?.find(
-			(session) =>
-				!session.persisted &&
-				(session.runtime?.recoverable === false ||
-					(durableSessions !== undefined &&
-						!durableSessions.some((durable) => durable.sessionHandle === session.sessionHandle))),
+		const recovered = state.hotSessionsByWorkspace[workspaceHandle]?.find((session) =>
+			isExplicitlyUnpersisted(session),
 		);
 		if (!recovered) return false;
 		get().selectSession(recovered);
 		return true;
 	},
+
+	hotTransientResumeStatus: (workspaceHandle) => hotTransientResumeStatus(get(), workspaceHandle),
 
 	beginSessionCreation: (workspaceHandle) => {
 		const token = nextNavigationToken();
@@ -800,6 +863,8 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 	},
 
 	applyRuntime: (runtime) => {
+		const hotIdentity = get().hotRuntimeIdentityBySession[runtime.sessionHandle];
+		if (hotIdentity && !runtimeMatchesHotIdentity(runtime, hotIdentity)) return;
 		if (runtime.recoverable && get().locallyCreatedTransientSessions[runtime.sessionHandle]) {
 			const locallyCreatedTransientSessions = { ...get().locallyCreatedTransientSessions };
 			delete locallyCreatedTransientSessions[runtime.sessionHandle];
@@ -865,8 +930,10 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 		const current = get();
 		const next: Record<string, NativeSessionDto[]> = {};
 		const hotRuntimeStateBySession: Record<string, HotRuntimeStateDto> = {};
+		const hotRuntimeIdentityBySession: Record<string, HotRuntimeInventoryEntryDto> = {};
 		for (const runtime of inventory.runtimes) {
 			hotRuntimeStateBySession[runtime.sessionHandle] = runtime.state;
+			hotRuntimeIdentityBySession[runtime.sessionHandle] = { ...runtime };
 			const durable = current.sessionsByWorkspace[runtime.workspaceId]?.find(
 				(session) => session.sessionHandle === runtime.sessionHandle,
 			);
@@ -875,10 +942,13 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 			);
 			const selected =
 				current.currentSession?.sessionHandle === runtime.sessionHandle ? current.currentSession : undefined;
-			const session = durable ?? selected ?? previous ?? hotSessionPlaceholder(runtime);
+			const candidate = selected ?? previous;
+			const matchingCandidate =
+				candidate?.runtime && runtimeMatchesHotIdentity(candidate.runtime, runtime) ? candidate : undefined;
+			const session = durable ?? matchingCandidate ?? hotSessionPlaceholder(runtime);
 			next[runtime.workspaceId] = [...(next[runtime.workspaceId] ?? []), session];
 		}
-		set({ hotSessionsByWorkspace: next, hotRuntimeStateBySession });
+		set({ hotSessionsByWorkspace: next, hotRuntimeStateBySession, hotRuntimeIdentityBySession });
 	},
 
 	rekeySession: (previousSessionHandle, sessionHandle, runtime) => {
@@ -928,6 +998,17 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 		delete hotRuntimeStateBySession[previousSessionHandle];
 		const rekeyedHotState = hotRuntimeState(runtime);
 		if (rekeyedHotState) hotRuntimeStateBySession[sessionHandle] = rekeyedHotState;
+		const hotRuntimeIdentityBySession = { ...get().hotRuntimeIdentityBySession };
+		delete hotRuntimeIdentityBySession[previousSessionHandle];
+		if (rekeyedHotState) {
+			hotRuntimeIdentityBySession[sessionHandle] = {
+				serverEpoch: runtime.serverEpoch,
+				sessionHandle,
+				workspaceId: runtime.workspaceId,
+				generation: runtime.generation,
+				state: rekeyedHotState,
+			};
+		}
 		set({
 			sessionsByWorkspace: { ...get().sessionsByWorkspace, [workspaceHandle]: next },
 			selectedSessionByWorkspace,
@@ -936,6 +1017,7 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 			locallyCreatedTransientSessions,
 			hotSessionsByWorkspace,
 			hotRuntimeStateBySession,
+			hotRuntimeIdentityBySession,
 			...(wasCurrent ? { currentSession: replacement } : {}),
 		});
 		if (wasCurrent) {
@@ -968,6 +1050,8 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 		}
 		const hotRuntimeStateBySession = { ...get().hotRuntimeStateBySession };
 		delete hotRuntimeStateBySession[sessionHandle];
+		const hotRuntimeIdentityBySession = { ...get().hotRuntimeIdentityBySession };
+		delete hotRuntimeIdentityBySession[sessionHandle];
 		set({
 			sessionsByWorkspace: { ...get().sessionsByWorkspace, [workspaceHandle]: sessions },
 			selectedSessionByWorkspace,
@@ -976,6 +1060,7 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 			locallyCreatedTransientSessions,
 			hotSessionsByWorkspace,
 			hotRuntimeStateBySession,
+			hotRuntimeIdentityBySession,
 			...(wasCurrent ? { currentSession: null } : {}),
 		});
 		if (wasCurrent) activateSessionView(null);

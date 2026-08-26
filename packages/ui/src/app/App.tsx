@@ -8,7 +8,7 @@ import { api } from "../lib/api";
 import { displayError } from "../lib/format";
 import { tt } from "../lib/i18n";
 import { loadDirectoryAfterStableHotInventory } from "../lib/initial-inventory-bootstrap";
-import { newSession } from "../lib/session-controller";
+import { ensureInitialSession } from "../lib/session-controller";
 import { initPipeline } from "../lib/stream-pipeline";
 import { useTheme } from "../lib/use-theme";
 import { useSessionDirectoryStore } from "../stores/session-directory";
@@ -69,7 +69,7 @@ export function App() {
 				const workspace = directory.workspaces.find(
 					(candidate) => candidate.workspaceHandle === directory.currentWorkspaceHandle,
 				);
-				if (workspace?.available) void newSession();
+				if (workspace?.available) void ensureInitialSession();
 				setBootstrapped(true);
 			})
 			.catch((error) => {

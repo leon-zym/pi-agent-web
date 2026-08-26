@@ -59,6 +59,7 @@ import { cn } from "../../lib/utils";
 import { useComposerStore } from "../../stores/composer";
 import { useProjectionStore } from "../../stores/projection";
 import {
+	resolveHotSessionPersistence,
 	selectCurrentWorkspaceSessions,
 	selectVisibleSessionsByWorkspace,
 	useSessionDirectoryStore,
@@ -586,6 +587,7 @@ export function WorkspaceSidebar({
 	const sessionsByWorkspace = useSessionDirectoryStore(selectVisibleSessionsByWorkspace);
 	const durableSessionsByWorkspace = useSessionDirectoryStore((s) => s.sessionsByWorkspace);
 	const hotSessionsByWorkspace = useSessionDirectoryStore((s) => s.hotSessionsByWorkspace);
+	const hotRuntimeIdentityBySession = useSessionDirectoryStore((s) => s.hotRuntimeIdentityBySession);
 	const currentWorkspaceHandle = useSessionDirectoryStore((s) => s.currentWorkspaceHandle);
 	const currentSession = useSessionDirectoryStore((s) => s.currentSession);
 	const searchQuery = useSessionDirectoryStore((s) => s.searchQuery);
@@ -795,7 +797,14 @@ export function WorkspaceSidebar({
 							const catalogLoaded = Object.hasOwn(durableSessionsByWorkspace, workspace.workspaceHandle);
 							const unpersistedHotCount = new Set(
 								(hotSessionsByWorkspace[workspace.workspaceHandle] ?? [])
-									.filter((session) => session.runtime?.recoverable === false)
+									.filter(
+										(session) =>
+											resolveHotSessionPersistence(
+												session,
+												hotRuntimeIdentityBySession[session.sessionHandle],
+												durableSessionsByWorkspace[workspace.workspaceHandle],
+											).status === "unpersisted",
+									)
 									.map((session) => session.sessionHandle),
 							).size;
 							return (

@@ -7,9 +7,15 @@ import type {
 } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api } from "../src/lib/api";
-import { deleteSession, newSession, openSession, renameSession } from "../src/lib/session-controller";
+import {
+	deleteSession,
+	ensureInitialSession,
+	newSession,
+	openSession,
+	renameSession,
+} from "../src/lib/session-controller";
 import { selectCurrentWorkspaceSessions, useSessionDirectoryStore } from "../src/stores/session-directory";
-import { sessionTransport } from "../src/stores/session-transport";
+import { type SessionChannelState, sessionTransport } from "../src/stores/session-transport";
 
 const originalTransport = sessionTransport.store.getState();
 const originalDirectory = useSessionDirectoryStore.getState();
@@ -40,6 +46,41 @@ function runtime(sessionHandle: string, workspaceHandle: string): SessionRuntime
 		state: "idle",
 		lastActivityAt: 1,
 		recoverable: true,
+	};
+}
+
+function manualOnlyChannel(
+	sessionHandle: string,
+	workspaceHandle: string,
+	generation = 1,
+): SessionChannelState {
+	return {
+		sessionHandle,
+		subscribed: true,
+		controllerIntent: false,
+		runtime: null,
+		generation,
+		baselineAuthoritative: false,
+		freshLeaseBaseline: null,
+		lastSeq: 0,
+		projectedSeq: 0,
+		lease: { isController: false },
+		pendingExtensionRequests: [],
+		resync: null,
+		recovery: {
+			identity: {
+				serverEpoch: "test-server-epoch",
+				workspaceId: workspaceHandle,
+				sessionHandle,
+				generation,
+			},
+			phase: "degraded",
+			attempt: 4,
+			cursorless: true,
+			retryAt: null,
+			lastError: "snapshot unavailable",
+		},
+		rawEvents: [],
 	};
 }
 
@@ -119,9 +160,29 @@ describe("Session-scoped controls", () => {
 		expect(useSessionDirectoryStore.getState().hotRuntimeStateBySession["hot-1"]).toBe("idle");
 	});
 
-	it("does not resume a catalog-proven persisted hot placeholder before its exact baseline arrives", () => {
-		const persisted = session("persisted-hot", "workspace-a");
+	it("waits for exact persistence when a materialized empty Session is filtered from the directory", async () => {
+		const persisted = {
+			...session("persisted-hot", "workspace-a"),
+			messageCount: 0,
+			firstMessage: "",
+		};
+		const created = {
+			...session("created-after-persisted", "workspace-a"),
+			sessionFile: null,
+			persisted: false,
+			messageCount: 0,
+			firstMessage: "",
+			runtime: { ...runtime("created-after-persisted", "workspace-a"), recoverable: false },
+		};
+		vi.spyOn(api, "listSessions").mockResolvedValue(nativeList([persisted]));
+		const createSession = vi.spyOn(api, "createSession").mockResolvedValue({
+			session: created,
+			runtime: created.runtime!,
+			layout: { sessionDir: "/tmp/sessions", source: "default" },
+		});
+		isolateTransportActions();
 		useSessionDirectoryStore.setState({
+			workspaces: [workspace("workspace-a")],
 			currentWorkspaceHandle: "workspace-a",
 			currentSession: null,
 			sessionsByWorkspace: {},
@@ -136,19 +197,391 @@ describe("Session-scoped controls", () => {
 					serverEpoch: "test-server-epoch",
 					sessionHandle: persisted.sessionHandle,
 					workspaceId: persisted.workspaceHandle,
+					generation: 3,
+					state: "idle",
+				},
+			],
+		});
+		await useSessionDirectoryStore.getState().reloadSessions("workspace-a");
+		expect(useSessionDirectoryStore.getState().sessionsByWorkspace["workspace-a"]).toEqual([]);
+
+		const creation = ensureInitialSession();
+		await Promise.resolve();
+
+		expect(
+			useSessionDirectoryStore.getState().hotSessionsByWorkspace["workspace-a"]?.[0]?.runtime,
+		).toBeNull();
+		expect(useSessionDirectoryStore.getState().hotTransientResumeStatus("workspace-a")).toBe("pending");
+		expect(useSessionDirectoryStore.getState().currentSession).toBeNull();
+		expect(createSession).not.toHaveBeenCalled();
+
+		useSessionDirectoryStore.getState().applyRuntime(runtime("persisted-hot", "workspace-a"));
+		await creation;
+
+		expect(createSession).toHaveBeenCalledTimes(1);
+		expect(useSessionDirectoryStore.getState().currentSession?.sessionHandle).toBe("created-after-persisted");
+	});
+
+	it("single-flights initial Session reconciliation while exact persistence is unknown", async () => {
+		const created = {
+			...session("created-after-exact", "workspace-a"),
+			sessionFile: null,
+			persisted: false,
+			runtime: { ...runtime("created-after-exact", "workspace-a"), recoverable: false },
+		};
+		const createSession = vi.spyOn(api, "createSession").mockResolvedValue({
+			session: created,
+			runtime: created.runtime!,
+			layout: { sessionDir: "/tmp/sessions", source: "default" },
+		});
+		isolateTransportActions();
+		useSessionDirectoryStore.setState({
+			workspaces: [workspace("workspace-a")],
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: null,
+			sessionsByWorkspace: { "workspace-a": [] },
+			hotSessionsByWorkspace: {},
+		});
+		useSessionDirectoryStore.getState().applyHotRuntimeInventory({
+			type: "hot_runtime_inventory",
+			serverEpoch: "test-server-epoch",
+			revision: 1,
+			runtimes: [
+				{
+					serverEpoch: "test-server-epoch",
+					sessionHandle: "unknown-hot",
+					workspaceId: "workspace-a",
 					generation: 1,
 					state: "idle",
 				},
 			],
 		});
-		// Startup loads the native catalog after the inventory while exact recovery is still serialized.
-		useSessionDirectoryStore.setState({ sessionsByWorkspace: { "workspace-a": [persisted] } });
 
-		expect(
-			useSessionDirectoryStore.getState().hotSessionsByWorkspace["workspace-a"]?.[0]?.runtime,
-		).toBeNull();
-		expect(useSessionDirectoryStore.getState().resumeTransientSession("workspace-a")).toBe(false);
-		expect(useSessionDirectoryStore.getState().currentSession).toBeNull();
+		const first = ensureInitialSession();
+		const second = ensureInitialSession();
+		expect(first).toBe(second);
+		expect(createSession).not.toHaveBeenCalled();
+
+		useSessionDirectoryStore.getState().applyRuntime({
+			...runtime("unknown-hot", "workspace-a"),
+			generation: 1,
+			recoverable: true,
+		});
+		await Promise.all([first, second]);
+
+		expect(createSession).toHaveBeenCalledTimes(1);
+	});
+
+	it("resumes once an unknown initial hot Session is exactly known to be unpersisted", async () => {
+		const createSession = vi.spyOn(api, "createSession");
+		isolateTransportActions();
+		useSessionDirectoryStore.setState({
+			workspaces: [workspace("workspace-a")],
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: null,
+			sessionsByWorkspace: { "workspace-a": [] },
+			hotSessionsByWorkspace: {},
+		});
+		useSessionDirectoryStore.getState().applyHotRuntimeInventory({
+			type: "hot_runtime_inventory",
+			serverEpoch: "test-server-epoch",
+			revision: 1,
+			runtimes: [
+				{
+					serverEpoch: "test-server-epoch",
+					sessionHandle: "unknown-recovered-hot",
+					workspaceId: "workspace-a",
+					generation: 1,
+					state: "idle",
+				},
+			],
+		});
+
+		const reconciliation = ensureInitialSession();
+		expect(createSession).not.toHaveBeenCalled();
+		useSessionDirectoryStore.getState().applyRuntime({
+			...runtime("unknown-recovered-hot", "workspace-a"),
+			generation: 1,
+			sessionFile: null,
+			recoverable: false,
+		});
+		await reconciliation;
+
+		expect(createSession).not.toHaveBeenCalled();
+		expect(useSessionDirectoryStore.getState().currentSession?.sessionHandle).toBe("unknown-recovered-hot");
+	});
+
+	it("does not block an explicit new Session on unknown hot persistence", async () => {
+		const created = {
+			...session("explicit-created", "workspace-a"),
+			sessionFile: null,
+			persisted: false,
+			runtime: { ...runtime("explicit-created", "workspace-a"), recoverable: false },
+		};
+		const createSession = vi.spyOn(api, "createSession").mockResolvedValue({
+			session: created,
+			runtime: created.runtime!,
+			layout: { sessionDir: "/tmp/sessions", source: "default" },
+		});
+		isolateTransportActions();
+		useSessionDirectoryStore.setState({
+			workspaces: [workspace("workspace-a")],
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: null,
+			sessionsByWorkspace: { "workspace-a": [] },
+			hotSessionsByWorkspace: {},
+		});
+		useSessionDirectoryStore.getState().applyHotRuntimeInventory({
+			type: "hot_runtime_inventory",
+			serverEpoch: "test-server-epoch",
+			revision: 1,
+			runtimes: [
+				{
+					serverEpoch: "test-server-epoch",
+					sessionHandle: "degraded-unknown-hot",
+					workspaceId: "workspace-a",
+					generation: 1,
+					state: "idle",
+				},
+			],
+		});
+
+		await newSession();
+
+		expect(createSession).toHaveBeenCalledTimes(1);
+		expect(useSessionDirectoryStore.getState().currentSession?.sessionHandle).toBe("explicit-created");
+	});
+
+	it("single-flights the create API across initial reconciliation and rapid explicit creation", async () => {
+		const created = {
+			...session("single-flight-created", "workspace-a"),
+			sessionFile: null,
+			persisted: false,
+			runtime: { ...runtime("single-flight-created", "workspace-a"), recoverable: false },
+		};
+		let resolveCreate: ((value: NativeSessionCreateDto) => void) | undefined;
+		const createSession = vi.spyOn(api, "createSession").mockReturnValue(
+			new Promise<NativeSessionCreateDto>((resolve) => {
+				resolveCreate = resolve;
+			}),
+		);
+		isolateTransportActions();
+		useSessionDirectoryStore.setState({
+			workspaces: [workspace("workspace-a")],
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: null,
+			sessionCreation: null,
+			sessionsByWorkspace: { "workspace-a": [] },
+			hotSessionsByWorkspace: {},
+		});
+
+		const automatic = ensureInitialSession();
+		await vi.waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+		const initialToken = useSessionDirectoryStore.getState().sessionCreation?.token;
+		const firstClick = newSession();
+		const secondClick = newSession();
+
+		expect(createSession).toHaveBeenCalledTimes(1);
+		expect(useSessionDirectoryStore.getState().sessionCreation?.token).toBe(initialToken);
+		resolveCreate?.({
+			session: created,
+			runtime: created.runtime!,
+			layout: { sessionDir: "/tmp/sessions", source: "default" },
+		});
+		await Promise.all([automatic, firstClick, secondClick]);
+
+		expect(createSession).toHaveBeenCalledTimes(1);
+		expect(useSessionDirectoryStore.getState().currentSession?.sessionHandle).toBe("single-flight-created");
+	});
+
+	it("queues a fresh creation intent after returning to a Workspace with a stale request in flight", async () => {
+		const workspaceA = workspace("workspace-a");
+		const workspaceB = workspace("workspace-b");
+		const staleCreated = {
+			...session("stale-created-a", workspaceA.workspaceHandle),
+			sessionFile: null,
+			persisted: false,
+			runtime: { ...runtime("stale-created-a", workspaceA.workspaceHandle), recoverable: false },
+		};
+		const freshCreated = {
+			...session("fresh-created-a", workspaceA.workspaceHandle),
+			sessionFile: null,
+			persisted: false,
+			runtime: { ...runtime("fresh-created-a", workspaceA.workspaceHandle), recoverable: false },
+		};
+		let resolveStale: ((value: NativeSessionCreateDto) => void) | undefined;
+		let resolveFresh: ((value: NativeSessionCreateDto) => void) | undefined;
+		const staleResponse = new Promise<NativeSessionCreateDto>((resolve) => {
+			resolveStale = resolve;
+		});
+		const freshResponse = new Promise<NativeSessionCreateDto>((resolve) => {
+			resolveFresh = resolve;
+		});
+		const createSession = vi
+			.spyOn(api, "createSession")
+			.mockReturnValueOnce(staleResponse)
+			.mockReturnValueOnce(freshResponse);
+		vi.spyOn(api, "activateWorkspace").mockImplementation(async (workspaceHandle) =>
+			workspace(workspaceHandle),
+		);
+		vi.spyOn(api, "listSessions").mockResolvedValue(nativeList([]));
+		isolateTransportActions();
+		useSessionDirectoryStore.setState({
+			workspaces: [workspaceA, workspaceB],
+			currentWorkspaceHandle: workspaceA.workspaceHandle,
+			currentSession: null,
+			sessionCreation: null,
+			sessionsByWorkspace: { [workspaceA.workspaceHandle]: [], [workspaceB.workspaceHandle]: [] },
+			hotSessionsByWorkspace: {},
+		});
+
+		const staleCreation = newSession();
+		const staleToken = useSessionDirectoryStore.getState().sessionCreation?.token;
+		await useSessionDirectoryStore.getState().selectWorkspace(workspaceB.workspaceHandle);
+		await useSessionDirectoryStore.getState().selectWorkspace(workspaceA.workspaceHandle);
+		const freshCreation = newSession();
+
+		expect(createSession).toHaveBeenCalledTimes(1);
+		expect(useSessionDirectoryStore.getState().sessionCreation).toBeNull();
+		resolveStale?.({
+			session: staleCreated,
+			runtime: staleCreated.runtime!,
+			layout: { sessionDir: "/tmp/sessions", source: "default" },
+		});
+		await staleCreation;
+		await Promise.resolve();
+
+		expect(createSession).toHaveBeenCalledTimes(2);
+		expect(useSessionDirectoryStore.getState().sessionCreation?.token).not.toBe(staleToken);
+		expect(useSessionDirectoryStore.getState().currentSession?.sessionHandle).not.toBe("stale-created-a");
+		resolveFresh?.({
+			session: freshCreated,
+			runtime: freshCreated.runtime!,
+			layout: { sessionDir: "/tmp/sessions", source: "default" },
+		});
+		await freshCreation;
+
+		expect(useSessionDirectoryStore.getState().currentSession?.sessionHandle).toBe("fresh-created-a");
+	});
+
+	it("settles unknown initial reconciliation when its exact observation becomes manual-only", async () => {
+		const createSession = vi.spyOn(api, "createSession");
+		isolateTransportActions();
+		useSessionDirectoryStore.setState({
+			workspaces: [workspace("workspace-a")],
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: null,
+			sessionCreation: null,
+			sessionsByWorkspace: { "workspace-a": [] },
+			hotSessionsByWorkspace: {},
+		});
+		useSessionDirectoryStore.getState().applyHotRuntimeInventory({
+			type: "hot_runtime_inventory",
+			serverEpoch: "test-server-epoch",
+			revision: 1,
+			runtimes: [
+				{
+					serverEpoch: "test-server-epoch",
+					sessionHandle: "manual-only-hot",
+					workspaceId: "workspace-a",
+					generation: 1,
+					state: "idle",
+				},
+			],
+		});
+		const directorySubscribe = useSessionDirectoryStore.subscribe.bind(useSessionDirectoryStore);
+		const transportSubscribe = sessionTransport.store.subscribe.bind(sessionTransport.store);
+		let directoryUnsubscribes = 0;
+		let transportUnsubscribes = 0;
+		vi.spyOn(useSessionDirectoryStore, "subscribe").mockImplementation((listener) => {
+			const unsubscribe = directorySubscribe(listener);
+			return () => {
+				directoryUnsubscribes += 1;
+				unsubscribe();
+			};
+		});
+		vi.spyOn(sessionTransport.store, "subscribe").mockImplementation((listener) => {
+			const unsubscribe = transportSubscribe(listener);
+			return () => {
+				transportUnsubscribes += 1;
+				unsubscribe();
+			};
+		});
+
+		let settled = false;
+		const initialReconciliation = ensureInitialSession();
+		const reconciliation = initialReconciliation.then(() => {
+			settled = true;
+		});
+		sessionTransport.store.setState({
+			sessions: {
+				"manual-only-hot": manualOnlyChannel("manual-only-hot", "workspace-a"),
+			},
+		});
+		await vi.waitFor(() => expect(settled).toBe(true));
+		await reconciliation;
+		expect(createSession).not.toHaveBeenCalled();
+		expect(directoryUnsubscribes).toBe(1);
+		expect(transportUnsubscribes).toBe(1);
+		const nextReconciliation = ensureInitialSession();
+		expect(nextReconciliation).not.toBe(initialReconciliation);
+		await nextReconciliation;
+	});
+
+	it("keeps waiting past one degraded hot Runtime and resumes another exact unpersisted Runtime", async () => {
+		const createSession = vi.spyOn(api, "createSession");
+		isolateTransportActions();
+		useSessionDirectoryStore.setState({
+			workspaces: [workspace("workspace-a")],
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: null,
+			sessionCreation: null,
+			sessionsByWorkspace: { "workspace-a": [] },
+			hotSessionsByWorkspace: {},
+		});
+		useSessionDirectoryStore.getState().applyHotRuntimeInventory({
+			type: "hot_runtime_inventory",
+			serverEpoch: "test-server-epoch",
+			revision: 1,
+			runtimes: [
+				{
+					serverEpoch: "test-server-epoch",
+					sessionHandle: "degraded-hot",
+					workspaceId: "workspace-a",
+					generation: 1,
+					state: "idle",
+				},
+				{
+					serverEpoch: "test-server-epoch",
+					sessionHandle: "recovering-hot",
+					workspaceId: "workspace-a",
+					generation: 1,
+					state: "running",
+				},
+			],
+		});
+
+		let settled = false;
+		const reconciliation = ensureInitialSession().then(() => {
+			settled = true;
+		});
+		sessionTransport.store.setState({
+			sessions: { "degraded-hot": manualOnlyChannel("degraded-hot", "workspace-a") },
+		});
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(settled).toBe(false);
+
+		useSessionDirectoryStore.getState().applyRuntime({
+			...runtime("recovering-hot", "workspace-a"),
+			generation: 1,
+			sessionFile: null,
+			recoverable: false,
+		});
+		await reconciliation;
+
+		expect(createSession).not.toHaveBeenCalled();
+		expect(useSessionDirectoryStore.getState().currentSession?.sessionHandle).toBe("recovering-hot");
 	});
 
 	it("resumes a recovered unpersisted hot Runtime instead of auto-creating after reload", async () => {
@@ -174,6 +607,12 @@ describe("Session-scoped controls", () => {
 				},
 			],
 		});
+		useSessionDirectoryStore.getState().applyRuntime({
+			...runtime("recovered-hot", "workspace-a"),
+			sessionFile: null,
+			recoverable: false,
+			generation: 1,
+		});
 
 		await newSession();
 
@@ -181,6 +620,45 @@ describe("Session-scoped controls", () => {
 		expect(useSessionDirectoryStore.getState().currentSession?.sessionHandle).toBe("recovered-hot");
 		expect(subscribeSession).toHaveBeenCalledWith("recovered-hot");
 		expect(claimSession).toHaveBeenCalledWith("recovered-hot");
+	});
+
+	it("does not reuse unpersisted persistence across a same-handle generation change", () => {
+		isolateTransportActions();
+		useSessionDirectoryStore.setState({
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: null,
+			sessionsByWorkspace: { "workspace-a": [] },
+			hotSessionsByWorkspace: {},
+		});
+		const inventory = (generation: number, revision: number): HotRuntimeInventoryDto => ({
+			type: "hot_runtime_inventory",
+			serverEpoch: "test-server-epoch",
+			revision,
+			runtimes: [
+				{
+					serverEpoch: "test-server-epoch",
+					sessionHandle: "generation-hot",
+					workspaceId: "workspace-a",
+					generation,
+					state: "idle",
+				},
+			],
+		});
+		useSessionDirectoryStore.getState().applyHotRuntimeInventory(inventory(1, 1));
+		useSessionDirectoryStore.getState().applyRuntime({
+			...runtime("generation-hot", "workspace-a"),
+			generation: 1,
+			sessionFile: null,
+			recoverable: false,
+		});
+		useSessionDirectoryStore.getState().applyHotRuntimeInventory(inventory(2, 2));
+
+		expect(
+			useSessionDirectoryStore.getState().hotSessionsByWorkspace["workspace-a"]?.[0]?.runtime,
+		).toBeNull();
+		expect(useSessionDirectoryStore.getState().hotTransientResumeStatus("workspace-a")).toBe("pending");
+		expect(useSessionDirectoryStore.getState().resumeTransientSession("workspace-a")).toBe(false);
+		expect(useSessionDirectoryStore.getState().currentSession).toBeNull();
 	});
 
 	it("keeps the empty Workspace Session snapshot referentially stable for React", () => {

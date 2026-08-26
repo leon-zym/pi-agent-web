@@ -176,4 +176,51 @@ describe("WorkspaceSidebar hot runtime overlay", () => {
 
 		expect(html).toMatch(/Unloaded inventory workspace<\/span><span[^>]*>10<\/span>/);
 	});
+
+	it("drops stale unpersisted knowledge when the same handle advances generation", () => {
+		const workspace: NativeWorkspaceDto = {
+			workspaceHandle: "workspace-generation",
+			path: "/tmp/workspace-generation",
+			available: true,
+			pinned: false,
+			displayName: "Generation workspace",
+			lastOpenedAt: null,
+			sessionCount: 10,
+			hasNativeHistory: true,
+		};
+		useSessionDirectoryStore.setState({
+			workspaces: [workspace],
+			currentWorkspaceHandle: null,
+			currentSession: null,
+			sessionsByWorkspace: {},
+			hotSessionsByWorkspace: {},
+			hotRuntimeStateBySession: {},
+			searchQuery: "",
+		});
+		const applyInventory = (generation: number, revision: number) =>
+			useSessionDirectoryStore.getState().applyHotRuntimeInventory({
+				type: "hot_runtime_inventory",
+				serverEpoch: "epoch-sidebar",
+				revision,
+				runtimes: [
+					{
+						serverEpoch: "epoch-sidebar",
+						sessionHandle: "generation-hot",
+						workspaceId: workspace.workspaceHandle,
+						generation,
+						state: "idle",
+					},
+				],
+			});
+		applyInventory(1, 1);
+		useSessionDirectoryStore.getState().applyRuntime({
+			...runtime("generation-hot", workspace.workspaceHandle, false),
+			generation: 1,
+		});
+		applyInventory(2, 2);
+
+		const html = renderToStaticMarkup(createElement(WorkspaceSidebar, { rail: false }));
+
+		expect(html).toMatch(/Generation workspace<\/span><span[^>]*>10<\/span>/);
+	});
 });
