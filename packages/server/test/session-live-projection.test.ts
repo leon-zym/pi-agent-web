@@ -101,6 +101,17 @@ function wireSnapshot(projection: ReturnType<SessionLiveProjection["snapshot"]>)
 }
 
 describe("SessionLiveProjection", () => {
+	it("checks its current waterline without materializing a snapshot", () => {
+		const projection = new SessionLiveProjection({ identity, baseSeq: 7, runtimePhase: "idle" });
+
+		expect(projection.isAtSeq(7)).toBe(true);
+		expect(projection.isAtSeq(6)).toBe(false);
+		projection.commitInlineOnly(identity, event({ type: "agent_start" }), "running");
+		expect(projection.isAtSeq(7)).toBe(false);
+		expect(projection.isAtSeq(8)).toBe(true);
+		expect(projection.isAtSeq(Number.MAX_SAFE_INTEGER + 1)).toBe(false);
+	});
+
 	it("captures settled messages plus ordered text and thinking partials at one waterline", () => {
 		const projection = new SessionLiveProjection({
 			identity,

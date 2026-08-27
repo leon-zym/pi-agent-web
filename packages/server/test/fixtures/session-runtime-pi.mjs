@@ -36,6 +36,7 @@ let pendingBashTimer;
 let startupFloodSent = false;
 let initialStateRequest = true;
 let getMessagesRequestCount = 0;
+let transitionPayloadPostPending = false;
 const usage = {
 	input: 1,
 	output: 1,
@@ -549,6 +550,26 @@ function streamPrompt(command) {
 }
 
 function transition(command) {
+	if (process.env.PI_WEB_FIXTURE_TRANSITION_PAYLOAD_EVENTS === "1") {
+		send({
+			type: "message_end",
+			message: {
+				role: "user",
+				content: [{ type: "text", text: "transition-staged-ref" }],
+				timestamp: Date.now(),
+			},
+		});
+		if (process.env.PI_WEB_FIXTURE_TRANSITION_PAYLOAD_PARTIAL === "1") {
+			send({
+				type: "message_end",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "transition-staged-invalid-ref" }],
+					timestamp: Date.now(),
+				},
+			});
+		}
+	}
 	if (process.env.PI_WEB_FIXTURE_CANCEL_TRANSITION === "1") {
 		if (process.env.PI_WEB_FIXTURE_TRANSITION_STICKY === "1") {
 			send({
@@ -562,6 +583,10 @@ function transition(command) {
 		response(command, { cancelled: true });
 		return;
 	}
+	if (process.env.PI_WEB_FIXTURE_TRANSITION_SAME_IDENTITY === "1") {
+		response(command, command.type === "fork" ? { text: "forked", cancelled: false } : { cancelled: false });
+		return;
+	}
 	const previousFile = sessionFile;
 	sessionId = `${sessionId}-${command.type}`;
 	sessionFile = path.join(path.dirname(previousFile), `2026-08-20T00-00-01-000Z_${sessionId}.jsonl`);
@@ -571,6 +596,9 @@ function transition(command) {
 		configuredBytes("PI_WEB_FIXTURE_TRANSITION_FRAME_BYTES"),
 	);
 	if (process.env.PI_WEB_FIXTURE_TRANSITION_STATE_DELAY_MS) delayNextTransitionState = true;
+	if (process.env.PI_WEB_FIXTURE_TRANSITION_PAYLOAD_EVENTS === "1") {
+		transitionPayloadPostPending = true;
+	}
 	if (process.env.PI_WEB_FIXTURE_TRANSITION_STICKY === "1") {
 		send({
 			type: "extension_ui_request",
@@ -665,6 +693,33 @@ function handleLine(line) {
 				});
 			}
 			response(command, { messages });
+			if (
+				process.env.PI_WEB_FIXTURE_TRANSITION_DIALOG_DURING_PARENT_CLEANUP === "1" &&
+				getMessagesRequestCount === 2
+			) {
+				setTimeout(() => {
+					send({
+						type: "extension_ui_request",
+						id: `transition-applying-dialog-${sessionId}`,
+						method: "confirm",
+						title: "Transition applying dialog",
+						message: "transition-applying-dialog",
+					});
+				}, 20);
+			}
+			if (transitionPayloadPostPending && getMessagesRequestCount === 2) {
+				transitionPayloadPostPending = false;
+				setTimeout(() => {
+					send({
+						type: "message_end",
+						message: {
+							role: "user",
+							content: [{ type: "text", text: "transition-post-rekey-ref" }],
+							timestamp: Date.now(),
+						},
+					});
+				}, 20);
+			}
 			return;
 		case "get_commands":
 			response(command, { commands: [] });

@@ -339,6 +339,11 @@ export class SessionLiveProjection {
 		this.revision += 1;
 	}
 
+	/** O(1) waterline check for lifecycle fences that must not clone the projection. */
+	isAtSeq(seq: number): boolean {
+		return Number.isSafeInteger(seq) && seq >= 0 && this.asOfSeq === seq;
+	}
+
 	snapshot(): SessionLiveProjectionSnapshot {
 		const value: SessionLiveProjectionSnapshot = {
 			...this.identity,
