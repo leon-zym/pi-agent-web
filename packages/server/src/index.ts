@@ -1,3 +1,4 @@
+export * from "./attachment-routes.js";
 export * from "./auth-storage.js";
 export * from "./config.js";
 export * from "./directory-picker.js";

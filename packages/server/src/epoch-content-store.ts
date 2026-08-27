@@ -71,6 +71,8 @@ export interface EpochContentPin {
 export interface StagedEpochContent {
 	readonly ref: SessionAttachmentRefDto;
 	readonly hold: EpochContentHold;
+	/** True only when this stage committed a new digest directory. */
+	readonly created: boolean;
 }
 
 export interface PinnedEpochContent {
@@ -701,7 +703,7 @@ export class EpochContentStore {
 				fail("manifest_mismatch", "Digest metadata differs");
 			await this.#verifyEntry(existing.ref, undefined, existing.published);
 			this.#rollbackReservation(reservation);
-			return Object.freeze({ ref: existing.ref, hold: this.#createHold(existing) });
+			return Object.freeze({ ref: existing.ref, hold: this.#createHold(existing), created: false });
 		}
 		if (await this.#digestPathExists(ref.sha256)) fail("digest_collision", "Unowned digest path exists");
 		const directory = this.#blobDirectory(ref.sha256);
@@ -723,7 +725,7 @@ export class EpochContentStore {
 			const entry: Entry = { ref, published: false, holds: 0, pins: 0, deleting: false };
 			this.#entries.set(ref.sha256, entry);
 			this.#commitReservation(reservation, ref.byteLength);
-			return Object.freeze({ ref: entry.ref, hold: this.#createHold(entry) });
+			return Object.freeze({ ref: entry.ref, hold: this.#createHold(entry), created: true });
 		} catch (error) {
 			this.#temporaryPaths.delete(innerTemp);
 			if (directoryOwned) await this.#remove(directory, { recursive: true, force: true }).catch(() => {});

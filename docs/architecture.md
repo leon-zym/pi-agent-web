@@ -144,12 +144,38 @@ Gateway、Pi adapter、projection、replay、snapshot 与 queue 的统一 payloa
 
 Attachment blob 使用 `webDataDir` 下的私有、epoch-scoped disk spool，容量、hold、pin 与 publish 状态由
 Gateway 内存 ledger 管理；它仍是可丢弃的有界派生 cache，不是新的持久化层。Store root 由单个 Gateway
-生命周期锁独占，持锁者才可把旧 epoch 原子改名为 tombstone 后清理。写入先按声明长度预留容量；未知长度
-按单 blob 上限预留，然后流式计算 SHA-256，并通过同目录临时文件与原子 rename 发布 manifest。Reference
-携带创建它的 `serverEpoch`、内容摘要、media type 与 byte length，只能在完全相同的 epoch 使用。Gateway restart
+生命周期锁独占，持锁者才可把旧 epoch 原子改名为 tombstone 后清理。新 digest 的写入先按声明长度预留
+容量；未知长度按单 blob 上限预留，然后流式计算 SHA-256，并通过同目录临时文件与原子 rename 发布
+manifest。已发布 digest 会先取得 pin；只有
+`serverEpoch`、digest、media type 与 length 全部相同才进入重复 PUT 快路径，并在固定内存内重新流式验证
+raster gross contract、实际长度和 SHA-256，不创建新 reservation 或 temp file；metadata 不同则直接拒绝。
+Reference 携带创建它的 `serverEpoch`、内容摘要、media type 与 byte length，只能在完全相同的 epoch 使用。Gateway restart
 会使旧 reference 无效；后续恢复必须从 Pi JSONL 或 Pi Runtime 的权威内容重新 externalize，不能只凭
 digest 推断新进程仍拥有原 blob。Cache eviction 也不改变 Pi 内容，缺失 blob 必须 fail closed 或从
 Pi authority 重建，不能把附件静默替换为空值。
+
+Disk spool 只保存 blob 与校验所需的 manifest。Reservation、hold、pin、publish/delete transition 和
+并发 digest serialization 属于当前进程的内存 ledger。Epoch 目录名由 `serverEpoch` 摘要派生，URL 参数
+不能直接成为文件路径。Store 在读取和发布时重新验证 manifest、digest、length、inode 与目录布局；同一
+digest 的并发写入只发布一个条目。未 publish 且没有 hold/pin 的条目会被回收，已 publish 且没有
+hold/pin 的条目可以由 GC 淘汰。
+
+Gateway 已提供同源、认证后的 attachment REST ingress：
+
+- `PUT /api/v1/attachments/:serverEpoch/:sha256` 接受 raw raster body。它在访问 store 前精确比较当前
+  epoch 和 64 位小写 digest，要求正的 safe-integer `Content-Length`、identity encoding，以及精确的
+  PNG、JPEG、WebP 或 GIF media type。新 digest 在读取 body 前 reservation，并在写盘时流式计算 digest
+  和实际长度；已有 exact metadata 的 digest 先 pin，再以固定内存完整重验 raster gross contract、length
+  与 SHA-256 后返回 200，不创建新 reservation。
+- `GET /api/v1/attachments/:serverEpoch/:sha256` 只在 URL epoch 等于当前 epoch 后按 digest pin 已发布
+  内容。Pin 持续到 EOF、stream error 或 Browser cancel。`Range` 返回 416，`HEAD` 明确返回 405。
+- Raster admission 验证 media type、magic、最低 header/tail、gross container length/padding 和明显截断。
+  它不是 codec decoder，也不证明 PNG CRC、JPEG marker graph、WebP frame semantics、GIF sub-block graph
+  或像素数据可解码。Browser preprocessing 与最终 Pi/provider 消费路径仍需处理 decode failure。
+
+Attachment REST 与 store 是协议分阶段接入的基础设施。Gateway hello 目前仍不广告
+`payload.epoch_attachment_refs`，Browser 也不能因为 REST endpoint 存在就发送 reference。WebSocket
+command、adapter externalization、UI composer 与 recovery 接入完成并满足全部预算边界后，才能回显该能力。
 
 Reference 消费入口必须把 canonical DTO、协商后的 blob ceiling 与当前 `serverEpoch` 作为同一次
 admission 判断。Payload ceiling 必须保持 producer 不大于 consumer。Raw Pi event 到 normalized event
@@ -164,6 +190,13 @@ attachment cache item ceiling 使用独立的 item limit 与 actual。这个结�
 Pi response barrier、Session identity 或 controller fencing。
 该结构由 Gateway 拥有。Pi adapter 拒绝 raw Pi response 中的同名字段，Bridge 只透传 Gateway 内部真实
 `RpcError` 携带的 admission detail。
+
+Gateway startup 只 canonicalize 一次 `webDataDir`，并只生成一次 `serverEpoch`。Preferences 取得锁后，
+content store 才初始化；任一后续构造或 bind 失败都会按已取得资源的逆向依赖清理。正常 shutdown 严格按
+ingress、Supervisor、content store、preferences 的顺序执行，继续收集 cleanup failure 后统一报告。
+Store shutdown 会 abort active upload/download、等待已登记操作、清理未发布 temp/entry，再释放 lifecycle
+lock。两个 Gateway 不能同时拥有同一个 `webDataDir` 的 attachment store；持锁进程只在确认 ownership 后
+处理旧 epoch 和 tombstone。
 
 ## 事件、回放与 resync
 

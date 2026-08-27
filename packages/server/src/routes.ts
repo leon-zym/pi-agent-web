@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import type { GatewayAccessControl } from "./access-control.js";
+import { type AttachmentContentStore, createAttachmentRoutes } from "./attachment-routes.js";
 import { readAuthStatus, saveApiKey } from "./auth-storage.js";
 import type { ServerConfig } from "./config.js";
 import { pickWorkspaceDirectory } from "./directory-picker.js";
@@ -24,6 +25,8 @@ import type { WorkspacePreferences } from "./workspace-preferences.js";
  */
 export interface AppContext {
 	accessControl: GatewayAccessControl;
+	contentStore: AttachmentContentStore;
+	serverEpoch: string;
 	config: ServerConfig;
 	catalog: NativeSessionCatalog;
 	layoutResolver: SessionLayoutResolver;
@@ -56,6 +59,11 @@ export function createApp(ctx: AppContext): Hono {
 		}
 		c.header("Set-Cookie", accessControl.createSessionCookie());
 		return c.json({ ok: true });
+	});
+
+	app.use("/api/v1/attachments/*", async (c, next) => {
+		await next();
+		c.header("Cache-Control", "no-store");
 	});
 
 	app.use("/api/v1/*", async (c, next) => {
@@ -103,6 +111,11 @@ export function createApp(ctx: AppContext): Hono {
 		supervisor.notifyAuthChanged();
 		return c.json({ ok: true, providers: readAuthStatus(config.agentDir) });
 	});
+
+	app.route(
+		"/api/v1",
+		createAttachmentRoutes({ contentStore: ctx.contentStore, serverEpoch: ctx.serverEpoch }),
+	);
 
 	app.route(
 		"/api/v1",

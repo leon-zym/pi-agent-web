@@ -214,6 +214,55 @@ Gateway 只有在所有表内边界已经执行、旧 epoch reference 会 fail c
 `admissionError` 是 Gateway-owned 字段。Pi raw failure response 携带该字段属于协议不兼容；Bridge
 只从 Gateway 内部真实 `RpcError` 透传结构，不接受普通 Error 或形似对象注入。
 
+### Attachment REST staging contract
+
+Attachment REST 使用与其他 `/api/v1/*` 路由相同的 loopback Host、same-origin Origin/Fetch Metadata 和
+bootstrap Cookie 校验。所有 attachment 成功与错误响应都携带 `Cache-Control: no-store`。这些 endpoint
+已经可用，但 Gateway hello 尚未广告 `payload.epoch_attachment_refs`；未协商的 Browser 必须继续发送
+inline image，不能把 REST 可达性当作 capability negotiation。
+
+`PUT /api/v1/attachments/:serverEpoch/:sha256` 的 request body 是 raw raster bytes：
+
+| 条件 | 结果 |
+|---|---|
+| URL epoch 不是当前 `serverEpoch` | 410，`attachment_ref_epoch_mismatch` |
+| digest 不是 64 位小写十六进制 | 400，`attachment_ref_invalid` |
+| 缺少 `Content-Length` | 411，`content_length_required` |
+| length 不是正的 safe integer | 400，`invalid_content_length` |
+| length 超过 blob ceiling | 413，`payload_too_large`，携带 byte evidence |
+| 非 identity `Content-Encoding` 或非 allowlisted raster media type | 415 |
+| magic、gross container、截断、声明 length/digest 或 manifest 校验失败 | 422 |
+| cache byte/item reservation 失败 | 507，使用 canonical cache admission code 与 evidence |
+| 新 digest 发布成功 | 201，body 为 `{attachment: attachment_ref}` |
+| 已有相同 digest、media type 与 length，且完整 body 重验成功 | 200，body 为同一个 canonical reference |
+
+PUT 先按 URL digest 查询已发布内容。查询未命中（即新 digest）时，它在读取 body 前按声明长度预留
+cache，并在写入私有 temp file 时流式计算 SHA-256 和实际长度；只有 validator flush、长度和 digest
+全部成功后才 publish。
+命中已发布 digest 时，Gateway 先 pin 该条目并精确比较 `serverEpoch`、digest、media type 与 length。
+Metadata 完全相同才走重复 PUT 快路径：不创建新 reservation 或 temp file，而是在固定内存内完整流式重验
+raster gross contract、实际长度和 SHA-256，成功后返回 200。任一 metadata 或 body 不匹配都返回 422，
+不能只凭 URL digest 接纳重复上传。Raster validator 是安全 admission，不是图片 decoder：它只验证
+allowlisted MIME、
+magic、最低 header/tail、gross container size/padding 与明显截断。通过 PUT 不代表 codec-valid 或
+provider 可解码。
+
+`GET /api/v1/attachments/:serverEpoch/:sha256` 在访问 store 前执行同一 URL epoch 与 digest 校验。旧 epoch
+固定返回 410，即使当前 epoch 碰巧已有相同 digest。未知或已淘汰的 digest 返回 404
+`attachment_unavailable`。`Range` 返回 416；`HEAD` 返回 405 和 `Allow: GET, PUT`，不能使用 Hono 的
+implicit HEAD fallback。成功 GET 返回 exact `Content-Type`、`Content-Length`，以及：
+
+```text
+Cache-Control: no-store
+Content-Disposition: attachment; filename="<sha256>.<safe-extension>"
+Cross-Origin-Resource-Policy: same-origin
+X-Content-Type-Options: nosniff
+```
+
+GET 先取得 published digest 的 pin，再从同一个已验证 file descriptor 建立 managed stream。EOF、stream
+error、request abort 和 Browser cancel 都必须幂等 release pin；GC 不能删除仍被 pin 的 blob。未知 I/O
+错误固定映射为不含本地路径的 generic 500。Store unavailable 使用 503，响应不能反射内部 Error message。
+
 ## 5. Gateway → Browser WebSocket
 
 | `type` | 核心字段 | 语义 |

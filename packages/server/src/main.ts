@@ -12,6 +12,7 @@ import {
 	type GatewayAccessControl,
 } from "./access-control.js";
 import { assertLoopbackHost, ENV_SESSION_DIR, loadConfig, type ServerConfig } from "./config.js";
+import { EpochContentStore } from "./epoch-content-store.js";
 import { NativeSessionCatalog, sessionHandleForCanonicalFile } from "./native-session-catalog.js";
 import { RecoverableSessionTrash } from "./recoverable-session-trash.js";
 import { type ProbedPiRuntime, resolvePiRuntime } from "./resolver.js";
@@ -43,6 +44,8 @@ export interface ServerHandle {
 	layoutResolver: SessionLayoutResolver;
 	preferences: WorkspacePreferences;
 	trash: RecoverableSessionTrash;
+	contentStore: EpochContentStore;
+	serverEpoch: string;
 	config: ServerConfig;
 	runtime: ProbedPiRuntime;
 	accessControl: GatewayAccessControl;
@@ -81,7 +84,8 @@ function openBrowser(host: string, port: number): void {
 }
 
 export async function startServer(options: StartServerOptions = {}): Promise<ServerHandle> {
-	const config: ServerConfig = { ...loadConfig(), ...options.config };
+	const mergedConfig: ServerConfig = { ...loadConfig(), ...options.config };
+	const config: ServerConfig = { ...mergedConfig, webDataDir: path.resolve(mergedConfig.webDataDir) };
 	assertLoopbackHost(config.host);
 	const runtime = await resolvePiRuntime({ piPath: options.piPath });
 	log("info", `Pi runtime resolved: ${runtime.source} Pi ${runtime.version} (${runtime.adapterId})`);
@@ -105,175 +109,202 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 		runtimeCwd: process.cwd(),
 		settingsProbeCwd: process.cwd(),
 	});
-	const preferences = new WorkspacePreferences(config.webDataDir);
-	const catalog = new NativeSessionCatalog({
-		layoutResolver,
-		preferences,
-		cacheTtlMs: 1_000,
-	});
-	const trash = new RecoverableSessionTrash(config.webDataDir);
+	let preferences: WorkspacePreferences | undefined;
+	let contentStore: EpochContentStore | undefined;
+	let supervisor: SessionSupervisor | undefined;
+	let bridge: SessionWsBridge | undefined;
+	let server: ServerType | undefined;
+	const sockets = new Set<Socket>();
+	try {
+		const activePreferences = new WorkspacePreferences(config.webDataDir);
+		preferences = activePreferences;
+		const catalog = new NativeSessionCatalog({
+			layoutResolver,
+			preferences: activePreferences,
+			cacheTtlMs: 1_000,
+		});
+		const trash = new RecoverableSessionTrash(config.webDataDir);
+		const activeContentStore = new EpochContentStore({ webDataDir: config.webDataDir, serverEpoch });
+		contentStore = activeContentStore;
+		await activeContentStore.initialize();
 
-	let bridge!: SessionWsBridge;
-	const supervisor = new SessionSupervisor({
-		serverEpoch,
-		resolved: runtime,
-		envForWorkspace: (cwd) => layoutResolver.normalizedChildEnvForWorkspace(cwd),
-		resolveSession: async (sessionHandle) => {
-			const snapshot = await catalog.refresh({ force: true });
-			const session = snapshot.sessions.find((candidate) => candidate.sessionHandle === sessionHandle);
-			if (!session?.workspaceAvailable || !session.workspacePath) return undefined;
-			let canonicalFile: string;
-			try {
-				canonicalFile = await fs.promises.realpath(session.sessionFile);
-			} catch {
-				return undefined;
-			}
-			if (
-				canonicalFile !== session.sessionFile ||
-				sessionHandleForCanonicalFile(canonicalFile) !== sessionHandle
-			) {
-				return undefined;
-			}
-			return {
-				kind: "existing" as const,
-				sessionHandle: session.sessionHandle,
-				workspaceId: session.workspaceHandle,
-				cwd: session.workspacePath,
-				sessionFile: canonicalFile,
-				nativeSessionId: session.nativeSessionId,
-			};
-		},
-		broadcast: (message) => bridge.broadcast(message),
-		onHotRuntimeInventory: (inventory) => bridge.broadcastHotRuntimeInventory(inventory),
-		log,
-	});
-	bridge = new SessionWsBridge({
-		supervisor,
-		log,
-		serverBuild: "0.1.0",
-		runtime: {
-			version: runtime.version,
-			adapterId: runtime.adapterId,
-			capabilities: [...runtime.capabilities, "session.multiplex", GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY],
-		},
-	});
-
-	const app = createApp({
-		accessControl,
-		config,
-		catalog,
-		layoutResolver,
-		preferences,
-		supervisor,
-		trash,
-		readiness: {
-			ready: true,
+		let activeBridge!: SessionWsBridge;
+		const activeSupervisor = new SessionSupervisor({
+			serverEpoch,
+			resolved: runtime,
+			envForWorkspace: (cwd) => layoutResolver.normalizedChildEnvForWorkspace(cwd),
+			resolveSession: async (sessionHandle) => {
+				const snapshot = await catalog.refresh({ force: true });
+				const session = snapshot.sessions.find((candidate) => candidate.sessionHandle === sessionHandle);
+				if (!session?.workspaceAvailable || !session.workspacePath) return undefined;
+				let canonicalFile: string;
+				try {
+					canonicalFile = await fs.promises.realpath(session.sessionFile);
+				} catch {
+					return undefined;
+				}
+				if (
+					canonicalFile !== session.sessionFile ||
+					sessionHandleForCanonicalFile(canonicalFile) !== sessionHandle
+				) {
+					return undefined;
+				}
+				return {
+					kind: "existing" as const,
+					sessionHandle: session.sessionHandle,
+					workspaceId: session.workspaceHandle,
+					cwd: session.workspacePath,
+					sessionFile: canonicalFile,
+					nativeSessionId: session.nativeSessionId,
+				};
+			},
+			broadcast: (message) => activeBridge.broadcast(message),
+			onHotRuntimeInventory: (inventory) => activeBridge.broadcastHotRuntimeInventory(inventory),
+			log,
+		});
+		supervisor = activeSupervisor;
+		activeBridge = new SessionWsBridge({
+			supervisor: activeSupervisor,
+			log,
+			serverBuild: "0.1.0",
 			runtime: {
-				source: runtime.source,
 				version: runtime.version,
 				adapterId: runtime.adapterId,
-				capabilities: runtime.capabilities,
+				capabilities: [
+					...runtime.capabilities,
+					"session.multiplex",
+					GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+				],
 			},
-		},
-	});
-	serveStaticApp(app, options.staticDir);
-
-	let server: ServerType;
-	try {
-		server = serve({ fetch: app.fetch, port: config.port, hostname: config.host });
-	} catch (error) {
-		await cleanupFailedStartup(bridge, supervisor, preferences);
-		throw error;
-	}
-	const sockets = new Set<Socket>();
-	server.on("connection", (socket: Socket) => {
-		sockets.add(socket);
-		socket.once("close", () => sockets.delete(socket));
-	});
-	try {
-		await waitForListening(server);
-	} catch (error) {
-		await cleanupFailedStartup(bridge, supervisor, preferences, server);
-		throw error;
-	}
-	const address = server.address();
-	if (!address || typeof address === "string") {
-		await cleanupFailedStartup(bridge, supervisor, preferences, server);
-		throw new Error("gateway did not expose a TCP address after listening");
-	}
-	log("info", `pi-agent-web server listening on http://${config.host}:${address.port}`);
-	if (options.openInBrowser) openBrowser(config.host, address.port);
-
-	server.on("upgrade", (request, socket, head) => {
-		const url = new URL(request.url ?? "/", "http://localhost");
-		if (url.pathname !== "/api/v1/ws") {
-			socket.destroy();
-			return;
-		}
-		if (!accessControl.isAuthorized(request.headers)) {
-			const body = "Forbidden";
-			socket.write(
-				[
-					"HTTP/1.1 403 Forbidden",
-					"Connection: close",
-					"Content-Type: text/plain; charset=utf-8",
-					`Content-Length: ${String(Buffer.byteLength(body))}`,
-					"",
-					body,
-				].join("\r\n"),
-			);
-			socket.destroy();
-			return;
-		}
-		bridge.wss.handleUpgrade(request, socket, head, (ws) => {
-			bridge.wss.emit("connection", ws, request);
 		});
-	});
+		bridge = activeBridge;
 
-	const signalHandlers = new Map<NodeJS.Signals, () => void>();
-	let closePromise: Promise<void> | null = null;
-	const close = (): Promise<void> => {
-		closePromise ??= (async () => {
-			for (const [signal, handler] of signalHandlers) process.off(signal, handler);
-			signalHandlers.clear();
-			const results = await closeIngress(server, bridge, sockets);
-			results.push(...(await Promise.allSettled([supervisor.stopAll()])));
-			preferences.close();
-			const errors = results.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
-			if (errors.length > 0) throw new AggregateError(errors, "gateway shutdown failed");
-		})();
-		return closePromise;
-	};
+		const app = createApp({
+			accessControl,
+			contentStore: activeContentStore,
+			serverEpoch,
+			config,
+			catalog,
+			layoutResolver,
+			preferences: activePreferences,
+			supervisor: activeSupervisor,
+			trash,
+			readiness: {
+				ready: true,
+				runtime: {
+					source: runtime.source,
+					version: runtime.version,
+					adapterId: runtime.adapterId,
+					capabilities: runtime.capabilities,
+				},
+			},
+		});
+		serveStaticApp(app, options.staticDir);
 
-	if (options.handleSignals !== false) {
-		for (const signal of ["SIGINT", "SIGTERM"] as const) {
-			const handler = () => {
-				void close().then(
-					() => process.exit(0),
-					(error: unknown) => {
-						log("error", `shutdown failed: ${errorText(error)}`);
-						process.exit(1);
-					},
-				);
-			};
-			signalHandlers.set(signal, handler);
-			process.on(signal, handler);
+		const activeServer = serve({ fetch: app.fetch, port: config.port, hostname: config.host });
+		server = activeServer;
+		activeServer.on("connection", (socket: Socket) => {
+			sockets.add(socket);
+			socket.once("close", () => sockets.delete(socket));
+		});
+		await waitForListening(activeServer);
+		const address = activeServer.address();
+		if (!address || typeof address === "string") {
+			throw new Error("gateway did not expose a TCP address after listening");
 		}
-	}
+		log("info", `pi-agent-web server listening on http://${config.host}:${address.port}`);
+		if (options.openInBrowser) openBrowser(config.host, address.port);
 
-	return {
-		server,
-		supervisor,
-		bridge,
-		catalog,
-		layoutResolver,
-		preferences,
-		trash,
-		config,
-		runtime,
-		accessControl,
-		close,
-	};
+		activeServer.on("upgrade", (request, socket, head) => {
+			const url = new URL(request.url ?? "/", "http://localhost");
+			if (url.pathname !== "/api/v1/ws") {
+				socket.destroy();
+				return;
+			}
+			if (!accessControl.isAuthorized(request.headers)) {
+				const body = "Forbidden";
+				socket.write(
+					[
+						"HTTP/1.1 403 Forbidden",
+						"Connection: close",
+						"Content-Type: text/plain; charset=utf-8",
+						`Content-Length: ${String(Buffer.byteLength(body))}`,
+						"",
+						body,
+					].join("\r\n"),
+				);
+				socket.destroy();
+				return;
+			}
+			activeBridge.wss.handleUpgrade(request, socket, head, (ws) => {
+				activeBridge.wss.emit("connection", ws, request);
+			});
+		});
+
+		const signalHandlers = new Map<NodeJS.Signals, () => void>();
+		let closePromise: Promise<void> | null = null;
+		const close = (): Promise<void> => {
+			closePromise ??= (async () => {
+				for (const [signal, handler] of signalHandlers) process.off(signal, handler);
+				signalHandlers.clear();
+				const errors: unknown[] = [];
+				collectRejected(errors, await closeIngress(activeServer, activeBridge, sockets));
+				collectRejected(errors, await Promise.allSettled([activeSupervisor.stopAll()]));
+				collectRejected(errors, await Promise.allSettled([activeContentStore.shutdown()]));
+				try {
+					activePreferences.close();
+				} catch (error) {
+					errors.push(error);
+				}
+				if (errors.length > 0) throw new AggregateError(errors, "gateway shutdown failed");
+			})();
+			return closePromise;
+		};
+
+		if (options.handleSignals !== false) {
+			for (const signal of ["SIGINT", "SIGTERM"] as const) {
+				const handler = () => {
+					void close().then(
+						() => process.exit(0),
+						(error: unknown) => {
+							log("error", `shutdown failed: ${errorText(error)}`);
+							process.exit(1);
+						},
+					);
+				};
+				signalHandlers.set(signal, handler);
+				process.on(signal, handler);
+			}
+		}
+
+		return {
+			server: activeServer,
+			supervisor: activeSupervisor,
+			bridge: activeBridge,
+			catalog,
+			layoutResolver,
+			preferences: activePreferences,
+			trash,
+			contentStore: activeContentStore,
+			serverEpoch,
+			config,
+			runtime,
+			accessControl,
+			close,
+		};
+	} catch (error) {
+		const cleanupErrors = await cleanupFailedStartup({
+			server,
+			bridge,
+			supervisor,
+			contentStore,
+			preferences,
+		});
+		if (cleanupErrors.length > 0) {
+			throw new AggregateError([error, ...cleanupErrors], "gateway startup failed");
+		}
+		throw error;
+	}
 }
 
 function serveStaticApp(app: ReturnType<typeof createApp>, staticDir: string | undefined): void {
@@ -351,18 +382,33 @@ function waitForListening(server: ServerType): Promise<void> {
 	});
 }
 
-async function cleanupFailedStartup(
-	bridge: SessionWsBridge,
-	supervisor: SessionSupervisor,
-	preferences: WorkspacePreferences,
-	server?: ServerType,
-): Promise<void> {
-	await Promise.allSettled([
-		bridge.close(),
-		supervisor.stopAll(),
-		...(server ? [closeHttpServer(server)] : []),
-	]);
-	preferences.close();
+async function cleanupFailedStartup(resources: {
+	server?: ServerType;
+	bridge?: SessionWsBridge;
+	supervisor?: SessionSupervisor;
+	contentStore?: EpochContentStore;
+	preferences?: WorkspacePreferences;
+}): Promise<unknown[]> {
+	const errors: unknown[] = [];
+	if (resources.server)
+		collectRejected(errors, await Promise.allSettled([closeHttpServer(resources.server)]));
+	if (resources.bridge) collectRejected(errors, await Promise.allSettled([resources.bridge.close()]));
+	if (resources.supervisor)
+		collectRejected(errors, await Promise.allSettled([resources.supervisor.stopAll()]));
+	if (resources.contentStore)
+		collectRejected(errors, await Promise.allSettled([resources.contentStore.shutdown()]));
+	try {
+		resources.preferences?.close();
+	} catch (error) {
+		errors.push(error);
+	}
+	return errors;
+}
+
+function collectRejected(errors: unknown[], results: PromiseSettledResult<unknown>[]): void {
+	for (const result of results) {
+		if (result.status === "rejected") errors.push(result.reason);
+	}
 }
 
 async function closeIngress(

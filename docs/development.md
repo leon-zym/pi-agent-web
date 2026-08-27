@@ -1,4 +1,4 @@
-# 开发 — 工具链、测试与发布门禁
+# 开发：工具链、测试与发布门禁
 
 ## 环境
 
@@ -45,6 +45,8 @@ Focused Vitest 可以在 package 内传文件：
 
 ```bash
 pnpm --filter @pi-agent-web/server exec vitest run test/session-supervisor.test.ts
+pnpm --filter @pi-agent-web/server exec vitest run test/epoch-content-store.test.ts
+pnpm --filter @pi-agent-web/server exec vitest run test/attachment-routes.test.ts test/main-lifecycle.test.ts
 pnpm --filter @pi-agent-web/ui exec vitest run test/session-transport.test.ts
 pnpm exec playwright test --config tests/e2e/playwright.config.ts multi-session.spec.ts
 ```
@@ -67,6 +69,26 @@ Focused 绿灯不是 release gate；修改完成后仍按风险运行上层组�
 架构或协议改动至少要有 L1/L2 不变式与 L3/L4 中一条用户路径。UI shell/composer 改动不能用
 reducer 单测代替 browser bounding-box/console 断言。删除、process 或 shutdown 改动必须覆盖 race 和
 失败恢复；不能只检查 happy path。
+
+Attachment store 与 REST 变更至少覆盖以下边界：
+
+- Store 测试验证新 digest 的 pre-read reservation、blob/cache byte 与 item ceiling、streaming
+  digest/length、同 digest 并发、hold/publish/pin/release/GC、temp cleanup、path/symlink/manifest/inode
+  防护，以及 lifecycle lock、tombstone 和 shutdown race。Route 测试还要证明 exact-metadata digest 快路径
+  先 pin，使用固定内存重验完整 raster gross contract/length/SHA-256，且不创建新 reservation 或 temp
+  file。测试不能把整段 request body 读入内存来替代 streaming seam。
+- Route 测试验证 auth、旧 epoch 和非法 digest 在触碰 store 前失败，required `Content-Length`、identity
+  encoding、allowlisted raster MIME、magic/gross container/truncation、canonical admission evidence、
+  201/200 并发语义、GET safety headers、明确拒绝 Range/HEAD，以及真实 HTTP client abort 后 pin release。
+- Main lifecycle 测试用 entered gate 证明 active PUT/GET 已进入 store，不使用固定 sleep 猜测时序。Shutdown
+  顺序必须是 ingress、Supervisor、content store、preferences；store failure 仍要释放 preferences，startup
+  init/bind failure 仍要释放已经取得的锁。
+
+Raster fixtures 只证明 Gateway admission 的 MIME、magic、gross container 与 truncation 边界，不宣称图片
+通过真实 decoder。Codec validity、Browser preprocessing、reference composer、adapter externalization 与
+provider acceptance 需要各自的上层测试。`payload.epoch_attachment_refs` 尚未广告，因此当前 Browser E2E
+继续覆盖 inline image；在 capability、UI 与 recovery 接入完成前，不能把 attachment REST 测试记作完整
+用户路径。
 
 ## 确定性 browser E2E
 
