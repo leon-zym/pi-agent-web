@@ -114,6 +114,10 @@ async function waitForSocketClose(observation: SocketWireObservation): Promise<v
 	await expect.poll(() => observation.socket.isClosed()).toBe(true);
 }
 
+function gatewayDisconnectCount(logs: string): number {
+	return logs.match(/\[pi-web\] ws disconnected \(/g)?.length ?? 0;
+}
+
 async function installPagehideSocketClose(page: Page): Promise<void> {
 	await page.addInitScript(() => {
 		const NativeWebSocket = window.WebSocket;
@@ -482,12 +486,12 @@ test("hard reload observes every hot Runtime exactly once without activating dor
 	});
 
 	const reloadSocketIndex = wire.sockets.length;
-	await page.evaluate(() => window.dispatchEvent(new Event("piweb:e2e-close-sockets")));
-	expect(oldSocket.socket.isClosed(), "reload must begin before the old socket close is confirmed").toBe(
-		false,
-	);
-	const oldSocketClosed = waitForSocketClose(oldSocket);
-	await Promise.all([page.reload({ waitUntil: "domcontentloaded" }), oldSocketClosed]);
+	expect(oldSocket.socket.isClosed(), "old socket must be open before hard reload").toBe(false);
+	const disconnectCountBeforeReload = gatewayDisconnectCount(harness.logs());
+	const oldSocketDisconnected = expect
+		.poll(() => gatewayDisconnectCount(harness.logs()))
+		.toBeGreaterThan(disconnectCountBeforeReload);
+	await Promise.all([page.reload({ waitUntil: "domcontentloaded" }), oldSocketDisconnected]);
 	const reloadSocket = await waitForSocket(wire, reloadSocketIndex);
 	await expect(page.locator("main")).toBeVisible();
 	const initialInventory = await expectObservationBaseline(reloadSocket, expectedHandles);
