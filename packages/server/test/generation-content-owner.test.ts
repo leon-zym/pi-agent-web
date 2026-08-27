@@ -304,4 +304,90 @@ describe("GenerationContentOwner", () => {
 		await owner.release();
 		expect(release).not.toHaveBeenCalled();
 	});
+
+	it("seals adoption idempotently while retaining existing holds until release", async () => {
+		const released: EpochContentHold[] = [];
+		const owner = new GenerationContentOwner({
+			serverEpoch: SERVER_EPOCH,
+			generation: 11,
+			release: async (entry) => {
+				released.push(entry);
+			},
+		});
+		const retained = hold(ref("b".repeat(64)));
+		owner.adopt(transfer([retained]));
+
+		owner.seal();
+		owner.seal();
+
+		expect(owner.refs).toEqual([retained.ref]);
+		expect(owner.size).toBe(1);
+		expect(() => owner.adopt(transfer([hold(ref("c".repeat(64)))]))).toThrow(GenerationContentOwnerError);
+		expect(released).toEqual([]);
+
+		await owner.release();
+		expect(released).toEqual([retained]);
+	});
+
+	it("rejects sealing while an adoption callback is active", async () => {
+		const owner = new GenerationContentOwner({
+			serverEpoch: SERVER_EPOCH,
+			generation: 12,
+			release: async () => {},
+		});
+		let sealError: unknown;
+		owner.adopt(
+			transfer([hold(ref("d".repeat(64)))], {
+				beforeAccept: () => {
+					try {
+						owner.seal();
+					} catch (error) {
+						sealError = error;
+					}
+				},
+			}),
+		);
+
+		expect(sealError).toBeInstanceOf(GenerationContentOwnerError);
+		owner.seal();
+		await owner.release();
+	});
+
+	it("rejects sealing an owner that duplicate cleanup already poisoned", async () => {
+		const exact = ref("e".repeat(64));
+		const retained = hold(exact);
+		const duplicate = hold(exact);
+		let attempts = 0;
+		const owner = new GenerationContentOwner({
+			serverEpoch: SERVER_EPOCH,
+			generation: 13,
+			release: async (entry) => {
+				if (entry === duplicate && attempts++ === 0) throw new Error("fixture duplicate cleanup failed");
+			},
+		});
+		owner.adopt(transfer([retained, duplicate]));
+		await expect(owner.fatalCleanup).rejects.toThrow("fixture duplicate cleanup failed");
+
+		expect(() => owner.seal()).toThrow(GenerationContentOwnerError);
+		await owner.release();
+	});
+
+	it("rejects sealing while release is pending or after the owner closed", async () => {
+		let finishRelease!: () => void;
+		const releaseGate = new Promise<void>((resolve) => {
+			finishRelease = resolve;
+		});
+		const owner = new GenerationContentOwner({
+			serverEpoch: SERVER_EPOCH,
+			generation: 14,
+			release: async () => releaseGate,
+		});
+		owner.adopt(transfer([hold(ref("f".repeat(64)))]));
+
+		const releasing = owner.release();
+		expect(() => owner.seal()).toThrow(GenerationContentOwnerError);
+		finishRelease();
+		await releasing;
+		expect(() => owner.seal()).toThrow(GenerationContentOwnerError);
+	});
 });

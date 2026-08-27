@@ -2,7 +2,7 @@ import { isSessionAttachmentRefDto, type SessionAttachmentRefDto } from "@pi-age
 import type { EpochContentHold } from "./epoch-content-store.js";
 import type { PiPayloadLeaseTransfer } from "./pi-payload-externalizer.js";
 
-type OwnerState = "active" | "adopting" | "poisoned" | "closing" | "closed";
+type OwnerState = "active" | "adopting" | "sealed" | "poisoned" | "closing" | "closed";
 
 interface OwnedContent {
 	ref: SessionAttachmentRefDto;
@@ -69,6 +69,15 @@ export class GenerationContentOwner {
 
 	get refs(): readonly SessionAttachmentRefDto[] {
 		return Object.freeze([...this.byDigest.values()].map((entry) => entry.ref));
+	}
+
+	/** Closes adoption without releasing content that is still reachable. */
+	seal(): void {
+		if (this.state === "sealed") return;
+		if (this.state !== "active") {
+			throw new GenerationContentOwnerError("generation content owner cannot be sealed");
+		}
+		this.state = "sealed";
 	}
 
 	/** Atomically adopts a trusted transfer after preflighting every exact hold/reference pair. */
@@ -222,7 +231,7 @@ export class GenerationContentOwner {
 	}
 
 	private poison(error: unknown): void {
-		if (this.state === "active") this.state = "poisoned";
+		if (this.state === "active" || this.state === "sealed") this.state = "poisoned";
 		if (!this.fatalCleanupSignaled) {
 			this.fatalCleanupSignaled = true;
 			this.rejectFatalCleanup(error);
