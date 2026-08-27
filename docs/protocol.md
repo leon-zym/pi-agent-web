@@ -214,6 +214,20 @@ Gateway 只有在所有表内边界已经执行、旧 epoch reference 会 fail c
 `admissionError` 是 Gateway-owned 字段。Pi raw failure response 携带该字段属于协议不兼容；Bridge
 只从 Gateway 内部真实 `RpcError` 透传结构，不接受普通 Error 或形似对象注入。
 
+Server 已实现 default-off 的 Pi image output seam。Adapter 顺序是 command/event-specific raw guard →
+可选 image externalization → trusted epoch/budget product guard → redaction。Externalizer 只处理 message
+content、message/custom_message entry、三个 history success response 和五类明确携带 message/entry 的
+authoritative event；tool args/result/details、Extension UI 与 opaque JSON 保持原值。Late 或 unknown-id
+response 只完成 command-specific raw validation 后丢弃，不调用 externalizer。Main 尚未安装该 seam，
+Gateway hello 不广告 `payload.epoch_attachment_refs`，当前 Browser 仍使用 inline image。
+
+Externalized outcome 显式携带 provisional lease。PiProcess 只在同步 prepare 和 commit 都返回 literal
+`true`、且 spawn/pending identity 仍匹配后移交 transfer；late、timeout、abort、stale 与 ownerless 路径
+负责释放。Runtime owner 在 ref 进入 projection、replay 或 snapshot 前接管 hold，并跨 startup、普通
+event/response、idle compaction 和 identity transition 保持 generation ownership。Correlated response
+只有可信 blob/cache ceiling evidence 或 PiProcess 自身 caller abort/deadline 可转为 Gateway delivery failure；
+所有 authoritative event failure、payload provenance/integrity failure 与 unsafe store state 都是 terminal。
+
 ### Attachment REST staging contract
 
 Attachment REST 使用与其他 `/api/v1/*` 路由相同的 loopback Host、same-origin Origin/Fetch Metadata 和
@@ -375,7 +389,7 @@ does not change the ordinary replay-gap rule above.
 | `<workspace>/.pi/settings.json` | 项目级覆盖与可选 `sessionDir`；project 覆盖 global |
 | 默认 Session 目录 | `<agentDir>/sessions/--<encoded-cwd>--/*.jsonl` |
 | 自定义 Session 目录 | env/global/project 指定的直接目录，不再追加 cwd 编码 |
-| Web data | Workspace presentation preferences、启动期控制数据与 recoverable trash；不保存正常 Session 副本 |
+| Web data | Workspace preferences、启动期控制数据、recoverable trash，以及 epoch-scoped derived attachment blob/manifest；不保存正常 Session 副本 |
 
 默认目录编码只用于发现候选目录：
 
@@ -396,10 +410,11 @@ Workspace cwd 解析；Gateway 必须让 Catalog 与 child 看到相同结果。
 probe，再以 exact version compatibility matrix 校验 adapter 与必需 capabilities。发行依赖版本、Pi
 package manifest 与 probe 输出必须一致；失败使用稳定且不含路径/凭据的诊断码。
 
-Pi stdout 先由 `legacy-rpc-v1` adapter 完整解码为产品 DTO。响应按 command 校验 nested data，事件与
-Extension UI 按 discriminant、UTF-8 bytes、item count、safe number 与 JSON depth 校验。显式列入
-non-authoritative allowlist 的 frame 可忽略；其他未知或畸形权威 frame 进入单一
-`protocol_incompatible` 终态。
+Pi stdout 先由 `legacy-rpc-v1` adapter 的 raw wire guard 按 command/event 验证，再转换为产品 DTO。
+响应按 command 校验 nested data，事件与 Extension UI 按 discriminant、UTF-8 bytes、item count、safe
+number 与 JSON depth 校验。显式列入 non-authoritative allowlist 的 frame 可忽略；其他未知或畸形权威
+frame 进入单一 `protocol_incompatible` 终态。若注入 server-private image externalizer，转换顺序和
+ownership 采用上面的 default-off attachment seam。
 
 The first WebSocket frame must be `client_hello`. A successful `server_hello` carries the Gateway
 protocol major and minor, server build and epoch, Pi version, adapter id, capability intersection,

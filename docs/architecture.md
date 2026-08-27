@@ -43,6 +43,7 @@ Node Gateway · Hono + ws
   ├─ SessionLayoutResolver ── NativeSessionCatalog
   │                             └─ bounded streaming JSONL summaries
   ├─ WorkspacePreferences (presentation and discovery hints only)
+  ├─ EpochContentStore (epoch-scoped derived attachment spool)
   ├─ Native REST routes
   ├─ SessionWsBridge (multiplexing, catch-up, id mapping, backpressure)
   └─ SessionSupervisor (bounded hot-runtime pool)
@@ -52,9 +53,10 @@ Node Gateway · Hono + ws
          └─ dormant Session C ─ no process
                                       │
                                       └─ Pi settings, credentials, extensions, JSONL history
-
-RecoverableSessionTrash is a side store used only by fenced deletion.
 ```
+
+RecoverableSessionTrash is a side store used only by fenced deletion. EpochContentStore holds only
+bounded, discardable attachment derivatives; neither store replaces Pi JSONL.
 
 ## 身份模型
 
@@ -174,8 +176,30 @@ Gateway 已提供同源、认证后的 attachment REST ingress：
   或像素数据可解码。Browser preprocessing 与最终 Pi/provider 消费路径仍需处理 decode failure。
 
 Attachment REST 与 store 是协议分阶段接入的基础设施。Gateway hello 目前仍不广告
-`payload.epoch_attachment_refs`，Browser 也不能因为 REST endpoint 存在就发送 reference。WebSocket
-command、adapter externalization、UI composer 与 recovery 接入完成并满足全部预算边界后，才能回显该能力。
+`payload.epoch_attachment_refs`，Browser 也不能因为 REST endpoint 存在就发送 reference。Main 当前
+没有向 Supervisor 注入 server-private Pi payload services，Browser 继续发送 inline image。
+
+Server 已实现 default-off 的 Pi image externalization 路径。`legacy-rpc-v1` 先用 command/event-specific
+raw guard 验证来源，再只遍历明确的 image 语义槽：user、toolResult 与 custom message content，message
+与 custom_message entry，`get_messages`、`get_entries`、`get_tree` 成功响应，以及 `agent_end`、
+`turn_end`、`message_start`、`message_end`、`entry_appended` 事件。Tool args/result/details、Extension UI
+与 opaque JSON 不递归，嵌套 lookalike 也不会获得 reference 语义。每个 inline image 先严格验证 canonical
+base64，再用唯一 decoded Buffer 完成 raster admission、SHA-256 和 store staging；整帧通过 trusted product
+guard 后才返回 `{value, lease}`，任一失败都会回滚该帧取得的 holds。
+
+Lease 通过 PiProcess 的两阶段 decoded-delivery seam 移交，timeout、abort、late response、stale spawn 与
+ownerless outcome 都会幂等释放。启用该 seam 的 Runtime 为每个 generation 建立 content owner，并在
+startup history、普通 response/event、idle compaction 与 fork/clone rekey 中先接管 holds，再推进
+projection、seq、replay 或 child identity。Transition ledger 只在身份未决期间保存 staged transfer，
+验证 parent 后归还 parent owner，验证 child 后原子转入 child owner；不确定失败清理 parent、candidate 与
+ledger，禁止发布半完成 child frame。
+
+Correlated response 只有具备可信 limit/actual evidence 的 blob ceiling、cache bytes/items exhaustion，
+以及 PiProcess 自己判定的 caller abort/deadline 才是 response-local Gateway delivery failure。Raw/product/
+provenance/raster 不兼容、manifest/path safety、rollback failure 和所有 authoritative event externalization
+failure 都会终止当前 Runtime。Manual/capacity stop、recoverable crash、generation roll、rekey、overflow
+与 shutdown 清理 projection 和 holds；只有已建立最终 projection、没有未决 cleanup 的真实
+nonrecoverable leader crash 才 seal 并保留当前 owner，直到显式 stop 或 Gateway shutdown。
 
 Reference 消费入口必须把 canonical DTO、协商后的 blob ceiling 与当前 `serverEpoch` 作为同一次
 admission 判断。Payload ceiling 必须保持 producer 不大于 consumer。Raw Pi event 到 normalized event
@@ -384,8 +408,8 @@ Gateway 进程存活，`/health/ready` 表示 Pi 版本、adapter 与能力已�
 
 HTTP server 只有在 `listening` 后才 resolve；bind 失败会清理已创建资源。关闭顺序先停止
 新 ingress，给 HTTP/WS 一个短的有界 grace，随后 terminate/destroy 残留连接，等待 activation、
-delete 和 pool transaction，停止所有 Pi 进程，最后释放 preferences 文件锁。重复 close 共享同一
-Promise，关闭开始后所有新 mutation 都被拒绝。
+delete 和 pool transaction，停止所有 Pi 进程，再关闭 content store，最后释放 preferences 文件锁。
+重复 close 共享同一 Promise，关闭开始后所有新 mutation 都被拒绝。
 
 ## 非目标
 

@@ -47,6 +47,12 @@ Focused Vitest 可以在 package 内传文件：
 pnpm --filter @pi-agent-web/server exec vitest run test/session-supervisor.test.ts
 pnpm --filter @pi-agent-web/server exec vitest run test/epoch-content-store.test.ts
 pnpm --filter @pi-agent-web/server exec vitest run test/attachment-routes.test.ts test/main-lifecycle.test.ts
+pnpm --filter @pi-agent-web/server exec vitest run \
+  test/legacy-rpc-v1-wire.test.ts test/pi-payload-externalizer.test.ts
+pnpm --filter @pi-agent-web/server exec vitest run \
+  test/pi-process.test.ts test/generation-content-owner.test.ts
+pnpm --filter @pi-agent-web/server exec vitest run \
+  test/transition-payload-ledger.test.ts test/session-live-projection.test.ts
 pnpm --filter @pi-agent-web/ui exec vitest run test/session-transport.test.ts
 pnpm exec playwright test --config tests/e2e/playwright.config.ts multi-session.spec.ts
 ```
@@ -85,10 +91,12 @@ Attachment store 与 REST 变更至少覆盖以下边界：
   init/bind failure 仍要释放已经取得的锁。
 
 Raster fixtures 只证明 Gateway admission 的 MIME、magic、gross container 与 truncation 边界，不宣称图片
-通过真实 decoder。Codec validity、Browser preprocessing、reference composer、adapter externalization 与
-provider acceptance 需要各自的上层测试。`payload.epoch_attachment_refs` 尚未广告，因此当前 Browser E2E
-继续覆盖 inline image；在 capability、UI 与 recovery 接入完成前，不能把 attachment REST 测试记作完整
-用户路径。
+通过真实 decoder。Browser preprocessing 已用原生 decode seam 覆盖；server-private adapter externalizer
+复用同一 raster admission，并验证 canonical base64、decoded/blob ceiling、同帧去重、单 Buffer streaming
+与整帧 rollback。PiProcess 与 Runtime 测试覆盖 late/deadline/stale/orphan disposal，startup、普通
+response/event、idle compaction、generation cleanup、fork/clone/rekey ownership，以及 cleanup rejection 的
+永久 fence。`payload.epoch_attachment_refs` 尚未广告，Main 未注入 payload services，当前 Browser E2E
+继续覆盖 inline image；server-private L1/L2 测试和 attachment REST 测试都不构成完整用户路径。
 
 ## 确定性 browser E2E
 

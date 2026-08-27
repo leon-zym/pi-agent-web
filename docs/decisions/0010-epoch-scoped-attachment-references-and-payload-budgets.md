@@ -56,12 +56,31 @@ Gateway restart even though its backing bytes may have disappeared.
 8. The Gateway may advertise the capability only after every advertised boundary is enforced and
    stale references fail closed. Until then, peers continue using the minor 1 compatible inline
    payload path even when they can select protocol minor 2.
+9. The server-private Pi output path externalizes images only from reviewed raw message and entry
+   slots. Command/event-specific raw guards run first, and the epoch-aware product guard runs after
+   externalization. Tool details, Extension UI, opaque JSON, and nested lookalike objects never gain
+   reference semantics.
+10. Externalization is transactional per frame and returns an explicit provisional lease. PiProcess
+    exposes attachment custody only through a synchronous two-phase decoded-delivery contract;
+    timeout, abort, late, stale, orphaned, and ownerless outcomes release their lease. A Runtime
+    generation owner adopts holds before refs enter projection, replay, or snapshots. Fork/clone
+    uses a bounded transition ledger until parent or child identity is verified.
+11. Correlated response failure is local only for evidenced blob/cache ceiling exhaustion and a
+    PiProcess-owned caller abort or response deadline. Authoritative event failure, malformed
+    provenance, raster or product incompatibility, unsafe store state, and rollback failure terminate
+    the Runtime. Manual or capacity stop, recoverable crash, generation roll, rekey, overflow, and
+    shutdown release reachable holds. A true nonrecoverable leader crash may retain a sealed final
+    projection and its owner until explicit stop or shutdown.
+12. The production Main does not install the server-private externalizer or Runtime payload services.
+    Gateway hello therefore does not advertise `payload.epoch_attachment_refs`, and the Browser
+    continues to use inline images.
 
 ## Consequences
 
-The Browser can distinguish a payload policy failure from a Pi command failure without parsing
-localized text. Future server and UI slices can reuse attachment bytes during one Gateway lifetime
-without treating that cache as recoverable storage.
+The Browser protocol can distinguish a payload policy failure from a Pi command failure without
+parsing localized text. The server-private image path can reuse attachment bytes during one Gateway
+lifetime without treating that cache as recoverable storage. Since Main leaves the path disabled,
+these references are not part of the current Browser/Gateway runtime contract.
 
 A Gateway restart intentionally loses reference continuity. Recovery may spend CPU and bandwidth to
 externalize Pi-owned attachment content again. This is preferable to accepting a reference whose
@@ -89,9 +108,11 @@ review and tests at every affected boundary.
 - Protocol tests cover minor 1 hello compatibility, minor 2 capability and complete-budget gating,
   negotiation frame relationships, strict canonical budget guards, epoch-scoped reference guards,
   and structured command admission errors.
-- Later server tests must cover cache admission and eviction, stale-epoch rejection, Pi-to-product
-  externalization, product-to-Pi resolution, and every advertised byte boundary before enabling the
-  capability.
-- Later UI and Browser tests must cover reference reuse within one epoch, restart recovery through a
-  fresh Pi-derived reference, localized structured failures, and fallback when the capability is not
-  negotiated.
+- Store and route tests cover cache admission and eviction, stale-epoch rejection, exact-metadata
+  holds, raster validation, fixed-memory duplicate PUT verification, download pins, lifecycle locks,
+  and shutdown races.
+- Adapter, PiProcess, projection, and Runtime tests cover raw provenance, image externalization,
+  transactional rollback, decoded-delivery disposal, active generation ownership, compaction,
+  rekey, transition cleanup, and stop/crash cleanup fences.
+- Browser preprocessing tests cover decode failure and bounded inline image preparation. Production
+  Browser tests remain on the inline path because Main does not install or advertise attachment refs.
