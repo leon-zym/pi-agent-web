@@ -333,7 +333,6 @@ describe("production server lifecycle", () => {
 				headers: {
 					...headers,
 					"Content-Type": "image/webp",
-					"Content-Length": String(bytes.byteLength),
 				},
 				body: bytes,
 			});
@@ -362,7 +361,6 @@ describe("production server lifecycle", () => {
 				headers: {
 					...headers,
 					"Content-Type": "image/webp",
-					"Content-Length": String(largeBytes.byteLength),
 				},
 				body: largeBytes,
 			});
