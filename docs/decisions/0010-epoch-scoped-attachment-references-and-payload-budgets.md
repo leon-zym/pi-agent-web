@@ -46,11 +46,13 @@ Gateway restart even though its backing bytes may have disappeared.
 6. Attachment blobs and their index are a bounded, discardable derived cache. They are not Session
    history, do not establish persistence, and may be evicted at any time. Pi JSONL and Pi Runtime
    state remain authoritative.
-7. Payload admission failures use the product-owned `payload_admission_error` shape. Sized failures
-   carry a stable code, boundary, limit, and actual byte count. Capability and attachment reference
-   failures omit synthetic byte evidence. A failed command response may carry this structure beside
-   its human-readable error. The field is Gateway-owned: the Pi adapter rejects it on raw Pi
-   responses, and the WebSocket bridge forwards it only from an actual internal `RpcError`.
+7. Payload admission failures use the product-owned `payload_admission_error` shape. Byte failures
+   carry a stable code, boundary, byte limit, and actual byte count. Attachment cache item exhaustion
+   uses `attachment_cache_item_limit_exceeded` with an item limit and actual item count. Capability
+   and attachment reference failures omit synthetic size evidence. A failed command response may
+   carry this structure beside its human-readable error. The field is Gateway-owned: the Pi adapter
+   rejects it on raw Pi responses, and the WebSocket bridge forwards it only from an actual internal
+   `RpcError`.
 8. The Gateway may advertise the capability only after every advertised boundary is enforced and
    stale references fail closed. Until then, peers continue using the minor 1 compatible inline
    payload path even when they can select protocol minor 2.

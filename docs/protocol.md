@@ -204,11 +204,13 @@ externalize，生成新 epoch 的 reference。Blob 与索引只是有界、可�
 读取权限。
 
 Payload admission 失败使用结构化
-`{type:"payload_admission_error",code,boundary,limitBytes?,actualBytes?}`。超限与 cache exhaustion
-同时携带 `limitBytes` 和更大的 `actualBytes`；能力缺失、reference 非法、epoch 不匹配或 blob 不可用
-不伪造 byte evidence。失败的 command response 可以在可读 `error` 之外携带 `admissionError`，UI 不得
-依赖解析错误文案；共享 response helper 抛出的 `RpcError` 会保留这个结构。Gateway 只有在所有表内
-边界已经执行、旧 epoch reference 会 fail closed 后才能实际回显并启用该能力。
+`{type:"payload_admission_error",code,boundary,limitBytes?,actualBytes?,limitItems?,actualItems?}`。
+Byte 超限与 byte cache exhaustion 同时携带 `limitBytes` 和更大的 `actualBytes`。Attachment cache
+item 上限使用独立的 `attachment_cache_item_limit_exceeded` code、`limitItems` 和更大的
+`actualItems`，不能用 byte 字段冒充 item evidence。能力缺失、reference 非法、epoch 不匹配或 blob
+不可用不伪造 size evidence。失败的 command response 可以在可读 `error` 之外携带
+`admissionError`，UI 不得依赖解析错误文案；共享 response helper 抛出的 `RpcError` 会保留这个结构。
+Gateway 只有在所有表内边界已经执行、旧 epoch reference 会 fail closed 后才能实际回显并启用该能力。
 `admissionError` 是 Gateway-owned 字段。Pi raw failure response 携带该字段属于协议不兼容；Bridge
 只从 Gateway 内部真实 `RpcError` 透传结构，不接受普通 Error 或形似对象注入。
 

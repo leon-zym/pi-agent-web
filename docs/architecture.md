@@ -142,8 +142,11 @@ Gateway、Pi adapter、projection、replay、snapshot 与 queue 的统一 payloa
 可选的 `payload.epoch_attachment_refs` 能力协商完整预算；minor 1 hello 保持旧 shape。分阶段接入时，
 只有已经执行表内全部边界的 Gateway 才能回显该能力，否则继续使用原有 inline image 合同。
 
-Attachment blob 与索引是 Gateway 内存中的有界派生 cache，不是新的持久化层。Reference 携带创建它的
-`serverEpoch`、内容摘要、media type 与 byte length，只能在完全相同的 epoch 使用。Gateway restart
+Attachment blob 使用 `webDataDir` 下的私有、epoch-scoped disk spool，容量、hold、pin 与 publish 状态由
+Gateway 内存 ledger 管理；它仍是可丢弃的有界派生 cache，不是新的持久化层。Store root 由单个 Gateway
+生命周期锁独占，持锁者才可把旧 epoch 原子改名为 tombstone 后清理。写入先按声明长度预留容量；未知长度
+按单 blob 上限预留，然后流式计算 SHA-256，并通过同目录临时文件与原子 rename 发布 manifest。Reference
+携带创建它的 `serverEpoch`、内容摘要、media type 与 byte length，只能在完全相同的 epoch 使用。Gateway restart
 会使旧 reference 无效；后续恢复必须从 Pi JSONL 或 Pi Runtime 的权威内容重新 externalize，不能只凭
 digest 推断新进程仍拥有原 blob。Cache eviction 也不改变 Pi 内容，缺失 blob 必须 fail closed 或从
 Pi authority 重建，不能把附件静默替换为空值。
@@ -156,8 +159,9 @@ replay frame 到 server frame，以及 Pi snapshot 到 canonical snapshot 再到
 backlog ceiling 通过单个 oversized item 隔离处理，不代表合法大 frame 可以无限排队。
 
 每一层在占用 buffer、推进 seq、写入 Pi 或发送 socket 之前执行自己的 admission。拒绝结果使用稳定的
-`payload_admission_error` code 与 boundary；有实际 byte ceiling 的失败同时报告 limit 与 actual。这个
-结构用于 UI 本地化和诊断，不改变 Pi response barrier、Session identity 或 controller fencing。
+`payload_admission_error` code 与 boundary；有实际 byte ceiling 的失败同时报告 byte limit 与 actual，
+attachment cache item ceiling 使用独立的 item limit 与 actual。这个结构用于 UI 本地化和诊断，不改变
+Pi response barrier、Session identity 或 controller fencing。
 该结构由 Gateway 拥有。Pi adapter 拒绝 raw Pi response 中的同名字段，Bridge 只透传 Gateway 内部真实
 `RpcError` 携带的 admission detail。
 

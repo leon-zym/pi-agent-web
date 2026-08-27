@@ -193,7 +193,18 @@ type UnsizedPayloadAdmissionErrorDto = {
 	boundary: SessionPayloadAdmissionBoundaryDto;
 };
 
-export type SessionPayloadAdmissionErrorDto = SizedPayloadAdmissionErrorDto | UnsizedPayloadAdmissionErrorDto;
+export type SessionAttachmentCacheItemLimitAdmissionErrorDto = {
+	type: "payload_admission_error";
+	code: "attachment_cache_item_limit_exceeded";
+	boundary: "attachment_cache";
+	limitItems: number;
+	actualItems: number;
+};
+
+export type SessionPayloadAdmissionErrorDto =
+	| SizedPayloadAdmissionErrorDto
+	| SessionAttachmentCacheItemLimitAdmissionErrorDto
+	| UnsizedPayloadAdmissionErrorDto;
 
 const PAYLOAD_ADMISSION_BOUNDARIES = new Set<SessionPayloadAdmissionBoundaryDto>([
 	"capability",
@@ -214,7 +225,19 @@ const PAYLOAD_ADMISSION_BOUNDARIES = new Set<SessionPayloadAdmissionBoundaryDto>
 ]);
 
 export function isSessionPayloadAdmissionErrorDto(value: unknown): value is SessionPayloadAdmissionErrorDto {
-	if (!isCanonicalRecord(value, ["type", "code", "boundary", "limitBytes", "actualBytes"])) return false;
+	if (
+		!isCanonicalRecord(value, [
+			"type",
+			"code",
+			"boundary",
+			"limitBytes",
+			"actualBytes",
+			"limitItems",
+			"actualItems",
+		])
+	) {
+		return false;
+	}
 	if (
 		value.type !== "payload_admission_error" ||
 		typeof value.boundary !== "string" ||
@@ -237,6 +260,15 @@ export function isSessionPayloadAdmissionErrorDto(value: unknown): value is Sess
 			isSafePositiveInteger(value.limitBytes) &&
 			isSafePositiveInteger(value.actualBytes) &&
 			value.actualBytes > value.limitBytes
+		);
+	}
+	if (value.code === "attachment_cache_item_limit_exceeded") {
+		return (
+			Object.keys(value).length === 5 &&
+			value.boundary === "attachment_cache" &&
+			isSafePositiveInteger(value.limitItems) &&
+			isSafePositiveInteger(value.actualItems) &&
+			value.actualItems > value.limitItems
 		);
 	}
 	if (

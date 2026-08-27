@@ -12,6 +12,7 @@ import {
 	SESSION_ATTACHMENT_BLOB_MAX_BYTES,
 	SESSION_EVENT_ENVELOPE_HEADROOM_BYTES,
 	SESSION_PAYLOAD_BUDGET,
+	type SessionAttachmentCacheItemLimitAdmissionErrorDto,
 } from "../src/index.js";
 
 describe("Session payload budget", () => {
@@ -335,5 +336,54 @@ describe("structured payload admission errors", () => {
 				limitBytes: 1,
 			}),
 		).toBe(false);
+	});
+
+	it("represents attachment cache item exhaustion with canonical item evidence", () => {
+		const itemLimitError = {
+			type: "payload_admission_error",
+			code: "attachment_cache_item_limit_exceeded",
+			boundary: "attachment_cache",
+			limitItems: SESSION_PAYLOAD_BUDGET.maxAttachmentCacheItems,
+			actualItems: SESSION_PAYLOAD_BUDGET.maxAttachmentCacheItems + 1,
+		} as const satisfies SessionAttachmentCacheItemLimitAdmissionErrorDto;
+
+		expect(isSessionPayloadAdmissionErrorDto(itemLimitError)).toBe(true);
+		expect(
+			isSessionCommandResponseDto({
+				type: "response",
+				id: "prompt-1",
+				command: "prompt",
+				success: false,
+				error: "attachment cache item limit exceeded",
+				admissionError: itemLimitError,
+			}),
+		).toBe(true);
+		expect(
+			isSessionPayloadAdmissionErrorDto({
+				...itemLimitError,
+				actualItems: itemLimitError.limitItems,
+			}),
+		).toBe(false);
+		expect(
+			isSessionPayloadAdmissionErrorDto({
+				...itemLimitError,
+				boundary: "attachment_blob",
+			}),
+		).toBe(false);
+		expect(
+			isSessionPayloadAdmissionErrorDto({
+				...itemLimitError,
+				limitBytes: itemLimitError.limitItems,
+				actualBytes: itemLimitError.actualItems,
+			}),
+		).toBe(false);
+		expect(isSessionPayloadAdmissionErrorDto({ ...itemLimitError, extra: true })).toBe(false);
+		expect(isSessionPayloadAdmissionErrorDto(Object.create(itemLimitError))).toBe(false);
+		const accessor = { ...itemLimitError };
+		Object.defineProperty(accessor, "actualItems", {
+			enumerable: true,
+			get: () => itemLimitError.actualItems,
+		});
+		expect(isSessionPayloadAdmissionErrorDto(accessor)).toBe(false);
 	});
 });
