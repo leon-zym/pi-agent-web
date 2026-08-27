@@ -426,6 +426,22 @@ export class EpochContentStore {
 		}
 	}
 
+	/**
+	 * Acquires a hold for already-published exact content without opening a download stream.
+	 * Callers must already own generation-authorized content identity; this does not admit or hash a body.
+	 */
+	holdPublished(ref: SessionAttachmentRefDto): Promise<EpochContentHold> {
+		try {
+			this.#assertReady();
+			this.#validateRef(ref);
+			const operation = this.#publicOperation(this.#holdPublishedInternal(ref));
+			this.#track(operation);
+			return operation;
+		} catch (error) {
+			return Promise.reject(error);
+		}
+	}
+
 	release(handle: EpochContentHold | EpochContentPin): Promise<void> {
 		const token = this.#tokens.get(handle);
 		if (!token?.active) return Promise.resolve();
@@ -775,6 +791,18 @@ export class EpochContentStore {
 			entry.pins = Math.max(0, entry.pins - 1);
 			throw error;
 		}
+	}
+
+	async #holdPublishedInternal(ref: SessionAttachmentRefDto): Promise<EpochContentHold> {
+		return this.#withDigestLock(ref.sha256, async () => {
+			const entry = this.#entries.get(ref.sha256);
+			if (!entry || entry.deleting) fail("not_found", "Attachment content is unavailable");
+			if (!refsEqual(entry.ref, ref)) fail("manifest_mismatch", "Attachment metadata differs");
+			if (!entry.published) fail("not_published", "Attachment is not published");
+			await this.#verifyManifest(ref, true);
+			this.#assertReady();
+			return this.#createHold(entry);
+		});
 	}
 
 	async #releaseInternal(handle: EpochContentHold | EpochContentPin, token: TokenState): Promise<void> {

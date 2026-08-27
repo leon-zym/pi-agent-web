@@ -621,6 +621,111 @@ describe("EpochContentStore", () => {
 		await expect(store.pinByDigest("A".repeat(64))).rejects.toMatchObject({ code: "invalid_ref" });
 	});
 
+	it("acquires and releases an exact published hold without opening the blob", async () => {
+		let contentOpens = 0;
+		const { open } = await import("node:fs/promises");
+		const store = await createStore(
+			"epoch-published-hold",
+			{},
+			{
+				webDataDir,
+				serverEpoch: "epoch-published-hold",
+				async openFile(filePath, flags, mode) {
+					if (path.basename(filePath) === "content") contentOpens += 1;
+					return open(filePath, flags, mode);
+				},
+			},
+		);
+		const ref = await publishContent(store, { source: source("hold-me"), mediaType: "image/png" });
+		contentOpens = 0;
+
+		const hold = await store.holdPublished(ref);
+		expect(hold.ref).toBe(ref);
+		expect(contentOpens).toBe(0);
+		expect(await store.gc()).toEqual({ bytes: 0, items: 0 });
+		await store.release(hold);
+		expect(await store.gc()).toEqual({ bytes: ref.byteLength, items: 1 });
+		expect(contentOpens).toBe(0);
+	});
+
+	it("requires exact published metadata when acquiring a hold", async () => {
+		const store = await createStore("epoch-hold-metadata");
+		const staged = await store.stage({ source: source("metadata"), mediaType: "image/png" });
+		await expect(store.holdPublished(staged.ref)).rejects.toMatchObject({ code: "not_published" });
+		await store.publish(staged.hold);
+		await store.release(staged.hold);
+
+		await expect(store.holdPublished({ ...staged.ref, mediaType: "image/webp" })).rejects.toMatchObject({
+			code: "manifest_mismatch",
+		});
+		await expect(
+			store.holdPublished({ ...staged.ref, byteLength: staged.ref.byteLength + 1 }),
+		).rejects.toMatchObject({
+			code: "manifest_mismatch",
+		});
+		await expect(store.holdPublished({ ...staged.ref, sha256: "f".repeat(64) })).rejects.toMatchObject({
+			code: "not_found",
+		});
+	});
+
+	it("serializes published hold acquisition with GC deletion", async () => {
+		let gcRenameEntered!: () => void;
+		const entered = new Promise<void>((resolve) => {
+			gcRenameEntered = resolve;
+		});
+		let allowGcRename!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			allowGcRename = resolve;
+		});
+		const { rename } = await import("node:fs/promises");
+		const store = await createStore(
+			"epoch-hold-gc-race",
+			{},
+			{
+				webDataDir,
+				serverEpoch: "epoch-hold-gc-race",
+				async rename(from, to) {
+					if (/^[0-9a-f]{64}$/.test(path.basename(from)) && path.basename(to).startsWith(".tombstone-")) {
+						gcRenameEntered();
+						await gate;
+					}
+					await rename(from, to);
+				},
+			},
+		);
+		const ref = await publishContent(store, { source: source("collect"), mediaType: "image/png" });
+
+		const collecting = store.gc();
+		await entered;
+		const holding = store.holdPublished(ref);
+		allowGcRename();
+		expect(await collecting).toEqual({ bytes: ref.byteLength, items: 1 });
+		await expect(holding).rejects.toMatchObject({ code: "not_found" });
+	});
+
+	it("rechecks a snapshotted GC candidate after a published hold wins the digest lock", async () => {
+		const store = await createStore("epoch-hold-wins-gc");
+		const ref = await publishContent(store, { source: source("retained"), mediaType: "image/png" });
+
+		const holding = store.holdPublished(ref);
+		const collecting = store.gc();
+		const hold = await holding;
+		expect(await collecting).toEqual({ bytes: 0, items: 0 });
+		await expect(readContent(store, ref)).resolves.toEqual(Buffer.from("retained"));
+		await store.release(hold);
+	});
+
+	it("fails closed when shutdown races published hold acquisition", async () => {
+		const store = await createStore("epoch-hold-shutdown-race");
+		const ref = await publishContent(store, { source: source("shutdown-hold"), mediaType: "image/png" });
+
+		const holding = store.holdPublished(ref);
+		const shutdown = store.shutdown();
+		await expect(holding).rejects.toMatchObject({ code: "closed" });
+		await shutdown;
+		await expect(store.holdPublished(ref)).rejects.toMatchObject({ code: "closed" });
+	});
+
 	it("establishes manifest permissions before rename so publish cannot split disk and memory state", async () => {
 		let manifestChmods = 0;
 		const { open } = await import("node:fs/promises");

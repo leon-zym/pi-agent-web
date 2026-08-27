@@ -341,6 +341,17 @@ describe("attachment REST routes", () => {
 		const wrongLength = await put(app, PNG, { contentLength: String(PNG.byteLength - 1) });
 		expect(wrongLength.status).toBe(422);
 		expect(await errorCode(wrongLength)).toBe("declared_length_mismatch");
+
+		const invalidGif = Buffer.from(GIF);
+		invalidGif[invalidGif.byteLength - 1] = 0;
+		const digestBeforeGross = await put(app, invalidGif, { sha256: "0".repeat(64), mediaType: "image/gif" });
+		expect(await errorCode(digestBeforeGross)).toBe("declared_digest_mismatch");
+		const lengthBeforeDigestAndGross = await put(app, Buffer.concat([invalidGif, Buffer.from([0])]), {
+			sha256: "0".repeat(64),
+			mediaType: "image/gif",
+			contentLength: String(invalidGif.byteLength),
+		});
+		expect(await errorCode(lengthBeforeDigestAndGross)).toBe("declared_length_mismatch");
 	});
 
 	it.each([
