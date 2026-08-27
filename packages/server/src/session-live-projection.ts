@@ -1,12 +1,15 @@
 import {
 	type ExtensionUiRequestDto,
 	isProductSessionEventDto,
+	isSessionAttachmentGuardContext,
+	isSessionMessageDto,
 	type ProductSessionEventDto,
 	SESSION_SNAPSHOT_MAX_BYTES,
 	SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS,
 	SESSION_SNAPSHOT_MAX_MESSAGES,
 	SESSION_SNAPSHOT_MAX_PROJECTION_EVENTS,
 	SESSION_SNAPSHOT_MAX_QUEUE_ITEMS,
+	type SessionAttachmentGuardContext,
 	type SessionMessageDto,
 	type SessionProjectionEventDto,
 } from "@pi-agent-web/protocol";
@@ -52,6 +55,7 @@ export interface SessionLiveProjectionOptions {
 	baseSeq: number;
 	runtimePhase?: SessionLiveRuntimePhase;
 	limits?: Partial<SessionLiveProjectionLimits>;
+	attachmentGuardContext?: SessionAttachmentGuardContext;
 }
 
 export type SessionLiveProjectionInput =
@@ -88,8 +92,34 @@ export interface SessionLiveProjectionTurnBudget {
 	maxBytes: number;
 }
 
+export interface SessionLiveProjectionPreparedCommit {
+	readonly nextSeq: number;
+}
+
+export interface SessionLiveProjectionPreparedCompaction {
+	readonly expectedAsOfSeq: number;
+}
+
 interface InternalCompactionToken extends SessionLiveProjectionCompactionToken {
 	owner: symbol;
+}
+
+interface PreparedCommitState {
+	revision: number;
+	nextSeq: number;
+	projectionEvents: readonly SessionLiveProjectionEventFrame[];
+	projectionEventFrameBytes: readonly number[];
+	projectionEventBytes: number;
+	queue: { readonly steering: readonly string[]; readonly followUp: readonly string[] };
+	pendingExtensionRequests: Map<string, ExtensionUiRequestDto>;
+	runtimePhase: SessionLiveRuntimePhase;
+}
+
+interface PreparedCompactionState {
+	revision: number;
+	settledMessages: readonly SessionMessageDto[];
+	settledMessageBytes: number;
+	baseSeq: number;
 }
 
 export class SessionLiveProjectionIdentityError extends Error {
@@ -109,6 +139,13 @@ export class SessionLiveProjectionLimitError extends Error {
 	}
 }
 
+export class SessionLiveProjectionPayloadError extends Error {
+	constructor() {
+		super("session_live_projection_payload_invalid");
+		this.name = "SessionLiveProjectionPayloadError";
+	}
+}
+
 /**
  * Ephemeral product-domain Session projection.
  *
@@ -119,7 +156,12 @@ export class SessionLiveProjectionLimitError extends Error {
 export class SessionLiveProjection {
 	private readonly identity: SessionLiveProjectionIdentity;
 	private readonly limits: SessionLiveProjectionLimits;
+	private readonly attachmentGuardContext: SessionAttachmentGuardContext | undefined;
 	private readonly compactionOwner = Symbol("session-live-projection");
+	private readonly compactionTokens = new WeakMap<object, { revision: number }>();
+	private readonly preparedCommits = new WeakMap<object, PreparedCommitState>();
+	private readonly preparedCompactions = new WeakMap<object, PreparedCompactionState>();
+	private revision = 0;
 	private baseSeq: number;
 	private asOfSeq: number;
 	private settledMessages: readonly SessionMessageDto[];
@@ -142,24 +184,43 @@ export class SessionLiveProjection {
 		this.asOfSeq = options.baseSeq;
 		this.runtimePhase = options.runtimePhase ?? "dormant";
 		this.limits = normalizeLimits(options.limits);
+		if (
+			options.attachmentGuardContext !== undefined &&
+			(!isSessionAttachmentGuardContext(options.attachmentGuardContext) ||
+				options.attachmentGuardContext.serverEpoch !== options.identity.serverEpoch)
+		) {
+			throw new SessionLiveProjectionPayloadError();
+		}
+		this.attachmentGuardContext = options.attachmentGuardContext
+			? clone(options.attachmentGuardContext)
+			: undefined;
 		const settledMessages = clone(options.settledMessages ?? []);
+		this.assertMessagesValid(settledMessages);
 		this.assertSettledMessagesFit(settledMessages);
 		this.settledMessages = settledMessages;
 		this.settledMessageBytes = jsonBytes(settledMessages, "settled_messages");
 		this.assertSnapshotFits({ settledMessageBytes: this.settledMessageBytes });
 	}
 
-	commit(
+	prepareCommit(
 		identity: SessionLiveProjectionIdentity,
 		input: SessionLiveProjectionInput,
 		runtimePhase?: SessionLiveRuntimePhase,
-	): number {
+	): SessionLiveProjectionPreparedCommit {
 		this.assertIdentity(identity);
 		const nextSeq = this.asOfSeq + 1;
 		if (!Number.isSafeInteger(nextSeq)) throw new SessionLiveProjectionLimitError("live_events");
+		let projectionEvents = this.projectionEvents;
+		let projectionEventFrameBytes = this.projectionEventFrameBytes;
+		let projectionEventBytes = this.projectionEventBytes;
+		let queue = this.queue;
+		let pendingExtensionRequests = this.pendingExtensionRequests;
 
 		if (input.type === "event") {
 			const eventValue = clone(input.event);
+			if (!isProductSessionEventDto(eventValue, this.attachmentGuardContext)) {
+				throw new SessionLiveProjectionPayloadError();
+			}
 			const frame: SessionLiveProjectionEventFrame = {
 				type: "event",
 				...this.identity,
@@ -168,7 +229,9 @@ export class SessionLiveProjection {
 			};
 			const previousFrame = this.projectionEvents.at(-1);
 			const mergedEvent =
-				previousFrame?.seq === this.asOfSeq ? mergeCompatibleDelta(previousFrame.event, eventValue) : null;
+				previousFrame?.seq === this.asOfSeq
+					? mergeCompatibleDelta(previousFrame.event, eventValue, this.attachmentGuardContext)
+					: null;
 			const nextFrame = mergedEvent === null ? frame : { ...frame, event: mergedEvent };
 			const frameBytes = jsonBytes(nextFrame, "live_events");
 			const merging = mergedEvent !== null;
@@ -178,13 +241,13 @@ export class SessionLiveProjection {
 			if (nextEventCount > this.limits.maxLiveEventItems || nextEventBytes > this.limits.maxLiveEventBytes) {
 				throw new SessionLiveProjectionLimitError("live_events");
 			}
-			const nextQueue =
+			queue =
 				eventValue.type === "queue_update"
 					? { steering: [...eventValue.steering], followUp: [...eventValue.followUp] }
 					: this.queue;
 			if (
-				nextQueue.steering.length > this.limits.maxQueueItems ||
-				nextQueue.followUp.length > this.limits.maxQueueItems
+				queue.steering.length > this.limits.maxQueueItems ||
+				queue.followUp.length > this.limits.maxQueueItems
 			) {
 				throw new SessionLiveProjectionLimitError("queue");
 			}
@@ -192,39 +255,88 @@ export class SessionLiveProjection {
 				asOfSeq: nextSeq,
 				projectionEventBytes: nextEventBytes,
 				projectionEventCount: nextEventCount,
-				queue: nextQueue,
+				queue,
 				runtimePhase: runtimePhase ?? this.runtimePhase,
 			});
-			this.projectionEvents = merging
+			projectionEvents = merging
 				? [...this.projectionEvents.slice(0, -1), nextFrame]
 				: [...this.projectionEvents, nextFrame];
-			this.projectionEventFrameBytes = merging
+			projectionEventFrameBytes = merging
 				? [...this.projectionEventFrameBytes.slice(0, -1), frameBytes]
 				: [...this.projectionEventFrameBytes, frameBytes];
-			this.projectionEventBytes = nextEventBytes;
-			this.queue = nextQueue;
+			projectionEventBytes = nextEventBytes;
 		} else if (input.type === "extension_ui_request") {
-			this.commitExtensionRequest(input.request, nextSeq, runtimePhase);
-		} else {
-			const pending = new Map(this.pendingExtensionRequests);
-			pending.delete(input.requestId);
+			const requestValue = clone(input.request);
+			pendingExtensionRequests = new Map(this.pendingExtensionRequests);
+			if (BLOCKING_EXTENSION_METHODS.has(requestValue.method)) {
+				pendingExtensionRequests.delete(requestValue.id);
+				pendingExtensionRequests.set(requestValue.id, requestValue);
+			}
+			this.assertExtensionStateFits(pendingExtensionRequests);
 			this.assertSnapshotFits({
 				asOfSeq: nextSeq,
-				pendingExtensionRequests: pending,
-				runtimePhase: pending.size > 0 ? "waiting_ui" : (runtimePhase ?? this.runtimePhase),
+				pendingExtensionRequests,
+				runtimePhase: pendingExtensionRequests.size > 0 ? "waiting_ui" : (runtimePhase ?? this.runtimePhase),
 			});
-			this.pendingExtensionRequests = pending;
+		} else {
+			pendingExtensionRequests = new Map(this.pendingExtensionRequests);
+			pendingExtensionRequests.delete(input.requestId);
+			this.assertSnapshotFits({
+				asOfSeq: nextSeq,
+				pendingExtensionRequests,
+				runtimePhase: pendingExtensionRequests.size > 0 ? "waiting_ui" : (runtimePhase ?? this.runtimePhase),
+			});
 		}
+		const token = deepFreeze({ nextSeq });
+		this.preparedCommits.set(token, {
+			revision: this.revision,
+			nextSeq,
+			projectionEvents,
+			projectionEventFrameBytes,
+			projectionEventBytes,
+			queue,
+			pendingExtensionRequests,
+			runtimePhase: runtimePhase ?? this.runtimePhase,
+		});
+		return token;
+	}
 
-		this.asOfSeq = nextSeq;
-		if (runtimePhase !== undefined) this.runtimePhase = runtimePhase;
-		return nextSeq;
+	commitPrepared(token: SessionLiveProjectionPreparedCommit): number | null {
+		if (typeof token !== "object" || token === null) return null;
+		const prepared = this.preparedCommits.get(token);
+		if (!prepared) return null;
+		this.preparedCommits.delete(token);
+		if (prepared.revision !== this.revision || prepared.nextSeq !== this.asOfSeq + 1) return null;
+		this.projectionEvents = prepared.projectionEvents;
+		this.projectionEventFrameBytes = prepared.projectionEventFrameBytes;
+		this.projectionEventBytes = prepared.projectionEventBytes;
+		this.queue = prepared.queue;
+		this.pendingExtensionRequests = prepared.pendingExtensionRequests;
+		this.runtimePhase = prepared.runtimePhase;
+		this.asOfSeq = prepared.nextSeq;
+		this.revision += 1;
+		return prepared.nextSeq;
+	}
+
+	/** Temporary default-off seam. C2b must replace this with prepare/adopt/commit. */
+	commitInlineOnly(
+		identity: SessionLiveProjectionIdentity,
+		input: SessionLiveProjectionInput,
+		runtimePhase?: SessionLiveRuntimePhase,
+	): number {
+		if (input.type === "event" && !isProductSessionEventDto(input.event)) {
+			throw new SessionLiveProjectionPayloadError();
+		}
+		const committed = this.commitPrepared(this.prepareCommit(identity, input, runtimePhase));
+		if (committed === null) throw new SessionLiveProjectionIdentityError();
+		return committed;
 	}
 
 	setRuntimePhase(identity: SessionLiveProjectionIdentity, phase: SessionLiveRuntimePhase): void {
 		this.assertIdentity(identity);
 		this.assertSnapshotFits({ runtimePhase: phase });
 		this.runtimePhase = phase;
+		this.revision += 1;
 	}
 
 	snapshot(): SessionLiveProjectionSnapshot {
@@ -244,11 +356,13 @@ export class SessionLiveProjection {
 
 	beginIdleBaseCompaction(): SessionLiveProjectionCompactionToken | null {
 		if (this.snapshotRuntimePhase() !== "idle") return null;
-		return deepFreeze({
+		const token = deepFreeze({
 			...clone(this.identity),
 			expectedAsOfSeq: this.asOfSeq,
 			owner: this.compactionOwner,
 		}) as InternalCompactionToken;
+		this.compactionTokens.set(token, { revision: this.revision });
+		return token;
 	}
 
 	shouldCompactIdleBase(): boolean {
@@ -303,20 +417,37 @@ export class SessionLiveProjection {
 		);
 	}
 
-	commitIdleBaseCompaction(
+	/** Temporary default-off seam. C2b must replace this with prepare/adopt/commit. */
+	commitIdleBaseCompactionInlineOnly(
 		token: SessionLiveProjectionCompactionToken,
 		settledMessages: readonly SessionMessageDto[],
 	): boolean {
-		const internal = token as InternalCompactionToken;
+		if (!settledMessages.every((message) => isSessionMessageDto(message))) {
+			this.compactionTokens.delete(token);
+			throw new SessionLiveProjectionPayloadError();
+		}
+		const prepared = this.prepareIdleBaseCompaction(token, settledMessages);
+		return prepared !== null && this.commitPreparedIdleBaseCompaction(prepared);
+	}
+
+	prepareIdleBaseCompaction(
+		token: SessionLiveProjectionCompactionToken,
+		settledMessages: readonly SessionMessageDto[],
+	): SessionLiveProjectionPreparedCompaction | null {
+		const captured = this.compactionTokens.get(token);
+		this.compactionTokens.delete(token);
 		if (
-			internal.owner !== this.compactionOwner ||
+			!captured ||
+			(token as InternalCompactionToken).owner !== this.compactionOwner ||
 			!sameIdentity(this.identity, token) ||
+			captured.revision !== this.revision ||
 			token.expectedAsOfSeq !== this.asOfSeq ||
 			this.snapshotRuntimePhase() !== "idle"
 		) {
-			return false;
+			return null;
 		}
 		const candidate = clone(settledMessages);
+		this.assertMessagesValid(candidate);
 		this.assertSettledMessagesFit(candidate);
 		const candidateBytes = jsonBytes(candidate, "settled_messages");
 		this.assertSnapshotFits({
@@ -326,33 +457,30 @@ export class SessionLiveProjection {
 			projectionEventCount: 0,
 			runtimePhase: "idle",
 		});
-		this.settledMessages = candidate;
-		this.settledMessageBytes = candidateBytes;
-		this.baseSeq = this.asOfSeq;
+		const prepared = deepFreeze({ expectedAsOfSeq: this.asOfSeq });
+		this.preparedCompactions.set(prepared, {
+			revision: this.revision,
+			settledMessages: candidate,
+			settledMessageBytes: candidateBytes,
+			baseSeq: this.asOfSeq,
+		});
+		return prepared;
+	}
+
+	commitPreparedIdleBaseCompaction(token: SessionLiveProjectionPreparedCompaction): boolean {
+		if (typeof token !== "object" || token === null) return false;
+		const prepared = this.preparedCompactions.get(token);
+		if (!prepared) return false;
+		this.preparedCompactions.delete(token);
+		if (prepared.revision !== this.revision || prepared.baseSeq !== this.asOfSeq) return false;
+		this.settledMessages = prepared.settledMessages;
+		this.settledMessageBytes = prepared.settledMessageBytes;
+		this.baseSeq = prepared.baseSeq;
 		this.projectionEvents = [];
 		this.projectionEventFrameBytes = [];
 		this.projectionEventBytes = 0;
+		this.revision += 1;
 		return true;
-	}
-
-	private commitExtensionRequest(
-		request: ExtensionUiRequestDto,
-		nextSeq: number,
-		runtimePhase: SessionLiveRuntimePhase | undefined,
-	): void {
-		const requestValue = clone(request);
-		const pending = new Map(this.pendingExtensionRequests);
-		if (BLOCKING_EXTENSION_METHODS.has(requestValue.method)) {
-			pending.delete(requestValue.id);
-			pending.set(requestValue.id, requestValue);
-		}
-		this.assertExtensionStateFits(pending);
-		this.assertSnapshotFits({
-			asOfSeq: nextSeq,
-			pendingExtensionRequests: pending,
-			runtimePhase: pending.size > 0 ? "waiting_ui" : (runtimePhase ?? this.runtimePhase),
-		});
-		this.pendingExtensionRequests = pending;
 	}
 
 	private snapshotRuntimePhase(): SessionLiveRuntimePhase {
@@ -369,6 +497,12 @@ export class SessionLiveProjection {
 			jsonBytes(messages, "settled_messages") > this.limits.maxSettledMessageBytes
 		) {
 			throw new SessionLiveProjectionLimitError("settled_messages");
+		}
+	}
+
+	private assertMessagesValid(messages: readonly SessionMessageDto[]): void {
+		if (!messages.every((message) => isSessionMessageDto(message, this.attachmentGuardContext))) {
+			throw new SessionLiveProjectionPayloadError();
 		}
 	}
 
@@ -463,6 +597,7 @@ function normalizeLimits(
 function mergeCompatibleDelta(
 	previous: ProductSessionEventDto,
 	next: ProductSessionEventDto,
+	attachmentGuardContext?: SessionAttachmentGuardContext,
 ): ProductSessionEventDto | null {
 	if (previous.type !== "message_update" || next.type !== "message_update") return null;
 	const previousDelta = previous.assistantMessageEvent;
@@ -482,7 +617,7 @@ function mergeCompatibleDelta(
 			delta: previousDelta.delta + nextDelta.delta,
 		},
 	};
-	return isProductSessionEventDto(merged) ? merged : null;
+	return isProductSessionEventDto(merged, attachmentGuardContext) ? merged : null;
 }
 
 type MessageUpdateEvent = Extract<ProductSessionEventDto, { type: "message_update" }>;

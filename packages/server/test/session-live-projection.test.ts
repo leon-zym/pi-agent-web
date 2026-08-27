@@ -2,17 +2,23 @@ import type {
 	AssistantMessageDto,
 	ExtensionUiRequestDto,
 	ProductSessionEventDto,
+	SessionAttachmentRefDto,
 	SessionMessageDto,
 	SessionRuntimeDto,
 	UsageDto,
 } from "@pi-agent-web/protocol";
-import { isSessionSnapshotDto, SESSION_SNAPSHOT_MAX_MESSAGES } from "@pi-agent-web/protocol";
+import {
+	isSessionSnapshotDto,
+	SESSION_PAYLOAD_BUDGET,
+	SESSION_SNAPSHOT_MAX_MESSAGES,
+} from "@pi-agent-web/protocol";
 import { describe, expect, it } from "vitest";
 import {
 	SessionLiveProjection,
 	type SessionLiveProjectionIdentity,
 	SessionLiveProjectionIdentityError,
 	SessionLiveProjectionLimitError,
+	SessionLiveProjectionPayloadError,
 } from "../src/session-live-projection.js";
 
 const identity: SessionLiveProjectionIdentity = {
@@ -29,6 +35,16 @@ const usage: UsageDto = {
 	cacheWrite: 0,
 	totalTokens: 3,
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+const attachmentContext = { serverEpoch: identity.serverEpoch, payloadBudget: SESSION_PAYLOAD_BUDGET };
+
+const attachmentRef: SessionAttachmentRefDto = {
+	type: "attachment_ref",
+	serverEpoch: identity.serverEpoch,
+	sha256: "a".repeat(64),
+	mediaType: "image/png",
+	byteLength: 4,
 };
 
 function userMessage(text: string): SessionMessageDto {
@@ -93,8 +109,8 @@ describe("SessionLiveProjection", () => {
 			runtimePhase: "idle",
 		});
 
-		projection.commit(identity, event({ type: "agent_start" }), "running");
-		projection.commit(
+		projection.commitInlineOnly(identity, event({ type: "agent_start" }), "running");
+		projection.commitInlineOnly(
 			identity,
 			event({
 				type: "message_update",
@@ -102,7 +118,7 @@ describe("SessionLiveProjection", () => {
 				assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "plan" },
 			}),
 		);
-		projection.commit(
+		projection.commitInlineOnly(
 			identity,
 			event({
 				type: "message_update",
@@ -131,7 +147,7 @@ describe("SessionLiveProjection", () => {
 
 	it("coalesces 2050 adjacent compatible deltas without losing the authoritative waterline", () => {
 		const projection = new SessionLiveProjection({ identity, baseSeq: 0, runtimePhase: "running" });
-		projection.commit(
+		projection.commitInlineOnly(
 			identity,
 			event({
 				type: "message_update",
@@ -140,7 +156,7 @@ describe("SessionLiveProjection", () => {
 			}),
 		);
 		for (let index = 0; index < 2_049; index += 1) {
-			projection.commit(
+			projection.commitInlineOnly(
 				identity,
 				event({
 					type: "message_update",
@@ -172,11 +188,11 @@ describe("SessionLiveProjection", () => {
 				usage,
 				assistantMessageEvent: { type, contentIndex, delta: value },
 			});
-		projection.commit(identity, delta("text_delta", 0, "one"));
-		projection.commit(identity, delta("text_delta", 1, "two"));
-		projection.commit(identity, event({ type: "turn_start" }));
-		projection.commit(identity, delta("text_delta", 1, "three"));
-		projection.commit(identity, delta("thinking_delta", 1, "four"));
+		projection.commitInlineOnly(identity, delta("text_delta", 0, "one"));
+		projection.commitInlineOnly(identity, delta("text_delta", 1, "two"));
+		projection.commitInlineOnly(identity, event({ type: "turn_start" }));
+		projection.commitInlineOnly(identity, delta("text_delta", 1, "three"));
+		projection.commitInlineOnly(identity, delta("thinking_delta", 1, "four"));
 
 		expect(projection.snapshot().projectionEvents.map((frame) => frame.seq)).toEqual([1, 2, 3, 4, 5]);
 	});
@@ -189,9 +205,9 @@ describe("SessionLiveProjection", () => {
 				usage,
 				assistantMessageEvent: { type, contentIndex: 0, delta: value },
 			});
-		projection.commit(identity, delta("thinking_delta", "one"));
-		projection.commit(identity, delta("thinking_delta", "two"));
-		projection.commit(identity, {
+		projection.commitInlineOnly(identity, delta("thinking_delta", "one"));
+		projection.commitInlineOnly(identity, delta("thinking_delta", "two"));
+		projection.commitInlineOnly(identity, {
 			type: "extension_ui_request",
 			request: {
 				type: "extension_ui_request",
@@ -200,8 +216,8 @@ describe("SessionLiveProjection", () => {
 				message: "boundary",
 			},
 		});
-		projection.commit(identity, delta("toolcall_delta", '{"path"'));
-		projection.commit(identity, delta("toolcall_delta", ':"README.md"}'));
+		projection.commitInlineOnly(identity, delta("toolcall_delta", '{"path"'));
+		projection.commitInlineOnly(identity, delta("toolcall_delta", ':"README.md"}'));
 
 		const snapshot = projection.snapshot();
 		expect(snapshot.asOfSeq).toBe(5);
@@ -218,7 +234,7 @@ describe("SessionLiveProjection", () => {
 		const projection = new SessionLiveProjection({ identity, baseSeq: 0 });
 		const finalMessage = assistantMessage("done", "toolUse");
 
-		projection.commit(
+		projection.commitInlineOnly(
 			identity,
 			event({
 				type: "message_update",
@@ -232,7 +248,7 @@ describe("SessionLiveProjection", () => {
 			}),
 			"running",
 		);
-		projection.commit(
+		projection.commitInlineOnly(
 			identity,
 			event({
 				type: "tool_execution_start",
@@ -241,7 +257,7 @@ describe("SessionLiveProjection", () => {
 				args: { path: "README.md" },
 			}),
 		);
-		projection.commit(
+		projection.commitInlineOnly(
 			identity,
 			event({
 				type: "tool_execution_update",
@@ -251,7 +267,7 @@ describe("SessionLiveProjection", () => {
 				partialResult: { text: "prefix" },
 			}),
 		);
-		projection.commit(identity, event({ type: "message_end", message: finalMessage }));
+		projection.commitInlineOnly(identity, event({ type: "message_end", message: finalMessage }));
 
 		const snapshot = projection.snapshot();
 		expect(snapshot.asOfSeq).toBe(4);
@@ -267,8 +283,14 @@ describe("SessionLiveProjection", () => {
 
 	it("tracks the latest queue independently while preserving event order", () => {
 		const projection = new SessionLiveProjection({ identity, baseSeq: 4 });
-		projection.commit(identity, event({ type: "queue_update", steering: ["first"], followUp: ["later"] }));
-		projection.commit(identity, event({ type: "queue_update", steering: [], followUp: ["replacement"] }));
+		projection.commitInlineOnly(
+			identity,
+			event({ type: "queue_update", steering: ["first"], followUp: ["later"] }),
+		);
+		projection.commitInlineOnly(
+			identity,
+			event({ type: "queue_update", steering: [], followUp: ["replacement"] }),
+		);
 
 		const snapshot = projection.snapshot();
 		expect(snapshot.queue).toEqual({ steering: [], followUp: ["replacement"] });
@@ -284,8 +306,8 @@ describe("SessionLiveProjection", () => {
 			title: "Continue?",
 			message: "Confirm",
 		};
-		projection.commit(identity, { type: "extension_ui_request", request: dialog });
-		projection.commit(identity, {
+		projection.commitInlineOnly(identity, { type: "extension_ui_request", request: dialog });
+		projection.commitInlineOnly(identity, {
 			type: "extension_ui_request",
 			request: {
 				type: "extension_ui_request",
@@ -294,7 +316,7 @@ describe("SessionLiveProjection", () => {
 				message: "transient",
 			},
 		});
-		projection.commit(identity, {
+		projection.commitInlineOnly(identity, {
 			type: "extension_ui_request",
 			request: {
 				type: "extension_ui_request",
@@ -304,7 +326,7 @@ describe("SessionLiveProjection", () => {
 				statusText: "one",
 			},
 		});
-		projection.commit(identity, {
+		projection.commitInlineOnly(identity, {
 			type: "extension_ui_request",
 			request: {
 				type: "extension_ui_request",
@@ -322,7 +344,7 @@ describe("SessionLiveProjection", () => {
 		expect(JSON.stringify(snapshot)).not.toContain("transient");
 		expect(isSessionSnapshotDto(wireSnapshot(snapshot))).toBe(true);
 
-		projection.commit(identity, {
+		projection.commitInlineOnly(identity, {
 			type: "extension_ui_request",
 			request: {
 				type: "extension_ui_request",
@@ -331,7 +353,7 @@ describe("SessionLiveProjection", () => {
 				statusKey: "build",
 			},
 		});
-		projection.commit(identity, {
+		projection.commitInlineOnly(identity, {
 			type: "extension_ui_closed",
 			requestId: "dialog-1",
 			reason: "answered",
@@ -354,7 +376,7 @@ describe("SessionLiveProjection", () => {
 		];
 
 		for (const mismatch of mismatches) {
-			expect(() => projection.commit(mismatch, event({ type: "agent_start" }))).toThrow(
+			expect(() => projection.commitInlineOnly(mismatch, event({ type: "agent_start" }))).toThrow(
 				SessionLiveProjectionIdentityError,
 			);
 		}
@@ -374,7 +396,7 @@ describe("SessionLiveProjection", () => {
 			baseSeq: 0,
 			settledMessages: [originalMessage],
 		});
-		projection.commit(identity, event(originalEvent));
+		projection.commitInlineOnly(identity, event(originalEvent));
 		const snapshot = projection.snapshot();
 
 		(originalMessage as { content: string }).content = "mutated";
@@ -392,8 +414,8 @@ describe("SessionLiveProjection", () => {
 			baseSeq: 0,
 			limits: { maxLiveEventItems: 1, maxLiveEventBytes: 10_000 },
 		});
-		itemBounded.commit(identity, event({ type: "agent_start" }));
-		expect(() => itemBounded.commit(identity, event({ type: "turn_start" }))).toThrow(
+		itemBounded.commitInlineOnly(identity, event({ type: "agent_start" }));
+		expect(() => itemBounded.commitInlineOnly(identity, event({ type: "turn_start" }))).toThrow(
 			SessionLiveProjectionLimitError,
 		);
 		expect(itemBounded.snapshot().asOfSeq).toBe(1);
@@ -404,7 +426,7 @@ describe("SessionLiveProjection", () => {
 			limits: { maxLiveEventItems: 10, maxLiveEventBytes: 100 },
 		});
 		expect(() =>
-			byteBounded.commit(
+			byteBounded.commitInlineOnly(
 				identity,
 				event({
 					type: "extension_error",
@@ -423,7 +445,7 @@ describe("SessionLiveProjection", () => {
 			baseSeq: 0,
 			limits: { maxLiveEventItems: 10, maxLiveEventBytes: 450, maxSnapshotBytes: 10_000 },
 		});
-		merged.commit(
+		merged.commitInlineOnly(
 			identity,
 			event({
 				type: "message_update",
@@ -433,7 +455,7 @@ describe("SessionLiveProjection", () => {
 		);
 		const beforeMergedOverflow = merged.snapshot();
 		expect(() =>
-			merged.commit(
+			merged.commitInlineOnly(
 				identity,
 				event({
 					type: "message_update",
@@ -455,7 +477,7 @@ describe("SessionLiveProjection", () => {
 		});
 		const beforeAggregateOverflow = aggregate.snapshot();
 		expect(() =>
-			aggregate.commit(
+			aggregate.commitInlineOnly(
 				identity,
 				event({
 					type: "extension_error",
@@ -474,7 +496,7 @@ describe("SessionLiveProjection", () => {
 			baseSeq: 0,
 			limits: { maxExtensionItems: 1, maxExtensionBytes: 300 },
 		});
-		projection.commit(identity, {
+		projection.commitInlineOnly(identity, {
 			type: "extension_ui_request",
 			request: {
 				type: "extension_ui_request",
@@ -485,7 +507,7 @@ describe("SessionLiveProjection", () => {
 			},
 		});
 		expect(() =>
-			projection.commit(identity, {
+			projection.commitInlineOnly(identity, {
 				type: "extension_ui_request",
 				request: {
 					type: "extension_ui_request",
@@ -507,7 +529,7 @@ describe("SessionLiveProjection", () => {
 			limits: { maxExtensionItems: 10, maxExtensionBytes: 100 },
 		});
 		expect(() =>
-			byteBounded.commit(identity, {
+			byteBounded.commitInlineOnly(identity, {
 				type: "extension_ui_request",
 				request: {
 					type: "extension_ui_request",
@@ -562,11 +584,14 @@ describe("SessionLiveProjection", () => {
 			settledMessages: [userMessage("old")],
 			runtimePhase: "idle",
 		});
-		projection.commit(identity, event({ type: "message_end", message: assistantMessage("done", "stop") }));
+		projection.commitInlineOnly(
+			identity,
+			event({ type: "message_end", message: assistantMessage("done", "stop") }),
+		);
 		projection.setRuntimePhase(identity, "idle");
 		const token = projection.beginIdleBaseCompaction();
 		expect(token).not.toBeNull();
-		expect(projection.commitIdleBaseCompaction(token!, [userMessage("new")])).toBe(true);
+		expect(projection.commitIdleBaseCompactionInlineOnly(token!, [userMessage("new")])).toBe(true);
 		expect(projection.snapshot()).toMatchObject({
 			baseSeq: 4,
 			asOfSeq: 4,
@@ -575,9 +600,155 @@ describe("SessionLiveProjection", () => {
 		});
 
 		const staleToken = projection.beginIdleBaseCompaction();
-		projection.commit(identity, event({ type: "agent_start" }), "running");
-		expect(projection.commitIdleBaseCompaction(staleToken!, [userMessage("stale")])).toBe(false);
+		projection.commitInlineOnly(identity, event({ type: "agent_start" }), "running");
+		expect(projection.commitIdleBaseCompactionInlineOnly(staleToken!, [userMessage("stale")])).toBe(false);
 		expect(projection.snapshot().settledMessages).toEqual([userMessage("new")]);
 		expect(projection.beginIdleBaseCompaction()).toBeNull();
+	});
+
+	it("prepares a commit without mutation and consumes its owner-bound token exactly once", () => {
+		const projection = new SessionLiveProjection({ identity, baseSeq: 4, runtimePhase: "idle" });
+		const other = new SessionLiveProjection({ identity, baseSeq: 4, runtimePhase: "idle" });
+		const before = projection.snapshot();
+		const prepared = projection.prepareCommit(identity, event({ type: "agent_start" }), "running");
+
+		expect(projection.snapshot()).toEqual(before);
+		expect(prepared.nextSeq).toBe(5);
+		expect(other.commitPrepared(prepared)).toBeNull();
+		expect(projection.commitPrepared(prepared)).toBe(5);
+		expect(projection.snapshot()).toMatchObject({ asOfSeq: 5, runtimePhase: "running" });
+		expect(projection.commitPrepared(prepared)).toBeNull();
+	});
+
+	it("invalidates prepared commits after any intervening projection mutation", () => {
+		const projection = new SessionLiveProjection({ identity, baseSeq: 0, runtimePhase: "idle" });
+		const prepared = projection.prepareCommit(identity, event({ type: "agent_start" }), "running");
+		projection.setRuntimePhase(identity, "running");
+
+		expect(projection.commitPrepared(prepared)).toBeNull();
+		expect(projection.snapshot()).toMatchObject({ asOfSeq: 0, runtimePhase: "running" });
+	});
+
+	it("rejects prepare failures without mutation before a caller can adopt content", () => {
+		const projection = new SessionLiveProjection({
+			identity,
+			baseSeq: 0,
+			limits: { maxLiveEventBytes: 100 },
+		});
+		const before = projection.snapshot();
+		let adopted = false;
+
+		expect(() => {
+			const prepared = projection.prepareCommit(
+				identity,
+				event({
+					type: "extension_error",
+					extensionPath: "fixture",
+					event: "oversized",
+					error: "x".repeat(1_000),
+				}),
+			);
+			adopted = true;
+			projection.commitPrepared(prepared);
+		}).toThrow(SessionLiveProjectionLimitError);
+		expect(adopted).toBe(false);
+		expect(projection.snapshot()).toEqual(before);
+	});
+
+	it("requires a trusted attachment context for ref-bearing bases and events", () => {
+		const message: SessionMessageDto = {
+			role: "user",
+			content: [{ type: "image", data: attachmentRef, mimeType: "image/png" }],
+			timestamp: 1,
+		};
+		expect(() => new SessionLiveProjection({ identity, settledMessages: [message], baseSeq: 0 })).toThrow(
+			SessionLiveProjectionPayloadError,
+		);
+
+		const projection = new SessionLiveProjection({
+			identity,
+			settledMessages: [message],
+			baseSeq: 0,
+			attachmentGuardContext: attachmentContext,
+		});
+		expect(() => projection.commitInlineOnly(identity, event({ type: "message_end", message }))).toThrow(
+			SessionLiveProjectionPayloadError,
+		);
+		const prepared = projection.prepareCommit(identity, event({ type: "message_end", message }));
+		expect(projection.commitPrepared(prepared)).toBe(1);
+		projection.commitInlineOnly(
+			identity,
+			event({
+				type: "message_update",
+				usage,
+				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "a" },
+			}),
+		);
+		projection.commitInlineOnly(
+			identity,
+			event({
+				type: "message_update",
+				usage,
+				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "b" },
+			}),
+		);
+		const snapshot = projection.snapshot();
+		expect(snapshot.projectionEvents.at(-1)).toMatchObject({
+			seq: 3,
+			event: { assistantMessageEvent: { delta: "ab" } },
+		});
+		expect(isSessionSnapshotDto(wireSnapshot(snapshot))).toBe(false);
+		expect(isSessionSnapshotDto(wireSnapshot(snapshot), attachmentContext)).toBe(true);
+	});
+
+	it("prepares idle compaction transactionally and rejects stale, foreign, or reused tokens", () => {
+		const projection = new SessionLiveProjection({
+			identity,
+			baseSeq: 0,
+			settledMessages: [userMessage("old")],
+			runtimePhase: "idle",
+		});
+		const other = new SessionLiveProjection({ identity, baseSeq: 0, runtimePhase: "idle" });
+		projection.commitInlineOnly(identity, event({ type: "message_end", message: userMessage("done") }));
+		projection.setRuntimePhase(identity, "idle");
+		const firstWaterline = projection.beginIdleBaseCompaction()!;
+		const sameWaterline = projection.beginIdleBaseCompaction()!;
+		const prepared = projection.prepareIdleBaseCompaction(firstWaterline, [userMessage("new")]);
+		const before = projection.snapshot();
+
+		expect(prepared).not.toBeNull();
+		expect(projection.snapshot()).toEqual(before);
+		expect(other.commitPreparedIdleBaseCompaction(prepared!)).toBe(false);
+		expect(projection.commitPreparedIdleBaseCompaction(prepared!)).toBe(true);
+		expect(projection.commitPreparedIdleBaseCompaction(prepared!)).toBe(false);
+		expect(projection.commitIdleBaseCompactionInlineOnly(sameWaterline, [userMessage("overwrite")])).toBe(
+			false,
+		);
+		expect(projection.snapshot()).toMatchObject({
+			baseSeq: 1,
+			asOfSeq: 1,
+			settledMessages: [userMessage("new")],
+			projectionEvents: [],
+		});
+	});
+
+	it("keeps the inline-only compaction seam closed to refs even with trusted context", () => {
+		const message: SessionMessageDto = {
+			role: "user",
+			content: [{ type: "image", data: attachmentRef, mimeType: "image/png" }],
+			timestamp: 1,
+		};
+		const projection = new SessionLiveProjection({
+			identity,
+			baseSeq: 0,
+			runtimePhase: "idle",
+			attachmentGuardContext: attachmentContext,
+		});
+		const token = projection.beginIdleBaseCompaction()!;
+		expect(() => projection.commitIdleBaseCompactionInlineOnly(token, [message])).toThrow(
+			SessionLiveProjectionPayloadError,
+		);
+		expect(projection.commitIdleBaseCompactionInlineOnly(token, [])).toBe(false);
+		expect(projection.snapshot()).toMatchObject({ baseSeq: 0, asOfSeq: 0, settledMessages: [] });
 	});
 });

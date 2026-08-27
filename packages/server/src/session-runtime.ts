@@ -1167,7 +1167,7 @@ export class SessionRuntime {
 				}
 				turnBudget = { items, bytes };
 			}
-			seq = projection.commit(this.projectionIdentity(), frame, this.state);
+			seq = projection.commitInlineOnly(this.projectionIdentity(), frame, this.state);
 		} catch (error) {
 			throw this.normalizeProjectionError(error);
 		}
@@ -1324,7 +1324,7 @@ export class SessionRuntime {
 			if (processToken !== this.processToken || this.proc !== proc || this.liveProjection !== projection)
 				return;
 			const { messages } = expectCommandData(response, "get_messages");
-			if (projection.commitIdleBaseCompaction(token, messages)) this.assertWireSnapshotFits();
+			if (projection.commitIdleBaseCompactionInlineOnly(token, messages)) this.assertWireSnapshotFits();
 		})()
 			.catch((error) => {
 				const normalized = this.normalizeProjectionError(error);
