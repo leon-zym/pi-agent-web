@@ -13,6 +13,7 @@ an ADR explains why the contract exists and which alternatives were rejected.
 | [0005](0005-conversation-rendering.md) | Multi-Session publication and measured renderer decision |
 | [0006](0006-ui-ux-design-system-and-reading-stream.md) | UI/UX design system, reading stream orchestration, and client lifecycle invariants |
 | [0007](0007-versioned-pi-host-and-gateway-negotiation.md) | Versioned Pi host adapter, runtime selection, and Gateway hello negotiation |
+| [0008](0008-authoritative-epoch-aware-live-session-resync.md) | Authoritative epoch-aware live Session resync and snapshot waterlines |
 
 New ADRs use: Status, Date, Context, Decision, Consequences, Rejected alternatives, Verification.
 Accepted ADRs are amended or superseded by a later ADR; do not silently reverse them in a handoff or

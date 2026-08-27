@@ -15,8 +15,10 @@ const harnesses: Harness[] = [];
 
 async function createHarness(options: { helloTimeoutMs?: number } = {}): Promise<Harness> {
 	const bridge = new SessionWsBridge({
-		supervisor: { releaseConnection: () => undefined } as unknown as SessionSupervisor,
-		serverEpoch: "gateway-epoch-test",
+		supervisor: {
+			serverEpoch: "gateway-epoch-test",
+			releaseConnection: () => undefined,
+		} as unknown as SessionSupervisor,
 		serverBuild: "0.1.0-test",
 		runtime: {
 			version: "0.84.2",

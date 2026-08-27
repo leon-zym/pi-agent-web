@@ -33,6 +33,7 @@ const state = {
 function response(data: unknown) {
 	return {
 		type: "response",
+		serverEpoch: "gateway-epoch-a",
 		sessionHandle: "session-1",
 		generation: 1,
 		barrierSeq: 0,
@@ -43,6 +44,7 @@ function response(data: unknown) {
 function event(payload: unknown) {
 	return {
 		type: "event",
+		serverEpoch: "gateway-epoch-a",
 		sessionHandle: "session-1",
 		workspaceId: "workspace-1",
 		generation: 1,

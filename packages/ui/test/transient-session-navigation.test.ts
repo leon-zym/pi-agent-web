@@ -16,6 +16,7 @@ const originalTransport = sessionTransport.store.getState();
 
 function runtime(sessionHandle: string, recoverable = false): SessionRuntimeDto {
 	return {
+		serverEpoch: "test-server-epoch",
 		sessionHandle,
 		workspaceId: "workspace-a",
 		nativeSessionId: `native-${sessionHandle}`,
@@ -45,14 +46,18 @@ function session(sessionHandle: string, persisted: boolean): NativeSessionDto {
 }
 
 function controlledTransient(sessionHandle: string) {
+	const runtimeValue = runtime(sessionHandle);
 	return {
 		sessionHandle,
 		subscribed: true,
 		controllerIntent: true,
-		runtime: runtime(sessionHandle),
+		runtime: runtimeValue,
 		generation: 4,
 		lastSeq: 0,
 		projectedSeq: 0,
+		baselineAuthoritative: true,
+		freshLeaseBaseline: runtimeValue,
+		recovery: null,
 		lease: { isController: true, fencingToken: "fence-transient" },
 		pendingExtensionRequests: [],
 		resync: null,
@@ -262,6 +267,38 @@ describe("transient Session navigation", () => {
 					),
 			).toBe(false);
 		});
+	});
+
+	it("never abandons or releases a hidden transient Session before its baseline is authoritative", () => {
+		const transient = session("session-transient", false);
+		const target = session("session-history", true);
+		const abandon = vi.spyOn(api, "abandonTransientSession");
+		const releaseSession = vi.fn(() => true);
+		const unsubscribeSession = vi.fn();
+		sessionTransport.store.setState({
+			sessions: {
+				[transient.sessionHandle]: {
+					...controlledTransient(transient.sessionHandle),
+					baselineAuthoritative: false,
+				},
+			},
+			releaseSession,
+			unsubscribeSession,
+		});
+		useSessionDirectoryStore.setState({
+			currentWorkspaceHandle: target.workspaceHandle,
+			currentSession: transient,
+			sessionsByWorkspace: { [target.workspaceHandle]: [target] },
+			selectedSessionByWorkspace: { [target.workspaceHandle]: transient.sessionHandle },
+		});
+
+		useSessionDirectoryStore.getState().selectSession(target);
+		reconcileHiddenSessionLifecycle(transient.sessionHandle);
+
+		expect(useSessionDirectoryStore.getState().currentSession?.sessionHandle).toBe(target.sessionHandle);
+		expect(abandon).not.toHaveBeenCalled();
+		expect(releaseSession).not.toHaveBeenCalled();
+		expect(unsubscribeSession).not.toHaveBeenCalled();
 	});
 
 	it("keeps a browser-only draft reachable through New session", async () => {

@@ -1,4 +1,4 @@
-# 协议 — Pi RPC 与 Session Web Gateway
+# 协议：Pi RPC 与 Session Web Gateway
 
 本文区分上游 **Pi RPC** 与 Pi Agent Web 自己的 REST/WebSocket 协议。事实已对照当前依赖
 `@earendil-works/pi-coding-agent@0.84.2` 与本仓库 runtime guards 核对；升级 Pi 时必须重新验证。
@@ -75,6 +75,8 @@ partial 并标记已停止。零 delta 的 assistant start/end 是合法序列�
 - 阻塞方法：`select`、`confirm`、`input`、`editor`。响应分别为 `{value}`、`{confirmed}` 或
   `{cancelled:true}`；Editor 没有 Agent timeout，Host 必须在断连/进程丢失时收敛。
 - 语义状态：`setStatus`、`setWidget`、`setTitle`、`set_editor_text`；相同 key 替换，clear 删除。
+- Gateway 用一个有界 Runtime map 保存 sticky 语义状态；pending 与 sticky 共用 256 项、512 KiB
+  Runtime 预算。容量淘汰先发布对应 clear frame，使 live observer 与后续 snapshot 收敛。
 - `notify` 是瞬时 Toast，不应在 snapshot 中重复播放。
 - Web 为 request 设置数量/字节上限，并以 `extension_ui_closed` 向所有订阅者公布 answered、
   cancelled、expired、process_lost 或 replaced。
@@ -141,7 +143,7 @@ unpersisted、无 command/dialog/transition reservation。停止进程后若目�
 
 | `type` | 必填字段 | 语义 |
 |---|---|---|
-| `session_subscribe` | `sessionHandle`, optional `{generation,seq}` cursor | 激活/订阅并获取 baseline 与 replay/resync |
+| `session_subscribe` | `sessionHandle`, optional `{serverEpoch,generation,seq}` cursor | 激活/订阅并获取 baseline 与 replay/resync |
 | `session_unsubscribe` | `sessionHandle` | 停止该连接的事件消费；不停止 Pi |
 | `session_claim` | `sessionHandle` | 尝试取得该 Session 的 controller lease |
 | `session_release` | `sessionHandle` | 释放该连接持有的 Session lease |
@@ -158,44 +160,63 @@ Prompt/steer/follow_up 文本按 UTF-8 编码后上限 1 MiB。可以是 image-o
 
 | `type` | 核心字段 | 语义 |
 |---|---|---|
-| `runtime_state` | `runtime` | Session 的 handle/workspace/id/file/generation/lastSeq/state/recoverable |
-| `event` | Session envelope + `event` | 权威 Pi/extension error 事件 |
-| `response` | handle, generation, `barrierSeq`, Pi response, optional previous handle | 只发回命令发起连接 |
-| `lease_status` | handle, `isController`, controller-only token | 当前连接在该 Session 的权限快照 |
-| `resync_required` | handle, runtime, reason | initial/generation_changed/gap/invalid_cursor |
-| `extension_ui_snapshot` | handle, generation, requests | catch-up 时的原子待处理/semantic UI 状态 |
+| `runtime_state` | `runtime` | Session 的 epoch/handle/workspace/id/file/generation/lastSeq/state/recoverable |
+| `event` | epoch-aware Session envelope + `event` | 权威 Pi/extension error 事件 |
+| `response` | epoch, handle, generation, `barrierSeq`, Pi response, optional previous handle | 只发回命令发起连接 |
+| `lease_status` | epoch, handle, generation, `isController`, controller-only token | 当前连接在该 Session 的权限快照 |
+| `resync_required` | epoch, handle, runtime, reason | initial/epoch_changed/generation_changed/gap/invalid_cursor |
+| `session_snapshot` | snapshot identity, runtime, `baseSeq`, `asOfSeq`, projection state | 一个 waterline 上的原子 live baseline |
 | `extension_ui_request` | sequenced request | live blocking/semantic/notify 请求 |
-| `extension_ui_result` | request id, accepted/no_dialog/not_running | 只确认 response admission；closed 帧负责全体收敛 |
+| `extension_ui_result` | epoch, handle, generation, request id, accepted/no_dialog/not_running | 只确认 response admission；closed 帧负责全体收敛 |
 | `extension_ui_closed` | sequenced request id + reason | 所有订阅者删除对话框或 semantic request |
-| `session_rekeyed` | previous handle + authoritative runtime | new/fork/clone 或 catch-up identity 迁移 |
-| `session_error` | handle, operation, error | subscribe/claim/release/extension response 错误 |
+| `session_rekeyed` | epoch, previous handle + authoritative runtime | new/fork/clone 或 catch-up identity 迁移 |
+| `session_error` | epoch, handle, operation, error | subscribe/claim/release/extension response 错误 |
 | `session_directory_changed` | workspace id | 触发该 Workspace 的 forced native catalog refresh |
 | `auth_changed` | optional workspace id | 重新获取模型/认证状态 |
 
-Session envelope 是 `{sessionHandle,workspaceId,generation,seq}`。Runtime state：`starting`、`idle`、
-`running`、`waiting_ui`、`crashed`、`dormant`。
+Session envelope 是 `{serverEpoch,sessionHandle,workspaceId,generation,seq}`。Stream position 由
+`{serverEpoch,sessionHandle,generation,seq}` 唯一确定。Runtime state：`starting`、`idle`、`running`、
+`waiting_ui`、`crashed`、`dormant`。
 
 ### Subscribe 与 response barrier
 
 若请求的 handle 在 catch-up 中 fork/clone 到新 handle，Bridge 先发 synthetic `session_rekeyed`，
-让 UI 能关联 baseline。Bridge 的 wire 顺序为：runtime → replay 或 `resync_required` → Extension
-snapshot → lease → live。UI 不会把 baseline 中的 `resync_required` 提前暴露给 consumer；它先原子
-应用 Extension snapshot，再启动 snapshot resync，避免丢失让 Pi 阻塞的对话框。catch-up 窗口的
-新帧先缓冲，再按 generation/seq 去重；unsubscribe、重复 subscribe、close 与 buffer overflow 都会
-取消旧 continuation。
+让 UI 能关联 baseline。Bridge 的 wire 顺序为：runtime → replay，或 runtime → `resync_required` →
+`session_snapshot` → lease → live suffix。catch-up 窗口的新帧先缓冲，再按完整 stream identity 与
+seq 去重；unsubscribe、重复 subscribe、close 与 buffer overflow 都会取消旧 continuation。
+
+Cursor 先校验 `serverEpoch`，再解析 handle/rekey，随后校验 generation 和 seq range。Epoch 不匹配
+返回 `epoch_changed`，其他身份或范围不确定也必须显式 resync，禁止推断、补齐或静默修复 cursor。
+
+`session_snapshot` 的 `runtime.lastSeq` 必须等于 `asOfSeq`。它包含 `baseSeq` 上的 settled messages、
+严格递增且位于 `(baseSeq, asOfSeq]` 的 product projection events、queue、pending blocking Extension
+requests 与 sticky Extension state。UI 原子替换 Session-scoped projection 与 Extension state，再只应用
+`seq > asOfSeq` 的连续 suffix。`notify`、Controller Lease 与 fencing token 不属于 snapshot。Replay 若
+跳过 `notify` 以避免重复 Toast，产生的 seq 空洞必须转为 gap resync，不能把非连续帧当作 replay。
 
 Pi response 到达时 Gateway 记录 `barrierSeq`。UI 必须先应用同 generation 中不大于该序号的事件，
-再 resolve command。`get_messages` 是 resync 的特殊启动命令：它的 response 本身推进 snapshot barrier，
-否则“等待投影后 resolve / 等 response 才重建投影”会形成死锁。
+再 resolve command。这个规则适用于所有普通 response。`get_messages` 只是一条普通只读命令；它的
+response 不建立 resync baseline，也不推进 `asOfSeq`。
 
 ### 有界性与 backpressure
 
 - Runtime replay 默认同时受 1024 frame 与 8 MiB 限制；startup/transition staging、Extension state、
-  dialogs、UI raw events 和 resync buffers都有独立 item/byte ceiling。
-- Catch-up 与每连接应用层 outbound queue 分别限制积压。单个合法 `get_messages` snapshot response
-  （Pi JSONL line 不超过 64 MiB，另有固定上限的 Web envelope）可以成为唯一 oversized send/queue
-  item；其前后的普通 queued backlog 仍不得超过 1 MiB。已有 socket backlog 超过 1 MiB、出现第二个
-  oversized item 或追加 backlog 越界时才断开。
+  dialogs、UI raw events 和 resync buffers 都有独立 item/byte ceiling。
+- `session_snapshot` 的完整 canonical JSON 上限为 64 MiB，最多包含 10,000 条 settled message、4,096
+  条 projection event、每个 queue 分区 10,000 项、每个 Extension 分区 256 项，JSON depth 上限为 48，
+  总结构项上限为 250,000。Guard 只接受 plain canonical JSON record、自有可枚举 data property 与普通
+  Array；symbol、accessor、非枚举字段和 exotic container 都 fail closed。
+- Live product event suffix 默认上限为 4,096 项与 8 MiB。每个 active Turn 的 raw product-event
+  count 与完整 frame bytes 分别限制为对应 ceiling 的 50%，默认即 2,048 项与 4 MiB。发送
+  `prompt`、`steer` 或 `follow_up` 前，Runtime 必须等待并复核 idle base compaction 已恢复这份
+  remaining headroom，并在同一串行 admission 边界原子创建 pending reservation；容量不足时在发送
+  Pi 命令前拒绝。Reservation 在 Agent 启动时转为 active，并在失败、取消、结算、stop 或 rekey 时
+  释放。单个 Turn 超过 half-ceiling 时稳定 overflow，协议不承诺容纳任意 Turn，也不在本层合成
+  chunk 或 rollover。
+- Catch-up 与每连接应用层 outbound queue 分别限制积压。一个合法 `session_snapshot` 可以成为唯一
+  oversized send/queue item；其前后的普通 queued backlog 仍不得超过 1 MiB。已有 socket backlog
+  超过 1 MiB、出现第二个 oversized item 或追加 backlog 越界时才断开。Snapshot overflow 使用稳定
+  `session_snapshot_overflow` 错误，Runtime 不自动重启，Browser 也不形成永久 retry 或 Toast 循环。
 - 浏览器断开时 pending command reject、catch-up 取消、controller lease 释放；不保留幽灵 token。
 
 ## 6. Pi 存储与目录配置

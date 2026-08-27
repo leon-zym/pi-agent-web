@@ -141,6 +141,21 @@ describe("Session-scoped extension UI", () => {
 		expect(useComposerStore.getState().draft).toBe("extension draft");
 	});
 
+	it("preserves minimized state only for dialogs still present in the same generation", () => {
+		const store = useExtensionUiStore.getState();
+		store.replaceRequestsForSession("session-a", 7, [request("keep"), request("removed")]);
+		store.minimizeForSession("session-a", "keep");
+		store.minimizeForSession("session-a", "removed");
+
+		store.replaceRequestsForSession("session-a", 7, [request("keep")]);
+		expect(useExtensionUiStore.getState().bySession["session-a"]?.minimizedDialogIds).toEqual({
+			keep: true,
+		});
+
+		store.replaceRequestsForSession("session-a", 8, [request("keep")]);
+		expect(useExtensionUiStore.getState().bySession["session-a"]?.minimizedDialogIds).toEqual({});
+	});
+
 	it("routes responses to their Session and waits for an authoritative close", () => {
 		const sendExtensionUiResponse = vi.fn(() => true);
 		sessionTransport.store.setState({ sendExtensionUiResponse });

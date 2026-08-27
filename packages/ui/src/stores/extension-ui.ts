@@ -400,6 +400,15 @@ export const useExtensionUiStore = create<ExtensionUiState>()((set, get) => {
 						break;
 				}
 			}
+			const dialogIds = new Set(snapshot.dialogs.map((dialog) => dialog.request.id));
+			snapshot = {
+				...snapshot,
+				minimizedDialogIds: Object.fromEntries(
+					Object.entries(snapshot.minimizedDialogIds).filter(
+						([requestId, minimized]) => minimized && dialogIds.has(requestId),
+					),
+				),
+			};
 			updateSession(sessionHandle, () => snapshot);
 			if (snapshot.editorText !== null) {
 				useComposerStore.getState().setDraftForSession(sessionHandle, snapshot.editorText);

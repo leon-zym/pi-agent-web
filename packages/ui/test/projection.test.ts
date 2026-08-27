@@ -116,4 +116,49 @@ describe("projection cache", () => {
 			markdown: "x".repeat(1_000),
 		});
 	});
+
+	it("restores a running tool and its partial output from one authoritative snapshot", () => {
+		const events: SessionEventDto[] = [
+			{ type: "agent_start" },
+			{ type: "turn_start" },
+			{
+				type: "message_update",
+				usage,
+				assistantMessageEvent: { type: "toolcall_start", contentIndex: 0 },
+			},
+			{
+				type: "message_update",
+				usage,
+				assistantMessageEvent: {
+					type: "toolcall_end",
+					contentIndex: 0,
+					toolCall: { type: "toolCall", id: "call-live", name: "bash", arguments: { command: "sleep 1" } },
+				},
+			},
+			{
+				type: "tool_execution_start",
+				toolCallId: "call-live",
+				toolName: "bash",
+				args: { command: "sleep 1" },
+			},
+			{
+				type: "tool_execution_update",
+				toolCallId: "call-live",
+				toolName: "bash",
+				args: { command: "sleep 1" },
+				partialResult: { output: "still running" },
+			},
+		];
+
+		useProjectionStore.getState().applyAuthoritativeSnapshot("s1", [], events);
+
+		const projection = useProjectionStore.getState().projections.s1;
+		expect(projection?.activeTurnId).not.toBeNull();
+		expect(projection?.turns.at(-1)?.steps[0]?.blocks[0]).toMatchObject({
+			type: "tool_call",
+			toolCallId: "call-live",
+			status: "running",
+			partialOutput: "still running",
+		});
+	});
 });

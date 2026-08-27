@@ -1,5 +1,5 @@
 import type { NativeSessionDto } from "@pi-agent-web/protocol";
-import type { SessionChannelState } from "../stores/session-transport";
+import { hasFreshLeaseBaseline, type SessionChannelState } from "../stores/session-transport-contract";
 
 export type SessionDeleteBlockReason =
 	| "controller_required"
@@ -11,17 +11,23 @@ export type SessionDeleteCapability =
 	| { allowed: true; reason: null }
 	| { allowed: false; reason: SessionDeleteBlockReason };
 
+export function isSessionControlReady(channel: SessionChannelState | undefined): boolean {
+	return Boolean(
+		channel?.subscribed &&
+			channel.baselineAuthoritative &&
+			hasFreshLeaseBaseline(channel) &&
+			channel.generation !== null &&
+			channel.lease.isController &&
+			channel.lease.fencingToken,
+	);
+}
+
 /** Shared destructive-action admission hint; the gateway remains authoritative. */
 export function sessionDeleteCapability(
 	session: NativeSessionDto,
 	channel: SessionChannelState | undefined,
 ): SessionDeleteCapability {
-	if (
-		!channel?.subscribed ||
-		channel.generation === null ||
-		!channel.lease.isController ||
-		!channel.lease.fencingToken
-	) {
+	if (!channel || !isSessionControlReady(channel)) {
 		return { allowed: false, reason: "controller_required" };
 	}
 	if (!session.persisted) return { allowed: false, reason: "session_unpersisted" };

@@ -21,6 +21,7 @@ import { SessionSupervisor } from "../src/session-supervisor.js";
 import { MAX_SESSION_WS_BUFFERED_BYTES, SessionWsBridge } from "../src/session-ws-bridge.js";
 
 const fixturePath = path.join(import.meta.dirname, "fixtures", "session-runtime-pi.mjs");
+const TEST_SERVER_EPOCH = "session-ws-bridge-test-epoch";
 const temporaryRoots: string[] = [];
 const harnesses: Harness[] = [];
 
@@ -166,19 +167,47 @@ function createNativeSession(root: string, cwd: string, nativeSessionId: string)
 
 function snapshotResponse(textBytes: number): SessionWsServerMessage {
 	return {
-		type: "response",
+		type: "session_snapshot",
+		snapshotId: "snapshot-id",
+		serverEpoch: TEST_SERVER_EPOCH,
 		sessionHandle: "snapshot-session",
+		workspaceId: "snapshot-workspace",
 		generation: 1,
-		barrierSeq: 0,
-		response: {
-			type: "response",
-			id: "snapshot-command",
-			command: "get_messages",
-			success: true,
-			data: {
-				messages: [{ role: "assistant", content: [{ type: "text", text: "x".repeat(textBytes) }] }],
+		baseSeq: 0,
+		asOfSeq: 0,
+		runtime: {
+			serverEpoch: TEST_SERVER_EPOCH,
+			sessionHandle: "snapshot-session",
+			workspaceId: "snapshot-workspace",
+			nativeSessionId: "snapshot-native",
+			sessionFile: "/snapshot-session.jsonl",
+			cwd: "/snapshot-workspace",
+			generation: 1,
+			lastSeq: 0,
+			state: "idle",
+			lastActivityAt: 0,
+			recoverable: true,
+		},
+		settledMessages: [
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "x".repeat(textBytes) }],
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: 0,
 			},
-		} as unknown as SessionCommandResponseDto,
+		],
+		projectionEvents: [],
+		queue: { steering: [], followUp: [] },
+		pendingExtensionRequests: [],
+		stickyExtensionState: [],
 	};
 }
 
@@ -202,12 +231,13 @@ function markBridgeConnectionHelloComplete(bridge: SessionWsBridge): void {
 
 async function createHarness(
 	targets: ExistingSessionTarget[],
-	options: { replayLimit?: number } = {},
+	options: { replayLimit?: number; serverEpoch?: string; env?: Record<string, string> } = {},
 ): Promise<Harness> {
 	const connectionEvents: string[] = [];
 	const targetMap = new Map(targets.map((target) => [target.sessionHandle, target]));
 	let bridge: SessionWsBridge;
 	const supervisor = new SessionSupervisor({
+		serverEpoch: options.serverEpoch ?? TEST_SERVER_EPOCH,
 		resolved: {
 			command: process.execPath,
 			args: [fixturePath],
@@ -220,6 +250,7 @@ async function createHarness(
 			capabilities: legacyRpcV1Adapter.capabilities,
 		},
 		resolveSession: async (sessionHandle) => targetMap.get(sessionHandle),
+		env: options.env,
 		broadcast: (message) => bridge.broadcast(message),
 		replayLimit: options.replayLimit ?? 32,
 		readyTimeoutMs: 2_000,
@@ -227,7 +258,6 @@ async function createHarness(
 	});
 	bridge = new SessionWsBridge({
 		supervisor,
-		serverEpoch: "session-ws-bridge-test-epoch",
 		serverBuild: "0.1.0-test",
 		runtime: {
 			version: "0.84.2",
@@ -295,13 +325,13 @@ async function openClient(harness: Harness): Promise<ClientProbe> {
 async function subscribe(
 	client: ClientProbe,
 	sessionHandle: string,
-	cursor?: { generation: number; seq: number },
+	cursor?: { serverEpoch?: string; generation: number; seq: number },
 ): Promise<{ runtime: SessionRuntimeDto; lease: LeaseFrame; frames: SessionWsServerMessage[] }> {
 	const mark = client.mark();
 	client.send({
 		type: "session_subscribe",
 		sessionHandle,
-		...(cursor ? { cursor } : {}),
+		...(cursor ? { cursor: { serverEpoch: cursor.serverEpoch ?? TEST_SERVER_EPOCH, ...cursor } } : {}),
 	});
 	const lease = await client.waitForFrame(
 		(frame): frame is LeaseFrame => frame.type === "lease_status" && frame.sessionHandle === sessionHandle,
@@ -404,13 +434,270 @@ describe("SessionWsBridge", () => {
 		});
 
 		expect(subscription.runtime.state).toBe("idle");
-		expect(scopedTypes).toEqual([
-			"runtime_state",
-			"resync_required",
-			"extension_ui_snapshot",
-			"lease_status",
-		]);
+		expect(scopedTypes).toEqual(["runtime_state", "resync_required", "session_snapshot", "lease_status"]);
+		const snapshot = subscription.frames.find((frame) => frame.type === "session_snapshot");
+		expect(snapshot).toMatchObject({
+			serverEpoch: TEST_SERVER_EPOCH,
+			sessionHandle: target.sessionHandle,
+			baseSeq: 0,
+			asOfSeq: subscription.runtime.lastSeq,
+		});
 	});
+
+	it("fences a cursor issued by Gateway A when the same Session reconnects to Gateway B", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "previous-gateway-epoch");
+		const gatewayA = await createHarness([target], { serverEpoch: "gateway-a-epoch" });
+		const owner = await openClient(gatewayA);
+		const initial = await subscribe(owner, target.sessionHandle);
+		const lease = await claim(owner, target.sessionHandle);
+		await command(
+			owner,
+			target.sessionHandle,
+			initial.runtime.generation,
+			{ id: "gateway-a-events", type: "prompt", message: "events" },
+			lease.fencingToken,
+		);
+		const gatewayACursor = await eventually(() => {
+			const runtime = gatewayA.supervisor.getRuntime(target.sessionHandle);
+			return runtime?.state === "idle" && runtime.lastSeq > 0
+				? {
+						serverEpoch: runtime.serverEpoch,
+						generation: runtime.generation,
+						seq: runtime.lastSeq,
+					}
+				: undefined;
+		});
+		await owner.close();
+		await gatewayA.bridge.close();
+		await gatewayA.supervisor.stopAll();
+		await new Promise<void>((resolve) => gatewayA.server.close(() => resolve()));
+		const gatewayAIndex = harnesses.indexOf(gatewayA);
+		if (gatewayAIndex >= 0) harnesses.splice(gatewayAIndex, 1);
+
+		const gatewayB = await createHarness([target], { serverEpoch: "gateway-b-epoch" });
+		const observer = await openClient(gatewayB);
+		const restarted = await subscribe(observer, target.sessionHandle, gatewayACursor);
+		expect(restarted.frames).toContainEqual(
+			expect.objectContaining({
+				type: "resync_required",
+				serverEpoch: "gateway-b-epoch",
+				reason: "epoch_changed",
+			}),
+		);
+		expect(restarted.frames).toContainEqual(
+			expect.objectContaining({
+				type: "session_snapshot",
+				serverEpoch: "gateway-b-epoch",
+				asOfSeq: restarted.runtime.lastSeq,
+			}),
+		);
+		expect(
+			restarted.frames.filter(
+				(frame) =>
+					frame.type === "event" ||
+					frame.type === "extension_ui_request" ||
+					frame.type === "extension_ui_closed",
+			),
+		).toEqual([]);
+	});
+
+	it("fails a stale generation cursor closed with one fresh snapshot and zero replay", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "stale-generation-cursor");
+		const harness = await createHarness([target]);
+		const client = await openClient(harness);
+		const initial = await subscribe(client, target.sessionHandle);
+		client.send({ type: "session_unsubscribe", sessionHandle: target.sessionHandle });
+		await harness.supervisor.stop(target.sessionHandle);
+
+		const restarted = await subscribe(client, target.sessionHandle, {
+			generation: initial.runtime.generation,
+			seq: initial.runtime.lastSeq,
+		});
+
+		expect(restarted.runtime.generation).toBeGreaterThan(initial.runtime.generation);
+		expect(restarted.frames.filter((frame) => frame.type === "resync_required")).toEqual([
+			expect.objectContaining({ reason: "generation_changed" }),
+		]);
+		expect(restarted.frames.filter((frame) => frame.type === "session_snapshot")).toHaveLength(1);
+		expect(
+			restarted.frames.filter(
+				(frame) =>
+					frame.type === "event" ||
+					frame.type === "extension_ui_request" ||
+					frame.type === "extension_ui_closed",
+			),
+		).toEqual([]);
+	});
+
+	it.each(["thinking", "text", "tool", "dialog"] as const)(
+		"gives an active %s checkpoint observer an equivalent snapshot and one contiguous suffix",
+		async (stage) => {
+			const root = temporaryRoot();
+			const cwd = path.join(root, "workspace");
+			const checkpointDir = path.join(root, "checkpoints");
+			fs.mkdirSync(cwd);
+			fs.mkdirSync(checkpointDir);
+			const target = createNativeSession(root, cwd, `active-${stage}-snapshot`);
+			const harness = await createHarness([target], {
+				env: { PI_WEB_FIXTURE_CHECKPOINT_DIR: checkpointDir },
+			});
+			const owner = await openClient(harness);
+			const observer = await openClient(harness);
+			const ownerSubscription = await subscribe(owner, target.sessionHandle);
+			const ownerLease = await claim(owner, target.sessionHandle);
+			const ownerMark = owner.mark();
+
+			await command(
+				owner,
+				target.sessionHandle,
+				ownerSubscription.runtime.generation,
+				{ id: `checkpoint-${stage}`, type: "prompt", message: `snapshot-checkpoint:${stage}` },
+				ownerLease.fencingToken,
+			);
+			await eventually(() => {
+				const frames = owner.frames.slice(ownerMark);
+				if (stage === "thinking") {
+					return frames.some(
+						(frame) =>
+							frame.type === "event" &&
+							frame.event.type === "message_update" &&
+							frame.event.assistantMessageEvent.type === "thinking_delta",
+					);
+				}
+				if (stage === "text") {
+					return frames.some(
+						(frame) =>
+							frame.type === "event" &&
+							frame.event.type === "message_update" &&
+							frame.event.assistantMessageEvent.type === "text_delta",
+					);
+				}
+				if (stage === "tool") {
+					return frames.some(
+						(frame) => frame.type === "event" && frame.event.type === "tool_execution_update",
+					);
+				}
+				return frames.some(
+					(frame) => frame.type === "extension_ui_request" && frame.request.method === "confirm",
+				);
+			});
+
+			const observed = await subscribe(observer, target.sessionHandle);
+			const snapshot = observed.frames.find(
+				(frame): frame is Extract<SessionWsServerMessage, { type: "session_snapshot" }> =>
+					frame.type === "session_snapshot",
+			);
+			if (!snapshot) throw new Error(`${stage} subscription did not include a Session snapshot`);
+			expect(snapshot).toMatchObject({
+				serverEpoch: TEST_SERVER_EPOCH,
+				sessionHandle: target.sessionHandle,
+				workspaceId: target.workspaceId,
+				generation: ownerSubscription.runtime.generation,
+				baseSeq: 0,
+				asOfSeq: snapshot.runtime.lastSeq,
+				runtime: { state: stage === "dialog" ? "waiting_ui" : "running" },
+			});
+			const ownerProjection = owner.frames
+				.slice(ownerMark)
+				.filter(
+					(frame): frame is Extract<SessionWsServerMessage, { type: "event" }> =>
+						frame.type === "event" && frame.seq <= snapshot.asOfSeq,
+				);
+			expect(snapshot.projectionEvents).toEqual(ownerProjection);
+
+			const snapshotEvents = snapshot.projectionEvents.map((frame) => frame.event);
+			expect(snapshotEvents).toContainEqual(expect.objectContaining({ type: "agent_start" }));
+			if (stage !== "thinking") {
+				expect(snapshotEvents).toContainEqual(
+					expect.objectContaining({
+						type: "message_update",
+						assistantMessageEvent: expect.objectContaining({
+							type: "text_delta",
+							delta: "checkpoint-text",
+						}),
+					}),
+				);
+			}
+			if (stage === "tool" || stage === "dialog") {
+				expect(snapshotEvents).toContainEqual(
+					expect.objectContaining({
+						type: "tool_execution_update",
+						partialResult: { text: "checkpoint-tool-partial" },
+					}),
+				);
+				expect(snapshotEvents.some((event) => event.type === "tool_execution_end")).toBe(false);
+			}
+			if (stage === "dialog") {
+				const requestId = `checkpoint-dialog-${target.nativeSessionId}`;
+				expect(snapshot.pendingExtensionRequests.filter((request) => request.id === requestId)).toHaveLength(
+					1,
+				);
+				expect(
+					owner.frames
+						.slice(ownerMark)
+						.filter((frame) => frame.type === "extension_ui_request" && frame.request.id === requestId),
+				).toHaveLength(1);
+				expect(
+					observed.frames.filter(
+						(frame) => frame.type === "extension_ui_request" && frame.request.id === requestId,
+					),
+				).toEqual([]);
+			} else {
+				expect(snapshot.pendingExtensionRequests).toEqual([]);
+			}
+
+			const suffixMark = observer.mark();
+			if (stage === "dialog") {
+				const requestId = `checkpoint-dialog-${target.nativeSessionId}`;
+				const responseMark = owner.mark();
+				owner.send({
+					type: "extension_ui_response",
+					sessionHandle: target.sessionHandle,
+					expectedGeneration: ownerSubscription.runtime.generation,
+					fencingToken: ownerLease.fencingToken!,
+					response: { type: "extension_ui_response", id: requestId, confirmed: true },
+				});
+				await owner.waitForFrame(
+					(frame): frame is Extract<SessionWsServerMessage, { type: "extension_ui_result" }> =>
+						frame.type === "extension_ui_result" &&
+						frame.requestId === requestId &&
+						frame.outcome === "accepted",
+					responseMark,
+				);
+			}
+			fs.writeFileSync(path.join(checkpointDir, `${target.nativeSessionId}-${stage}.release`), "release\n");
+			await observer.waitForFrame(
+				(frame): frame is Extract<SessionWsServerMessage, { type: "event" }> =>
+					frame.type === "event" && frame.event.type === "agent_settled",
+				suffixMark,
+			);
+			const current = await eventually(() => {
+				const runtime = harness.supervisor.getRuntime(target.sessionHandle);
+				return runtime?.state === "idle" ? runtime : undefined;
+			});
+			const suffixSequences = observer.frames
+				.slice(suffixMark)
+				.flatMap((frame) =>
+					frame.type === "event" ||
+					frame.type === "extension_ui_request" ||
+					frame.type === "extension_ui_closed"
+						? [frame.seq]
+						: [],
+				);
+			expect(suffixSequences).toEqual(
+				Array.from(
+					{ length: current.lastSeq - snapshot.asOfSeq },
+					(_value, index) => snapshot.asOfSeq + index + 1,
+				),
+			);
+		},
+	);
 
 	it("buffers events during catch-up and flushes every newer sequence exactly once", async () => {
 		const root = temporaryRoot();
@@ -461,7 +748,7 @@ describe("SessionWsBridge", () => {
 		});
 		const baselineIndex = scopedFrames.findIndex((frame) => frame.type === "runtime_state");
 		const resyncIndex = scopedFrames.findIndex((frame) => frame.type === "resync_required");
-		const snapshotIndex = scopedFrames.findIndex((frame) => frame.type === "extension_ui_snapshot");
+		const snapshotIndex = scopedFrames.findIndex((frame) => frame.type === "session_snapshot");
 		const leaseIndex = scopedFrames.findIndex((frame) => frame.type === "lease_status");
 		const eventSequences = scopedFrames.flatMap((frame) => (frame.type === "event" ? [frame.seq] : []));
 
@@ -513,8 +800,8 @@ describe("SessionWsBridge", () => {
 		const caughtUp = await observerSubscription;
 		const requestId = `dialog-${target.nativeSessionId}`;
 		const snapshotOccurrences = caughtUp.frames.flatMap((frame) =>
-			frame.type === "extension_ui_snapshot"
-				? frame.requests.filter((request) => request.id === requestId)
+			frame.type === "session_snapshot"
+				? frame.pendingExtensionRequests.filter((request) => request.id === requestId)
 				: [],
 		).length;
 		const liveOccurrences = caughtUp.frames.filter(
@@ -593,12 +880,13 @@ describe("SessionWsBridge", () => {
 			"session_rekeyed",
 			"runtime_state",
 			"resync_required",
-			"extension_ui_snapshot",
+			"session_snapshot",
 			"lease_status",
 		]);
 		expect(sessionFrames.filter((frame) => frame.type === "session_rekeyed")).toEqual([
 			{
 				type: "session_rekeyed",
+				serverEpoch: TEST_SERVER_EPOCH,
 				previousSessionHandle: parent.sessionHandle,
 				runtime: expect.objectContaining({ sessionHandle: grandchild.sessionHandle }),
 			},
@@ -678,12 +966,13 @@ describe("SessionWsBridge", () => {
 				"session_rekeyed",
 				"runtime_state",
 				"resync_required",
-				"extension_ui_snapshot",
+				"session_snapshot",
 				"lease_status",
 			]);
 			expect(scopedFrames.filter((frame) => frame.type === "session_rekeyed")).toEqual([
 				{
 					type: "session_rekeyed",
+					serverEpoch: TEST_SERVER_EPOCH,
 					previousSessionHandle: parent.sessionHandle,
 					runtime: expect.objectContaining({ sessionHandle: grandchild.sessionHandle }),
 				},
@@ -904,7 +1193,7 @@ describe("SessionWsBridge", () => {
 
 		expect(frames.filter((frame) => frame.type === "runtime_state")).toHaveLength(1);
 		expect(frames.filter((frame) => frame.type === "resync_required")).toHaveLength(1);
-		expect(frames.filter((frame) => frame.type === "extension_ui_snapshot")).toHaveLength(1);
+		expect(frames.filter((frame) => frame.type === "session_snapshot")).toHaveLength(1);
 		expect(frames.filter((frame) => frame.type === "lease_status")).toHaveLength(1);
 	});
 
@@ -980,6 +1269,7 @@ describe("SessionWsBridge", () => {
 
 		send(connection, {
 			type: "session_error",
+			serverEpoch: TEST_SERVER_EPOCH,
 			sessionHandle: "ordinary-oversized-session",
 			operation: "subscribe",
 			error: "x".repeat(MAX_SESSION_WS_BUFFERED_BYTES),
@@ -990,7 +1280,7 @@ describe("SessionWsBridge", () => {
 		expect(harness.connectionEvents).toContainEqual(expect.stringContaining("oversized WebSocket frame"));
 	});
 
-	it("queues one near-limit get_messages response behind an in-flight frame", async () => {
+	it("queues one near-limit atomic Session snapshot behind an in-flight frame", async () => {
 		const harness = await createHarness([]);
 		const socket = new ControlledSendSocket();
 		socket.deferNextSend();
@@ -1010,7 +1300,7 @@ describe("SessionWsBridge", () => {
 		expect(socket.readyState).toBe(WebSocket.OPEN);
 	});
 
-	it("keeps additional backlog bounded while one oversized response is queued", async () => {
+	it("keeps additional backlog bounded while one oversized Session snapshot is queued", async () => {
 		const harness = await createHarness([]);
 		const socket = new ControlledSendSocket();
 		socket.deferNextSend();
@@ -1019,6 +1309,7 @@ describe("SessionWsBridge", () => {
 		const { connection, send } = bridgeConnection(harness.bridge);
 		const backlogFrame = (suffix: string): SessionWsServerMessage => ({
 			type: "session_error",
+			serverEpoch: TEST_SERVER_EPOCH,
 			sessionHandle: "snapshot-session",
 			operation: "subscribe",
 			error: `${suffix}${"x".repeat(600_000)}`,
@@ -1246,7 +1537,9 @@ describe("SessionWsBridge", () => {
 		const subscription = await subscribe(client, target.sessionHandle);
 		expect(subscription.lease).toEqual({
 			type: "lease_status",
+			serverEpoch: TEST_SERVER_EPOCH,
 			sessionHandle: target.sessionHandle,
+			generation: subscription.runtime.generation,
 			isController: false,
 		});
 		const response = await command(client, target.sessionHandle, subscription.runtime.generation, {
@@ -1379,48 +1672,52 @@ describe("SessionWsBridge", () => {
 		).toEqual([]);
 	});
 
-	it.each([1_100_000, 2_000_000, 6_000_000])(
-		"keeps a real Session socket open after a legitimate %i-byte response",
-		async (responseBytes) => {
-			const root = temporaryRoot();
-			const cwd = path.join(root, "workspace");
-			fs.mkdirSync(cwd);
-			const target = createNativeSession(root, cwd, `large-response-${String(responseBytes)}`);
-			const harness = await createHarness([target]);
-			const client = await openClient(harness);
-			const subscription = await subscribe(client, target.sessionHandle);
-			const originalSendCommand = harness.supervisor.sendCommand.bind(harness.supervisor);
-			harness.supervisor.sendCommand = async (sessionHandle, rpcCommand, context) => {
-				const result = await originalSendCommand(sessionHandle, rpcCommand, context);
-				if (rpcCommand.type !== "get_messages") return result;
-				return {
-					...result,
-					response: {
-						type: "response",
-						id: rpcCommand.id,
-						command: rpcCommand.type,
-						success: true,
-						data: {
-							messages: [
-								{
-									role: "assistant",
-									content: [{ type: "text", text: "x".repeat(responseBytes) }],
-								},
-							],
-						},
-					} as unknown as SessionCommandResponseDto,
-				};
+	it("rejects an oversized get_messages command response as an ordinary frame", async () => {
+		const responseBytes = 1_100_000;
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, `large-response-${String(responseBytes)}`);
+		const harness = await createHarness([target]);
+		const client = await openClient(harness);
+		const subscription = await subscribe(client, target.sessionHandle);
+		const originalSendCommand = harness.supervisor.sendCommand.bind(harness.supervisor);
+		harness.supervisor.sendCommand = async (sessionHandle, rpcCommand, context) => {
+			const result = await originalSendCommand(sessionHandle, rpcCommand, context);
+			if (rpcCommand.type !== "get_messages") return result;
+			return {
+				...result,
+				response: {
+					type: "response",
+					id: rpcCommand.id,
+					command: rpcCommand.type,
+					success: true,
+					data: {
+						messages: [
+							{
+								role: "assistant",
+								content: [{ type: "text", text: "x".repeat(responseBytes) }],
+							},
+						],
+					},
+				} as unknown as SessionCommandResponseDto,
 			};
+		};
 
-			const response = await command(client, target.sessionHandle, subscription.runtime.generation, {
+		const closed = new Promise<{ code: number; reason: string }>((resolve) => {
+			client.ws.once("close", (code, reason) => resolve({ code, reason: reason.toString() }));
+		});
+		client.send({
+			type: "command",
+			sessionHandle: target.sessionHandle,
+			expectedGeneration: subscription.runtime.generation,
+			command: {
 				id: `large-response-${String(responseBytes)}`,
 				type: "get_messages",
-			});
-			expect(response.response).toMatchObject({ success: true });
-			await new Promise<void>((resolve) => setTimeout(resolve, 25));
-			expect(client.ws.readyState).toBe(WebSocket.OPEN);
-		},
-	);
+			},
+		});
+		expect(await closed).toEqual({ code: 1008, reason: "policy violation" });
+	});
 
 	it("rewrites streamed bash ids only for the originating connection", async () => {
 		const root = temporaryRoot();
@@ -1445,6 +1742,7 @@ describe("SessionWsBridge", () => {
 				if (!runtime) throw new Error("bash id fixture runtime disappeared");
 				harness.bridge.broadcast({
 					type: "event",
+					serverEpoch: TEST_SERVER_EPOCH,
 					sessionHandle: runtime.sessionHandle,
 					workspaceId: runtime.workspaceId,
 					generation: runtime.generation,
@@ -1545,7 +1843,11 @@ describe("SessionWsBridge", () => {
 			owner.send({
 				type: "session_subscribe",
 				sessionHandle: parent.sessionHandle,
-				cursor: { generation: subscription.runtime.generation, seq: subscription.runtime.lastSeq },
+				cursor: {
+					serverEpoch: TEST_SERVER_EPOCH,
+					generation: subscription.runtime.generation,
+					seq: subscription.runtime.lastSeq,
+				},
 			});
 			await captured;
 			const child = await harness.supervisor.sendCommand(
@@ -1661,16 +1963,16 @@ describe("SessionWsBridge", () => {
 
 		const restored = await subscribe(client, dialogSession.sessionHandle);
 		const snapshot = restored.frames.find(
-			(frame): frame is Extract<SessionWsServerMessage, { type: "extension_ui_snapshot" }> =>
-				frame.type === "extension_ui_snapshot" && frame.sessionHandle === dialogSession.sessionHandle,
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_snapshot" }> =>
+				frame.type === "session_snapshot" && frame.sessionHandle === dialogSession.sessionHandle,
 		);
-		expect(snapshot?.requests).toContainEqual(requestFrame.request);
+		expect(snapshot?.pendingExtensionRequests).toContainEqual(requestFrame.request);
 		const observer = await openClient(harness);
 		const observed = await subscribe(observer, dialogSession.sessionHandle);
 		expect(
 			observed.frames
-				.find((frame) => frame.type === "extension_ui_snapshot")
-				?.requests.some((request) => request.id === requestFrame.request.id),
+				.find((frame) => frame.type === "session_snapshot")
+				?.pendingExtensionRequests.some((request) => request.id === requestFrame.request.id),
 		).toBe(true);
 		const restoredLease = await claim(client, dialogSession.sessionHandle);
 		if (!restoredLease.fencingToken) throw new Error("restored controller lease is missing its token");

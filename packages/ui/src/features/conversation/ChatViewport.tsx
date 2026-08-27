@@ -5,8 +5,10 @@ import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import { useProjectionStore } from "../../stores/projection";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
+import { useSessionTransportStore } from "../../stores/session-transport";
 import { ConversationToc } from "./ConversationToc";
 import { EmptyHero } from "./EmptyHero";
+import { SessionRecoveryNotice } from "./SessionRecoveryNotice";
 import { StatusRowView } from "./StatusRowView";
 import { TurnView } from "./TurnView";
 
@@ -116,6 +118,10 @@ export function ChatViewport() {
 		currentSessionId ? s.projections[currentSessionId] : undefined,
 	);
 	const creatingSession = useSessionDirectoryStore((state) => state.sessionCreation !== null);
+	const recovery = useSessionTransportStore((state) =>
+		currentSessionId ? state.sessions[currentSessionId]?.recovery : null,
+	);
+	const manualRetryResync = useSessionTransportStore((state) => state.manualRetryResync);
 
 	const scrollToBottom = useCallback(
 		(smooth = false) => {
@@ -198,6 +204,16 @@ export function ChatViewport() {
 				ref={contentRef}
 				className="mx-auto flex min-h-full min-w-0 w-full max-w-[748px] flex-col px-6 py-6"
 			>
+				{recovery && (
+					<div className="mb-4 shrink-0">
+						<SessionRecoveryNotice
+							state={recovery}
+							onRetry={() => {
+								if (currentSessionId) manualRetryResync(currentSessionId);
+							}}
+						/>
+					</div>
+				)}
 				{isLoading ? (
 					<ConversationLoadingSkeleton />
 				) : isEmpty ? (

@@ -1,4 +1,4 @@
-# UI/UX — Session 工作台交互契约
+# UI/UX：Session 工作台交互契约
 
 视觉 Token 与组件配方见 [DESIGN.md](../DESIGN.md)；本文件规定用户可观察的交互行为。页面的
 selected Session 只是显示指针，不能被误写成 Gateway 或 Pi 的唯一“当前会话”。
@@ -23,6 +23,9 @@ selected Session 只是显示指针，不能被误写成 Gateway 或 Pi 的唯�
 选择 Session 时按标准流水线执行：恢复该 Session 的本地 Store 视图 $\to$ 订阅 WebSocket Channel $\to$ 在 Baseline 同步完成后按需 Claim 控制权。离开 Session 时：
 
 - **骨架屏平滑过渡**：新建与尚无 Projection 的历史 Session 先呈现骨架屏（Skeleton）；只有 Authoritative 空快照才能展示 First-turn 引导页。新建请求开始时旧对话立即退出可见树，迟到的 Create Response 不得把用户从后来选中的 Session 抢回。
+- **权威 Baseline 门禁**：订阅、rekey、reload 或 resync 期间，在原子 `session_snapshot` 与连续 suffix 完成前保持陈旧内容可辨识但不可修改。Composer、Abort、Fork、设置变更与 Extension UI 响应全部禁用；只读检查仍可使用。普通命令响应也必须等投影越过 `barrierSeq` 才显示完成。
+- **有界恢复状态**：自动 resync 只进行有限次数，使用退避与 jitter，不递归触发连接或错误 Toast。恢复期间显示稳定的同步提示；预算耗尽后停在 degraded 状态，保留陈旧内容并提供单一“重试同步”操作。Manual retry 从 cursorless baseline 重新开始，不能绕过 Mutation 门禁。
+- **Hard reload 边界**：页面能从一个权威 snapshot 恢复本地已知并重新打开的 Session，包括流式文本、Thinking、运行中工具 partial result、Queue 与阻塞对话框。新连接发现 Gateway 持有的全部后台 hot Runtime 属于 hot-runtime inventory reconciliation，不从 selected pointer 或 dormant 历史列表推断。
 - **WebSocket 订阅 LRU admission target（带 Running 活性守卫）**：
   - `MAX_ACTIVE_SUBSCRIPTIONS = 6` 是 idle/persisted 订阅的软 admission target，不是所有状态下的硬上限；
   - **前置活性守卫**：达到目标后，仅允许淘汰 `state === "idle"` 或 `"dormant"`、已持久化且没有待处理 Extension 请求的会话。处于 `running`、`waiting_ui`、`starting`、`unpersisted` 的会话必须常驻订阅，受保护会话可能使活跃数暂时超过目标，确保后台任务流、音频提示与审批弹窗持续生效。
@@ -36,7 +39,7 @@ selected Session 只是显示指针，不能被误写成 Gateway 或 Pi 的唯�
 每个 Session 拥有独立的 Controller Lease。一个浏览器 Tab 可控制多个 Session，不同 Tab 可各自控制不同 Session；同一 Session 的第二个打开者为 Observer。
 
 - **Observer 只读模式**：Observer 可实时浏览历史、流式事件、Tool Output 与待处理 Extension UI，但 Composer、中断按钮及所有 Mutation 控件显式呈现为只读禁用态，并展示“另一个标签页正在控制此 Session”的原因说明。
-- **Lease 释放与接管**：Controller 标签页关闭、释放或断网时，Observer 重新选择该 Session 即可取得新 Baseline 并按 Controller 意图完成 Claim。
+- **Lease 释放与接管**：Controller 标签页关闭、释放或断网时，Observer 重新选择该 Session 即可取得新 Baseline 并按 Controller 意图完成 Claim。新连接不继承旧 fencing token，Claim 只能在 Authoritative Baseline 完成后发起。
 - **柔性幂等退让 (Soft Idempotency)**：用户点击 `Abort` 或响应已超时的 Extension UI 请求时，若后端返回“已结算/已过期/无进行中任务”等竞态结果，客户端统一按**柔性无操作 (Soft No-op)** 吸收，不弹出侵入式红色错误 Toast，界面平滑过渡至 Idle 状态。
 
 ---
@@ -99,11 +102,11 @@ Composer Visual Seat 固定于 Center 底部，同一 DOM 延续焦点，数据�
 - **乐观更新回填与 ContentShape 对齐**：本地发送即刻渲染 `optimistic: true` 气泡；当权威 `message_start` 到达时，基于 `contentShape`（文本特征 + 附件数）与 FIFO 队列匹配替换，消除消息重复与跳闪。
 
 ### 7.2 思维链 (Thinking) 2 段式平滑折叠
-- **Stage 1 (流式生成中)**：
+- **Stage 1（流式生成中）**：
   - 展示 5 行高度的滚动视窗，新文本追加时自动平滑置底（`scrollTop = scrollHeight`）；
   - 伴随 2.6s 优雅脉冲呼吸指示（`.thinking-sweep`），表明深度思考中。
-- **Stage 2 (结算完成 Settled)**：
-  - 流式结束后，通过 CSS Grid 动画（`grid-template-rows: 0fr 1fr`）平滑折叠为**末段结论摘要 (Teaser)**，仅呈现最终结论段落。
+- **Stage 2（结算完成 Settled）**：
+  - 流式结束后，通过 CSS Grid 动画（`grid-template-rows: 0fr 1fr`）平滑折叠为**末段结论摘要（Teaser）**，仅呈现最终结论段落。
 - **原位展开主交互**：
   - 点击 Thinking 卡片主体执行**原位内联平滑展开/折叠**，不弹出侧边栏，保障主阅读流居中；
   - 卡片右上角提供微型 `<ExternalLink>` 图标，按需在 DetailsPanel 的 Inspector 中全屏审阅。
@@ -120,7 +123,7 @@ Composer Visual Seat 固定于 Center 底部，同一 DOM 延续焦点，数据�
 - **Tier 3 决策卡片**：
   - Extension UI 审批、输入、选择等高注意力交互保留独立卡片权重。
 - **悬挂工具状态收敛 (`interrupted`)**：
-  - 历史会话加载或未完成 Turn 结算时，因 Crash、断网或 Abort 未收到结果的工具调用统一收敛为 `interrupted` 状态（弱化灰色标志），消除永久 Loading Spinner。
+  - 只有进程 Crash、用户 Abort 或权威 settled Turn 中仍无结果的工具调用收敛为 `interrupted` 状态（弱化灰色标志）。短暂断网、reload 与 resync 必须通过 snapshot 保留 running 状态和已有 partial result，不能提前伪造中断。
 
 ### 7.4 行级代码 Diff 块 (`DiffBlock`)
 - 在 Markdown 解析中专门拦截 ````diff` 代码块与文件编辑输出：

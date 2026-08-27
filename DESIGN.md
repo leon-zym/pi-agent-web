@@ -1,4 +1,4 @@
-# DESIGN.md — Pi Agent Web 视觉与设计系统契约
+# DESIGN.md：Pi Agent Web 视觉与设计系统契约
 
 本文件是所有界面与交互的视觉事实源。偏离 Token、布局、状态语言或交互模型时，PR 必须说明用户问题与验证证据。
 
@@ -16,11 +16,11 @@ Pi Agent Web 是**安静、精确、高生产力**的本地 Agent 工作台：
 
 ## 2. 信息架构与表面划分
 
-- **Sidebar (左栏)**：负责 Workspace 与 Session 导航、创建、搜索与后台状态感知。
-- **Center (主视口)**：唯一默认主表面，承载 Session Header、主对话阅读流与粘性 Composer。
-- **DetailsPanel (右侧上下文抽屉)**：三合一专注面板（`inspector` / `tree` / `debug`），**默认关闭**，仅在检查工具调用详情、代码 Diff、会话血缘分支或用户显式打开时挂载；禁止常驻空面板。
-- **ChatDock (浮动协作坞)**：阻塞式 Extension UI 最小化后的浮动胶囊，停靠在 Composer 上方，解除全屏遮罩以支持无障碍阅读历史。
-- **Conversation TOC (悬浮大纲轨)**：主对话右侧微缩进度刻度轨，提供长会话快速锚点与视口感知。
+- **Sidebar（左栏）**：负责 Workspace 与 Session 导航、创建、搜索与后台状态感知。
+- **Center（主视口）**：唯一默认主表面，承载 Session Header、主对话阅读流与粘性 Composer。
+- **DetailsPanel（右侧上下文抽屉）**：三合一专注面板（`inspector` / `tree` / `debug`），**默认关闭**，仅在检查工具调用详情、代码 Diff、会话血缘分支或用户显式打开时挂载；禁止常驻空面板。
+- **ChatDock（浮动协作坞）**：阻塞式 Extension UI 最小化后的浮动胶囊，停靠在 Composer 上方，解除全屏遮罩以支持无障碍阅读历史。
+- **Conversation TOC（悬浮大纲轨）**：主对话右侧微缩进度刻度轨，提供长会话快速锚点与视口感知。
 - **后台生命周期**：当前选中 Session 只是视图指针；Sidebar 与全局指示器必须清晰展示后台 `running` / `waiting_ui` / `crashed` 状态。
 
 ---
@@ -91,12 +91,12 @@ Pi Agent Web 是**安静、精确、高生产力**的本地 Agent 工作台：
 ## 4. 响应式布局与视口适配
 
 ### 4.1 桌面端 (Desktop ≥ 1024px)
-- **Sidebar**：默认 280px，支持 264–420px 拖拽调节，可一键收拢为 56px 导航 Rail。
-- **Center**：主阅读视口优先保留至少 640px，阅读轴居中（正文最大宽 700–748px，Composer 宽 760–780px）。
-- **DetailsPanel**：目标宽度 360px（300–520px 可拖拽），**默认关闭**；打开时优先压缩至 300px，必要时再微幅挤压 Center。关闭后保留固定可聚焦的 Reopen Rail。
+- **Sidebar**：默认 280px，支持 264 到 420px 拖拽调节，可一键收拢为 56px 导航 Rail。
+- **Center**：主阅读视口优先保留至少 640px，阅读轴居中（正文最大宽 700 到 748px，Composer 宽 760 到 780px）。
+- **DetailsPanel**：目标宽度 360px（300 到 520px 可拖拽），**默认关闭**；打开时优先压缩至 300px，必要时再微幅挤压 Center。关闭后保留固定可聚焦的 Reopen Rail。
 - **Conversation TOC**：悬浮于主阅读列右侧，视口右侧余量 $\ge 240\text{px}$ 时展现。
 
-### 4.2 平板端 (Tablet 768–1023px)
+### 4.2 平板端 (Tablet 768 到 1023px)
 - **Sidebar**：默认采用 56px Rail；Session 列表通过可滑出的覆盖层（Flyout surface）呈现。
 - **DetailsPanel**：不占常驻列，以抽屉（Sheet）或 Overlay 形式按需呈现。
 - **Composer**：与 Center 等宽，次要操作自动缩略为图标或短标签。
@@ -117,10 +117,10 @@ Pi Agent Web 是**安静、精确、高生产力**的本地 Agent 工作台：
 - **乐观更新对齐**：发送新消息时立即渲染 `optimistic: true` 占位气泡；当权威 `message_start` 到达时，通过 `contentShape`（文本特征 + 附件数）与 FIFO 队列精准对齐替换，杜绝重复闪烁。
 
 ### 5.2 思维链 (Thinking) 2 段式原位折叠
-- **Stage 1 (流式生成中)**：
+- **Stage 1（流式生成中）**：
   - 固定展示 5 行高度的滚动视窗，文本增量到达时平滑自动置底（`scrollTop = scrollHeight`）；
   - 伴随 2.6s 优雅平滑的脉冲呼吸指示（`.thinking-sweep`），表明模型正在深度思考。
-- **Stage 2 (结算完成 Settled)**：
+- **Stage 2（结算完成 Settled）**：
   - 流式结束后，通过 CSS Grid 动画（`grid-template-rows: 0fr 1fr`）平滑折叠为**末段结论摘要（Teaser）**，仅展示思考结论的最后关键段落。
 - **原位展开主交互**：
   - 点击 Thinking 卡片主体执行**原位内联平滑展开/收起**，不强行弹出侧边栏，保障主阅读轴连贯；
@@ -139,7 +139,7 @@ Pi Agent Web 是**安静、精确、高生产力**的本地 Agent 工作台：
 - **Tier 3 决策卡片**：
   - 仅对 Extension UI 审批、输入、选择等强人机交互保留完整卡片视觉权重。
 - **悬挂工具状态收敛 (`interrupted`)**：
-  - 历史会话加载或非活跃 Turn 结算时，未收到结果的工具调用统一收敛为 `interrupted`（弱化灰色标志），严禁残留永久 Loading Spinner，也绝不伪造为 `ok`。
+  - dormant settled history 加载、权威 Turn 结算、进程 Crash 或用户 Abort 时，未收到结果的工具调用收敛为 `interrupted`（弱化灰色标志）。Reload、短暂断线与 resync 不改变 live snapshot 中的 running 状态，严禁残留永久 Loading Spinner，也绝不伪造为 `ok`。
 
 ### 5.4 行级代码 Diff 块 (`DiffBlock`)
 - 在 Markdown 解析中专门拦截 ````diff` 代码块与文件编辑输出：
@@ -247,7 +247,12 @@ Pi Agent Web 是**安静、精确、高生产力**的本地 Agent 工作台：
 - **前置活性守卫**：达到目标后，仅允许淘汰 `state === "idle"` 或 `"dormant"`、已持久化且没有待处理 Extension 请求的会话。处于 `running`、`waiting_ui`、`starting`、`unpersisted` 的会话必须常驻订阅，受保护会话可能使活跃数暂时超过目标。
 
 ### 9.2 悬挂工具状态收敛
-- 进程崩溃、网络断开或用户 Abort 导致未返回结果的工具调用，视图层统一收敛为 `interrupted` 状态，显示弱化灰色标记，杜绝永恒 Loading Spinner。
+- 进程崩溃、用户 Abort 或权威 settled Turn 中仍未返回结果的工具调用，视图层收敛为 `interrupted` 状态，显示弱化灰色标记。短暂断线、reload 或 resync 期间继续显示 snapshot 中的 running 状态与 partial result，不以网络状态伪造工具结算。
+
+### 9.3 Authoritative resync 状态
+- Baseline 同步期间在 Conversation 阅读轴顶部显示 `SessionRecoveryNotice`，保留陈旧对话供阅读，并用文案明确说明内容正在同步。禁止用连续 Toast、全屏遮罩或无限 Spinner 表达恢复。
+- 自动尝试耗尽后，Notice 稳定停在 warning-soft 的 degraded 状态，显示原因摘要与单一“重试同步”按钮。按钮必须可键盘聚焦，点击只启动一次新的 cursorless 尝试，不隐藏当前内容。
+- Authoritative Baseline 完成前，Composer、Abort、Fork、设置变更与 Extension UI 响应保持禁用，并在控件附近说明同步原因。Manual retry 不能短暂恢复 Mutation 控件。
 
 ---
 
@@ -266,6 +271,6 @@ Pi Agent Web 是**安静、精确、高生产力**的本地 Agent 工作台：
 
 每次影响 Shell / Conversation / Composer 的改动，至少验证：
 1. **多主题与多视口**：Light / Dark；1440px、1280px、1024px、768px、375×812px；200% Zoom；`prefers-reduced-motion`。
-2. **完整生命周期状态**：empty、loading、no-model、running、waiting_ui、observer、crashed、reconnect/resync、error。
+2. **完整生命周期状态**：empty、loading、no-model、running、waiting_ui、observer、crashed、resync syncing、resync degraded/manual retry、error。
 3. **极值内容压力**：超长中英文标题、超长路径、大尺寸图片、超长 Markdown/代码、50+ 工具连续调用、后台 Session 并发更新。
 4. **自动化工程守卫**：运行 `node scripts/check-style.mjs` 与 `pnpm lint` 零错误通过。

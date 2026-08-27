@@ -2,6 +2,8 @@ import type {
 	ExtensionUiRequestDto,
 	ProductSessionEventDto,
 	SessionCommandResponseDto,
+	SessionRuntimeDto,
+	SessionSnapshotDto,
 } from "@pi-agent-web/protocol";
 import { READ_ONLY_RPC_COMMAND_TYPES } from "@pi-agent-web/protocol";
 
@@ -28,21 +30,12 @@ export interface NewSessionTarget {
 
 export type SessionTarget = ExistingSessionTarget | NewSessionTarget;
 
-export interface SessionRuntimeSnapshot {
-	sessionHandle: string;
-	workspaceId: string;
-	nativeSessionId: string;
-	sessionFile: string | null;
-	cwd: string;
-	generation: number;
-	lastSeq: number;
+export interface SessionRuntimeSnapshot extends SessionRuntimeDto {
 	state: SessionRuntimeState;
-	lastActivityAt: number;
-	recoverable: boolean;
-	error?: string;
 }
 
 interface SessionEnvelopeBase {
+	serverEpoch: string;
 	sessionHandle: string;
 	workspaceId: string;
 	generation: number;
@@ -66,6 +59,7 @@ export type SessionSupervisorMessage =
 	| { type: "runtime_state"; runtime: SessionRuntimeSnapshot }
 	| {
 			type: "session_rekeyed";
+			serverEpoch: string;
 			previousSessionHandle: string;
 			runtime: SessionRuntimeSnapshot;
 	  }
@@ -73,6 +67,7 @@ export type SessionSupervisorMessage =
 	| { type: "auth_changed"; workspaceId?: string };
 
 export interface ReplayCursor {
+	serverEpoch: string;
 	generation: number;
 	seq: number;
 }
@@ -82,16 +77,16 @@ export type ReplayResult =
 			type: "replay";
 			runtime: SessionRuntimeSnapshot;
 			frames: SessionReplayFrame[];
-			extensionRequests: ExtensionUiRequestDto[];
 	  }
 	| {
 			type: "resync_required";
 			runtime: SessionRuntimeSnapshot;
-			reason: "initial" | "generation_changed" | "gap" | "invalid_cursor";
-			extensionRequests: ExtensionUiRequestDto[];
+			reason: "initial" | "server_epoch_changed" | "generation_changed" | "gap" | "invalid_cursor";
+			snapshot: SessionSnapshotDto;
 	  };
 
 export interface SessionCommandResult {
+	serverEpoch: string;
 	sessionHandle: string;
 	generation: number;
 	/** Last event sequence observed when the Pi response was received. */
@@ -101,7 +96,9 @@ export interface SessionCommandResult {
 }
 
 export interface SessionLeaseSnapshot {
+	serverEpoch: string;
 	sessionHandle: string;
+	generation: number;
 	isController: boolean;
 	/** Present only for the controlling connection. */
 	fencingToken?: string;

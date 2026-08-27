@@ -1,8 +1,4 @@
-import {
-	expectCommandData,
-	type SessionRuntimeDto,
-	type SessionWsServerMessage,
-} from "@pi-agent-web/protocol";
+import type { SessionRuntimeDto, SessionWsServerMessage } from "@pi-agent-web/protocol";
 import { toast } from "sonner";
 import { migrateComposerHistory } from "../features/composer/use-composer-history";
 import { useComposerStore } from "../stores/composer";
@@ -11,10 +7,10 @@ import { useModelDirectoryStore } from "../stores/model-directory";
 import { useProjectionStore } from "../stores/projection";
 import { reconcileHiddenSessionLifecycle, useSessionDirectoryStore } from "../stores/session-directory";
 import { useSessionStatsStore } from "../stores/session-stats";
-import { SESSION_FRAME_DEFERRED, sessionTransport } from "../stores/session-transport";
+import { hasFreshLeaseBaseline, SESSION_FRAME_DEFERRED, sessionTransport } from "../stores/session-transport";
 import { useSlashCommandsStore } from "../stores/slash-commands";
 import { playAttentionChime, playCompletionChime } from "./audio-feedback";
-import { displayError, displayLabel, stripAnsi } from "./format";
+import { displayLabel, stripAnsi } from "./format";
 import { tt } from "./i18n";
 import { isSoftIdempotentError } from "./session-controller";
 import { isCoalescibleMessageUpdate, SessionEventScheduler } from "./session-event-scheduler";
@@ -25,22 +21,19 @@ type SessionFrameMessage = Exclude<
 	{ type: "response" } | { type: "session_directory_changed" } | { type: "auth_changed" }
 >;
 
-interface ResyncTask {
-	generation: number;
-	barrierSeq: number;
-	promise: Promise<void>;
-}
-
 let initialized = false;
-const resyncTasks = new Map<string, ResyncTask>();
-const resyncRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const directoryReloadTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const activeMessageIdentities = new Map<string, { generation: number; identity: string }>();
 
 const projectionEventScheduler = new SessionEventScheduler({
 	onFlush: (sessionHandle, generation, events) => {
 		const channel = sessionTransport.store.getState().sessions[sessionHandle];
-		if (channel?.generation !== generation || channel.resync) return;
+		if (
+			channel?.generation !== generation ||
+			(channel.resync && !sessionTransport.isSnapshotSuffixProjectionPending(sessionHandle, generation))
+		) {
+			return;
+		}
 		try {
 			const latest = events.at(-1);
 			if (latest) applyLiveUsage(sessionHandle, latest);
@@ -108,11 +101,34 @@ function routeSessionFrame(message: SessionFrameMessage): void | typeof SESSION_
 			return;
 		case "lease_status":
 			projectionEventScheduler.flushSession(message.sessionHandle);
+			scheduleHiddenLifecycleAfterLease(message);
 			return;
 		case "resync_required":
 			projectionEventScheduler.discardSession(message.sessionHandle);
 			activeMessageIdentities.delete(message.sessionHandle);
-			requestResync(message);
+			return;
+		case "session_snapshot":
+			projectionEventScheduler.discardSession(message.sessionHandle);
+			activeMessageIdentities.delete(message.sessionHandle);
+			routeRuntime(message.runtime, false);
+			useProjectionStore.getState().applyAuthoritativeSnapshot(
+				message.sessionHandle,
+				message.settledMessages,
+				message.projectionEvents.map((frame) => frame.event),
+			);
+			useComposerStore.getState().setQueueForSession(message.sessionHandle, {
+				steering: [...message.queue.steering],
+				followUp: [...message.queue.followUp],
+			});
+			useExtensionUiStore
+				.getState()
+				.replaceRequestsForSession(message.sessionHandle, message.generation, [
+					...message.pendingExtensionRequests,
+					...message.stickyExtensionState,
+				]);
+			applyVisibleExtensionTitle(message.sessionHandle);
+			void refreshSessionMetadata(message.sessionHandle);
+			scheduleHiddenLifecycleAfterSnapshot(message.runtime);
 			return;
 		case "session_rekeyed":
 			projectionEventScheduler.discardSession(message.previousSessionHandle);
@@ -128,7 +144,7 @@ function routeSessionFrame(message: SessionFrameMessage): void | typeof SESSION_
 	}
 }
 
-function routeRuntime(runtime: SessionRuntimeDto): void {
+function routeRuntime(runtime: SessionRuntimeDto, reconcileHidden = true): void {
 	const identity = activeMessageIdentities.get(runtime.sessionHandle);
 	if (
 		identity &&
@@ -145,6 +161,7 @@ function routeRuntime(runtime: SessionRuntimeDto): void {
 		useProjectionStore.getState().markRuntimeFailure(runtime.sessionHandle, stripAnsi(runtime.error ?? ""));
 	}
 	if (
+		reconcileHidden &&
 		!isCurrentSession(runtime.sessionHandle) &&
 		(runtime.state === "idle" || runtime.state === "dormant" || runtime.state === "crashed")
 	) {
@@ -162,6 +179,53 @@ function routeRuntime(runtime: SessionRuntimeDto): void {
 			updateTabBadge("idle", sessionLabel(runtime.sessionHandle));
 		}
 	}
+}
+
+function scheduleHiddenLifecycleAfterSnapshot(runtime: SessionRuntimeDto): void {
+	if (runtime.state !== "idle" && runtime.state !== "dormant" && runtime.state !== "crashed") return;
+	// The transport marks the baseline authoritative only after every synchronous
+	// snapshot listener commits. Reconcile on the next microtask and fence the
+	// captured incarnation so a visible switch or rekey cancels stale cleanup.
+	queueMicrotask(() => {
+		const channel = sessionTransport.store.getState().sessions[runtime.sessionHandle];
+		if (
+			!channel?.subscribed ||
+			!channel.baselineAuthoritative ||
+			!hasFreshLeaseBaseline(channel) ||
+			channel.resync !== null ||
+			channel.runtime?.serverEpoch !== runtime.serverEpoch ||
+			channel.runtime.workspaceId !== runtime.workspaceId ||
+			channel.runtime.sessionHandle !== runtime.sessionHandle ||
+			channel.runtime.generation !== runtime.generation
+		) {
+			return;
+		}
+		reconcileHiddenSessionLifecycle(runtime.sessionHandle);
+	});
+}
+
+function scheduleHiddenLifecycleAfterLease(
+	message: Extract<SessionWsServerMessage, { type: "lease_status" }>,
+): void {
+	const channel = sessionTransport.store.getState().sessions[message.sessionHandle];
+	const runtime = channel?.runtime;
+	if (!runtime || !hasFreshLeaseBaseline(channel)) return;
+	queueMicrotask(() => {
+		const current = sessionTransport.store.getState().sessions[message.sessionHandle];
+		if (
+			!current?.subscribed ||
+			!current.baselineAuthoritative ||
+			!hasFreshLeaseBaseline(current) ||
+			current.resync !== null ||
+			current.runtime?.serverEpoch !== runtime.serverEpoch ||
+			current.runtime.workspaceId !== runtime.workspaceId ||
+			current.runtime.sessionHandle !== runtime.sessionHandle ||
+			current.runtime.generation !== runtime.generation
+		) {
+			return;
+		}
+		reconcileHiddenSessionLifecycle(runtime.sessionHandle);
+	});
 }
 
 function routeEvent(
@@ -182,7 +246,10 @@ function routeEvent(
 	// Every structural event is an ordering boundary. Publish preceding deltas
 	// synchronously before tools, turn settlement, dialogs, errors, or snapshots.
 	projectionEventScheduler.flushSession(sessionHandle, generation);
-	if (sessionTransport.store.getState().sessions[sessionHandle]?.resync?.requiresFreshBaseline) {
+	if (
+		sessionTransport.store.getState().sessions[sessionHandle]?.resync?.requiresFreshBaseline &&
+		!sessionTransport.isSnapshotSuffixProjectionPending(sessionHandle, generation)
+	) {
 		return SESSION_FRAME_DEFERRED;
 	}
 	if (
@@ -303,78 +370,12 @@ function routeSessionError(message: Extract<SessionWsServerMessage, { type: "ses
 	toast.error(stripAnsi(message.error));
 }
 
-function requestResync(message: Extract<SessionWsServerMessage, { type: "resync_required" }>): void {
-	const existing = resyncTasks.get(message.sessionHandle);
-	if (
-		existing &&
-		existing.generation === message.runtime.generation &&
-		existing.barrierSeq >= message.runtime.lastSeq
-	) {
-		return;
-	}
-	clearResyncRetry(message.sessionHandle);
-	const task: ResyncTask = {
-		generation: message.runtime.generation,
-		barrierSeq: message.runtime.lastSeq,
-		promise: Promise.resolve(),
-	};
-	task.promise = performResync(message, 0).finally(() => {
-		if (resyncTasks.get(message.sessionHandle) === task) resyncTasks.delete(message.sessionHandle);
-	});
-	resyncTasks.set(message.sessionHandle, task);
-}
-
-async function performResync(
-	message: Extract<SessionWsServerMessage, { type: "resync_required" }>,
-	attempt: number,
-): Promise<void> {
-	const { sessionHandle } = message;
-	try {
-		const response = await sessionTransport.store
-			.getState()
-			.sendCommand(sessionHandle, { type: "get_messages" });
-		const { messages } = expectCommandData(response, "get_messages");
-		const channel = sessionTransport.store.getState().sessions[sessionHandle];
-		if (
-			!channel?.resync ||
-			channel.generation !== message.runtime.generation ||
-			channel.resync.generation !== message.runtime.generation
-		) {
-			return;
-		}
-		useProjectionStore.getState().rebuildFromMessages(sessionHandle, messages);
-		sessionTransport.store.getState().completeResync(sessionHandle);
-		void refreshSessionMetadata(sessionHandle);
-	} catch (error) {
-		const channel = sessionTransport.store.getState().sessions[sessionHandle];
-		if (!channel?.subscribed || channel.generation !== message.runtime.generation || !channel.resync) return;
-		const delay = Math.min(500 * 2 ** attempt, 10_000);
-		if (attempt >= 3 && isCurrentSession(sessionHandle)) {
-			toast.error(tt("session.loadFailed"), {
-				description: displayError(error),
-			});
-		}
-		clearResyncRetry(sessionHandle);
-		const timer = setTimeout(() => {
-			resyncRetryTimers.delete(sessionHandle);
-			void performResync(message, Math.min(attempt + 1, 5));
-		}, delay);
-		resyncRetryTimers.set(sessionHandle, timer);
-	}
-}
-
 async function refreshSessionMetadata(sessionHandle: string): Promise<void> {
 	await Promise.allSettled([
 		useSlashCommandsStore.getState().refresh(sessionHandle),
 		useModelDirectoryStore.getState().refresh(sessionHandle),
 		useSessionStatsStore.getState().refresh(sessionHandle),
 	]);
-}
-
-function clearResyncRetry(sessionHandle: string): void {
-	const timer = resyncRetryTimers.get(sessionHandle);
-	if (timer) clearTimeout(timer);
-	resyncRetryTimers.delete(sessionHandle);
 }
 
 function scheduleDirectoryReload(workspaceHandle: string): void {

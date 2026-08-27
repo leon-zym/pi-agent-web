@@ -6,6 +6,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "../../components/ui/pop
 import { SegmentedControl } from "../../components/ui/segmented-control";
 import { displayError, displayLabel } from "../../lib/format";
 import { tt } from "../../lib/i18n";
+import { isSessionControlReady } from "../../lib/session-capabilities";
 import { cn } from "../../lib/utils";
 import { useModelDirectoryStore } from "../../stores/model-directory";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
@@ -39,7 +40,7 @@ export function ModelSelector() {
 	const sessionHandle = useSessionDirectoryStore((s) => s.currentSession?.sessionHandle ?? null);
 	const canControl = useSessionTransportStore((state) => {
 		const channel = sessionHandle ? state.sessions[sessionHandle] : undefined;
-		return Boolean(channel?.lease.isController && channel.lease.fencingToken);
+		return isSessionControlReady(channel);
 	});
 	const runtimeState = useSessionTransportStore((state) =>
 		sessionHandle ? state.sessions[sessionHandle]?.runtime?.state : undefined,

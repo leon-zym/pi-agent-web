@@ -78,6 +78,7 @@ afterEach(() => {
 
 function idlePersistedRuntime(sessionHandle: string): SessionRuntimeDto {
 	return {
+		serverEpoch: "test-server-epoch",
 		sessionHandle,
 		workspaceId: "ws-1",
 		nativeSessionId: `native-${sessionHandle}`,
@@ -93,6 +94,7 @@ function idlePersistedRuntime(sessionHandle: string): SessionRuntimeDto {
 
 function runningRuntime(sessionHandle: string): SessionRuntimeDto {
 	return {
+		serverEpoch: "test-server-epoch",
 		sessionHandle,
 		workspaceId: "ws-1",
 		nativeSessionId: `native-${sessionHandle}`,
@@ -108,6 +110,7 @@ function runningRuntime(sessionHandle: string): SessionRuntimeDto {
 
 function unpersistedRuntime(sessionHandle: string): SessionRuntimeDto {
 	return {
+		serverEpoch: "test-server-epoch",
 		sessionHandle,
 		workspaceId: "ws-1",
 		nativeSessionId: `native-${sessionHandle}`,
@@ -261,10 +264,35 @@ describe("Active WebSocket Subscription LRU admission target with liveness guard
 			runtime: idlePersistedRuntime("session-1"),
 		});
 		controller.ingestServerMessage({
-			type: "extension_ui_snapshot",
+			type: "resync_required",
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "session-1",
+			runtime: idlePersistedRuntime("session-1"),
+			reason: "initial",
+		});
+		controller.ingestServerMessage({
+			type: "session_snapshot",
+			snapshotId: "snapshot-session-1",
+			serverEpoch: "test-server-epoch",
+			workspaceId: "ws-1",
 			sessionHandle: "session-1",
 			generation: 1,
-			requests: [{ id: "req-1", method: "confirm", message: "Allow file write?" } as never],
+			baseSeq: 10,
+			asOfSeq: 10,
+			runtime: idlePersistedRuntime("session-1"),
+			settledMessages: [],
+			projectionEvents: [],
+			queue: { steering: [], followUp: [] },
+			pendingExtensionRequests: [
+				{
+					type: "extension_ui_request",
+					id: "req-1",
+					method: "confirm",
+					title: "Confirm",
+					message: "Allow file write?",
+				},
+			],
+			stickyExtensionState: [],
 		});
 
 		// session-2 to session-6 are idle with no pending requests

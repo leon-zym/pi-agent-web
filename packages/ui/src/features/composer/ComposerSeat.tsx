@@ -17,6 +17,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/too
 import { stripAnsi } from "../../lib/format";
 import { tt, useT } from "../../lib/i18n";
 import { ImageAttachmentError, prepareImageAttachments } from "../../lib/image-attachments";
+import { isSessionControlReady } from "../../lib/session-capabilities";
 import { abortCurrentRun, submitDraft } from "../../lib/session-controller";
 import { cn } from "../../lib/utils";
 import { type SlashCommandToken, serializeComposerMessage, useComposerStore } from "../../stores/composer";
@@ -113,7 +114,7 @@ export function ComposerSeat() {
 
 	const canControl = useSessionTransportStore((state) => {
 		const channel = sessionHandle ? state.sessions[sessionHandle] : undefined;
-		return Boolean(channel?.lease.isController && channel.lease.fencingToken);
+		return isSessionControlReady(channel);
 	});
 	const runtimeBusy = useSessionTransportStore((state) => {
 		const runtimeState = sessionHandle ? state.sessions[sessionHandle]?.runtime?.state : undefined;

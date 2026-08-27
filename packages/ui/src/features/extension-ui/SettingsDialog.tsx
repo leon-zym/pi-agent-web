@@ -13,6 +13,7 @@ import { Separator } from "../../components/ui/separator";
 import { Switch } from "../../components/ui/switch";
 import { displayError } from "../../lib/format";
 import { tt } from "../../lib/i18n";
+import { isSessionControlReady } from "../../lib/session-capabilities";
 import { sendControlCommand } from "../../lib/session-controller";
 import { useTheme } from "../../lib/use-theme";
 import { cn } from "../../lib/utils";
@@ -69,7 +70,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 	const sessionHandle = useSessionDirectoryStore((s) => s.currentSession?.sessionHandle ?? null);
 	const canControl = useSessionTransportStore((transport) => {
 		const channel = sessionHandle ? transport.sessions[sessionHandle] : undefined;
-		return Boolean(channel?.lease.isController && channel.lease.fencingToken);
+		return isSessionControlReady(channel);
 	});
 	const [state, setState] = useState<Pick<
 		SessionStateDto,

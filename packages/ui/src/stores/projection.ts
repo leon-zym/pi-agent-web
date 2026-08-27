@@ -1,3 +1,4 @@
+import type { SessionProjectionEventDto } from "@pi-agent-web/protocol";
 import { create } from "zustand";
 import { type ConversationProjection, createEmptyProjection } from "../types/view-models";
 import { useComposerStore } from "./composer";
@@ -16,6 +17,12 @@ interface ProjectionState {
 	applyEvents: (sessionId: string, events: Parameters<typeof reduceProjection>[1][]) => void;
 	/** Rebuild the projection from a get_messages snapshot (reconnect/first load). */
 	rebuildFromMessages: (sessionId: string, messages: unknown[]) => void;
+	/** Atomically build and publish one authoritative snapshot projection. */
+	applyAuthoritativeSnapshot: (
+		sessionId: string,
+		settledMessages: unknown[],
+		projectionEvents: SessionProjectionEventDto["event"][],
+	) => void;
 	/** Settle a locally active turn when the owning Pi process is lost. */
 	markRuntimeFailure: (sessionId: string, error?: string) => void;
 	/** Drop a session projection (switch away, eviction). */
@@ -71,6 +78,21 @@ export const useProjectionStore = create<ProjectionState>()((set, get) => ({
 		// frames behind a resync barrier, so it is authoritative even if the
 		// previous local projection appeared to be streaming.
 		const next = rebuildProjectionFromMessages(sessionId, messages);
+		const order = touch(state.order, sessionId);
+		set(prune({ ...state, projections: { ...state.projections, [sessionId]: next }, order }));
+	},
+
+	applyAuthoritativeSnapshot: (sessionId, settledMessages, projectionEvents) => {
+		const state = get();
+		let next = rebuildProjectionFromMessages(sessionId, settledMessages);
+		for (const event of projectionEvents) {
+			if (event.type === "extension_error") continue;
+			next = reduceProjection(next, event, {
+				now: Date.now(),
+				resolveInjectionSource: (text) =>
+					useComposerStore.getState().consumeInjectionSourceForSession(sessionId, text),
+			});
+		}
 		const order = touch(state.order, sessionId);
 		set(prune({ ...state, projections: { ...state.projections, [sessionId]: next }, order }));
 	},

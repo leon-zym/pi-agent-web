@@ -1,4 +1,4 @@
-# 架构 — Pi Agent Web
+# 架构：Pi Agent Web
 
 本文描述当前生产路径。关键取舍见 [架构决策记录](decisions/)；协议字段与 Pi RPC
 事实见 [protocol.md](protocol.md)。
@@ -8,8 +8,8 @@
 1. **Pi JSONL 是持久化事实**：Web 不建立第二套 Workspace/Session 数据库。
 2. **每个热 Session 最多一个 Pi 进程**：历史 Session dormant 时没有进程；并发池有界。
 3. **选择只是视图指针**：切换页面不发送 Pi `switch_session`，也不停止后台 Session。
-4. **一条 WebSocket，多条 Session channel**：订阅、控制权、generation、seq、回放与
-   Extension UI 都按 Session 隔离。
+4. **一条 WebSocket，多条 Session channel**：订阅、控制权、`serverEpoch`、generation、seq、
+   回放与 Extension UI 都按 Session 隔离。
 5. **事件流是对话权威**：快照用于初始化与明确 resync；命令完成还要等待投影越过
    `barrierSeq`。
 6. **本机同源控制面**：只监听 loopback；Cookie、Host、Origin/Fetch Metadata 共同阻止
@@ -17,8 +17,8 @@
 7. **客户端订阅 LRU admission target（带 Running 活性守卫）**：单连接 idle/persisted 订阅的软目标为 6；
    **严格仅允许淘汰 `state === 'idle' || state === 'dormant'` 且已持久化、无待处理 Extension 请求的会话**；
    处于 `running`、`waiting_ui`、`starting`、`unpersisted` 的会话常驻订阅，受保护会话可能使活跃数暂时超过目标。
-8. **悬挂工具状态收敛为 interrupted**：异常崩溃、网络断开或用户 Abort 导致未收到结果的工具调用，
-   视图层统一收敛为 `interrupted` 状态，显示弱化灰色标志，杜绝界面残留永久 Loading 假死。
+8. **悬挂工具状态只在权威边界收敛**：进程崩溃、用户 Abort 或已结算 Turn 中未收到结果的工具调用
+   收敛为 `interrupted`。短暂断线或 resync 不提前中断工具；权威快照继续保留 running 与 partial result。
 9. **乐观 User 消息以 ContentShape 对齐**：前端提交即刻乐观挂载；权威 `message_start` 到达时按
    `contentShape`（文本特征 + 附件数）与 FIFO 队列匹配回填，消除重复与闪烁。
 10. **柔性幂等退让 (Soft Idempotency)**：针对竞争状态下的 Abort 或已失效 Extension UI 响应，
@@ -63,6 +63,7 @@ RecoverableSessionTrash is a side store used only by fenced deletion.
 | Workspace | JSONL Header `cwd` 的 canonical real path | `workspaceHandle` 是对应的不透明路由标识 |
 | 新空 Session | pending handle → allow-missing canonical path | Pi 可先分配 `sessionFile` 而不落盘；首次持久化后再冻结 Header/inode |
 | Controller | `(sessionHandle, connectionId, fencingToken)` | 只赋予一个 Session 的修改权，不是 Workspace 锁 |
+| Stream position | `(serverEpoch, sessionHandle, generation, seq)` | Gateway 重启、Session rekey、Runtime 重启和帧位置分别由四个分量隔离 |
 
 已存在文件用 `realpath`；尚未创建的 leaf 通过最近存在祖先的 realpath 规范化，防止符号链接
 父目录在落盘前后生成不同 handle。启动已有 Session 时，Runtime 会复核目标文件、Header id、
@@ -125,7 +126,7 @@ Session；不同连接也能各自控制不同 Session。同一 Session 同时�
 - prompt、queue、abort、model/thinking、compact、bash、fork/clone 等 mutation 需要精确
   `expectedGeneration` 与当前 `fencingToken`；
 - disconnect 释放该连接全部 lease，旧 fencing token 立即失效；
-- observer 继续接收历史、事件、运行状态与 Extension snapshot，但不能修改 Pi；
+- observer 继续接收权威 Session snapshot、事件、运行状态与 Extension state，但不能修改 Pi；
 - `new_session` 与 `switch_session` 是 Host 管理的生命周期命令，浏览器不能直接转发；新建走
   Native REST，页面导航只更改 selected pointer。
 
@@ -134,27 +135,64 @@ Session；不同连接也能各自控制不同 Session。同一 Session 同时�
 
 ## 事件、回放与 resync
 
-每个 generation 的权威事件按 `seq` 单调编号。Runtime 同时按帧数和字节数保存有界 replay；
-停止或溢出可以丢弃旧帧，但保留 cursor 边界，使客户端收到显式 gap，而不是静默漏消息。
+Gateway 启动时生成唯一 `serverEpoch`，并把同一值注入 hello、Runtime identity、sequenced
+envelope、response、lease、rekey、resync、snapshot 与 replay cursor。每个 stream position 是
+`{serverEpoch, sessionHandle, generation, seq}`。Cursor 按 epoch、handle/rekey、generation、seq
+range 的顺序校验；任一不确定身份都进入显式 resync。
+
+Runtime generation 启动时先用内部 `get_messages` 建立 `baseSeq = 0` 的 settled-message base，期间
+到达的已验证事件有界缓冲，base 建立后再按到达顺序提交。Gateway 的临时 live projection 保存
+settled base、有序 product-domain event suffix、queue、runtime phase 与 pending blocking Extension
+请求。Sticky Extension state 只保留在一个有界 Runtime map 中；替换、clear 与容量淘汰都发布明确的
+semantic frame，使 live observer 与 snapshot 在同一 waterline 收敛。Pi JSONL 仍是唯一持久化事实，
+这些内存状态只服务当前 Runtime generation。Startup frame 可以先提交 projection 与 replay，但必须
+等完整 wire snapshot guard 通过后才统一对外发布。
+
+每个 live frame 在同一串行边界中完成 projection、seq allocation、replay append 与 publish。投影或
+预算检查失败时，`lastSeq`、replay 和订阅者都看不到半提交帧。Runtime 同时按帧数和字节数保存有界
+replay；停止或溢出可以丢弃旧帧，但保留 cursor 边界，使客户端收到显式 gap。`notify` 只实时投递，
+不进入 snapshot；若 replay 为避免重复通知而跳过一个 `notify` seq，该范围必须按 gap 处理并改用
+snapshot，不能伪装成连续 replay。
 
 subscribe catch-up 的 Bridge wire 顺序是：
 
 ```text
 optional synthetic rekey
 → runtime baseline
-→ replay frames OR resync_required
-→ atomic Extension UI snapshot
+→ replay frames OR (resync_required → session_snapshot @ asOfSeq)
 → lease snapshot
-→ catch-up barrier 后的 live frames
+→ contiguous live suffix with seq > replay cursor / asOfSeq
 ```
 
-Bridge 在 catch-up 期间先缓冲新帧，最终按 generation/seq 去重后切 live。初次订阅、cursor
-无效、generation 变化、replay gap 或 UI 缓冲溢出都会进入 resync。UI 用 `get_messages` 重建
-投影，并在应用快照后完成新 cursor；UI 会延迟向 consumer 暴露 baseline `resync_required`，直到
-Extension snapshot 已原子应用，避免丢失让 Pi 阻塞的对话框。
+Bridge 在 catch-up 期间先缓冲新帧，最终按完整 stream identity 与 seq 去重后切 live。初次订阅、
+epoch 或 generation 变化、cursor 无效、replay gap、rekey race 或 UI 缓冲溢出都会进入 resync。
+`session_snapshot` 在一个 `asOfSeq` 原子包含 settled base、live product event suffix、queue、runtime
+phase、pending dialog 与 sticky Extension state；不包含瞬时 `notify`、Controller Lease 或 fencing token。
+UI 原子替换该 Session 的权威状态，然后只接受 `seq > asOfSeq` 的连续 suffix。
+
+Snapshot 有 item、byte 与 depth 上限。无法生成合法 snapshot 的 Runtime 进入稳定
+`session_snapshot_overflow` crashed 状态，停止 Pi 且不自动重启或形成订阅循环。Persisted Session 的
+显式 Runtime restart 会替换旧 overflow Runtime，以旧 generation 为 seed 启动下一 generation；不会
+复用已锁存 overflow 的实例。UI 的恢复状态机使用有界次数、退避与 jitter；预算耗尽后保持 degraded
+状态，只有显式 manual retry 才开始新的 cursorless 尝试。恢复完成前所有 mutation 与 Extension
+response 都 fail closed。已知 Session 的 hard reload 使用同一 snapshot 路径；新 Browser 连接发现并
+恢复所有 hot Runtime 的 inventory 属于独立的 hot-runtime reconciliation 契约。
+
+当 Runtime hot、idle 且没有 agent、compaction、awaiting-start、queue、in-flight command、dialog 或
+transition 时，可以用 compare-and-swap 压缩 live suffix：先记录 projection-owned incarnation 与
+`expectedAsOfSeq`，异步读取新的 settled base，提交时再次确认仍为 idle 且 waterline 未变化。成功后
+`baseSeq = asOfSeq` 并清空 suffix；任一条件变化都丢弃候选 base。
+
+`prompt`、`steer` 与 `follow_up` admission 还要为下一个 active Turn 保留有界 headroom。Raw product
+event 数量与完整 frame bytes 各自受 live suffix ceiling 的 50% 预算约束；剩余空间不足时，命令等待
+并复核 idle CAS compaction。容量复核与 pending reservation 在同一串行 admission 边界原子完成，
+不足时在命令发送给 Pi 前拒绝；Agent 启动后 reservation 转为 active，失败、取消、结算、stop 或
+rekey 时释放。这个预算只覆盖符合 half-ceiling 的 Turn，不保证任意完整 Turn。单个 active Turn
+超过预算时稳定进入 `session_snapshot_overflow`；更大的 Turn 需要 chunking 或 rollover 协议。
 
 Pi response 可与事件交错，因此 Gateway 附加 `barrierSeq`。UI 只有在同 generation 的投影已
-应用至该序号后才 resolve 调用者。fork/clone 的 `previousSessionHandle` 只迁移对应 transition
+应用至该序号后才 resolve 调用者。普通 `get_messages` response 也遵守该 barrier，但不再参与
+resync，也不能推进 snapshot waterline。fork/clone 的 `previousSessionHandle` 只迁移对应 transition
 命令和 channel，不批量改写父 Session 的其他 pending command。
 
 ## 前端状态所有权与生命周期不变量
@@ -177,7 +215,8 @@ Pi response 可与事件交错，因此 Gateway 附加 `barrierSeq`。UI 只有�
    - **严格活性守卫**：达到目标后，只有 `state === 'idle'` 或 `dormant`、已落盘持久化且没有待处理 Extension 请求的会话才允许由 LRU 策略退订；
    - `running`、`waiting_ui`、`starting` 或 `unpersisted` 会话受保护，因此受保护会话可能使活跃数暂时超过目标。
 2. **悬挂工具状态收敛为 `interrupted`**：
-   - 当历史会话加载、当前 Turn 结算或用户触发 Abort 时，若发现仍有尚未收到结果的工具调用，视图层统一将其状态置为 `interrupted`；
+   - 当 dormant settled history 加载、当前 Turn 权威结算、进程 Crash 或用户触发 Abort 时，若仍有尚未收到结果的工具调用，视图层将其状态置为 `interrupted`；
+   - reload、短暂断线或 resync 本身不是结算边界，live snapshot 中的 running tool 与 partial result 保持不变；
    - 渲染为低调的灰色标记，杜绝永恒 Loading Spinner，同时绝不篡改事实伪造为 `ok`。
 3. **乐观更新回填与 ContentShape 精准对齐**：
    - 用户发送 Prompt 后，前端立即生成带 `optimistic: true` 标记的 User 消息节点；

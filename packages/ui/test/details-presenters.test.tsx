@@ -13,6 +13,8 @@ import type { SessionRawEventRecord } from "../src/stores/session-transport-cont
 
 const event = {
 	receivedAt: Date.UTC(2026, 7, 21, 4, 3, 2),
+	serverEpoch: "test-server-epoch",
+	workspaceId: "workspace-a",
 	generation: 7,
 	seq: 42,
 	eventType: "agent_start",
