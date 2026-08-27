@@ -1,5 +1,7 @@
 /** Product-owned Browser/Gateway DTOs. No upstream Pi types may cross this module. */
 
+import type { SessionPayloadAdmissionErrorDto } from "./payload-budget.js";
+
 export type ThinkingLevelDto = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface ImageContentDto {
@@ -338,12 +340,26 @@ type SuccessResponseDto<K extends SessionCommandTypeDto> = {
 } & (SessionCommandDataMap[K] extends undefined ? { data?: undefined } : { data: SessionCommandDataMap[K] });
 
 export type SessionCommandResponseDto =
-	| { id?: string; type: "response"; command: string; success: false; error: string }
+	| {
+			id?: string;
+			type: "response";
+			command: string;
+			success: false;
+			error: string;
+			admissionError?: SessionPayloadAdmissionErrorDto;
+	  }
 	| { [K in SessionCommandTypeDto]: SuccessResponseDto<K> }[SessionCommandTypeDto];
 
 export type SessionCommandResponseFor<K extends SessionCommandTypeDto> =
 	| SuccessResponseDto<K>
-	| { id?: string; type: "response"; command: K; success: false; error: string };
+	| {
+			id?: string;
+			type: "response";
+			command: K;
+			success: false;
+			error: string;
+			admissionError?: SessionPayloadAdmissionErrorDto;
+	  };
 
 export type ExtensionUiRequestDto =
 	| {

@@ -96,7 +96,7 @@ test("a real browser negotiates an independently versioned client hello", async 
 	await expect
 		.poll(() => observed.received.find((frame) => frame.type === "server_hello"))
 		.toMatchObject({
-			protocol: { major: 1, minor: 1 },
+			protocol: { major: 1, minor: 2 },
 			serverBuild: "0.1.0",
 			piVersion: "0.84.2",
 			adapterId: "legacy-rpc-v1",

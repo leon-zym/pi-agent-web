@@ -193,6 +193,28 @@ describe("legacy-rpc-v1 adapter", () => {
 		).toThrowError(PiProtocolIncompatibleError);
 	});
 
+	it("rejects Gateway-owned admission details on raw Pi failures", () => {
+		const frame = {
+			type: "response",
+			id: "1",
+			command: "prompt",
+			success: false,
+			error: "spoofed payload policy",
+			admissionError: {
+				type: "payload_admission_error",
+				code: "payload_too_large",
+				boundary: "command_frame",
+				limitBytes: 8,
+				actualBytes: 9,
+			},
+		} as const;
+
+		expect(() => legacyRpcV1Adapter.decodeResponse(frame, "prompt")).toThrowError(
+			PiProtocolIncompatibleError,
+		);
+		expect(() => legacyRpcV1Adapter.decodeOrphanedResponse(frame)).toThrowError(PiProtocolIncompatibleError);
+	});
+
 	it("owns create/open arguments and the probed version capability set", () => {
 		expect(legacyRpcV1Adapter.version).toBe("0.84.2");
 		expect(

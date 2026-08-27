@@ -14,6 +14,7 @@ import type {
 } from "@pi-agent-web/protocol";
 import {
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+	RpcError,
 	SESSION_HOT_RUNTIME_INVENTORY_MAX_BYTES,
 } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it } from "vitest";
@@ -217,6 +218,61 @@ function snapshotResponse(textBytes: number): SessionWsServerMessage {
 		queue: { steering: [], followUp: [] },
 		pendingExtensionRequests: [],
 		stickyExtensionState: [],
+	};
+}
+
+function ordinaryLargeEvent(textBytes: number, seq = 1): Extract<SessionWsServerMessage, { type: "event" }> {
+	return {
+		type: "event",
+		serverEpoch: TEST_SERVER_EPOCH,
+		sessionHandle: "ordinary-large-session",
+		workspaceId: "ordinary-large-workspace",
+		generation: 1,
+		seq,
+		event: {
+			type: "tool_execution_update",
+			toolCallId: "ordinary-large-tool",
+			toolName: "large-result",
+			args: {},
+			partialResult: "x".repeat(textBytes),
+		},
+	};
+}
+
+function largeGetMessagesResponse(
+	textBytes: number,
+	id = "large-get-messages",
+): Extract<SessionWsServerMessage, { type: "response" }> {
+	return {
+		type: "response",
+		serverEpoch: TEST_SERVER_EPOCH,
+		sessionHandle: "large-response-session",
+		generation: 1,
+		barrierSeq: 0,
+		response: {
+			type: "response",
+			id,
+			command: "get_messages",
+			success: true,
+			data: {
+				messages: [
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "x".repeat(textBytes) }],
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "stop",
+						timestamp: 0,
+					},
+				],
+			},
+		},
 	};
 }
 
@@ -2095,6 +2151,7 @@ describe("SessionWsBridge", () => {
 		const socket = new NonClosingSocket();
 		harness.bridge.wss.emit("connection", socket as unknown as WebSocket, {} as http.IncomingMessage);
 		markBridgeConnectionHelloComplete(harness.bridge);
+		const { connection } = bridgeConnection(harness.bridge);
 		socket.emit(
 			"message",
 			Buffer.from(JSON.stringify({ type: "session_subscribe", sessionHandle: target.sessionHandle })),
@@ -2103,21 +2160,75 @@ describe("SessionWsBridge", () => {
 		await started;
 		const runtime = harness.supervisor.getRuntime(target.sessionHandle);
 		if (!runtime) throw new Error("overflow fixture runtime did not activate");
-		const oversizedState = {
-			type: "runtime_state" as const,
-			runtime: { ...runtime, error: "x".repeat(MAX_SESSION_WS_BUFFERED_BYTES) },
+		const oversizedEvent = {
+			...ordinaryLargeEvent(MAX_SESSION_WS_BUFFERED_BYTES + 1, runtime.lastSeq + 1),
+			sessionHandle: runtime.sessionHandle,
+			workspaceId: runtime.workspaceId,
+			generation: runtime.generation,
 		};
 
-		harness.bridge.broadcast(oversizedState);
-		for (let index = 0; index < 3; index += 1) harness.bridge.broadcast(oversizedState);
+		harness.bridge.broadcast(oversizedEvent);
+		expect(socket.closeCalls).toEqual([]);
+		harness.bridge.broadcast(oversizedEvent);
 		releaseSubscribe?.();
 		await new Promise<void>((resolve) => setImmediate(resolve));
 
 		expect(socket.closeCalls).toEqual([{ code: 1008, reason: "policy violation" }]);
 		expect(socket.sent).toEqual([]);
+		expect(connection).toMatchObject({
+			catchUpSmallBufferedBytes: 0,
+			catchUpLargeItems: 0,
+		});
+		expect((connection as { catchUps: Set<unknown> }).catchUps.size).toBe(0);
 		expect(harness.connectionEvents.filter((message) => message.startsWith("ws disconnected"))).toHaveLength(
 			1,
 		);
+	});
+
+	it("flushes one large ordinary event buffered during catch-up", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "catch-up-large-event");
+		const harness = await createHarness([target]);
+		const originalSubscribe = harness.supervisor.subscribe.bind(harness.supervisor);
+		let subscribeStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			subscribeStarted = resolve;
+		});
+		let releaseSubscribe: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			releaseSubscribe = resolve;
+		});
+		harness.supervisor.subscribe = async (sessionHandle, cursor) => {
+			const result = await originalSubscribe(sessionHandle, cursor);
+			subscribeStarted?.();
+			await gate;
+			return result;
+		};
+		const socket = new ControlledSendSocket();
+		harness.bridge.wss.emit("connection", socket as unknown as WebSocket, {} as http.IncomingMessage);
+		markBridgeConnectionHelloComplete(harness.bridge);
+		socket.emit(
+			"message",
+			Buffer.from(JSON.stringify({ type: "session_subscribe", sessionHandle: target.sessionHandle })),
+			false,
+		);
+		await started;
+		const runtime = harness.supervisor.getRuntime(target.sessionHandle);
+		if (!runtime) throw new Error("large catch-up fixture runtime did not activate");
+
+		harness.bridge.broadcast({
+			...ordinaryLargeEvent(MAX_SESSION_WS_BUFFERED_BYTES + 1, runtime.lastSeq + 1),
+			sessionHandle: runtime.sessionHandle,
+			workspaceId: runtime.workspaceId,
+			generation: runtime.generation,
+		});
+		expect(socket.closeCalls).toEqual([]);
+		releaseSubscribe?.();
+
+		await eventually(() => socket.sentBytes.some((bytes) => bytes > MAX_SESSION_WS_BUFFERED_BYTES));
+		expect(socket.closeCalls).toEqual([]);
 	});
 
 	it("disconnects a peer whose existing outbound backlog already exceeds the limit", async () => {
@@ -2134,24 +2245,23 @@ describe("SessionWsBridge", () => {
 		expect(harness.connectionEvents).toContainEqual(expect.stringContaining("slow WebSocket client"));
 	});
 
-	it("rejects a single oversized non-snapshot outbound frame before sending it", async () => {
+	it("sends one ordinary event above the small-backlog budget as the only large frame", async () => {
 		const harness = await createHarness([]);
 		const socket = new ControlledSendSocket();
 		harness.bridge.wss.emit("connection", socket as unknown as WebSocket, {} as http.IncomingMessage);
 		markBridgeConnectionHelloComplete(harness.bridge);
 		const { connection, send } = bridgeConnection(harness.bridge);
 
-		send(connection, {
-			type: "session_error",
-			serverEpoch: TEST_SERVER_EPOCH,
-			sessionHandle: "ordinary-oversized-session",
-			operation: "subscribe",
-			error: "x".repeat(MAX_SESSION_WS_BUFFERED_BYTES),
-		});
+		send(connection, ordinaryLargeEvent(MAX_SESSION_WS_BUFFERED_BYTES + 1));
 
-		expect(socket.sentBytes).toEqual([]);
-		expect(socket.closeCalls).toEqual([{ code: 1008, reason: "policy violation" }]);
-		expect(harness.connectionEvents).toContainEqual(expect.stringContaining("oversized WebSocket frame"));
+		expect(socket.sentBytes).toHaveLength(1);
+		expect(socket.sentBytes[0]).toBeGreaterThan(MAX_SESSION_WS_BUFFERED_BYTES);
+		expect(socket.closeCalls).toEqual([]);
+		expect(socket.readyState).toBe(WebSocket.OPEN);
+		await eventually(() => (connection as { outboundLargeItems: number }).outboundLargeItems === 0);
+		send(connection, ordinaryLargeEvent(MAX_SESSION_WS_BUFFERED_BYTES + 1, 2));
+		await eventually(() => socket.sentBytes.length === 2);
+		expect(socket.closeCalls).toEqual([]);
 	});
 
 	it("applies ordinary frame and backlog ceilings to hot inventory refreshes", async () => {
@@ -2259,7 +2369,7 @@ describe("SessionWsBridge", () => {
 		expect(harness.connectionEvents).toContainEqual(expect.stringContaining("slow WebSocket client"));
 	});
 
-	it("rejects a second oversized snapshot while the first is still in flight", async () => {
+	it("rejects a second large ordinary event while the first is still in flight", async () => {
 		const harness = await createHarness([]);
 		const socket = new ControlledSendSocket();
 		socket.deferNextSend();
@@ -2267,13 +2377,72 @@ describe("SessionWsBridge", () => {
 		markBridgeConnectionHelloComplete(harness.bridge);
 		const { connection, send } = bridgeConnection(harness.bridge);
 
-		send(connection, snapshotResponse(2_000_000));
+		send(connection, ordinaryLargeEvent(2_000_000, 1));
 		expect(socket.closeCalls).toEqual([]);
-		send(connection, snapshotResponse(2_000_000));
+		send(connection, ordinaryLargeEvent(2_000_000, 2));
 
 		expect(socket.sentBytes).toHaveLength(1);
 		expect(socket.closeCalls).toEqual([{ code: 1008, reason: "policy violation" }]);
 		expect(harness.connectionEvents).toContainEqual(expect.stringContaining("slow WebSocket client"));
+	});
+
+	it("rejects a second large response while the first is still in flight", async () => {
+		const harness = await createHarness([]);
+		const socket = new ControlledSendSocket();
+		socket.deferNextSend();
+		harness.bridge.wss.emit("connection", socket as unknown as WebSocket, {} as http.IncomingMessage);
+		markBridgeConnectionHelloComplete(harness.bridge);
+		const { connection, send } = bridgeConnection(harness.bridge);
+
+		send(connection, largeGetMessagesResponse(2_000_000, "large-response-1"));
+		expect(socket.closeCalls).toEqual([]);
+		send(connection, largeGetMessagesResponse(2_000_000, "large-response-2"));
+
+		expect(socket.sentBytes).toHaveLength(1);
+		expect(socket.closeCalls).toEqual([{ code: 1008, reason: "policy violation" }]);
+		expect(harness.connectionEvents).toContainEqual(expect.stringContaining("slow WebSocket client"));
+	});
+
+	it("checks socket bufferedAmount before draining a callback-delayed queue", async () => {
+		const harness = await createHarness([]);
+		const socket = new ControlledSendSocket();
+		socket.deferNextSend();
+		harness.bridge.wss.emit("connection", socket as unknown as WebSocket, {} as http.IncomingMessage);
+		markBridgeConnectionHelloComplete(harness.bridge);
+		const { connection, send } = bridgeConnection(harness.bridge);
+
+		send(connection, { type: "auth_changed" });
+		send(connection, { type: "session_directory_changed", workspaceId: "buffered-workspace" });
+		socket.bufferedAmount = MAX_SESSION_WS_BUFFERED_BYTES + 1;
+		socket.releaseDeferredSend();
+
+		await eventually(() => socket.closeCalls.length === 1);
+		expect(socket.sentBytes).toHaveLength(1);
+		expect(socket.closeCalls).toEqual([{ code: 1008, reason: "policy violation" }]);
+	});
+
+	it("clears small-byte and large-item queue accounting when a peer disconnects", async () => {
+		const harness = await createHarness([]);
+		const socket = new ControlledSendSocket();
+		socket.deferNextSend();
+		harness.bridge.wss.emit("connection", socket as unknown as WebSocket, {} as http.IncomingMessage);
+		markBridgeConnectionHelloComplete(harness.bridge);
+		const { connection, send } = bridgeConnection(harness.bridge);
+
+		send(connection, { type: "auth_changed" });
+		send(connection, ordinaryLargeEvent(2_000_000));
+		send(connection, { type: "session_directory_changed", workspaceId: "buffered-workspace" });
+		socket.emit("close");
+
+		expect(connection).toMatchObject({
+			outboundQueue: [],
+			outboundSmallQueuedBytes: 0,
+			outboundLargeItems: 0,
+			outboundSending: false,
+		});
+		socket.releaseDeferredSend();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(socket.sentBytes).toHaveLength(1);
 	});
 
 	it("releases a delayed parent claim from the child identity after a rekey", async () => {
@@ -2605,7 +2774,53 @@ describe("SessionWsBridge", () => {
 		).toEqual([]);
 	});
 
-	it("rejects an oversized get_messages command response as an ordinary frame", async () => {
+	it("preserves structured admission details only from a genuine Gateway RpcError", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "structured-command-error");
+		const harness = await createHarness([target]);
+		const client = await openClient(harness);
+		const subscription = await subscribe(client, target.sessionHandle);
+		const admissionError = {
+			type: "payload_admission_error",
+			code: "payload_too_large",
+			boundary: "command_frame",
+			limitBytes: 8,
+			actualBytes: 9,
+		} as const;
+		harness.supervisor.sendCommand = async () => {
+			throw new RpcError("prompt", "payload rejected", admissionError);
+		};
+
+		const admitted = await command(client, target.sessionHandle, subscription.runtime.generation, {
+			id: "structured-admission",
+			type: "prompt",
+			message: "too large",
+		});
+		expect(admitted.response).toMatchObject({
+			id: "structured-admission",
+			success: false,
+			error: "payload rejected",
+			admissionError,
+		});
+
+		harness.supervisor.sendCommand = async () => {
+			throw Object.assign(new Error("ordinary failure"), { admissionError });
+		};
+		const ordinary = await command(client, target.sessionHandle, subscription.runtime.generation, {
+			id: "ordinary-error",
+			type: "get_state",
+		});
+		expect(ordinary.response).toMatchObject({
+			id: "ordinary-error",
+			success: false,
+			error: "ordinary failure",
+		});
+		expect(ordinary.response).not.toHaveProperty("admissionError");
+	});
+
+	it("sends a valid get_messages command response above the small-backlog budget", async () => {
 		const responseBytes = 1_100_000;
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace");
@@ -2637,19 +2852,15 @@ describe("SessionWsBridge", () => {
 			};
 		};
 
-		const closed = new Promise<{ code: number; reason: string }>((resolve) => {
-			client.ws.once("close", (code, reason) => resolve({ code, reason: reason.toString() }));
+		const result = await command(client, target.sessionHandle, subscription.runtime.generation, {
+			id: `large-response-${String(responseBytes)}`,
+			type: "get_messages",
 		});
-		client.send({
-			type: "command",
-			sessionHandle: target.sessionHandle,
-			expectedGeneration: subscription.runtime.generation,
-			command: {
-				id: `large-response-${String(responseBytes)}`,
-				type: "get_messages",
-			},
+		expect(result.response).toMatchObject({
+			command: "get_messages",
+			success: true,
 		});
-		expect(await closed).toEqual({ code: 1008, reason: "policy violation" });
+		expect(client.ws.readyState).toBe(WebSocket.OPEN);
 	});
 
 	it("rewrites streamed bash ids only for the originating connection", async () => {

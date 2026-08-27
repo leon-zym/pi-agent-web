@@ -1,3 +1,4 @@
+import { isSessionPayloadAdmissionErrorDto } from "./payload-budget.js";
 import type {
 	AssistantMessageDiagnosticDto,
 	AssistantMessageDto,
@@ -1050,7 +1051,11 @@ export function isSessionCommandResponseDto(value: unknown): value is SessionCom
 		return false;
 	if (!isSessionCommandTypeDto(value.command)) return false;
 	if (value.success === false) {
-		return hasOnlyKeys(value, ["type", "id", "command", "success", "error"]) && isText(value.error);
+		return (
+			hasOnlyKeys(value, ["type", "id", "command", "success", "error", "admissionError"]) &&
+			isText(value.error) &&
+			(value.admissionError === undefined || isSessionPayloadAdmissionErrorDto(value.admissionError))
+		);
 	}
 	if (!hasOnlyKeys(value, ["type", "id", "command", "success", "data"])) return false;
 	return isCommandData(value.command, value.data);

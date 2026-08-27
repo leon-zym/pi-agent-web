@@ -156,6 +156,62 @@ Prompt/steer/follow_up 文本按 UTF-8 编码后上限 1 MiB。可以是 image-o
 反斜杠/引号转义、CJK 文本与图片组合不能绕过 transport 预算。UI 在 `WebSocket.send` 前执行同一
 整帧检查，并会预先解码、缩放和压缩图片；协议 guard 是最终边界而不是图片处理器。
 
+### Payload budget 与 attachment reference
+
+协议 minor 2 新增可选能力 `payload.epoch_attachment_refs`。minor 1 的 hello 必须保持原有 shape，
+不能携带该能力或 `payloadBudget`。minor 2 只有在双方都声明该能力，且 `server_hello` 携带完整预算时
+才能使用 attachment reference。该能力在分阶段接入期间不是 Browser 或 Gateway 的 required
+capability；未协商时继续使用上述 inline image 路径。
+
+完整 `payloadBudget` 是一个不可缺项、不可扩展的 canonical record：
+
+| 字段 | 上限 |
+|---|---:|
+| `maxCommandFrameBytes` | 8 MiB |
+| `maxCommandTextBytes` | 1 MiB |
+| `maxInlineImageBase64Bytes` | 2 MiB |
+| `maxInlineImagesBase64Bytes` | 6 MiB |
+| `maxImageCount` | 16 items |
+| `maxPiJsonlFrameBytes` | 8 MiB |
+| `maxPiSnapshotJsonlFrameBytes` | 64 MiB |
+| `maxNormalizedEventFrameBytes` | 8 MiB + 4 KiB |
+| `maxReplayFrameBytes` | 8 MiB + 4 KiB |
+| `maxReplayBytes` | 16 MiB |
+| `maxSnapshotCanonicalBytes` | 64 MiB |
+| `maxServerFrameBytes` | 65 MiB |
+| `maxQueuedBacklogBytes` | 1 MiB |
+| `maxCatchUpBacklogBytes` | 1 MiB |
+| `maxAttachmentBlobBytes` | 8 MiB |
+| `maxAttachmentCacheBytes` | 64 MiB |
+| `maxAttachmentCacheItems` | 256 items |
+
+Guard 同时验证 producer 和 consumer 的关系：完整 command frame 不大于普通 Pi line；normalized
+event ceiling 必须比普通 Pi line 多出至少 `SESSION_EVENT_ENVELOPE_HEADROOM_BYTES`；normalized event
+不大于 replay frame，replay frame 不大于单个 server frame；Pi snapshot line 不大于 canonical
+snapshot，canonical snapshot 不大于单个 server frame。Canonical headroom 是 4 KiB，覆盖最大长度、
+最坏 JSON 转义的 Session identity、generation、seq 与 event wrapper。Replay aggregate 上限为 16 MiB，
+至少能接纳一个合法的最大 replay frame。
+
+Attachment reference 的产品 DTO 是
+`{type:"attachment_ref",serverEpoch,sha256,mediaType,byteLength}`。`sha256` 只接受 64 位小写十六
+进制，`byteLength` 必须为正数且不超过 blob 上限。Reference 只在完全相同的 `serverEpoch` 内有效。
+Gateway 重启后，旧 reference 必须 fail closed；需要的附件从 Pi 权威消息或 Runtime 状态重新
+externalize，生成新 epoch 的 reference。Blob 与索引只是有界、可淘汰的派生缓存，不是 Session
+持久化事实，也不能替代 Pi JSONL。
+
+消费 reference 时必须使用组合 guard，同时验证 canonical DTO、当前连接协商的
+`maxAttachmentBlobBytes` 和预期 `serverEpoch`。只调用结构 guard 或只比较 epoch 都不足以取得 blob
+读取权限。
+
+Payload admission 失败使用结构化
+`{type:"payload_admission_error",code,boundary,limitBytes?,actualBytes?}`。超限与 cache exhaustion
+同时携带 `limitBytes` 和更大的 `actualBytes`；能力缺失、reference 非法、epoch 不匹配或 blob 不可用
+不伪造 byte evidence。失败的 command response 可以在可读 `error` 之外携带 `admissionError`，UI 不得
+依赖解析错误文案；共享 response helper 抛出的 `RpcError` 会保留这个结构。Gateway 只有在所有表内
+边界已经执行、旧 epoch reference 会 fail closed 后才能实际回显并启用该能力。
+`admissionError` 是 Gateway-owned 字段。Pi raw failure response 携带该字段属于协议不兼容；Bridge
+只从 Gateway 内部真实 `RpcError` 透传结构，不接受普通 Error 或形似对象注入。
+
 ## 5. Gateway → Browser WebSocket
 
 | `type` | 核心字段 | 语义 |
@@ -299,7 +355,10 @@ protocol major and minor, server build and epoch, Pi version, adapter id, capabi
 and negotiated limits. A major mismatch returns a stable `protocol_error` and closes the connection;
 the UI does not reconnect automatically. Client and Gateway validate their directional base RPC and
 multiplex capabilities. The Browser additionally requires `session.hot_runtime_inventory` and uses
-the shared negotiation helper to validate minor selection and the server frame ceiling.
+the shared negotiation helper to validate minor selection and the server frame ceiling. Protocol
+minor 2 may additionally negotiate `payload.epoch_attachment_refs`; its helper validates both hello
+messages, the exact selected minor, both capability declarations, the complete `payloadBudget`, and
+the client and server frame-limit intersection. Minor 1 keeps the previous hello shape.
 `/api/v1/health/live` reports process liveness, `/api/v1/health/ready` reports Pi Host readiness, and
 the legacy `/health` endpoint remains a readiness alias.
 

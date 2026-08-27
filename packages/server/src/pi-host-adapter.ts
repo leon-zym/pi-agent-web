@@ -79,6 +79,14 @@ export type PiHostUnsolicitedFrame =
 	| { kind: "extension_ui_request"; request: ExtensionUiRequestDto }
 	| { kind: "ignored"; frameType: string };
 
+/** Adapter normalization may be synchronous today or asynchronously externalize bounded payloads. */
+export type PiHostDecodeResult<T> = T | PromiseLike<T>;
+
+/** Spawn-scoped cancellation passed to asynchronous normalization/externalization work. */
+export interface PiHostDecodeContext {
+	readonly signal: AbortSignal;
+}
+
 /** Product-facing boundary for one concrete Pi host protocol implementation. */
 export interface PiHostAdapter {
 	readonly id: string;
@@ -92,12 +100,18 @@ export interface PiHostAdapter {
 	decodeResponse(
 		value: unknown,
 		expectedCommand: SessionCommandTypeDto,
-	): SessionCommandResponseDto & {
-		id: string;
-	};
+		context?: PiHostDecodeContext,
+	): PiHostDecodeResult<
+		SessionCommandResponseDto & {
+			id: string;
+		}
+	>;
 	/** Validate a late/unknown-id response before explicitly ignoring it. */
-	decodeOrphanedResponse(value: unknown): void;
-	decodeUnsolicited(value: unknown): PiHostUnsolicitedFrame;
+	decodeOrphanedResponse(value: unknown, context?: PiHostDecodeContext): PiHostDecodeResult<void>;
+	decodeUnsolicited(
+		value: unknown,
+		context?: PiHostDecodeContext,
+	): PiHostDecodeResult<PiHostUnsolicitedFrame>;
 }
 
 /** Execute an adapter-owned, bounded version probe and clean its whole process group. */

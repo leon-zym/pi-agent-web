@@ -162,7 +162,7 @@ describe("Gateway WebSocket hello negotiation", () => {
 
 		await expect(frame).resolves.toMatchObject({
 			type: "server_hello",
-			protocol: { major: 1, minor: 1 },
+			protocol: { major: 1, minor: 2 },
 			serverBuild: "0.1.0-test",
 			serverEpoch: "gateway-epoch-test",
 			piVersion: "0.84.2",
@@ -174,6 +174,42 @@ describe("Gateway WebSocket hello negotiation", () => {
 				maxExtensionRequests: expect.any(Number),
 			},
 		});
+		ws.close();
+	});
+
+	it("selects minor 1 and preserves the legacy hello shape for a minor 1 client", async () => {
+		const harness = await createHarness();
+		const ws = await openSocket(harness.url);
+		const frame = nextJson(ws);
+		ws.send(
+			JSON.stringify({
+				type: "client_hello",
+				protocol: { major: 1, minor: 1 },
+				clientBuild: "0.1.0-minor-1-test",
+				capabilities: ["rpc.commands", "rpc.events", "rpc.extension_ui", "session.multiplex"],
+				limits: { maxServerFrameBytes: 4096 },
+			}),
+		);
+
+		const hello = await frame;
+		expect(hello).toMatchObject({
+			type: "server_hello",
+			protocol: { major: 1, minor: 1 },
+			limits: { maxSnapshotFrameBytes: 4096 },
+		});
+		expect(hello).not.toHaveProperty("payloadBudget");
+		expect(Object.keys(hello).sort()).toEqual(
+			[
+				"type",
+				"protocol",
+				"serverBuild",
+				"serverEpoch",
+				"piVersion",
+				"adapterId",
+				"capabilities",
+				"limits",
+			].sort(),
+		);
 		ws.close();
 	});
 

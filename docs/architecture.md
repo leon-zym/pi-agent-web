@@ -135,6 +135,32 @@ Session；不同连接也能各自控制不同 Session。同一 Session 同时�
 桥接层为每条浏览器命令分配内部 Pi id，response 前恢复发起者 id。Bash 的流式 execution id
 也按连接映射，避免不同连接使用相同 client id 时串流。
 
+## Payload authority 与派生 attachment cache
+
+[ADR 0010](decisions/0010-epoch-scoped-attachment-references-and-payload-budgets.md) 定义跨 Browser、
+Gateway、Pi adapter、projection、replay、snapshot 与 queue 的统一 payload budget。协议 minor 2 通过
+可选的 `payload.epoch_attachment_refs` 能力协商完整预算；minor 1 hello 保持旧 shape。分阶段接入时，
+只有已经执行表内全部边界的 Gateway 才能回显该能力，否则继续使用原有 inline image 合同。
+
+Attachment blob 与索引是 Gateway 内存中的有界派生 cache，不是新的持久化层。Reference 携带创建它的
+`serverEpoch`、内容摘要、media type 与 byte length，只能在完全相同的 epoch 使用。Gateway restart
+会使旧 reference 无效；后续恢复必须从 Pi JSONL 或 Pi Runtime 的权威内容重新 externalize，不能只凭
+digest 推断新进程仍拥有原 blob。Cache eviction 也不改变 Pi 内容，缺失 blob 必须 fail closed 或从
+Pi authority 重建，不能把附件静默替换为空值。
+
+Reference 消费入口必须把 canonical DTO、协商后的 blob ceiling 与当前 `serverEpoch` 作为同一次
+admission 判断。Payload ceiling 必须保持 producer 不大于 consumer。Raw Pi event 到 normalized event
+还要保留固定的 4 KiB canonical envelope headroom，用来容纳最大长度、最坏 JSON 转义的 Session
+identity、generation、seq 与 wrapper。其他关系包括 command 到 Pi、normalized event 到 replay frame、
+replay frame 到 server frame，以及 Pi snapshot 到 canonical snapshot 再到 server frame。Queue 的小
+backlog ceiling 通过单个 oversized item 隔离处理，不代表合法大 frame 可以无限排队。
+
+每一层在占用 buffer、推进 seq、写入 Pi 或发送 socket 之前执行自己的 admission。拒绝结果使用稳定的
+`payload_admission_error` code 与 boundary；有实际 byte ceiling 的失败同时报告 limit 与 actual。这个
+结构用于 UI 本地化和诊断，不改变 Pi response barrier、Session identity 或 controller fencing。
+该结构由 Gateway 拥有。Pi adapter 拒绝 raw Pi response 中的同名字段，Bridge 只透传 Gateway 内部真实
+`RpcError` 携带的 admission detail。
+
 ## 事件、回放与 resync
 
 Gateway 启动时生成唯一 `serverEpoch`，并把同一值注入 hello、Runtime identity、sequenced

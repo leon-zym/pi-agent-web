@@ -48,6 +48,8 @@ export interface PiProcessOptions {
 	env?: Record<string, string>;
 	readyTimeoutMs?: number;
 	commandTimeoutMs?: number;
+	/** Maximum duration of one adapter normalization/externalization operation. */
+	decodeTimeoutMs?: number;
 	stderrMaxBytes?: number;
 	/** Bounded allowance for Pi's single-line get_messages response. */
 	snapshotLineMaxBytes?: number;
@@ -94,6 +96,8 @@ interface SpawnIdentity {
 	processGroupId: number | null;
 	leaderExitObserved: boolean;
 	unexpectedFinalization: Promise<void> | null;
+	decodeAbortController: AbortController;
+	activeLine: Promise<void> | null;
 }
 
 const UNEXPECTED_GROUP_TERM_GRACE_MS = 250;
@@ -120,7 +124,10 @@ export class PiProcess {
 	private writeTail: Promise<void> = Promise.resolve();
 	private readonly adapter: PiHostAdapter;
 	private opts: Required<
-		Pick<PiProcessOptions, "stderrMaxBytes" | "commandTimeoutMs" | "readyTimeoutMs" | "snapshotLineMaxBytes">
+		Pick<
+			PiProcessOptions,
+			"stderrMaxBytes" | "commandTimeoutMs" | "readyTimeoutMs" | "snapshotLineMaxBytes" | "decodeTimeoutMs"
+		>
 	> &
 		PiProcessOptions;
 
@@ -131,6 +138,7 @@ export class PiProcess {
 			...opts,
 			readyTimeoutMs: opts.readyTimeoutMs ?? 10_000,
 			commandTimeoutMs: opts.commandTimeoutMs ?? 30_000,
+			decodeTimeoutMs: Math.max(1, opts.decodeTimeoutMs ?? 30_000),
 			stderrMaxBytes: opts.stderrMaxBytes ?? 64 * 1024,
 			snapshotLineMaxBytes: Math.max(0, opts.snapshotLineMaxBytes ?? MAX_JSONL_SNAPSHOT_LINE_BYTES),
 		};
@@ -177,6 +185,8 @@ export class PiProcess {
 			processGroupId: process.platform !== "win32" ? leaderPid : null,
 			leaderExitObserved: false,
 			unexpectedFinalization: null,
+			decodeAbortController: new AbortController(),
+			activeLine: null,
 		};
 		this.spawnIdentity = identity;
 
@@ -204,7 +214,7 @@ export class PiProcess {
 			}
 		});
 
-		this.detach = attachJsonlLineReader(child.stdout!, (line) => this.handleLine(line), {
+		this.detach = attachJsonlLineReader(child.stdout!, (line) => this.consumeLine(line, identity), {
 			maxLineBytes: () => this.currentJsonlLineBudget(),
 			onError: (error) => this.handleProtocolFailure(identity, this.normalizeFramingError(error)),
 		});
@@ -218,7 +228,7 @@ export class PiProcess {
 				this.clearSpawn(identity);
 				return;
 			}
-			this.beginUnexpectedFinalization(identity, error, info);
+			this.arbitrateUnexpectedExit(identity, error, info);
 		});
 
 		// Ready handshake: no ready frame in the protocol, probe with get_state.
@@ -337,6 +347,7 @@ export class PiProcess {
 
 	private beginUnexpectedFinalization(identity: SpawnIdentity, error: Error, info: PiProcessExitInfo): void {
 		if (this.spawnIdentity !== identity || identity.unexpectedFinalization) return;
+		identity.decodeAbortController.abort(error);
 		const finalization = this.finalizeUnexpectedExit(identity, error, info);
 		identity.unexpectedFinalization = finalization;
 		// EventEmitter callbacks cannot await cleanup. Keep the promise observed;
@@ -434,13 +445,83 @@ export class PiProcess {
 
 	private clearSpawn(identity: SpawnIdentity): void {
 		if (this.spawnIdentity !== identity) return;
+		identity.decodeAbortController.abort(new Error("Pi adapter decode scope closed"));
 		this.child = null;
 		this.spawnIdentity = null;
 		this.detach?.();
 		this.detach = null;
 	}
 
-	private handleLine(line: string): void {
+	private consumeLine(line: string, identity: SpawnIdentity): Promise<void> {
+		let task: Promise<void>;
+		task = this.handleLine(line, identity)
+			.catch((error: unknown) => {
+				const normalized = error instanceof Error ? error : new Error(String(error));
+				this.handleProtocolFailure(identity, normalized);
+				throw normalized;
+			})
+			.finally(() => {
+				if (identity.activeLine === task) identity.activeLine = null;
+			});
+		identity.activeLine = task;
+		return task;
+	}
+
+	private arbitrateUnexpectedExit(
+		identity: SpawnIdentity,
+		error: ProcessExitedError,
+		info: PiProcessExitInfo,
+	): void {
+		const activeLine = identity.activeLine;
+		if (!activeLine) {
+			this.beginUnexpectedFinalization(identity, error, info);
+			return;
+		}
+		// An in-flight adapter operation is spawn-bounded. Let its success or
+		// protocol failure settle first so a concrete incompatibility is not
+		// downgraded to the concurrent generic process exit.
+		void activeLine.then(
+			() => this.beginUnexpectedFinalization(identity, error, info),
+			() => this.beginUnexpectedFinalization(identity, error, info),
+		);
+	}
+
+	private decodeWithDeadline<T>(identity: SpawnIdentity, decode: () => PromiseLike<T> | T): Promise<T> {
+		const { signal } = identity.decodeAbortController;
+		const operation = Promise.resolve().then(decode);
+		return new Promise<T>((resolve, reject) => {
+			let settled = false;
+			const settle = (): boolean => {
+				if (settled) return false;
+				settled = true;
+				clearTimeout(timer);
+				signal.removeEventListener("abort", onAbort);
+				return true;
+			};
+			const onAbort = (): void => {
+				const reason = signal.reason;
+				if (settle()) reject(reason instanceof Error ? reason : new Error("Pi adapter decode aborted"));
+			};
+			const timer = setTimeout(() => {
+				identity.decodeAbortController.abort(
+					new Error(`Pi adapter decode timed out after ${String(this.opts.decodeTimeoutMs)}ms`),
+				);
+			}, this.opts.decodeTimeoutMs);
+			timer.unref?.();
+			if (signal.aborted) onAbort();
+			else signal.addEventListener("abort", onAbort, { once: true });
+			operation.then(
+				(value) => {
+					if (settle()) resolve(value);
+				},
+				(error: unknown) => {
+					if (settle()) reject(error instanceof Error ? error : new Error(String(error)));
+				},
+			);
+		});
+	}
+
+	private async handleLine(line: string, identity: SpawnIdentity | null = this.spawnIdentity): Promise<void> {
 		const exceedsOrdinaryLimit = Buffer.byteLength(line) > MAX_JSONL_LINE_BYTES;
 		let data: unknown;
 		try {
@@ -465,8 +546,11 @@ export class PiProcess {
 				reason: "oversized_frame",
 			});
 		}
+		if (!identity) throw new Error("cannot decode a Pi frame without an active spawn");
 		if (typeof data !== "object" || data === null) {
-			this.adapter.decodeUnsolicited(data);
+			await this.decodeWithDeadline(identity, () =>
+				this.adapter.decodeUnsolicited(data, { signal: identity.decodeAbortController.signal }),
+			);
 			return;
 		}
 		const frame = data as Record<string, unknown>;
@@ -476,7 +560,12 @@ export class PiProcess {
 			if (id) {
 				const pending = this.pending.get(id);
 				if (pending) {
-					const response = this.adapter.decodeResponse(frame, pending.command);
+					const response = await this.decodeWithDeadline(identity, () =>
+						this.adapter.decodeResponse(frame, pending.command, {
+							signal: identity.decodeAbortController.signal,
+						}),
+					);
+					if (!this.ownsSpawn(identity) || this.pending.get(id) !== pending) return;
 					this.pending.delete(id);
 					clearTimeout(pending.timer);
 					pending.resolve(response);
@@ -485,13 +574,29 @@ export class PiProcess {
 			}
 			// Late or unknown-id responses are ignorable only after their complete
 			// command-specific shape has been validated by the adapter.
-			this.adapter.decodeOrphanedResponse(frame);
+			await this.decodeWithDeadline(identity, () =>
+				this.adapter.decodeOrphanedResponse(frame, { signal: identity.decodeAbortController.signal }),
+			);
 			return;
 		}
 
-		const decoded = this.adapter.decodeUnsolicited(frame);
+		const decoded = await this.decodeWithDeadline(identity, () =>
+			this.adapter.decodeUnsolicited(frame, { signal: identity.decodeAbortController.signal }),
+		);
+		if (!this.ownsSpawn(identity)) return;
 		if (decoded.kind === "event") this.opts.onEvent?.(decoded.event);
 		if (decoded.kind === "extension_ui_request") this.opts.onExtensionUiRequest?.(decoded.request);
+	}
+
+	private ownsSpawn(identity: SpawnIdentity | null): identity is SpawnIdentity {
+		return (
+			identity !== null &&
+			!this.stopped &&
+			!identity.leaderExitObserved &&
+			this.spawnIdentity === identity &&
+			this.child === identity.child &&
+			identity.unexpectedFinalization === null
+		);
 	}
 
 	private isPendingSnapshotResponse(data: unknown): data is UnknownFrame {
@@ -523,6 +628,7 @@ export class PiProcess {
 	async stop(): Promise<void> {
 		this.stopped = true;
 		const identity = this.spawnIdentity;
+		identity?.decodeAbortController.abort(new RpcError("stop", "pi process stopped"));
 		const child = identity?.child ?? this.child;
 		if (!child) return;
 		this.detach?.();

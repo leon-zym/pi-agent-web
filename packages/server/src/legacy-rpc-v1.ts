@@ -199,10 +199,11 @@ function normalizeLegacyResponse(value: unknown): unknown {
 
 function hasGatewayOnlyResponseFields(value: UnknownRecord): boolean {
 	return (
-		value.command === "export_html" &&
-		value.success === true &&
-		isRecord(value.data) &&
-		value.data.url !== undefined
+		value.admissionError !== undefined ||
+		(value.command === "export_html" &&
+			value.success === true &&
+			isRecord(value.data) &&
+			value.data.url !== undefined)
 	);
 }
 
@@ -336,7 +337,7 @@ export function createLegacyRpcV1Adapter(
 			if (!isSessionCommandResponseDto(normalized)) {
 				return incompatible("response", "malformed_response", frameType);
 			}
-			return redactResponse(normalized as ReturnType<PiHostAdapter["decodeResponse"]>);
+			return redactResponse(normalized as SessionCommandResponseDto & { id: string });
 		},
 
 		decodeOrphanedResponse(value) {

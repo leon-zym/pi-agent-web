@@ -4,6 +4,7 @@ import type {
 	SessionRuntimeDto,
 	SessionWsClientMessage,
 } from "@pi-agent-web/protocol";
+import { GATEWAY_PROTOCOL_VERSION } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	createSessionTransport,
@@ -35,7 +36,7 @@ function open(socket: FakeSocket | undefined): void {
 	socket.onmessage?.({
 		data: JSON.stringify({
 			type: "server_hello",
-			protocol: { major: 1, minor: 1 },
+			protocol: GATEWAY_PROTOCOL_VERSION,
 			serverBuild: "test-server",
 			serverEpoch: "test-epoch",
 			piVersion: "0.84.2",

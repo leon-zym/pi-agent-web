@@ -7,6 +7,16 @@ import {
 	type GatewayServerHelloDto,
 } from "./gateway-handshake.js";
 import {
+	SESSION_IMAGE_MAX_BASE64_CHARS,
+	SESSION_IMAGE_MAX_COUNT,
+	SESSION_IMAGE_TOTAL_MAX_BASE64_CHARS,
+	SESSION_SNAPSHOT_MAX_BYTES,
+	SESSION_TEXT_MAX_BYTES,
+	SESSION_WS_CLIENT_MAX_BYTES,
+	SESSION_WS_SERVER_MAX_BYTES,
+	type SessionPayloadAdmissionErrorDto,
+} from "./payload-budget.js";
+import {
 	isExtensionUiRequestDto,
 	isExtensionUiResponseDto,
 	isProductSessionEventDto,
@@ -25,16 +35,12 @@ import type {
 } from "./product-dto.js";
 
 export * from "./gateway-handshake.js";
+export * from "./payload-budget.js";
 export * from "./product-decoders.js";
 export * from "./product-dto.js";
 
 const MAX_IDENTIFIER_LENGTH = 256;
 const MAX_PATH_LENGTH = 8192;
-export const SESSION_TEXT_MAX_BYTES = 1024 * 1024;
-export const SESSION_WS_CLIENT_MAX_BYTES = 8 * 1024 * 1024;
-/** Maximum negotiated Gateway-to-browser frame, including a bounded history snapshot envelope. */
-export const SESSION_WS_SERVER_MAX_BYTES = 65 * 1024 * 1024;
-export const SESSION_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024;
 export const SESSION_SNAPSHOT_MAX_MESSAGES = 10_000;
 export const SESSION_SNAPSHOT_MAX_PROJECTION_EVENTS = 4_096;
 export const SESSION_SNAPSHOT_MAX_QUEUE_ITEMS = 10_000;
@@ -44,9 +50,6 @@ export const SESSION_SNAPSHOT_MAX_ITEMS = 250_000;
 export const SESSION_HOT_RUNTIME_INVENTORY_MAX_ITEMS = 256;
 /** Covers the worst canonical JSON envelope for 256 maximum escaped identities. */
 export const SESSION_HOT_RUNTIME_INVENTORY_MAX_BYTES = 1024 * 1024;
-export const SESSION_IMAGE_MAX_COUNT = 16;
-export const SESSION_IMAGE_MAX_BASE64_CHARS = 2 * 1024 * 1024;
-export const SESSION_IMAGE_TOTAL_MAX_BASE64_CHARS = 6 * 1024 * 1024;
 
 const UTF8_ENCODER = new TextEncoder();
 
@@ -1133,10 +1136,12 @@ export interface NativeSessionCreateDto {
 /** RPC error response, success:false. */
 export class RpcError extends Error {
 	readonly command: string;
-	constructor(command: string, message: string) {
+	readonly admissionError?: SessionPayloadAdmissionErrorDto;
+	constructor(command: string, message: string, admissionError?: SessionPayloadAdmissionErrorDto) {
 		super(message);
 		this.name = "RpcError";
 		this.command = command;
+		this.admissionError = admissionError;
 	}
 }
 
@@ -1152,7 +1157,9 @@ export function isErrorResponse(
  */
 export function expectData(response: SessionCommandResponseDto): unknown {
 	if (response.type !== "response") throw new RpcError("<no-command>", "not a response frame");
-	if (response.success === false) throw new RpcError(response.command, response.error);
+	if (response.success === false) {
+		throw new RpcError(response.command, response.error, response.admissionError);
+	}
 	return "data" in response ? (response as { data: unknown }).data : undefined;
 }
 
@@ -1164,6 +1171,8 @@ export function expectCommandData<K extends SessionCommandTypeDto>(
 	if (response.command !== command) {
 		throw new RpcError(response.command, `expected ${command} response, received ${response.command}`);
 	}
-	if (response.success === false) throw new RpcError(response.command, response.error);
+	if (response.success === false) {
+		throw new RpcError(response.command, response.error, response.admissionError);
+	}
 	return ("data" in response ? response.data : undefined) as SessionCommandDataMap[K];
 }

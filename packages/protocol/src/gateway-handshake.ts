@@ -1,8 +1,15 @@
-export const GATEWAY_PROTOCOL_VERSION = { major: 1, minor: 1 } as const;
+import { isSessionPayloadBudgetDto, type SessionPayloadBudgetDto } from "./payload-budget.js";
+
+export type { SessionPayloadBudgetDto } from "./payload-budget.js";
+export { SESSION_PAYLOAD_BUDGET } from "./payload-budget.js";
+
+export const GATEWAY_PROTOCOL_VERSION = { major: 1, minor: 2 } as const;
 export const MAX_GATEWAY_HELLO_CAPABILITIES = 64;
 export const MAX_GATEWAY_HELLO_CAPABILITY_LENGTH = 128;
 export const MIN_GATEWAY_SERVER_FRAME_BYTES = 1024;
 export const GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY = "session.hot_runtime_inventory";
+export const GATEWAY_PAYLOAD_BUDGET_CAPABILITY = "payload.epoch_attachment_refs";
+export const GATEWAY_PAYLOAD_BUDGET_PROTOCOL_MINOR = 2;
 const GATEWAY_BASE_CAPABILITIES = [
 	"rpc.commands",
 	"rpc.events",
@@ -47,6 +54,7 @@ export interface GatewayServerHelloDto {
 		maxSnapshotFrameBytes: number;
 		maxExtensionRequests: number;
 	};
+	payloadBudget?: SessionPayloadBudgetDto;
 }
 
 export interface GatewayProtocolErrorDto {
@@ -102,15 +110,21 @@ export function isGatewayClientHello(value: unknown): value is GatewayClientHell
 	) {
 		return false;
 	}
-	return (
-		value.type === "client_hello" &&
-		isProtocolVersion(value.protocol) &&
-		isBoundedNonEmptyString(value.clientBuild, 128) &&
-		isCapabilities(value.capabilities) &&
-		isRecord(value.limits) &&
-		hasOnlyKeys(value.limits, ["maxServerFrameBytes"]) &&
-		isSafeNonNegativeInteger(value.limits.maxServerFrameBytes) &&
-		value.limits.maxServerFrameBytes >= MIN_GATEWAY_SERVER_FRAME_BYTES
+	if (
+		value.type !== "client_hello" ||
+		!isProtocolVersion(value.protocol) ||
+		!isBoundedNonEmptyString(value.clientBuild, 128) ||
+		!isCapabilities(value.capabilities) ||
+		!isRecord(value.limits) ||
+		!hasOnlyKeys(value.limits, ["maxServerFrameBytes"]) ||
+		!isSafeNonNegativeInteger(value.limits.maxServerFrameBytes) ||
+		value.limits.maxServerFrameBytes < MIN_GATEWAY_SERVER_FRAME_BYTES
+	) {
+		return false;
+	}
+	return !(
+		value.protocol.minor < GATEWAY_PAYLOAD_BUDGET_PROTOCOL_MINOR &&
+		value.capabilities.includes(GATEWAY_PAYLOAD_BUDGET_CAPABILITY)
 	);
 }
 
@@ -126,6 +140,7 @@ export function isGatewayServerHello(value: unknown): value is GatewayServerHell
 			"adapterId",
 			"capabilities",
 			"limits",
+			"payloadBudget",
 		])
 	) {
 		return false;
@@ -143,14 +158,72 @@ export function isGatewayServerHello(value: unknown): value is GatewayServerHell
 	) {
 		return false;
 	}
-	return (
+	const validLimits =
 		isSafeNonNegativeInteger(value.limits.maxClientFrameBytes) &&
 		value.limits.maxClientFrameBytes > 0 &&
 		isSafeNonNegativeInteger(value.limits.maxSnapshotFrameBytes) &&
 		value.limits.maxSnapshotFrameBytes > 0 &&
 		isSafeNonNegativeInteger(value.limits.maxExtensionRequests) &&
-		value.limits.maxExtensionRequests > 0
-	);
+		value.limits.maxExtensionRequests > 0;
+	if (!validLimits) return false;
+	const hasCapability = value.capabilities.includes(GATEWAY_PAYLOAD_BUDGET_CAPABILITY);
+	const hasBudget = Object.hasOwn(value, "payloadBudget");
+	if (value.protocol.minor < GATEWAY_PAYLOAD_BUDGET_PROTOCOL_MINOR) return !hasCapability && !hasBudget;
+	if (hasCapability !== hasBudget) return false;
+	return !hasBudget || isSessionPayloadBudgetDto(value.payloadBudget);
+}
+
+export type GatewayPayloadBudgetNegotiation =
+	| { negotiated: true; budget: SessionPayloadBudgetDto }
+	| {
+			negotiated: false;
+			reason:
+				| "hello_invalid"
+				| "protocol_major_unsupported"
+				| "protocol_minor_unsupported"
+				| "protocol_selection_invalid"
+				| "capability_missing"
+				| "gateway_capability_missing"
+				| "server_frame_selection_invalid";
+	  };
+
+export function negotiateGatewayPayloadBudget(
+	clientHello: GatewayClientHelloDto,
+	serverHello: GatewayServerHelloDto,
+): GatewayPayloadBudgetNegotiation {
+	if (!isGatewayClientHello(clientHello) || !isGatewayServerHello(serverHello)) {
+		return { negotiated: false, reason: "hello_invalid" };
+	}
+	if (
+		clientHello.protocol.major !== GATEWAY_PROTOCOL_VERSION.major ||
+		serverHello.protocol.major !== GATEWAY_PROTOCOL_VERSION.major
+	) {
+		return { negotiated: false, reason: "protocol_major_unsupported" };
+	}
+	if (
+		clientHello.protocol.minor < GATEWAY_PAYLOAD_BUDGET_PROTOCOL_MINOR ||
+		serverHello.protocol.minor < GATEWAY_PAYLOAD_BUDGET_PROTOCOL_MINOR
+	) {
+		return { negotiated: false, reason: "protocol_minor_unsupported" };
+	}
+	if (serverHello.protocol.minor !== Math.min(clientHello.protocol.minor, GATEWAY_PROTOCOL_VERSION.minor)) {
+		return { negotiated: false, reason: "protocol_selection_invalid" };
+	}
+	if (!clientHello.capabilities.includes(GATEWAY_PAYLOAD_BUDGET_CAPABILITY)) {
+		return { negotiated: false, reason: "capability_missing" };
+	}
+	if (!serverHello.capabilities.includes(GATEWAY_PAYLOAD_BUDGET_CAPABILITY) || !serverHello.payloadBudget) {
+		return { negotiated: false, reason: "gateway_capability_missing" };
+	}
+	if (
+		serverHello.limits.maxSnapshotFrameBytes > clientHello.limits.maxServerFrameBytes ||
+		serverHello.payloadBudget.maxServerFrameBytes > clientHello.limits.maxServerFrameBytes ||
+		serverHello.payloadBudget.maxCommandFrameBytes > serverHello.limits.maxClientFrameBytes ||
+		serverHello.payloadBudget.maxServerFrameBytes > serverHello.limits.maxSnapshotFrameBytes
+	) {
+		return { negotiated: false, reason: "server_frame_selection_invalid" };
+	}
+	return { negotiated: true, budget: serverHello.payloadBudget };
 }
 
 export function isGatewayProtocolError(value: unknown): value is GatewayProtocolErrorDto {
