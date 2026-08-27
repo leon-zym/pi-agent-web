@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { deflateSync } from "node:zlib";
 
 if (process.argv.includes("--version")) {
 	process.stdout.write("0.84.2\n");
@@ -85,6 +86,45 @@ process.stdin.on("data", (chunk) => {
 function positiveNumber(value, fallback) {
 	const parsed = Number(value);
 	return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function crc32(input) {
+	let crc = 0xffff_ffff;
+	for (const byte of input) {
+		crc ^= byte;
+		for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb8_8320 : 0);
+	}
+	return (crc ^ 0xffff_ffff) >>> 0;
+}
+
+function pngChunk(type, data) {
+	const typeBytes = Buffer.from(type, "ascii");
+	const chunk = Buffer.allocUnsafe(12 + data.byteLength);
+	chunk.writeUInt32BE(data.byteLength, 0);
+	typeBytes.copy(chunk, 4);
+	data.copy(chunk, 8);
+	chunk.writeUInt32BE(crc32(Buffer.concat([typeBytes, data])), 8 + data.byteLength);
+	return chunk;
+}
+
+/** Valid 1x1 PNG with a large safe-to-copy ancillary chunk. */
+function largeValidPng(byteLength = 1024 * 1024 + 257) {
+	const signature = Buffer.from("89504e470d0a1a0a", "hex");
+	const ihdr = Buffer.alloc(13);
+	ihdr.writeUInt32BE(1, 0);
+	ihdr.writeUInt32BE(1, 4);
+	ihdr.set([8, 6, 0, 0, 0], 8);
+	const idat = pngChunk("IDAT", deflateSync(Buffer.from([0, 0, 0, 0, 0])));
+	const fixed = [signature, pngChunk("IHDR", ihdr), idat, pngChunk("IEND", Buffer.alloc(0))];
+	const fixedBytes = fixed.reduce((total, part) => total + part.byteLength, 0);
+	const paddingBytes = byteLength - fixedBytes - 12;
+	if (paddingBytes < 1) throw new Error("large PNG fixture is too small");
+	return Buffer.concat([
+		fixed[0],
+		fixed[1],
+		pngChunk("paWa", Buffer.alloc(paddingBytes, 0x61)),
+		...fixed.slice(2),
+	]);
 }
 
 function countRecordedStarts(file) {
@@ -1087,14 +1127,15 @@ function streamReloadCheckpointPrompt(command, text, user, userEntryId) {
 function streamPrompt(command) {
 	const text = typeof command.message === "string" ? command.message : "";
 	const images = Array.isArray(command.images) ? command.images : [];
+	const echoedImages =
+		text === "E2E_PAYLOAD_ATTACHMENT" && images.length > 0
+			? [{ type: "image", data: largeValidPng().toString("base64"), mimeType: "image/png" }]
+			: images.map((image) => ({ type: "image", data: image.data, mimeType: image.mimeType }));
 	const presentedText =
 		recoveryFeatures && text.startsWith("/skill:e2e")
 			? `<skill name="e2e" location="/synthetic/e2e/SKILL.md">\nSECRET_SKILL_BODY_MUST_NOT_RENDER\n</skill>${text.slice("/skill:e2e".length).trim() ? `\n\n${text.slice("/skill:e2e".length).trim()}` : ""}`
 			: text;
-	const userContent = [
-		...(presentedText ? [{ type: "text", text: presentedText }] : []),
-		...images.map((image) => ({ type: "image", data: image.data, mimeType: image.mimeType })),
-	];
+	const userContent = [...(presentedText ? [{ type: "text", text: presentedText }] : []), ...echoedImages];
 	const user = { role: "user", content: userContent, timestamp: Date.now() };
 	const userEntryId = persistMessage(user, null);
 	messages.push(user);

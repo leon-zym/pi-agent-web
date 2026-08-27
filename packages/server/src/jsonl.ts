@@ -17,6 +17,9 @@ export interface JsonlReaderOptions {
 	onError?: (error: Error) => void;
 }
 
+/** Return values are ignored, except thenables are awaited before the next line is read. */
+export type JsonlLineConsumer = (line: string) => unknown;
+
 /**
  * Strict LF-only JSONL line reader.
  *
@@ -29,7 +32,7 @@ export interface JsonlReaderOptions {
  */
 export function attachJsonlLineReader(
 	stream: Readable,
-	onLine: (line: string) => void,
+	onLine: JsonlLineConsumer,
 	options: JsonlReaderOptions = {},
 ): () => void {
 	const decoder = new StringDecoder("utf8");
@@ -39,59 +42,98 @@ export function attachJsonlLineReader(
 	};
 	let buffer = "";
 	let failed = false;
+	let detached = false;
+	let ended = false;
+	let tail = Promise.resolve();
 
-	const fail = (error: Error) => {
-		if (failed) return;
+	const fail = (error: unknown) => {
+		if (failed || detached) return;
 		failed = true;
 		buffer = "";
-		options.onError?.(error);
+		stream.pause();
+		stream.off("data", onData);
+		stream.off("end", onEnd);
+		options.onError?.(error instanceof Error ? error : new Error(String(error)));
 	};
 
-	const emitLine = (line: string) => {
+	function onStreamError(error: Error): void {
+		fail(error);
+	}
+
+	function onClose(): void {
+		stream.off("error", onStreamError);
+	}
+
+	const emitLine = async (line: string): Promise<void> => {
 		const maxLineBytes = currentMaxLineBytes();
 		if (Buffer.byteLength(line) > maxLineBytes) {
-			fail(new JsonlLineTooLongError(maxLineBytes));
-			return;
+			throw new JsonlLineTooLongError(maxLineBytes);
 		}
-		try {
-			onLine(line.endsWith("\r") ? line.slice(0, -1) : line);
-		} catch (error) {
-			fail(error instanceof Error ? error : new Error(String(error)));
-		}
+		await onLine(line.endsWith("\r") ? line.slice(0, -1) : line);
 	};
 
-	const onData = (chunk: string | Buffer) => {
-		if (failed) return;
+	const consume = async (chunk: string | Buffer): Promise<void> => {
+		if (failed || detached) return;
 		buffer += typeof chunk === "string" ? chunk : decoder.write(chunk);
 
 		for (;;) {
 			const newlineIndex = buffer.indexOf("\n");
 			if (newlineIndex === -1) {
 				const maxLineBytes = currentMaxLineBytes();
-				if (Buffer.byteLength(buffer) > maxLineBytes) fail(new JsonlLineTooLongError(maxLineBytes));
+				if (Buffer.byteLength(buffer) > maxLineBytes) throw new JsonlLineTooLongError(maxLineBytes);
 				return;
 			}
-			emitLine(buffer.slice(0, newlineIndex));
-			if (failed) return;
+			const line = buffer.slice(0, newlineIndex);
 			buffer = buffer.slice(newlineIndex + 1);
+			await emitLine(line);
+			if (failed || detached) return;
 		}
 	};
 
-	const onEnd = () => {
-		if (failed) return;
+	function onData(chunk: string | Buffer): void {
+		if (failed || detached) return;
+		stream.pause();
+		tail = tail.then(() => consume(chunk));
+		const current = tail;
+		void current.then(
+			() => {
+				if (current === tail && !ended && !failed && !detached) stream.resume();
+			},
+			(error) => fail(error),
+		);
+	}
+
+	async function finish(): Promise<void> {
+		if (failed || detached) return;
 		buffer += decoder.end();
 		if (buffer.length > 0) {
-			emitLine(buffer);
+			const line = buffer;
 			buffer = "";
+			await emitLine(line);
 		}
-	};
+	}
+
+	function onEnd(): void {
+		if (failed || detached) return;
+		ended = true;
+		tail = tail.then(() => finish());
+		void tail.catch(fail);
+	}
 
 	stream.on("data", onData);
 	stream.on("end", onEnd);
+	// Keep the error observer until close, including after detach. Node streams
+	// may report a teardown error after listeners have otherwise been removed;
+	// an unobserved `error` event would escape the process boundary.
+	stream.on("error", onStreamError);
+	stream.once("close", onClose);
 
 	return () => {
+		detached = true;
+		buffer = "";
 		stream.off("data", onData);
 		stream.off("end", onEnd);
+		stream.resume();
 	};
 }
 

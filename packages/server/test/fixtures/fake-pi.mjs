@@ -126,6 +126,57 @@ function handleLine(line) {
 			});
 			return;
 		case "prompt":
+			if (command.message === "never-response") return;
+			if (command.message === "delayed-response") {
+				setTimeout(
+					() => send({ type: "response", id: command.id, command: command.type, success: true }),
+					60,
+				);
+				return;
+			}
+			if (command.message === "delayed-reused-response") {
+				setTimeout(
+					() => send({ type: "response", id: command.id, command: command.type, success: true }),
+					140,
+				);
+				return;
+			}
+			if (command.message === "orphan-response") {
+				send({
+					type: "response",
+					id: "unknown-history-id",
+					command: "get_messages",
+					success: true,
+					data: {
+						messages: [
+							{
+								role: "user",
+								content: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }],
+								timestamp: 1,
+							},
+						],
+					},
+				});
+				send({ type: "response", id: command.id, command: command.type, success: true });
+				return;
+			}
+			if (command.message === "async-decode-exit") {
+				process.stdout.write(`${JSON.stringify({ type: "agent_start" })}\n`);
+				setTimeout(() => process.exit(23), 10);
+				return;
+			}
+			if (command.message === "ordered-async") {
+				process.stdout.write(
+					[
+						{ type: "agent_start" },
+						{ type: "response", id: command.id, command: command.type, success: true },
+						{ type: "agent_settled" },
+					]
+						.map((frame) => `${JSON.stringify(frame)}\n`)
+						.join(""),
+				);
+				return;
+			}
 			if (command.message === "malformed-event") {
 				send({ type: "queue_update" });
 				return;

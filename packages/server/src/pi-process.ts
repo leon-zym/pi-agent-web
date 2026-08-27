@@ -19,9 +19,14 @@ import {
 import { legacyRpcV1Adapter } from "./legacy-rpc-v1.js";
 import {
 	type PiHostAdapter,
+	type PiHostDecodeOutcome,
+	type PiHostDecodeResult,
+	type PiHostPayloadExternalizer,
+	PiHostResponseExternalizationError,
 	PiProtocolIncompatibleError,
 	type PiRuntimeDiagnostic,
 } from "./pi-host-adapter.js";
+import type { PiPayloadLeaseTransfer } from "./pi-payload-externalizer.js";
 import type { ResolvedPi } from "./resolver.js";
 
 /**
@@ -31,7 +36,7 @@ import type { ResolvedPi } from "./resolver.js";
  *
  * Semantics align with the official RpcClient (rpc-client.ts), with
  * Supervisor-oriented additions:
- * - Ready handshake: send get_state{id:"ready-1"} after spawn; the response
+ * - Ready handshake: send get_state after spawn; the response
  *   means ready (the protocol has no ready frame; the official client blind-
  *   waits 100ms).
  * - Events / responses / Extension UI frames are routed separately.
@@ -48,15 +53,37 @@ export interface PiProcessOptions {
 	env?: Record<string, string>;
 	readyTimeoutMs?: number;
 	commandTimeoutMs?: number;
+	/** Maximum duration of one adapter normalization/externalization operation. */
+	decodeTimeoutMs?: number;
 	stderrMaxBytes?: number;
 	/** Bounded allowance for Pi's single-line get_messages response. */
 	snapshotLineMaxBytes?: number;
 	adapter?: PiHostAdapter;
+	/** Disabled until a downstream generation owner is installed. */
+	payloadExternalizer?: PiHostPayloadExternalizer;
+	/** Future Runtime seam: synchronously prepare an exact event handoff without seeing its transfer early. */
+	onDecodedEvent?: PiDecodedDeliveryConsumer<ProductSessionEventDto>;
 	onEvent?: (event: ProductSessionEventDto) => void;
 	onExtensionUiRequest?: (request: ExtensionUiRequestDto) => void;
 	onExit?: (info: PiProcessExitInfo) => void;
 	onReady?: (initialState: SessionStateDto) => void;
 }
+
+export interface PiDecodedDelivery<T> {
+	readonly value: T;
+	/**
+	 * Prepare a one-shot synchronous handoff after PiProcess rechecks spawn/pending identity.
+	 * Before returning literal true, commit must place the transfer in a bounded cleanup ledger
+	 * or atomically adopt it into the exact generation owner. PiProcess never releases after true.
+	 */
+	prepare(commit: (transfer: PiPayloadLeaseTransfer | null) => true): PiDecodedDeliveryPlan;
+}
+
+export interface PiDecodedDeliveryPlan {
+	readonly kind: "pi_decoded_delivery_plan";
+}
+
+export type PiDecodedDeliveryConsumer<T> = (delivery: PiDecodedDelivery<T>) => PiDecodedDeliveryPlan;
 
 export interface PiProcessExitInfo {
 	code: number | null;
@@ -81,8 +108,17 @@ export class ProcessExitedError extends Error {
 	}
 }
 
+class PiDecodeDeadlineError extends Error {
+	constructor(timeoutMs: number) {
+		super(`Pi adapter decode timed out after ${String(timeoutMs)}ms`);
+		this.name = "PiDecodeDeadlineError";
+	}
+}
+
 interface PendingRequest {
 	command: SessionCommandTypeDto;
+	publicId: string;
+	consumeDecoded?: PiDecodedDeliveryConsumer<SessionCommandResponseDto>;
 	resolve: (r: SessionCommandResponseDto) => void;
 	reject: (e: Error) => void;
 	timer: NodeJS.Timeout;
@@ -94,6 +130,8 @@ interface SpawnIdentity {
 	processGroupId: number | null;
 	leaderExitObserved: boolean;
 	unexpectedFinalization: Promise<void> | null;
+	decodeAbortController: AbortController;
+	activeLine: Promise<void> | null;
 }
 
 const UNEXPECTED_GROUP_TERM_GRACE_MS = 250;
@@ -105,13 +143,75 @@ function isRecord(value: unknown): value is UnknownFrame {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+	try {
+		return (
+			typeof value === "object" &&
+			value !== null &&
+			"then" in value &&
+			typeof (value as { then?: unknown }).then === "function"
+		);
+	} catch {
+		return false;
+	}
+}
+
+class PreparedDecodedDelivery<T> implements PiDecodedDelivery<T>, PiDecodedDeliveryPlan {
+	readonly kind = "pi_decoded_delivery_plan" as const;
+	readonly value: T;
+	private state: "pending" | "prepared" | "committing" | "committed" | "failed" = "pending";
+	private commitPrepared: ((transfer: PiPayloadLeaseTransfer | null) => true) | null = null;
+
+	constructor(value: T) {
+		this.value = value;
+	}
+
+	prepare(commit: (transfer: PiPayloadLeaseTransfer | null) => true): PiDecodedDeliveryPlan {
+		if (this.state !== "pending" || typeof commit !== "function") {
+			throw new Error("Pi decoded delivery is already prepared");
+		}
+		this.commitPrepared = commit;
+		this.state = "prepared";
+		return this;
+	}
+
+	isExactPlan(plan: unknown): boolean {
+		return plan === this && this.state === "prepared";
+	}
+
+	commit(transfer: PiPayloadLeaseTransfer | null): void {
+		if (this.state !== "prepared" || !this.commitPrepared) {
+			throw new Error("Pi decoded delivery plan is not prepared");
+		}
+		this.state = "committing";
+		try {
+			const result: unknown = this.commitPrepared(transfer);
+			if (isPromiseLike(result)) {
+				void Promise.resolve(result).catch(() => {
+					// Delivery commits are synchronous. Observe a forged thenable rejection.
+				});
+				throw new Error("Pi decoded delivery plan commit must return synchronous literal true");
+			}
+			if (result !== true) {
+				throw new Error("Pi decoded delivery plan did not return literal true");
+			}
+			this.state = "committed";
+		} catch (error) {
+			this.state = "failed";
+			throw error;
+		}
+	}
+}
+
 export class PiProcess {
 	readonly cwd: string;
 	private child: ChildProcess | null = null;
 	private spawnIdentity: SpawnIdentity | null = null;
 	private detach: (() => void) | null = null;
 	private pending = new Map<string, PendingRequest>();
-	private requestCounter = 0;
+	private pendingPublicIds = new Map<string, string>();
+	private publicRequestCounter = 0n;
+	private wireRequestCounter = 0n;
 	private stderrChunks: string[] = [];
 	private stderrBytes = 0;
 	private stopped = false;
@@ -120,7 +220,10 @@ export class PiProcess {
 	private writeTail: Promise<void> = Promise.resolve();
 	private readonly adapter: PiHostAdapter;
 	private opts: Required<
-		Pick<PiProcessOptions, "stderrMaxBytes" | "commandTimeoutMs" | "readyTimeoutMs" | "snapshotLineMaxBytes">
+		Pick<
+			PiProcessOptions,
+			"stderrMaxBytes" | "commandTimeoutMs" | "readyTimeoutMs" | "snapshotLineMaxBytes" | "decodeTimeoutMs"
+		>
 	> &
 		PiProcessOptions;
 
@@ -131,6 +234,7 @@ export class PiProcess {
 			...opts,
 			readyTimeoutMs: opts.readyTimeoutMs ?? 10_000,
 			commandTimeoutMs: opts.commandTimeoutMs ?? 30_000,
+			decodeTimeoutMs: Math.max(1, opts.decodeTimeoutMs ?? 30_000),
 			stderrMaxBytes: opts.stderrMaxBytes ?? 64 * 1024,
 			snapshotLineMaxBytes: Math.max(0, opts.snapshotLineMaxBytes ?? MAX_JSONL_SNAPSHOT_LINE_BYTES),
 		};
@@ -177,6 +281,8 @@ export class PiProcess {
 			processGroupId: process.platform !== "win32" ? leaderPid : null,
 			leaderExitObserved: false,
 			unexpectedFinalization: null,
+			decodeAbortController: new AbortController(),
+			activeLine: null,
 		};
 		this.spawnIdentity = identity;
 
@@ -204,7 +310,7 @@ export class PiProcess {
 			}
 		});
 
-		this.detach = attachJsonlLineReader(child.stdout!, (line) => this.handleLine(line), {
+		this.detach = attachJsonlLineReader(child.stdout!, (line) => this.consumeLine(line, identity), {
 			maxLineBytes: () => this.currentJsonlLineBudget(),
 			onError: (error) => this.handleProtocolFailure(identity, this.normalizeFramingError(error)),
 		});
@@ -218,7 +324,7 @@ export class PiProcess {
 				this.clearSpawn(identity);
 				return;
 			}
-			this.beginUnexpectedFinalization(identity, error, info);
+			this.arbitrateUnexpectedExit(identity, error, info);
 		});
 
 		// Ready handshake: no ready frame in the protocol, probe with get_state.
@@ -261,8 +367,18 @@ export class PiProcess {
 	/** Send a command and wait for its response frame (auto id, echoed back).
 	 * success:false responses resolve normally; callers check via expectData. */
 	send(command: SessionCommandDto, timeoutMs?: number): Promise<SessionCommandResponseDto> {
-		const id = command.id ?? this.nextId();
+		const id = command.id ?? this.nextPublicId();
 		return this.sendRaw({ ...command, id }, timeoutMs);
+	}
+
+	/** Future Runtime seam: synchronously plans ownership before a leased response can resolve. */
+	sendDecoded(
+		command: SessionCommandDto,
+		consume: PiDecodedDeliveryConsumer<SessionCommandResponseDto>,
+		timeoutMs?: number,
+	): Promise<SessionCommandResponseDto> {
+		const id = command.id ?? this.nextPublicId();
+		return this.sendRaw({ ...command, id }, timeoutMs, consume);
 	}
 
 	/** Send a no-response protocol frame (extension_ui_response etc.). */
@@ -278,26 +394,40 @@ export class PiProcess {
 	private sendRaw(
 		obj: SessionCommandDto & { id: string },
 		timeoutMs?: number,
+		consumeDecoded?: PiDecodedDeliveryConsumer<SessionCommandResponseDto>,
 	): Promise<SessionCommandResponseDto> {
-		if (!this.leaderRunning || this.spawnIdentity?.unexpectedFinalization) {
+		const identity = this.spawnIdentity;
+		if (!this.leaderRunning || !identity || identity.unexpectedFinalization) {
 			return Promise.reject(new Error("pi process is not running"));
 		}
-		if (this.pending.has(obj.id)) {
+		if (this.pendingPublicIds.has(obj.id)) {
 			return Promise.reject(new RpcError(obj.type, `duplicate pending command id: ${obj.id}`));
 		}
+		const wireId = this.nextWireId();
+		const encoded = { ...obj, id: wireId };
 		const timeout = timeoutMs ?? this.opts.commandTimeoutMs;
 		return new Promise<SessionCommandResponseDto>((resolve, reject) => {
 			const timer = setTimeout(() => {
-				this.pending.delete(obj.id);
+				const pending = this.pending.get(wireId);
+				if (pending) this.deletePending(wireId, pending);
 				reject(new Error(`command timed out (${timeout / 1000}s): ${obj.type}`));
 			}, timeout);
-			this.pending.set(obj.id, { command: obj.type, resolve, reject, timer });
-			void this.write(this.adapter.encodeCommand(obj)).catch((error) => {
+			const pending = { command: obj.type, publicId: obj.id, consumeDecoded, resolve, reject, timer };
+			this.pending.set(wireId, pending);
+			this.pendingPublicIds.set(obj.id, wireId);
+			void this.write(this.adapter.encodeCommand(encoded)).catch((error) => {
 				clearTimeout(timer);
-				this.pending.delete(obj.id);
+				this.deletePending(wireId, pending);
 				reject(error instanceof Error ? error : new Error(String(error)));
 			});
 		});
+	}
+
+	private deletePending(wireId: string, pending: PendingRequest): void {
+		if (this.pending.get(wireId) === pending) this.pending.delete(wireId);
+		if (this.pendingPublicIds.get(pending.publicId) === wireId) {
+			this.pendingPublicIds.delete(pending.publicId);
+		}
 	}
 
 	private async write(obj: unknown): Promise<void> {
@@ -337,6 +467,7 @@ export class PiProcess {
 
 	private beginUnexpectedFinalization(identity: SpawnIdentity, error: Error, info: PiProcessExitInfo): void {
 		if (this.spawnIdentity !== identity || identity.unexpectedFinalization) return;
+		identity.decodeAbortController.abort(error);
 		const finalization = this.finalizeUnexpectedExit(identity, error, info);
 		identity.unexpectedFinalization = finalization;
 		// EventEmitter callbacks cannot await cleanup. Keep the promise observed;
@@ -434,13 +565,187 @@ export class PiProcess {
 
 	private clearSpawn(identity: SpawnIdentity): void {
 		if (this.spawnIdentity !== identity) return;
+		identity.decodeAbortController.abort(new Error("Pi adapter decode scope closed"));
 		this.child = null;
 		this.spawnIdentity = null;
 		this.detach?.();
 		this.detach = null;
 	}
 
-	private handleLine(line: string): void {
+	private consumeLine(line: string, identity: SpawnIdentity): Promise<void> {
+		let task: Promise<void>;
+		task = this.handleLine(line, identity)
+			.catch((error: unknown) => {
+				const normalized = error instanceof Error ? error : new Error(String(error));
+				this.handleProtocolFailure(identity, normalized);
+				throw normalized;
+			})
+			.finally(() => {
+				if (identity.activeLine === task) identity.activeLine = null;
+			});
+		identity.activeLine = task;
+		return task;
+	}
+
+	private arbitrateUnexpectedExit(
+		identity: SpawnIdentity,
+		error: ProcessExitedError,
+		info: PiProcessExitInfo,
+	): void {
+		const activeLine = identity.activeLine;
+		if (!activeLine) {
+			this.beginUnexpectedFinalization(identity, error, info);
+			return;
+		}
+		// An in-flight adapter operation is spawn-bounded. Let its success or
+		// protocol failure settle first so a concrete incompatibility is not
+		// downgraded to the concurrent generic process exit.
+		void activeLine.then(
+			() => this.beginUnexpectedFinalization(identity, error, info),
+			() => this.beginUnexpectedFinalization(identity, error, info),
+		);
+	}
+
+	private decodeWithDeadline<T>(
+		identity: SpawnIdentity,
+		decode: (signal: AbortSignal) => PiHostDecodeResult<T>,
+	): Promise<PiHostDecodeOutcome<T>> {
+		const deadline = new AbortController();
+		const signal = AbortSignal.any([identity.decodeAbortController.signal, deadline.signal]);
+		const operation = Promise.resolve().then(() => decode(signal));
+		return new Promise<PiHostDecodeOutcome<T>>((resolve, reject) => {
+			let settled = false;
+			const settle = (): boolean => {
+				if (settled) return false;
+				settled = true;
+				clearTimeout(timer);
+				signal.removeEventListener("abort", onAbort);
+				return true;
+			};
+			const onAbort = (): void => {
+				const reason = signal.reason;
+				if (settle()) reject(reason instanceof Error ? reason : new Error("Pi adapter decode aborted"));
+			};
+			const timer = setTimeout(() => {
+				deadline.abort(new PiDecodeDeadlineError(this.opts.decodeTimeoutMs));
+			}, this.opts.decodeTimeoutMs);
+			timer.unref?.();
+			if (signal.aborted) onAbort();
+			else signal.addEventListener("abort", onAbort, { once: true });
+			operation.then(
+				(outcome) => {
+					if (settle()) resolve(outcome);
+					else this.observeDiscardedOutcome(outcome);
+				},
+				(error: unknown) => {
+					if (settle()) reject(error instanceof Error ? error : new Error(String(error)));
+				},
+			);
+		});
+	}
+
+	private observeDiscardedOutcome(outcome: PiHostDecodeOutcome<unknown>): void {
+		if (!outcome.lease) return;
+		void outcome.lease.release().catch(() => {
+			// The owning spawn already timed out or stopped. Observe cleanup failure
+			// without allowing it to target a replacement spawn.
+		});
+	}
+
+	private async releaseOutcome(outcome: PiHostDecodeOutcome<unknown>): Promise<void> {
+		await outcome.lease?.release();
+	}
+
+	private async releaseOutcomeAfterFailure(
+		outcome: PiHostDecodeOutcome<unknown>,
+		error: unknown,
+		message: string,
+	): Promise<never> {
+		try {
+			await this.releaseOutcome(outcome);
+		} catch (releaseError) {
+			throw new AggregateError([error, releaseError], message);
+		}
+		throw error;
+	}
+
+	private async transferOutcome(
+		outcome: PiHostDecodeOutcome<unknown>,
+	): Promise<PiPayloadLeaseTransfer | null> {
+		const lease = outcome.lease;
+		if (!lease) return null;
+		try {
+			return lease.transfer();
+		} catch (error) {
+			try {
+				await lease.release();
+			} catch (releaseError) {
+				throw new AggregateError([error, releaseError], "Pi decoded payload transfer cleanup failed");
+			}
+			throw error;
+		}
+	}
+
+	private async releaseTransferAfterFailure(
+		transfer: PiPayloadLeaseTransfer | null,
+		error: unknown,
+		message: string,
+	): Promise<never> {
+		try {
+			await transfer?.release();
+		} catch (releaseError) {
+			throw new AggregateError([error, releaseError], message);
+		}
+		throw error;
+	}
+
+	private async consumeDecodedOutcome<T>(
+		outcome: PiHostDecodeOutcome<T>,
+		consume: PiDecodedDeliveryConsumer<T>,
+		isCurrent: () => boolean,
+	): Promise<boolean> {
+		const delivery = new PreparedDecodedDelivery(outcome.value);
+		let plan: unknown;
+		try {
+			plan = consume(delivery);
+		} catch (error) {
+			return this.releaseOutcomeAfterFailure(outcome, error, "Pi decoded consumer cleanup failed");
+		}
+		if (isPromiseLike(plan)) {
+			void Promise.resolve(plan).catch(() => {
+				// The callback contract is synchronous. Observe a forged thenable rejection.
+			});
+			return this.releaseOutcomeAfterFailure(
+				outcome,
+				new Error("Pi decoded delivery consumer must return a synchronous plan"),
+				"Pi decoded consumer cleanup failed",
+			);
+		}
+		if (!delivery.isExactPlan(plan)) {
+			return this.releaseOutcomeAfterFailure(
+				outcome,
+				new Error("Pi decoded delivery consumer did not prepare its exact delivery"),
+				"Pi decoded consumer cleanup failed",
+			);
+		}
+		if (!isCurrent()) {
+			await this.releaseOutcome(outcome);
+			return false;
+		}
+		const transfer = await this.transferOutcome(outcome);
+		if (!isCurrent()) {
+			await transfer?.release();
+			return false;
+		}
+		try {
+			delivery.commit(transfer);
+		} catch (error) {
+			return this.releaseTransferAfterFailure(transfer, error, "Pi decoded plan cleanup failed");
+		}
+		return true;
+	}
+
+	private async handleLine(line: string, identity: SpawnIdentity | null = this.spawnIdentity): Promise<void> {
 		const exceedsOrdinaryLimit = Buffer.byteLength(line) > MAX_JSONL_LINE_BYTES;
 		let data: unknown;
 		try {
@@ -465,8 +770,15 @@ export class PiProcess {
 				reason: "oversized_frame",
 			});
 		}
+		if (!identity) throw new Error("cannot decode a Pi frame without an active spawn");
 		if (typeof data !== "object" || data === null) {
-			this.adapter.decodeUnsolicited(data);
+			const outcome = await this.decodeWithDeadline(identity, (signal) =>
+				this.adapter.decodeUnsolicited(data, {
+					signal,
+					externalizer: this.opts.payloadExternalizer,
+				}),
+			);
+			await this.releaseOutcome(outcome);
 			return;
 		}
 		const frame = data as Record<string, unknown>;
@@ -476,8 +788,64 @@ export class PiProcess {
 			if (id) {
 				const pending = this.pending.get(id);
 				if (pending) {
-					const response = this.adapter.decodeResponse(frame, pending.command);
-					this.pending.delete(id);
+					let outcome: PiHostDecodeOutcome<SessionCommandResponseDto & { id: string }>;
+					try {
+						outcome = await this.decodeWithDeadline(identity, (signal) =>
+							this.adapter.decodeResponse(frame, pending.command, {
+								signal,
+								externalizer: this.opts.payloadExternalizer,
+							}),
+						);
+					} catch (error) {
+						const responseError =
+							error instanceof PiDecodeDeadlineError
+								? new PiHostResponseExternalizationError(pending.command, "deadline", {
+										cause: error,
+									})
+								: error;
+						if (
+							responseError instanceof PiHostResponseExternalizationError &&
+							!identity.decodeAbortController.signal.aborted &&
+							this.ownsSpawn(identity) &&
+							this.pending.get(id) === pending
+						) {
+							this.deletePending(id, pending);
+							clearTimeout(pending.timer);
+							pending.reject(responseError);
+							return;
+						}
+						if (
+							responseError instanceof PiHostResponseExternalizationError &&
+							(!this.ownsSpawn(identity) || this.pending.get(id) !== pending)
+						) {
+							return;
+						}
+						throw responseError;
+					}
+					if (!this.ownsSpawn(identity) || this.pending.get(id) !== pending) {
+						await this.releaseOutcome(outcome);
+						return;
+					}
+					const response: SessionCommandResponseDto = { ...outcome.value, id: pending.publicId };
+					if (pending.consumeDecoded) {
+						const accepted = await this.consumeDecodedOutcome(
+							{ value: response, lease: outcome.lease },
+							pending.consumeDecoded,
+							() => this.ownsSpawn(identity) && this.pending.get(id) === pending,
+						);
+						if (!accepted) return;
+					} else if (outcome.lease) {
+						return this.releaseOutcomeAfterFailure(
+							outcome,
+							new Error("inline-only Pi response delivery cannot carry attachment holds"),
+							"Pi inline response cleanup failed",
+						);
+					}
+					if (!this.ownsSpawn(identity) || this.pending.get(id) !== pending) {
+						if (!pending.consumeDecoded) await this.releaseOutcome(outcome);
+						return;
+					}
+					this.deletePending(id, pending);
 					clearTimeout(pending.timer);
 					pending.resolve(response);
 					return;
@@ -485,13 +853,74 @@ export class PiProcess {
 			}
 			// Late or unknown-id responses are ignorable only after their complete
 			// command-specific shape has been validated by the adapter.
-			this.adapter.decodeOrphanedResponse(frame);
+			const orphaned = await this.decodeWithDeadline(identity, (signal) =>
+				this.adapter.decodeOrphanedResponse(frame, {
+					signal,
+				}),
+			);
+			await this.releaseOutcome(orphaned);
 			return;
 		}
 
-		const decoded = this.adapter.decodeUnsolicited(frame);
-		if (decoded.kind === "event") this.opts.onEvent?.(decoded.event);
-		if (decoded.kind === "extension_ui_request") this.opts.onExtensionUiRequest?.(decoded.request);
+		const outcome = await this.decodeWithDeadline(identity, (signal) =>
+			this.adapter.decodeUnsolicited(frame, {
+				signal,
+				externalizer: this.opts.payloadExternalizer,
+			}),
+		);
+		if (!this.ownsSpawn(identity)) {
+			await this.releaseOutcome(outcome);
+			return;
+		}
+		if (outcome.value.kind === "ignored") {
+			await this.releaseOutcome(outcome);
+			return;
+		}
+		if (outcome.value.kind === "event") {
+			const consume = this.opts.onDecodedEvent;
+			if (consume) {
+				await this.consumeDecodedOutcome({ value: outcome.value.event, lease: outcome.lease }, consume, () =>
+					this.ownsSpawn(identity),
+				);
+				return;
+			}
+			if (!this.opts.onEvent) {
+				await this.releaseOutcome(outcome);
+				return;
+			}
+			if (outcome.lease) {
+				return this.releaseOutcomeAfterFailure(
+					outcome,
+					new Error("inline-only Pi event delivery cannot carry attachment holds"),
+					"Pi inline event cleanup failed",
+				);
+			}
+			this.opts.onEvent(outcome.value.event);
+			return;
+		}
+		if (!this.opts.onExtensionUiRequest) {
+			await this.releaseOutcome(outcome);
+			return;
+		}
+		if (outcome.lease) {
+			return this.releaseOutcomeAfterFailure(
+				outcome,
+				new Error("inline-only Pi Extension UI delivery cannot carry attachment holds"),
+				"Pi inline Extension UI cleanup failed",
+			);
+		}
+		this.opts.onExtensionUiRequest(outcome.value.request);
+	}
+
+	private ownsSpawn(identity: SpawnIdentity | null): identity is SpawnIdentity {
+		return (
+			identity !== null &&
+			!this.stopped &&
+			!identity.leaderExitObserved &&
+			this.spawnIdentity === identity &&
+			this.child === identity.child &&
+			identity.unexpectedFinalization === null
+		);
 	}
 
 	private isPendingSnapshotResponse(data: unknown): data is UnknownFrame {
@@ -505,6 +934,7 @@ export class PiProcess {
 			pending.reject(error);
 		}
 		this.pending.clear();
+		this.pendingPublicIds.clear();
 	}
 
 	private currentJsonlLineBudget(): number {
@@ -514,15 +944,25 @@ export class PiProcess {
 		return MAX_JSONL_LINE_BYTES;
 	}
 
-	private nextId(): string {
-		this.requestCounter += 1;
-		return `web-${this.requestCounter.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+	private nextPublicId(): string {
+		let id: string;
+		do {
+			this.publicRequestCounter += 1n;
+			id = `web-${this.publicRequestCounter.toString(36)}`;
+		} while (this.pendingPublicIds.has(id));
+		return id;
+	}
+
+	private nextWireId(): string {
+		this.wireRequestCounter += 1n;
+		return `pi-web-wire-${this.wireRequestCounter.toString(36)}`;
 	}
 
 	/** Graceful stop: terminate the complete detached process group before cleanup. */
 	async stop(): Promise<void> {
 		this.stopped = true;
 		const identity = this.spawnIdentity;
+		identity?.decodeAbortController.abort(new RpcError("stop", "pi process stopped"));
 		const child = identity?.child ?? this.child;
 		if (!child) return;
 		this.detach?.();

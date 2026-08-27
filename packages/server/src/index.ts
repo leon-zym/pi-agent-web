@@ -1,6 +1,8 @@
+export * from "./attachment-routes.js";
 export * from "./auth-storage.js";
 export * from "./config.js";
 export * from "./directory-picker.js";
+export * from "./epoch-content-store.js";
 export * from "./jsonl.js";
 export * from "./legacy-rpc-v1.js";
 export { type ServerHandle, type StartServerOptions, startServer } from "./main.js";

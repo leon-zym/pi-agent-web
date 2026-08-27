@@ -1,4 +1,4 @@
-import type { SessionEventDto } from "@pi-agent-web/protocol";
+import type { SessionEventDto, SessionImageContentDto } from "@pi-agent-web/protocol";
 import { tt } from "../lib/i18n";
 import { presentUserMessage, serializePresentedUserMessage } from "../lib/user-message-presentation";
 import type {
@@ -38,7 +38,7 @@ type ContentBlockLite = {
 	type?: string;
 	text?: string;
 	thinking?: string;
-	data?: string;
+	data?: SessionImageContentDto["data"];
 	mimeType?: string;
 	id?: string;
 	name?: string;
@@ -57,7 +57,7 @@ function flattenText(content: unknown): string {
 		.join("\n");
 }
 
-function extractImages(content: unknown): { type: "image"; data: string; mimeType: string }[] | undefined {
+function extractImages(content: unknown): SessionImageContentDto[] | undefined {
 	if (!Array.isArray(content)) return undefined;
 	const images = content
 		.filter(
@@ -65,12 +65,14 @@ function extractImages(content: unknown): { type: "image"; data: string; mimeTyp
 				typeof block === "object" &&
 				block !== null &&
 				(block as ContentBlockLite).type === "image" &&
-				typeof (block as ContentBlockLite).data === "string" &&
+				(typeof (block as ContentBlockLite).data === "string" ||
+					((block as ContentBlockLite).data !== null &&
+						typeof (block as ContentBlockLite).data === "object")) &&
 				typeof (block as ContentBlockLite).mimeType === "string",
 		)
 		.map((block) => ({
 			type: "image" as const,
-			data: (block as ContentBlockLite).data as string,
+			data: (block as ContentBlockLite).data as SessionImageContentDto["data"],
 			mimeType: (block as ContentBlockLite).mimeType as string,
 		}));
 	return images.length > 0 ? images : undefined;

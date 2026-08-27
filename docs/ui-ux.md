@@ -103,7 +103,12 @@ Composer Visual Seat 固定于 Center 底部，同一 DOM 延续焦点，数据�
 - **只读 QueueDock 状态指示坞**：
   - 严格遵循 Pi RPC `queue_update` 单向流事实，不虚构前端重排功能；
   - 胶囊展示当前排队的 Steering 引导指令与 Follow-up 任务数量及文本摘要。
-- **图片与多模态**：支持纯图片发送；发图前在客户端完成解码、分辨率限制与压缩，并在当前 Session 呈现安全缩略图与删除入口。
+- **图片与多模态**：支持纯图片发送；每个候选图片必须先通过浏览器原生 decode，失败时不得进入
+  Composer。小型 allowlisted JPEG/PNG/WebP/GIF 保留原始字节，因此动画与编码保真；大图或其他
+  浏览器可解码格式继续经过分辨率限制并由 Canvas 压缩为 WebP。Decode 使用的 `ImageBitmap` 必须
+  立即 `close`；fallback `<img>` 在 `load` 后还必须等待 `HTMLImageElement.decode()` 成功，不能只凭
+  `onload` admission。若浏览器同时缺少 `createImageBitmap` 与 `image.decode`，图片选择 fail closed。
+  Fallback 使用的临时 object URL 在成功或失败后都必须 revoke。当前 Session 呈现安全缩略图与删除入口。
 
 ---
 

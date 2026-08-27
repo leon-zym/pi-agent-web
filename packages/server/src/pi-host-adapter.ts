@@ -3,10 +3,12 @@ import type {
 	ExtensionUiRequestDto,
 	ExtensionUiResponseDto,
 	ProductSessionEventDto,
+	SessionAttachmentGuardContext,
 	SessionCommandDto,
 	SessionCommandResponseDto,
 	SessionCommandTypeDto,
 } from "@pi-agent-web/protocol";
+import type { Externalized, PiPayloadExternalizerInput, PiPayloadLease } from "./pi-payload-externalizer.js";
 
 const MAX_VERSION_LENGTH = 64;
 const EXACT_SEMVER = /^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/;
@@ -79,6 +81,44 @@ export type PiHostUnsolicitedFrame =
 	| { kind: "extension_ui_request"; request: ExtensionUiRequestDto }
 	| { kind: "ignored"; frameType: string };
 
+export interface PiHostDecodeOutcome<T> {
+	readonly value: T;
+	readonly lease: PiPayloadLease | null;
+}
+
+export interface PiHostPayloadExternalizer {
+	readonly context: SessionAttachmentGuardContext;
+	externalize(input: PiPayloadExternalizerInput, signal: AbortSignal): Promise<Externalized<unknown>>;
+}
+
+/** Adapter normalization may be synchronous today or asynchronously externalize bounded payloads. */
+export type PiHostDecodeResult<T> = PiHostDecodeOutcome<T> | PromiseLike<PiHostDecodeOutcome<T>>;
+
+/** Spawn-scoped cancellation passed to asynchronous normalization/externalization work. */
+export interface PiHostDecodeContext {
+	readonly signal: AbortSignal;
+	/** Server-private and disabled unless the complete downstream ownership path is installed. */
+	readonly externalizer?: PiHostPayloadExternalizer;
+}
+
+export type PiHostResponseExternalizationFailure =
+	| "blob_too_large"
+	| "cache_bytes_exhausted"
+	| "cache_items_exhausted"
+	| "deadline";
+
+/** A valid raw response that the Gateway could not make locally deliverable. */
+export class PiHostResponseExternalizationError extends Error {
+	constructor(
+		readonly command: SessionCommandTypeDto,
+		readonly failure: PiHostResponseExternalizationFailure,
+		options?: ErrorOptions,
+	) {
+		super(`Gateway failed to deliver the Pi ${command} response`, options);
+		this.name = "PiHostResponseExternalizationError";
+	}
+}
+
 /** Product-facing boundary for one concrete Pi host protocol implementation. */
 export interface PiHostAdapter {
 	readonly id: string;
@@ -92,12 +132,18 @@ export interface PiHostAdapter {
 	decodeResponse(
 		value: unknown,
 		expectedCommand: SessionCommandTypeDto,
-	): SessionCommandResponseDto & {
-		id: string;
-	};
+		context?: PiHostDecodeContext,
+	): PiHostDecodeResult<
+		SessionCommandResponseDto & {
+			id: string;
+		}
+	>;
 	/** Validate a late/unknown-id response before explicitly ignoring it. */
-	decodeOrphanedResponse(value: unknown): void;
-	decodeUnsolicited(value: unknown): PiHostUnsolicitedFrame;
+	decodeOrphanedResponse(value: unknown, context?: PiHostDecodeContext): PiHostDecodeResult<void>;
+	decodeUnsolicited(
+		value: unknown,
+		context?: PiHostDecodeContext,
+	): PiHostDecodeResult<PiHostUnsolicitedFrame>;
 }
 
 /** Execute an adapter-owned, bounded version probe and clean its whole process group. */

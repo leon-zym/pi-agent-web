@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { GATEWAY_PAYLOAD_BUDGET_CAPABILITY, SESSION_PAYLOAD_BUDGET } from "@pi-agent-web/protocol";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type ServerHandle, startServer } from "../src/main.js";
 
@@ -37,10 +38,16 @@ async function openSocket(): Promise<import("ws").WebSocket> {
 	ws.send(
 		JSON.stringify({
 			type: "client_hello",
-			protocol: { major: 1, minor: 0 },
+			protocol: { major: 1, minor: 2 },
 			clientBuild: "workspace-control-test",
-			capabilities: ["rpc.commands", "rpc.events", "rpc.extension_ui", "session.multiplex"],
-			limits: { maxServerFrameBytes: 68 * 1024 * 1024 },
+			capabilities: [
+				"rpc.commands",
+				"rpc.events",
+				"rpc.extension_ui",
+				"session.multiplex",
+				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+			],
+			limits: { maxServerFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes },
 		}),
 	);
 	await hello;

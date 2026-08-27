@@ -148,7 +148,7 @@ test("an image-only prompt is delivered and the same WebSocket remains usable", 
 	await openWorkbench(page, harness);
 
 	const png = Buffer.from(
-		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZqxQAAAAASUVORK5CYII=",
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
 		"base64",
 	);
 	await page.locator("#piweb-image-input").setInputFiles({

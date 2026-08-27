@@ -1,11 +1,13 @@
 import {
 	type ExtensionUiRequestDto,
+	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 	GATEWAY_PROTOCOL_VERSION,
 	type GatewayClientHelloDto,
 	type GatewayServerHelloDto,
 	isSessionSnapshotDto,
 	isSessionWsServerMessage,
 	type ProductSessionEventDto,
+	SESSION_PAYLOAD_BUDGET,
 	type SessionReplayFrameDto,
 	type SessionRuntimeDto,
 	type SessionSnapshotDto,
@@ -58,12 +60,14 @@ class FakeSocket implements SessionWebSocket {
 				"rpc.extension_ui",
 				"session.multiplex",
 				"session.hot_runtime_inventory",
+				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 			],
 			limits: {
 				maxClientFrameBytes: 8 * 1024 * 1024,
-				maxSnapshotFrameBytes: 32 * 1024 * 1024,
+				maxSnapshotFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes,
 				maxExtensionRequests: 256,
 			},
+			payloadBudget: SESSION_PAYLOAD_BUDGET,
 		} satisfies GatewayServerHelloDto);
 		this.receive({
 			type: "hot_runtime_inventory",

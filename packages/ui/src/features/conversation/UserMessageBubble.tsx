@@ -1,8 +1,10 @@
+import type { SessionImageContentDto } from "@pi-agent-web/protocol";
 import { Check, Copy } from "lucide-react";
-import { memo, useState } from "react";
+import { memo, useRef, useState } from "react";
 import { Badge } from "../../components/ui/badge";
 import { stripAnsi } from "../../lib/format";
 import { tt } from "../../lib/i18n";
+import { isSessionAttachmentImage, sessionImageKey, sessionImageSource } from "../../lib/session-attachment";
 import { serializePresentedUserMessage } from "../../lib/user-message-presentation";
 import { cn } from "../../lib/utils";
 import type { UiUserMessage } from "../../types/view-models";
@@ -11,7 +13,40 @@ import type { UiUserMessage } from "../../types/view-models";
  * Right-aligned light-blue bubble (DESIGN.md): max 525px, 22px radius,
  * queued injections carry a 插队/排队 badge.
  */
-export const UserMessageBubble = memo(function UserMessageBubble({ message }: { message: UiUserMessage }) {
+interface UserMessageBubbleProps {
+	message: UiUserMessage;
+	onAttachmentLoadError?: (image: SessionImageContentDto) => void;
+}
+
+const UserAttachmentImage = memo(function UserAttachmentImage({
+	image,
+	index,
+	onLoadError,
+}: {
+	image: SessionImageContentDto;
+	index: number;
+	onLoadError?: (image: SessionImageContentDto) => void;
+}) {
+	const reportedFailure = useRef(false);
+	const source = sessionImageSource(image);
+	return (
+		<img
+			src={source}
+			alt={tt("composer.attachmentImage", { n: index + 1 })}
+			className="mt-2 max-h-64 max-w-full rounded-md"
+			onError={() => {
+				if (!isSessionAttachmentImage(image) || reportedFailure.current) return;
+				reportedFailure.current = true;
+				onLoadError?.(image);
+			}}
+		/>
+	);
+});
+
+export const UserMessageBubble = memo(function UserMessageBubble({
+	message,
+	onAttachmentLoadError,
+}: UserMessageBubbleProps) {
 	const [copied, setCopied] = useState(false);
 	const displayText = stripAnsi(message.text);
 	const displayCommand = message.command ? stripAnsi(message.command) : undefined;
@@ -43,11 +78,11 @@ export const UserMessageBubble = memo(function UserMessageBubble({ message }: { 
 					)}
 				</div>
 				{message.images?.map((image, index) => (
-					<img
-						key={`${image.mimeType}:${index}`}
-						src={`data:${image.mimeType};base64,${image.data}`}
-						alt={tt("composer.attachmentImage", { n: index + 1 })}
-						className="mt-2 max-h-64 max-w-full rounded-md"
+					<UserAttachmentImage
+						key={sessionImageKey(image, index)}
+						image={image}
+						index={index}
+						onLoadError={onAttachmentLoadError}
 					/>
 				))}
 				<button

@@ -1,6 +1,10 @@
 import type { Page, WebSocket } from "@playwright/test";
 import { expect, test } from "../fixtures/test";
 
+const MIB = 1024 * 1024;
+const PAYLOAD_CAPABILITY = "payload.epoch_attachment_refs";
+const MAX_SERVER_FRAME_BYTES = 65 * MIB;
+
 interface HelloOverride {
 	clientBuild: string;
 	maxServerFrameBytes?: number;
@@ -87,7 +91,7 @@ test("a real browser negotiates an independently versioned client hello", async 
 		clientBuild: "7.3.1-browser-test",
 		major: 1,
 		minor: 7,
-		maxServerFrameBytes: 1024 * 1024,
+		maxServerFrameBytes: MAX_SERVER_FRAME_BYTES,
 	});
 	const observed = observeSockets(page);
 
@@ -96,7 +100,7 @@ test("a real browser negotiates an independently versioned client hello", async 
 	await expect
 		.poll(() => observed.received.find((frame) => frame.type === "server_hello"))
 		.toMatchObject({
-			protocol: { major: 1, minor: 1 },
+			protocol: { major: 1, minor: 2 },
 			serverBuild: "0.1.0",
 			piVersion: "0.84.2",
 			adapterId: "legacy-rpc-v1",
@@ -106,19 +110,21 @@ test("a real browser negotiates an independently versioned client hello", async 
 				"rpc.extension_ui",
 				"session.multiplex",
 				"session.hot_runtime_inventory",
+				PAYLOAD_CAPABILITY,
 			],
-			limits: { maxSnapshotFrameBytes: 1024 * 1024 },
+			limits: { maxSnapshotFrameBytes: MAX_SERVER_FRAME_BYTES },
+			payloadBudget: { maxServerFrameBytes: MAX_SERVER_FRAME_BYTES },
 		});
 	expect(observed.sent[0]).toMatchObject({
 		type: "client_hello",
 		clientBuild: "7.3.1-browser-test",
 		protocol: { major: 1, minor: 7 },
-		limits: { maxServerFrameBytes: 1024 * 1024 },
+		limits: { maxServerFrameBytes: MAX_SERVER_FRAME_BYTES },
 	});
 });
 
 test("a real browser treats a protocol-major mismatch as terminal", async ({ page, harness }) => {
-	await overrideClientHello(page, { clientBuild: "99.0.0-browser-test", major: 99, minor: 0 });
+	await overrideClientHello(page, { clientBuild: "99.0.0-browser-test", major: 99, minor: 2 });
 	const observed = observeSockets(page);
 
 	await page.goto(harness.origin, { waitUntil: "domcontentloaded" });

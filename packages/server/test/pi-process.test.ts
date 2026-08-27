@@ -2,10 +2,30 @@ import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { expectData } from "@pi-agent-web/protocol";
+import {
+	expectData,
+	type ProductSessionEventDto,
+	SESSION_PAYLOAD_BUDGET,
+	type SessionAttachmentRefDto,
+} from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { EpochContentHold } from "../src/epoch-content-store.js";
+import { GenerationContentOwner } from "../src/generation-content-owner.js";
 import { MAX_JSONL_LINE_BYTES } from "../src/jsonl.js";
-import { PiProcess } from "../src/pi-process.js";
+import { legacyRpcV1Adapter } from "../src/legacy-rpc-v1.js";
+import {
+	type PiHostAdapter,
+	type PiHostDecodeContext,
+	PiHostResponseExternalizationError,
+	type PiHostUnsolicitedFrame,
+	PiProtocolIncompatibleError,
+} from "../src/pi-host-adapter.js";
+import {
+	PiPayloadExternalizationError,
+	type PiPayloadLease,
+	type PiPayloadLeaseTransfer,
+} from "../src/pi-payload-externalizer.js";
+import { type PiDecodedDeliveryConsumer, PiProcess, type PiProcessOptions } from "../src/pi-process.js";
 
 const fakePiPath = path.join(import.meta.dirname, "fixtures", "fake-pi.mjs");
 const processGroupPiPath = path.join(import.meta.dirname, "fixtures", "process-group-pi.mjs");
@@ -18,6 +38,74 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<voi
 		await new Promise<void>((resolve) => setTimeout(resolve, 5));
 	}
 	throw new Error("condition did not settle before timeout");
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+	let resolve!: () => void;
+	const promise = new Promise<void>((resolvePromise) => {
+		resolve = resolvePromise;
+	});
+	return { promise, resolve };
+}
+
+function fakeLease(options: { rejectRelease?: boolean } = {}): {
+	lease: PiPayloadLease;
+	release: ReturnType<typeof vi.fn>;
+	adopt: ReturnType<typeof vi.fn>;
+} {
+	const ref: SessionAttachmentRefDto = {
+		type: "attachment_ref",
+		serverEpoch: "process-test-epoch",
+		sha256: "a".repeat(64),
+		mediaType: "image/png",
+		byteLength: 1,
+	};
+	const hold = Object.freeze({ ref });
+	let transferred = false;
+	const release = vi.fn(async () => {
+		if (options.rejectRelease) throw new Error("injected lease release failure");
+	});
+	const adopt = vi.fn((accept: (holds: readonly EpochContentHold[]) => true) => {
+		if (accept([hold]) !== true) throw new Error("lease was not adopted");
+	});
+	const lease: PiPayloadLease = Object.freeze({
+		refs: Object.freeze([ref]),
+		transfer() {
+			if (transferred) throw new Error("already transferred");
+			transferred = true;
+			return Object.freeze({ refs: lease.refs, adopt, release });
+		},
+		release,
+	});
+	return { lease, release, adopt };
+}
+
+type DecodedFrame =
+	| { kind: "response"; command: string }
+	| { kind: "orphaned_response" }
+	| PiHostUnsolicitedFrame;
+
+function withAsyncDecodeGate(
+	gate: (frame: DecodedFrame, signal: AbortSignal | undefined) => Promise<void>,
+): PiHostAdapter {
+	return {
+		...legacyRpcV1Adapter,
+		async decodeResponse(value, expectedCommand, context?: PiHostDecodeContext) {
+			const decoded = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand);
+			await gate({ kind: "response", command: expectedCommand }, context?.signal);
+			return decoded;
+		},
+		async decodeOrphanedResponse(value, context?: PiHostDecodeContext) {
+			const decoded = await legacyRpcV1Adapter.decodeOrphanedResponse(value);
+			await gate({ kind: "orphaned_response" }, context?.signal);
+			return decoded;
+		},
+		async decodeUnsolicited(value, context?: PiHostDecodeContext) {
+			const decoded = await legacyRpcV1Adapter.decodeUnsolicited(value);
+			await gate(decoded.value, context?.signal);
+			return decoded;
+		},
+	};
 }
 
 function processGroupPids(marker: string): { leaderPid: number; descendantPid: number } {
@@ -74,11 +162,88 @@ describe("PiProcess response correlation", () => {
 		});
 		await proc.start();
 
-		const first = proc.send({ id: "same-id", type: "get_last_assistant_text" }, 100);
-		await expect(proc.send({ id: "same-id", type: "get_last_assistant_text" }, 100)).rejects.toThrow(
-			"duplicate pending command id",
-		);
+		const first = proc.send({ id: "same-id", type: "prompt", message: "never-response" }, 100);
+		await expect(
+			proc.send({ id: "same-id", type: "prompt", message: "never-response" }, 100),
+		).rejects.toThrow("duplicate pending command id");
 		await expect(first).rejects.toThrow("command timed out");
+	});
+
+	it("reuses a settled public id with a fresh wire id without correlating the late old response", async () => {
+		const encodedIds: string[] = [];
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			encodeCommand(command) {
+				encodedIds.push(command.id);
+				return legacyRpcV1Adapter.encodeCommand(command);
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+		});
+		await proc.start();
+		const internals = proc as unknown as {
+			pending: Map<string, unknown>;
+			pendingPublicIds: Map<string, string>;
+		};
+
+		await expect(
+			proc.send({ id: "retired-id", type: "prompt", message: "delayed-response" }, 20),
+		).rejects.toThrow("command timed out");
+		expect(internals.pendingPublicIds.size).toBe(0);
+
+		let secondSettled = false;
+		const second = proc
+			.send({ id: "retired-id", type: "prompt", message: "delayed-reused-response" }, 250)
+			.finally(() => {
+				secondSettled = true;
+			});
+		expect(internals.pendingPublicIds.size).toBe(1);
+		await new Promise<void>((resolve) => setTimeout(resolve, 80));
+		expect(secondSettled).toBe(false);
+		await expect(second).resolves.toMatchObject({ id: "retired-id", command: "prompt", success: true });
+		expect(internals.pendingPublicIds.size).toBe(0);
+		expect(internals.pending.size).toBe(0);
+		const promptWireIds = encodedIds.slice(-2);
+		expect(promptWireIds).toHaveLength(2);
+		expect(promptWireIds[0]).not.toBe(promptWireIds[1]);
+		expect(promptWireIds).not.toContain("retired-id");
+		await expect(proc.send({ type: "get_state" })).resolves.toMatchObject({ success: true });
+		expect(proc.running).toBe(true);
+	});
+
+	it("never exposes the payload externalizer to an unknown-id orphan response", async () => {
+		const orphanContexts: Array<PiHostDecodeContext | undefined> = [];
+		const externalize = vi.fn();
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			decodeResponse(value, expectedCommand) {
+				return legacyRpcV1Adapter.decodeResponse(value, expectedCommand);
+			},
+			decodeOrphanedResponse(value, context) {
+				orphanContexts.push(context);
+				return legacyRpcV1Adapter.decodeOrphanedResponse(value, context);
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+			payloadExternalizer: {
+				context: { serverEpoch: "orphan-test-epoch", payloadBudget: SESSION_PAYLOAD_BUDGET },
+				externalize,
+			},
+		});
+		await proc.start();
+
+		await expect(proc.send({ type: "prompt", message: "orphan-response" })).resolves.toMatchObject({
+			success: true,
+		});
+		expect(orphanContexts).toHaveLength(1);
+		expect(orphanContexts[0]?.externalizer).toBeUndefined();
+		expect(externalize).not.toHaveBeenCalled();
 	});
 
 	it("isolates a malformed typed event as a child protocol failure", async () => {
@@ -107,6 +272,948 @@ describe("PiProcess response correlation", () => {
 		});
 		expect(events).toEqual([]);
 		expect(proc.running).toBe(false);
+	});
+
+	it("preserves event-response-event order while adapter normalization is asynchronous", async () => {
+		const firstEventStarted = deferred();
+		const releaseFirstEvent = deferred();
+		const normalized: string[] = [];
+		const delivered: string[] = [];
+		const adapter = withAsyncDecodeGate(async (frame) => {
+			if (frame.kind === "event" && frame.event.type === "agent_start") {
+				firstEventStarted.resolve();
+				await releaseFirstEvent.promise;
+			}
+			if (frame.kind === "event") normalized.push(`event:${frame.event.type}`);
+			if (frame.kind === "response" && frame.command === "prompt") normalized.push("response:prompt");
+		});
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+			onEvent: (event) => delivered.push(`event:${event.type}`),
+		});
+		await proc.start();
+
+		const response = proc.send({ type: "prompt", message: "ordered-async" }).then((value) => {
+			delivered.push("response:prompt");
+			return value;
+		});
+		await firstEventStarted.promise;
+		expect(normalized).toEqual([]);
+		expect(delivered).toEqual([]);
+
+		releaseFirstEvent.resolve();
+		await response;
+		await waitFor(() => delivered.includes("event:agent_settled"));
+		expect(normalized).toEqual(["event:agent_start", "response:prompt", "event:agent_settled"]);
+		expect(delivered).toEqual(["event:agent_start", "response:prompt", "event:agent_settled"]);
+	});
+
+	it("drops an old async decode completion after stop and restart", async () => {
+		const oldEventStarted = deferred();
+		const releaseOldEvent = deferred();
+		const delivered: string[] = [];
+		const exits: Array<{ stderrTail: string }> = [];
+		const adapter = withAsyncDecodeGate(async (frame) => {
+			if (frame.kind === "event" && frame.event.type === "agent_start") {
+				oldEventStarted.resolve();
+				await releaseOldEvent.promise;
+				throw new Error("stale externalizer rejected frame");
+			}
+		});
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+			onEvent: (event) => delivered.push(event.type),
+			onExit: (info) => exits.push(info),
+		});
+		await proc.start();
+
+		const oldCommand = proc.send({ type: "prompt", message: "ordered-async" });
+		const oldRejected = expect(oldCommand).rejects.toThrow();
+		await oldEventStarted.promise;
+		await proc.stop();
+		await oldRejected;
+		await proc.start();
+
+		releaseOldEvent.resolve();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(delivered).toEqual([]);
+		expect(exits).toEqual([]);
+		expect(proc.running).toBe(true);
+	});
+
+	it("does not let a stale async response consume a reused pending id after restart", async () => {
+		const oldResponseStarted = deferred();
+		const releaseOldResponse = deferred();
+		const newResponseStarted = deferred();
+		const releaseNewResponse = deferred();
+		let promptResponseCount = 0;
+		const adapter = withAsyncDecodeGate(async (frame) => {
+			if (frame.kind !== "response" || frame.command !== "prompt") return;
+			promptResponseCount += 1;
+			if (promptResponseCount === 1) {
+				oldResponseStarted.resolve();
+				await releaseOldResponse.promise;
+				return;
+			}
+			newResponseStarted.resolve();
+			await releaseNewResponse.promise;
+		});
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+		});
+		await proc.start();
+
+		const oldCommand = proc.send({ id: "reused-id", type: "prompt", message: "old-response" });
+		const oldResult = oldCommand.then(
+			() => "resolved",
+			() => "rejected",
+		);
+		await oldResponseStarted.promise;
+		await proc.stop();
+		expect(await oldResult).toBe("rejected");
+		await proc.start();
+
+		let newSettled = false;
+		const newCommand = proc.send({ id: "reused-id", type: "prompt", message: "new-response" }).finally(() => {
+			newSettled = true;
+		});
+		await newResponseStarted.promise;
+		releaseOldResponse.resolve();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(newSettled).toBe(false);
+
+		releaseNewResponse.resolve();
+		await expect(newCommand).resolves.toMatchObject({ id: "reused-id", command: "prompt", success: true });
+		expect(proc.running).toBe(true);
+	});
+
+	it("terminalizes exactly once when async normalization rejects", async () => {
+		const exits: Array<{ stderrTail: string }> = [];
+		const delivered: string[] = [];
+		let normalizationAttempts = 0;
+		const adapter = withAsyncDecodeGate(async (frame) => {
+			if (frame.kind !== "event") return;
+			normalizationAttempts += 1;
+			throw new Error("externalizer rejected frame");
+		});
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+			onEvent: (event) => delivered.push(event.type),
+			onExit: (info) => exits.push(info),
+		});
+		await proc.start();
+
+		await expect(proc.send({ type: "prompt", message: "ordered-async" })).rejects.toThrow(
+			"externalizer rejected frame",
+		);
+		await waitFor(() => exits.length === 1);
+		await new Promise<void>((resolve) => setTimeout(resolve, 20));
+		expect(normalizationAttempts).toBe(1);
+		expect(delivered).toEqual([]);
+		expect(exits).toHaveLength(1);
+		expect(exits[0]?.stderrTail).toContain("externalizer rejected frame");
+		expect(proc.running).toBe(false);
+	});
+
+	it("aborts a never-settling decode at the spawn deadline and observes its late rejection", async () => {
+		const decodeStarted = deferred();
+		let rejectDecode: ((error: Error) => void) | undefined;
+		let decodeSignal: AbortSignal | undefined;
+		const decodeGate = new Promise<void>((_resolve, reject) => {
+			rejectDecode = reject;
+		});
+		const exits: Array<{ stderrTail: string }> = [];
+		const unhandledRejections: unknown[] = [];
+		const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
+		process.on("unhandledRejection", onUnhandledRejection);
+		try {
+			const adapter = withAsyncDecodeGate(async (frame, signal) => {
+				if (frame.kind !== "event") return;
+				decodeSignal = signal;
+				decodeStarted.resolve();
+				await decodeGate;
+			});
+			proc = new PiProcess({
+				cwd: process.cwd(),
+				resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+				adapter,
+				decodeTimeoutMs: 20,
+				onExit: (info) => exits.push(info),
+			});
+			await proc.start();
+
+			const command = proc.send({ type: "prompt", message: "ordered-async" });
+			await decodeStarted.promise;
+			const outcome = await Promise.race([
+				command.then(
+					() => "resolved",
+					(error: Error) => error.message,
+				),
+				new Promise<string>((resolve) => setTimeout(() => resolve("still pending"), 150)),
+			]);
+			expect(outcome).toContain("decode timed out");
+			expect(decodeSignal?.aborted).toBe(true);
+			await waitFor(() => exits.length === 1);
+
+			rejectDecode?.(new Error("late externalizer rejection"));
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(exits).toHaveLength(1);
+			expect(unhandledRejections).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandledRejection);
+		}
+	});
+
+	it("observes a failed lease release from a late success after an event decode deadline", async () => {
+		const decodeStarted = deferred();
+		const releaseDecode = deferred();
+		const leased = fakeLease({ rejectRelease: true });
+		const exits: Array<{ stderrTail: string }> = [];
+		const unhandledRejections: unknown[] = [];
+		const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
+		process.on("unhandledRejection", onUnhandledRejection);
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeUnsolicited(value, context) {
+				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				if (outcome.value.kind !== "event" || outcome.value.event.type !== "agent_start") return outcome;
+				decodeStarted.resolve();
+				await releaseDecode.promise;
+				return { value: outcome.value, lease: leased.lease };
+			},
+		};
+		try {
+			proc = new PiProcess({
+				cwd: process.cwd(),
+				resolved: {
+					command: process.execPath,
+					args: [fakePiPath],
+					source: "pi-path",
+					label: "fake Pi",
+				},
+				adapter,
+				decodeTimeoutMs: 20,
+				onExit: (info) => exits.push(info),
+			});
+			await proc.start();
+
+			const command = proc.send({ type: "prompt", message: "ordered-async" });
+			await decodeStarted.promise;
+			await expect(command).rejects.toThrow("decode timed out");
+			await waitFor(() => exits.length === 1);
+			releaseDecode.resolve();
+			await waitFor(() => leased.release.mock.calls.length === 1);
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(leased.release).toHaveBeenCalledOnce();
+			expect(unhandledRejections).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandledRejection);
+		}
+	});
+
+	it("keeps the removed pre-callback hold adoption API out of PiProcess options", () => {
+		const options: PiProcessOptions = {
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			// @ts-expect-error pre-callback hold adoption was intentionally removed
+			adoptDecodedHolds: () => true,
+		};
+		void options;
+	});
+
+	it("releases and fails closed when the inline-only event callback receives a lease", async () => {
+		const leased = fakeLease();
+		const delivered: string[] = [];
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeUnsolicited(value, context) {
+				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
+					? { value: outcome.value, lease: leased.lease }
+					: outcome;
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+			onEvent: (event) => delivered.push(event.type),
+		});
+		await proc.start();
+
+		await expect(proc.send({ type: "prompt", message: "ordered-async" })).rejects.toThrow(
+			"inline-only Pi event delivery cannot carry attachment holds",
+		);
+		expect(leased.release).toHaveBeenCalledOnce();
+		expect(delivered).toEqual([]);
+	});
+
+	it("hands a leased event transfer to the decoded callback without releasing it", async () => {
+		const leased = fakeLease();
+		const order: string[] = [];
+		let claimed: PiPayloadLeaseTransfer | null | undefined;
+		let consumerReturned = false;
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeUnsolicited(value, context) {
+				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
+					? { value: outcome.value, lease: leased.lease }
+					: outcome;
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+			onDecodedEvent: (delivery) => {
+				expect(delivery.value.type).toBe("agent_start");
+				const plan = delivery.prepare((transfer) => {
+					expect(consumerReturned).toBe(true);
+					claimed = transfer;
+					order.push("accept");
+					return true;
+				});
+				consumerReturned = true;
+				return plan;
+			},
+		});
+		await proc.start();
+
+		await proc.send({ type: "prompt", message: "ordered-async" });
+		await waitFor(() => order.includes("accept"));
+		expect(order).toEqual(["accept"]);
+		expect(claimed?.refs).toEqual(leased.lease.refs);
+		expect(leased.release).not.toHaveBeenCalled();
+		await claimed?.release();
+		expect(leased.release).toHaveBeenCalledOnce();
+	});
+
+	it("returns a leased response transfer from sendDecoded without releasing it", async () => {
+		const leased = fakeLease();
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeResponse(value, expectedCommand, context) {
+				const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, context);
+				return expectedCommand === "prompt" ? { value: outcome.value, lease: leased.lease } : outcome;
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+		});
+		await proc.start();
+
+		let claimed: PiPayloadLeaseTransfer | null | undefined;
+		const response = await proc.sendDecoded(
+			{ id: "public-response", type: "prompt", message: "response" },
+			(delivery) => {
+				expect(delivery.value).toMatchObject({ id: "public-response", command: "prompt", success: true });
+				return delivery.prepare((transfer) => {
+					claimed = transfer;
+					return true;
+				});
+			},
+		);
+		expect(response).toMatchObject({ id: "public-response", command: "prompt", success: true });
+		expect(claimed?.refs).toEqual(leased.lease.refs);
+		expect(leased.release).not.toHaveBeenCalled();
+		await claimed?.release();
+		expect(leased.release).toHaveBeenCalledOnce();
+	});
+
+	it("releases and rejects a decoded callback that returns true without claiming ownership", async () => {
+		const leased = fakeLease();
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeUnsolicited(value, context) {
+				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
+					? { value: outcome.value, lease: leased.lease }
+					: outcome;
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+			onDecodedEvent: (() => true) as unknown as PiDecodedDeliveryConsumer<ProductSessionEventDto>,
+		});
+		await proc.start();
+
+		await expect(proc.send({ type: "prompt", message: "ordered-async" })).rejects.toThrow(
+			"did not prepare its exact delivery",
+		);
+		expect(leased.release).toHaveBeenCalledOnce();
+	});
+
+	it("releases and fails closed when inline-only send receives a leased response", async () => {
+		const leased = fakeLease();
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeResponse(value, expectedCommand, context) {
+				const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, context);
+				return expectedCommand === "prompt" ? { value: outcome.value, lease: leased.lease } : outcome;
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+		});
+		await proc.start();
+
+		await expect(proc.send({ type: "prompt", message: "leased-inline-response" })).rejects.toThrow(
+			"inline-only Pi response delivery cannot carry attachment holds",
+		);
+		expect(leased.release).toHaveBeenCalledOnce();
+	});
+
+	it.each([
+		["false", (): boolean => false],
+		["undefined", (): undefined => undefined],
+		["thenable", (): Promise<never> => Promise.reject(new Error("async consumer rejected"))],
+		[
+			"throw",
+			(): never => {
+				throw new Error("decoded event callback failed");
+			},
+		],
+	] as const)("releases a leased event when the decoded callback returns %s", async (_name, callback) => {
+		const leased = fakeLease();
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeUnsolicited(value, context) {
+				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
+					? { value: outcome.value, lease: leased.lease }
+					: outcome;
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+			onDecodedEvent: callback as unknown as PiDecodedDeliveryConsumer<ProductSessionEventDto>,
+		});
+		await proc.start();
+
+		await expect(proc.send({ type: "prompt", message: "ordered-async" })).rejects.toThrow();
+		expect(leased.release).toHaveBeenCalledOnce();
+	});
+
+	it.each([
+		["false", (): boolean => false],
+		["undefined", (): undefined => undefined],
+		["thenable", (): Promise<never> => Promise.reject(new Error("async commit rejected"))],
+		[
+			"throw",
+			(): never => {
+				throw new Error("decoded plan commit failed");
+			},
+		],
+	] as const)("releases a leased event when the prepared commit returns %s", async (_name, result) => {
+		const leased = fakeLease();
+		const unhandledRejections: unknown[] = [];
+		const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
+		process.on("unhandledRejection", onUnhandledRejection);
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeUnsolicited(value, context) {
+				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
+					? { value: outcome.value, lease: leased.lease }
+					: outcome;
+			},
+		};
+		try {
+			proc = new PiProcess({
+				cwd: process.cwd(),
+				resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+				adapter,
+				onDecodedEvent: (delivery) =>
+					delivery.prepare(result as unknown as (transfer: PiPayloadLeaseTransfer | null) => true),
+			});
+			await proc.start();
+
+			await expect(proc.send({ type: "prompt", message: "ordered-async" })).rejects.toThrow();
+			expect(leased.release).toHaveBeenCalledOnce();
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(unhandledRejections).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandledRejection);
+		}
+	});
+
+	it("does not expose a transfer when the decoded consumer stops the owning spawn", async () => {
+		const leased = fakeLease();
+		let commitCalled = false;
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeUnsolicited(value, context) {
+				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
+					? { value: outcome.value, lease: leased.lease }
+					: outcome;
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+			onDecodedEvent: (delivery) => {
+				const plan = delivery.prepare(() => {
+					commitCalled = true;
+					return true;
+				});
+				void proc?.stop();
+				return plan;
+			},
+		});
+		await proc.start();
+
+		await expect(proc.send({ type: "prompt", message: "ordered-async" })).rejects.toThrow();
+		await waitFor(() => leased.release.mock.calls.length === 1);
+		expect(commitCalled).toBe(false);
+		expect(leased.adopt).not.toHaveBeenCalled();
+	});
+
+	it("does not release custody after a literal-true commit even when that commit stops the spawn", async () => {
+		const leased = fakeLease();
+		let ownedTransfer: PiPayloadLeaseTransfer | null | undefined;
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeUnsolicited(value, context) {
+				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
+					? { value: outcome.value, lease: leased.lease }
+					: outcome;
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+			onDecodedEvent: (delivery) =>
+				delivery.prepare((transfer) => {
+					ownedTransfer = transfer;
+					void proc?.stop();
+					return true;
+				}),
+		});
+		await proc.start();
+
+		await expect(proc.send({ type: "prompt", message: "ordered-async" })).rejects.toThrow();
+		expect(ownedTransfer?.refs).toEqual(leased.lease.refs);
+		expect(leased.release).not.toHaveBeenCalled();
+		await ownedTransfer?.release();
+		expect(leased.release).toHaveBeenCalledOnce();
+	});
+
+	it("terminalizes after an adopted commit throws and leaves cleanup to the generation owner", async () => {
+		const exactRef: SessionAttachmentRefDto = {
+			type: "attachment_ref",
+			serverEpoch: "process-test-epoch",
+			sha256: "c".repeat(64),
+			mediaType: "image/png",
+			byteLength: 1,
+		};
+		const exactHold = Object.freeze({ ref: exactRef });
+		const releaseOwnedHold = vi.fn(async (_hold: EpochContentHold) => {});
+		const owner = new GenerationContentOwner({
+			serverEpoch: exactRef.serverEpoch,
+			generation: 3,
+			release: releaseOwnedHold,
+		});
+		let transferState: "pending" | "adopted" | "released" = "pending";
+		const transferRelease = vi.fn(async () => {
+			if (transferState !== "pending") return;
+			transferState = "released";
+			await releaseOwnedHold(exactHold);
+		});
+		const transfer: PiPayloadLeaseTransfer = {
+			refs: [exactRef],
+			adopt(accept) {
+				if (transferState !== "pending") throw new Error("transfer is not pending");
+				if (accept([exactHold]) !== true) throw new Error("transfer was not accepted");
+				transferState = "adopted";
+			},
+			release: transferRelease,
+		};
+		const lease: PiPayloadLease = {
+			refs: [exactRef],
+			transfer: () => transfer,
+			release: async () => {
+				if (transferState === "pending") await transferRelease();
+			},
+		};
+		const exits: Array<{ stderrTail: string }> = [];
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeUnsolicited(value, context) {
+				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
+					? { value: outcome.value, lease }
+					: outcome;
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+			onDecodedEvent: (delivery) =>
+				delivery.prepare((transfer) => {
+					if (!transfer) throw new Error("missing transfer");
+					owner.adopt(transfer);
+					throw new Error("projection commit failed after adoption");
+				}),
+			onExit: (info) => exits.push(info),
+		});
+		await proc.start();
+
+		await expect(proc.send({ type: "prompt", message: "ordered-async" })).rejects.toThrow(
+			"projection commit failed after adoption",
+		);
+		await waitFor(() => exits.length === 1);
+		expect(owner.size).toBe(1);
+		expect(transferRelease).toHaveBeenCalledOnce();
+		expect(releaseOwnedHold).not.toHaveBeenCalled();
+		expect(exits).toHaveLength(1);
+		await owner.release();
+		expect(releaseOwnedHold).toHaveBeenCalledOnce();
+	});
+
+	it("releases a leased event when no event callback is installed", async () => {
+		const leased = fakeLease();
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeUnsolicited(value, context) {
+				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
+					? { value: outcome.value, lease: leased.lease }
+					: outcome;
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+		});
+		await proc.start();
+
+		await expect(proc.send({ type: "prompt", message: "ordered-async" })).resolves.toMatchObject({
+			success: true,
+		});
+		expect(leased.release).toHaveBeenCalledOnce();
+	});
+
+	it("releases the original lease when transfer throws and aggregates a cleanup rejection", async () => {
+		const ref: SessionAttachmentRefDto = {
+			type: "attachment_ref",
+			serverEpoch: "process-test-epoch",
+			sha256: "b".repeat(64),
+			mediaType: "image/png",
+			byteLength: 1,
+		};
+		const release = vi.fn(async () => {
+			throw new Error("transfer cleanup failed");
+		});
+		const lease: PiPayloadLease = {
+			refs: [ref],
+			transfer() {
+				throw new Error("transfer failed");
+			},
+			release,
+		};
+		const exits: Array<{ stderrTail: string }> = [];
+		const unhandledRejections: unknown[] = [];
+		const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
+		process.on("unhandledRejection", onUnhandledRejection);
+		try {
+			const adapter: PiHostAdapter = {
+				...legacyRpcV1Adapter,
+				async decodeUnsolicited(value, context) {
+					const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+					return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
+						? { value: outcome.value, lease }
+						: outcome;
+				},
+			};
+			proc = new PiProcess({
+				cwd: process.cwd(),
+				resolved: {
+					command: process.execPath,
+					args: [fakePiPath],
+					source: "pi-path",
+					label: "fake Pi",
+				},
+				adapter,
+				onDecodedEvent: (delivery) => delivery.prepare(() => true),
+				onExit: (info) => exits.push(info),
+			});
+			await proc.start();
+
+			await expect(proc.send({ type: "prompt", message: "ordered-async" })).rejects.toMatchObject({
+				name: "AggregateError",
+			});
+			await waitFor(() => exits.length === 1);
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(release).toHaveBeenCalledOnce();
+			expect(exits).toHaveLength(1);
+			expect(unhandledRejections).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandledRejection);
+		}
+	});
+
+	it("releases a leased response when its pending command times out during decode", async () => {
+		const responseStarted = deferred();
+		const releaseResponse = deferred();
+		const leased = fakeLease();
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeResponse(value, expectedCommand, context) {
+				const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, context);
+				if (expectedCommand !== "prompt") return outcome;
+				responseStarted.resolve();
+				await releaseResponse.promise;
+				return { value: outcome.value, lease: leased.lease };
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+		});
+		await proc.start();
+
+		const command = proc.send({ type: "prompt", message: "ordered-async" }, 20);
+		await responseStarted.promise;
+		await expect(command).rejects.toThrow("command timed out");
+		releaseResponse.resolve();
+		await waitFor(() => leased.release.mock.calls.length === 1);
+		expect(proc.running).toBe(true);
+	});
+
+	it("rejects a response-local delivery failure without terminating the Pi process", async () => {
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			decodeResponse(value, expectedCommand, context) {
+				if (expectedCommand === "prompt") {
+					throw new PiHostResponseExternalizationError("prompt", "cache_bytes_exhausted");
+				}
+				return legacyRpcV1Adapter.decodeResponse(value, expectedCommand, context);
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+		});
+		await proc.start();
+
+		await expect(proc.send({ type: "prompt", message: "response-local" })).rejects.toThrow(
+			"Gateway failed to deliver the Pi prompt response",
+		);
+		await expect(proc.send({ type: "get_state" })).resolves.toMatchObject({
+			command: "get_state",
+			success: true,
+		});
+		expect(proc.running).toBe(true);
+	});
+
+	it("keeps a response decode deadline local while aborting its operation signal", async () => {
+		const responseStarted = deferred();
+		let responseSignal: AbortSignal | undefined;
+		const never = new Promise<void>(() => {});
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeResponse(value, expectedCommand, context) {
+				const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, context);
+				if (expectedCommand !== "prompt") return outcome;
+				responseSignal = context?.signal;
+				responseStarted.resolve();
+				await never;
+				return outcome;
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+			decodeTimeoutMs: 20,
+		});
+		await proc.start();
+
+		const response = proc.send({ type: "prompt", message: "response-deadline" });
+		await responseStarted.promise;
+		await expect(response).rejects.toMatchObject({
+			name: "PiHostResponseExternalizationError",
+			failure: "deadline",
+		});
+		expect(responseSignal?.aborted).toBe(true);
+		await expect(proc.send({ type: "get_state" })).resolves.toMatchObject({ success: true });
+		expect(proc.running).toBe(true);
+	});
+
+	it("uses its own deadline provenance when the adapter rejects from the operation abort signal", async () => {
+		const responseStarted = deferred();
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeResponse(value, expectedCommand, context) {
+				const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, context);
+				if (expectedCommand !== "prompt") return outcome;
+				responseStarted.resolve();
+				await new Promise<never>((_resolve, reject) => {
+					const rejectAborted = () =>
+						reject(new PiPayloadExternalizationError("aborted", "operation signal aborted"));
+					if (context?.signal.aborted) rejectAborted();
+					else context?.signal.addEventListener("abort", rejectAborted, { once: true });
+				});
+				return outcome;
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+			decodeTimeoutMs: 20,
+		});
+		await proc.start();
+
+		const response = proc.send({ type: "prompt", message: "deadline-abort-race" });
+		await responseStarted.promise;
+		await expect(response).rejects.toMatchObject({
+			name: "PiHostResponseExternalizationError",
+			failure: "deadline",
+		});
+		await expect(proc.send({ type: "get_state" })).resolves.toMatchObject({ success: true });
+		expect(proc.running).toBe(true);
+	});
+
+	it("treats a typed response-local error from an authoritative event as terminal", async () => {
+		const exits: Array<{ stderrTail: string }> = [];
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			decodeUnsolicited(value, context) {
+				if ((value as { type?: string }).type === "agent_start") {
+					throw new PiHostResponseExternalizationError("get_messages", "cache_bytes_exhausted");
+				}
+				return legacyRpcV1Adapter.decodeUnsolicited(value, context);
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+			onExit: (info) => exits.push(info),
+		});
+		await proc.start();
+
+		await expect(proc.send({ type: "prompt", message: "ordered-async" })).rejects.toThrow(
+			"Gateway failed to deliver",
+		);
+		await waitFor(() => exits.length === 1);
+		expect(proc.running).toBe(false);
+	});
+
+	it("aborts an active decode on manual stop and drops its late protocol rejection after restart", async () => {
+		const decodeStarted = deferred();
+		const releaseDecode = deferred();
+		let decodeSignal: AbortSignal | undefined;
+		const exits: Array<{ reason?: string }> = [];
+		const adapter = withAsyncDecodeGate(async (frame, signal) => {
+			if (frame.kind !== "event") return;
+			decodeSignal = signal;
+			decodeStarted.resolve();
+			await releaseDecode.promise;
+			throw new PiProtocolIncompatibleError({
+				code: "protocol_incompatible",
+				adapterId: legacyRpcV1Adapter.id,
+				frameKind: "event",
+				reason: "malformed_event",
+				frameType: "agent_start",
+			});
+		});
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+			decodeTimeoutMs: 1_000,
+			onExit: (info) => exits.push(info),
+		});
+		await proc.start();
+
+		const oldCommand = proc.send({ type: "prompt", message: "ordered-async" });
+		const oldResult = oldCommand.then(
+			() => "resolved",
+			() => "rejected",
+		);
+		await decodeStarted.promise;
+		await proc.stop();
+		expect(decodeSignal?.aborted).toBe(true);
+		expect(await oldResult).toBe("rejected");
+		await proc.start();
+
+		releaseDecode.resolve();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(exits).toEqual([]);
+		expect(proc.running).toBe(true);
+	});
+
+	it("lets an active protocol rejection win over a concurrent unexpected child exit", async () => {
+		const decodeStarted = deferred();
+		const releaseDecode = deferred();
+		const exits: Array<{ reason?: string; diagnostic?: { reason: string } }> = [];
+		const adapter = withAsyncDecodeGate(async (frame) => {
+			if (frame.kind !== "event") return;
+			decodeStarted.resolve();
+			await releaseDecode.promise;
+			throw new PiProtocolIncompatibleError({
+				code: "protocol_incompatible",
+				adapterId: legacyRpcV1Adapter.id,
+				frameKind: "event",
+				reason: "malformed_event",
+				frameType: "agent_start",
+			});
+		});
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+			decodeTimeoutMs: 1_000,
+			onExit: (info) => exits.push(info),
+		});
+		await proc.start();
+
+		const command = proc.send({ type: "prompt", message: "async-decode-exit" });
+		await decodeStarted.promise;
+		const internals = proc as unknown as {
+			spawnIdentity: { leaderExitObserved: boolean } | null;
+		};
+		await waitFor(() => internals.spawnIdentity?.leaderExitObserved === true);
+		releaseDecode.resolve();
+
+		await expect(command).rejects.toMatchObject({
+			name: "PiProtocolIncompatibleError",
+			diagnostic: { reason: "malformed_event" },
+		});
+		await waitFor(() => exits.length === 1);
+		expect(exits).toEqual([
+			expect.objectContaining({
+				reason: "protocol_incompatible",
+				diagnostic: expect.objectContaining({ reason: "malformed_event" }),
+			}),
+		]);
 	});
 
 	it("reports a spawn error exactly once without an unhandled rejection", async () => {
@@ -436,7 +1543,7 @@ describe("PiProcess response correlation", () => {
 			name: "a dirty line",
 			line: () => "x".repeat(MAX_JSONL_LINE_BYTES + 1),
 		},
-	])("rejects $name above the ordinary limit while get_messages is pending", ({ line }) => {
+	])("rejects $name above the ordinary limit while get_messages is pending", async ({ line }) => {
 		proc = new PiProcess({
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
@@ -451,7 +1558,7 @@ describe("PiProcess response correlation", () => {
 					timer: NodeJS.Timeout;
 				}
 			>;
-			handleLine: (line: string) => void;
+			handleLine: (line: string) => Promise<void>;
 		};
 		const timers = [setTimeout(() => {}, 60_000), setTimeout(() => {}, 60_000)];
 		internals.pending.set("snapshot", {
@@ -468,7 +1575,7 @@ describe("PiProcess response correlation", () => {
 		});
 
 		try {
-			expect(() => internals.handleLine(line())).toThrowError(
+			await expect(internals.handleLine(line())).rejects.toEqual(
 				expect.objectContaining({
 					name: "PiProtocolIncompatibleError",
 					diagnostic: expect.objectContaining({ frameKind: "frame", reason: "oversized_frame" }),

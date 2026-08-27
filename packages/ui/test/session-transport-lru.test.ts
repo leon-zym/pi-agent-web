@@ -4,6 +4,11 @@ import type {
 	SessionRuntimeDto,
 	SessionWsClientMessage,
 } from "@pi-agent-web/protocol";
+import {
+	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+	GATEWAY_PROTOCOL_VERSION,
+	SESSION_PAYLOAD_BUDGET,
+} from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	createSessionTransport,
@@ -35,7 +40,7 @@ function open(socket: FakeSocket | undefined): void {
 	socket.onmessage?.({
 		data: JSON.stringify({
 			type: "server_hello",
-			protocol: { major: 1, minor: 1 },
+			protocol: GATEWAY_PROTOCOL_VERSION,
 			serverBuild: "test-server",
 			serverEpoch: "test-epoch",
 			piVersion: "0.84.2",
@@ -46,12 +51,14 @@ function open(socket: FakeSocket | undefined): void {
 				"rpc.extension_ui",
 				"session.multiplex",
 				"session.hot_runtime_inventory",
+				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 			],
 			limits: {
 				maxClientFrameBytes: 8 * 1024 * 1024,
-				maxSnapshotFrameBytes: 32 * 1024 * 1024,
+				maxSnapshotFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes,
 				maxExtensionRequests: 256,
 			},
+			payloadBudget: SESSION_PAYLOAD_BUDGET,
 		}),
 	});
 	socket.onmessage?.({
@@ -93,7 +100,7 @@ afterEach(() => {
 
 function idlePersistedRuntime(sessionHandle: string): SessionRuntimeDto {
 	return {
-		serverEpoch: "test-server-epoch",
+		serverEpoch: "test-epoch",
 		sessionHandle,
 		workspaceId: "ws-1",
 		nativeSessionId: `native-${sessionHandle}`,
@@ -109,7 +116,7 @@ function idlePersistedRuntime(sessionHandle: string): SessionRuntimeDto {
 
 function runningRuntime(sessionHandle: string): SessionRuntimeDto {
 	return {
-		serverEpoch: "test-server-epoch",
+		serverEpoch: "test-epoch",
 		sessionHandle,
 		workspaceId: "ws-1",
 		nativeSessionId: `native-${sessionHandle}`,
@@ -125,7 +132,7 @@ function runningRuntime(sessionHandle: string): SessionRuntimeDto {
 
 function unpersistedRuntime(sessionHandle: string): SessionRuntimeDto {
 	return {
-		serverEpoch: "test-server-epoch",
+		serverEpoch: "test-epoch",
 		sessionHandle,
 		workspaceId: "ws-1",
 		nativeSessionId: `native-${sessionHandle}`,
@@ -312,7 +319,7 @@ describe("Active WebSocket Subscription LRU admission target with liveness guard
 		});
 		controller.ingestServerMessage({
 			type: "resync_required",
-			serverEpoch: "test-server-epoch",
+			serverEpoch: "test-epoch",
 			sessionHandle: "session-1",
 			runtime: idlePersistedRuntime("session-1"),
 			reason: "initial",
@@ -320,7 +327,7 @@ describe("Active WebSocket Subscription LRU admission target with liveness guard
 		controller.ingestServerMessage({
 			type: "session_snapshot",
 			snapshotId: "snapshot-session-1",
-			serverEpoch: "test-server-epoch",
+			serverEpoch: "test-epoch",
 			workspaceId: "ws-1",
 			sessionHandle: "session-1",
 			generation: 1,

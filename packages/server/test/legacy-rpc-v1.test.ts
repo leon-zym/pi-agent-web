@@ -1,7 +1,36 @@
 import fs from "node:fs";
-import { describe, expect, it } from "vitest";
-import { createLegacyRpcV1Adapter, legacyRpcV1Adapter } from "../src/legacy-rpc-v1.js";
-import { PiProtocolIncompatibleError } from "../src/pi-host-adapter.js";
+import { SESSION_PAYLOAD_BUDGET } from "@pi-agent-web/protocol";
+import { describe, expect, it, vi } from "vitest";
+import { EpochContentStoreError } from "../src/epoch-content-store.js";
+import {
+	createLegacyRpcV1Adapter,
+	legacyRpcV1Adapter as outcomeLegacyRpcV1Adapter,
+} from "../src/legacy-rpc-v1.js";
+import {
+	type PiHostDecodeOutcome,
+	type PiHostDecodeResult,
+	PiHostResponseExternalizationError,
+	PiProtocolIncompatibleError,
+} from "../src/pi-host-adapter.js";
+import { PiPayloadExternalizationError } from "../src/pi-payload-externalizer.js";
+
+function syncOutcome<T>(result: PiHostDecodeResult<T>): PiHostDecodeOutcome<T> {
+	if ("then" in result) throw new Error("expected synchronous adapter outcome");
+	return result;
+}
+
+const legacyRpcV1Adapter = {
+	...outcomeLegacyRpcV1Adapter,
+	decodeResponse(...args: Parameters<typeof outcomeLegacyRpcV1Adapter.decodeResponse>) {
+		return syncOutcome(outcomeLegacyRpcV1Adapter.decodeResponse(...args)).value;
+	},
+	decodeOrphanedResponse(...args: Parameters<typeof outcomeLegacyRpcV1Adapter.decodeOrphanedResponse>) {
+		return syncOutcome(outcomeLegacyRpcV1Adapter.decodeOrphanedResponse(...args)).value;
+	},
+	decodeUnsolicited(...args: Parameters<typeof outcomeLegacyRpcV1Adapter.decodeUnsolicited>) {
+		return syncOutcome(outcomeLegacyRpcV1Adapter.decodeUnsolicited(...args)).value;
+	},
+};
 
 const state = {
 	thinkingLevel: "off",
@@ -25,7 +54,179 @@ const usage = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
+const imageResponse = {
+	type: "response",
+	id: "image-response",
+	command: "get_messages",
+	success: true,
+	data: {
+		messages: [
+			{
+				role: "user",
+				content: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }],
+				timestamp: 1,
+			},
+		],
+	},
+} as const;
+
+const attachmentContext = { serverEpoch: "epoch", payloadBudget: SESSION_PAYLOAD_BUDGET } as const;
+
 describe("legacy-rpc-v1 adapter", () => {
+	it("keeps externalization disabled by default and carries an explicit null lease", () => {
+		const decoded = outcomeLegacyRpcV1Adapter.decodeResponse(
+			{ type: "response", id: "1", command: "get_state", success: true, data: state },
+			"get_state",
+		);
+		expect(decoded).toMatchObject({ value: { success: true, data: state }, lease: null });
+	});
+
+	it("externalizes a raw image event before the trusted product guard and preserves its lease", async () => {
+		const release = vi.fn(async () => {});
+		const ref = {
+			type: "attachment_ref",
+			serverEpoch: "epoch",
+			sha256: "a".repeat(64),
+			mediaType: "image/png",
+			byteLength: 5,
+		} as const;
+		const lease = { refs: [ref], transfer: vi.fn(), release };
+		const externalize = vi.fn(async () => ({
+			value: {
+				type: "message_start",
+				message: {
+					role: "user",
+					content: [{ type: "image", data: ref, mimeType: "image/png" }],
+					timestamp: 1,
+				},
+			},
+			lease,
+		}));
+		const inline = {
+			type: "message_start",
+			message: {
+				role: "user",
+				content: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }],
+				timestamp: 1,
+			},
+		};
+
+		const signal = new AbortController().signal;
+		const decoded = await outcomeLegacyRpcV1Adapter.decodeUnsolicited(inline, {
+			signal,
+			externalizer: {
+				context: { serverEpoch: "epoch", payloadBudget: SESSION_PAYLOAD_BUDGET },
+				externalize,
+			},
+		});
+
+		expect(externalize).toHaveBeenCalledWith({ kind: "event", value: inline }, signal);
+		expect(decoded).toMatchObject({
+			value: { kind: "event", event: { type: "message_start" } },
+			lease,
+		});
+		expect(release).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		new EpochContentStoreError("cache_bytes_exhausted", "quota", { limit: 8, actual: 9 }),
+		new EpochContentStoreError("cache_items_exhausted", "quota", { limit: 8, actual: 9 }),
+		new EpochContentStoreError("blob_too_large", "blob", { limit: 8, actual: 9 }),
+		new PiPayloadExternalizationError("decoded_image_too_large", "blob", 8, 9),
+	])("classifies only evidenced response delivery failures as response-local: %s", async (failure) => {
+		await expect(
+			outcomeLegacyRpcV1Adapter.decodeResponse(imageResponse, "get_messages", {
+				signal: new AbortController().signal,
+				externalizer: {
+					context: attachmentContext,
+					externalize: async () => Promise.reject(failure),
+				},
+			}),
+		).rejects.toMatchObject({
+			name: "PiHostResponseExternalizationError",
+			command: "get_messages",
+			message: "Gateway failed to deliver the Pi get_messages response",
+		});
+	});
+
+	it.each([
+		new EpochContentStoreError("cache_bytes_exhausted", "missing evidence"),
+		new EpochContentStoreError("cache_items_exhausted", "bad evidence", { limit: 8, actual: 8 }),
+		new EpochContentStoreError("aborted", "store lifecycle aborted"),
+		new EpochContentStoreError("manifest_mismatch", "unsafe metadata"),
+		new PiPayloadExternalizationError("decoded_image_too_large", "bad evidence", 8, 8),
+		new PiPayloadExternalizationError("aborted", "unproven abort provenance"),
+		new PiPayloadExternalizationError("invalid_base64", "invalid image"),
+		new PiPayloadExternalizationError("invalid_product_payload", "invalid product"),
+		new PiPayloadExternalizationError("rollback_failed", "unknown ownership"),
+	])("leaves corruption, contract failures, and invalid evidence terminal: %s", async (failure) => {
+		try {
+			await outcomeLegacyRpcV1Adapter.decodeResponse(imageResponse, "get_messages", {
+				signal: new AbortController().signal,
+				externalizer: {
+					context: attachmentContext,
+					externalize: async () => Promise.reject(failure),
+				},
+			});
+			throw new Error("expected externalization failure");
+		} catch (error) {
+			expect(error).toBe(failure);
+			expect(error).not.toBeInstanceOf(PiHostResponseExternalizationError);
+		}
+	});
+
+	it("keeps every event externalization failure terminal", async () => {
+		const failure = new EpochContentStoreError("cache_bytes_exhausted", "quota", {
+			limit: 8,
+			actual: 9,
+		});
+		await expect(
+			outcomeLegacyRpcV1Adapter.decodeUnsolicited(
+				{ type: "agent_start" },
+				{
+					signal: new AbortController().signal,
+					externalizer: {
+						context: attachmentContext,
+						externalize: async () => Promise.reject(failure),
+					},
+				},
+			),
+		).rejects.toBe(failure);
+	});
+
+	it("validates and ignores orphaned responses without externalization", () => {
+		const externalize = vi.fn();
+		const outcome = outcomeLegacyRpcV1Adapter.decodeOrphanedResponse(imageResponse, {
+			signal: new AbortController().signal,
+			externalizer: { context: attachmentContext, externalize },
+		});
+		expect(syncOutcome(outcome)).toEqual({ value: undefined, lease: null });
+		expect(externalize).not.toHaveBeenCalled();
+	});
+
+	it("releases a nonempty lease when trusted-context post-processing fails", async () => {
+		const ref = {
+			type: "attachment_ref",
+			serverEpoch: "epoch",
+			sha256: "a".repeat(64),
+			mediaType: "image/png",
+			byteLength: 1,
+		} as const;
+		const release = vi.fn(async () => {});
+		await expect(
+			outcomeLegacyRpcV1Adapter.decodeResponse(imageResponse, "get_messages", {
+				signal: new AbortController().signal,
+				externalizer: {
+					context: attachmentContext,
+					externalize: async () => ({
+						value: { ...imageResponse, data: { messages: "not-an-array" } },
+						lease: { refs: [ref], transfer: vi.fn(), release },
+					}),
+				},
+			}),
+		).rejects.toBeInstanceOf(PiProtocolIncompatibleError);
+		expect(release).toHaveBeenCalledOnce();
+	});
 	it("fully decodes command-specific responses", () => {
 		expect(
 			legacyRpcV1Adapter.decodeResponse(
@@ -193,6 +394,90 @@ describe("legacy-rpc-v1 adapter", () => {
 		).toThrowError(PiProtocolIncompatibleError);
 	});
 
+	it("rejects Gateway-owned admission details on raw Pi failures", () => {
+		const frame = {
+			type: "response",
+			id: "1",
+			command: "prompt",
+			success: false,
+			error: "spoofed payload policy",
+			admissionError: {
+				type: "payload_admission_error",
+				code: "payload_too_large",
+				boundary: "command_frame",
+				limitBytes: 8,
+				actualBytes: 9,
+			},
+		} as const;
+
+		expect(() => legacyRpcV1Adapter.decodeResponse(frame, "prompt")).toThrowError(
+			PiProtocolIncompatibleError,
+		);
+		expect(() => legacyRpcV1Adapter.decodeOrphanedResponse(frame)).toThrowError(PiProtocolIncompatibleError);
+	});
+
+	it("preserves Gateway-shaped lookalikes inside opaque Pi JSON fields", () => {
+		const admissionError = {
+			type: "payload_admission_error",
+			code: "payload_too_large",
+			boundary: "command_frame",
+			limitBytes: 8,
+			actualBytes: 9,
+		} as const;
+		expect(
+			legacyRpcV1Adapter.decodeResponse(
+				{
+					type: "response",
+					id: "1",
+					command: "compact",
+					success: true,
+					data: {
+						summary: "summary",
+						firstKeptEntryId: "entry-1",
+						tokensBefore: 1,
+						details: { admissionError },
+					},
+				},
+				"compact",
+			),
+		).toMatchObject({ success: true, data: { details: { admissionError } } });
+
+		expect(
+			legacyRpcV1Adapter.decodeUnsolicited({
+				type: "tool_execution_end",
+				toolCallId: "tool-1",
+				toolName: "read",
+				result: {
+					type: "attachment_ref",
+					serverEpoch: "spoofed",
+					sha256: "a".repeat(64),
+					mediaType: "image/png",
+					byteLength: 1,
+				},
+				isError: false,
+			}),
+		).toMatchObject({ kind: "event", event: { result: { type: "attachment_ref" } } });
+	});
+
+	it("keeps wide raw Pi payloads outside the downstream product DTO boundary", () => {
+		const frame = {
+			type: "message_start",
+			message: {
+				role: "user",
+				content: [
+					{
+						type: "image",
+						data: "x".repeat(2 * 1024 * 1024 + 1),
+						mimeType: "image/png",
+					},
+				],
+				timestamp: 1,
+			},
+		};
+
+		expect(() => legacyRpcV1Adapter.decodeUnsolicited(frame)).toThrowError(PiProtocolIncompatibleError);
+	});
+
 	it("owns create/open arguments and the probed version capability set", () => {
 		expect(legacyRpcV1Adapter.version).toBe("0.84.2");
 		expect(
@@ -231,7 +516,7 @@ describe("legacy-rpc-v1 adapter", () => {
 		expect(legacyRpcV1Adapter.decodeUnsolicited(legacyFrame)).toMatchObject({ kind: "event" });
 		expect(() => candidate.decodeUnsolicited(legacyFrame)).toThrowError(PiProtocolIncompatibleError);
 
-		expect(candidate.decodeUnsolicited(capturedCandidateFrame)).toMatchObject({
+		expect(syncOutcome(candidate.decodeUnsolicited(capturedCandidateFrame)).value).toMatchObject({
 			kind: "event",
 			event: capturedCandidateFrame,
 		});

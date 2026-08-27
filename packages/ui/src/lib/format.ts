@@ -4,6 +4,14 @@
  * for backward-compatible imports.
  */
 
+import {
+	RpcError,
+	type SessionCommandResponseDto,
+	type SessionPayloadAdmissionErrorDto,
+} from "@pi-agent-web/protocol";
+import type { Dictionary } from "./i18n";
+import { tt } from "./i18n";
+
 export { formatRelativeTimeLocal as formatRelativeTime } from "./i18n";
 
 export function formatDuration(ms: number): string {
@@ -126,8 +134,33 @@ export function stripAnsi(text: string): string {
 	return output;
 }
 
+const PAYLOAD_ADMISSION_COPY = {
+	payload_too_large: "payloadAdmission.payload_too_large",
+	attachment_cache_exhausted: "payloadAdmission.attachment_cache_exhausted",
+	attachment_cache_item_limit_exceeded: "payloadAdmission.attachment_cache_item_limit_exceeded",
+	attachment_ref_invalid: "payloadAdmission.attachment_ref_invalid",
+	attachment_ref_epoch_mismatch: "payloadAdmission.attachment_ref_epoch_mismatch",
+	attachment_unavailable: "payloadAdmission.attachment_unavailable",
+	capability_required: "payloadAdmission.capability_required",
+} as const satisfies Record<SessionPayloadAdmissionErrorDto["code"], keyof Dictionary>;
+
+export function displayPayloadAdmissionError(error: SessionPayloadAdmissionErrorDto): string {
+	return tt(PAYLOAD_ADMISSION_COPY[error.code]);
+}
+
+export function displayCommandResponseError(
+	response: Extract<SessionCommandResponseDto, { success: false }>,
+): string {
+	return response.admissionError
+		? displayPayloadAdmissionError(response.admissionError)
+		: stripAnsi(response.error);
+}
+
 /** Convert an unknown failure into inert display text without reflecting control sequences. */
 export function displayError(error: unknown): string {
+	if (error instanceof RpcError && error.admissionError) {
+		return displayPayloadAdmissionError(error.admissionError);
+	}
 	return stripAnsi(error instanceof Error ? error.message : String(error));
 }
 

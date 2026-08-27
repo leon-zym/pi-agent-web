@@ -1,4 +1,4 @@
-import type { SessionProjectionEventDto } from "@pi-agent-web/protocol";
+import type { SessionImageContentDto, SessionProjectionEventDto } from "@pi-agent-web/protocol";
 import { create } from "zustand";
 import { type ConversationProjection, createEmptyProjection } from "../types/view-models";
 import { useComposerStore } from "./composer";
@@ -176,7 +176,7 @@ export function rebuildProjectionFromMessages(
 		id?: string;
 		name?: string;
 		arguments?: unknown;
-		data?: string;
+		data?: SessionImageContentDto["data"];
 		mimeType?: string;
 	};
 	type LiteMessage = {
@@ -213,8 +213,17 @@ export function rebuildProjectionFromMessages(
 							.map((b) => b.text ?? "")
 							.join("\n");
 			const images = blocks
-				.filter((b) => b.type === "image" && typeof b.data === "string" && typeof b.mimeType === "string")
-				.map((b) => ({ type: "image" as const, data: b.data as string, mimeType: b.mimeType as string }));
+				.filter(
+					(b) =>
+						b.type === "image" &&
+						(typeof b.data === "string" || (b.data !== null && typeof b.data === "object")) &&
+						typeof b.mimeType === "string",
+				)
+				.map((b) => ({
+					type: "image" as const,
+					data: b.data as SessionImageContentDto["data"],
+					mimeType: b.mimeType as string,
+				}));
 			projection.turns.push({
 				id,
 				userMessages: [

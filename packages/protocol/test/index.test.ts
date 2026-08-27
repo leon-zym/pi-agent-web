@@ -130,6 +130,27 @@ describe("Session runtime browser frame guard", () => {
 		).toBe(false);
 	});
 
+	it("keeps Browser image commands inline-only even when the server output protocol supports refs", () => {
+		const attachment = {
+			type: "attachment_ref",
+			serverEpoch: "gateway-epoch-a",
+			sha256: "a".repeat(64),
+			mediaType: "image/png",
+			byteLength: 4,
+		};
+		for (const type of ["prompt", "steer", "follow_up"] as const) {
+			expect(
+				isSessionWsClientMessage({
+					type: "command",
+					sessionHandle: "session-native-b",
+					expectedGeneration: 2,
+					fencingToken: "lease-token",
+					command: { id: `ref-${type}`, type, message: "inspect", images: [{ ...attachment }] },
+				}),
+			).toBe(false);
+		}
+	});
+
 	it("bounds text by UTF-8 bytes and the complete serialized browser frame", () => {
 		const command = (message: string, images?: Array<{ type: "image"; data: string; mimeType: string }>) => ({
 			type: "command",

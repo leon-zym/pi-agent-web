@@ -1,3 +1,9 @@
+import {
+	isSessionAttachmentRefForNegotiatedBudget,
+	isSessionPayloadAdmissionErrorDto,
+	isSessionPayloadBudgetDto,
+	type SessionPayloadBudgetDto,
+} from "./payload-budget.js";
 import type {
 	AssistantMessageDiagnosticDto,
 	AssistantMessageDto,
@@ -38,6 +44,14 @@ const MAX_JSON_STRING_BYTES = 8 * 1024 * 1024;
 const UTF8_ENCODER = new TextEncoder();
 
 type UnknownRecord = Record<string, unknown>;
+
+export interface SessionAttachmentGuardContext {
+	/** Trusted current epoch from the negotiated hello or Gateway runtime, never from the candidate payload. */
+	serverEpoch: string;
+	payloadBudget: SessionPayloadBudgetDto;
+}
+
+const ATTACHMENT_IMAGE_MEDIA_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 
 function isRecord(value: unknown): value is UnknownRecord {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -115,13 +129,31 @@ export function isThinkingLevelDto(value: unknown): value is ThinkingLevelDto {
 	return isOneOf(value, ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 }
 
-function isImageContent(value: unknown): boolean {
+export function isSessionAttachmentGuardContext(value: unknown): value is SessionAttachmentGuardContext {
 	return (
 		isRecord(value) &&
-		hasOnlyKeys(value, ["type", "data", "mimeType"]) &&
-		value.type === "image" &&
-		isText(value.data, 2 * 1024 * 1024) &&
-		isString(value.mimeType, 256)
+		hasOnlyKeys(value, ["serverEpoch", "payloadBudget"]) &&
+		isString(value.serverEpoch, 128) &&
+		isSessionPayloadBudgetDto(value.payloadBudget)
+	);
+}
+
+function isImageContent(value: unknown, context?: SessionAttachmentGuardContext): boolean {
+	if (!isRecord(value) || !hasOnlyKeys(value, ["type", "data", "mimeType"]) || value.type !== "image") {
+		return false;
+	}
+	if (!isString(value.mimeType, 256)) return false;
+	if (typeof value.data === "string") return isText(value.data, 2 * 1024 * 1024);
+	if (
+		!context ||
+		!isSessionAttachmentGuardContext(context) ||
+		!ATTACHMENT_IMAGE_MEDIA_TYPES.has(value.mimeType)
+	) {
+		return false;
+	}
+	return (
+		isSessionAttachmentRefForNegotiatedBudget(value.data, context.serverEpoch, context.payloadBudget) &&
+		value.data.mediaType === value.mimeType
 	);
 }
 
@@ -231,12 +263,15 @@ function isDeferredHandle(value: unknown): value is DeferredHandleDto {
 	);
 }
 
-function isMessageContent(value: unknown): boolean {
+function isMessageContent(value: unknown, context?: SessionAttachmentGuardContext): boolean {
 	return (
 		isText(value) ||
 		(Array.isArray(value) &&
 			value.length <= MAX_ARRAY_ITEMS &&
-			value.every((block) => isTextContent(block) || isImageContent(block)))
+			(!context ||
+				value.filter((block) => isRecord(block) && block.type === "image").length <=
+					context.payloadBudget.maxImageCount) &&
+			value.every((block) => isTextContent(block) || isImageContent(block, context)))
 	);
 }
 
@@ -281,7 +316,10 @@ function isAssistantMessage(value: unknown): value is AssistantMessageDto {
 	);
 }
 
-function isToolResultMessage(value: unknown): value is ToolResultMessageDto {
+function isToolResultMessage(
+	value: unknown,
+	context?: SessionAttachmentGuardContext,
+): value is ToolResultMessageDto {
 	return (
 		isRecord(value) &&
 		hasOnlyKeys(value, [
@@ -298,7 +336,13 @@ function isToolResultMessage(value: unknown): value is ToolResultMessageDto {
 		value.role === "toolResult" &&
 		isString(value.toolCallId) &&
 		isString(value.toolName) &&
-		isArrayOf(value.content, (block): block is never => isTextContent(block) || isImageContent(block)) &&
+		isArrayOf(
+			value.content,
+			(block): block is unknown => isTextContent(block) || isImageContent(block, context),
+		) &&
+		(!context ||
+			value.content.filter((block) => isRecord(block) && block.type === "image").length <=
+				context.payloadBudget.maxImageCount) &&
 		(value.details === undefined || isBoundedJsonValue(value.details)) &&
 		(value.usage === undefined || isUsageDto(value.usage)) &&
 		(value.addedToolNames === undefined ||
@@ -308,19 +352,23 @@ function isToolResultMessage(value: unknown): value is ToolResultMessageDto {
 	);
 }
 
-export function isSessionMessageDto(value: unknown): value is SessionMessageDto {
+export function isSessionMessageDto(
+	value: unknown,
+	context?: SessionAttachmentGuardContext,
+): value is SessionMessageDto {
+	if (context !== undefined && !isSessionAttachmentGuardContext(context)) return false;
 	if (!isRecord(value) || !isString(value.role, 64)) return false;
 	switch (value.role) {
 		case "user":
 			return (
 				hasOnlyKeys(value, ["role", "content", "timestamp"]) &&
-				isMessageContent(value.content) &&
+				isMessageContent(value.content, context) &&
 				isCount(value.timestamp)
 			);
 		case "assistant":
 			return isAssistantMessage(value);
 		case "toolResult":
-			return isToolResultMessage(value);
+			return isToolResultMessage(value, context);
 		case "bashExecution":
 			return (
 				hasOnlyKeys(value, [
@@ -348,7 +396,7 @@ export function isSessionMessageDto(value: unknown): value is SessionMessageDto 
 			return (
 				hasOnlyKeys(value, ["role", "customType", "content", "display", "details", "timestamp"]) &&
 				isString(value.customType) &&
-				isMessageContent(value.content) &&
+				isMessageContent(value.content, context) &&
 				typeof value.display === "boolean" &&
 				(value.details === undefined || isBoundedJsonValue(value.details)) &&
 				isCount(value.timestamp)
@@ -474,7 +522,11 @@ export function isSessionStatsDto(value: unknown): value is SessionStatsDto {
 	);
 }
 
-export function isSessionEntryDto(value: unknown): value is SessionEntryDto {
+export function isSessionEntryDto(
+	value: unknown,
+	context?: SessionAttachmentGuardContext,
+): value is SessionEntryDto {
+	if (context !== undefined && !isSessionAttachmentGuardContext(context)) return false;
 	if (
 		!isRecord(value) ||
 		!isString(value.type, 64) ||
@@ -487,7 +539,7 @@ export function isSessionEntryDto(value: unknown): value is SessionEntryDto {
 		case "message":
 			return (
 				hasOnlyKeys(value, ["type", "id", "parentId", "timestamp", "message"]) &&
-				isSessionMessageDto(value.message)
+				isSessionMessageDto(value.message, context)
 			);
 		case "thinking_level_change":
 			return (
@@ -559,7 +611,7 @@ export function isSessionEntryDto(value: unknown): value is SessionEntryDto {
 					"display",
 				]) &&
 				isString(value.customType) &&
-				isMessageContent(value.content) &&
+				isMessageContent(value.content, context) &&
 				(value.details === undefined || isBoundedJsonValue(value.details)) &&
 				typeof value.display === "boolean"
 			);
@@ -579,7 +631,11 @@ export function isSessionEntryDto(value: unknown): value is SessionEntryDto {
 	}
 }
 
-export function isSessionTreeDto(value: unknown): value is SessionTreeNodeDto[] {
+export function isSessionTreeDto(
+	value: unknown,
+	context?: SessionAttachmentGuardContext,
+): value is SessionTreeNodeDto[] {
+	if (context !== undefined && !isSessionAttachmentGuardContext(context)) return false;
 	if (!Array.isArray(value) || value.length > MAX_ARRAY_ITEMS) return false;
 	const stack = value.map((node) => ({ node, depth: 0 }));
 	let nodes = 0;
@@ -588,7 +644,7 @@ export function isSessionTreeDto(value: unknown): value is SessionTreeNodeDto[] 
 		if (!current || current.depth > MAX_TREE_DEPTH || ++nodes > MAX_ARRAY_ITEMS || !isRecord(current.node))
 			return false;
 		if (
-			!isSessionEntryDto(current.node.entry) ||
+			!isSessionEntryDto(current.node.entry, context) ||
 			!hasOnlyKeys(current.node, ["entry", "children", "label", "labelTimestamp"]) ||
 			!Array.isArray(current.node.children) ||
 			current.node.children.length > MAX_ARRAY_ITEMS ||
@@ -744,7 +800,11 @@ function isStreamEvent(value: unknown): value is AssistantMessageStreamEventDto 
 	}
 }
 
-export function isProductSessionEventDto(value: unknown): value is ProductSessionEventDto {
+export function isProductSessionEventDto(
+	value: unknown,
+	context?: SessionAttachmentGuardContext,
+): value is ProductSessionEventDto {
+	if (context !== undefined && !isSessionAttachmentGuardContext(context)) return false;
 	if (!isRecord(value) || !isString(value.type, 64)) return false;
 	switch (value.type) {
 		case "agent_start":
@@ -755,18 +815,22 @@ export function isProductSessionEventDto(value: unknown): value is ProductSessio
 		case "agent_end":
 			return (
 				hasOnlyKeys(value, ["type", "messages", "willRetry"]) &&
-				isArrayOf(value.messages, isSessionMessageDto) &&
+				isArrayOf(value.messages, (message): message is SessionMessageDto =>
+					isSessionMessageDto(message, context),
+				) &&
 				typeof value.willRetry === "boolean"
 			);
 		case "turn_end":
 			return (
 				hasOnlyKeys(value, ["type", "message", "toolResults"]) &&
-				isSessionMessageDto(value.message) &&
-				isArrayOf(value.toolResults, isToolResultMessage)
+				isSessionMessageDto(value.message, context) &&
+				isArrayOf(value.toolResults, (result): result is ToolResultMessageDto =>
+					isToolResultMessage(result, context),
+				)
 			);
 		case "message_start":
 		case "message_end":
-			return hasOnlyKeys(value, ["type", "message"]) && isSessionMessageDto(value.message);
+			return hasOnlyKeys(value, ["type", "message"]) && isSessionMessageDto(value.message, context);
 		case "message_update":
 			return (
 				hasOnlyKeys(value, ["type", "usage", "assistantMessageEvent"]) &&
@@ -807,7 +871,7 @@ export function isProductSessionEventDto(value: unknown): value is ProductSessio
 				hasOnlyKeys(value, ["type", "reason"]) && isOneOf(value.reason, ["manual", "threshold", "overflow"])
 			);
 		case "entry_appended":
-			return hasOnlyKeys(value, ["type", "entry"]) && isSessionEntryDto(value.entry);
+			return hasOnlyKeys(value, ["type", "entry"]) && isSessionEntryDto(value.entry, context);
 		case "session_info_changed":
 			return hasOnlyKeys(value, ["type", "name"]) && (value.name === undefined || isText(value.name));
 		case "thinking_level_changed":
@@ -916,6 +980,7 @@ function isBashResult(value: unknown): value is BashResultDto {
 function isCommandData<K extends SessionCommandTypeDto>(
 	command: K,
 	value: unknown,
+	context?: SessionAttachmentGuardContext,
 ): value is SessionCommandDataMap[K] {
 	if (ACK_COMMANDS.has(command)) return value === undefined;
 	switch (command) {
@@ -984,21 +1049,25 @@ function isCommandData<K extends SessionCommandTypeDto>(
 			return (
 				isRecord(value) &&
 				hasOnlyKeys(value, ["entries", "leafId"]) &&
-				isArrayOf(value.entries, isSessionEntryDto) &&
+				isArrayOf(value.entries, (entry): entry is SessionEntryDto => isSessionEntryDto(entry, context)) &&
 				(value.leafId === null || isString(value.leafId))
 			);
 		case "get_tree":
 			return (
 				isRecord(value) &&
 				hasOnlyKeys(value, ["tree", "leafId"]) &&
-				isSessionTreeDto(value.tree) &&
+				isSessionTreeDto(value.tree, context) &&
 				(value.leafId === null || isString(value.leafId))
 			);
 		case "get_last_assistant_text":
 			return isRecord(value) && hasOnlyKeys(value, ["text"]) && (value.text === null || isText(value.text));
 		case "get_messages":
 			return (
-				isRecord(value) && hasOnlyKeys(value, ["messages"]) && isArrayOf(value.messages, isSessionMessageDto)
+				isRecord(value) &&
+				hasOnlyKeys(value, ["messages"]) &&
+				isArrayOf(value.messages, (message): message is SessionMessageDto =>
+					isSessionMessageDto(message, context),
+				)
 			);
 		case "get_commands":
 			return (
@@ -1039,7 +1108,11 @@ export function isSessionCommandTypeDto(value: unknown): value is SessionCommand
 	return typeof value === "string" && COMMAND_TYPES.has(value as SessionCommandTypeDto);
 }
 
-export function isSessionCommandResponseDto(value: unknown): value is SessionCommandResponseDto {
+export function isSessionCommandResponseDto(
+	value: unknown,
+	context?: SessionAttachmentGuardContext,
+): value is SessionCommandResponseDto {
+	if (context !== undefined && !isSessionAttachmentGuardContext(context)) return false;
 	if (
 		!isRecord(value) ||
 		value.type !== "response" ||
@@ -1050,8 +1123,12 @@ export function isSessionCommandResponseDto(value: unknown): value is SessionCom
 		return false;
 	if (!isSessionCommandTypeDto(value.command)) return false;
 	if (value.success === false) {
-		return hasOnlyKeys(value, ["type", "id", "command", "success", "error"]) && isText(value.error);
+		return (
+			hasOnlyKeys(value, ["type", "id", "command", "success", "error", "admissionError"]) &&
+			isText(value.error) &&
+			(value.admissionError === undefined || isSessionPayloadAdmissionErrorDto(value.admissionError))
+		);
 	}
 	if (!hasOnlyKeys(value, ["type", "id", "command", "success", "data"])) return false;
-	return isCommandData(value.command, value.data);
+	return isCommandData(value.command, value.data, context);
 }

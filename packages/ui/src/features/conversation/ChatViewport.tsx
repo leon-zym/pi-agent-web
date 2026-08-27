@@ -2,10 +2,11 @@ import { ArrowDown } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Skeleton } from "../../components/ui/skeleton";
 import { tt } from "../../lib/i18n";
+import { reportAuthoritativeAttachmentFailure } from "../../lib/session-attachment";
 import { cn } from "../../lib/utils";
 import { useProjectionStore } from "../../stores/projection";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
-import { useSessionTransportStore } from "../../stores/session-transport";
+import { sessionTransport, useSessionTransportStore } from "../../stores/session-transport";
 import { ConversationToc } from "./ConversationToc";
 import { EmptyHero } from "./EmptyHero";
 import { SessionRecoveryNotice } from "./SessionRecoveryNotice";
@@ -122,6 +123,14 @@ export function ChatViewport() {
 		currentSessionId ? state.sessions[currentSessionId]?.recovery : null,
 	);
 	const manualRetryResync = useSessionTransportStore((state) => state.manualRetryResync);
+	const reportAttachmentLoadError = useCallback(() => {
+		if (currentSessionId === null) return;
+		reportAuthoritativeAttachmentFailure(
+			currentSessionId,
+			sessionTransport.store.getState().sessions[currentSessionId],
+			sessionTransport.reportProjectionFailure,
+		);
+	}, [currentSessionId]);
 
 	const scrollToBottom = useCallback(
 		(smooth = false) => {
@@ -221,7 +230,7 @@ export function ChatViewport() {
 				) : (
 					<div className="flex min-w-0 max-w-full flex-col gap-6">
 						{projection.turns.map((turn) => (
-							<TurnView key={turn.id} turn={turn} />
+							<TurnView key={turn.id} turn={turn} onAttachmentLoadError={reportAttachmentLoadError} />
 						))}
 						{projection.statusRows.map((row) => (
 							<StatusRowView key={row.key} row={row} />

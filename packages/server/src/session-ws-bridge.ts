@@ -2,12 +2,15 @@ import { randomUUID } from "node:crypto";
 import {
 	GATEWAY_CLIENT_REQUIRED_CAPABILITIES,
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 	GATEWAY_PROTOCOL_VERSION,
 	type GatewayProtocolErrorDto,
 	type GatewayServerHelloDto,
 	type HotRuntimeInventoryDto,
 	isGatewayClientHello,
+	isSessionAttachmentGuardContext,
 	isSessionWsClientMessage,
+	negotiateGatewayPayloadBudget,
 	negotiateHotRuntimeInventory,
 	RpcError,
 	SESSION_WS_CLIENT_MAX_BYTES,
@@ -23,6 +26,7 @@ import {
 } from "@pi-agent-web/protocol";
 import type { WebSocket } from "ws";
 import { WebSocketServer } from "ws";
+import type { GatewayPayloadActivation } from "./gateway-payload-activation.js";
 import type { ReplayResult, SessionSupervisorMessage } from "./session-runtime-types.js";
 import type { HotRuntimeSubscriptionToken, SessionSupervisor } from "./session-supervisor.js";
 
@@ -32,15 +36,15 @@ interface ConnectionState {
 	subscriptions: Set<string>;
 	subscriptionAliases: Map<string, string>;
 	catchUps: Set<SessionCatchUp>;
-	catchUpBufferedBytes: number;
+	catchUpSmallBufferedBytes: number;
+	catchUpLargeItems: number;
 	nextCatchUpOrder: number;
 	controlledSessions: Set<string>;
 	pendingCommands: Set<string>;
 	outboundQueue: OutboundPayload[];
-	outboundQueuedBytes: number;
-	outboundOversizedQueued: boolean;
+	outboundSmallQueuedBytes: number;
+	outboundLargeItems: number;
 	outboundSending: boolean;
-	outboundSendingOversized: boolean;
 	alive: boolean;
 	closed: boolean;
 	epoch: number;
@@ -56,7 +60,7 @@ interface ConnectionState {
 interface OutboundPayload {
 	payload: string;
 	bytes: number;
-	oversizedSnapshot: boolean;
+	large: boolean;
 }
 
 interface BufferedCatchUpMessage {
@@ -69,7 +73,8 @@ interface SessionCatchUp {
 	currentHandle: string;
 	handles: Set<string>;
 	buffered: BufferedCatchUpMessage[];
-	bufferedBytes: number;
+	bufferedSmallBytes: number;
+	bufferedLargeItems: number;
 	order: number;
 	rekeyVersion: number;
 	exactTransactional: boolean;
@@ -88,6 +93,8 @@ export interface SessionWsBridgeOptions {
 		adapterId: string;
 		capabilities: readonly string[];
 	};
+	/** Required production activation for epoch attachment references and the negotiated budget. */
+	payloadActivation?: Pick<GatewayPayloadActivation, "context">;
 	heartbeatIntervalMs?: number;
 	helloTimeoutMs?: number;
 	log?: (level: "info" | "warn" | "error", message: string) => void;
@@ -96,7 +103,7 @@ export interface SessionWsBridgeOptions {
 export const MAX_SESSION_WS_IN_FLIGHT_COMMANDS = 32;
 export const MAX_SESSION_WS_IN_FLIGHT_EXACT_SUBSCRIPTIONS = 256;
 export const MAX_SESSION_WS_BUFFERED_BYTES = 1024 * 1024;
-const MAX_SESSION_WS_SNAPSHOT_RESPONSE_BYTES = SESSION_WS_SERVER_MAX_BYTES;
+const MAX_SESSION_WS_FRAME_BYTES = SESSION_WS_SERVER_MAX_BYTES;
 
 /** Multiplexes one browser socket across any number of independent Sessions. */
 export class SessionWsBridge {
@@ -108,6 +115,7 @@ export class SessionWsBridge {
 	private readonly serverEpoch: string;
 	private readonly serverBuild: string;
 	private readonly runtime: SessionWsBridgeOptions["runtime"];
+	private readonly payloadActivation: SessionWsBridgeOptions["payloadActivation"];
 	private readonly helloTimeoutMs: number;
 	private requestCounter = 0;
 	private closePromise: Promise<void> | null = null;
@@ -118,7 +126,22 @@ export class SessionWsBridge {
 		this.log = opts.log ?? (() => {});
 		this.serverEpoch = opts.supervisor.serverEpoch;
 		this.serverBuild = opts.serverBuild;
-		this.runtime = opts.runtime;
+		if (
+			opts.runtime.capabilities.includes(GATEWAY_PAYLOAD_BUDGET_CAPABILITY) ||
+			(opts.payloadActivation !== undefined &&
+				(!isSessionAttachmentGuardContext(opts.payloadActivation.context) ||
+					opts.payloadActivation.context.serverEpoch !== this.serverEpoch))
+		) {
+			throw new TypeError("Session WebSocket payload activation is invalid");
+		}
+		this.payloadActivation = opts.payloadActivation;
+		this.runtime = {
+			...opts.runtime,
+			capabilities: [
+				...opts.runtime.capabilities,
+				...(opts.payloadActivation ? [GATEWAY_PAYLOAD_BUDGET_CAPABILITY] : []),
+			],
+		};
 		this.helloTimeoutMs = Math.max(1, opts.helloTimeoutMs ?? 5_000);
 		this.wss = new WebSocketServer({ noServer: true, maxPayload: SESSION_WS_CLIENT_MAX_BYTES });
 		this.wss.on("connection", (ws) => this.handleConnection(ws));
@@ -180,7 +203,7 @@ export class SessionWsBridge {
 			const payload = this.payloadForConnection(connection, message, sharedPayload);
 			const sessionHandle = this.broadcastSessionHandle(message);
 			if (!sessionHandle) {
-				this.sendPayload(connection, payload);
+				this.sendPayload(connection, payload, message.type === "event");
 				continue;
 			}
 			const catchUps = this.findCatchUps(connection, sessionHandle);
@@ -190,7 +213,9 @@ export class SessionWsBridge {
 				}
 				continue;
 			}
-			if (this.isSubscribed(connection, sessionHandle)) this.sendPayload(connection, payload);
+			if (this.isSubscribed(connection, sessionHandle)) {
+				this.sendPayload(connection, payload, message.type === "event");
+			}
 		}
 	}
 
@@ -246,15 +271,15 @@ export class SessionWsBridge {
 			subscriptions: new Set(),
 			subscriptionAliases: new Map(),
 			catchUps: new Set(),
-			catchUpBufferedBytes: 0,
+			catchUpSmallBufferedBytes: 0,
+			catchUpLargeItems: 0,
 			nextCatchUpOrder: 0,
 			controlledSessions: new Set(),
 			pendingCommands: new Set(),
 			outboundQueue: [],
-			outboundQueuedBytes: 0,
-			outboundOversizedQueued: false,
+			outboundSmallQueuedBytes: 0,
+			outboundLargeItems: 0,
 			outboundSending: false,
-			outboundSendingOversized: false,
 			alive: true,
 			closed: false,
 			epoch: 0,
@@ -262,7 +287,7 @@ export class SessionWsBridge {
 			hotInventoryNegotiated: false,
 			hotInventoryRevision: -1,
 			admittedExactOperations: 0,
-			negotiatedMaxServerFrameBytes: MAX_SESSION_WS_SNAPSHOT_RESPONSE_BYTES,
+			negotiatedMaxServerFrameBytes: MAX_SESSION_WS_FRAME_BYTES,
 		};
 		this.connections.add(connection);
 		connection.helloTimer = setTimeout(() => {
@@ -364,7 +389,7 @@ export class SessionWsBridge {
 		}
 		connection.negotiatedMaxServerFrameBytes = Math.min(
 			value.limits.maxServerFrameBytes,
-			MAX_SESSION_WS_SNAPSHOT_RESPONSE_BYTES,
+			MAX_SESSION_WS_FRAME_BYTES,
 		);
 		const negotiatedCapabilities = this.runtime.capabilities.filter((capability) =>
 			requestedCapabilities.has(capability),
@@ -385,7 +410,13 @@ export class SessionWsBridge {
 				maxSnapshotFrameBytes: connection.negotiatedMaxServerFrameBytes,
 				maxExtensionRequests: 128,
 			},
+			...(this.payloadActivation ? { payloadBudget: this.payloadActivation.context.payloadBudget } : {}),
 		};
+		const payloadNegotiation = negotiateGatewayPayloadBudget(value, hello);
+		if (payloadNegotiation.negotiated === false) {
+			this.sendProtocolErrorAndClose(connection, "capability_unsupported");
+			return;
+		}
 		const inventoryNegotiation = negotiateHotRuntimeInventory(value, hello);
 		if (
 			inventoryNegotiation.negotiated === false &&
@@ -553,7 +584,7 @@ export class SessionWsBridge {
 					this.isNonReplayableCatchUpMessage(entry.message) ||
 					this.isNewerThanBaseline(entry.message, result.runtime, index, baselineMarker)
 				) {
-					this.sendPayload(connection, entry.payload);
+					this.sendPayload(connection, entry.payload, entry.message.type === "event");
 				}
 			}
 			this.flushDeferredHotInventory(connection);
@@ -585,7 +616,8 @@ export class SessionWsBridge {
 				currentHandle: requestedHandle,
 				handles: new Set([requestedHandle]),
 				buffered: [],
-				bufferedBytes: 0,
+				bufferedSmallBytes: 0,
+				bufferedLargeItems: 0,
 				order: ++connection.nextCatchUpOrder,
 				rekeyVersion: 0,
 				exactTransactional: true,
@@ -604,7 +636,8 @@ export class SessionWsBridge {
 			currentHandle: activeHandle,
 			handles,
 			buffered: [],
-			bufferedBytes: 0,
+			bufferedSmallBytes: 0,
+			bufferedLargeItems: 0,
 			order: ++connection.nextCatchUpOrder,
 			rekeyVersion: 0,
 			exactTransactional: false,
@@ -696,23 +729,36 @@ export class SessionWsBridge {
 	): void {
 		if (!connection.catchUps.has(catchUp) || connection.closed) return;
 		const bytes = Buffer.byteLength(payload);
-		if (connection.helloComplete && bytes > connection.negotiatedMaxServerFrameBytes) {
-			this.closeForPolicyViolation(connection, "frame exceeds negotiated client limit");
-			return;
+		const large = this.classifyPayload(connection, bytes, message.type === "event");
+		if (large === undefined) return;
+		if (large) {
+			if (connection.catchUpLargeItems >= 1) {
+				this.closeForPolicyViolation(connection, "Session catch-up buffer exceeded its limit");
+				return;
+			}
+			catchUp.bufferedLargeItems += 1;
+			connection.catchUpLargeItems += 1;
+		} else {
+			if (connection.catchUpSmallBufferedBytes + bytes > MAX_SESSION_WS_BUFFERED_BYTES) {
+				this.closeForPolicyViolation(connection, "Session catch-up buffer exceeded its limit");
+				return;
+			}
+			catchUp.bufferedSmallBytes += bytes;
+			connection.catchUpSmallBufferedBytes += bytes;
 		}
 		catchUp.buffered.push({ message, payload });
-		catchUp.bufferedBytes += bytes;
-		connection.catchUpBufferedBytes += bytes;
-		if (connection.catchUpBufferedBytes > MAX_SESSION_WS_BUFFERED_BYTES) {
-			this.closeForPolicyViolation(connection, "Session catch-up buffer exceeded its limit");
-		}
 	}
 
 	private cancelCatchUp(connection: ConnectionState, catchUp: SessionCatchUp): void {
 		if (!connection.catchUps.delete(catchUp)) return;
-		connection.catchUpBufferedBytes = Math.max(0, connection.catchUpBufferedBytes - catchUp.bufferedBytes);
+		connection.catchUpSmallBufferedBytes = Math.max(
+			0,
+			connection.catchUpSmallBufferedBytes - catchUp.bufferedSmallBytes,
+		);
+		connection.catchUpLargeItems = Math.max(0, connection.catchUpLargeItems - catchUp.bufferedLargeItems);
 		catchUp.buffered = [];
-		catchUp.bufferedBytes = 0;
+		catchUp.bufferedSmallBytes = 0;
+		catchUp.bufferedLargeItems = 0;
 	}
 
 	private rollbackExactCatchUp(connection: ConnectionState, catchUp: SessionCatchUp): void {
@@ -902,7 +948,7 @@ export class SessionWsBridge {
 				...(result.previousSessionHandle ? { previousSessionHandle: result.previousSessionHandle } : {}),
 			});
 		} catch (error) {
-			this.sendCommandError(connection, message, this.errorText(error));
+			this.sendCommandError(connection, message, error);
 			this.log("warn", `command ${message.command.type} failed: ${this.errorText(error)}`);
 		} finally {
 			this.bashCommandIds.delete(internalId);
@@ -945,9 +991,10 @@ export class SessionWsBridge {
 	private sendCommandError(
 		connection: ConnectionState,
 		message: Extract<SessionWsClientMessage, { type: "command" }>,
-		error: string,
+		error: unknown,
 	): void {
 		const runtime = this.supervisor.getRuntime(message.sessionHandle);
+		const admissionError = error instanceof RpcError ? error.admissionError : undefined;
 		this.send(connection, {
 			type: "response",
 			serverEpoch: this.serverEpoch,
@@ -959,7 +1006,8 @@ export class SessionWsBridge {
 				type: "response",
 				command: message.command.type,
 				success: false,
-				error,
+				error: this.errorText(error),
+				...(admissionError ? { admissionError } : {}),
 			},
 		});
 	}
@@ -1010,10 +1058,9 @@ export class SessionWsBridge {
 		connection.controlledSessions.clear();
 		connection.pendingCommands.clear();
 		connection.outboundQueue = [];
-		connection.outboundQueuedBytes = 0;
-		connection.outboundOversizedQueued = false;
+		connection.outboundSmallQueuedBytes = 0;
+		connection.outboundLargeItems = 0;
 		connection.outboundSending = false;
-		connection.outboundSendingOversized = false;
 		this.log("info", `ws disconnected (${this.connections.size} open)`);
 	}
 
@@ -1093,7 +1140,7 @@ export class SessionWsBridge {
 		this.sendPayload(
 			connection,
 			this.payloadForConnection(connection, message),
-			message.type === "session_snapshot",
+			message.type === "event" || message.type === "response" || message.type === "session_snapshot",
 		);
 	}
 
@@ -1121,54 +1168,66 @@ export class SessionWsBridge {
 		});
 	}
 
-	private sendPayload(connection: ConnectionState, payload: string, allowOversizedSnapshot = false): void {
+	private classifyPayload(
+		connection: ConnectionState,
+		bytes: number,
+		allowLarge: boolean,
+	): boolean | undefined {
+		if (bytes > MAX_SESSION_WS_FRAME_BYTES) {
+			this.closeForPolicyViolation(connection, "oversized WebSocket frame");
+			return undefined;
+		}
+		if (connection.helloComplete && bytes > connection.negotiatedMaxServerFrameBytes) {
+			this.closeForPolicyViolation(connection, "frame exceeds negotiated client limit");
+			return undefined;
+		}
+		const large = bytes > MAX_SESSION_WS_BUFFERED_BYTES;
+		if (large && !allowLarge) {
+			this.closeForPolicyViolation(connection, "oversized WebSocket frame");
+			return undefined;
+		}
+		return large;
+	}
+
+	private sendPayload(connection: ConnectionState, payload: string, allowLarge = false): void {
 		if (connection.closed) return;
 		if (connection.ws.readyState !== connection.ws.OPEN) return;
 		const bytes = Buffer.byteLength(payload);
-		if (connection.helloComplete && bytes > connection.negotiatedMaxServerFrameBytes) {
-			this.closeForPolicyViolation(connection, "frame exceeds negotiated client limit");
-			return;
-		}
-		const oversizedSnapshot = allowOversizedSnapshot && bytes > MAX_SESSION_WS_BUFFERED_BYTES;
-		if (bytes > MAX_SESSION_WS_BUFFERED_BYTES && !oversizedSnapshot) {
-			this.closeForPolicyViolation(connection, "oversized WebSocket frame");
-			return;
-		}
-		if (oversizedSnapshot && bytes > MAX_SESSION_WS_SNAPSHOT_RESPONSE_BYTES) {
-			this.closeForPolicyViolation(connection, "oversized WebSocket snapshot response");
+		const large = this.classifyPayload(connection, bytes, allowLarge);
+		if (large === undefined) return;
+		if (large && connection.outboundLargeItems >= 1) {
+			this.closeForPolicyViolation(connection, "slow WebSocket client");
 			return;
 		}
 		if (connection.outboundSending) {
-			if (oversizedSnapshot) {
-				if (connection.outboundSendingOversized || connection.outboundOversizedQueued) {
-					this.closeForPolicyViolation(connection, "slow WebSocket client");
-					return;
-				}
-				connection.outboundOversizedQueued = true;
-			} else if (connection.outboundQueuedBytes + bytes > MAX_SESSION_WS_BUFFERED_BYTES) {
+			if (large) {
+				connection.outboundLargeItems += 1;
+			} else if (connection.outboundSmallQueuedBytes + bytes > MAX_SESSION_WS_BUFFERED_BYTES) {
 				this.closeForPolicyViolation(connection, "slow WebSocket client");
 				return;
 			} else {
-				connection.outboundQueuedBytes += bytes;
+				connection.outboundSmallQueuedBytes += bytes;
 			}
-			connection.outboundQueue.push({ payload, bytes, oversizedSnapshot });
+			connection.outboundQueue.push({ payload, bytes, large });
 			return;
 		}
 		if (connection.ws.bufferedAmount > MAX_SESSION_WS_BUFFERED_BYTES) {
 			this.closeForPolicyViolation(connection, "slow WebSocket client");
 			return;
 		}
-		this.startPayloadSend(connection, { payload, bytes, oversizedSnapshot });
+		if (large) connection.outboundLargeItems += 1;
+		this.startPayloadSend(connection, { payload, bytes, large });
 	}
 
 	private startPayloadSend(connection: ConnectionState, item: OutboundPayload): void {
 		connection.outboundSending = true;
-		connection.outboundSendingOversized = item.oversizedSnapshot;
 		try {
 			connection.ws.send(item.payload, (error) => {
-				connection.outboundSending = false;
-				connection.outboundSendingOversized = false;
 				if (connection.closed) return;
+				connection.outboundSending = false;
+				if (item.large) {
+					connection.outboundLargeItems = Math.max(0, connection.outboundLargeItems - 1);
+				}
 				if (error) {
 					this.log("warn", `WebSocket send failed: ${this.errorText(error)}`);
 					this.disconnect(connection);
@@ -1176,15 +1235,16 @@ export class SessionWsBridge {
 				}
 				const next = connection.outboundQueue.shift();
 				if (!next) return;
-				if (next.oversizedSnapshot) connection.outboundOversizedQueued = false;
-				else {
-					connection.outboundQueuedBytes = Math.max(0, connection.outboundQueuedBytes - next.bytes);
+				if (!next.large) {
+					connection.outboundSmallQueuedBytes = Math.max(0, connection.outboundSmallQueuedBytes - next.bytes);
 				}
-				this.sendPayload(connection, next.payload, next.oversizedSnapshot);
+				if (connection.ws.bufferedAmount > MAX_SESSION_WS_BUFFERED_BYTES) {
+					this.closeForPolicyViolation(connection, "slow WebSocket client");
+					return;
+				}
+				this.startPayloadSend(connection, next);
 			});
 		} catch {
-			connection.outboundSending = false;
-			connection.outboundSendingOversized = false;
 			this.disconnect(connection);
 		}
 	}

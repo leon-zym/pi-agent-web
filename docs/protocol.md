@@ -156,6 +156,137 @@ Prompt/steer/follow_up 文本按 UTF-8 编码后上限 1 MiB。可以是 image-o
 反斜杠/引号转义、CJK 文本与图片组合不能绕过 transport 预算。UI 在 `WebSocket.send` 前执行同一
 整帧检查，并会预先解码、缩放和压缩图片；协议 guard 是最终边界而不是图片处理器。
 
+### Payload budget 与 attachment reference
+
+协议 minor 2 新增 `payload.epoch_attachment_refs`。Production Browser 与 Gateway 都把它列入 required
+capability。Minor 1 hello 必须保持原有 shape，不能携带该能力或 `payloadBudget`，因此不能与当前
+production peer 建立 Session connection。Minor 2 要求双方声明该能力，且 `server_hello` 携带完整预算；
+缺少任一条件都会在订阅前终止，不存在逐连接 inline output fallback。Browser-to-Gateway prompt image 仍按
+上面的 inline-only command DTO 和预算发送。
+
+完整 `payloadBudget` 是一个不可缺项、不可扩展的 canonical record：
+
+| 字段 | 上限 |
+|---|---:|
+| `maxCommandFrameBytes` | 8 MiB |
+| `maxCommandTextBytes` | 1 MiB |
+| `maxInlineImageBase64Bytes` | 2 MiB |
+| `maxInlineImagesBase64Bytes` | 6 MiB |
+| `maxImageCount` | 16 items |
+| `maxPiJsonlFrameBytes` | 8 MiB |
+| `maxPiSnapshotJsonlFrameBytes` | 64 MiB |
+| `maxNormalizedEventFrameBytes` | 8 MiB + 4 KiB |
+| `maxReplayFrameBytes` | 8 MiB + 4 KiB |
+| `maxReplayBytes` | 16 MiB |
+| `maxSnapshotCanonicalBytes` | 64 MiB |
+| `maxServerFrameBytes` | 65 MiB |
+| `maxQueuedBacklogBytes` | 1 MiB |
+| `maxCatchUpBacklogBytes` | 1 MiB |
+| `maxAttachmentBlobBytes` | 8 MiB |
+| `maxAttachmentCacheBytes` | 64 MiB |
+| `maxAttachmentCacheItems` | 256 items |
+
+Guard 同时验证 producer 和 consumer 的关系：完整 command frame 不大于普通 Pi line；normalized
+event ceiling 必须比普通 Pi line 多出至少 `SESSION_EVENT_ENVELOPE_HEADROOM_BYTES`；normalized event
+不大于 replay frame，replay frame 不大于单个 server frame；Pi snapshot line 不大于 canonical
+snapshot，canonical snapshot 不大于单个 server frame。Canonical headroom 是 4 KiB，覆盖最大长度、
+最坏 JSON 转义的 Session identity、generation、seq 与 event wrapper。Replay aggregate 上限为 16 MiB，
+至少能接纳一个合法的最大 replay frame。
+
+Attachment reference 的产品 DTO 是
+`{type:"attachment_ref",serverEpoch,sha256,mediaType,byteLength}`。`sha256` 只接受 64 位小写十六
+进制，`byteLength` 必须为正数且不超过 blob 上限。Reference 只在完全相同的 `serverEpoch` 内有效。
+Gateway 重启后，旧 reference 必须 fail closed；需要的附件从 Pi 权威消息或 Runtime 状态重新
+externalize，生成新 epoch 的 reference。Blob 与索引只是有界、可淘汰的派生缓存，不是 Session
+持久化事实，也不能替代 Pi JSONL。
+
+消费 reference 时必须使用组合 guard，同时验证 canonical DTO、当前连接协商的
+`maxAttachmentBlobBytes` 和预期 `serverEpoch`。只调用结构 guard 或只比较 epoch 都不足以取得 blob
+读取权限。
+
+Payload admission 失败使用结构化
+`{type:"payload_admission_error",code,boundary,limitBytes?,actualBytes?,limitItems?,actualItems?}`。
+Byte 超限与 byte cache exhaustion 同时携带 `limitBytes` 和更大的 `actualBytes`。Attachment cache
+item 上限使用独立的 `attachment_cache_item_limit_exceeded` code、`limitItems` 和更大的
+`actualItems`，不能用 byte 字段冒充 item evidence。能力缺失、reference 非法、epoch 不匹配或 blob
+不可用不伪造 size evidence。失败的 command response 可以在可读 `error` 之外携带
+`admissionError`，UI 不得依赖解析错误文案；共享 response helper 抛出的 `RpcError` 会保留这个结构。
+Gateway 只有在所有表内边界已经执行、旧 epoch reference 会 fail closed 后才能实际回显并启用该能力。
+`admissionError` 是 Gateway-owned 字段。Pi raw failure response 携带该字段属于协议不兼容；Bridge
+只从 Gateway 内部真实 `RpcError` 透传结构，不接受普通 Error 或形似对象注入。
+
+Production Pi image output 顺序是 command/event-specific raw guard → image externalization → trusted
+epoch/budget product guard → redaction。Externalizer 只处理 message
+content、message/custom_message entry、三个 history success response 和五类明确携带 message/entry 的
+authoritative event；tool args/result/details、Extension UI 与 opaque JSON 保持原值。Late 或 unknown-id
+response 只完成 command-specific raw validation 后丢弃，不调用 externalizer。Main 用同一个
+`serverEpoch`、canonical budget 与 `EpochContentStore` 构造 activation，把 externalizer/hold services 注入
+Supervisor，把 trusted context 注入 WebSocket Bridge；attachment routes 使用同一个 content store 与
+`serverEpoch`。
+
+Externalized outcome 显式携带 provisional lease。PiProcess 只在同步 prepare 和 commit 都返回 literal
+`true`、且 spawn/pending identity 仍匹配后移交 transfer；late、timeout、abort、stale 与 ownerless 路径
+负责释放。Runtime owner 在 ref 进入 projection、replay 或 snapshot 前接管 hold，并跨 startup、普通
+event/response、idle compaction 和 identity transition 保持 generation ownership。Correlated response
+只有可信 blob/cache ceiling evidence 或 PiProcess 自身 caller abort/deadline 可转为 Gateway delivery failure；
+所有 authoritative event failure、payload provenance/integrity failure 与 unsafe store state 都是 terminal。
+
+Browser 从已验证的 `server_hello` 保存 immutable attachment guard context。后续 event、response 与 snapshot
+都必须用这个 context 通过 wire guard，projection 才能保留 `SessionImageContentDto` reference。图片使用
+`/api/v1/attachments/:serverEpoch/:sha256` 的同源相对 URL，不经过 fetch-to-Blob 复制。只有当前 exact
+Session/generation 已提交 authoritative baseline 时，load error 才触发一次 cursorless resync；旧 identity
+或未完成 baseline 的 DOM error 被忽略。Structured `admissionError` 按 code 映射本地化文案，失败 prompt
+保留原 draft/images，后续成功提交后才清空。
+
+### Attachment REST staging contract
+
+Attachment REST 使用与其他 `/api/v1/*` 路由相同的 loopback Host、same-origin Origin/Fetch Metadata 和
+bootstrap Cookie 校验。所有 attachment 成功与错误响应都携带 `Cache-Control: no-store`。REST 可达性
+本身不替代 capability negotiation；production hello 必须先完成 required capability、完整 budget 与 frame
+ceiling 校验。
+
+`PUT /api/v1/attachments/:serverEpoch/:sha256` 的 request body 是 raw raster bytes：
+
+| 条件 | 结果 |
+|---|---|
+| URL epoch 不是当前 `serverEpoch` | 410，`attachment_ref_epoch_mismatch` |
+| digest 不是 64 位小写十六进制 | 400，`attachment_ref_invalid` |
+| 缺少 `Content-Length` | 411，`content_length_required` |
+| length 不是正的 safe integer | 400，`invalid_content_length` |
+| length 超过 blob ceiling | 413，`payload_too_large`，携带 byte evidence |
+| 非 identity `Content-Encoding` 或非 allowlisted raster media type | 415 |
+| magic、gross container、截断、声明 length/digest 或 manifest 校验失败 | 422 |
+| cache byte/item reservation 失败 | 507，使用 canonical cache admission code 与 evidence |
+| 新 digest 发布成功 | 201，body 为 `{attachment: attachment_ref}` |
+| 已有相同 digest、media type 与 length，且完整 body 重验成功 | 200，body 为同一个 canonical reference |
+
+PUT 先按 URL digest 查询已发布内容。查询未命中（即新 digest）时，它在读取 body 前按声明长度预留
+cache，并在写入私有 temp file 时流式计算 SHA-256 和实际长度；只有 validator flush、长度和 digest
+全部成功后才 publish。
+命中已发布 digest 时，Gateway 先 pin 该条目并精确比较 `serverEpoch`、digest、media type 与 length。
+Metadata 完全相同才走重复 PUT 快路径：不创建新 reservation 或 temp file，而是在固定内存内完整流式重验
+raster gross contract、实际长度和 SHA-256，成功后返回 200。任一 metadata 或 body 不匹配都返回 422，
+不能只凭 URL digest 接纳重复上传。Raster validator 是安全 admission，不是图片 decoder：它只验证
+allowlisted MIME、
+magic、最低 header/tail、gross container size/padding 与明显截断。通过 PUT 不代表 codec-valid 或
+provider 可解码。
+
+`GET /api/v1/attachments/:serverEpoch/:sha256` 在访问 store 前执行同一 URL epoch 与 digest 校验。旧 epoch
+固定返回 410，即使当前 epoch 碰巧已有相同 digest。未知或已淘汰的 digest 返回 404
+`attachment_unavailable`。`Range` 返回 416；`HEAD` 返回 405 和 `Allow: GET, PUT`，不能使用 Hono 的
+implicit HEAD fallback。成功 GET 返回 exact `Content-Type`、`Content-Length`，以及：
+
+```text
+Cache-Control: no-store
+Content-Disposition: attachment; filename="<sha256>.<safe-extension>"
+Cross-Origin-Resource-Policy: same-origin
+X-Content-Type-Options: nosniff
+```
+
+GET 先取得 published digest 的 pin，再从同一个已验证 file descriptor 建立 managed stream。EOF、stream
+error、request abort 和 Browser cancel 都必须幂等 release pin；GC 不能删除仍被 pin 的 blob。未知 I/O
+错误固定映射为不含本地路径的 generic 500。Store unavailable 使用 503，响应不能反射内部 Error message。
+
 ## 5. Gateway → Browser WebSocket
 
 | `type` | 核心字段 | 语义 |
@@ -268,7 +399,7 @@ does not change the ordinary replay-gap rule above.
 | `<workspace>/.pi/settings.json` | 项目级覆盖与可选 `sessionDir`；project 覆盖 global |
 | 默认 Session 目录 | `<agentDir>/sessions/--<encoded-cwd>--/*.jsonl` |
 | 自定义 Session 目录 | env/global/project 指定的直接目录，不再追加 cwd 编码 |
-| Web data | Workspace presentation preferences、启动期控制数据与 recoverable trash；不保存正常 Session 副本 |
+| Web data | Workspace preferences、启动期控制数据、recoverable trash，以及 epoch-scoped derived attachment blob/manifest；不保存正常 Session 副本 |
 
 默认目录编码只用于发现候选目录：
 
@@ -289,17 +420,21 @@ Workspace cwd 解析；Gateway 必须让 Catalog 与 child 看到相同结果。
 probe，再以 exact version compatibility matrix 校验 adapter 与必需 capabilities。发行依赖版本、Pi
 package manifest 与 probe 输出必须一致；失败使用稳定且不含路径/凭据的诊断码。
 
-Pi stdout 先由 `legacy-rpc-v1` adapter 完整解码为产品 DTO。响应按 command 校验 nested data，事件与
-Extension UI 按 discriminant、UTF-8 bytes、item count、safe number 与 JSON depth 校验。显式列入
-non-authoritative allowlist 的 frame 可忽略；其他未知或畸形权威 frame 进入单一
-`protocol_incompatible` 终态。
+Pi stdout 先由 `legacy-rpc-v1` adapter 的 raw wire guard 按 command/event 验证，再转换为产品 DTO。
+响应按 command 校验 nested data，事件与 Extension UI 按 discriminant、UTF-8 bytes、item count、safe
+number 与 JSON depth 校验。显式列入 non-authoritative allowlist 的 frame 可忽略；其他未知或畸形权威
+frame 进入单一 `protocol_incompatible` 终态。Production Main 注入的 image externalizer 按上面的
+attachment 顺序与 generation ownership 处理 image payload。
 
 The first WebSocket frame must be `client_hello`. A successful `server_hello` carries the Gateway
 protocol major and minor, server build and epoch, Pi version, adapter id, capability intersection,
 and negotiated limits. A major mismatch returns a stable `protocol_error` and closes the connection;
-the UI does not reconnect automatically. Client and Gateway validate their directional base RPC and
-multiplex capabilities. The Browser additionally requires `session.hot_runtime_inventory` and uses
-the shared negotiation helper to validate minor selection and the server frame ceiling.
+the UI does not reconnect automatically. Client and Gateway validate every directional required
+capability. The Browser requires `session.hot_runtime_inventory`; both peers require
+`payload.epoch_attachment_refs`. Shared negotiation validates both hello messages, exact minor 2
+selection, both capability declarations, the complete `payloadBudget`, and the client/server frame
+limit intersection. Minor 1 keeps the previous hello shape for decoding and diagnostics but cannot
+establish a production Session connection.
 `/api/v1/health/live` reports process liveness, `/api/v1/health/ready` reports Pi Host readiness, and
 the legacy `/health` endpoint remains a readiness alias.
 
