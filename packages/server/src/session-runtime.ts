@@ -14,12 +14,22 @@ import type {
 import {
 	commandTimeoutMs,
 	expectCommandData,
+	isSessionAttachmentGuardContext,
 	isSessionSnapshotDto,
 	RpcError,
 	SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS,
 } from "@pi-agent-web/protocol";
+import type { EpochContentHold } from "./epoch-content-store.js";
+import { GenerationContentOwner } from "./generation-content-owner.js";
 import { canonicalizeSessionFile, sessionHandleForCanonicalFile } from "./native-session-catalog.js";
-import type { PiProcessExitInfo } from "./pi-process.js";
+import type { PiHostPayloadExternalizer } from "./pi-host-adapter.js";
+import type { PiPayloadLeaseTransfer } from "./pi-payload-externalizer.js";
+import type {
+	PiDecodedDelivery,
+	PiDecodedDeliveryConsumer,
+	PiDecodedDeliveryPlan,
+	PiProcessExitInfo,
+} from "./pi-process.js";
 import { PiProcess } from "./pi-process.js";
 import type { ProbedPiRuntime } from "./resolver.js";
 import { canonicalizePathAllowMissing } from "./session-layout-resolver.js";
@@ -28,6 +38,7 @@ import {
 	type SessionLiveProjectionIdentity,
 	SessionLiveProjectionLimitError,
 	type SessionLiveProjectionLimits,
+	type SessionLiveProjectionPreparedCommit,
 } from "./session-live-projection.js";
 import {
 	type ExistingSessionTarget,
@@ -84,6 +95,17 @@ interface FrozenSessionFileIdentity {
 	cwd: string;
 }
 
+interface PreparedActiveEventPublication {
+	projection: SessionLiveProjection;
+	token: SessionLiveProjectionPreparedCommit;
+	frame: Extract<BufferedFrame, { type: "event" }>;
+	envelope: SessionReplayFrame;
+	turnBudget: { items: number; bytes: number };
+	replay: SessionReplayFrame[];
+	replayFrameBytes: number[];
+	replayBytes: number;
+}
+
 export interface SessionIdentityTransitionCommit {
 	previousSessionHandle: string;
 	nextTarget: ExistingSessionTarget;
@@ -111,6 +133,8 @@ export interface SessionRuntimeOptions {
 	extensionStateMaxItems?: number;
 	pendingDialogLimit?: number;
 	projectionLimits?: Partial<SessionLiveProjectionLimits>;
+	/** Server-private and default-off until Main installs the complete attachment pipeline. */
+	piPayloadServices?: SessionRuntimePiPayloadServices;
 	initialGeneration?: number;
 	commandTimeoutFor?: (commandType: string) => number;
 	emit: (message: SessionSupervisorMessage) => void;
@@ -121,6 +145,11 @@ export interface SessionRuntimeOptions {
 		transition: SessionIdentityTransitionCommit,
 	) => Promise<void>;
 	log?: (level: "info" | "warn" | "error", message: string) => void;
+}
+
+export interface SessionRuntimePiPayloadServices {
+	readonly externalizer: PiHostPayloadExternalizer;
+	readonly releaseHold: (hold: EpochContentHold) => Promise<void>;
 }
 
 /**
@@ -178,8 +207,11 @@ export class SessionRuntime {
 	private sessionFileIdentityVerified = false;
 	private hasConversationIntent = false;
 	private liveProjection: SessionLiveProjection | null = null;
+	private generationContentOwner: GenerationContentOwner | null = null;
 	private snapshotOverflow = false;
 	private idleBaseCompactionPromise: Promise<void> | null = null;
+	private discardedCompactionTransferCleanup: Promise<void> | null = null;
+	private generationContentCleanupFailure: Error | null = null;
 	private deferredStartupEmits: SessionSupervisorMessage[] | null = null;
 	private deferredTransitionEmits: SessionSupervisorMessage[] | null = null;
 
@@ -216,6 +248,14 @@ export class SessionRuntime {
 			extensionStateMaxItems: Math.max(0, opts.extensionStateMaxItems ?? DEFAULT_EXTENSION_STATE_MAX_ITEMS),
 			pendingDialogLimit: Math.max(0, opts.pendingDialogLimit ?? DEFAULT_PENDING_DIALOG_LIMIT),
 		};
+		if (
+			opts.piPayloadServices &&
+			(!isSessionAttachmentGuardContext(opts.piPayloadServices.externalizer.context) ||
+				opts.piPayloadServices.externalizer.context.serverEpoch !== opts.serverEpoch ||
+				typeof opts.piPayloadServices.releaseHold !== "function")
+		) {
+			throw new TypeError("Session Runtime Pi payload services are invalid");
+		}
 		this.sessionHandle = target.sessionHandle;
 		this.workspaceId = target.workspaceId;
 		this.cwd = target.cwd;
@@ -364,6 +404,9 @@ export class SessionRuntime {
 
 	/** Start or reuse this exact Session target. */
 	start(): Promise<void> {
+		if (this.generationContentCleanupFailure) {
+			return Promise.reject(new RpcError("session_start", "generation_content_cleanup_failed"));
+		}
 		if (this.snapshotOverflow) {
 			return Promise.reject(new RpcError("session_start", "session_snapshot_overflow"));
 		}
@@ -397,6 +440,14 @@ export class SessionRuntime {
 		const processToken = this.processToken;
 		this.failedProcessToken = null;
 		this.generation += 1;
+		const contentOwner = this.opts.piPayloadServices
+			? new GenerationContentOwner({
+					serverEpoch: this.opts.serverEpoch,
+					generation: this.generation,
+					release: this.opts.piPayloadServices.releaseHold,
+				})
+			: null;
+		this.generationContentOwner = contentOwner;
 		this.lastSeq = 0;
 		this.liveProjection = null;
 		this.clearReplay();
@@ -407,19 +458,26 @@ export class SessionRuntime {
 		this.error = undefined;
 		this.setState("starting");
 
-		const proc = new PiProcess({
+		const proc: PiProcess = new PiProcess({
 			cwd: this.cwd,
 			resolved: this.opts.resolved,
 			args: this.spawnArguments(),
 			adapter: this.opts.resolved.adapter,
+			payloadExternalizer: this.opts.piPayloadServices?.externalizer,
 			env: this.opts.env,
 			readyTimeoutMs: this.opts.readyTimeoutMs,
 			onReady: (state) => this.handleReady(processToken, state),
-			onEvent: (event) => this.handleEvent(processToken, event),
+			...(contentOwner
+				? {
+						onDecodedEvent: (delivery: PiDecodedDelivery<ProductSessionEventDto>) =>
+							this.prepareDecodedEvent(processToken, proc, contentOwner, delivery),
+					}
+				: { onEvent: (event: ProductSessionEventDto) => this.handleEvent(processToken, event) }),
 			onExtensionUiRequest: (request) => this.handleExtensionRequest(processToken, request),
 			onExit: (info) => this.handleFailure(processToken, info),
 		});
 		this.proc = proc;
+		if (contentOwner) this.observeGenerationContentFailure(processToken, proc, contentOwner);
 
 		try {
 			const ready = proc.start();
@@ -449,6 +507,9 @@ export class SessionRuntime {
 					stderrTail: normalized instanceof Error ? normalized.message : String(normalized),
 				});
 			}
+			// Manual stop increments processToken and already waits for this spawn.
+			// Only a same-generation failure may await the independent owner cleanup fence.
+			if (processToken === this.processToken && this.stopPromise) await this.stopPromise;
 			throw normalized;
 		}
 	}
@@ -538,17 +599,69 @@ export class SessionRuntime {
 		proc: PiProcess,
 		identity: SessionLiveProjectionIdentity,
 	): Promise<SessionLiveProjection> {
-		const response = await proc.send({ type: "get_messages" }, this.timeoutFor("get_messages"));
+		let preparedProjection: SessionLiveProjection | null = null;
+		const contentOwner = this.generationContentOwner;
+		const consume: PiDecodedDeliveryConsumer<SessionCommandResponseDto> = (delivery) => {
+			const { messages } = expectCommandData(delivery.value, "get_messages");
+			const candidate = new SessionLiveProjection({
+				identity,
+				settledMessages: messages,
+				baseSeq: 0,
+				runtimePhase: this.pendingDialogs.size > 0 ? "waiting_ui" : "idle",
+				limits: this.opts.projectionLimits,
+				attachmentGuardContext: this.opts.piPayloadServices?.externalizer.context,
+			});
+			return delivery.prepare((transfer) => {
+				if (!contentOwner || !this.isCurrentGenerationContentOwner(processToken, proc, contentOwner)) {
+					throw new RpcError("get_messages", "session_generation_stale");
+				}
+				if (transfer) contentOwner.adopt(transfer);
+				preparedProjection = candidate;
+				return true;
+			});
+		};
+		const response = this.opts.piPayloadServices
+			? await proc.sendDecoded({ type: "get_messages" }, consume, this.timeoutFor("get_messages"))
+			: await proc.send({ type: "get_messages" }, this.timeoutFor("get_messages"));
 		if (processToken !== this.processToken || this.proc !== proc) {
 			throw new RpcError("get_messages", "session_generation_stale");
 		}
 		const { messages } = expectCommandData(response, "get_messages");
+		if (this.opts.piPayloadServices) {
+			if (!preparedProjection) throw new RpcError("get_messages", "decoded_projection_not_committed");
+			return preparedProjection;
+		}
 		return new SessionLiveProjection({
 			identity,
 			settledMessages: messages,
 			baseSeq: 0,
 			runtimePhase: this.pendingDialogs.size > 0 ? "waiting_ui" : "idle",
 			limits: this.opts.projectionLimits,
+		});
+	}
+
+	private isCurrentGenerationContentOwner(
+		processToken: number,
+		proc: PiProcess,
+		owner: GenerationContentOwner,
+	): boolean {
+		return (
+			processToken === this.processToken &&
+			this.proc === proc &&
+			this.generationContentOwner === owner &&
+			owner.serverEpoch === this.opts.serverEpoch &&
+			owner.generation === this.generation
+		);
+	}
+
+	private observeGenerationContentFailure(
+		processToken: number,
+		proc: PiProcess,
+		owner: GenerationContentOwner,
+	): void {
+		void owner.fatalCleanup.catch((error) => {
+			if (!this.isCurrentGenerationContentOwner(processToken, proc, owner)) return;
+			this.terminalizeGenerationContentFailure(processToken, proc, owner, error);
 		});
 	}
 
@@ -586,7 +699,25 @@ export class SessionRuntime {
 			this.touch();
 			let response: Promise<SessionCommandResponseDto>;
 			try {
-				response = proc.send(command, timeoutMs ?? this.timeoutFor(command.type));
+				const processToken = this.processToken;
+				const contentOwner = this.generationContentOwner;
+				response = this.opts.piPayloadServices
+					? proc.sendDecoded(
+							command,
+							(delivery) =>
+								delivery.prepare((transfer) => {
+									if (
+										!contentOwner ||
+										!this.isCurrentGenerationContentOwner(processToken, proc, contentOwner)
+									) {
+										throw new RpcError(command.type, "session_generation_stale");
+									}
+									if (transfer) contentOwner.adopt(transfer);
+									return true;
+								}),
+							timeoutMs ?? this.timeoutFor(command.type),
+						)
+					: proc.send(command, timeoutMs ?? this.timeoutFor(command.type));
 			} catch (error) {
 				this.inFlight = Math.max(0, this.inFlight - 1);
 				if (turnReservation) this.releasePendingTurn(turnReservation);
@@ -634,6 +765,9 @@ export class SessionRuntime {
 		return this.withCommandAdmission(async () => {
 			this.assertGeneration(command.type, expectedGeneration);
 			admit();
+			if (this.opts.piPayloadServices) {
+				throw new RpcError(command.type, "session_payload_identity_transition_not_supported");
+			}
 			const blocker = this.identityTransitionBlocker();
 			if (blocker) throw new RpcError(command.type, `session_busy:${blocker}`);
 			const proc = this.proc;
@@ -828,7 +962,7 @@ export class SessionRuntime {
 
 	sessionSnapshot(): SessionSnapshotDto {
 		const snapshot = this.buildSessionSnapshot();
-		if (!isSessionSnapshotDto(snapshot)) {
+		if (!isSessionSnapshotDto(snapshot, this.opts.piPayloadServices?.externalizer.context)) {
 			this.terminalizeSnapshotOverflow();
 			throw new RpcError("session_snapshot", "session_snapshot_overflow");
 		}
@@ -859,7 +993,8 @@ export class SessionRuntime {
 	}
 
 	private assertWireSnapshotFits(): void {
-		if (isSessionSnapshotDto(this.buildSessionSnapshot())) return;
+		if (isSessionSnapshotDto(this.buildSessionSnapshot(), this.opts.piPayloadServices?.externalizer.context))
+			return;
 		if (this.startupReady) this.terminalizeSnapshotOverflow();
 		else {
 			this.snapshotOverflow = true;
@@ -895,15 +1030,32 @@ export class SessionRuntime {
 		this.manuallyStopped = true;
 		this.processToken += 1;
 		const proc = this.proc;
+		const contentOwner = this.generationContentOwner;
+		const discardedCleanup = this.discardedCompactionTransferCleanup;
 		const starting = this.startPromise;
 		this.proc = null;
+		this.generationContentOwner = null;
 		this.opts.onHotSetChanged?.(this);
 		this.clearOwnedOperationalState(!this.snapshotOverflow);
 		let stopping!: Promise<void>;
 		stopping = (async () => {
 			try {
-				await proc?.stop();
-				if (starting) await Promise.allSettled([starting]);
+				const results = await Promise.allSettled([
+					proc?.stop(),
+					contentOwner?.release(),
+					discardedCleanup,
+					starting ? Promise.allSettled([starting]) : undefined,
+				]);
+				const failures = results
+					.filter((result): result is PromiseRejectedResult => result.status === "rejected")
+					.map((result) => result.reason);
+				if (failures.length > 0) {
+					const failure = new AggregateError(failures, "Session generation cleanup failed");
+					this.generationContentCleanupFailure = failure;
+					this.error = "generation_content_cleanup_failed";
+					this.state = "crashed";
+					throw failure;
+				}
 				this.finishProcessFinalization();
 				this.setState("dormant");
 			} finally {
@@ -918,6 +1070,179 @@ export class SessionRuntime {
 		if (processToken !== this.processToken) return;
 		this.verifyMaterializedSessionFile();
 		this.enqueueFrame({ type: "event", event });
+	}
+
+	private prepareDecodedEvent(
+		processToken: number,
+		proc: PiProcess,
+		owner: GenerationContentOwner,
+		delivery: PiDecodedDelivery<ProductSessionEventDto>,
+	): PiDecodedDeliveryPlan {
+		if (!this.isCurrentGenerationContentOwner(processToken, proc, owner)) {
+			throw new RpcError("event", "session_generation_stale");
+		}
+		const commitMaterializedIdentity = this.inspectMaterializedSessionFile();
+		const frame: BufferedFrame = { type: "event", event: delivery.value };
+		if (!this.startupReady) {
+			const bytes = bufferedFrameBytes(frame);
+			const nextBytes = this.startupFrameBytes + bytes;
+			if (nextBytes > this.opts.transientBufferMaxBytes) {
+				throw new RpcError("session_start", "startup_frame_buffer_limit_exceeded");
+			}
+			const nextFrames = [...this.startupFrames, frame];
+			return delivery.prepare((transfer) => {
+				if (!this.isCurrentGenerationContentOwner(processToken, proc, owner)) {
+					throw new RpcError("event", "session_generation_stale");
+				}
+				if (transfer) owner.adopt(transfer);
+				if (commitMaterializedIdentity) this.sessionFileIdentityVerified = true;
+				this.startupFrames = nextFrames;
+				this.startupFrameBytes = nextBytes;
+				this.touch();
+				return true;
+			});
+		}
+
+		const prepared = this.prepareActiveEventPublication(frame);
+		return delivery.prepare((transfer) => {
+			if (!this.isCurrentGenerationContentOwner(processToken, proc, owner)) {
+				throw new RpcError("event", "session_generation_stale");
+			}
+			if (transfer) owner.adopt(transfer);
+			try {
+				if (commitMaterializedIdentity) this.sessionFileIdentityVerified = true;
+				this.commitActiveEventPublication(prepared);
+			} catch (error) {
+				this.terminalizeGenerationContentFailure(processToken, proc, owner, error);
+			}
+			return true;
+		});
+	}
+
+	private prepareActiveEventPublication(
+		frame: Extract<BufferedFrame, { type: "event" }>,
+	): PreparedActiveEventPublication {
+		const projection = this.liveProjection;
+		if (!projection) throw new RpcError("session_snapshot", "session_snapshot_unavailable");
+		const reset = !this.agentBusy && eventStartsWork(frame.event);
+		const items = (reset ? 0 : this.activeTurnProjectionItems) + 1;
+		const bytes = (reset ? 0 : this.activeTurnProjectionBytes) + projection.activeTurnEventBytes(frame.event);
+		const limit = projection.activeTurnBudget();
+		if (items > limit.maxItems || bytes > limit.maxBytes) {
+			throw this.normalizeProjectionError(new SessionLiveProjectionLimitError("live_events"));
+		}
+		let token: SessionLiveProjectionPreparedCommit;
+		try {
+			token = projection.prepareCommit(this.projectionIdentity(), frame, this.state);
+		} catch (error) {
+			throw this.normalizeProjectionError(error);
+		}
+		const envelope: SessionReplayFrame = {
+			...frame,
+			serverEpoch: this.opts.serverEpoch,
+			sessionHandle: this.sessionHandle,
+			workspaceId: this.workspaceId,
+			generation: this.generation,
+			seq: token.nextSeq,
+		};
+		const envelopeBytes = Buffer.byteLength(JSON.stringify(envelope));
+		const replay = [...this.replay, envelope];
+		const replayFrameBytes = [...this.replayFrameBytes, envelopeBytes];
+		let replayBytes = this.replayBytes + envelopeBytes;
+		let removeCount = 0;
+		while (replay.length - removeCount > this.opts.replayLimit || replayBytes > this.opts.replayMaxBytes) {
+			replayBytes -= replayFrameBytes[removeCount] ?? 0;
+			removeCount += 1;
+		}
+		if (removeCount > 0) {
+			replay.splice(0, removeCount);
+			replayFrameBytes.splice(0, removeCount);
+		}
+		return {
+			projection,
+			token,
+			frame,
+			envelope,
+			turnBudget: { items, bytes },
+			replay,
+			replayFrameBytes,
+			replayBytes,
+		};
+	}
+
+	private commitActiveEventPublication(prepared: PreparedActiveEventPublication): void {
+		if (this.liveProjection !== prepared.projection) {
+			throw new RpcError("event", "session_projection_changed_before_commit");
+		}
+		const seq = prepared.projection.commitPrepared(prepared.token);
+		if (seq === null || seq !== prepared.envelope.seq) {
+			throw new RpcError("event", "session_projection_commit_invariant_failed");
+		}
+		this.activeTurnProjectionItems = prepared.turnBudget.items;
+		this.activeTurnProjectionBytes = prepared.turnBudget.bytes;
+		this.replay = prepared.replay;
+		this.replayFrameBytes = prepared.replayFrameBytes;
+		this.replayBytes = prepared.replayBytes;
+		this.lastSeq = seq;
+		this.touch();
+		this.emitSupervisorMessage(prepared.envelope);
+		this.applyFrameState(prepared.frame);
+	}
+
+	private terminalizeGenerationContentFailure(
+		processToken: number,
+		proc: PiProcess,
+		owner: GenerationContentOwner,
+		error: unknown,
+	): void {
+		if (!this.isCurrentGenerationContentOwner(processToken, proc, owner)) return;
+		this.manuallyStopped = true;
+		this.failedProcessToken = processToken;
+		this.processToken += 1;
+		const discardedCleanup = this.discardedCompactionTransferCleanup;
+		this.discardedCompactionTransferCleanup = null;
+		this.proc = null;
+		this.generationContentOwner = null;
+		this.opts.onHotSetChanged?.(this);
+		this.clearOwnedOperationalState(false);
+		this.startupReady = false;
+		this.liveProjection = null;
+		this.error = `generation content failure: ${error instanceof Error ? error.message : String(error)}`;
+		this.state = "crashed";
+		this.touch();
+		this.emitSupervisorMessage({ type: "runtime_state", runtime: this.snapshot() });
+		this.beginTerminalGenerationCleanup("Generation content terminal cleanup", [
+			owner.release(),
+			proc.stop(),
+			discardedCleanup,
+		]);
+	}
+
+	private beginTerminalGenerationCleanup(
+		label: string,
+		tasks: readonly (Promise<unknown> | null | undefined)[],
+	): Promise<void> {
+		if (this.stopPromise) return this.stopPromise;
+		let cleanup!: Promise<void>;
+		cleanup = Promise.allSettled(tasks)
+			.then((results) => {
+				const failures = results
+					.filter((result): result is PromiseRejectedResult => result.status === "rejected")
+					.map((result) => result.reason);
+				if (failures.length === 0) return;
+				const failure = new AggregateError(failures, `${label} failed`);
+				this.generationContentCleanupFailure = failure;
+				this.error = "generation_content_cleanup_failed";
+				throw failure;
+			})
+			.finally(() => {
+				if (this.stopPromise === cleanup) this.stopPromise = null;
+			});
+		this.stopPromise = cleanup;
+		void cleanup.catch((error) => {
+			this.log("error", `${label} failed for ${this.sessionHandle}: ${String(error)}`);
+		});
+		return cleanup;
 	}
 
 	private applyEventState(event: ProductSessionEventDto): void {
@@ -978,7 +1303,13 @@ export class SessionRuntime {
 	}
 
 	private verifyMaterializedSessionFile(): void {
-		if (this.sessionFileIdentityVerified || !this.sessionFile || !fs.existsSync(this.sessionFile)) return;
+		if (this.inspectMaterializedSessionFile()) this.sessionFileIdentityVerified = true;
+	}
+
+	/** Pure carrier phase-one validation; returns whether phase two must freeze the identity. */
+	private inspectMaterializedSessionFile(): boolean {
+		if (this.sessionFileIdentityVerified || !this.sessionFile || !fs.existsSync(this.sessionFile))
+			return false;
 		const frozenFile = inspectFrozenSessionFile(this.sessionFile);
 		if (
 			frozenFile.nativeSessionId !== this.nativeSessionId ||
@@ -986,7 +1317,7 @@ export class SessionRuntime {
 		) {
 			throw new RpcError("get_state", "materialized Pi Session Header does not match its pending identity");
 		}
-		this.sessionFileIdentityVerified = true;
+		return true;
 	}
 
 	private trackDialog(request: ExtensionUiRequestDto, processToken: number, publishState: boolean): void {
@@ -1167,7 +1498,15 @@ export class SessionRuntime {
 				}
 				turnBudget = { items, bytes };
 			}
-			seq = projection.commitInlineOnly(this.projectionIdentity(), frame, this.state);
+			if (this.opts.piPayloadServices) {
+				const committed = projection.commitPrepared(
+					projection.prepareCommit(this.projectionIdentity(), frame, this.state),
+				);
+				if (committed === null) throw new SessionLiveProjectionLimitError("snapshot");
+				seq = committed;
+			} else {
+				seq = projection.commitInlineOnly(this.projectionIdentity(), frame, this.state);
+			}
 		} catch (error) {
 			throw this.normalizeProjectionError(error);
 		}
@@ -1211,7 +1550,10 @@ export class SessionRuntime {
 	private handleFailure(processToken: number, info: PiProcessExitInfo): void {
 		if (processToken !== this.processToken || this.failedProcessToken === processToken) return;
 		this.failedProcessToken = processToken;
+		const contentOwner = this.generationContentOwner;
+		const discardedCleanup = this.discardedCompactionTransferCleanup;
 		this.proc = null;
+		this.generationContentOwner = null;
 		this.opts.onHotSetChanged?.(this);
 		this.finishProcessFinalization();
 		this.clearOwnedOperationalState(!this.snapshotOverflow);
@@ -1223,6 +1565,12 @@ export class SessionRuntime {
 				: this.describeFailure(info);
 		this.setState("crashed");
 		this.log("error", `Pi runtime crashed for ${this.sessionHandle}: ${this.error}`);
+		if ((contentOwner || discardedCleanup) && !this.stopPromise) {
+			this.beginTerminalGenerationCleanup("Crashed generation content cleanup", [
+				contentOwner?.release(),
+				discardedCleanup,
+			]);
+		}
 		if (!this.manuallyStopped && !this.snapshotOverflow) this.opts.onCrash(this);
 	}
 
@@ -1311,15 +1659,61 @@ export class SessionRuntime {
 	}
 
 	private maybeCompactIdleProjectionBase(): void {
-		if (this.idleBaseCompactionPromise || this.identityTransitionBlocker() !== null) return;
+		if (
+			this.idleBaseCompactionPromise ||
+			this.discardedCompactionTransferCleanup ||
+			this.identityTransitionBlocker() !== null
+		)
+			return;
 		const projection = this.liveProjection;
 		const proc = this.proc;
 		if (!projection || !proc?.running || !projection.shouldCompactIdleBase()) return;
 		const token = projection.beginIdleBaseCompaction();
 		if (!token || token.expectedAsOfSeq === projection.snapshot().baseSeq) return;
 		const processToken = this.processToken;
+		const contentOwner = this.generationContentOwner;
 		let compaction!: Promise<void>;
 		compaction = (async () => {
+			if (this.opts.piPayloadServices) {
+				let committed = false;
+				await proc.sendDecoded(
+					{ type: "get_messages" },
+					(delivery) => {
+						const { messages } = expectCommandData(delivery.value, "get_messages");
+						const prepared =
+							contentOwner &&
+							this.isCurrentGenerationContentOwner(processToken, proc, contentOwner) &&
+							this.liveProjection === projection
+								? projection.prepareIdleBaseCompaction(token, messages)
+								: null;
+						return delivery.prepare((transfer) => {
+							if (
+								!prepared ||
+								!contentOwner ||
+								!this.isCurrentGenerationContentOwner(processToken, proc, contentOwner) ||
+								this.liveProjection !== projection
+							) {
+								this.trackDiscardedCompactionTransfer(processToken, proc, contentOwner, transfer);
+								return true;
+							}
+							if (transfer) contentOwner.adopt(transfer);
+							try {
+								if (!projection.commitPreparedIdleBaseCompaction(prepared)) {
+									throw new RpcError("get_messages", "session_compaction_commit_invariant_failed");
+								}
+								this.assertWireSnapshotFits();
+								committed = true;
+							} catch (error) {
+								this.terminalizeGenerationContentFailure(processToken, proc, contentOwner, error);
+							}
+							return true;
+						});
+					},
+					this.timeoutFor("get_messages"),
+				);
+				if (!committed) return;
+				return;
+			}
 			const response = await proc.send({ type: "get_messages" }, this.timeoutFor("get_messages"));
 			if (processToken !== this.processToken || this.proc !== proc || this.liveProjection !== projection)
 				return;
@@ -1340,6 +1734,34 @@ export class SessionRuntime {
 				if (this.idleBaseCompactionPromise === compaction) this.idleBaseCompactionPromise = null;
 			});
 		this.idleBaseCompactionPromise = compaction;
+	}
+
+	private trackDiscardedCompactionTransfer(
+		processToken: number,
+		proc: PiProcess,
+		owner: GenerationContentOwner | null,
+		transfer: PiPayloadLeaseTransfer | null,
+	): void {
+		if (!transfer) return;
+		if (this.discardedCompactionTransferCleanup) {
+			throw new RpcError("get_messages", "session_compaction_cleanup_busy");
+		}
+		const cleanup = transfer.release();
+		this.discardedCompactionTransferCleanup = cleanup;
+		void cleanup.then(
+			() => {
+				if (this.discardedCompactionTransferCleanup === cleanup) {
+					this.discardedCompactionTransferCleanup = null;
+				}
+			},
+			(error) => {
+				if (owner && this.isCurrentGenerationContentOwner(processToken, proc, owner)) {
+					this.terminalizeGenerationContentFailure(processToken, proc, owner, error);
+				} else if (this.discardedCompactionTransferCleanup === cleanup) {
+					this.discardedCompactionTransferCleanup = null;
+				}
+			},
+		);
 	}
 
 	private async ensureProjectionHeadroomForWork(commandType: string): Promise<void> {
@@ -1472,28 +1894,28 @@ export class SessionRuntime {
 		this.manuallyStopped = true;
 		this.processToken += 1;
 		const proc = this.proc;
+		const contentOwner = this.generationContentOwner;
+		const discardedCleanup = this.discardedCompactionTransferCleanup;
 		const starting = this.startPromise;
 		this.proc = null;
+		this.generationContentOwner = null;
 		this.opts.onHotSetChanged?.(this);
 		this.clearOwnedOperationalState(false);
 		this.startupReady = false;
 		this.state = "crashed";
 		this.liveProjection = null;
 		this.touch();
-		if (proc && !this.stopPromise) {
-			let stopping!: Promise<void>;
-			stopping = (async () => {
-				try {
-					await proc.stop();
-					if (starting) await Promise.allSettled([starting]);
-					this.finishProcessFinalization();
-				} catch (error) {
-					this.log("warn", `Unable to stop overflowed Session ${this.sessionHandle}: ${String(error)}`);
-				} finally {
-					if (this.stopPromise === stopping) this.stopPromise = null;
-				}
-			})();
-			this.stopPromise = stopping;
+		if ((proc || contentOwner || discardedCleanup) && !this.stopPromise) {
+			const cleanup = this.beginTerminalGenerationCleanup("Overflowed generation cleanup", [
+				proc?.stop(),
+				contentOwner?.release(),
+				discardedCleanup,
+				starting ? Promise.allSettled([starting]) : undefined,
+			]);
+			void cleanup.then(
+				() => this.finishProcessFinalization(),
+				() => {},
+			);
 		}
 		this.emitSupervisorMessage({ type: "runtime_state", runtime: this.snapshot() });
 	}

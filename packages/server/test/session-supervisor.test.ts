@@ -2,13 +2,25 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import type { HotRuntimeInventoryDto, SessionRuntimeIdentityDto } from "@pi-agent-web/protocol";
+import type {
+	HotRuntimeInventoryDto,
+	SessionAttachmentRefDto,
+	SessionCommandResponseDto,
+	SessionRuntimeIdentityDto,
+} from "@pi-agent-web/protocol";
+import { SESSION_PAYLOAD_BUDGET } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { EpochContentHold } from "../src/epoch-content-store.js";
 import { legacyRpcV1Adapter } from "../src/legacy-rpc-v1.js";
 import { canonicalizeSessionFile, sessionHandleForFile } from "../src/native-session-catalog.js";
-import type { PiHostAdapter } from "../src/pi-host-adapter.js";
+import type { PiHostAdapter, PiHostDecodeOutcome } from "../src/pi-host-adapter.js";
+import type { PiPayloadLease } from "../src/pi-payload-externalizer.js";
 import type { SessionLiveProjectionLimits } from "../src/session-live-projection.js";
-import type { SessionIdentityTransitionCommit, SessionRuntime } from "../src/session-runtime.js";
+import type {
+	SessionIdentityTransitionCommit,
+	SessionRuntime,
+	SessionRuntimePiPayloadServices,
+} from "../src/session-runtime.js";
 import type {
 	ExistingSessionTarget,
 	SessionRuntimeSnapshot,
@@ -70,6 +82,7 @@ function createHarness(options: {
 	envForWorkspace?: (cwd: string) => Record<string, string>;
 	commandTimeoutFor?: (commandType: string) => number;
 	adapter?: PiHostAdapter;
+	piPayloadServices?: SessionRuntimePiPayloadServices;
 }) {
 	const messages: SessionSupervisorMessage[] = [];
 	const targets = new Map(options.targets.map((target) => [target.sessionHandle, target]));
@@ -103,6 +116,7 @@ function createHarness(options: {
 		extensionStateMaxItems: options.extensionStateMaxItems,
 		pendingDialogLimit: options.pendingDialogLimit,
 		projectionLimits: options.projectionLimits,
+		piPayloadServices: options.piPayloadServices,
 		commandTimeoutFor: options.commandTimeoutFor,
 		restartBaseDelayMs: options.restartBaseDelayMs ?? 5,
 		maxAutoRestarts: options.maxAutoRestarts,
@@ -112,6 +126,130 @@ function createHarness(options: {
 	});
 	supervisors.push(supervisor);
 	return { supervisor, messages, targets };
+}
+
+function attachmentRef(sha256: string): SessionAttachmentRefDto {
+	return Object.freeze({
+		type: "attachment_ref",
+		serverEpoch: "session-supervisor-test-epoch",
+		sha256,
+		mediaType: "image/png",
+		byteLength: 4,
+	});
+}
+
+function trackedLease(
+	ref: SessionAttachmentRefDto,
+	tracking: { adopted: EpochContentHold[][]; released: EpochContentHold[] },
+): { hold: EpochContentHold; lease: PiPayloadLease } {
+	const hold: EpochContentHold = Object.freeze({ ref });
+	let state: "pending" | "transferred" | "adopted" | "released" = "pending";
+	const lease: PiPayloadLease = Object.freeze({
+		refs: Object.freeze([ref]),
+		transfer() {
+			if (state !== "pending") throw new Error("test lease is not pending");
+			state = "transferred";
+			return Object.freeze({
+				refs: Object.freeze([ref]),
+				adopt(accept: Parameters<ReturnType<PiPayloadLease["transfer"]>["adopt"]>[0]) {
+					if (state !== "transferred") throw new Error("test transfer is not pending");
+					if (accept([hold]) !== true) throw new Error("test transfer adoption was rejected");
+					tracking.adopted.push([hold]);
+					state = "adopted";
+				},
+				async release() {
+					if (state !== "transferred") return;
+					state = "released";
+					tracking.released.push(hold);
+				},
+			});
+		},
+		async release() {
+			if (state !== "pending") return;
+			state = "released";
+			tracking.released.push(hold);
+		},
+	});
+	return { hold, lease };
+}
+
+function rejectingTransferLease(
+	ref: SessionAttachmentRefDto,
+	tracking: { transferReleaseAttempts: number },
+): PiPayloadLease {
+	let state: "pending" | "transferred" = "pending";
+	return Object.freeze({
+		refs: Object.freeze([ref]),
+		transfer() {
+			if (state !== "pending") throw new Error("test lease is not pending");
+			state = "transferred";
+			return Object.freeze({
+				refs: Object.freeze([ref]),
+				adopt() {
+					throw new Error("stale test transfer must not be adopted");
+				},
+				async release() {
+					tracking.transferReleaseAttempts += 1;
+					throw new Error("fixture stale transfer release failed");
+				},
+			});
+		},
+		async release() {
+			throw new Error("transferred test lease cannot be released directly");
+		},
+	});
+}
+
+function testPayloadServices(released: EpochContentHold[]): SessionRuntimePiPayloadServices {
+	return {
+		externalizer: {
+			context: {
+				serverEpoch: "session-supervisor-test-epoch",
+				payloadBudget: SESSION_PAYLOAD_BUDGET,
+			},
+			externalize: async () => {
+				throw new Error("the carrier fixture owns decoded outcomes");
+			},
+		},
+		releaseHold: async (entry) => {
+			released.push(entry);
+		},
+	};
+}
+
+function startupBaseAdapter(ref: SessionAttachmentRefDto, lease: PiPayloadLease): PiHostAdapter {
+	let attached = false;
+	return {
+		...legacyRpcV1Adapter,
+		async decodeResponse(value, expectedCommand, context) {
+			const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, {
+				signal: context?.signal ?? new AbortController().signal,
+			});
+			if (expectedCommand !== "get_messages" || attached || outcome.value.success !== true) {
+				return outcome;
+			}
+			attached = true;
+			const decoded: PiHostDecodeOutcome<SessionCommandResponseDto & { id: string }> = {
+				value: {
+					type: "response",
+					id: outcome.value.id,
+					command: "get_messages",
+					success: true,
+					data: {
+						messages: [
+							{
+								role: "user",
+								content: [{ type: "image", data: ref, mimeType: "image/png" }],
+								timestamp: 1,
+							},
+						],
+					},
+				},
+				lease,
+			};
+			return decoded;
+		},
+	};
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
@@ -498,6 +636,561 @@ describe("SessionSupervisor", () => {
 			seq: initial.runtime.lastSeq,
 		});
 		expect(staleEpoch).toMatchObject({ type: "resync_required", reason: "server_epoch_changed" });
+	});
+
+	it("adopts a ref-bearing startup base into the exact active generation before publishing it", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "startup-owned-image");
+		const exactRef = attachmentRef("a".repeat(64));
+		const adopted: EpochContentHold[][] = [];
+		const released: EpochContentHold[] = [];
+		const tracking = { adopted, released };
+		const { hold, lease } = trackedLease(exactRef, tracking);
+		const adapter = startupBaseAdapter(exactRef, lease);
+		const piPayloadServices = testPayloadServices(released);
+		const { supervisor, messages } = createHarness({
+			targets: [target],
+			adapter,
+			piPayloadServices,
+			maxAutoRestarts: 0,
+		});
+
+		await expect(supervisor.activate(target.sessionHandle)).resolves.toMatchObject({ state: "idle" });
+		const initial = await supervisor.subscribe(target.sessionHandle);
+		expect(initial).toMatchObject({
+			type: "resync_required",
+			snapshot: {
+				settledMessages: [
+					expect.objectContaining({
+						content: [expect.objectContaining({ data: exactRef })],
+					}),
+				],
+			},
+		});
+		expect(adopted).toEqual([[hold]]);
+		expect(released).toEqual([]);
+		expect(
+			messages.findIndex((message) => message.type === "runtime_state" && message.runtime.state === "idle"),
+		).toBeGreaterThanOrEqual(0);
+	});
+
+	it("flushes an owner-held ref event buffered before the startup base through the trusted projection", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "startup-owned-event");
+		const exactRef = attachmentRef("2".repeat(64));
+		const adopted: EpochContentHold[][] = [];
+		const released: EpochContentHold[] = [];
+		const { hold, lease } = trackedLease(exactRef, { adopted, released });
+		let attached = false;
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			decodeResponse(value, expectedCommand, context) {
+				return legacyRpcV1Adapter.decodeResponse(value, expectedCommand, {
+					signal: context?.signal ?? new AbortController().signal,
+				});
+			},
+			async decodeUnsolicited(value, context) {
+				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, {
+					signal: context?.signal ?? new AbortController().signal,
+				});
+				if (attached || outcome.value.kind !== "event" || outcome.value.event.type !== "agent_start") {
+					return outcome;
+				}
+				attached = true;
+				return {
+					value: {
+						kind: "event" as const,
+						event: {
+							type: "message_end" as const,
+							message: {
+								role: "user" as const,
+								content: [{ type: "image" as const, data: exactRef, mimeType: "image/png" }],
+								timestamp: 5,
+							},
+						},
+					},
+					lease,
+				};
+			},
+		};
+		const { supervisor } = createHarness({
+			targets: [target],
+			adapter,
+			piPayloadServices: testPayloadServices(released),
+			env: { PI_WEB_FIXTURE_STARTUP_PROJECTION_DOMAINS: "1" },
+			maxAutoRestarts: 0,
+		});
+
+		await expect(supervisor.activate(target.sessionHandle)).resolves.toMatchObject({ state: "waiting_ui" });
+		const initial = await supervisor.subscribe(target.sessionHandle);
+		expect(initial).toMatchObject({
+			type: "resync_required",
+			snapshot: {
+				projectionEvents: expect.arrayContaining([
+					expect.objectContaining({
+						event: expect.objectContaining({
+							message: expect.objectContaining({
+								content: [expect.objectContaining({ data: exactRef })],
+							}),
+						}),
+					}),
+				]),
+			},
+		});
+		expect(adopted).toEqual([[hold]]);
+		expect(released).toEqual([]);
+	});
+
+	it("keeps stop fenced until the active generation owner releases every adopted hold", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "owned-stop-fence");
+		const exactRef = attachmentRef("e".repeat(64));
+		const adopted: EpochContentHold[][] = [];
+		const released: EpochContentHold[] = [];
+		const { hold, lease } = trackedLease(exactRef, { adopted, released });
+		let releaseGate!: () => void;
+		const gated = new Promise<void>((resolve) => {
+			releaseGate = resolve;
+		});
+		const services = testPayloadServices(released);
+		const { supervisor } = createHarness({
+			targets: [target],
+			adapter: startupBaseAdapter(exactRef, lease),
+			piPayloadServices: {
+				...services,
+				releaseHold: async (entry) => {
+					released.push(entry);
+					await gated;
+				},
+			},
+			maxAutoRestarts: 0,
+		});
+		await supervisor.activate(target.sessionHandle);
+
+		const stopping = supervisor.stop(target.sessionHandle);
+		await expect(
+			Promise.race([
+				stopping.then(() => "stopped" as const),
+				new Promise<"waiting">((resolve) => setTimeout(() => resolve("waiting"), 20)),
+			]),
+		).resolves.toBe("waiting");
+		expect(adopted).toEqual([[hold]]);
+		expect(released).toEqual([hold]);
+		releaseGate();
+		await stopping;
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({ state: "dormant" });
+	});
+
+	it("blocks a replacement generation when active owner teardown fails", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "owned-stop-failure");
+		const exactRef = attachmentRef("f".repeat(64));
+		const adopted: EpochContentHold[][] = [];
+		const released: EpochContentHold[] = [];
+		const { lease } = trackedLease(exactRef, { adopted, released });
+		const services = testPayloadServices(released);
+		const { supervisor } = createHarness({
+			targets: [target],
+			adapter: startupBaseAdapter(exactRef, lease),
+			piPayloadServices: {
+				...services,
+				releaseHold: async () => {
+					throw new Error("fixture owner release failed");
+				},
+			},
+			maxAutoRestarts: 0,
+		});
+		const before = await supervisor.activate(target.sessionHandle);
+
+		await expect(supervisor.stop(target.sessionHandle)).rejects.toThrow("Session generation cleanup failed");
+		await expect(supervisor.activate(target.sessionHandle)).rejects.toThrow(
+			"generation_content_cleanup_failed",
+		);
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({
+			generation: before.generation,
+			error: "generation_content_cleanup_failed",
+		});
+	});
+
+	it("terminalizes the exact active generation when duplicate-hold cleanup poisons its owner", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "owned-fatal-cleanup");
+		const exactRef = attachmentRef("1".repeat(64));
+		const adopted: EpochContentHold[][] = [];
+		const leaseReleased: EpochContentHold[] = [];
+		const first = trackedLease(exactRef, { adopted, released: leaseReleased });
+		const duplicate = trackedLease(exactRef, { adopted, released: leaseReleased });
+		let attachedEvent = false;
+		const base = startupBaseAdapter(exactRef, first.lease);
+		const adapter: PiHostAdapter = {
+			...base,
+			async decodeUnsolicited(value, context) {
+				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, {
+					signal: context?.signal ?? new AbortController().signal,
+				});
+				if (attachedEvent || outcome.value.kind !== "event" || outcome.value.event.type !== "agent_end") {
+					return outcome;
+				}
+				attachedEvent = true;
+				return { value: outcome.value, lease: duplicate.lease };
+			},
+		};
+		const ownerReleased: EpochContentHold[] = [];
+		const services = testPayloadServices(ownerReleased);
+		const { supervisor } = createHarness({
+			targets: [target],
+			adapter,
+			piPayloadServices: {
+				...services,
+				releaseHold: async (entry) => {
+					ownerReleased.push(entry);
+					if (entry === duplicate.hold) throw new Error("fixture duplicate cleanup failed");
+				},
+			},
+			maxAutoRestarts: 0,
+		});
+		const controller = await supervisor.claim(target.sessionHandle, "controller");
+		const runtime = supervisor.getRuntime(target.sessionHandle)!;
+
+		await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "prompt", message: "small-structural-turn" },
+			{
+				connectionId: "controller",
+				expectedGeneration: runtime.generation,
+				fencingToken: controller.fencingToken,
+			},
+		);
+		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "crashed");
+
+		expect(adopted).toEqual([[first.hold], [duplicate.hold]]);
+		await expect(supervisor.activate(target.sessionHandle)).rejects.toThrow(/cleanup failed/i);
+		expect(supervisor.isActive(target.sessionHandle)).toBe(false);
+		expect(ownerReleased).toContain(first.hold);
+		expect(supervisor.getRuntime(target.sessionHandle)?.generation).toBe(runtime.generation);
+	});
+
+	it("adopts a ref-bearing active history response before resolving it to the caller", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "active-owned-history");
+		const exactRef = attachmentRef("b".repeat(64));
+		const adopted: EpochContentHold[][] = [];
+		const released: EpochContentHold[] = [];
+		const tracking = { adopted, released };
+		const { hold, lease } = trackedLease(exactRef, tracking);
+		let getMessagesCount = 0;
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeResponse(value, expectedCommand, context) {
+				const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, {
+					signal: context?.signal ?? new AbortController().signal,
+				});
+				if (expectedCommand !== "get_messages") return outcome;
+				getMessagesCount += 1;
+				if (getMessagesCount !== 2 || outcome.value.success !== true) return outcome;
+				const decoded: PiHostDecodeOutcome<SessionCommandResponseDto & { id: string }> = {
+					value: {
+						type: "response",
+						id: outcome.value.id,
+						command: "get_messages",
+						success: true,
+						data: {
+							messages: [
+								{
+									role: "user",
+									content: [{ type: "image", data: exactRef, mimeType: "image/png" }],
+									timestamp: 2,
+								},
+							],
+						},
+					},
+					lease,
+				};
+				return decoded;
+			},
+		};
+		const { supervisor } = createHarness({
+			targets: [target],
+			adapter,
+			piPayloadServices: testPayloadServices(released),
+			maxAutoRestarts: 0,
+		});
+		const runtime = await supervisor.activate(target.sessionHandle);
+
+		const response = await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "get_messages" },
+			{ connectionId: "reader", expectedGeneration: runtime.generation },
+		);
+
+		expect(response).toMatchObject({
+			response: {
+				success: true,
+				data: {
+					messages: [
+						expect.objectContaining({
+							content: [expect.objectContaining({ data: exactRef })],
+						}),
+					],
+				},
+			},
+		});
+		expect(adopted).toEqual([[hold]]);
+		expect(released).toEqual([]);
+	});
+
+	it("prepares and adopts a ref-bearing active event before seq and replay publication", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "active-owned-event");
+		const exactRef = attachmentRef("c".repeat(64));
+		const adopted: EpochContentHold[][] = [];
+		const released: EpochContentHold[] = [];
+		const tracking = { adopted, released };
+		const { hold, lease } = trackedLease(exactRef, tracking);
+		let attached = false;
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			decodeResponse(value, expectedCommand, context) {
+				return legacyRpcV1Adapter.decodeResponse(value, expectedCommand, {
+					signal: context?.signal ?? new AbortController().signal,
+				});
+			},
+			async decodeUnsolicited(value, context) {
+				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, {
+					signal: context?.signal ?? new AbortController().signal,
+				});
+				if (outcome.value.kind !== "event" || outcome.value.event.type !== "agent_end" || attached) {
+					return outcome;
+				}
+				attached = true;
+				return {
+					value: {
+						kind: "event" as const,
+						event: {
+							type: "agent_end" as const,
+							messages: [
+								{
+									role: "user" as const,
+									content: [{ type: "image" as const, data: exactRef, mimeType: "image/png" }],
+									timestamp: 3,
+								},
+							],
+							willRetry: false,
+						},
+					},
+					lease,
+				};
+			},
+		};
+		const { supervisor, messages } = createHarness({
+			targets: [target],
+			adapter,
+			piPayloadServices: testPayloadServices(released),
+			maxAutoRestarts: 0,
+		});
+		const runtime = await supervisor.activate(target.sessionHandle);
+		const controller = await supervisor.claim(target.sessionHandle, "controller");
+
+		await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "prompt", message: "small-structural-turn" },
+			{
+				connectionId: "controller",
+				expectedGeneration: runtime.generation,
+				fencingToken: controller.fencingToken,
+			},
+		);
+		await waitFor(() => adopted.length === 1);
+
+		const published = messages.find(
+			(message) => message.type === "event" && message.event.type === "agent_end",
+		);
+		expect(published).toMatchObject({
+			type: "event",
+			event: {
+				messages: [
+					expect.objectContaining({
+						content: [expect.objectContaining({ data: exactRef })],
+					}),
+				],
+			},
+		});
+		expect(adopted).toEqual([[hold]]);
+		expect(released).toEqual([]);
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({ state: "idle" });
+	});
+
+	it("adopts a ref-bearing idle compaction base only after its CAS prepare succeeds", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "active-owned-compaction");
+		const exactRef = attachmentRef("d".repeat(64));
+		const adopted: EpochContentHold[][] = [];
+		const released: EpochContentHold[] = [];
+		const tracking = { adopted, released };
+		const { hold, lease } = trackedLease(exactRef, tracking);
+		let getMessagesCount = 0;
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeResponse(value, expectedCommand, context) {
+				const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, {
+					signal: context?.signal ?? new AbortController().signal,
+				});
+				if (expectedCommand !== "get_messages") return outcome;
+				getMessagesCount += 1;
+				if (getMessagesCount !== 2 || outcome.value.success !== true) return outcome;
+				const decoded: PiHostDecodeOutcome<SessionCommandResponseDto & { id: string }> = {
+					value: {
+						type: "response",
+						id: outcome.value.id,
+						command: "get_messages",
+						success: true,
+						data: {
+							messages: [
+								{
+									role: "user",
+									content: [{ type: "image", data: exactRef, mimeType: "image/png" }],
+									timestamp: 4,
+								},
+							],
+						},
+					},
+					lease,
+				};
+				return decoded;
+			},
+			decodeUnsolicited(value, context) {
+				return legacyRpcV1Adapter.decodeUnsolicited(value, {
+					signal: context?.signal ?? new AbortController().signal,
+				});
+			},
+		};
+		const { supervisor } = createHarness({
+			targets: [target],
+			adapter,
+			piPayloadServices: testPayloadServices(released),
+			projectionLimits: { maxLiveEventItems: 8 },
+			maxAutoRestarts: 0,
+		});
+		const controller = await supervisor.claim(target.sessionHandle, "controller");
+		const runtime = supervisor.getRuntime(target.sessionHandle)!;
+
+		await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "prompt", message: "small-structural-turn" },
+			{
+				connectionId: "controller",
+				expectedGeneration: runtime.generation,
+				fencingToken: controller.fencingToken,
+			},
+		);
+		await waitFor(() => adopted.length === 1);
+
+		const initial = await supervisor.subscribe(target.sessionHandle);
+		expect(initial).toMatchObject({
+			type: "resync_required",
+			snapshot: {
+				baseSeq: expect.any(Number),
+				settledMessages: [
+					expect.objectContaining({
+						content: [expect.objectContaining({ data: exactRef })],
+					}),
+				],
+				projectionEvents: [],
+			},
+		});
+		expect(adopted).toEqual([[hold]]);
+		expect(released).toEqual([]);
+	});
+
+	it("permanently blocks replacement when a stale ref-bearing compaction transfer cannot release", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "stale-compaction-release-failure");
+		const exactRef = attachmentRef("3".repeat(64));
+		const tracking = { transferReleaseAttempts: 0 };
+		const lease = rejectingTransferLease(exactRef, tracking);
+		let getMessagesCount = 0;
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeResponse(value, expectedCommand, context) {
+				const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, {
+					signal: context?.signal ?? new AbortController().signal,
+				});
+				if (expectedCommand !== "get_messages") return outcome;
+				getMessagesCount += 1;
+				if (getMessagesCount !== 2 || outcome.value.success !== true) return outcome;
+				return {
+					value: {
+						type: "response" as const,
+						id: outcome.value.id,
+						command: "get_messages" as const,
+						success: true as const,
+						data: {
+							messages: [
+								{
+									role: "user" as const,
+									content: [{ type: "image" as const, data: exactRef, mimeType: "image/png" }],
+									timestamp: 6,
+								},
+							],
+						},
+					},
+					lease,
+				};
+			},
+			decodeUnsolicited(value, context) {
+				return legacyRpcV1Adapter.decodeUnsolicited(value, {
+					signal: context?.signal ?? new AbortController().signal,
+				});
+			},
+		};
+		const released: EpochContentHold[] = [];
+		const { supervisor } = createHarness({
+			targets: [target],
+			adapter,
+			piPayloadServices: testPayloadServices(released),
+			projectionLimits: { maxLiveEventItems: 8 },
+			env: { PI_WEB_FIXTURE_COMPACTION_RACE: "1" },
+			maxAutoRestarts: 0,
+		});
+		const controller = await supervisor.claim(target.sessionHandle, "controller");
+		const runtime = supervisor.getRuntime(target.sessionHandle)!;
+
+		await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "prompt", message: "small-structural-turn" },
+			{
+				connectionId: "controller",
+				expectedGeneration: runtime.generation,
+				fencingToken: controller.fencingToken,
+			},
+		);
+		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "crashed");
+
+		expect(tracking.transferReleaseAttempts).toBe(1);
+		await expect(supervisor.activate(target.sessionHandle)).rejects.toThrow(/cleanup failed/i);
+		await expect(supervisor.activate(target.sessionHandle)).rejects.toThrow(
+			"generation_content_cleanup_failed",
+		);
+		expect(supervisor.getRuntime(target.sessionHandle)?.generation).toBe(runtime.generation);
+		expect(released).toEqual([]);
 	});
 
 	it("fails a projection overflow without publishing or entering an automatic restart loop", async () => {
@@ -1819,6 +2512,53 @@ describe("SessionSupervisor", () => {
 		},
 	);
 
+	it.each([
+		{ name: "default-off", services: false },
+		{ name: "payload-enabled", services: true },
+	])("settles a $name stop while the ready handshake is still pending", async ({ services }) => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, `startup-stop-${String(services)}`);
+		const adapter: PiHostAdapter = services
+			? {
+					...legacyRpcV1Adapter,
+					decodeResponse(value, expectedCommand, context) {
+						return legacyRpcV1Adapter.decodeResponse(value, expectedCommand, {
+							signal: context?.signal ?? new AbortController().signal,
+						});
+					},
+					decodeUnsolicited(value, context) {
+						return legacyRpcV1Adapter.decodeUnsolicited(value, {
+							signal: context?.signal ?? new AbortController().signal,
+						});
+					},
+				}
+			: legacyRpcV1Adapter;
+		const released: EpochContentHold[] = [];
+		const { supervisor } = createHarness({
+			targets: [target],
+			adapter,
+			...(services ? { piPayloadServices: testPayloadServices(released) } : {}),
+			env: { PI_WEB_FIXTURE_READY_DELAY_MS: "250" },
+			maxAutoRestarts: 0,
+		});
+
+		const activation = supervisor.activate(target.sessionHandle);
+		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "starting");
+		const stopping = supervisor.stop(target.sessionHandle);
+		const settled = Promise.allSettled([activation, stopping]);
+
+		await expect(
+			Promise.race([
+				settled.then(() => "settled" as const),
+				new Promise<"timed_out">((resolve) => setTimeout(() => resolve("timed_out"), 1_000)),
+			]),
+		).resolves.toBe("settled");
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({ state: "dormant" });
+		expect(released).toEqual([]);
+	});
+
 	it("never evicts active work when the hot runtime capacity is exhausted", async () => {
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace");
@@ -2421,6 +3161,66 @@ describe("SessionSupervisor", () => {
 		const reopenedParent = await supervisor.activate(parent.sessionHandle);
 		expect(reopenedParent.nativeSessionId).toBe("parent");
 		expect(supervisor.listRuntimes()).toHaveLength(2);
+	});
+
+	it("fails a payload-enabled identity transition before sending Pi or changing generation ownership", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const parent = createNativeSession(root, cwd, "payload-transition-parent");
+		const encoded: string[] = [];
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			encodeCommand(command) {
+				encoded.push(command.type);
+				return legacyRpcV1Adapter.encodeCommand(command);
+			},
+			decodeResponse(value, expectedCommand, context) {
+				return legacyRpcV1Adapter.decodeResponse(value, expectedCommand, {
+					signal: context?.signal ?? new AbortController().signal,
+				});
+			},
+			decodeUnsolicited(value, context) {
+				return legacyRpcV1Adapter.decodeUnsolicited(value, {
+					signal: context?.signal ?? new AbortController().signal,
+				});
+			},
+		};
+		const released: EpochContentHold[] = [];
+		const { supervisor } = createHarness({
+			targets: [parent],
+			adapter,
+			piPayloadServices: testPayloadServices(released),
+			maxAutoRestarts: 0,
+		});
+		const lease = await supervisor.claim(parent.sessionHandle, "controller");
+		const before = supervisor.getRuntime(parent.sessionHandle)!;
+		const internal = supervisor as unknown as { runtimes: Map<string, SessionRuntime> };
+		const runtime = internal.runtimes.get(parent.sessionHandle)!;
+		const ownerBefore = (runtime as unknown as { generationContentOwner: unknown }).generationContentOwner;
+		encoded.length = 0;
+
+		await expect(
+			supervisor.sendCommand(
+				parent.sessionHandle,
+				{ type: "clone" },
+				{
+					connectionId: "controller",
+					expectedGeneration: before.generation,
+					fencingToken: lease.fencingToken,
+				},
+			),
+		).rejects.toThrow("session_payload_identity_transition_not_supported");
+		expect(encoded).toEqual([]);
+		expect(supervisor.getRuntime(parent.sessionHandle)).toMatchObject({
+			generation: before.generation,
+			sessionHandle: parent.sessionHandle,
+			state: "idle",
+		});
+		expect((runtime as unknown as { generationContentOwner: unknown }).generationContentOwner).toBe(
+			ownerBefore,
+		);
+		expect(released).toEqual([]);
 	});
 
 	it("accepts Pi's unpersisted child identity when forking before the first user entry", async () => {

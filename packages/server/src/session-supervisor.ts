@@ -18,6 +18,7 @@ import {
 	type SessionHotRuntimeObservation,
 	type SessionIdentityTransitionCommit,
 	SessionRuntime,
+	type SessionRuntimePiPayloadServices,
 } from "./session-runtime.js";
 import {
 	type ExistingSessionTarget,
@@ -85,6 +86,8 @@ export interface SessionSupervisorOptions {
 	extensionStateMaxItems?: number;
 	pendingDialogLimit?: number;
 	projectionLimits?: Partial<SessionLiveProjectionLimits>;
+	/** Server-private and default-off until Main installs the complete attachment pipeline. */
+	piPayloadServices?: SessionRuntimePiPayloadServices;
 	commandTimeoutFor?: (commandType: string) => number;
 	maxHotRuntimes?: number;
 	idleTtlMs?: number;
@@ -906,6 +909,7 @@ export class SessionSupervisor {
 			extensionStateMaxItems: this.opts.extensionStateMaxItems,
 			pendingDialogLimit: this.opts.pendingDialogLimit,
 			projectionLimits: this.opts.projectionLimits,
+			piPayloadServices: this.opts.piPayloadServices,
 			initialGeneration,
 			commandTimeoutFor: this.opts.commandTimeoutFor,
 			emit: (message) => this.safeBroadcast(message),
