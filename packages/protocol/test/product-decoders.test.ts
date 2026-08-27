@@ -7,6 +7,7 @@ import {
 	isSessionMessageDto,
 	isSessionTreeDto,
 	isSessionWsServerMessage,
+	SESSION_PAYLOAD_BUDGET,
 } from "../src/index.js";
 
 const usage = {
@@ -28,6 +29,19 @@ const state = {
 	autoCompactionEnabled: true,
 	messageCount: 4,
 	pendingMessageCount: 0,
+};
+
+const attachmentRef = {
+	type: "attachment_ref",
+	serverEpoch: "gateway-epoch-a",
+	sha256: "a".repeat(64),
+	mediaType: "image/png",
+	byteLength: 4,
+} as const;
+
+const attachmentContext = {
+	serverEpoch: "gateway-epoch-a",
+	payloadBudget: SESSION_PAYLOAD_BUDGET,
 };
 
 function response(data: unknown) {
@@ -54,6 +68,149 @@ function event(payload: unknown) {
 }
 
 describe("product-owned protocol decoders", () => {
+	it("admits image references only with the trusted epoch and complete negotiated budget", () => {
+		const message = {
+			role: "user",
+			content: [{ type: "image", data: attachmentRef, mimeType: "image/png" }],
+			timestamp: 1,
+		};
+
+		expect(isSessionMessageDto(message)).toBe(false);
+		expect(isSessionMessageDto(message, attachmentContext)).toBe(true);
+		expect(isSessionMessageDto(message, { ...attachmentContext, serverEpoch: "gateway-epoch-b" })).toBe(
+			false,
+		);
+		expect(
+			isSessionMessageDto(message, {
+				...attachmentContext,
+				payloadBudget: { ...SESSION_PAYLOAD_BUDGET, maxAttachmentBlobBytes: 3 },
+			}),
+		).toBe(false);
+	});
+
+	it("fails closed for ref media mismatches, non-raster refs, and excess image items", () => {
+		const message = (data: unknown, mimeType: string) => ({
+			role: "toolResult",
+			toolCallId: "call",
+			toolName: "tool",
+			content: [{ type: "image", data, mimeType }],
+			isError: false,
+			timestamp: 1,
+		});
+
+		expect(isSessionMessageDto(message(attachmentRef, "image/jpeg"), attachmentContext)).toBe(false);
+		expect(
+			isSessionMessageDto(
+				message({ ...attachmentRef, mediaType: "application/json" }, "application/json"),
+				attachmentContext,
+			),
+		).toBe(false);
+		expect(
+			isSessionMessageDto(
+				{
+					...message(attachmentRef, "image/png"),
+					content: Array.from({ length: 2 }, () => ({
+						type: "image",
+						data: attachmentRef,
+						mimeType: "image/png",
+					})),
+				},
+				{
+					...attachmentContext,
+					payloadBudget: { ...SESSION_PAYLOAD_BUDGET, maxImageCount: 1 },
+				},
+			),
+		).toBe(false);
+	});
+
+	it("validates image refs through event and response paths against the trusted outer epoch", () => {
+		const message = {
+			role: "user",
+			content: [{ type: "image", data: attachmentRef, mimeType: "image/png" }],
+			timestamp: 1,
+		};
+		const refEvent = event({ type: "message_start", message });
+		const refResponse = {
+			...response(state),
+			response: {
+				type: "response",
+				id: "request-1",
+				command: "get_messages",
+				success: true,
+				data: { messages: [message] },
+			},
+		};
+
+		expect(isSessionWsServerMessage(refEvent)).toBe(false);
+		expect(isSessionWsServerMessage(refEvent, attachmentContext)).toBe(true);
+		expect(isSessionWsServerMessage(refResponse, attachmentContext)).toBe(true);
+		expect(
+			isSessionWsServerMessage(
+				{
+					...refEvent,
+					serverEpoch: "gateway-epoch-b",
+					event: {
+						type: "message_start",
+						message: {
+							...message,
+							content: [
+								{
+									type: "image",
+									data: { ...attachmentRef, serverEpoch: "gateway-epoch-b" },
+									mimeType: "image/png",
+								},
+							],
+						},
+					},
+				},
+				attachmentContext,
+			),
+		).toBe(false);
+	});
+
+	it("propagates image-ref admission through every historical response container", () => {
+		const message = {
+			role: "toolResult",
+			toolCallId: "call",
+			toolName: "image-tool",
+			content: [{ type: "image", data: attachmentRef, mimeType: "image/png" }],
+			isError: false,
+			timestamp: 1,
+		};
+		const entry = {
+			type: "message",
+			id: "entry-1",
+			parentId: null,
+			timestamp: "2026-08-27T00:00:00.000Z",
+			message,
+		};
+		const responses = [
+			{
+				type: "response",
+				command: "get_messages",
+				success: true,
+				data: { messages: [message] },
+			},
+			{
+				type: "response",
+				command: "get_entries",
+				success: true,
+				data: { entries: [entry], leafId: "entry-1" },
+			},
+			{
+				type: "response",
+				command: "get_tree",
+				success: true,
+				data: { tree: [{ entry, children: [] }], leafId: "entry-1" },
+			},
+		];
+
+		for (const candidate of responses) {
+			expect(isSessionCommandResponseDto(candidate)).toBe(false);
+			expect(isSessionCommandResponseDto(candidate, attachmentContext)).toBe(true);
+		}
+	});
+
 	it("accepts every bounded optional field emitted by the supported Pi message schema", () => {
 		const extendedUsage = { ...usage, cacheWrite1h: 1, reasoning: 1 };
 		expect(

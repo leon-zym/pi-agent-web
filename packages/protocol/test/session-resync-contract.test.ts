@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+	isProductSessionEventDto,
+	isSessionMessageDto,
 	isSessionSnapshotDto,
 	isSessionWsClientMessage,
 	isSessionWsServerMessage,
+	SESSION_PAYLOAD_BUDGET,
 	type SessionRuntimeDto,
 	type SessionSnapshotDto,
 	sessionWsServerMessageBytes,
@@ -198,6 +201,47 @@ describe("epoch-aware Session resync protocol", () => {
 				],
 			}),
 		).toBe(false);
+	});
+
+	it("admits snapshot image refs only against the trusted current epoch and budget", () => {
+		const attachment = {
+			type: "attachment_ref" as const,
+			serverEpoch,
+			sha256: "a".repeat(64),
+			mediaType: "image/png",
+			byteLength: 4,
+		};
+		const value = snapshot({
+			settledMessages: [
+				{
+					role: "user",
+					content: [{ type: "image", data: attachment, mimeType: "image/png" }],
+					timestamp: 1,
+				},
+			],
+			projectionEvents: [
+				{
+					...projectionEvent(2),
+					event: {
+						type: "message_start",
+						message: {
+							role: "user",
+							content: [{ type: "image", data: { ...attachment }, mimeType: "image/png" }],
+							timestamp: 1,
+						},
+					},
+				},
+				projectionEvent(4),
+			],
+		});
+		const context = { serverEpoch, payloadBudget: SESSION_PAYLOAD_BUDGET };
+
+		expect(isSessionMessageDto(value.settledMessages[0], context)).toBe(true);
+		expect(isProductSessionEventDto(value.projectionEvents[0]?.event, context)).toBe(true);
+		expect(isSessionSnapshotDto(value)).toBe(false);
+		expect(isSessionSnapshotDto(value, context)).toBe(true);
+		expect(isSessionWsServerMessage(value, context)).toBe(true);
+		expect(isSessionSnapshotDto(value, { ...context, serverEpoch: "gateway-epoch-b" })).toBe(false);
 	});
 
 	it("rejects mixed incarnations and invalid snapshot waterlines", () => {

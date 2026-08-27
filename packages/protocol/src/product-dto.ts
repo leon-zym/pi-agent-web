@@ -1,12 +1,19 @@
 /** Product-owned Browser/Gateway DTOs. No upstream Pi types may cross this module. */
 
-import type { SessionPayloadAdmissionErrorDto } from "./payload-budget.js";
+import type { SessionAttachmentRefDto, SessionPayloadAdmissionErrorDto } from "./payload-budget.js";
 
 export type ThinkingLevelDto = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface ImageContentDto {
 	type: "image";
 	data: string;
+	mimeType: string;
+}
+
+/** Gateway-to-Browser image content. Browser-to-Gateway commands remain inline-only ImageContentDto. */
+export interface SessionImageContentDto {
+	type: "image";
+	data: string | SessionAttachmentRefDto;
 	mimeType: string;
 }
 
@@ -75,7 +82,7 @@ export interface DeferredHandleDto {
 
 export interface UserMessageDto {
 	role: "user";
-	content: string | (TextContentDto | ImageContentDto)[];
+	content: string | (TextContentDto | SessionImageContentDto)[];
 	timestamp: number;
 }
 
@@ -101,7 +108,7 @@ export interface ToolResultMessageDto {
 	role: "toolResult";
 	toolCallId: string;
 	toolName: string;
-	content: (TextContentDto | ImageContentDto)[];
+	content: (TextContentDto | SessionImageContentDto)[];
 	details?: unknown;
 	usage?: UsageDto;
 	addedToolNames?: string[];
@@ -124,7 +131,7 @@ export interface BashExecutionMessageDto {
 export interface CustomMessageDto {
 	role: "custom";
 	customType: string;
-	content: string | (TextContentDto | ImageContentDto)[];
+	content: string | (TextContentDto | SessionImageContentDto)[];
 	display: boolean;
 	details?: unknown;
 	timestamp: number;
@@ -248,7 +255,7 @@ export type SessionEntryDto =
 	| (SessionEntryBaseDto & {
 			type: "custom_message";
 			customType: string;
-			content: string | (TextContentDto | ImageContentDto)[];
+			content: string | (TextContentDto | SessionImageContentDto)[];
 			details?: unknown;
 			display: boolean;
 	  })

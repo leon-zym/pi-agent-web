@@ -20,8 +20,10 @@ import {
 	isExtensionUiRequestDto,
 	isExtensionUiResponseDto,
 	isProductSessionEventDto,
+	isSessionAttachmentGuardContext,
 	isSessionCommandResponseDto,
 	isSessionMessageDto,
+	type SessionAttachmentGuardContext,
 } from "./product-decoders.js";
 import type {
 	ExtensionUiRequestDto,
@@ -834,7 +836,10 @@ export function isHotRuntimeInventoryDto(value: unknown): value is HotRuntimeInv
 	}
 }
 
-function isProjectionEventDto(value: unknown): value is SessionProjectionEventDto {
+function isProjectionEventDto(
+	value: unknown,
+	context?: SessionAttachmentGuardContext,
+): value is SessionProjectionEventDto {
 	return (
 		isRecord(value) &&
 		hasOnlyKeys(value, [
@@ -848,7 +853,7 @@ function isProjectionEventDto(value: unknown): value is SessionProjectionEventDt
 		]) &&
 		value.type === "event" &&
 		hasSessionEnvelope(value) &&
-		isProductSessionEventDto(value.event)
+		isProductSessionEventDto(value.event, context)
 	);
 }
 
@@ -863,7 +868,10 @@ function isStickyExtensionRequest(value: unknown): value is StickyExtensionUiReq
 	);
 }
 
-function isCanonicalSessionSnapshotDto(value: unknown): value is SessionSnapshotDto {
+function isCanonicalSessionSnapshotDto(
+	value: unknown,
+	context?: SessionAttachmentGuardContext,
+): value is SessionSnapshotDto {
 	if (
 		!isRecord(value) ||
 		!hasOnlyKeys(value, [
@@ -885,6 +893,7 @@ function isCanonicalSessionSnapshotDto(value: unknown): value is SessionSnapshot
 		value.type !== "session_snapshot" ||
 		!isString(value.snapshotId) ||
 		!isString(value.serverEpoch, 128) ||
+		(context !== undefined && value.serverEpoch !== context.serverEpoch) ||
 		!isString(value.sessionHandle) ||
 		!isString(value.workspaceId) ||
 		!isGeneration(value.generation) ||
@@ -896,7 +905,7 @@ function isCanonicalSessionSnapshotDto(value: unknown): value is SessionSnapshot
 		value.runtime.lastSeq !== value.asOfSeq ||
 		!Array.isArray(value.settledMessages) ||
 		value.settledMessages.length > SESSION_SNAPSHOT_MAX_MESSAGES ||
-		!value.settledMessages.every(isSessionMessageDto) ||
+		!value.settledMessages.every((message) => isSessionMessageDto(message, context)) ||
 		!Array.isArray(value.projectionEvents) ||
 		value.projectionEvents.length > SESSION_SNAPSHOT_MAX_PROJECTION_EVENTS ||
 		!isRecord(value.queue) ||
@@ -920,7 +929,7 @@ function isCanonicalSessionSnapshotDto(value: unknown): value is SessionSnapshot
 	let previousSeq = value.baseSeq;
 	for (const event of value.projectionEvents) {
 		if (
-			!isProjectionEventDto(event) ||
+			!isProjectionEventDto(event, context) ||
 			!isSameRuntimeIncarnation(value as unknown as SessionRuntimeIdentityDto, event) ||
 			event.seq <= previousSeq ||
 			event.seq > value.asOfSeq
@@ -932,20 +941,37 @@ function isCanonicalSessionSnapshotDto(value: unknown): value is SessionSnapshot
 	return true;
 }
 
-export function isSessionSnapshotDto(value: unknown): value is SessionSnapshotDto {
+export function isSessionSnapshotDto(
+	value: unknown,
+	context?: SessionAttachmentGuardContext,
+): value is SessionSnapshotDto {
+	if (context !== undefined && !isSessionAttachmentGuardContext(context)) return false;
 	const serialized = boundedCanonicalSnapshotJson(value);
 	if (serialized === null) return false;
 	try {
-		return isCanonicalSessionSnapshotDto(JSON.parse(serialized));
+		return isCanonicalSessionSnapshotDto(JSON.parse(serialized), context);
 	} catch {
 		return false;
 	}
 }
 
 /** Validate gateway-to-browser Session frames before they enter UI state. */
-export function isSessionWsServerMessage(value: unknown): value is SessionWsServerMessage {
+export function isSessionWsServerMessage(
+	value: unknown,
+	context?: SessionAttachmentGuardContext,
+): value is SessionWsServerMessage {
 	if (!isRecord(value) || !isString(value.type, 64)) return false;
-	if (value.type === "session_snapshot") return isSessionSnapshotDto(value);
+	if (context !== undefined && !isSessionAttachmentGuardContext(context)) return false;
+	if (
+		context &&
+		((typeof value.serverEpoch === "string" && value.serverEpoch !== context.serverEpoch) ||
+			(value.type === "runtime_state" &&
+				isRecord(value.runtime) &&
+				value.runtime.serverEpoch !== context.serverEpoch))
+	) {
+		return false;
+	}
+	if (value.type === "session_snapshot") return isSessionSnapshotDto(value, context);
 	if (sessionWsServerMessageBytes(value) > SESSION_WS_SERVER_MAX_BYTES) return false;
 	switch (value.type) {
 		case "hot_runtime_inventory":
@@ -968,7 +994,7 @@ export function isSessionWsServerMessage(value: unknown): value is SessionWsServ
 				(value.workspaceId === undefined || isString(value.workspaceId))
 			);
 		case "event":
-			return isProjectionEventDto(value);
+			return isProjectionEventDto(value, context);
 		case "extension_ui_request":
 			return (
 				hasOnlyKeys(value, [
@@ -1014,7 +1040,7 @@ export function isSessionWsServerMessage(value: unknown): value is SessionWsServ
 				isString(value.sessionHandle) &&
 				isGeneration(value.generation) &&
 				isGeneration(value.barrierSeq) &&
-				isSessionCommandResponseDto(value.response)
+				isSessionCommandResponseDto(value.response, context)
 			);
 		case "lease_status":
 			return (
