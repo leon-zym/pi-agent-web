@@ -4,14 +4,12 @@ import type {
 	ExtensionUiRequestDto,
 	ExtensionUiResponseDto,
 	ProductSessionEventDto,
-	SessionAttachmentRefDto,
 	SessionCommandDto,
 	SessionCommandResponseDto,
 	SessionCommandTypeDto,
 	SessionStateDto,
 } from "@pi-agent-web/protocol";
 import { RpcError } from "@pi-agent-web/protocol";
-import type { EpochContentHold } from "./epoch-content-store.js";
 import {
 	attachJsonlLineReader,
 	JsonlLineTooLongError,
@@ -28,7 +26,7 @@ import {
 	PiProtocolIncompatibleError,
 	type PiRuntimeDiagnostic,
 } from "./pi-host-adapter.js";
-import type { PiPayloadLease } from "./pi-payload-externalizer.js";
+import type { PiPayloadLeaseTransfer } from "./pi-payload-externalizer.js";
 import type { ResolvedPi } from "./resolver.js";
 
 /**
@@ -63,20 +61,29 @@ export interface PiProcessOptions {
 	adapter?: PiHostAdapter;
 	/** Disabled until a downstream generation owner is installed. */
 	payloadExternalizer?: PiHostPayloadExternalizer;
-	/** Synchronous all-or-nothing ownership transfer before a leased value is delivered. */
-	adoptDecodedHolds?: (input: PiDecodedHoldAdoption) => true;
+	/** Future Runtime seam: synchronously prepare an exact event handoff without seeing its transfer early. */
+	onDecodedEvent?: PiDecodedDeliveryConsumer<ProductSessionEventDto>;
 	onEvent?: (event: ProductSessionEventDto) => void;
 	onExtensionUiRequest?: (request: ExtensionUiRequestDto) => void;
 	onExit?: (info: PiProcessExitInfo) => void;
 	onReady?: (initialState: SessionStateDto) => void;
 }
 
-export interface PiDecodedHoldAdoption {
-	readonly kind: "event" | "response" | "extension_ui_request" | "ignored";
-	readonly command?: SessionCommandTypeDto;
-	readonly refs: readonly SessionAttachmentRefDto[];
-	readonly holds: readonly EpochContentHold[];
+export interface PiDecodedDelivery<T> {
+	readonly value: T;
+	/**
+	 * Prepare a one-shot synchronous handoff after PiProcess rechecks spawn/pending identity.
+	 * Before returning literal true, commit must place the transfer in a bounded cleanup ledger
+	 * or atomically adopt it into the exact generation owner. PiProcess never releases after true.
+	 */
+	prepare(commit: (transfer: PiPayloadLeaseTransfer | null) => true): PiDecodedDeliveryPlan;
 }
+
+export interface PiDecodedDeliveryPlan {
+	readonly kind: "pi_decoded_delivery_plan";
+}
+
+export type PiDecodedDeliveryConsumer<T> = (delivery: PiDecodedDelivery<T>) => PiDecodedDeliveryPlan;
 
 export interface PiProcessExitInfo {
 	code: number | null;
@@ -111,6 +118,7 @@ class PiDecodeDeadlineError extends Error {
 interface PendingRequest {
 	command: SessionCommandTypeDto;
 	publicId: string;
+	consumeDecoded?: PiDecodedDeliveryConsumer<SessionCommandResponseDto>;
 	resolve: (r: SessionCommandResponseDto) => void;
 	reject: (e: Error) => void;
 	timer: NodeJS.Timeout;
@@ -133,6 +141,66 @@ type UnknownFrame = Record<string, unknown>;
 
 function isRecord(value: unknown): value is UnknownFrame {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+	try {
+		return (
+			typeof value === "object" &&
+			value !== null &&
+			"then" in value &&
+			typeof (value as { then?: unknown }).then === "function"
+		);
+	} catch {
+		return false;
+	}
+}
+
+class PreparedDecodedDelivery<T> implements PiDecodedDelivery<T>, PiDecodedDeliveryPlan {
+	readonly kind = "pi_decoded_delivery_plan" as const;
+	readonly value: T;
+	private state: "pending" | "prepared" | "committing" | "committed" | "failed" = "pending";
+	private commitPrepared: ((transfer: PiPayloadLeaseTransfer | null) => true) | null = null;
+
+	constructor(value: T) {
+		this.value = value;
+	}
+
+	prepare(commit: (transfer: PiPayloadLeaseTransfer | null) => true): PiDecodedDeliveryPlan {
+		if (this.state !== "pending" || typeof commit !== "function") {
+			throw new Error("Pi decoded delivery is already prepared");
+		}
+		this.commitPrepared = commit;
+		this.state = "prepared";
+		return this;
+	}
+
+	isExactPlan(plan: unknown): boolean {
+		return plan === this && this.state === "prepared";
+	}
+
+	commit(transfer: PiPayloadLeaseTransfer | null): void {
+		if (this.state !== "prepared" || !this.commitPrepared) {
+			throw new Error("Pi decoded delivery plan is not prepared");
+		}
+		this.state = "committing";
+		try {
+			const result: unknown = this.commitPrepared(transfer);
+			if (isPromiseLike(result)) {
+				void Promise.resolve(result).catch(() => {
+					// Delivery commits are synchronous. Observe a forged thenable rejection.
+				});
+				throw new Error("Pi decoded delivery plan commit must return synchronous literal true");
+			}
+			if (result !== true) {
+				throw new Error("Pi decoded delivery plan did not return literal true");
+			}
+			this.state = "committed";
+		} catch (error) {
+			this.state = "failed";
+			throw error;
+		}
+	}
 }
 
 export class PiProcess {
@@ -303,6 +371,16 @@ export class PiProcess {
 		return this.sendRaw({ ...command, id }, timeoutMs);
 	}
 
+	/** Future Runtime seam: synchronously plans ownership before a leased response can resolve. */
+	sendDecoded(
+		command: SessionCommandDto,
+		consume: PiDecodedDeliveryConsumer<SessionCommandResponseDto>,
+		timeoutMs?: number,
+	): Promise<SessionCommandResponseDto> {
+		const id = command.id ?? this.nextPublicId();
+		return this.sendRaw({ ...command, id }, timeoutMs, consume);
+	}
+
 	/** Send a no-response protocol frame (extension_ui_response etc.). */
 	sendNoResponse(obj: ExtensionUiResponseDto): void {
 		const identity = this.spawnIdentity;
@@ -316,6 +394,7 @@ export class PiProcess {
 	private sendRaw(
 		obj: SessionCommandDto & { id: string },
 		timeoutMs?: number,
+		consumeDecoded?: PiDecodedDeliveryConsumer<SessionCommandResponseDto>,
 	): Promise<SessionCommandResponseDto> {
 		const identity = this.spawnIdentity;
 		if (!this.leaderRunning || !identity || identity.unexpectedFinalization) {
@@ -333,7 +412,7 @@ export class PiProcess {
 				if (pending) this.deletePending(wireId, pending);
 				reject(new Error(`command timed out (${timeout / 1000}s): ${obj.type}`));
 			}, timeout);
-			const pending = { command: obj.type, publicId: obj.id, resolve, reject, timer };
+			const pending = { command: obj.type, publicId: obj.id, consumeDecoded, resolve, reject, timer };
 			this.pending.set(wireId, pending);
 			this.pendingPublicIds.set(obj.id, wireId);
 			void this.write(this.adapter.encodeCommand(encoded)).catch((error) => {
@@ -577,20 +656,26 @@ export class PiProcess {
 		await outcome.lease?.release();
 	}
 
-	private async adoptOutcome<T>(
-		outcome: PiHostDecodeOutcome<T>,
-		input: Omit<PiDecodedHoldAdoption, "holds" | "refs">,
-	): Promise<T> {
-		const lease = outcome.lease;
-		if (!lease) return outcome.value;
-		const accept = this.opts.adoptDecodedHolds;
-		if (!accept) {
-			await lease.release();
-			throw new Error("Pi decoded payload has no installed hold owner");
-		}
-		let transfer: ReturnType<PiPayloadLease["transfer"]>;
+	private async releaseOutcomeAfterFailure(
+		outcome: PiHostDecodeOutcome<unknown>,
+		error: unknown,
+		message: string,
+	): Promise<never> {
 		try {
-			transfer = lease.transfer();
+			await this.releaseOutcome(outcome);
+		} catch (releaseError) {
+			throw new AggregateError([error, releaseError], message);
+		}
+		throw error;
+	}
+
+	private async transferOutcome(
+		outcome: PiHostDecodeOutcome<unknown>,
+	): Promise<PiPayloadLeaseTransfer | null> {
+		const lease = outcome.lease;
+		if (!lease) return null;
+		try {
+			return lease.transfer();
 		} catch (error) {
 			try {
 				await lease.release();
@@ -599,17 +684,65 @@ export class PiProcess {
 			}
 			throw error;
 		}
+	}
+
+	private async releaseTransferAfterFailure(
+		transfer: PiPayloadLeaseTransfer | null,
+		error: unknown,
+		message: string,
+	): Promise<never> {
 		try {
-			transfer.adopt((holds) => accept({ ...input, refs: transfer.refs, holds }));
-		} catch (error) {
-			try {
-				await transfer.release();
-			} catch (releaseError) {
-				throw new AggregateError([error, releaseError], "Pi decoded payload adoption cleanup failed");
-			}
-			throw error;
+			await transfer?.release();
+		} catch (releaseError) {
+			throw new AggregateError([error, releaseError], message);
 		}
-		return outcome.value;
+		throw error;
+	}
+
+	private async consumeDecodedOutcome<T>(
+		outcome: PiHostDecodeOutcome<T>,
+		consume: PiDecodedDeliveryConsumer<T>,
+		isCurrent: () => boolean,
+	): Promise<boolean> {
+		const delivery = new PreparedDecodedDelivery(outcome.value);
+		let plan: unknown;
+		try {
+			plan = consume(delivery);
+		} catch (error) {
+			return this.releaseOutcomeAfterFailure(outcome, error, "Pi decoded consumer cleanup failed");
+		}
+		if (isPromiseLike(plan)) {
+			void Promise.resolve(plan).catch(() => {
+				// The callback contract is synchronous. Observe a forged thenable rejection.
+			});
+			return this.releaseOutcomeAfterFailure(
+				outcome,
+				new Error("Pi decoded delivery consumer must return a synchronous plan"),
+				"Pi decoded consumer cleanup failed",
+			);
+		}
+		if (!delivery.isExactPlan(plan)) {
+			return this.releaseOutcomeAfterFailure(
+				outcome,
+				new Error("Pi decoded delivery consumer did not prepare its exact delivery"),
+				"Pi decoded consumer cleanup failed",
+			);
+		}
+		if (!isCurrent()) {
+			await this.releaseOutcome(outcome);
+			return false;
+		}
+		const transfer = await this.transferOutcome(outcome);
+		if (!isCurrent()) {
+			await transfer?.release();
+			return false;
+		}
+		try {
+			delivery.commit(transfer);
+		} catch (error) {
+			return this.releaseTransferAfterFailure(transfer, error, "Pi decoded plan cleanup failed");
+		}
+		return true;
 	}
 
 	private async handleLine(line: string, identity: SpawnIdentity | null = this.spawnIdentity): Promise<void> {
@@ -693,14 +826,28 @@ export class PiProcess {
 						await this.releaseOutcome(outcome);
 						return;
 					}
-					const response = await this.adoptOutcome(outcome, {
-						kind: "response",
-						command: pending.command,
-					});
-					if (!this.ownsSpawn(identity) || this.pending.get(id) !== pending) return;
+					const response: SessionCommandResponseDto = { ...outcome.value, id: pending.publicId };
+					if (pending.consumeDecoded) {
+						const accepted = await this.consumeDecodedOutcome(
+							{ value: response, lease: outcome.lease },
+							pending.consumeDecoded,
+							() => this.ownsSpawn(identity) && this.pending.get(id) === pending,
+						);
+						if (!accepted) return;
+					} else if (outcome.lease) {
+						return this.releaseOutcomeAfterFailure(
+							outcome,
+							new Error("inline-only Pi response delivery cannot carry attachment holds"),
+							"Pi inline response cleanup failed",
+						);
+					}
+					if (!this.ownsSpawn(identity) || this.pending.get(id) !== pending) {
+						if (!pending.consumeDecoded) await this.releaseOutcome(outcome);
+						return;
+					}
 					this.deletePending(id, pending);
 					clearTimeout(pending.timer);
-					pending.resolve({ ...response, id: pending.publicId });
+					pending.resolve(response);
 					return;
 				}
 			}
@@ -725,20 +872,44 @@ export class PiProcess {
 			await this.releaseOutcome(outcome);
 			return;
 		}
-		if (
-			outcome.value.kind === "ignored" ||
-			(outcome.value.kind === "event" && !this.opts.onEvent) ||
-			(outcome.value.kind === "extension_ui_request" && !this.opts.onExtensionUiRequest)
-		) {
+		if (outcome.value.kind === "ignored") {
 			await this.releaseOutcome(outcome);
 			return;
 		}
-		const decoded = await this.adoptOutcome(outcome, {
-			kind: outcome.value.kind,
-		});
-		if (!this.ownsSpawn(identity)) return;
-		if (decoded.kind === "event") this.opts.onEvent?.(decoded.event);
-		if (decoded.kind === "extension_ui_request") this.opts.onExtensionUiRequest?.(decoded.request);
+		if (outcome.value.kind === "event") {
+			const consume = this.opts.onDecodedEvent;
+			if (consume) {
+				await this.consumeDecodedOutcome({ value: outcome.value.event, lease: outcome.lease }, consume, () =>
+					this.ownsSpawn(identity),
+				);
+				return;
+			}
+			if (!this.opts.onEvent) {
+				await this.releaseOutcome(outcome);
+				return;
+			}
+			if (outcome.lease) {
+				return this.releaseOutcomeAfterFailure(
+					outcome,
+					new Error("inline-only Pi event delivery cannot carry attachment holds"),
+					"Pi inline event cleanup failed",
+				);
+			}
+			this.opts.onEvent(outcome.value.event);
+			return;
+		}
+		if (!this.opts.onExtensionUiRequest) {
+			await this.releaseOutcome(outcome);
+			return;
+		}
+		if (outcome.lease) {
+			return this.releaseOutcomeAfterFailure(
+				outcome,
+				new Error("inline-only Pi Extension UI delivery cannot carry attachment holds"),
+				"Pi inline Extension UI cleanup failed",
+			);
+		}
+		this.opts.onExtensionUiRequest(outcome.value.request);
 	}
 
 	private ownsSpawn(identity: SpawnIdentity | null): identity is SpawnIdentity {

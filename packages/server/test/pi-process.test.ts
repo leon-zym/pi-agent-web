@@ -2,9 +2,15 @@ import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { expectData, SESSION_PAYLOAD_BUDGET, type SessionAttachmentRefDto } from "@pi-agent-web/protocol";
+import {
+	expectData,
+	type ProductSessionEventDto,
+	SESSION_PAYLOAD_BUDGET,
+	type SessionAttachmentRefDto,
+} from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { EpochContentHold } from "../src/epoch-content-store.js";
+import { GenerationContentOwner } from "../src/generation-content-owner.js";
 import { MAX_JSONL_LINE_BYTES } from "../src/jsonl.js";
 import { legacyRpcV1Adapter } from "../src/legacy-rpc-v1.js";
 import {
@@ -14,8 +20,12 @@ import {
 	type PiHostUnsolicitedFrame,
 	PiProtocolIncompatibleError,
 } from "../src/pi-host-adapter.js";
-import { PiPayloadExternalizationError, type PiPayloadLease } from "../src/pi-payload-externalizer.js";
-import { PiProcess } from "../src/pi-process.js";
+import {
+	PiPayloadExternalizationError,
+	type PiPayloadLease,
+	type PiPayloadLeaseTransfer,
+} from "../src/pi-payload-externalizer.js";
+import { type PiDecodedDeliveryConsumer, PiProcess, type PiProcessOptions } from "../src/pi-process.js";
 
 const fakePiPath = path.join(import.meta.dirname, "fixtures", "fake-pi.mjs");
 const processGroupPiPath = path.join(import.meta.dirname, "fixtures", "process-group-pi.mjs");
@@ -509,7 +519,17 @@ describe("PiProcess response correlation", () => {
 		}
 	});
 
-	it("releases and fails closed when a current leased event has no owner", async () => {
+	it("keeps the removed pre-callback hold adoption API out of PiProcess options", () => {
+		const options: PiProcessOptions = {
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			// @ts-expect-error pre-callback hold adoption was intentionally removed
+			adoptDecodedHolds: () => true,
+		};
+		void options;
+	});
+
+	it("releases and fails closed when the inline-only event callback receives a lease", async () => {
 		const leased = fakeLease();
 		const delivered: string[] = [];
 		const adapter: PiHostAdapter = {
@@ -530,15 +550,17 @@ describe("PiProcess response correlation", () => {
 		await proc.start();
 
 		await expect(proc.send({ type: "prompt", message: "ordered-async" })).rejects.toThrow(
-			"no installed hold owner",
+			"inline-only Pi event delivery cannot carry attachment holds",
 		);
 		expect(leased.release).toHaveBeenCalledOnce();
 		expect(delivered).toEqual([]);
 	});
 
-	it("adopts leased event holds synchronously before delivery", async () => {
+	it("hands a leased event transfer to the decoded callback without releasing it", async () => {
 		const leased = fakeLease();
 		const order: string[] = [];
+		let claimed: PiPayloadLeaseTransfer | null | undefined;
+		let consumerReturned = false;
 		const adapter: PiHostAdapter = {
 			...legacyRpcV1Adapter,
 			async decodeUnsolicited(value, context) {
@@ -552,28 +574,31 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
-			adoptDecodedHolds: ({ kind, holds, refs }) => {
-				expect(kind).toBe("event");
-				expect(holds).toHaveLength(1);
-				expect(refs).toEqual([holds[0]?.ref]);
-				order.push("adopt");
-				return true;
-			},
-			onEvent: (event) => {
-				if (event.type === "agent_start") order.push("deliver");
+			onDecodedEvent: (delivery) => {
+				expect(delivery.value.type).toBe("agent_start");
+				const plan = delivery.prepare((transfer) => {
+					expect(consumerReturned).toBe(true);
+					claimed = transfer;
+					order.push("accept");
+					return true;
+				});
+				consumerReturned = true;
+				return plan;
 			},
 		});
 		await proc.start();
 
 		await proc.send({ type: "prompt", message: "ordered-async" });
-		await waitFor(() => order.includes("deliver"));
-		expect(order).toEqual(["adopt", "deliver"]);
+		await waitFor(() => order.includes("accept"));
+		expect(order).toEqual(["accept"]);
+		expect(claimed?.refs).toEqual(leased.lease.refs);
 		expect(leased.release).not.toHaveBeenCalled();
+		await claimed?.release();
+		expect(leased.release).toHaveBeenCalledOnce();
 	});
 
-	it("adopts leased response holds before resolving the bare response DTO", async () => {
+	it("returns a leased response transfer from sendDecoded without releasing it", async () => {
 		const leased = fakeLease();
-		const order: string[] = [];
 		const adapter: PiHostAdapter = {
 			...legacyRpcV1Adapter,
 			async decodeResponse(value, expectedCommand, context) {
@@ -585,25 +610,28 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
-			adoptDecodedHolds: ({ kind, command }) => {
-				expect(kind).toBe("response");
-				expect(command).toBe("prompt");
-				order.push("adopt");
-				return true;
-			},
 		});
 		await proc.start();
 
-		const response = await proc.send({ type: "prompt", message: "response-adopt" }).then((value) => {
-			order.push("resolve");
-			return value;
-		});
-		expect(response).toMatchObject({ command: "prompt", success: true });
-		expect(order).toEqual(["adopt", "resolve"]);
+		let claimed: PiPayloadLeaseTransfer | null | undefined;
+		const response = await proc.sendDecoded(
+			{ id: "public-response", type: "prompt", message: "response" },
+			(delivery) => {
+				expect(delivery.value).toMatchObject({ id: "public-response", command: "prompt", success: true });
+				return delivery.prepare((transfer) => {
+					claimed = transfer;
+					return true;
+				});
+			},
+		);
+		expect(response).toMatchObject({ id: "public-response", command: "prompt", success: true });
+		expect(claimed?.refs).toEqual(leased.lease.refs);
 		expect(leased.release).not.toHaveBeenCalled();
+		await claimed?.release();
+		expect(leased.release).toHaveBeenCalledOnce();
 	});
 
-	it("releases a transfer when the synchronous hold owner rejects adoption", async () => {
+	it("releases and rejects a decoded callback that returns true without claiming ownership", async () => {
 		const leased = fakeLease();
 		const adapter: PiHostAdapter = {
 			...legacyRpcV1Adapter,
@@ -618,17 +646,273 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
-			adoptDecodedHolds: () => {
-				throw new Error("generation owner rejected holds");
-			},
-			onEvent: vi.fn(),
+			onDecodedEvent: (() => true) as unknown as PiDecodedDeliveryConsumer<ProductSessionEventDto>,
 		});
 		await proc.start();
 
 		await expect(proc.send({ type: "prompt", message: "ordered-async" })).rejects.toThrow(
-			"generation owner rejected holds",
+			"did not prepare its exact delivery",
 		);
-		expect(leased.adopt).toHaveBeenCalledOnce();
+		expect(leased.release).toHaveBeenCalledOnce();
+	});
+
+	it("releases and fails closed when inline-only send receives a leased response", async () => {
+		const leased = fakeLease();
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeResponse(value, expectedCommand, context) {
+				const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, context);
+				return expectedCommand === "prompt" ? { value: outcome.value, lease: leased.lease } : outcome;
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+		});
+		await proc.start();
+
+		await expect(proc.send({ type: "prompt", message: "leased-inline-response" })).rejects.toThrow(
+			"inline-only Pi response delivery cannot carry attachment holds",
+		);
+		expect(leased.release).toHaveBeenCalledOnce();
+	});
+
+	it.each([
+		["false", (): boolean => false],
+		["undefined", (): undefined => undefined],
+		["thenable", (): Promise<never> => Promise.reject(new Error("async consumer rejected"))],
+		[
+			"throw",
+			(): never => {
+				throw new Error("decoded event callback failed");
+			},
+		],
+	] as const)("releases a leased event when the decoded callback returns %s", async (_name, callback) => {
+		const leased = fakeLease();
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeUnsolicited(value, context) {
+				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
+					? { value: outcome.value, lease: leased.lease }
+					: outcome;
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+			onDecodedEvent: callback as unknown as PiDecodedDeliveryConsumer<ProductSessionEventDto>,
+		});
+		await proc.start();
+
+		await expect(proc.send({ type: "prompt", message: "ordered-async" })).rejects.toThrow();
+		expect(leased.release).toHaveBeenCalledOnce();
+	});
+
+	it.each([
+		["false", (): boolean => false],
+		["undefined", (): undefined => undefined],
+		["thenable", (): Promise<never> => Promise.reject(new Error("async commit rejected"))],
+		[
+			"throw",
+			(): never => {
+				throw new Error("decoded plan commit failed");
+			},
+		],
+	] as const)("releases a leased event when the prepared commit returns %s", async (_name, result) => {
+		const leased = fakeLease();
+		const unhandledRejections: unknown[] = [];
+		const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
+		process.on("unhandledRejection", onUnhandledRejection);
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeUnsolicited(value, context) {
+				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
+					? { value: outcome.value, lease: leased.lease }
+					: outcome;
+			},
+		};
+		try {
+			proc = new PiProcess({
+				cwd: process.cwd(),
+				resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+				adapter,
+				onDecodedEvent: (delivery) =>
+					delivery.prepare(result as unknown as (transfer: PiPayloadLeaseTransfer | null) => true),
+			});
+			await proc.start();
+
+			await expect(proc.send({ type: "prompt", message: "ordered-async" })).rejects.toThrow();
+			expect(leased.release).toHaveBeenCalledOnce();
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(unhandledRejections).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandledRejection);
+		}
+	});
+
+	it("does not expose a transfer when the decoded consumer stops the owning spawn", async () => {
+		const leased = fakeLease();
+		let commitCalled = false;
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeUnsolicited(value, context) {
+				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
+					? { value: outcome.value, lease: leased.lease }
+					: outcome;
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+			onDecodedEvent: (delivery) => {
+				const plan = delivery.prepare(() => {
+					commitCalled = true;
+					return true;
+				});
+				void proc?.stop();
+				return plan;
+			},
+		});
+		await proc.start();
+
+		await expect(proc.send({ type: "prompt", message: "ordered-async" })).rejects.toThrow();
+		await waitFor(() => leased.release.mock.calls.length === 1);
+		expect(commitCalled).toBe(false);
+		expect(leased.adopt).not.toHaveBeenCalled();
+	});
+
+	it("does not release custody after a literal-true commit even when that commit stops the spawn", async () => {
+		const leased = fakeLease();
+		let ownedTransfer: PiPayloadLeaseTransfer | null | undefined;
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeUnsolicited(value, context) {
+				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
+					? { value: outcome.value, lease: leased.lease }
+					: outcome;
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+			onDecodedEvent: (delivery) =>
+				delivery.prepare((transfer) => {
+					ownedTransfer = transfer;
+					void proc?.stop();
+					return true;
+				}),
+		});
+		await proc.start();
+
+		await expect(proc.send({ type: "prompt", message: "ordered-async" })).rejects.toThrow();
+		expect(ownedTransfer?.refs).toEqual(leased.lease.refs);
+		expect(leased.release).not.toHaveBeenCalled();
+		await ownedTransfer?.release();
+		expect(leased.release).toHaveBeenCalledOnce();
+	});
+
+	it("terminalizes after an adopted commit throws and leaves cleanup to the generation owner", async () => {
+		const exactRef: SessionAttachmentRefDto = {
+			type: "attachment_ref",
+			serverEpoch: "process-test-epoch",
+			sha256: "c".repeat(64),
+			mediaType: "image/png",
+			byteLength: 1,
+		};
+		const exactHold = Object.freeze({ ref: exactRef });
+		const releaseOwnedHold = vi.fn(async (_hold: EpochContentHold) => {});
+		const owner = new GenerationContentOwner({
+			serverEpoch: exactRef.serverEpoch,
+			generation: 3,
+			release: releaseOwnedHold,
+		});
+		let transferState: "pending" | "adopted" | "released" = "pending";
+		const transferRelease = vi.fn(async () => {
+			if (transferState !== "pending") return;
+			transferState = "released";
+			await releaseOwnedHold(exactHold);
+		});
+		const transfer: PiPayloadLeaseTransfer = {
+			refs: [exactRef],
+			adopt(accept) {
+				if (transferState !== "pending") throw new Error("transfer is not pending");
+				if (accept([exactHold]) !== true) throw new Error("transfer was not accepted");
+				transferState = "adopted";
+			},
+			release: transferRelease,
+		};
+		const lease: PiPayloadLease = {
+			refs: [exactRef],
+			transfer: () => transfer,
+			release: async () => {
+				if (transferState === "pending") await transferRelease();
+			},
+		};
+		const exits: Array<{ stderrTail: string }> = [];
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeUnsolicited(value, context) {
+				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
+					? { value: outcome.value, lease }
+					: outcome;
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+			onDecodedEvent: (delivery) =>
+				delivery.prepare((transfer) => {
+					if (!transfer) throw new Error("missing transfer");
+					owner.adopt(transfer);
+					throw new Error("projection commit failed after adoption");
+				}),
+			onExit: (info) => exits.push(info),
+		});
+		await proc.start();
+
+		await expect(proc.send({ type: "prompt", message: "ordered-async" })).rejects.toThrow(
+			"projection commit failed after adoption",
+		);
+		await waitFor(() => exits.length === 1);
+		expect(owner.size).toBe(1);
+		expect(transferRelease).toHaveBeenCalledOnce();
+		expect(releaseOwnedHold).not.toHaveBeenCalled();
+		expect(exits).toHaveLength(1);
+		await owner.release();
+		expect(releaseOwnedHold).toHaveBeenCalledOnce();
+	});
+
+	it("releases a leased event when no event callback is installed", async () => {
+		const leased = fakeLease();
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeUnsolicited(value, context) {
+				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
+					? { value: outcome.value, lease: leased.lease }
+					: outcome;
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+		});
+		await proc.start();
+
+		await expect(proc.send({ type: "prompt", message: "ordered-async" })).resolves.toMatchObject({
+			success: true,
+		});
 		expect(leased.release).toHaveBeenCalledOnce();
 	});
 
@@ -673,8 +957,7 @@ describe("PiProcess response correlation", () => {
 					label: "fake Pi",
 				},
 				adapter,
-				adoptDecodedHolds: () => true,
-				onEvent: vi.fn(),
+				onDecodedEvent: (delivery) => delivery.prepare(() => true),
 				onExit: (info) => exits.push(info),
 			});
 			await proc.start();
