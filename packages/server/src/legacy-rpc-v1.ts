@@ -15,6 +15,7 @@ import {
 	type SessionMessageDto,
 	type SessionTreeNodeDto,
 } from "@pi-agent-web/protocol";
+import { EpochContentStoreError } from "./epoch-content-store.js";
 import {
 	isLegacyRpcV1RawEvent,
 	isLegacyRpcV1RawExtensionUiRequest,
@@ -23,10 +24,18 @@ import {
 import {
 	type PiCapability,
 	type PiHostAdapter,
+	type PiHostDecodeContext,
+	type PiHostDecodeOutcome,
+	PiHostResponseExternalizationError,
 	type PiHostUnsolicitedFrame,
 	PiProtocolIncompatibleError,
 	probeExactPiVersion,
 } from "./pi-host-adapter.js";
+import {
+	type Externalized,
+	PiPayloadExternalizationError,
+	type PiPayloadLease,
+} from "./pi-payload-externalizer.js";
 
 export const LEGACY_RPC_V1_ADAPTER_ID = "legacy-rpc-v1";
 
@@ -64,6 +73,60 @@ const AUTHORITATIVE_EVENT_TYPES: ReadonlySet<string> = new Set([
 ]);
 
 type UnknownRecord = Record<string, unknown>;
+
+function decoded<T>(value: T): PiHostDecodeOutcome<T> {
+	return Object.freeze({ value, lease: null });
+}
+
+async function keepExternalizedLease<T>(
+	externalized: Externalized<unknown>,
+	value: T,
+): Promise<PiHostDecodeOutcome<T>> {
+	if (externalized.lease.refs.length > 0) {
+		return Object.freeze({ value, lease: externalized.lease });
+	}
+	await externalized.lease.release();
+	return decoded(value);
+}
+
+async function releaseAfterPostprocessFailure(lease: PiPayloadLease, error: unknown): Promise<never> {
+	try {
+		await lease.release();
+	} catch (releaseError) {
+		throw new AggregateError([error, releaseError], "Pi payload post-processing cleanup failed");
+	}
+	throw error;
+}
+
+function responseLocalFailure(
+	error: unknown,
+): "blob_too_large" | "cache_bytes_exhausted" | "cache_items_exhausted" | null {
+	if (error instanceof EpochContentStoreError) {
+		if (
+			(error.code === "blob_too_large" ||
+				error.code === "cache_bytes_exhausted" ||
+				error.code === "cache_items_exhausted") &&
+			hasOversizeEvidence(error.limit, error.actual)
+		)
+			return error.code;
+		return null;
+	}
+	if (!(error instanceof PiPayloadExternalizationError)) return null;
+	if (error.code === "decoded_image_too_large" && hasOversizeEvidence(error.limit, error.actual))
+		return "blob_too_large";
+	return null;
+}
+
+function hasOversizeEvidence(limit: unknown, actual: unknown): boolean {
+	return (
+		typeof limit === "number" &&
+		Number.isSafeInteger(limit) &&
+		limit > 0 &&
+		typeof actual === "number" &&
+		Number.isSafeInteger(actual) &&
+		actual > limit
+	);
+}
 
 const LEGACY_MODEL_KEYS = new Set([
 	"id",
@@ -297,6 +360,75 @@ function redactEvent(event: ProductSessionEventDto): ProductSessionEventDto {
 	}
 }
 
+async function externalizeResponse(
+	value: UnknownRecord,
+	expectedCommand: SessionCommandTypeDto,
+	context: PiHostDecodeContext & { externalizer: NonNullable<PiHostDecodeContext["externalizer"]> },
+	frameType?: string,
+): Promise<PiHostDecodeOutcome<SessionCommandResponseDto & { id: string }>> {
+	let externalized: Externalized<unknown>;
+	try {
+		externalized = await context.externalizer.externalize(
+			{ kind: "response", expectedCommand, value },
+			context.signal,
+		);
+	} catch (error) {
+		const failure = responseLocalFailure(error);
+		if (failure) {
+			throw new PiHostResponseExternalizationError(expectedCommand, failure, { cause: error });
+		}
+		throw error;
+	}
+	let response: SessionCommandResponseDto & { id: string };
+	try {
+		if (
+			!isRecord(externalized.value) ||
+			externalized.value.type !== "response" ||
+			externalized.value.id !== value.id ||
+			externalized.value.command !== expectedCommand ||
+			hasGatewayOnlyResponseFields(externalized.value) ||
+			!isSessionCommandResponseDto(externalized.value, context.externalizer.context)
+		) {
+			return incompatible("response", "malformed_response", frameType);
+		}
+		response = redactResponse(externalized.value as SessionCommandResponseDto & { id: string });
+	} catch (error) {
+		return releaseAfterPostprocessFailure(externalized.lease, error);
+	}
+	return keepExternalizedLease(externalized, response);
+}
+
+async function externalizeEvent(
+	value: UnknownRecord,
+	context: PiHostDecodeContext & { externalizer: NonNullable<PiHostDecodeContext["externalizer"]> },
+	requiresToolcallIdentity: boolean,
+): Promise<PiHostDecodeOutcome<PiHostUnsolicitedFrame>> {
+	const externalized = await context.externalizer.externalize({ kind: "event", value }, context.signal);
+	let event: ProductSessionEventDto;
+	try {
+		if (
+			!isRecord(externalized.value) ||
+			externalized.value.type !== value.type ||
+			!isProductSessionEventDto(externalized.value, context.externalizer.context)
+		) {
+			return incompatible("event", "malformed_event", boundedFrameType(value.type));
+		}
+		event = redactEvent(externalized.value);
+		if (
+			requiresToolcallIdentity &&
+			event.type === "message_update" &&
+			event.assistantMessageEvent.type === "toolcall_start" &&
+			(typeof event.assistantMessageEvent.id !== "string" ||
+				typeof event.assistantMessageEvent.toolName !== "string")
+		) {
+			return incompatible("event", "malformed_event", "toolcall_start");
+		}
+	} catch (error) {
+		return releaseAfterPostprocessFailure(externalized.lease, error);
+	}
+	return keepExternalizedLease(externalized, { kind: "event", event });
+}
+
 export function createLegacyRpcV1Adapter(
 	version: string,
 	capabilities: readonly PiCapability[],
@@ -327,7 +459,7 @@ export function createLegacyRpcV1Adapter(
 			return response;
 		},
 
-		decodeResponse(value, expectedCommand) {
+		decodeResponse(value, expectedCommand, context) {
 			const normalized = normalizeLegacyResponse(value);
 			const frameType = isRecord(normalized) ? boundedFrameType(normalized.command) : undefined;
 			if (!isRecord(normalized) || normalized.type !== "response" || typeof normalized.id !== "string") {
@@ -342,10 +474,14 @@ export function createLegacyRpcV1Adapter(
 			if (!isLegacyRpcV1RawResponse(normalized, expectedCommand)) {
 				return incompatible("response", "malformed_response", frameType);
 			}
-			if (!isSessionCommandResponseDto(normalized)) {
-				return incompatible("response", "malformed_response", frameType);
+			const externalizer = context?.externalizer;
+			if (!externalizer) {
+				if (!isSessionCommandResponseDto(normalized)) {
+					return incompatible("response", "malformed_response", frameType);
+				}
+				return decoded(redactResponse(normalized as SessionCommandResponseDto & { id: string }));
 			}
-			return redactResponse(normalized as SessionCommandResponseDto & { id: string });
+			return externalizeResponse(normalized, expectedCommand, { ...context, externalizer }, frameType);
 		},
 
 		decodeOrphanedResponse(value) {
@@ -357,14 +493,14 @@ export function createLegacyRpcV1Adapter(
 				typeof normalized.id !== "string" ||
 				hasGatewayOnlyResponseFields(normalized) ||
 				!isSessionCommandTypeDto(normalized.command) ||
-				!isLegacyRpcV1RawResponse(normalized, normalized.command) ||
-				!isSessionCommandResponseDto(normalized)
+				!isLegacyRpcV1RawResponse(normalized, normalized.command)
 			) {
 				return incompatible("response", "malformed_response", frameType);
 			}
+			return decoded(undefined);
 		},
 
-		decodeUnsolicited(value): PiHostUnsolicitedFrame {
+		decodeUnsolicited(value, context) {
 			if (!isRecord(value) || typeof value.type !== "string") {
 				return incompatible("frame", "malformed_frame");
 			}
@@ -376,9 +512,16 @@ export function createLegacyRpcV1Adapter(
 						"extension_ui_request",
 					);
 				}
-				return { kind: "extension_ui_request", request: value };
+				return decoded({ kind: "extension_ui_request", request: value } satisfies PiHostUnsolicitedFrame);
 			}
-			if (isLegacyRpcV1RawEvent(value) && isProductSessionEventDto(value)) {
+			if (isLegacyRpcV1RawEvent(value)) {
+				const externalizer = context?.externalizer;
+				if (externalizer) {
+					return externalizeEvent(value, { ...context, externalizer }, requiresToolcallIdentity);
+				}
+				if (!isProductSessionEventDto(value)) {
+					return incompatible("event", "malformed_event", boundedFrameType(value.type));
+				}
 				const event = redactEvent(value);
 				if (
 					requiresToolcallIdentity &&
@@ -389,13 +532,13 @@ export function createLegacyRpcV1Adapter(
 				) {
 					return incompatible("event", "malformed_event", "toolcall_start");
 				}
-				return { kind: "event", event };
+				return decoded({ kind: "event", event } satisfies PiHostUnsolicitedFrame);
 			}
 			if (AUTHORITATIVE_EVENT_TYPES.has(value.type)) {
 				return incompatible("event", "malformed_event", boundedFrameType(value.type));
 			}
 			if (LEGACY_RPC_V1_IGNORABLE_FRAME_TYPES.has(value.type)) {
-				return { kind: "ignored", frameType: value.type };
+				return decoded({ kind: "ignored", frameType: value.type } satisfies PiHostUnsolicitedFrame);
 			}
 			return incompatible("event", "unknown_authoritative_event", boundedFrameType(value.type));
 		},

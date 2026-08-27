@@ -4,12 +4,14 @@ import type {
 	ExtensionUiRequestDto,
 	ExtensionUiResponseDto,
 	ProductSessionEventDto,
+	SessionAttachmentRefDto,
 	SessionCommandDto,
 	SessionCommandResponseDto,
 	SessionCommandTypeDto,
 	SessionStateDto,
 } from "@pi-agent-web/protocol";
 import { RpcError } from "@pi-agent-web/protocol";
+import type { EpochContentHold } from "./epoch-content-store.js";
 import {
 	attachJsonlLineReader,
 	JsonlLineTooLongError,
@@ -19,9 +21,14 @@ import {
 import { legacyRpcV1Adapter } from "./legacy-rpc-v1.js";
 import {
 	type PiHostAdapter,
+	type PiHostDecodeOutcome,
+	type PiHostDecodeResult,
+	type PiHostPayloadExternalizer,
+	PiHostResponseExternalizationError,
 	PiProtocolIncompatibleError,
 	type PiRuntimeDiagnostic,
 } from "./pi-host-adapter.js";
+import type { PiPayloadLease } from "./pi-payload-externalizer.js";
 import type { ResolvedPi } from "./resolver.js";
 
 /**
@@ -31,7 +38,7 @@ import type { ResolvedPi } from "./resolver.js";
  *
  * Semantics align with the official RpcClient (rpc-client.ts), with
  * Supervisor-oriented additions:
- * - Ready handshake: send get_state{id:"ready-1"} after spawn; the response
+ * - Ready handshake: send get_state after spawn; the response
  *   means ready (the protocol has no ready frame; the official client blind-
  *   waits 100ms).
  * - Events / responses / Extension UI frames are routed separately.
@@ -54,10 +61,21 @@ export interface PiProcessOptions {
 	/** Bounded allowance for Pi's single-line get_messages response. */
 	snapshotLineMaxBytes?: number;
 	adapter?: PiHostAdapter;
+	/** Disabled until a downstream generation owner is installed. */
+	payloadExternalizer?: PiHostPayloadExternalizer;
+	/** Synchronous all-or-nothing ownership transfer before a leased value is delivered. */
+	adoptDecodedHolds?: (input: PiDecodedHoldAdoption) => true;
 	onEvent?: (event: ProductSessionEventDto) => void;
 	onExtensionUiRequest?: (request: ExtensionUiRequestDto) => void;
 	onExit?: (info: PiProcessExitInfo) => void;
 	onReady?: (initialState: SessionStateDto) => void;
+}
+
+export interface PiDecodedHoldAdoption {
+	readonly kind: "event" | "response" | "extension_ui_request" | "ignored";
+	readonly command?: SessionCommandTypeDto;
+	readonly refs: readonly SessionAttachmentRefDto[];
+	readonly holds: readonly EpochContentHold[];
 }
 
 export interface PiProcessExitInfo {
@@ -83,8 +101,16 @@ export class ProcessExitedError extends Error {
 	}
 }
 
+class PiDecodeDeadlineError extends Error {
+	constructor(timeoutMs: number) {
+		super(`Pi adapter decode timed out after ${String(timeoutMs)}ms`);
+		this.name = "PiDecodeDeadlineError";
+	}
+}
+
 interface PendingRequest {
 	command: SessionCommandTypeDto;
+	publicId: string;
 	resolve: (r: SessionCommandResponseDto) => void;
 	reject: (e: Error) => void;
 	timer: NodeJS.Timeout;
@@ -115,7 +141,9 @@ export class PiProcess {
 	private spawnIdentity: SpawnIdentity | null = null;
 	private detach: (() => void) | null = null;
 	private pending = new Map<string, PendingRequest>();
-	private requestCounter = 0;
+	private pendingPublicIds = new Map<string, string>();
+	private publicRequestCounter = 0n;
+	private wireRequestCounter = 0n;
 	private stderrChunks: string[] = [];
 	private stderrBytes = 0;
 	private stopped = false;
@@ -271,7 +299,7 @@ export class PiProcess {
 	/** Send a command and wait for its response frame (auto id, echoed back).
 	 * success:false responses resolve normally; callers check via expectData. */
 	send(command: SessionCommandDto, timeoutMs?: number): Promise<SessionCommandResponseDto> {
-		const id = command.id ?? this.nextId();
+		const id = command.id ?? this.nextPublicId();
 		return this.sendRaw({ ...command, id }, timeoutMs);
 	}
 
@@ -289,25 +317,38 @@ export class PiProcess {
 		obj: SessionCommandDto & { id: string },
 		timeoutMs?: number,
 	): Promise<SessionCommandResponseDto> {
-		if (!this.leaderRunning || this.spawnIdentity?.unexpectedFinalization) {
+		const identity = this.spawnIdentity;
+		if (!this.leaderRunning || !identity || identity.unexpectedFinalization) {
 			return Promise.reject(new Error("pi process is not running"));
 		}
-		if (this.pending.has(obj.id)) {
+		if (this.pendingPublicIds.has(obj.id)) {
 			return Promise.reject(new RpcError(obj.type, `duplicate pending command id: ${obj.id}`));
 		}
+		const wireId = this.nextWireId();
+		const encoded = { ...obj, id: wireId };
 		const timeout = timeoutMs ?? this.opts.commandTimeoutMs;
 		return new Promise<SessionCommandResponseDto>((resolve, reject) => {
 			const timer = setTimeout(() => {
-				this.pending.delete(obj.id);
+				const pending = this.pending.get(wireId);
+				if (pending) this.deletePending(wireId, pending);
 				reject(new Error(`command timed out (${timeout / 1000}s): ${obj.type}`));
 			}, timeout);
-			this.pending.set(obj.id, { command: obj.type, resolve, reject, timer });
-			void this.write(this.adapter.encodeCommand(obj)).catch((error) => {
+			const pending = { command: obj.type, publicId: obj.id, resolve, reject, timer };
+			this.pending.set(wireId, pending);
+			this.pendingPublicIds.set(obj.id, wireId);
+			void this.write(this.adapter.encodeCommand(encoded)).catch((error) => {
 				clearTimeout(timer);
-				this.pending.delete(obj.id);
+				this.deletePending(wireId, pending);
 				reject(error instanceof Error ? error : new Error(String(error)));
 			});
 		});
+	}
+
+	private deletePending(wireId: string, pending: PendingRequest): void {
+		if (this.pending.get(wireId) === pending) this.pending.delete(wireId);
+		if (this.pendingPublicIds.get(pending.publicId) === wireId) {
+			this.pendingPublicIds.delete(pending.publicId);
+		}
 	}
 
 	private async write(obj: unknown): Promise<void> {
@@ -486,10 +527,14 @@ export class PiProcess {
 		);
 	}
 
-	private decodeWithDeadline<T>(identity: SpawnIdentity, decode: () => PromiseLike<T> | T): Promise<T> {
-		const { signal } = identity.decodeAbortController;
-		const operation = Promise.resolve().then(decode);
-		return new Promise<T>((resolve, reject) => {
+	private decodeWithDeadline<T>(
+		identity: SpawnIdentity,
+		decode: (signal: AbortSignal) => PiHostDecodeResult<T>,
+	): Promise<PiHostDecodeOutcome<T>> {
+		const deadline = new AbortController();
+		const signal = AbortSignal.any([identity.decodeAbortController.signal, deadline.signal]);
+		const operation = Promise.resolve().then(() => decode(signal));
+		return new Promise<PiHostDecodeOutcome<T>>((resolve, reject) => {
 			let settled = false;
 			const settle = (): boolean => {
 				if (settled) return false;
@@ -503,22 +548,68 @@ export class PiProcess {
 				if (settle()) reject(reason instanceof Error ? reason : new Error("Pi adapter decode aborted"));
 			};
 			const timer = setTimeout(() => {
-				identity.decodeAbortController.abort(
-					new Error(`Pi adapter decode timed out after ${String(this.opts.decodeTimeoutMs)}ms`),
-				);
+				deadline.abort(new PiDecodeDeadlineError(this.opts.decodeTimeoutMs));
 			}, this.opts.decodeTimeoutMs);
 			timer.unref?.();
 			if (signal.aborted) onAbort();
 			else signal.addEventListener("abort", onAbort, { once: true });
 			operation.then(
-				(value) => {
-					if (settle()) resolve(value);
+				(outcome) => {
+					if (settle()) resolve(outcome);
+					else this.observeDiscardedOutcome(outcome);
 				},
 				(error: unknown) => {
 					if (settle()) reject(error instanceof Error ? error : new Error(String(error)));
 				},
 			);
 		});
+	}
+
+	private observeDiscardedOutcome(outcome: PiHostDecodeOutcome<unknown>): void {
+		if (!outcome.lease) return;
+		void outcome.lease.release().catch(() => {
+			// The owning spawn already timed out or stopped. Observe cleanup failure
+			// without allowing it to target a replacement spawn.
+		});
+	}
+
+	private async releaseOutcome(outcome: PiHostDecodeOutcome<unknown>): Promise<void> {
+		await outcome.lease?.release();
+	}
+
+	private async adoptOutcome<T>(
+		outcome: PiHostDecodeOutcome<T>,
+		input: Omit<PiDecodedHoldAdoption, "holds" | "refs">,
+	): Promise<T> {
+		const lease = outcome.lease;
+		if (!lease) return outcome.value;
+		const accept = this.opts.adoptDecodedHolds;
+		if (!accept) {
+			await lease.release();
+			throw new Error("Pi decoded payload has no installed hold owner");
+		}
+		let transfer: ReturnType<PiPayloadLease["transfer"]>;
+		try {
+			transfer = lease.transfer();
+		} catch (error) {
+			try {
+				await lease.release();
+			} catch (releaseError) {
+				throw new AggregateError([error, releaseError], "Pi decoded payload transfer cleanup failed");
+			}
+			throw error;
+		}
+		try {
+			transfer.adopt((holds) => accept({ ...input, refs: transfer.refs, holds }));
+		} catch (error) {
+			try {
+				await transfer.release();
+			} catch (releaseError) {
+				throw new AggregateError([error, releaseError], "Pi decoded payload adoption cleanup failed");
+			}
+			throw error;
+		}
+		return outcome.value;
 	}
 
 	private async handleLine(line: string, identity: SpawnIdentity | null = this.spawnIdentity): Promise<void> {
@@ -548,9 +639,13 @@ export class PiProcess {
 		}
 		if (!identity) throw new Error("cannot decode a Pi frame without an active spawn");
 		if (typeof data !== "object" || data === null) {
-			await this.decodeWithDeadline(identity, () =>
-				this.adapter.decodeUnsolicited(data, { signal: identity.decodeAbortController.signal }),
+			const outcome = await this.decodeWithDeadline(identity, (signal) =>
+				this.adapter.decodeUnsolicited(data, {
+					signal,
+					externalizer: this.opts.payloadExternalizer,
+				}),
 			);
+			await this.releaseOutcome(outcome);
 			return;
 		}
 		const frame = data as Record<string, unknown>;
@@ -560,29 +655,87 @@ export class PiProcess {
 			if (id) {
 				const pending = this.pending.get(id);
 				if (pending) {
-					const response = await this.decodeWithDeadline(identity, () =>
-						this.adapter.decodeResponse(frame, pending.command, {
-							signal: identity.decodeAbortController.signal,
-						}),
-					);
+					let outcome: PiHostDecodeOutcome<SessionCommandResponseDto & { id: string }>;
+					try {
+						outcome = await this.decodeWithDeadline(identity, (signal) =>
+							this.adapter.decodeResponse(frame, pending.command, {
+								signal,
+								externalizer: this.opts.payloadExternalizer,
+							}),
+						);
+					} catch (error) {
+						const responseError =
+							error instanceof PiDecodeDeadlineError
+								? new PiHostResponseExternalizationError(pending.command, "deadline", {
+										cause: error,
+									})
+								: error;
+						if (
+							responseError instanceof PiHostResponseExternalizationError &&
+							!identity.decodeAbortController.signal.aborted &&
+							this.ownsSpawn(identity) &&
+							this.pending.get(id) === pending
+						) {
+							this.deletePending(id, pending);
+							clearTimeout(pending.timer);
+							pending.reject(responseError);
+							return;
+						}
+						if (
+							responseError instanceof PiHostResponseExternalizationError &&
+							(!this.ownsSpawn(identity) || this.pending.get(id) !== pending)
+						) {
+							return;
+						}
+						throw responseError;
+					}
+					if (!this.ownsSpawn(identity) || this.pending.get(id) !== pending) {
+						await this.releaseOutcome(outcome);
+						return;
+					}
+					const response = await this.adoptOutcome(outcome, {
+						kind: "response",
+						command: pending.command,
+					});
 					if (!this.ownsSpawn(identity) || this.pending.get(id) !== pending) return;
-					this.pending.delete(id);
+					this.deletePending(id, pending);
 					clearTimeout(pending.timer);
-					pending.resolve(response);
+					pending.resolve({ ...response, id: pending.publicId });
 					return;
 				}
 			}
 			// Late or unknown-id responses are ignorable only after their complete
 			// command-specific shape has been validated by the adapter.
-			await this.decodeWithDeadline(identity, () =>
-				this.adapter.decodeOrphanedResponse(frame, { signal: identity.decodeAbortController.signal }),
+			const orphaned = await this.decodeWithDeadline(identity, (signal) =>
+				this.adapter.decodeOrphanedResponse(frame, {
+					signal,
+				}),
 			);
+			await this.releaseOutcome(orphaned);
 			return;
 		}
 
-		const decoded = await this.decodeWithDeadline(identity, () =>
-			this.adapter.decodeUnsolicited(frame, { signal: identity.decodeAbortController.signal }),
+		const outcome = await this.decodeWithDeadline(identity, (signal) =>
+			this.adapter.decodeUnsolicited(frame, {
+				signal,
+				externalizer: this.opts.payloadExternalizer,
+			}),
 		);
+		if (!this.ownsSpawn(identity)) {
+			await this.releaseOutcome(outcome);
+			return;
+		}
+		if (
+			outcome.value.kind === "ignored" ||
+			(outcome.value.kind === "event" && !this.opts.onEvent) ||
+			(outcome.value.kind === "extension_ui_request" && !this.opts.onExtensionUiRequest)
+		) {
+			await this.releaseOutcome(outcome);
+			return;
+		}
+		const decoded = await this.adoptOutcome(outcome, {
+			kind: outcome.value.kind,
+		});
 		if (!this.ownsSpawn(identity)) return;
 		if (decoded.kind === "event") this.opts.onEvent?.(decoded.event);
 		if (decoded.kind === "extension_ui_request") this.opts.onExtensionUiRequest?.(decoded.request);
@@ -610,6 +763,7 @@ export class PiProcess {
 			pending.reject(error);
 		}
 		this.pending.clear();
+		this.pendingPublicIds.clear();
 	}
 
 	private currentJsonlLineBudget(): number {
@@ -619,9 +773,18 @@ export class PiProcess {
 		return MAX_JSONL_LINE_BYTES;
 	}
 
-	private nextId(): string {
-		this.requestCounter += 1;
-		return `web-${this.requestCounter.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+	private nextPublicId(): string {
+		let id: string;
+		do {
+			this.publicRequestCounter += 1n;
+			id = `web-${this.publicRequestCounter.toString(36)}`;
+		} while (this.pendingPublicIds.has(id));
+		return id;
+	}
+
+	private nextWireId(): string {
+		this.wireRequestCounter += 1n;
+		return `pi-web-wire-${this.wireRequestCounter.toString(36)}`;
 	}
 
 	/** Graceful stop: terminate the complete detached process group before cleanup. */
