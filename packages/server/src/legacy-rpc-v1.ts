@@ -16,6 +16,11 @@ import {
 	type SessionTreeNodeDto,
 } from "@pi-agent-web/protocol";
 import {
+	isLegacyRpcV1RawEvent,
+	isLegacyRpcV1RawExtensionUiRequest,
+	isLegacyRpcV1RawResponse,
+} from "./legacy-rpc-v1-wire.js";
+import {
 	type PiCapability,
 	type PiHostAdapter,
 	type PiHostUnsolicitedFrame,
@@ -334,6 +339,9 @@ export function createLegacyRpcV1Adapter(
 			if (hasGatewayOnlyResponseFields(normalized)) {
 				return incompatible("response", "malformed_response", frameType);
 			}
+			if (!isLegacyRpcV1RawResponse(normalized, expectedCommand)) {
+				return incompatible("response", "malformed_response", frameType);
+			}
 			if (!isSessionCommandResponseDto(normalized)) {
 				return incompatible("response", "malformed_response", frameType);
 			}
@@ -349,6 +357,7 @@ export function createLegacyRpcV1Adapter(
 				typeof normalized.id !== "string" ||
 				hasGatewayOnlyResponseFields(normalized) ||
 				!isSessionCommandTypeDto(normalized.command) ||
+				!isLegacyRpcV1RawResponse(normalized, normalized.command) ||
 				!isSessionCommandResponseDto(normalized)
 			) {
 				return incompatible("response", "malformed_response", frameType);
@@ -360,7 +369,7 @@ export function createLegacyRpcV1Adapter(
 				return incompatible("frame", "malformed_frame");
 			}
 			if (value.type === "extension_ui_request") {
-				if (!isExtensionUiRequestDto(value)) {
+				if (!isLegacyRpcV1RawExtensionUiRequest(value) || !isExtensionUiRequestDto(value)) {
 					return incompatible(
 						"extension_ui_request",
 						"malformed_extension_ui_request",
@@ -369,7 +378,7 @@ export function createLegacyRpcV1Adapter(
 				}
 				return { kind: "extension_ui_request", request: value };
 			}
-			if (isProductSessionEventDto(value)) {
+			if (isLegacyRpcV1RawEvent(value) && isProductSessionEventDto(value)) {
 				const event = redactEvent(value);
 				if (
 					requiresToolcallIdentity &&

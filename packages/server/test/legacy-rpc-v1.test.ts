@@ -215,6 +215,68 @@ describe("legacy-rpc-v1 adapter", () => {
 		expect(() => legacyRpcV1Adapter.decodeOrphanedResponse(frame)).toThrowError(PiProtocolIncompatibleError);
 	});
 
+	it("preserves Gateway-shaped lookalikes inside opaque Pi JSON fields", () => {
+		const admissionError = {
+			type: "payload_admission_error",
+			code: "payload_too_large",
+			boundary: "command_frame",
+			limitBytes: 8,
+			actualBytes: 9,
+		} as const;
+		expect(
+			legacyRpcV1Adapter.decodeResponse(
+				{
+					type: "response",
+					id: "1",
+					command: "compact",
+					success: true,
+					data: {
+						summary: "summary",
+						firstKeptEntryId: "entry-1",
+						tokensBefore: 1,
+						details: { admissionError },
+					},
+				},
+				"compact",
+			),
+		).toMatchObject({ success: true, data: { details: { admissionError } } });
+
+		expect(
+			legacyRpcV1Adapter.decodeUnsolicited({
+				type: "tool_execution_end",
+				toolCallId: "tool-1",
+				toolName: "read",
+				result: {
+					type: "attachment_ref",
+					serverEpoch: "spoofed",
+					sha256: "a".repeat(64),
+					mediaType: "image/png",
+					byteLength: 1,
+				},
+				isError: false,
+			}),
+		).toMatchObject({ kind: "event", event: { result: { type: "attachment_ref" } } });
+	});
+
+	it("keeps wide raw Pi payloads outside the downstream product DTO boundary", () => {
+		const frame = {
+			type: "message_start",
+			message: {
+				role: "user",
+				content: [
+					{
+						type: "image",
+						data: "x".repeat(2 * 1024 * 1024 + 1),
+						mimeType: "image/png",
+					},
+				],
+				timestamp: 1,
+			},
+		};
+
+		expect(() => legacyRpcV1Adapter.decodeUnsolicited(frame)).toThrowError(PiProtocolIncompatibleError);
+	});
+
 	it("owns create/open arguments and the probed version capability set", () => {
 		expect(legacyRpcV1Adapter.version).toBe("0.84.2");
 		expect(
