@@ -53,7 +53,9 @@ pnpm --filter @pi-agent-web/server exec vitest run \
   test/pi-process.test.ts test/generation-content-owner.test.ts
 pnpm --filter @pi-agent-web/server exec vitest run \
   test/transition-payload-ledger.test.ts test/session-live-projection.test.ts
-pnpm --filter @pi-agent-web/ui exec vitest run test/session-transport.test.ts
+pnpm --filter @pi-agent-web/server exec vitest run test/payload-reference-gateway.integration.test.ts
+pnpm --filter @pi-agent-web/ui exec vitest run \
+  test/session-transport.test.ts test/projection.test.ts test/user-message-bubble.test.tsx
 pnpm exec playwright test --config tests/e2e/playwright.config.ts multi-session.spec.ts
 ```
 
@@ -95,8 +97,11 @@ Raster fixtures 只证明 Gateway admission 的 MIME、magic、gross container �
 复用同一 raster admission，并验证 canonical base64、decoded/blob ceiling、同帧去重、单 Buffer streaming
 与整帧 rollback。PiProcess 与 Runtime 测试覆盖 late/deadline/stale/orphan disposal，startup、普通
 response/event、idle compaction、generation cleanup、fork/clone/rekey ownership，以及 cleanup rejection 的
-永久 fence。`payload.epoch_attachment_refs` 尚未广告，Main 未注入 payload services，当前 Browser E2E
-继续覆盖 inline image；server-private L1/L2 测试和 attachment REST 测试都不构成完整用户路径。
+永久 fence。Production Main 通过一个 activation root 把相同 store、epoch、budget context 与 Pi payload
+services 接到 REST、Supervisor 和 WebSocket hello。L3 real HTTP/WS integration 已验证大 Pi image 在 live、
+replay、snapshot 中只以 reference 出现，认证 GET 返回原 bytes，stop 后 hold/GC 清理完成。L4 packaged
+Browser coverage 与该 activation diff 一起验证 trusted-context projection/render、attachment load resync 和
+结构化 admission recovery；Browser command ingress 继续覆盖 inline-only image preparation。
 
 ## 确定性 browser E2E
 
@@ -108,6 +113,8 @@ case 建立隔离的 agent/session/web/workspace/control 目录，并从 child e
 - cold bootstrap，无 console/page error；
 - 同一 Workspace 的两个独立 Pi PID/Session 并发；A 后台流式时选择并完成 B，再切回 A；
 - image-only prompt 后同一 multiplexed socket 仍能发下一条 command；
+- Pi output attachment reference 通过同源认证 URL 渲染；失效 reference 触发精确、单次 resync；
+- 结构化 payload admission failure 显示本地化文案并保留 draft/images，重试成功后才清空；
 - ordinary first prompt 不被标成 steer，真实 event order 不留下空 Working step；
 - 375×812 没有页面水平 overflow，composer 主控件 bounding box 都在 viewport。
 

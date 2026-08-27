@@ -217,16 +217,28 @@ try {
 					socket.send(
 						JSON.stringify({
 							type: "client_hello",
-							protocol: { major: 1, minor: 0 },
+							protocol: { major: 1, minor: 2 },
 							clientBuild: "pack-smoke",
-							capabilities: ["rpc.commands", "rpc.events", "rpc.extension_ui", "session.multiplex"],
+							capabilities: [
+								"rpc.commands",
+								"rpc.events",
+								"rpc.extension_ui",
+								"session.multiplex",
+								"session.hot_runtime_inventory",
+								"payload.epoch_attachment_refs",
+							],
 							limits: { maxServerFrameBytes: 68 * 1024 * 1024 },
 						}),
 					);
 				});
 				socket.once("message", (raw) => {
 					const hello = JSON.parse(raw.toString());
-					if (hello.type !== "server_hello" || hello.serverEpoch === undefined) {
+					if (
+						hello.type !== "server_hello" ||
+						hello.serverEpoch === undefined ||
+						!hello.capabilities?.includes("payload.epoch_attachment_refs") ||
+						hello.payloadBudget?.maxServerFrameBytes !== 65 * 1024 * 1024
+					) {
 						finish(new Error(`Packaged WebSocket did not negotiate hello: ${raw.toString()}`));
 						return;
 					}

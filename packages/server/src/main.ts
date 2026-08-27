@@ -13,6 +13,7 @@ import {
 } from "./access-control.js";
 import { assertLoopbackHost, ENV_SESSION_DIR, loadConfig, type ServerConfig } from "./config.js";
 import { EpochContentStore } from "./epoch-content-store.js";
+import { createGatewayPayloadActivation } from "./gateway-payload-activation.js";
 import { NativeSessionCatalog, sessionHandleForCanonicalFile } from "./native-session-catalog.js";
 import { RecoverableSessionTrash } from "./recoverable-session-trash.js";
 import { type ProbedPiRuntime, resolvePiRuntime } from "./resolver.js";
@@ -127,6 +128,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 		const activeContentStore = new EpochContentStore({ webDataDir: config.webDataDir, serverEpoch });
 		contentStore = activeContentStore;
 		await activeContentStore.initialize();
+		const payloadActivation = createGatewayPayloadActivation(activeContentStore, serverEpoch);
 
 		let activeBridge!: SessionWsBridge;
 		const activeSupervisor = new SessionSupervisor({
@@ -158,6 +160,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 					nativeSessionId: session.nativeSessionId,
 				};
 			},
+			piPayloadServices: payloadActivation.supervisorServices,
 			broadcast: (message) => activeBridge.broadcast(message),
 			onHotRuntimeInventory: (inventory) => activeBridge.broadcastHotRuntimeInventory(inventory),
 			log,
@@ -176,12 +179,13 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 					GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 				],
 			},
+			payloadActivation,
 		});
 		bridge = activeBridge;
 
 		const app = createApp({
 			accessControl,
-			contentStore: activeContentStore,
+			contentStore: payloadActivation.contentStore,
 			serverEpoch,
 			config,
 			catalog,

@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { deflateSync } from "node:zlib";
 
 if (process.argv.includes("--version")) {
 	process.stdout.write("0.84.2\n");
@@ -158,6 +159,44 @@ function ensurePersisted() {
 function configuredBytes(name) {
 	const value = Number(process.env[name]);
 	return Number.isFinite(value) && value > 0 ? Math.min(value, 2 * 1024 * 1024) : 0;
+}
+
+function crc32(input) {
+	let crc = 0xffff_ffff;
+	for (const byte of input) {
+		crc ^= byte;
+		for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb8_8320 : 0);
+	}
+	return (crc ^ 0xffff_ffff) >>> 0;
+}
+
+function pngChunk(type, data) {
+	const typeBytes = Buffer.from(type, "ascii");
+	const chunk = Buffer.allocUnsafe(12 + data.byteLength);
+	chunk.writeUInt32BE(data.byteLength, 0);
+	typeBytes.copy(chunk, 4);
+	data.copy(chunk, 8);
+	chunk.writeUInt32BE(crc32(Buffer.concat([typeBytes, data])), 8 + data.byteLength);
+	return chunk;
+}
+
+function largeValidPng(byteLength = 1024 * 1024 + 257) {
+	const signature = Buffer.from("89504e470d0a1a0a", "hex");
+	const ihdr = Buffer.alloc(13);
+	ihdr.writeUInt32BE(1, 0);
+	ihdr.writeUInt32BE(1, 4);
+	ihdr.set([8, 6, 0, 0, 0], 8);
+	const idat = pngChunk("IDAT", deflateSync(Buffer.from([0, 0, 0, 0, 0])));
+	const fixed = [signature, pngChunk("IHDR", ihdr), idat, pngChunk("IEND", Buffer.alloc(0))];
+	const fixedBytes = fixed.reduce((total, part) => total + part.byteLength, 0);
+	const paddingBytes = byteLength - fixedBytes - 12;
+	if (paddingBytes < 1) throw new Error("large PNG fixture is too small");
+	return Buffer.concat([
+		fixed[0],
+		fixed[1],
+		pngChunk("paWa", Buffer.alloc(paddingBytes, 0x61)),
+		...fixed.slice(2),
+	]);
 }
 
 function configuredCount(name) {
@@ -415,6 +454,20 @@ function streamPrompt(command) {
 	}
 	send({ type: "agent_start" });
 	response(command);
+	if (text === "payload-reference-large-image-events") {
+		const image = largeValidPng();
+		const message = {
+			role: "user",
+			content: [{ type: "image", data: image.toString("base64"), mimeType: "image/png" }],
+			timestamp: Date.now(),
+		};
+		messages.push(message);
+		send({ type: "message_start", message });
+		send({ type: "message_end", message });
+		send({ type: "agent_end", messages: [], willRetry: false });
+		send({ type: "agent_settled" });
+		return;
+	}
 	if (text === "notify-then-event") {
 		send({
 			type: "extension_ui_request",

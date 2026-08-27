@@ -141,8 +141,9 @@ Session；不同连接也能各自控制不同 Session。同一 Session 同时�
 
 [ADR 0010](decisions/0010-epoch-scoped-attachment-references-and-payload-budgets.md) 定义跨 Browser、
 Gateway、Pi adapter、projection、replay、snapshot 与 queue 的统一 payload budget。协议 minor 2 通过
-可选的 `payload.epoch_attachment_refs` 能力协商完整预算；minor 1 hello 保持旧 shape。分阶段接入时，
-只有已经执行表内全部边界的 Gateway 才能回显该能力，否则继续使用原有 inline image 合同。
+`payload.epoch_attachment_refs` 协商完整预算。Production Browser 与 Gateway 都把它列入 required
+capability；缺少能力、预算或足够 frame ceiling 的 hello 在订阅 Session 前终止。Minor 1 hello 仍保留旧
+shape 供严格解码和版本诊断，但 production connection 没有逐连接 inline fallback。
 
 Attachment blob 使用 `webDataDir` 下的私有、epoch-scoped disk spool，容量、hold、pin 与 publish 状态由
 Gateway 内存 ledger 管理；它仍是可丢弃的有界派生 cache，不是新的持久化层。Store root 由单个 Gateway
@@ -175,11 +176,13 @@ Gateway 已提供同源、认证后的 attachment REST ingress：
   它不是 codec decoder，也不证明 PNG CRC、JPEG marker graph、WebP frame semantics、GIF sub-block graph
   或像素数据可解码。Browser preprocessing 与最终 Pi/provider 消费路径仍需处理 decode failure。
 
-Attachment REST 与 store 是协议分阶段接入的基础设施。Gateway hello 目前仍不广告
-`payload.epoch_attachment_refs`，Browser 也不能因为 REST endpoint 存在就发送 reference。Main 当前
-没有向 Supervisor 注入 server-private Pi payload services，Browser 继续发送 inline image。
+Main 从同一个 `EpochContentStore`、`serverEpoch` 与 canonical budget 构造单一 payload activation，并把
+其中的 externalizer/hold services 注入 Supervisor，把 trusted attachment context 注入 WebSocket Bridge。
+REST routes 使用同一个 store。Production Main 只在完整 activation 存在时把其中的 context 交给 Bridge；
+Bridge 复验 epoch/context 后才广告 `payload.epoch_attachment_refs`。缺少 required capability 的连接不会
+退回 inline output。
 
-Server 已实现 default-off 的 Pi image externalization 路径。`legacy-rpc-v1` 先用 command/event-specific
+Production Pi image externalization 路径中，`legacy-rpc-v1` 先用 command/event-specific
 raw guard 验证来源，再只遍历明确的 image 语义槽：user、toolResult 与 custom message content，message
 与 custom_message entry，`get_messages`、`get_entries`、`get_tree` 成功响应，以及 `agent_end`、
 `turn_end`、`message_start`、`message_end`、`entry_appended` 事件。Tool args/result/details、Extension UI
@@ -200,6 +203,14 @@ provenance/raster 不兼容、manifest/path safety、rollback failure 和所有 
 failure 都会终止当前 Runtime。Manual/capacity stop、recoverable crash、generation roll、rekey、overflow
 与 shutdown 清理 projection 和 holds；只有已建立最终 projection、没有未决 cleanup 的真实
 nonrecoverable leader crash 才 seal 并保留当前 owner，直到显式 stop 或 Gateway shutdown。
+
+Browser 从已验证的 `server_hello` 固化 `{serverEpoch,payloadBudget}`，所有后续 server frame 与 snapshot
+都用该 trusted context guard。Ingress prompt image 仍是 inline-only `ImageContentDto`，projection 则保留
+`SessionImageContentDto` 的 inline 或 reference data。Reference 通过同源、带认证 Cookie 的相对 GET URL
+直接交给 `<img>`，不先 fetch 或复制为 Blob。当前 authoritative baseline 的图片加载失败只对精确
+Session/generation 发起一次 cursorless resync；identity 已变化或 baseline 尚未提交时忽略旧 DOM error。
+结构化 admission failure 按稳定 code 本地化。失败提交保留原 draft 与 images，同 Session 后续提交成功后
+才清空。
 
 Reference 消费入口必须把 canonical DTO、协商后的 blob ceiling 与当前 `serverEpoch` 作为同一次
 admission 判断。Payload ceiling 必须保持 producer 不大于 consumer。Raw Pi event 到 normalized event

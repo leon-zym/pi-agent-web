@@ -17,11 +17,15 @@ const GATEWAY_BASE_CAPABILITIES = [
 	"session.multiplex",
 ] as const;
 /** Capabilities a Gateway requires before accepting a client connection. */
-export const GATEWAY_CLIENT_REQUIRED_CAPABILITIES = [...GATEWAY_BASE_CAPABILITIES] as const;
+export const GATEWAY_CLIENT_REQUIRED_CAPABILITIES = [
+	...GATEWAY_BASE_CAPABILITIES,
+	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+] as const;
 /** Capabilities the current Browser requires the negotiated Gateway to provide. */
 export const GATEWAY_SERVER_REQUIRED_CAPABILITIES = [
 	...GATEWAY_BASE_CAPABILITIES,
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 ] as const;
 /** @deprecated Use the directional required-capability sets. */
 export const GATEWAY_REQUIRED_CAPABILITIES = GATEWAY_CLIENT_REQUIRED_CAPABILITIES;
@@ -169,8 +173,7 @@ export function isGatewayServerHello(value: unknown): value is GatewayServerHell
 	const hasCapability = value.capabilities.includes(GATEWAY_PAYLOAD_BUDGET_CAPABILITY);
 	const hasBudget = Object.hasOwn(value, "payloadBudget");
 	if (value.protocol.minor < GATEWAY_PAYLOAD_BUDGET_PROTOCOL_MINOR) return !hasCapability && !hasBudget;
-	if (hasCapability !== hasBudget) return false;
-	return !hasBudget || isSessionPayloadBudgetDto(value.payloadBudget);
+	return hasCapability && hasBudget && isSessionPayloadBudgetDto(value.payloadBudget);
 }
 
 export type GatewayPayloadBudgetNegotiation =

@@ -1,4 +1,4 @@
-import type { ImageContent } from "./pi-types";
+import type { SessionImageContentDto } from "@pi-agent-web/protocol";
 
 /**
  * View models for the conversation projection.
@@ -15,7 +15,7 @@ export interface UiUserMessage {
 	text: string;
 	/** Slash/skill invocation rendered as an atomic tag; expanded skill source is never displayed. */
 	command?: string;
-	images?: ImageContent[];
+	images?: SessionImageContentDto[];
 	source: UiUserMessageSource;
 	/** queued-but-not-injected messages show a badge */
 	delivered: boolean;

@@ -12,7 +12,7 @@ import {
 import { sessionTransport } from "../stores/session-transport";
 import type { ImageContent } from "../types/pi-types";
 import { api } from "./api";
-import { displayError, stripAnsi } from "./format";
+import { displayCommandResponseError, displayError, stripAnsi } from "./format";
 import { tt } from "./i18n";
 import { isSessionControlReady, sessionDeleteCapability } from "./session-capabilities";
 import { sendControlCommand } from "./session-command";
@@ -349,7 +349,7 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 			response = await sendControlCommand(sessionHandle, { type: "prompt", message: text, images });
 		}
 		if (response.success === false) {
-			toast.error(tt("session.sendFailed"), { description: stripAnsi(response.error) });
+			toast.error(tt("session.sendFailed"), { description: displayCommandResponseError(response) });
 		} else {
 			useComposerStore
 				.getState()

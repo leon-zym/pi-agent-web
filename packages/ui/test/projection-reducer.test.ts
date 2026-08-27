@@ -51,6 +51,35 @@ function finalAssistant(
 const ctx = { now: 1000 };
 
 describe("projection reducer", () => {
+	it("preserves a trusted attachment ref in a live user message", () => {
+		const ref = {
+			type: "attachment_ref",
+			serverEpoch: "epoch-a",
+			sha256: "b".repeat(64),
+			mediaType: "image/png",
+			byteLength: 48,
+		};
+		const projection = reduceProjection(
+			createEmptyProjection("s-ref"),
+			{
+				type: "message_start",
+				message: {
+					role: "user",
+					content: [
+						{ type: "text", text: "with ref" },
+						{ type: "image", data: ref, mimeType: "image/png" },
+					],
+					timestamp: 1,
+				},
+			} as never,
+			ctx,
+		);
+
+		expect(projection.turns[0]?.userMessages[0]?.images).toEqual([
+			{ type: "image", data: ref, mimeType: "image/png" },
+		]);
+	});
+
 	it("assembles a full prompt round trip into one settled turn", () => {
 		let p = createEmptyProjection("s1");
 		p = reduceProjection(p, { type: "agent_start" }, ctx);

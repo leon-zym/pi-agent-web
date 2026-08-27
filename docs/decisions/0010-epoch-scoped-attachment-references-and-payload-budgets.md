@@ -1,7 +1,8 @@
 # ADR 0010: Epoch-scoped attachment references and payload budgets
 
-- Status: Accepted
+- Status: Accepted (amended)
 - Date: 2026-08-27
+- Amended: 2026-08-28
 
 ## Context
 
@@ -18,14 +19,18 @@ Gateway restart even though its backing bytes may have disappeared.
 
 ## Decision
 
-1. Gateway protocol minor 2 introduces the optional `payload.epoch_attachment_refs` capability.
-   Protocol minor 1 keeps its previous hello shape. A peer at minor 1 must not send the capability
-   or `payloadBudget` field.
-2. A server that selects minor 2 advertises `payloadBudget` if and only if it advertises the new
-   capability. Both peers validate the complete budget, the selected minor, the capability
-   intersection, and compatible client and server frame ceilings before using attachment
-   references. The capability is not part of either directional required-capability set during the
-   staged rollout.
+The 2026-08-28 amendment completes the staged activation described by the original decision. The
+required capability, production Main wiring, and Browser reference consumption below supersede the
+earlier staged rollout state.
+
+1. Gateway protocol minor 2 introduces `payload.epoch_attachment_refs` as a required production
+   capability in both directions. Protocol minor 1 keeps its previous hello shape and must not send
+   the capability or `payloadBudget`, so it cannot establish a Session connection with the current
+   production peers.
+2. A minor 2 server advertises the capability and complete `payloadBudget` together. Both peers
+   validate every directional requirement, the selected minor, the complete budget, and compatible
+   client/server frame ceilings before Session subscription. Failure is terminal for that
+   connection; there is no per-connection inline output fallback.
 3. `@pi-agent-web/protocol` owns one canonical payload budget. It covers complete Browser command
    frames, command text, inline images, Pi JSONL frames, normalized event frames, replay frames and
    buffers, canonical snapshots, Gateway frames, queued and catch-up backlogs, and the derived
@@ -53,9 +58,11 @@ Gateway restart even though its backing bytes may have disappeared.
    carry this structure beside its human-readable error. The field is Gateway-owned: the Pi adapter
    rejects it on raw Pi responses, and the WebSocket bridge forwards it only from an actual internal
    `RpcError`.
-8. The Gateway may advertise the capability only after every advertised boundary is enforced and
-   stale references fail closed. Until then, peers continue using the minor 1 compatible inline
-   payload path even when they can select protocol minor 2.
+8. Production Main constructs one activation from the canonical budget, current `serverEpoch`, and
+   initialized `EpochContentStore`. The same activation supplies REST storage, Pi externalization
+   and hold services to the Supervisor, and the trusted attachment context to the WebSocket bridge.
+   Production Main passes that context only from the complete activation. The bridge validates its
+   epoch before advertising the required capability.
 9. The server-private Pi output path externalizes images only from reviewed raw message and entry
    slots. Command/event-specific raw guards run first, and the epoch-aware product guard runs after
    externalization. Tool details, Extension UI, opaque JSON, and nested lookalike objects never gain
@@ -71,16 +78,20 @@ Gateway restart even though its backing bytes may have disappeared.
     the Runtime. Manual or capacity stop, recoverable crash, generation roll, rekey, overflow, and
     shutdown release reachable holds. A true nonrecoverable leader crash may retain a sealed final
     projection and its owner until explicit stop or shutdown.
-12. The production Main does not install the server-private externalizer or Runtime payload services.
-    Gateway hello therefore does not advertise `payload.epoch_attachment_refs`, and the Browser
-    continues to use inline images.
+12. The Browser freezes the trusted epoch/budget context from the verified server hello and uses it
+    for every server frame and snapshot guard. Projection preserves `SessionImageContentDto`
+    references and renders them through authenticated same-origin GET URLs without a fetch-to-Blob
+    copy. An attachment load failure requests one exact authoritative resync; stale DOM failures are
+    ignored while the new baseline is uncommitted. Structured admission errors use localized copy,
+    and a failed submit retains its draft and images until a later success. Browser command images
+    remain inline-only ingress.
 
 ## Consequences
 
 The Browser protocol can distinguish a payload policy failure from a Pi command failure without
-parsing localized text. The server-private image path can reuse attachment bytes during one Gateway
-lifetime without treating that cache as recoverable storage. Since Main leaves the path disabled,
-these references are not part of the current Browser/Gateway runtime contract.
+parsing localized text. The image path reuses attachment bytes during one Gateway lifetime without
+treating that cache as recoverable storage. Epoch-scoped references are part of the required current
+Browser/Gateway runtime contract.
 
 A Gateway restart intentionally loses reference continuity. Recovery may spend CPU and bandwidth to
 externalize Pi-owned attachment content again. This is preferable to accepting a reference whose
@@ -114,5 +125,7 @@ review and tests at every affected boundary.
 - Adapter, PiProcess, projection, and Runtime tests cover raw provenance, image externalization,
   transactional rollback, decoded-delivery disposal, active generation ownership, compaction,
   rekey, transition cleanup, and stop/crash cleanup fences.
-- Browser preprocessing tests cover decode failure and bounded inline image preparation. Production
-  Browser tests remain on the inline path because Main does not install or advertise attachment refs.
+- Production Gateway integration covers required hello activation, large-image refs across live,
+  replay and snapshot, authenticated GET, and teardown cleanup. Browser tests cover trusted-context
+  guards, ref projection/rendering, exact load-failure resync, localized admission recovery, and
+  bounded inline command-image preparation.

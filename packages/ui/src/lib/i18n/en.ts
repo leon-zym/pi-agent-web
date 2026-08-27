@@ -322,6 +322,17 @@ export const en: typeof zhCN = {
 	"session.renameCurrentOnly": "Only the currently controlled session can be renamed",
 	"session.needWorkspace": "Open a workspace first",
 	"session.sendFailed": "Send failed",
+	"payloadAdmission.payload_too_large": "The image payload is too large to deliver.",
+	"payloadAdmission.attachment_cache_exhausted":
+		"The attachment cache is full. Try again after other attachment work finishes.",
+	"payloadAdmission.attachment_cache_item_limit_exceeded":
+		"The attachment cache has reached its item limit. Try again later.",
+	"payloadAdmission.attachment_ref_invalid": "The attachment reference is invalid.",
+	"payloadAdmission.attachment_ref_epoch_mismatch":
+		"The attachment belongs to an expired Gateway session. Sync and try again.",
+	"payloadAdmission.attachment_unavailable": "The attachment is no longer available. Sync and try again.",
+	"payloadAdmission.capability_required":
+		"This Gateway cannot deliver the attachment format required by the Browser.",
 	"session.abortFailed": "Abort failed",
 	"session.commandFailed": "Command failed",
 	"session.forkCancelled": "Fork cancelled by an extension",

@@ -1,5 +1,8 @@
+import { RpcError, type SessionPayloadAdmissionErrorDto } from "@pi-agent-web/protocol";
 import { describe, expect, it } from "vitest";
-import { displayLabel, formatExactDateTime, stripAnsi, tailTeaser } from "../src/lib/format";
+import { displayError, displayLabel, formatExactDateTime, stripAnsi, tailTeaser } from "../src/lib/format";
+import { useI18n } from "../src/lib/i18n";
+import { en } from "../src/lib/i18n/en";
 
 it("formats an exact local timestamp through seconds", () => {
 	const timestamp = new Date(2026, 7, 21, 6, 7, 8).getTime();
@@ -39,5 +42,83 @@ describe("stripAnsi", () => {
 		expect(tailTeaser("First thought.\nSecond thought.\nFinal conclusion.")).toBe("Final conclusion.");
 		expect(tailTeaser("  \n  Single line  \n  ")).toBe("Single line");
 		expect(tailTeaser("")).toBe("");
+	});
+});
+
+describe("payload admission errors", () => {
+	it("maps every structured code through localized copy instead of Gateway error text", () => {
+		useI18n.getState().setLocale("en");
+		const cases: Array<[SessionPayloadAdmissionErrorDto, string]> = [
+			[
+				{
+					type: "payload_admission_error",
+					code: "payload_too_large",
+					boundary: "attachment_blob",
+					limitBytes: 1024,
+					actualBytes: 2048,
+				},
+				"payloadAdmission.payload_too_large",
+			],
+			[
+				{
+					type: "payload_admission_error",
+					code: "attachment_cache_exhausted",
+					boundary: "attachment_cache",
+					limitBytes: 1024,
+					actualBytes: 2048,
+				},
+				"payloadAdmission.attachment_cache_exhausted",
+			],
+			[
+				{
+					type: "payload_admission_error",
+					code: "attachment_cache_item_limit_exceeded",
+					boundary: "attachment_cache",
+					limitItems: 16,
+					actualItems: 17,
+				},
+				"payloadAdmission.attachment_cache_item_limit_exceeded",
+			],
+			[
+				{
+					type: "payload_admission_error",
+					code: "attachment_ref_invalid",
+					boundary: "attachment_ref",
+				},
+				"payloadAdmission.attachment_ref_invalid",
+			],
+			[
+				{
+					type: "payload_admission_error",
+					code: "attachment_ref_epoch_mismatch",
+					boundary: "attachment_ref",
+				},
+				"payloadAdmission.attachment_ref_epoch_mismatch",
+			],
+			[
+				{
+					type: "payload_admission_error",
+					code: "attachment_unavailable",
+					boundary: "attachment_ref",
+				},
+				"payloadAdmission.attachment_unavailable",
+			],
+			[
+				{
+					type: "payload_admission_error",
+					code: "capability_required",
+					boundary: "capability",
+				},
+				"payloadAdmission.capability_required",
+			],
+		];
+		const dictionary = en as Record<string, string>;
+
+		for (const [admissionError, key] of cases) {
+			expect(dictionary[key]).toEqual(expect.any(String));
+			expect(displayError(new RpcError("prompt", "Gateway delivery failure", admissionError))).toBe(
+				dictionary[key],
+			);
+		}
 	});
 });

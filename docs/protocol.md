@@ -158,10 +158,11 @@ Prompt/steer/follow_up 文本按 UTF-8 编码后上限 1 MiB。可以是 image-o
 
 ### Payload budget 与 attachment reference
 
-协议 minor 2 新增可选能力 `payload.epoch_attachment_refs`。minor 1 的 hello 必须保持原有 shape，
-不能携带该能力或 `payloadBudget`。minor 2 只有在双方都声明该能力，且 `server_hello` 携带完整预算时
-才能使用 attachment reference。该能力在分阶段接入期间不是 Browser 或 Gateway 的 required
-capability；未协商时继续使用上述 inline image 路径。
+协议 minor 2 新增 `payload.epoch_attachment_refs`。Production Browser 与 Gateway 都把它列入 required
+capability。Minor 1 hello 必须保持原有 shape，不能携带该能力或 `payloadBudget`，因此不能与当前
+production peer 建立 Session connection。Minor 2 要求双方声明该能力，且 `server_hello` 携带完整预算；
+缺少任一条件都会在订阅前终止，不存在逐连接 inline output fallback。Browser-to-Gateway prompt image 仍按
+上面的 inline-only command DTO 和预算发送。
 
 完整 `payloadBudget` 是一个不可缺项、不可扩展的 canonical record：
 
@@ -214,12 +215,14 @@ Gateway 只有在所有表内边界已经执行、旧 epoch reference 会 fail c
 `admissionError` 是 Gateway-owned 字段。Pi raw failure response 携带该字段属于协议不兼容；Bridge
 只从 Gateway 内部真实 `RpcError` 透传结构，不接受普通 Error 或形似对象注入。
 
-Server 已实现 default-off 的 Pi image output seam。Adapter 顺序是 command/event-specific raw guard →
-可选 image externalization → trusted epoch/budget product guard → redaction。Externalizer 只处理 message
+Production Pi image output 顺序是 command/event-specific raw guard → image externalization → trusted
+epoch/budget product guard → redaction。Externalizer 只处理 message
 content、message/custom_message entry、三个 history success response 和五类明确携带 message/entry 的
 authoritative event；tool args/result/details、Extension UI 与 opaque JSON 保持原值。Late 或 unknown-id
-response 只完成 command-specific raw validation 后丢弃，不调用 externalizer。Main 尚未安装该 seam，
-Gateway hello 不广告 `payload.epoch_attachment_refs`，当前 Browser 仍使用 inline image。
+response 只完成 command-specific raw validation 后丢弃，不调用 externalizer。Main 用同一个
+`serverEpoch`、canonical budget 与 `EpochContentStore` 构造 activation，把 externalizer/hold services 注入
+Supervisor，把 trusted context 注入 WebSocket Bridge；attachment routes 使用同一个 content store 与
+`serverEpoch`。
 
 Externalized outcome 显式携带 provisional lease。PiProcess 只在同步 prepare 和 commit 都返回 literal
 `true`、且 spawn/pending identity 仍匹配后移交 transfer；late、timeout、abort、stale 与 ownerless 路径
@@ -228,12 +231,19 @@ event/response、idle compaction 和 identity transition 保持 generation owner
 只有可信 blob/cache ceiling evidence 或 PiProcess 自身 caller abort/deadline 可转为 Gateway delivery failure；
 所有 authoritative event failure、payload provenance/integrity failure 与 unsafe store state 都是 terminal。
 
+Browser 从已验证的 `server_hello` 保存 immutable attachment guard context。后续 event、response 与 snapshot
+都必须用这个 context 通过 wire guard，projection 才能保留 `SessionImageContentDto` reference。图片使用
+`/api/v1/attachments/:serverEpoch/:sha256` 的同源相对 URL，不经过 fetch-to-Blob 复制。只有当前 exact
+Session/generation 已提交 authoritative baseline 时，load error 才触发一次 cursorless resync；旧 identity
+或未完成 baseline 的 DOM error 被忽略。Structured `admissionError` 按 code 映射本地化文案，失败 prompt
+保留原 draft/images，后续成功提交后才清空。
+
 ### Attachment REST staging contract
 
 Attachment REST 使用与其他 `/api/v1/*` 路由相同的 loopback Host、same-origin Origin/Fetch Metadata 和
-bootstrap Cookie 校验。所有 attachment 成功与错误响应都携带 `Cache-Control: no-store`。这些 endpoint
-已经可用，但 Gateway hello 尚未广告 `payload.epoch_attachment_refs`；未协商的 Browser 必须继续发送
-inline image，不能把 REST 可达性当作 capability negotiation。
+bootstrap Cookie 校验。所有 attachment 成功与错误响应都携带 `Cache-Control: no-store`。REST 可达性
+本身不替代 capability negotiation；production hello 必须先完成 required capability、完整 budget 与 frame
+ceiling 校验。
 
 `PUT /api/v1/attachments/:serverEpoch/:sha256` 的 request body 是 raw raster bytes：
 
@@ -413,18 +423,18 @@ package manifest 与 probe 输出必须一致；失败使用稳定且不含路�
 Pi stdout 先由 `legacy-rpc-v1` adapter 的 raw wire guard 按 command/event 验证，再转换为产品 DTO。
 响应按 command 校验 nested data，事件与 Extension UI 按 discriminant、UTF-8 bytes、item count、safe
 number 与 JSON depth 校验。显式列入 non-authoritative allowlist 的 frame 可忽略；其他未知或畸形权威
-frame 进入单一 `protocol_incompatible` 终态。若注入 server-private image externalizer，转换顺序和
-ownership 采用上面的 default-off attachment seam。
+frame 进入单一 `protocol_incompatible` 终态。Production Main 注入的 image externalizer 按上面的
+attachment 顺序与 generation ownership 处理 image payload。
 
 The first WebSocket frame must be `client_hello`. A successful `server_hello` carries the Gateway
 protocol major and minor, server build and epoch, Pi version, adapter id, capability intersection,
 and negotiated limits. A major mismatch returns a stable `protocol_error` and closes the connection;
-the UI does not reconnect automatically. Client and Gateway validate their directional base RPC and
-multiplex capabilities. The Browser additionally requires `session.hot_runtime_inventory` and uses
-the shared negotiation helper to validate minor selection and the server frame ceiling. Protocol
-minor 2 may additionally negotiate `payload.epoch_attachment_refs`; its helper validates both hello
-messages, the exact selected minor, both capability declarations, the complete `payloadBudget`, and
-the client and server frame-limit intersection. Minor 1 keeps the previous hello shape.
+the UI does not reconnect automatically. Client and Gateway validate every directional required
+capability. The Browser requires `session.hot_runtime_inventory`; both peers require
+`payload.epoch_attachment_refs`. Shared negotiation validates both hello messages, exact minor 2
+selection, both capability declarations, the complete `payloadBudget`, and the client/server frame
+limit intersection. Minor 1 keeps the previous hello shape for decoding and diagnostics but cannot
+establish a production Session connection.
 `/api/v1/health/live` reports process liveness, `/api/v1/health/ready` reports Pi Host readiness, and
 the legacy `/health` endpoint remains a readiness alias.
 

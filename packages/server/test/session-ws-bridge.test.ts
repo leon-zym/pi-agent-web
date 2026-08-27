@@ -14,8 +14,9 @@ import type {
 } from "@pi-agent-web/protocol";
 import {
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 	RpcError,
-	SESSION_HOT_RUNTIME_INVENTORY_MAX_BYTES,
+	SESSION_PAYLOAD_BUDGET,
 } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
@@ -345,6 +346,12 @@ async function createHarness(
 				GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 			],
 		},
+		payloadActivation: {
+			context: {
+				serverEpoch: options.serverEpoch ?? TEST_SERVER_EPOCH,
+				payloadBudget: SESSION_PAYLOAD_BUDGET,
+			},
+		},
 		heartbeatIntervalMs: 60_000,
 		log: (_level, message) => connectionEvents.push(message),
 	});
@@ -391,10 +398,16 @@ async function openClient(harness: Harness): Promise<ClientProbe> {
 	ws.send(
 		JSON.stringify({
 			type: "client_hello",
-			protocol: { major: 1, minor: 0 },
+			protocol: { major: 1, minor: 2 },
 			clientBuild: "0.1.0-test",
-			capabilities: ["rpc.commands", "rpc.events", "rpc.extension_ui", "session.multiplex"],
-			limits: { maxServerFrameBytes: MAX_JSONL_SNAPSHOT_LINE_BYTES + MAX_SESSION_WS_BUFFERED_BYTES },
+			capabilities: [
+				"rpc.commands",
+				"rpc.events",
+				"rpc.extension_ui",
+				"session.multiplex",
+				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+			],
+			limits: { maxServerFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes },
 		}),
 	);
 	if ((await hello).type !== "server_hello") throw new Error("Gateway rejected test client hello");
@@ -421,17 +434,18 @@ async function openInventoryClient(
 	ws.send(
 		JSON.stringify({
 			type: "client_hello",
-			protocol: { major: 1, minor: overrides.minor ?? 1 },
+			protocol: { major: 1, minor: overrides.minor ?? 2 },
 			clientBuild: "0.1.0-inventory-test",
 			capabilities: [
 				"rpc.commands",
 				"rpc.events",
 				"rpc.extension_ui",
 				"session.multiplex",
+				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 				...(overrides.capability === false ? [] : [GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY]),
 			],
 			limits: {
-				maxServerFrameBytes: overrides.maxServerFrameBytes ?? SESSION_HOT_RUNTIME_INVENTORY_MAX_BYTES,
+				maxServerFrameBytes: overrides.maxServerFrameBytes ?? SESSION_PAYLOAD_BUDGET.maxServerFrameBytes,
 			},
 		}),
 	);
@@ -517,7 +531,7 @@ afterEach(async () => {
 });
 
 describe("SessionWsBridge", () => {
-	it("sends hello then the initial full hot inventory only after 1.1 capability negotiation", async () => {
+	it("sends hello then the initial full hot inventory only after capability negotiation", async () => {
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace");
 		fs.mkdirSync(cwd);
@@ -531,7 +545,7 @@ describe("SessionWsBridge", () => {
 		expect(frames.slice(0, 2).map((frame) => frame.type)).toEqual(["server_hello", "hot_runtime_inventory"]);
 		expect(frames[0]).toMatchObject({
 			type: "server_hello",
-			protocol: { major: 1, minor: 1 },
+			protocol: { major: 1, minor: 2 },
 			capabilities: expect.arrayContaining([GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY]),
 		});
 		expect(inventory).toMatchObject({
@@ -542,17 +556,14 @@ describe("SessionWsBridge", () => {
 
 	it("gates inventory by minor, capability, and full-frame receive ceiling", async () => {
 		const harness = await createHarness([]);
-		for (const client of [
-			await openInventoryClient(harness, { minor: 0 }),
-			await openInventoryClient(harness, { capability: false }),
-		]) {
+		for (const client of [await openInventoryClient(harness, { capability: false })]) {
 			const frames = client.frames as unknown as Array<Record<string, unknown>>;
 			await eventually(() => frames.find((frame) => frame.type === "server_hello"));
 			await new Promise<void>((resolve) => setTimeout(resolve, 20));
 			expect(frames.some((frame) => frame.type === "hot_runtime_inventory")).toBe(false);
 		}
 		const undersized = await openInventoryClient(harness, {
-			maxServerFrameBytes: SESSION_HOT_RUNTIME_INVENTORY_MAX_BYTES - 1,
+			maxServerFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes - 1,
 		});
 		const frames = undersized.frames as unknown as Array<Record<string, unknown>>;
 		await eventually(() => frames.find((frame) => frame.type === "protocol_error"));
@@ -1241,10 +1252,7 @@ describe("SessionWsBridge", () => {
 		const target = createNativeSession(root, cwd, "inventory-exact-capability-gate");
 		const harness = await createHarness([target]);
 		const runtime = await harness.supervisor.activate(target.sessionHandle);
-		for (const client of [
-			await openInventoryClient(harness, { minor: 0 }),
-			await openInventoryClient(harness, { capability: false }),
-		]) {
+		for (const client of [await openInventoryClient(harness, { capability: false })]) {
 			await eventually(() =>
 				(client.frames as unknown as Array<{ type: string }>).find((frame) => frame.type === "server_hello"),
 			);

@@ -2,12 +2,15 @@ import { randomUUID } from "node:crypto";
 import {
 	GATEWAY_CLIENT_REQUIRED_CAPABILITIES,
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 	GATEWAY_PROTOCOL_VERSION,
 	type GatewayProtocolErrorDto,
 	type GatewayServerHelloDto,
 	type HotRuntimeInventoryDto,
 	isGatewayClientHello,
+	isSessionAttachmentGuardContext,
 	isSessionWsClientMessage,
+	negotiateGatewayPayloadBudget,
 	negotiateHotRuntimeInventory,
 	RpcError,
 	SESSION_WS_CLIENT_MAX_BYTES,
@@ -23,6 +26,7 @@ import {
 } from "@pi-agent-web/protocol";
 import type { WebSocket } from "ws";
 import { WebSocketServer } from "ws";
+import type { GatewayPayloadActivation } from "./gateway-payload-activation.js";
 import type { ReplayResult, SessionSupervisorMessage } from "./session-runtime-types.js";
 import type { HotRuntimeSubscriptionToken, SessionSupervisor } from "./session-supervisor.js";
 
@@ -89,6 +93,8 @@ export interface SessionWsBridgeOptions {
 		adapterId: string;
 		capabilities: readonly string[];
 	};
+	/** Required production activation for epoch attachment references and the negotiated budget. */
+	payloadActivation?: Pick<GatewayPayloadActivation, "context">;
 	heartbeatIntervalMs?: number;
 	helloTimeoutMs?: number;
 	log?: (level: "info" | "warn" | "error", message: string) => void;
@@ -109,6 +115,7 @@ export class SessionWsBridge {
 	private readonly serverEpoch: string;
 	private readonly serverBuild: string;
 	private readonly runtime: SessionWsBridgeOptions["runtime"];
+	private readonly payloadActivation: SessionWsBridgeOptions["payloadActivation"];
 	private readonly helloTimeoutMs: number;
 	private requestCounter = 0;
 	private closePromise: Promise<void> | null = null;
@@ -119,7 +126,22 @@ export class SessionWsBridge {
 		this.log = opts.log ?? (() => {});
 		this.serverEpoch = opts.supervisor.serverEpoch;
 		this.serverBuild = opts.serverBuild;
-		this.runtime = opts.runtime;
+		if (
+			opts.runtime.capabilities.includes(GATEWAY_PAYLOAD_BUDGET_CAPABILITY) ||
+			(opts.payloadActivation !== undefined &&
+				(!isSessionAttachmentGuardContext(opts.payloadActivation.context) ||
+					opts.payloadActivation.context.serverEpoch !== this.serverEpoch))
+		) {
+			throw new TypeError("Session WebSocket payload activation is invalid");
+		}
+		this.payloadActivation = opts.payloadActivation;
+		this.runtime = {
+			...opts.runtime,
+			capabilities: [
+				...opts.runtime.capabilities,
+				...(opts.payloadActivation ? [GATEWAY_PAYLOAD_BUDGET_CAPABILITY] : []),
+			],
+		};
 		this.helloTimeoutMs = Math.max(1, opts.helloTimeoutMs ?? 5_000);
 		this.wss = new WebSocketServer({ noServer: true, maxPayload: SESSION_WS_CLIENT_MAX_BYTES });
 		this.wss.on("connection", (ws) => this.handleConnection(ws));
@@ -388,7 +410,13 @@ export class SessionWsBridge {
 				maxSnapshotFrameBytes: connection.negotiatedMaxServerFrameBytes,
 				maxExtensionRequests: 128,
 			},
+			...(this.payloadActivation ? { payloadBudget: this.payloadActivation.context.payloadBudget } : {}),
 		};
+		const payloadNegotiation = negotiateGatewayPayloadBudget(value, hello);
+		if (payloadNegotiation.negotiated === false) {
+			this.sendProtocolErrorAndClose(connection, "capability_unsupported");
+			return;
+		}
 		const inventoryNegotiation = negotiateHotRuntimeInventory(value, hello);
 		if (
 			inventoryNegotiation.negotiated === false &&

@@ -18,6 +18,30 @@ function resetProjectionStore(): void {
 describe("projection cache", () => {
 	beforeEach(resetProjectionStore);
 
+	it("preserves a trusted attachment ref while rebuilding settled history", () => {
+		const ref = {
+			type: "attachment_ref",
+			serverEpoch: "epoch-a",
+			sha256: "c".repeat(64),
+			mediaType: "image/jpeg",
+			byteLength: 128,
+		};
+		useProjectionStore.getState().rebuildFromMessages("s-ref", [
+			{
+				role: "user",
+				content: [
+					{ type: "text", text: "history ref" },
+					{ type: "image", data: ref, mimeType: "image/jpeg" },
+				],
+				timestamp: 1,
+			},
+		]);
+
+		expect(useProjectionStore.getState().projections["s-ref"]?.turns[0]?.userMessages[0]?.images).toEqual([
+			{ type: "image", data: ref, mimeType: "image/jpeg" },
+		]);
+	});
+
 	it("keeps recently touched sessions instead of evicting the newest snapshots", () => {
 		const store = useProjectionStore.getState();
 		for (const sessionId of ["s1", "s2", "s3"]) {

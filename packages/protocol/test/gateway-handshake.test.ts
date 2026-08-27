@@ -14,12 +14,12 @@ import {
 } from "../src/gateway-handshake.js";
 
 describe("Gateway hello DTOs", () => {
-	it("adds epoch attachment references behind protocol 1.2 without changing required sets", () => {
+	it("requires epoch attachment references in both directional capability sets", () => {
 		expect(GATEWAY_PROTOCOL_VERSION).toEqual({ major: 1, minor: 2 });
 		expect(GATEWAY_CLIENT_REQUIRED_CAPABILITIES).not.toContain(GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY);
 		expect(GATEWAY_SERVER_REQUIRED_CAPABILITIES).toContain(GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY);
-		expect(GATEWAY_CLIENT_REQUIRED_CAPABILITIES).not.toContain(GATEWAY_PAYLOAD_BUDGET_CAPABILITY);
-		expect(GATEWAY_SERVER_REQUIRED_CAPABILITIES).not.toContain(GATEWAY_PAYLOAD_BUDGET_CAPABILITY);
+		expect(GATEWAY_CLIENT_REQUIRED_CAPABILITIES).toContain(GATEWAY_PAYLOAD_BUDGET_CAPABILITY);
+		expect(GATEWAY_SERVER_REQUIRED_CAPABILITIES).toContain(GATEWAY_PAYLOAD_BUDGET_CAPABILITY);
 		expect(GATEWAY_REQUIRED_CAPABILITIES).toEqual(GATEWAY_CLIENT_REQUIRED_CAPABILITIES);
 	});
 
@@ -38,7 +38,7 @@ describe("Gateway hello DTOs", () => {
 				type: "client_hello",
 				protocol: { major: 1, minor: 0 },
 				clientBuild: "0.1.0",
-				capabilities: [...GATEWAY_CLIENT_REQUIRED_CAPABILITIES],
+				capabilities: ["rpc.commands"],
 				limits: { maxServerFrameBytes: 1024 },
 			}),
 		).toBe(true);
@@ -68,12 +68,13 @@ describe("Gateway hello DTOs", () => {
 				serverEpoch: "0198f1f1-epoch",
 				piVersion: "0.84.2",
 				adapterId: "legacy-rpc-v1",
-				capabilities: ["rpc.commands", "rpc.events"],
+				capabilities: ["rpc.commands", "rpc.events", GATEWAY_PAYLOAD_BUDGET_CAPABILITY],
 				limits: {
 					maxClientFrameBytes: 8 * 1024 * 1024,
 					maxSnapshotFrameBytes: 32 * 1024 * 1024,
 					maxExtensionRequests: 256,
 				},
+				payloadBudget: SESSION_PAYLOAD_BUDGET,
 			}),
 		).toBe(true);
 		expect(
@@ -86,11 +87,18 @@ describe("Gateway hello DTOs", () => {
 	});
 
 	it("keeps protocol 1.1 hello at the old shape", () => {
+		const legacyCapabilities = [
+			"rpc.commands",
+			"rpc.events",
+			"rpc.extension_ui",
+			"session.multiplex",
+			GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+		];
 		const client = {
 			type: "client_hello",
 			protocol: { major: 1, minor: 1 },
 			clientBuild: "0.1.0",
-			capabilities: [...GATEWAY_SERVER_REQUIRED_CAPABILITIES],
+			capabilities: legacyCapabilities,
 			limits: { maxServerFrameBytes: 65 * 1024 * 1024 },
 		};
 		const server = {
@@ -100,7 +108,7 @@ describe("Gateway hello DTOs", () => {
 			serverEpoch: "epoch-a",
 			piVersion: "0.84.2",
 			adapterId: "legacy-rpc-v1",
-			capabilities: [...GATEWAY_SERVER_REQUIRED_CAPABILITIES],
+			capabilities: legacyCapabilities,
 			limits: {
 				maxClientFrameBytes: 8 * 1024 * 1024,
 				maxSnapshotFrameBytes: 65 * 1024 * 1024,
@@ -129,7 +137,9 @@ describe("Gateway hello DTOs", () => {
 			type: "client_hello" as const,
 			protocol: { major: 1, minor: 2 },
 			clientBuild: "0.1.0",
-			capabilities: [...GATEWAY_SERVER_REQUIRED_CAPABILITIES, GATEWAY_PAYLOAD_BUDGET_CAPABILITY],
+			capabilities: Array.from(
+				new Set([...GATEWAY_SERVER_REQUIRED_CAPABILITIES, GATEWAY_PAYLOAD_BUDGET_CAPABILITY]),
+			),
 			limits: { maxServerFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes },
 		};
 		const server = {
@@ -139,7 +149,9 @@ describe("Gateway hello DTOs", () => {
 			serverEpoch: "epoch-a",
 			piVersion: "0.84.2",
 			adapterId: "legacy-rpc-v1",
-			capabilities: [...GATEWAY_SERVER_REQUIRED_CAPABILITIES, GATEWAY_PAYLOAD_BUDGET_CAPABILITY],
+			capabilities: Array.from(
+				new Set([...GATEWAY_SERVER_REQUIRED_CAPABILITIES, GATEWAY_PAYLOAD_BUDGET_CAPABILITY]),
+			),
 			limits: {
 				maxClientFrameBytes: SESSION_PAYLOAD_BUDGET.maxCommandFrameBytes,
 				maxSnapshotFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes,

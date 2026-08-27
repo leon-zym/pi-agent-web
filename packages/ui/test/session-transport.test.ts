@@ -1,12 +1,14 @@
 import {
 	type ExtensionUiRequestDto,
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 	GATEWAY_PROTOCOL_VERSION,
 	type GatewayClientHelloDto,
 	type GatewayProtocolErrorDto,
 	type GatewayServerHelloDto,
 	type NativeSessionDto,
 	type ProductSessionEventDto,
+	SESSION_PAYLOAD_BUDGET,
 	SESSION_WS_CLIENT_MAX_BYTES,
 	SESSION_WS_SERVER_MAX_BYTES,
 	type SessionCommandResponseDto,
@@ -84,12 +86,14 @@ function serverHello(overrides: Partial<GatewayServerHelloDto> = {}): GatewaySer
 			"rpc.extension_ui",
 			"session.multiplex",
 			GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+			GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 		],
 		limits: {
 			maxClientFrameBytes: 8 * 1024 * 1024,
-			maxSnapshotFrameBytes: 32 * 1024 * 1024,
+			maxSnapshotFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes,
 			maxExtensionRequests: 256,
 		},
+		payloadBudget: SESSION_PAYLOAD_BUDGET,
 		...overrides,
 	};
 }
@@ -212,6 +216,16 @@ function eventFrame(
 		generation,
 		seq,
 		event: { type: "agent_start" } as ProductSessionEventDto,
+	};
+}
+
+function attachmentRef(overrides: { serverEpoch?: string; byteLength?: number } = {}) {
+	return {
+		type: "attachment_ref" as const,
+		serverEpoch: overrides.serverEpoch ?? "test-server-epoch",
+		sha256: "a".repeat(64),
+		mediaType: "image/png",
+		byteLength: overrides.byteLength ?? 48,
 	};
 }
 
@@ -374,6 +388,7 @@ describe("session transport Gateway negotiation", () => {
 				"rpc.extension_ui",
 				"session.multiplex",
 				GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 			],
 			limits: { maxServerFrameBytes: SESSION_WS_SERVER_MAX_BYTES },
 		});
@@ -1254,17 +1269,30 @@ describe("session transport Gateway negotiation", () => {
 	});
 
 	it("requires negotiated capabilities and an honored server-frame limit", () => {
-		const missingCapability = harness();
-		missingCapability.controller.store.getState().connect();
-		const capabilitySocket = missingCapability.sockets[0];
+		const missingPayload = harness();
+		missingPayload.controller.store.getState().connect();
+		const payloadSocket = missingPayload.sockets[0];
+		if (!payloadSocket) throw new Error("transport did not create a socket");
+		payloadSocket.open(false);
+		const inlineOnlyHello = serverHello();
+		inlineOnlyHello.capabilities = inlineOnlyHello.capabilities.filter(
+			(capability) => capability !== GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+		);
+		delete inlineOnlyHello.payloadBudget;
+		payloadSocket.serverMessage(inlineOnlyHello);
+		expect(missingPayload.controller.store.getState().connectionState).toBe("incompatible");
+
+		const missingBaseCapability = harness();
+		missingBaseCapability.controller.store.getState().connect();
+		const capabilitySocket = missingBaseCapability.sockets[0];
 		if (!capabilitySocket) throw new Error("transport did not create a socket");
 		capabilitySocket.open(false);
-		capabilitySocket.serverMessage(
-			serverHello({
-				capabilities: ["rpc.commands", "rpc.events", "rpc.extension_ui", "session.multiplex"],
-			}),
+		const helloWithoutEvents = serverHello();
+		helloWithoutEvents.capabilities = helloWithoutEvents.capabilities.filter(
+			(capability) => capability !== "rpc.events",
 		);
-		expect(missingCapability.controller.store.getState().connectionState).toBe("incompatible");
+		capabilitySocket.serverMessage(helloWithoutEvents);
+		expect(missingBaseCapability.controller.store.getState().connectionState).toBe("incompatible");
 
 		const excessiveLimit = harness();
 		excessiveLimit.controller.store.getState().connect();
@@ -1342,6 +1370,145 @@ describe("session transport Gateway negotiation", () => {
 });
 
 describe("session transport multiplexing", () => {
+	it("uses the negotiated attachment context for authoritative ref events", () => {
+		const h = harness();
+		const socket = connect(h);
+		subscribeAndPrime(h, "session-a");
+		const delivered: SessionReplayFrameDto[] = [];
+		h.controller.frameBus.subscribe("session-a", ({ message }) => {
+			if (message.type === "event") delivered.push(message);
+		});
+		const frame = {
+			...eventFrame("session-a", 1, 1),
+			event: {
+				type: "message_start",
+				message: {
+					role: "user",
+					content: [
+						{ type: "text", text: "restored" },
+						{ type: "image", data: attachmentRef(), mimeType: "image/png" },
+					],
+					timestamp: 1,
+				},
+			} as ProductSessionEventDto,
+		} satisfies Extract<SessionReplayFrameDto, { type: "event" }>;
+
+		socket.serverMessage(frame);
+
+		expect(h.controller.store.getState().connectionState).toBe("online");
+		expect(delivered).toEqual([frame]);
+	});
+
+	it("uses the negotiated attachment context for authoritative ref snapshots", () => {
+		const h = harness();
+		const socket = connect(h);
+		subscribeAndPrime(h, "session-a");
+		socket.serverMessage({
+			type: "resync_required",
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "session-a",
+			runtime: runtime("session-a", 1, 0),
+			reason: "gap",
+		});
+		socket.serverMessage({
+			type: "session_snapshot",
+			snapshotId: "snapshot-with-ref",
+			serverEpoch: "test-server-epoch",
+			workspaceId: "workspace-a",
+			sessionHandle: "session-a",
+			generation: 1,
+			baseSeq: 0,
+			asOfSeq: 0,
+			runtime: runtime("session-a", 1, 0),
+			settledMessages: [
+				{
+					role: "user",
+					content: [{ type: "image", data: attachmentRef(), mimeType: "image/png" }],
+					timestamp: 1,
+				},
+			],
+			projectionEvents: [],
+			queue: { steering: [], followUp: [] },
+			pendingExtensionRequests: [],
+			stickyExtensionState: [],
+		} satisfies SessionSnapshotDto);
+
+		expect(h.controller.store.getState().sessions["session-a"]?.resync).toBeNull();
+		expect(h.controller.store.getState().connectionState).toBe("online");
+	});
+
+	it("keeps a correlated structured admission failure local to its command", async () => {
+		const h = harness();
+		const socket = connect(h);
+		subscribeAndPrime(h, "session-a");
+		h.controller.store.getState().claimSession("session-a");
+		h.controller.ingestServerMessage({
+			type: "lease_status",
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "session-a",
+			generation: 1,
+			isController: true,
+			fencingToken: "token-a",
+		});
+		const failed = h.controller.store
+			.getState()
+			.sendCommand("session-a", { id: "cache-full", type: "prompt", message: "keep draft" });
+		socket.serverMessage({
+			type: "response",
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "session-a",
+			generation: 1,
+			barrierSeq: 0,
+			response: {
+				type: "response",
+				id: "cache-full",
+				command: "prompt",
+				success: false,
+				error: "Gateway delivery failure",
+				admissionError: {
+					type: "payload_admission_error",
+					code: "attachment_cache_exhausted",
+					boundary: "attachment_cache",
+					limitBytes: 1024,
+					actualBytes: 2048,
+				},
+			},
+		});
+
+		await expect(failed).resolves.toMatchObject({
+			success: false,
+			admissionError: { code: "attachment_cache_exhausted" },
+		});
+		expect(h.controller.store.getState().connectionState).toBe("online");
+		const next = h.controller.store
+			.getState()
+			.sendCommand("session-a", { id: "retry", type: "prompt", message: "retry" });
+		socket.serverMessage(successResponse("session-a", 1, "retry", "prompt"));
+		await expect(next).resolves.toMatchObject({ success: true });
+	});
+
+	it("coalesces attachment load failures into one cursorless resync for the exact identity", () => {
+		const h = harness();
+		const socket = connect(h);
+		subscribeAndPrime(h, "session-a", 1, 4);
+		const before = socket.sent.filter(({ type }) => type === "session_subscribe").length;
+
+		expect(h.controller.reportProjectionFailure("session-a", 1, new Error("attachment unavailable"))).toBe(
+			true,
+		);
+		expect(h.controller.reportProjectionFailure("session-a", 1, new Error("duplicate image error"))).toBe(
+			false,
+		);
+		expect(h.controller.reportProjectionFailure("session-a", 2, new Error("stale image error"))).toBe(false);
+		const resubscriptions = socket.sent
+			.filter(
+				(message): message is Extract<SessionWsClientMessage, { type: "session_subscribe" }> =>
+					message.type === "session_subscribe",
+			)
+			.slice(before);
+		expect(resubscriptions).toEqual([{ type: "session_subscribe", sessionHandle: "session-a" }]);
+	});
+
 	it("ingests foreground and background Sessions independently over one socket", () => {
 		const h = harness({ rawEventLimit: 2 });
 		const socket = connect(h);

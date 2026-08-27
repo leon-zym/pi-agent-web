@@ -1,3 +1,4 @@
+import type { SessionImageContentDto } from "@pi-agent-web/protocol";
 import { memo } from "react";
 import { tt } from "../../lib/i18n";
 import type { ProductTurn } from "../../types/view-models";
@@ -9,7 +10,13 @@ import { UserMessageBubble } from "./UserMessageBubble";
  * One product turn: queued/injected user messages, assistant steps, and a
  * single turn-level tail (timing/tokens/copy) under the last step.
  */
-export const TurnView = memo(function TurnView({ turn }: { turn: ProductTurn }) {
+export const TurnView = memo(function TurnView({
+	turn,
+	onAttachmentLoadError,
+}: {
+	turn: ProductTurn;
+	onAttachmentLoadError?: (image: SessionImageContentDto) => void;
+}) {
 	return (
 		<section
 			data-turn-id={turn.id}
@@ -17,7 +24,11 @@ export const TurnView = memo(function TurnView({ turn }: { turn: ProductTurn }) 
 			className="flex min-w-0 max-w-full flex-col gap-4"
 		>
 			{turn.userMessages.map((message) => (
-				<UserMessageBubble key={message.entryKey} message={message} />
+				<UserMessageBubble
+					key={message.entryKey}
+					message={message}
+					onAttachmentLoadError={onAttachmentLoadError}
+				/>
 			))}
 			{turn.steps.map((step) => (
 				<AssistantStepView key={step.key} turnId={turn.id} step={step} />

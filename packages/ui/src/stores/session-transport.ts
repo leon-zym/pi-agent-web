@@ -12,9 +12,11 @@ import {
 	isReadOnlyRpcCommand,
 	isSessionSnapshotDto,
 	isSessionWsServerMessage,
+	negotiateGatewayPayloadBudget,
 	negotiateHotRuntimeInventory,
 	SESSION_WS_CLIENT_MAX_BYTES,
 	SESSION_WS_SERVER_MAX_BYTES,
+	type SessionAttachmentGuardContext,
 	type SessionCommandDto,
 	type SessionCommandResponseDto,
 	type SessionReplayCursorDto,
@@ -333,6 +335,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	let negotiatedMaxClientFrameBytes = SESSION_WS_CLIENT_MAX_BYTES;
 	let negotiatedMaxServerFrameBytes = SESSION_WS_SERVER_MAX_BYTES;
 	let negotiatedServerEpoch: string | null = null;
+	let attachmentGuardContext: Readonly<SessionAttachmentGuardContext> | null = null;
 	let hotRuntimeRevision = -1;
 	let hotRuntimeByHandle = new Map<string, HotRuntimeInventoryEntryDto>();
 	const connectionObservations = new Map<string, SessionRuntimeIdentityDto>();
@@ -615,8 +618,15 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				return;
 			}
 			if (isGatewayServerHello(value)) {
+				if (
+					!GATEWAY_SERVER_REQUIRED_CAPABILITIES.every((capability) => value.capabilities.includes(capability))
+				) {
+					enterIncompatible(next);
+					return;
+				}
 				const inventoryNegotiation = negotiateHotRuntimeInventory(clientHello, value);
-				if (!inventoryNegotiation.negotiated) {
+				const payloadNegotiation = negotiateGatewayPayloadBudget(clientHello, value);
+				if (!inventoryNegotiation.negotiated || !payloadNegotiation.negotiated) {
 					enterIncompatible(next);
 					return;
 				}
@@ -630,12 +640,21 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				);
 				negotiatedMaxServerFrameBytes = value.limits.maxSnapshotFrameBytes;
 				negotiatedServerEpoch = value.serverEpoch;
+				attachmentGuardContext = Object.freeze({
+					serverEpoch: value.serverEpoch,
+					payloadBudget: Object.freeze({ ...payloadNegotiation.budget }),
+				});
 				hotRuntimeRevision = -1;
+				return;
+			}
+			const guardContext = attachmentGuardContext;
+			if (guardContext === null) {
+				enterIncompatible(next);
 				return;
 			}
 			if (store.getState().connectionState === "connecting" && negotiatedServerEpoch !== null) {
 				if (
-					!isSessionWsServerMessage(value) ||
+					!isSessionWsServerMessage(value, guardContext) ||
 					value.type !== "hot_runtime_inventory" ||
 					value.serverEpoch !== negotiatedServerEpoch
 				) {
@@ -645,7 +664,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				handleHotRuntimeInventory(value, true);
 				return;
 			}
-			if (store.getState().connectionState !== "online" || !isSessionWsServerMessage(value)) {
+			if (store.getState().connectionState !== "online" || !isSessionWsServerMessage(value, guardContext)) {
 				enterIncompatible(next);
 				return;
 			}
@@ -726,6 +745,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		negotiatedMaxClientFrameBytes = SESSION_WS_CLIENT_MAX_BYTES;
 		negotiatedMaxServerFrameBytes = SESSION_WS_SERVER_MAX_BYTES;
 		negotiatedServerEpoch = null;
+		attachmentGuardContext = null;
 		hotRuntimeRevision = -1;
 		claimAttempts.clear();
 		baselineRefreshes.clear();
@@ -1667,6 +1687,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		const channel = store.getState().sessions[sessionHandle];
 		if (!channel?.subscribed || channel.generation !== generation) return false;
 		if (!channel.runtime) return false;
+		if (channel.resync?.requiresFreshBaseline) return false;
 		clearIdentityBuffers(channel.runtime);
 		acknowledgedExtensionRequests.delete(sessionHandle);
 		baselineRefreshes.delete(sessionHandle);
@@ -1883,7 +1904,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	}
 
 	function handleSessionSnapshot(message: SessionSnapshotDto): void {
-		if (!isSessionSnapshotDto(message)) return;
+		const guardContext = attachmentGuardContext;
+		if (guardContext === null || !isSessionSnapshotDto(message, guardContext)) return;
 		const channel = store.getState().sessions[message.sessionHandle];
 		if (!channel?.subscribed || !channel.resync || !identitiesMatch(channel.runtime, message)) return;
 		const key = identityKey(message);
