@@ -3,13 +3,16 @@ import {
 	type ExtensionUiRequestDto,
 	type ExtensionUiResponseDto,
 	GATEWAY_PROTOCOL_VERSION,
-	GATEWAY_REQUIRED_CAPABILITIES,
+	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
 	type GatewayClientHelloDto,
+	type HotRuntimeInventoryDto,
+	type HotRuntimeInventoryEntryDto,
 	isGatewayProtocolError,
 	isGatewayServerHello,
 	isReadOnlyRpcCommand,
 	isSessionSnapshotDto,
 	isSessionWsServerMessage,
+	negotiateHotRuntimeInventory,
 	SESSION_WS_CLIENT_MAX_BYTES,
 	SESSION_WS_SERVER_MAX_BYTES,
 	type SessionCommandDto,
@@ -31,6 +34,7 @@ import {
 } from "../lib/session-resync";
 import { OrderedSessionFrameBus, SessionTransportGlobalBus } from "./session-frame-bus";
 import {
+	type HotRuntimeInventoryToken,
 	hasFreshLeaseBaseline,
 	type SessionChannelState,
 	type SessionTransportController,
@@ -51,6 +55,7 @@ export {
 	SessionTransportGlobalBus,
 } from "./session-frame-bus";
 export {
+	type HotRuntimeInventoryToken,
 	hasFreshLeaseBaseline,
 	type SessionChannelState,
 	type SessionLeaseState,
@@ -77,8 +82,10 @@ const MAX_RESYNC_BUFFERED_FRAMES = 1_024;
 const MAX_RESYNC_BUFFERED_BYTES = 1024 * 1024;
 export const MAX_ACTIVE_SUBSCRIPTIONS = 6;
 const MAX_PENDING_EXTENSION_REQUESTS = 256;
+const MAX_DELIVERED_NOTIFY_KEYS = 256;
+const MAX_DELIVERED_NOTIFY_IDENTITIES = 64;
 const CLIENT_BUILD = "0.1.0";
-const CLIENT_CAPABILITIES = [...GATEWAY_REQUIRED_CAPABILITIES];
+const CLIENT_CAPABILITIES = [...GATEWAY_SERVER_REQUIRED_CAPABILITIES];
 
 type WireSendResult = "sent" | "payload_too_large" | "unavailable";
 
@@ -95,6 +102,18 @@ interface PendingCommand {
 	resolve: (response: SessionCommandResponseDto) => void;
 	reject: (error: Error) => void;
 	timer: ReturnType<typeof setTimeout>;
+}
+
+interface InitialInventoryWaiter {
+	resolve: (token: HotRuntimeInventoryToken) => void;
+	reject: (error: Error) => void;
+}
+
+interface ActiveExactHotRecovery {
+	identity: SessionRuntimeIdentityDto;
+	baselineReady: boolean;
+	leaseReady: boolean;
+	recoveryStarted: boolean;
 }
 
 interface RetainedRawEvent {
@@ -257,6 +276,12 @@ interface AcknowledgedExtensionRequests {
 	requestIds: Set<string>;
 }
 
+interface DeliveredNotifyKeys {
+	identity: SessionRuntimeIdentityDto;
+	keys: string[];
+	keySet: Set<string>;
+}
+
 export function createSessionTransport(options: SessionTransportOptions = {}): SessionTransportController {
 	const createSocket = options.createSocket ?? defaultSocketFactory;
 	const socketUrl = options.url ?? defaultSocketUrl;
@@ -288,6 +313,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	const snapshotWaiters = new Map<string, SnapshotWaiter>();
 	const skipNextResubscribe = new Set<string>();
 	const acknowledgedExtensionRequests = new Map<string, AcknowledgedExtensionRequests>();
+	const deliveredNotifyKeys = new Map<string, DeliveredNotifyKeys>();
+	let deliveredNotifyIdentityOrder: string[] = [];
 	const claimAttempts = new Set<string>();
 	const baselineRefreshes = new Set<string>();
 	const subscriptionBaselines = new Map<string, string | null>();
@@ -305,6 +332,14 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	let disposed = false;
 	let negotiatedMaxClientFrameBytes = SESSION_WS_CLIENT_MAX_BYTES;
 	let negotiatedMaxServerFrameBytes = SESSION_WS_SERVER_MAX_BYTES;
+	let negotiatedServerEpoch: string | null = null;
+	let hotRuntimeRevision = -1;
+	let hotRuntimeByHandle = new Map<string, HotRuntimeInventoryEntryDto>();
+	const connectionObservations = new Map<string, SessionRuntimeIdentityDto>();
+	const initialInventoryWaiters = new Set<InitialInventoryWaiter>();
+	const exactHotRecoveryQueue: string[] = [];
+	const queuedExactHotRecoveries = new Set<string>();
+	let activeExactHotRecovery: ActiveExactHotRecovery | null = null;
 
 	const resyncCoordinator = createSessionResyncCoordinator({
 		attempt: attemptResync,
@@ -314,6 +349,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 
 	const store = createStore<SessionTransportState>()(() => ({
 		connectionState: "idle",
+		hotRuntimeInventory: null,
 		sessions: {},
 		connect,
 		disconnect,
@@ -327,11 +363,35 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		manualRetryResync: (sessionHandle) => resyncCoordinator.manualRetry(sessionHandle),
 	}));
 
+	function waitForInitialHotInventory(): Promise<HotRuntimeInventoryToken> {
+		if (disposed || store.getState().connectionState === "incompatible") {
+			return Promise.reject(new SessionTransportError("unavailable", "Gateway inventory is unavailable"));
+		}
+		const inventory = store.getState().hotRuntimeInventory;
+		if (inventory !== null && store.getState().connectionState === "online") {
+			return Promise.resolve({ serverEpoch: inventory.serverEpoch, revision: inventory.revision });
+		}
+		return new Promise((resolve, reject) => initialInventoryWaiters.add({ resolve, reject }));
+	}
+
+	function rejectInitialInventoryWaiters(error: Error): void {
+		for (const waiter of initialInventoryWaiters) waiter.reject(error);
+		initialInventoryWaiters.clear();
+	}
+
 	resyncCoordinator.subscribe((sessionHandle, recovery) => {
 		setChannel(sessionHandle, (channel) => {
 			if (recovery && !identitiesMatch(channel.runtime, recovery.identity)) return channel;
 			return channel.recovery === (recovery ?? null) ? channel : { ...channel, recovery: recovery ?? null };
 		});
+		if (
+			recovery?.phase === "degraded" &&
+			activeExactHotRecovery &&
+			identitiesMatch(activeExactHotRecovery.identity, recovery.identity)
+		) {
+			activeExactHotRecovery = null;
+			pumpExactHotRecovery();
+		}
 	});
 
 	function setChannel(
@@ -406,6 +466,48 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				skipNextResubscribe.delete(key);
 			}
 		}
+	}
+
+	function clearDeliveredNotifyKeys(sessionHandle: string): void {
+		deliveredNotifyKeys.delete(sessionHandle);
+		deliveredNotifyIdentityOrder = deliveredNotifyIdentityOrder.filter(
+			(candidate) => candidate !== sessionHandle,
+		);
+	}
+
+	function hasDeliveredNotify(
+		identity: SessionRuntimeIdentityDto,
+		message: Extract<SessionReplayFrameDto, { type: "extension_ui_request" }>,
+	): boolean {
+		const retained = deliveredNotifyKeys.get(identity.sessionHandle);
+		if (!retained || !identitiesMatch(retained.identity, identity)) return false;
+		return retained.keySet.has(`${String(message.seq)}:${message.request.id}`);
+	}
+
+	function rememberDeliveredNotify(
+		identity: SessionRuntimeIdentityDto,
+		message: Extract<SessionReplayFrameDto, { type: "extension_ui_request" }>,
+	): void {
+		const existing = deliveredNotifyKeys.get(identity.sessionHandle);
+		let retained = existing && identitiesMatch(existing.identity, identity) ? existing : undefined;
+		if (!retained) {
+			clearDeliveredNotifyKeys(identity.sessionHandle);
+			retained = { identity, keys: [], keySet: new Set<string>() };
+			deliveredNotifyIdentityOrder.push(identity.sessionHandle);
+			while (deliveredNotifyIdentityOrder.length > MAX_DELIVERED_NOTIFY_IDENTITIES) {
+				const oldest = deliveredNotifyIdentityOrder.shift();
+				if (oldest) deliveredNotifyKeys.delete(oldest);
+			}
+		}
+		const key = `${String(message.seq)}:${message.request.id}`;
+		if (retained.keySet.has(key)) return;
+		retained.keys.push(key);
+		retained.keySet.add(key);
+		while (retained.keys.length > MAX_DELIVERED_NOTIFY_KEYS) {
+			const oldest = retained.keys.shift();
+			if (oldest) retained.keySet.delete(oldest);
+		}
+		deliveredNotifyKeys.set(identity.sessionHandle, retained);
 	}
 
 	function attemptResync(context: SessionResyncAttemptContext): Promise<SessionResyncCompletion> {
@@ -513,12 +615,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				return;
 			}
 			if (isGatewayServerHello(value)) {
-				if (
-					value.protocol.major !== protocolVersion.major ||
-					value.protocol.minor > protocolVersion.minor ||
-					value.limits.maxSnapshotFrameBytes > clientHello.limits.maxServerFrameBytes ||
-					GATEWAY_REQUIRED_CAPABILITIES.some((capability) => !value.capabilities.includes(capability))
-				) {
+				const inventoryNegotiation = negotiateHotRuntimeInventory(clientHello, value);
+				if (!inventoryNegotiation.negotiated) {
 					enterIncompatible(next);
 					return;
 				}
@@ -526,24 +624,25 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 					enterIncompatible(next);
 					return;
 				}
-				clearHelloTimer();
 				negotiatedMaxClientFrameBytes = Math.min(
 					SESSION_WS_CLIENT_MAX_BYTES,
 					value.limits.maxClientFrameBytes,
 				);
 				negotiatedMaxServerFrameBytes = value.limits.maxSnapshotFrameBytes;
-				reconnectAttempt = 0;
-				store.setState({ connectionState: "online" });
-				resyncCoordinator.reconnect();
-				for (const channel of Object.values(store.getState().sessions)) {
-					if (!channel.subscribed) continue;
-					const recovery = resyncCoordinator.getState(channel.sessionHandle);
-					if (recovery?.phase === "degraded" && identitiesMatch(recovery.identity, channel.runtime)) {
-						continue;
-					}
-					const cursor = validCursor(channel);
-					sendSubscription(channel.sessionHandle, cursor);
+				negotiatedServerEpoch = value.serverEpoch;
+				hotRuntimeRevision = -1;
+				return;
+			}
+			if (store.getState().connectionState === "connecting" && negotiatedServerEpoch !== null) {
+				if (
+					!isSessionWsServerMessage(value) ||
+					value.type !== "hot_runtime_inventory" ||
+					value.serverEpoch !== negotiatedServerEpoch
+				) {
+					enterIncompatible(next);
+					return;
 				}
+				handleHotRuntimeInventory(value, true);
 				return;
 			}
 			if (store.getState().connectionState !== "online" || !isSessionWsServerMessage(value)) {
@@ -563,7 +662,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		current.onclose = null;
 		current.onerror = null;
 		current.onmessage = null;
-		rejectAllPending(new SessionTransportError("unavailable", "Gateway protocol is incompatible"));
+		const error = new SessionTransportError("unavailable", "Gateway protocol is incompatible");
+		rejectAllPending(error);
+		rejectInitialInventoryWaiters(error);
 		resetDisconnectedState("incompatible");
 		try {
 			current.close();
@@ -624,9 +725,15 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		clearHelloTimer();
 		negotiatedMaxClientFrameBytes = SESSION_WS_CLIENT_MAX_BYTES;
 		negotiatedMaxServerFrameBytes = SESSION_WS_SERVER_MAX_BYTES;
+		negotiatedServerEpoch = null;
+		hotRuntimeRevision = -1;
 		claimAttempts.clear();
 		baselineRefreshes.clear();
 		subscriptionBaselines.clear();
+		activeExactHotRecovery = null;
+		exactHotRecoveryQueue.length = 0;
+		queuedExactHotRecoveries.clear();
+		connectionObservations.clear();
 		const receivedAt = now();
 		const sessions: Record<string, SessionChannelState> = {};
 		const lostLeases: string[] = [];
@@ -638,7 +745,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			};
 			if (channel.lease.isController || channel.lease.fencingToken) lostLeases.push(sessionHandle);
 		}
-		store.setState({ connectionState, sessions });
+		store.setState({ connectionState, hotRuntimeInventory: null, sessions });
 		for (const sessionHandle of lostLeases) {
 			const channel = sessions[sessionHandle];
 			if (!channel?.runtime || channel.generation === null) continue;
@@ -671,6 +778,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 
 		for (const candidateHandle of [...subscribedLruOrder]) {
 			if (candidateHandle === incomingSessionHandle) continue;
+			if (hotRuntimeByHandle.has(candidateHandle)) continue;
 			const candidate = state.sessions[candidateHandle];
 			if (!candidate?.subscribed) continue;
 
@@ -717,6 +825,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		claimAttempts.delete(sessionHandle);
 		baselineRefreshes.delete(sessionHandle);
 		subscriptionBaselines.delete(sessionHandle);
+		connectionObservations.delete(sessionHandle);
+		cancelExactHotRecovery(sessionHandle);
 		resyncCoordinator.unsubscribe(sessionHandle);
 		clearSessionResyncData(sessionHandle);
 		rejectPendingForSession(sessionHandle, new SessionTransportError("session_not_subscribed"));
@@ -734,6 +844,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		);
 		clearSessionResyncData(sessionHandle);
 		acknowledgedExtensionRequests.delete(sessionHandle);
+		clearDeliveredNotifyKeys(sessionHandle);
 		claimAttempts.delete(sessionHandle);
 		baselineRefreshes.delete(sessionHandle);
 		subscriptionBaselines.delete(sessionHandle);
@@ -746,12 +857,28 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		const channel = store.getState().sessions[sessionHandle];
 		if (!channel?.subscribed) return false;
 		setChannel(sessionHandle, (channel) => ({ ...channel, controllerIntent: true }));
-		if (store.getState().connectionState !== "online" || subscriptionBaselines.has(sessionHandle)) {
-			return true;
-		}
-		const delivered = sendWire({ type: "session_claim", sessionHandle }) === "sent";
-		if (delivered) claimAttempts.add(sessionHandle);
+		claimSessionIfReady(sessionHandle);
 		return true;
+	}
+
+	function claimSessionIfReady(sessionHandle: string): void {
+		const channel = store.getState().sessions[sessionHandle];
+		if (
+			store.getState().connectionState !== "online" ||
+			!channel?.subscribed ||
+			!channel.controllerIntent ||
+			!channel.baselineAuthoritative ||
+			!hasFreshLeaseBaseline(channel) ||
+			channel.lease.isController ||
+			claimAttempts.has(sessionHandle) ||
+			subscriptionBaselines.has(sessionHandle)
+		) {
+			return;
+		}
+		claimAttempts.add(sessionHandle);
+		if (sendWire({ type: "session_claim", sessionHandle }) !== "sent") {
+			claimAttempts.delete(sessionHandle);
+		}
 	}
 
 	function releaseSession(sessionHandle: string): boolean {
@@ -779,13 +906,6 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		}
 		if (store.getState().connectionState !== "online") return false;
 		return sendWire({ type: "session_release", sessionHandle }) === "sent";
-	}
-
-	function requireSubscribedOnline(sessionHandle: string): boolean {
-		return (
-			store.getState().connectionState === "online" &&
-			store.getState().sessions[sessionHandle]?.subscribed === true
-		);
 	}
 
 	function sendCommand(
@@ -885,6 +1005,14 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	}
 
 	function sendSubscription(sessionHandle: string, cursor?: SessionReplayCursorDto): boolean {
+		return sendSubscriptionForRuntime(sessionHandle, cursor);
+	}
+
+	function sendSubscriptionForRuntime(
+		sessionHandle: string,
+		cursor?: SessionReplayCursorDto,
+		expectedHotRuntime?: SessionRuntimeIdentityDto,
+	): boolean {
 		const runtime = store.getState().sessions[sessionHandle]?.runtime;
 		setChannel(sessionHandle, (channel) =>
 			channel.freshLeaseBaseline === null ? channel : { ...channel, freshLeaseBaseline: null },
@@ -894,13 +1022,181 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			type: "session_subscribe",
 			sessionHandle,
 			...(cursor ? { cursor } : {}),
+			...(expectedHotRuntime ? { expectedHotRuntime } : {}),
 		});
-		if (delivered !== "sent") subscriptionBaselines.delete(sessionHandle);
+		if (delivered === "sent") {
+			const observation = expectedHotRuntime ?? runtime;
+			if (observation) connectionObservations.set(sessionHandle, observation);
+		} else {
+			subscriptionBaselines.delete(sessionHandle);
+		}
 		return delivered === "sent";
+	}
+
+	function hotRuntimeIdentity(runtime: HotRuntimeInventoryEntryDto): SessionRuntimeIdentityDto {
+		return {
+			serverEpoch: runtime.serverEpoch,
+			sessionHandle: runtime.sessionHandle,
+			workspaceId: runtime.workspaceId,
+			generation: runtime.generation,
+		};
+	}
+
+	function hasAuthoritativeHotBaseline(runtime: HotRuntimeInventoryEntryDto): boolean {
+		const channel = store.getState().sessions[runtime.sessionHandle];
+		return Boolean(
+			channel?.subscribed &&
+				channel.baselineAuthoritative &&
+				hasFreshLeaseBaseline(channel) &&
+				identitiesMatch(channel.runtime, runtime),
+		);
+	}
+
+	function hasConnectionObservation(runtime: HotRuntimeInventoryEntryDto): boolean {
+		const observation = connectionObservations.get(runtime.sessionHandle);
+		return Boolean(observation && identitiesMatch(observation, runtime));
+	}
+
+	function isManualOnlyDegraded(runtime: HotRuntimeInventoryEntryDto): boolean {
+		const recovery = resyncCoordinator.getState(runtime.sessionHandle);
+		return Boolean(recovery?.phase === "degraded" && identitiesMatch(recovery.identity, runtime));
+	}
+
+	function queueHotRuntimeRecovery(runtime: HotRuntimeInventoryEntryDto): void {
+		const existing = store.getState().sessions[runtime.sessionHandle];
+		if (!existing?.subscribed) {
+			touchSubscriptionLru(runtime.sessionHandle);
+			setChannel(runtime.sessionHandle, (channel) => ({
+				...channel,
+				subscribed: true,
+				freshLeaseBaseline: null,
+			}));
+		}
+		if (
+			hasAuthoritativeHotBaseline(runtime) ||
+			hasConnectionObservation(runtime) ||
+			isManualOnlyDegraded(runtime)
+		) {
+			return;
+		}
+		if (activeExactHotRecovery?.identity.sessionHandle === runtime.sessionHandle) return;
+		if (queuedExactHotRecoveries.has(runtime.sessionHandle)) return;
+		queuedExactHotRecoveries.add(runtime.sessionHandle);
+		exactHotRecoveryQueue.push(runtime.sessionHandle);
+		pumpExactHotRecovery();
+	}
+
+	function pumpExactHotRecovery(): void {
+		if (activeExactHotRecovery || store.getState().connectionState !== "online") return;
+		for (;;) {
+			const sessionHandle = exactHotRecoveryQueue.shift();
+			if (!sessionHandle) return;
+			queuedExactHotRecoveries.delete(sessionHandle);
+			const desired = hotRuntimeByHandle.get(sessionHandle);
+			if (
+				!desired ||
+				hasAuthoritativeHotBaseline(desired) ||
+				hasConnectionObservation(desired) ||
+				isManualOnlyDegraded(desired)
+			) {
+				continue;
+			}
+			const channel = store.getState().sessions[sessionHandle];
+			if (!channel?.subscribed) continue;
+			const identity = hotRuntimeIdentity(desired);
+			activeExactHotRecovery = {
+				identity,
+				baselineReady: channel.baselineAuthoritative && identitiesMatch(channel.runtime, identity),
+				leaseReady: false,
+				recoveryStarted: false,
+			};
+			const cursor = validCursor(channel);
+			if (sendSubscriptionForRuntime(sessionHandle, cursor, identity)) return;
+			activeExactHotRecovery = null;
+		}
+	}
+
+	function cancelExactHotRecovery(sessionHandle: string): void {
+		if (queuedExactHotRecoveries.delete(sessionHandle)) {
+			const index = exactHotRecoveryQueue.indexOf(sessionHandle);
+			if (index !== -1) exactHotRecoveryQueue.splice(index, 1);
+		}
+		if (activeExactHotRecovery?.identity.sessionHandle === sessionHandle) {
+			activeExactHotRecovery = null;
+		}
+		pumpExactHotRecovery();
+	}
+
+	function advanceExactHotRecovery(identity: SessionRuntimeIdentityDto, kind: "baseline" | "lease"): void {
+		const active = activeExactHotRecovery;
+		if (!active || !identitiesMatch(active.identity, identity)) return;
+		if (kind === "baseline") active.baselineReady = true;
+		else active.leaseReady = true;
+		if (!active.baselineReady || !active.leaseReady) return;
+		activeExactHotRecovery = null;
+		const desired = hotRuntimeByHandle.get(identity.sessionHandle);
+		if (desired && !identitiesMatch(desired, identity)) queueHotRuntimeRecovery(desired);
+		pumpExactHotRecovery();
+	}
+
+	function settleExactHotRecoveryError(sessionHandle: string): boolean {
+		const active = activeExactHotRecovery;
+		if (!active || active.identity.sessionHandle !== sessionHandle) return false;
+		activeExactHotRecovery = null;
+		const observation = connectionObservations.get(sessionHandle);
+		if (observation && identitiesMatch(observation, active.identity)) {
+			connectionObservations.delete(sessionHandle);
+		}
+		const desired = hotRuntimeByHandle.get(sessionHandle);
+		const superseded = Boolean(desired && !identitiesMatch(desired, active.identity));
+		if (desired && superseded) queueHotRuntimeRecovery(desired);
+		pumpExactHotRecovery();
+		return true;
+	}
+
+	function handleHotRuntimeInventory(message: HotRuntimeInventoryDto, initial = false): void {
+		if (negotiatedServerEpoch !== null && message.serverEpoch !== negotiatedServerEpoch) return;
+		if (message.revision <= hotRuntimeRevision) return;
+		const previous = hotRuntimeByHandle;
+		const next = new Map(message.runtimes.map((runtime) => [runtime.sessionHandle, runtime]));
+		hotRuntimeRevision = message.revision;
+		hotRuntimeByHandle = next;
+		store.setState({ hotRuntimeInventory: message });
+		globalBus.emit(message);
+
+		for (const [sessionHandle] of previous) {
+			if (next.has(sessionHandle)) continue;
+			connectionObservations.delete(sessionHandle);
+			cancelExactHotRecovery(sessionHandle);
+			const channel = store.getState().sessions[sessionHandle];
+			if (channel?.subscribed) unsubscribeSession(sessionHandle);
+		}
+		if (initial) {
+			clearHelloTimer();
+			reconnectAttempt = 0;
+			store.setState({ connectionState: "online" });
+			resyncCoordinator.reconnect();
+		}
+		for (const runtime of message.runtimes) queueHotRuntimeRecovery(runtime);
+
+		if (initial) {
+			for (const channel of Object.values(store.getState().sessions)) {
+				if (!channel.subscribed || next.has(channel.sessionHandle)) continue;
+				const recovery = resyncCoordinator.getState(channel.sessionHandle);
+				if (recovery?.phase === "degraded" && identitiesMatch(recovery.identity, channel.runtime)) continue;
+				sendSubscription(channel.sessionHandle, validCursor(channel));
+			}
+			const token = { serverEpoch: message.serverEpoch, revision: message.revision };
+			for (const waiter of initialInventoryWaiters) waiter.resolve(token);
+			initialInventoryWaiters.clear();
+		}
 	}
 
 	function ingestServerMessage(message: SessionWsServerMessage): void {
 		switch (message.type) {
+			case "hot_runtime_inventory":
+				handleHotRuntimeInventory(message);
+				return;
 			case "response":
 				handleResponse(message);
 				return;
@@ -941,6 +1237,17 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	}
 
 	function handleSessionError(message: Extract<SessionWsServerMessage, { type: "session_error" }>): void {
+		const activeExact = activeExactHotRecovery;
+		const exactErrorMatches =
+			message.operation === "subscribe" &&
+			activeExact?.identity.sessionHandle === message.sessionHandle &&
+			activeExact.identity.serverEpoch === message.serverEpoch &&
+			!activeExact.recoveryStarted;
+		if (exactErrorMatches) {
+			settleExactHotRecoveryError(message.sessionHandle);
+			frameBus.emit(message.sessionHandle, message, now());
+			return;
+		}
 		const current = store.getState().sessions[message.sessionHandle];
 		if (
 			!current?.subscribed ||
@@ -957,6 +1264,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				frameBus.emit(message.sessionHandle, message, now());
 				return;
 			}
+			connectionObservations.delete(message.sessionHandle);
 			rejectPendingForSession(
 				message.sessionHandle,
 				new SessionTransportError("session_not_subscribed", message.error),
@@ -1047,6 +1355,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			clearSessionResyncData(sessionHandle);
 			resyncCoordinator.unsubscribe(sessionHandle);
 			acknowledgedExtensionRequests.delete(sessionHandle);
+			clearDeliveredNotifyKeys(sessionHandle);
 			claimAttempts.delete(sessionHandle);
 			baselineRefreshes.delete(sessionHandle);
 			subscriptionBaselines.delete(sessionHandle);
@@ -1070,6 +1379,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			lease: identityChanged ? { isController: false } : channel.lease,
 			rawEvents: identityChanged ? [] : channel.rawEvents,
 		}));
+		connectionObservations.set(sessionHandle, message.runtime);
 		const delivery = frameBus.emit(sessionHandle, message, now());
 		if (delivery.errors.length > 0) {
 			reportProjectionFailure(sessionHandle, message.runtime.generation, delivery.errors[0]);
@@ -1079,10 +1389,24 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 
 	function handleReplayFrame(message: SessionReplayFrameDto): void {
 		const current = store.getState().sessions[message.sessionHandle];
-		if (!current?.subscribed || current.generation === null || !identitiesMatch(current.runtime, message)) {
+		const currentRuntime = current?.runtime;
+		if (
+			!current?.subscribed ||
+			current.generation === null ||
+			!currentRuntime ||
+			!identitiesMatch(currentRuntime, message)
+		) {
 			return;
 		}
 		const receivedAt = now();
+		const journaledNotify =
+			message.type === "extension_ui_request" && message.request.method === "notify" ? message : null;
+		if (journaledNotify && hasDeliveredNotify(currentRuntime, journaledNotify)) return;
+		if (journaledNotify && message.seq <= current.lastSeq) {
+			const delivery = frameBus.emit(message.sessionHandle, message, receivedAt);
+			if (delivery.errors.length === 0) rememberDeliveredNotify(currentRuntime, journaledNotify);
+			return;
+		}
 
 		if (current.resync) {
 			if (message.seq <= current.resync.barrierSeq) return;
@@ -1121,6 +1445,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		const deliveredChannel = store.getState().sessions[message.sessionHandle];
 		if (deliveredChannel?.resync?.requiresFreshBaseline) return;
 		if (message.type === "event") appendRawEvent(message.sessionHandle, message, receivedAt);
+		if (journaledNotify) rememberDeliveredNotify(currentRuntime, journaledNotify);
 		applyReplayFrameState(message, !delivery.deferred);
 		resolvePendingResponsesForSession(message.sessionHandle);
 	}
@@ -1387,7 +1712,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		if (subscriptionBaselines.get(message.sessionHandle) === identityKey(current.runtime)) {
 			subscriptionBaselines.delete(message.sessionHandle);
 		}
-		const channel = setChannel(message.sessionHandle, (channel) => ({
+		setChannel(message.sessionHandle, (channel) => ({
 			...channel,
 			freshLeaseBaseline: channel.runtime,
 			lease: message.isController
@@ -1398,17 +1723,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				: { isController: false },
 		}));
 		frameBus.emit(message.sessionHandle, message, now());
-		if (
-			!message.isController &&
-			channel.controllerIntent &&
-			!claimAttempts.has(message.sessionHandle) &&
-			requireSubscribedOnline(message.sessionHandle)
-		) {
-			claimAttempts.add(message.sessionHandle);
-			if (sendWire({ type: "session_claim", sessionHandle: message.sessionHandle }) !== "sent") {
-				claimAttempts.delete(message.sessionHandle);
-			}
-		}
+		if (current.runtime) advanceExactHotRecovery(current.runtime, "lease");
+		if (!message.isController) claimSessionIfReady(message.sessionHandle);
 	}
 
 	function handleResyncRequired(
@@ -1429,6 +1745,10 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			message.runtime.generation < current.generation
 		) {
 			return;
+		}
+		connectionObservations.set(message.sessionHandle, message.runtime);
+		if (activeExactHotRecovery && identitiesMatch(activeExactHotRecovery.identity, message.runtime)) {
+			activeExactHotRecovery.recoveryStarted = true;
 		}
 		const sameIdentity = identitiesMatch(current.runtime, message.runtime);
 		if (!sameIdentity && current.runtime) {
@@ -1456,6 +1776,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		}
 		if (!sameIdentity) {
 			acknowledgedExtensionRequests.delete(message.sessionHandle);
+			clearDeliveredNotifyKeys(message.sessionHandle);
 			rejectPendingForSession(
 				message.sessionHandle,
 				new SessionTransportError("response_mismatch", "Session generation changed during resync"),
@@ -1555,7 +1876,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		clearAcknowledgedExtensionRequests(identity);
 		snapshotWaiters.delete(key);
 		waiter.resolve({ identity, snapshotId, asOfSeq: endpointSeq });
+		advanceExactHotRecovery(identity, "baseline");
 		resolvePendingResponsesForSession(identity.sessionHandle);
+		claimSessionIfReady(identity.sessionHandle);
 		return true;
 	}
 
@@ -1643,6 +1966,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			}
 			if (snapshotWaiters.get(key)?.token !== waiter.token) return;
 			suffixDeferred ||= delivery.deferred;
+			if (frame.type === "extension_ui_request" && frame.request.method === "notify") {
+				rememberDeliveredNotify(message, frame);
+			}
 			applyReplayFrameState(frame, !delivery.deferred, acknowledged);
 		}
 		resyncBuffers.delete(key);
@@ -1714,6 +2040,16 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		const state = store.getState();
 		const previous = state.sessions[previousSessionHandle];
 		if (!previous?.subscribed) return;
+		const exactRekeyInFlight = activeExactHotRecovery?.identity.sessionHandle === previousSessionHandle;
+		if (!exactRekeyInFlight) {
+			const previousObservation = connectionObservations.get(previousSessionHandle);
+			connectionObservations.delete(previousSessionHandle);
+			if (previousObservation) connectionObservations.set(sessionHandle, message.runtime);
+		}
+		if (queuedExactHotRecoveries.delete(previousSessionHandle)) {
+			const queuedIndex = exactHotRecoveryQueue.indexOf(previousSessionHandle);
+			if (queuedIndex !== -1) exactHotRecoveryQueue.splice(queuedIndex, 1);
+		}
 		const dormantLastSeq = previous.resync?.barrierSeq ?? previous.projectedSeq;
 		const dormantRuntime = previous.runtime
 			? { ...previous.runtime, lastSeq: dormantLastSeq, state: "dormant" as const }
@@ -1757,6 +2093,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		clearSessionResyncData(sessionHandle);
 		acknowledgedExtensionRequests.delete(previousSessionHandle);
 		acknowledgedExtensionRequests.delete(sessionHandle);
+		clearDeliveredNotifyKeys(previousSessionHandle);
+		clearDeliveredNotifyKeys(sessionHandle);
 		baselineRefreshes.delete(previousSessionHandle);
 		baselineRefreshes.delete(sessionHandle);
 		const previousBaseline = subscriptionBaselines.get(previousSessionHandle);
@@ -1810,12 +2148,15 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		if (disposed) return;
 		disconnect();
 		disposed = true;
+		rejectInitialInventoryWaiters(new SessionTransportError("unavailable", "Session transport disposed"));
 		resyncBuffers.clear();
 		resyncBufferBytes.clear();
 		snapshotWaiters.clear();
 		skipNextResubscribe.clear();
 		resyncCoordinator.dispose();
 		acknowledgedExtensionRequests.clear();
+		deliveredNotifyKeys.clear();
+		deliveredNotifyIdentityOrder = [];
 		claimAttempts.clear();
 		baselineRefreshes.clear();
 		subscriptionBaselines.clear();
@@ -1834,6 +2175,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		confirmProjectionDelivery,
 		isSnapshotSuffixProjectionPending,
 		reportProjectionFailure,
+		waitForInitialHotInventory,
 		dispose,
 	};
 }

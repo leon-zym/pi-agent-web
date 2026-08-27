@@ -1,11 +1,14 @@
 import { randomUUID } from "node:crypto";
 import {
+	GATEWAY_CLIENT_REQUIRED_CAPABILITIES,
+	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 	GATEWAY_PROTOCOL_VERSION,
-	GATEWAY_REQUIRED_CAPABILITIES,
 	type GatewayProtocolErrorDto,
 	type GatewayServerHelloDto,
+	type HotRuntimeInventoryDto,
 	isGatewayClientHello,
 	isSessionWsClientMessage,
+	negotiateHotRuntimeInventory,
 	RpcError,
 	SESSION_WS_CLIENT_MAX_BYTES,
 	SESSION_WS_SERVER_MAX_BYTES,
@@ -14,13 +17,14 @@ import {
 	type SessionReplayCursorDto,
 	type SessionReplayFrameDto,
 	type SessionRuntimeDto,
+	type SessionRuntimeIdentityDto,
 	type SessionWsClientMessage,
 	type SessionWsServerMessage,
 } from "@pi-agent-web/protocol";
 import type { WebSocket } from "ws";
 import { WebSocketServer } from "ws";
-import type { SessionSupervisorMessage } from "./session-runtime-types.js";
-import type { SessionSupervisor } from "./session-supervisor.js";
+import type { ReplayResult, SessionSupervisorMessage } from "./session-runtime-types.js";
+import type { HotRuntimeSubscriptionToken, SessionSupervisor } from "./session-supervisor.js";
 
 interface ConnectionState {
 	connectionId: string;
@@ -41,6 +45,10 @@ interface ConnectionState {
 	closed: boolean;
 	epoch: number;
 	helloComplete: boolean;
+	hotInventoryNegotiated: boolean;
+	hotInventoryRevision: number;
+	deferredHotInventory?: HotRuntimeInventoryDto;
+	admittedExactOperations: number;
 	helloTimer?: NodeJS.Timeout;
 	negotiatedMaxServerFrameBytes: number;
 }
@@ -64,6 +72,7 @@ interface SessionCatchUp {
 	bufferedBytes: number;
 	order: number;
 	rekeyVersion: number;
+	exactTransactional: boolean;
 }
 
 interface BashCommandIdMapping {
@@ -85,6 +94,7 @@ export interface SessionWsBridgeOptions {
 }
 
 export const MAX_SESSION_WS_IN_FLIGHT_COMMANDS = 32;
+export const MAX_SESSION_WS_IN_FLIGHT_EXACT_SUBSCRIPTIONS = 256;
 export const MAX_SESSION_WS_BUFFERED_BYTES = 1024 * 1024;
 const MAX_SESSION_WS_SNAPSHOT_RESPONSE_BYTES = SESSION_WS_SERVER_MAX_BYTES;
 
@@ -173,12 +183,20 @@ export class SessionWsBridge {
 				this.sendPayload(connection, payload);
 				continue;
 			}
-			const catchUp = this.findCatchUp(connection, sessionHandle);
-			if (catchUp) {
-				this.bufferCatchUpMessage(connection, catchUp, message, payload);
+			const catchUps = this.findCatchUps(connection, sessionHandle);
+			if (catchUps.length > 0) {
+				for (const catchUp of catchUps) {
+					this.bufferCatchUpMessage(connection, catchUp, message, payload);
+				}
 				continue;
 			}
 			if (this.isSubscribed(connection, sessionHandle)) this.sendPayload(connection, payload);
+		}
+	}
+
+	broadcastHotRuntimeInventory(inventory: HotRuntimeInventoryDto): void {
+		for (const connection of this.connections) {
+			this.sendHotRuntimeInventory(connection, inventory);
 		}
 	}
 
@@ -202,8 +220,8 @@ export class SessionWsBridge {
 		const payload = JSON.stringify(message satisfies SessionWsServerMessage);
 		for (const connection of this.connections) {
 			if (connection.closed) continue;
-			const catchUp = this.findCatchUp(connection, message.previousSessionHandle);
-			if (catchUp) {
+			const catchUps = this.findCatchUps(connection, message.previousSessionHandle);
+			for (const catchUp of catchUps) {
 				catchUp.currentHandle = message.runtime.sessionHandle;
 				catchUp.handles.add(message.runtime.sessionHandle);
 				catchUp.rekeyVersion += 1;
@@ -217,7 +235,7 @@ export class SessionWsBridge {
 			if (connection.controlledSessions.delete(message.previousSessionHandle)) {
 				connection.controlledSessions.add(message.runtime.sessionHandle);
 			}
-			if (wasSubscribed && !catchUp) this.sendPayload(connection, payload);
+			if (wasSubscribed && catchUps.length === 0) this.sendPayload(connection, payload);
 		}
 	}
 
@@ -241,6 +259,9 @@ export class SessionWsBridge {
 			closed: false,
 			epoch: 0,
 			helloComplete: false,
+			hotInventoryNegotiated: false,
+			hotInventoryRevision: -1,
+			admittedExactOperations: 0,
 			negotiatedMaxServerFrameBytes: MAX_SESSION_WS_SNAPSHOT_RESPONSE_BYTES,
 		};
 		this.connections.add(connection);
@@ -297,7 +318,7 @@ export class SessionWsBridge {
 
 		switch (message.type) {
 			case "session_subscribe":
-				await this.subscribe(connection, message.sessionHandle, message.cursor);
+				await this.subscribe(connection, message.sessionHandle, message.cursor, message.expectedHotRuntime);
 				return;
 			case "session_unsubscribe":
 				this.unsubscribe(connection, message.sessionHandle);
@@ -333,7 +354,7 @@ export class SessionWsBridge {
 
 		const requestedCapabilities = new Set(value.capabilities);
 		if (
-			GATEWAY_REQUIRED_CAPABILITIES.some(
+			GATEWAY_CLIENT_REQUIRED_CAPABILITIES.some(
 				(capability) =>
 					!requestedCapabilities.has(capability) || !this.runtime.capabilities.includes(capability),
 			)
@@ -341,9 +362,6 @@ export class SessionWsBridge {
 			this.sendProtocolErrorAndClose(connection, "capability_unsupported");
 			return;
 		}
-		connection.helloComplete = true;
-		if (connection.helloTimer) clearTimeout(connection.helloTimer);
-		connection.helloTimer = undefined;
 		connection.negotiatedMaxServerFrameBytes = Math.min(
 			value.limits.maxServerFrameBytes,
 			MAX_SESSION_WS_SNAPSHOT_RESPONSE_BYTES,
@@ -368,7 +386,25 @@ export class SessionWsBridge {
 				maxExtensionRequests: 128,
 			},
 		};
+		const inventoryNegotiation = negotiateHotRuntimeInventory(value, hello);
+		if (
+			inventoryNegotiation.negotiated === false &&
+			inventoryNegotiation.reason === "server_frame_limit_too_small" &&
+			value.protocol.minor >= 1 &&
+			value.capabilities.includes(GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY) &&
+			hello.capabilities.includes(GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY)
+		) {
+			this.sendProtocolErrorAndClose(connection, "capability_unsupported");
+			return;
+		}
+		connection.helloComplete = true;
+		connection.hotInventoryNegotiated = inventoryNegotiation.negotiated;
+		if (connection.helloTimer) clearTimeout(connection.helloTimer);
+		connection.helloTimer = undefined;
 		this.sendPayload(connection, JSON.stringify(hello));
+		if (inventoryNegotiation.negotiated) {
+			this.sendHotRuntimeInventory(connection, this.supervisor.getHotRuntimeInventory());
+		}
 	}
 
 	private sendProtocolErrorAndClose(
@@ -403,22 +439,77 @@ export class SessionWsBridge {
 		connection: ConnectionState,
 		sessionHandle: string,
 		cursor?: SessionReplayCursorDto,
+		expectedHotRuntime?: SessionRuntimeIdentityDto,
 	): Promise<void> {
+		if (expectedHotRuntime && !connection.hotInventoryNegotiated) {
+			this.sendSessionError(connection, sessionHandle, "subscribe", "hot_runtime_inventory_not_negotiated");
+			return;
+		}
+		if (expectedHotRuntime) {
+			if (
+				this.isSubscribed(connection, sessionHandle) ||
+				this.findCatchUps(connection, sessionHandle).length > 0
+			) {
+				return;
+			}
+			if (connection.admittedExactOperations >= MAX_SESSION_WS_IN_FLIGHT_EXACT_SUBSCRIPTIONS) {
+				this.sendSessionError(
+					connection,
+					sessionHandle,
+					"subscribe",
+					"too_many_in_flight_exact_subscriptions",
+				);
+				return;
+			}
+			connection.admittedExactOperations += 1;
+		}
 		const lifecycleEpoch = connection.epoch;
-		const catchUp = this.beginCatchUp(connection, sessionHandle);
-		if (!catchUp) return;
+		const catchUp = this.beginCatchUp(connection, sessionHandle, expectedHotRuntime !== undefined);
+		if (!catchUp) {
+			if (expectedHotRuntime) connection.admittedExactOperations -= 1;
+			return;
+		}
 		try {
 			let observedRekeyVersion = catchUp.rekeyVersion;
-			let result = await this.supervisor.subscribe(sessionHandle, cursor);
+			let exactObservationToken: HotRuntimeSubscriptionToken | undefined;
+			let result: ReplayResult;
+			if (expectedHotRuntime) {
+				const exact = await this.supervisor.subscribeHotExact(expectedHotRuntime, cursor);
+				exactObservationToken = exact.observationToken;
+				result = exact;
+			} else {
+				result = await this.supervisor.subscribe(sessionHandle, cursor);
+			}
 			if (!this.isCurrentCatchUp(connection, catchUp, lifecycleEpoch)) return;
-			if (!this.adoptCatchUpHandle(connection, catchUp, result.runtime.sessionHandle, observedRekeyVersion)) {
+			if (
+				expectedHotRuntime &&
+				(catchUp.rekeyVersion !== observedRekeyVersion ||
+					catchUp.currentHandle !== expectedHotRuntime.sessionHandle)
+			) {
+				throw new RpcError("session_subscribe", "hot_runtime_identity_changed");
+			}
+			if (expectedHotRuntime) {
+				if (
+					!exactObservationToken ||
+					!this.supervisor.revalidateHotExactSubscription(exactObservationToken)
+				) {
+					throw new RpcError("session_subscribe", "hot_runtime_identity_changed");
+				}
+				if (
+					!this.adoptCatchUpHandle(connection, catchUp, result.runtime.sessionHandle, observedRekeyVersion)
+				) {
+					return;
+				}
+			} else if (
+				!this.adoptCatchUpHandle(connection, catchUp, result.runtime.sessionHandle, observedRekeyVersion)
+			) {
 				return;
 			}
 
 			// A concurrent fork/clone can rekey the runtime while activation is
 			// awaited. Anchor the catch-up to the newest identity before publishing
 			// any baseline; the old cursor cannot describe the child generation.
-			while (catchUp.currentHandle !== result.runtime.sessionHandle) {
+			while (!expectedHotRuntime && catchUp.currentHandle !== result.runtime.sessionHandle) {
 				observedRekeyVersion = catchUp.rekeyVersion;
 				result = await this.supervisor.subscribe(catchUp.currentHandle);
 				if (!this.isCurrentCatchUp(connection, catchUp, lifecycleEpoch)) return;
@@ -458,31 +549,56 @@ export class SessionWsBridge {
 			const baselineMarker = this.findBaselineMarker(buffered, result.runtime);
 			this.establishLiveSubscription(connection, catchUp, resolvedHandle);
 			for (const [index, entry] of buffered.entries()) {
-				if (this.isNewerThanBaseline(entry.message, result.runtime, index, baselineMarker)) {
+				if (
+					this.isNonReplayableCatchUpMessage(entry.message) ||
+					this.isNewerThanBaseline(entry.message, result.runtime, index, baselineMarker)
+				) {
 					this.sendPayload(connection, entry.payload);
 				}
 			}
+			this.flushDeferredHotInventory(connection);
 		} catch (error) {
 			if (!this.isCurrentCatchUp(connection, catchUp, lifecycleEpoch)) return;
-			this.cancelCatchUp(connection, catchUp);
+			if (catchUp.exactTransactional) this.rollbackExactCatchUp(connection, catchUp);
+			else {
+				this.enqueueBufferedRekeys(connection, catchUp);
+				this.cancelCatchUp(connection, catchUp);
+			}
 			this.sendSessionError(connection, sessionHandle, "subscribe", error);
+			this.flushDeferredHotInventory(connection);
+		} finally {
+			if (expectedHotRuntime) {
+				connection.admittedExactOperations = Math.max(0, connection.admittedExactOperations - 1);
+			}
 		}
 	}
 
-	private beginCatchUp(connection: ConnectionState, requestedHandle: string): SessionCatchUp | null {
+	private beginCatchUp(
+		connection: ConnectionState,
+		requestedHandle: string,
+		exactHotRuntime = false,
+	): SessionCatchUp | null {
 		if (connection.closed) return null;
+		if (exactHotRuntime) {
+			const catchUp: SessionCatchUp = {
+				requestedHandle,
+				currentHandle: requestedHandle,
+				handles: new Set([requestedHandle]),
+				buffered: [],
+				bufferedBytes: 0,
+				order: ++connection.nextCatchUpOrder,
+				rekeyVersion: 0,
+				exactTransactional: true,
+			};
+			connection.catchUps.add(catchUp);
+			return catchUp;
+		}
 		// An explicit subscribe to a fork parent is not a stale reference to the
 		// child. Clear only that stale-unsubscribe alias and preserve the child as
 		// an independent live subscription.
 		connection.subscriptionAliases.delete(requestedHandle);
 		const activeHandle = this.supervisor.getRuntime(requestedHandle)?.sessionHandle ?? requestedHandle;
 		const handles = new Set([requestedHandle, activeHandle]);
-		for (const existing of [...connection.catchUps]) {
-			if ([...handles].some((handle) => existing.handles.has(handle))) {
-				this.cancelCatchUp(connection, existing);
-			}
-		}
-		this.removeLiveSubscription(connection, activeHandle);
 		const catchUp: SessionCatchUp = {
 			requestedHandle,
 			currentHandle: activeHandle,
@@ -491,8 +607,16 @@ export class SessionWsBridge {
 			bufferedBytes: 0,
 			order: ++connection.nextCatchUpOrder,
 			rekeyVersion: 0,
+			exactTransactional: false,
 		};
 		connection.catchUps.add(catchUp);
+		for (const existing of [...connection.catchUps]) {
+			if (existing === catchUp) continue;
+			if ([...handles].some((handle) => existing.handles.has(handle))) {
+				this.transferCatchUpJournalAndCancel(connection, existing, catchUp);
+			}
+		}
+		this.removeLiveSubscription(connection, activeHandle);
 		return catchUp;
 	}
 
@@ -505,6 +629,7 @@ export class SessionWsBridge {
 				catchUp.handles.has(sessionHandle) ||
 				catchUp.handles.has(canonicalHandle)
 			) {
+				this.enqueueBufferedRekeys(connection, catchUp);
 				this.cancelCatchUp(connection, catchUp);
 			}
 		}
@@ -512,6 +637,7 @@ export class SessionWsBridge {
 		this.supervisor.release(canonicalHandle, connection.connectionId);
 		connection.controlledSessions.delete(canonicalHandle);
 		connection.controlledSessions.delete(sessionHandle);
+		this.flushDeferredHotInventory(connection);
 	}
 
 	private adoptCatchUpHandle(
@@ -525,10 +651,10 @@ export class SessionWsBridge {
 		for (const other of [...connection.catchUps]) {
 			if (other === catchUp || !other.handles.has(resolvedHandle)) continue;
 			if (other.order > catchUp.order) {
-				this.cancelCatchUp(connection, catchUp);
+				this.transferCatchUpJournalAndCancel(connection, catchUp, other);
 				return false;
 			}
-			this.cancelCatchUp(connection, other);
+			this.transferCatchUpJournalAndCancel(connection, other, catchUp);
 		}
 		this.removeLiveSubscription(connection, resolvedHandle);
 		return connection.catchUps.has(catchUp);
@@ -556,6 +682,12 @@ export class SessionWsBridge {
 		return match;
 	}
 
+	private findCatchUps(connection: ConnectionState, sessionHandle: string): SessionCatchUp[] {
+		return [...connection.catchUps]
+			.filter((catchUp) => catchUp.handles.has(sessionHandle))
+			.sort((left, right) => left.order - right.order);
+	}
+
 	private bufferCatchUpMessage(
 		connection: ConnectionState,
 		catchUp: SessionCatchUp,
@@ -581,6 +713,33 @@ export class SessionWsBridge {
 		connection.catchUpBufferedBytes = Math.max(0, connection.catchUpBufferedBytes - catchUp.bufferedBytes);
 		catchUp.buffered = [];
 		catchUp.bufferedBytes = 0;
+	}
+
+	private rollbackExactCatchUp(connection: ConnectionState, catchUp: SessionCatchUp): void {
+		this.enqueueBufferedRekeys(connection, catchUp);
+		this.cancelCatchUp(connection, catchUp);
+	}
+
+	private enqueueBufferedRekeys(connection: ConnectionState, catchUp: SessionCatchUp): void {
+		for (const entry of catchUp.buffered) {
+			if (entry.message.type === "session_rekeyed") this.sendPayload(connection, entry.payload);
+		}
+	}
+
+	private transferCatchUpJournalAndCancel(
+		connection: ConnectionState,
+		from: SessionCatchUp,
+		to: SessionCatchUp,
+	): void {
+		const retained = from.buffered.filter(
+			(entry) =>
+				entry.message.type === "session_rekeyed" || this.isNonReplayableCatchUpMessage(entry.message),
+		);
+		this.cancelCatchUp(connection, from);
+		for (const entry of retained) {
+			if (to.buffered.some((existing) => existing.payload === entry.payload)) continue;
+			this.bufferCatchUpMessage(connection, to, entry.message, entry.payload);
+		}
 	}
 
 	private establishLiveSubscription(
@@ -659,6 +818,10 @@ export class SessionWsBridge {
 			message.runtime.state === baseline.state &&
 			message.runtime.error === baseline.error
 		);
+	}
+
+	private isNonReplayableCatchUpMessage(message: SessionSupervisorMessage): boolean {
+		return message.type === "extension_ui_request" && message.request.method === "notify";
 	}
 
 	private async claim(connection: ConnectionState, sessionHandle: string): Promise<void> {
@@ -836,6 +999,8 @@ export class SessionWsBridge {
 		connection.closed = true;
 		if (connection.helloTimer) clearTimeout(connection.helloTimer);
 		connection.helloTimer = undefined;
+		connection.hotInventoryNegotiated = false;
+		connection.deferredHotInventory = undefined;
 		connection.epoch += 1;
 		this.connections.delete(connection);
 		for (const catchUp of [...connection.catchUps]) this.cancelCatchUp(connection, catchUp);
@@ -888,6 +1053,40 @@ export class SessionWsBridge {
 
 	private sendLease(connection: ConnectionState, lease: Omit<SessionLeaseSnapshot, "type">): void {
 		this.send(connection, { type: "lease_status", ...lease });
+	}
+
+	private sendHotRuntimeInventory(connection: ConnectionState, inventory: HotRuntimeInventoryDto): void {
+		if (
+			connection.closed ||
+			!connection.helloComplete ||
+			!connection.hotInventoryNegotiated ||
+			inventory.serverEpoch !== this.serverEpoch ||
+			inventory.revision <= connection.hotInventoryRevision
+		) {
+			return;
+		}
+		if (connection.deferredHotInventory || this.hasPendingCatchUpRekey(connection)) {
+			if (!connection.deferredHotInventory || inventory.revision > connection.deferredHotInventory.revision) {
+				connection.deferredHotInventory = inventory;
+			}
+			return;
+		}
+		connection.hotInventoryRevision = inventory.revision;
+		this.send(connection, inventory);
+	}
+
+	private hasPendingCatchUpRekey(connection: ConnectionState): boolean {
+		for (const catchUp of connection.catchUps) {
+			if (catchUp.buffered.some((entry) => entry.message.type === "session_rekeyed")) return true;
+		}
+		return false;
+	}
+
+	private flushDeferredHotInventory(connection: ConnectionState): void {
+		if (this.hasPendingCatchUpRekey(connection)) return;
+		const inventory = connection.deferredHotInventory;
+		connection.deferredHotInventory = undefined;
+		if (inventory) this.sendHotRuntimeInventory(connection, inventory);
 	}
 
 	private send(connection: ConnectionState, message: SessionWsServerMessage): void {

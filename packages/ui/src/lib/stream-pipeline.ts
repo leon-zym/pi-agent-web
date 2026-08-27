@@ -58,7 +58,9 @@ export function initPipeline(): void {
 
 	sessionTransport.frameBus.subscribeAll((frame) => routeSessionFrame(frame.message));
 	sessionTransport.globalBus.subscribe((message) => {
-		if (message.type === "session_directory_changed") {
+		if (message.type === "hot_runtime_inventory") {
+			useSessionDirectoryStore.getState().applyHotRuntimeInventory(message);
+		} else if (message.type === "session_directory_changed") {
 			scheduleDirectoryReload(message.workspaceId);
 		} else {
 			void refreshModelsAfterAuthChange();

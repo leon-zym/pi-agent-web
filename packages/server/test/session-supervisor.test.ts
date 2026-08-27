@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import type { HotRuntimeInventoryDto, SessionRuntimeIdentityDto } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { legacyRpcV1Adapter } from "../src/legacy-rpc-v1.js";
 import { canonicalizeSessionFile, sessionHandleForFile } from "../src/native-session-catalog.js";
@@ -52,6 +53,7 @@ function createNativeSession(root: string, cwd: string, nativeSessionId: string)
 function createHarness(options: {
 	targets: ExistingSessionTarget[];
 	onBroadcast?: (message: SessionSupervisorMessage) => void;
+	onHotRuntimeInventory?: (inventory: HotRuntimeInventoryDto) => void;
 	maxHotRuntimes?: number;
 	replayLimit?: number;
 	replayMaxBytes?: number;
@@ -92,6 +94,7 @@ function createHarness(options: {
 			messages.push(message);
 			options.onBroadcast?.(message);
 		},
+		onHotRuntimeInventory: options.onHotRuntimeInventory,
 		maxHotRuntimes: options.maxHotRuntimes ?? 8,
 		replayLimit: options.replayLimit ?? 32,
 		replayMaxBytes: options.replayMaxBytes,
@@ -176,6 +179,285 @@ afterEach(async () => {
 });
 
 describe("SessionSupervisor", () => {
+	it("publishes strictly revisioned full inventories for hot lifecycle and operational states", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const first = createNativeSession(root, cwd, "hot-inventory-b");
+		const second = createNativeSession(root, cwd, "hot-inventory-a");
+		const inventories: HotRuntimeInventoryDto[] = [];
+		const { supervisor } = createHarness({
+			targets: [first, second],
+			env: { PI_WEB_FIXTURE_READY_DELAY_MS: "80" },
+			onHotRuntimeInventory: (inventory) => inventories.push(inventory),
+		});
+
+		expect(supervisor.getHotRuntimeInventory()).toEqual({
+			type: "hot_runtime_inventory",
+			serverEpoch: supervisor.serverEpoch,
+			revision: 0,
+			runtimes: [],
+		});
+		const activating = Promise.all([
+			supervisor.activate(first.sessionHandle),
+			supervisor.activate(second.sessionHandle),
+		]);
+		await waitFor(() =>
+			inventories.some((inventory) => inventory.runtimes.some((entry) => entry.state === "starting")),
+		);
+		await activating;
+		await waitFor(() =>
+			supervisor.getHotRuntimeInventory().runtimes.every((entry) => entry.state === "idle"),
+		);
+
+		const current = supervisor.getHotRuntimeInventory();
+		expect(current.runtimes.map((entry) => entry.sessionHandle)).toEqual(
+			[first.sessionHandle, second.sessionHandle].sort(),
+		);
+		expect(new Set(current.runtimes.map((entry) => entry.sessionHandle)).size).toBe(2);
+		expect(current.runtimes.every((entry) => entry.serverEpoch === supervisor.serverEpoch)).toBe(true);
+		expect(inventories.every((inventory) => inventory.runtimes.length <= 2)).toBe(true);
+		expect(inventories.map((inventory) => inventory.revision)).toEqual(
+			inventories.map((_, index) => index + 1),
+		);
+
+		const lease = await supervisor.claim(first.sessionHandle, "hot-controller");
+		const before = supervisor.getRuntime(first.sessionHandle)!;
+		await supervisor.sendCommand(
+			first.sessionHandle,
+			{ type: "prompt", message: "open-dialog-no-agent" },
+			{
+				connectionId: "hot-controller",
+				expectedGeneration: before.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		await waitFor(() =>
+			supervisor
+				.getHotRuntimeInventory()
+				.runtimes.some(
+					(entry) => entry.sessionHandle === first.sessionHandle && entry.state === "waiting_ui",
+				),
+		);
+
+		const internal = supervisor as unknown as { runtimes: Map<string, SessionRuntime> };
+		const firstRuntime = internal.runtimes.get(first.sessionHandle)!;
+		const ownedProcess = (firstRuntime as unknown as { proc: { stop: () => Promise<void> } | null }).proc;
+		if (!ownedProcess) throw new Error("hot Runtime did not own its Pi process");
+		const originalProcessStop = ownedProcess.stop.bind(ownedProcess);
+		let releaseProcessStop: (() => void) | undefined;
+		const processStopGate = new Promise<void>((resolve) => {
+			releaseProcessStop = resolve;
+		});
+		ownedProcess.stop = async () => {
+			await processStopGate;
+			await originalProcessStop();
+		};
+		const stopping = supervisor.stop(first.sessionHandle);
+		await waitFor(
+			() =>
+				!supervisor
+					.getHotRuntimeInventory()
+					.runtimes.some((entry) => entry.sessionHandle === first.sessionHandle),
+		);
+		expect(firstRuntime.running).toBe(true);
+		releaseProcessStop?.();
+		await stopping;
+		await supervisor.restart(first.sessionHandle);
+		await waitFor(() =>
+			supervisor
+				.getHotRuntimeInventory()
+				.runtimes.some(
+					(entry) => entry.sessionHandle === first.sessionHandle && entry.generation > before.generation,
+				),
+		);
+		const restarted = supervisor.getRuntime(first.sessionHandle)!;
+		await supervisor.sendCommand(
+			first.sessionHandle,
+			{ type: "prompt", message: "slow" },
+			{
+				connectionId: "hot-controller",
+				expectedGeneration: restarted.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		await waitFor(() =>
+			supervisor
+				.getHotRuntimeInventory()
+				.runtimes.some((entry) => entry.sessionHandle === first.sessionHandle && entry.state === "running"),
+		);
+		await waitFor(() => supervisor.getRuntime(first.sessionHandle)?.state === "idle");
+		await supervisor.stopAll();
+		expect(supervisor.getHotRuntimeInventory().runtimes).toEqual([]);
+		expect(inventories.map((inventory) => inventory.revision)).toEqual(
+			inventories.map((_, index) => index + 1),
+		);
+	});
+
+	it("publishes rekey, crash, eviction, and unpersisted hot membership without duplicates", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const persisted = createNativeSession(root, cwd, "hot-evicted");
+		const crash = createNativeSession(root, cwd, "hot-crash");
+		const crashMarker = path.join(root, "crash.marker");
+		const inventories: HotRuntimeInventoryDto[] = [];
+		const { supervisor } = createHarness({
+			targets: [persisted, crash],
+			maxHotRuntimes: 1,
+			maxAutoRestarts: 0,
+			env: { PI_WEB_FIXTURE_CRASH_MARKER: crashMarker },
+			onHotRuntimeInventory: (inventory) => inventories.push(inventory),
+		});
+
+		await supervisor.activate(persisted.sessionHandle);
+		await waitFor(() =>
+			inventories.some((inventory) =>
+				inventory.runtimes.some((entry) => entry.sessionHandle === persisted.sessionHandle),
+			),
+		);
+		await supervisor.activate(crash.sessionHandle);
+		await waitFor(() =>
+			supervisor
+				.getHotRuntimeInventory()
+				.runtimes.some((entry) => entry.sessionHandle === crash.sessionHandle),
+		);
+		expect(supervisor.getHotRuntimeInventory().runtimes).toHaveLength(1);
+		expect(supervisor.getHotRuntimeInventory().runtimes[0]?.sessionHandle).toBe(crash.sessionHandle);
+
+		const lease = await supervisor.claim(crash.sessionHandle, "crash-controller");
+		const active = supervisor.getRuntime(crash.sessionHandle)!;
+		await supervisor.sendCommand(
+			crash.sessionHandle,
+			{ type: "prompt", message: "crash-once" },
+			{
+				connectionId: "crash-controller",
+				expectedGeneration: active.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		await waitFor(() => supervisor.getRuntime(crash.sessionHandle)?.state === "crashed");
+		await waitFor(() => supervisor.getHotRuntimeInventory().runtimes.length === 0);
+
+		const revisionBeforeCreate = supervisor.getHotRuntimeInventory().revision;
+		const inventoryCountBeforeCreate = inventories.length;
+		const created = await supervisor.createSession({
+			workspaceId: "workspace-new",
+			cwd,
+			sessionDir: path.join(root, "new-sessions"),
+			requestedNativeSessionId: "hot-unpersisted",
+		});
+		await waitFor(() =>
+			supervisor
+				.getHotRuntimeInventory()
+				.runtimes.some((entry) => entry.sessionHandle === created.sessionHandle),
+		);
+		expect(created.recoverable).toBe(false);
+		const inventoriesAfterCreate = inventories.slice(inventoryCountBeforeCreate);
+		expect(
+			inventoriesAfterCreate.some((inventory) =>
+				inventory.runtimes.some((entry) => entry.sessionHandle.startsWith("pending_")),
+			),
+		).toBe(false);
+		const canonicalInventory = inventoriesAfterCreate.find((inventory) =>
+			inventory.runtimes.some((entry) => entry.sessionHandle === created.sessionHandle),
+		);
+		expect(canonicalInventory?.revision).toBe(revisionBeforeCreate + 1);
+		expect(
+			inventories.every(
+				(inventory) =>
+					new Set(inventory.runtimes.map((entry) => entry.sessionHandle)).size === inventory.runtimes.length,
+			),
+		).toBe(true);
+		expect(
+			inventories.some(
+				(inventory) =>
+					inventory.runtimes.length === 1 &&
+					inventory.runtimes[0]?.sessionHandle === created.sessionHandle &&
+					inventory.runtimes[0].state === "idle",
+			),
+		).toBe(true);
+	});
+
+	it("subscribes to one exact hot incarnation without alias resolution or process activation", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "hot-exact");
+		const lifecycleMarker = path.join(root, "lifecycle.log");
+		const { supervisor } = createHarness({
+			targets: [target],
+			env: {
+				PI_WEB_FIXTURE_LIFECYCLE_MARKER: lifecycleMarker,
+				PI_WEB_FIXTURE_READY_DELAY_MS: "80",
+			},
+		});
+		const expected: SessionRuntimeIdentityDto = {
+			serverEpoch: supervisor.serverEpoch,
+			sessionHandle: target.sessionHandle,
+			workspaceId: target.workspaceId,
+			generation: 1,
+		};
+
+		await expect(supervisor.subscribeHotExact(expected)).rejects.toThrow("hot_runtime_not_found");
+		expect(fs.existsSync(lifecycleMarker)).toBe(false);
+		const activating = supervisor.activate(target.sessionHandle);
+		await waitFor(() => supervisor.getHotRuntimeInventory().runtimes[0]?.state === "starting");
+		await expect(
+			supervisor.subscribeHotExact(supervisor.getHotRuntimeInventory().runtimes[0]!),
+		).rejects.toThrow("session_snapshot_unavailable");
+		await activating;
+		const hot = supervisor.getHotRuntimeInventory().runtimes[0]!;
+		await expect(supervisor.subscribeHotExact({ ...hot, generation: hot.generation + 1 })).rejects.toThrow(
+			"hot_runtime_identity_changed",
+		);
+		await expect(supervisor.subscribeHotExact({ ...hot, workspaceId: "workspace-other" })).rejects.toThrow(
+			"hot_runtime_identity_changed",
+		);
+		await expect(
+			supervisor.subscribeHotExact(hot, {
+				serverEpoch: "stale-epoch",
+				generation: hot.generation,
+				seq: 0,
+			}),
+		).resolves.toMatchObject({ type: "resync_required", reason: "server_epoch_changed" });
+		const startsBeforeStop = fs.readFileSync(lifecycleMarker, "utf8").match(/^start:/gm)?.length ?? 0;
+
+		await supervisor.stop(target.sessionHandle);
+		await expect(supervisor.subscribeHotExact(hot)).rejects.toThrow("hot_runtime_not_found");
+		const startsAfterExactSubscribe =
+			fs.readFileSync(lifecycleMarker, "utf8").match(/^start:/gm)?.length ?? 0;
+		expect(startsAfterExactSubscribe).toBe(startsBeforeStop);
+		await expect(
+			supervisor.subscribeHotExact({ ...hot, sessionHandle: `pending_${hot.sessionHandle}` }),
+		).rejects.toThrow("hot_runtime_not_found");
+	});
+
+	it("revalidates exact process ownership after capturing the replay baseline", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "hot-exact-race");
+		const { supervisor } = createHarness({ targets: [target] });
+		await supervisor.activate(target.sessionHandle);
+		const hot = supervisor.getHotRuntimeInventory().runtimes[0]!;
+		const internal = supervisor as unknown as { runtimes: Map<string, SessionRuntime> };
+		const runtime = internal.runtimes.get(target.sessionHandle)!;
+		const originalReplay = runtime.getReplay.bind(runtime);
+		runtime.getReplay = (...args) => {
+			void runtime.stop();
+			return originalReplay(...args);
+		};
+
+		await expect(supervisor.subscribeHotExact(hot)).rejects.toThrow("hot_runtime_identity_changed");
+	});
+
+	it("hard caps configured hot Runtime capacity to the protocol inventory ceiling", () => {
+		const { supervisor } = createHarness({ targets: [], maxHotRuntimes: 100_000 });
+		const configured = supervisor as unknown as { opts: { maxHotRuntimes: number } };
+		expect(configured.opts.maxHotRuntimes).toBe(256);
+	});
+
 	it("builds generation zero from get_messages before committing buffered product domains", async () => {
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace");
@@ -2388,12 +2670,21 @@ describe("SessionSupervisor", () => {
 		const cwd = path.join(root, "workspace");
 		fs.mkdirSync(cwd);
 		const parent = createNativeSession(root, cwd, "ordered-parent");
+		const order: string[] = [];
 		const { supervisor, messages } = createHarness({
 			targets: [parent],
 			env: { PI_WEB_FIXTURE_TRANSITION_STICKY: "1" },
+			onBroadcast: (message) => {
+				if (message.type === "session_rekeyed") order.push("rekey");
+				if (message.type === "extension_ui_request" && message.request.method === "setStatus") {
+					order.push("staged");
+				}
+			},
+			onHotRuntimeInventory: () => order.push("inventory"),
 		});
 		const lease = await supervisor.claim(parent.sessionHandle, "connection");
 		const before = supervisor.getRuntime(parent.sessionHandle)!;
+		order.length = 0;
 		const result = await supervisor.sendCommand(
 			parent.sessionHandle,
 			{ type: "clone" },
@@ -2410,6 +2701,7 @@ describe("SessionSupervisor", () => {
 		);
 		expect(rekeyIndex).toBeGreaterThanOrEqual(0);
 		expect(stickyIndex).toBeGreaterThan(rekeyIndex);
+		expect(order).toEqual(["rekey", "inventory", "staged"]);
 		expect(messages[stickyIndex]).toMatchObject({
 			type: "extension_ui_request",
 			sessionHandle: result.sessionHandle,
@@ -2520,6 +2812,7 @@ describe("SessionSupervisor", () => {
 		fs.mkdirSync(cwd);
 		const parent = createNativeSession(root, cwd, "staged-overflow-parent");
 		const lifecycleMarker = path.join(root, "lifecycle.log");
+		const order: string[] = [];
 		const { supervisor, messages } = createHarness({
 			targets: [parent],
 			maxAutoRestarts: 0,
@@ -2528,9 +2821,20 @@ describe("SessionSupervisor", () => {
 				PI_WEB_FIXTURE_LIFECYCLE_MARKER: lifecycleMarker,
 				PI_WEB_FIXTURE_TRANSITION_DIALOG_AFTER_BASE: "1",
 			},
+			onBroadcast: (message) => {
+				if (message.type === "session_rekeyed") order.push("rekey");
+				if (
+					message.type === "runtime_state" &&
+					(message.runtime.state === "crashed" || message.runtime.state === "dormant")
+				) {
+					order.push("terminal");
+				}
+			},
+			onHotRuntimeInventory: () => order.push("inventory"),
 		});
 		const lease = await supervisor.claim(parent.sessionHandle, "connection");
 		const before = supervisor.getRuntime(parent.sessionHandle)!;
+		order.length = 0;
 
 		await expect(
 			supervisor.sendCommand(
@@ -2561,6 +2865,7 @@ describe("SessionSupervisor", () => {
 		);
 		expect(rekeyIndex).toBeGreaterThanOrEqual(0);
 		expect(terminalIndex).toBeGreaterThan(rekeyIndex);
+		expect(order.slice(0, 3)).toEqual(["rekey", "inventory", "terminal"]);
 		expect(
 			messages.filter(
 				(message) =>

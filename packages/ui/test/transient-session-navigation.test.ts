@@ -244,6 +244,7 @@ describe("transient Session navigation", () => {
 			currentWorkspaceHandle: "workspace-a",
 			currentSession: transient,
 			sessionsByWorkspace: { "workspace-a": [target] },
+			locallyCreatedTransientSessions: { [transient.sessionHandle]: true },
 			selectedSessionByWorkspace: { "workspace-a": transient.sessionHandle },
 		});
 		useComposerStore.getState().beginSession(transient.sessionHandle);
@@ -267,6 +268,89 @@ describe("transient Session navigation", () => {
 					),
 			).toBe(false);
 		});
+	});
+
+	it("releases but keeps the observer subscription for a recovered hot transient", () => {
+		const recovered = session("session-recovered", false);
+		const target = session("session-history", true);
+		const abandon = vi.spyOn(api, "abandonTransientSession");
+		const releaseSession = vi.fn(() => true);
+		const unsubscribeSession = vi.fn();
+		sessionTransport.store.setState({
+			hotRuntimeInventory: {
+				type: "hot_runtime_inventory",
+				serverEpoch: "test-server-epoch",
+				revision: 1,
+				runtimes: [
+					{
+						serverEpoch: "test-server-epoch",
+						sessionHandle: recovered.sessionHandle,
+						workspaceId: "workspace-a",
+						generation: 4,
+						state: "idle",
+					},
+				],
+			},
+			sessions: { [recovered.sessionHandle]: controlledTransient(recovered.sessionHandle) },
+			releaseSession,
+			unsubscribeSession,
+		});
+		useSessionDirectoryStore.setState({
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: target,
+			sessionsByWorkspace: { "workspace-a": [target] },
+			locallyCreatedTransientSessions: {},
+		});
+
+		reconcileHiddenSessionLifecycle(recovered.sessionHandle);
+
+		expect(abandon).not.toHaveBeenCalled();
+		expect(releaseSession).toHaveBeenCalledWith(recovered.sessionHandle);
+		expect(unsubscribeSession).not.toHaveBeenCalledWith(recovered.sessionHandle);
+	});
+
+	it("keeps a pinned recovered observer without a release acknowledgement loop", () => {
+		const recovered = session("session-observer", false);
+		const target = session("session-history", true);
+		const releaseSession = vi.fn(() => true);
+		const unsubscribeSession = vi.fn();
+		sessionTransport.store.setState({
+			hotRuntimeInventory: {
+				type: "hot_runtime_inventory",
+				serverEpoch: "test-server-epoch",
+				revision: 1,
+				runtimes: [
+					{
+						serverEpoch: "test-server-epoch",
+						sessionHandle: recovered.sessionHandle,
+						workspaceId: "workspace-a",
+						generation: 4,
+						state: "idle",
+					},
+				],
+			},
+			sessions: {
+				[recovered.sessionHandle]: {
+					...controlledTransient(recovered.sessionHandle),
+					controllerIntent: false,
+					lease: { isController: false },
+				},
+			},
+			releaseSession,
+			unsubscribeSession,
+		});
+		useSessionDirectoryStore.setState({
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: target,
+			sessionsByWorkspace: { "workspace-a": [target] },
+			locallyCreatedTransientSessions: {},
+		});
+
+		reconcileHiddenSessionLifecycle(recovered.sessionHandle);
+		reconcileHiddenSessionLifecycle(recovered.sessionHandle);
+
+		expect(releaseSession).not.toHaveBeenCalled();
+		expect(unsubscribeSession).not.toHaveBeenCalled();
 	});
 
 	it("never abandons or releases a hidden transient Session before its baseline is authoritative", () => {
@@ -320,6 +404,7 @@ describe("transient Session navigation", () => {
 			currentWorkspaceHandle: "workspace-a",
 			currentSession: transient,
 			sessionsByWorkspace: { "workspace-a": [target] },
+			locallyCreatedTransientSessions: { [transient.sessionHandle]: true },
 			selectedSessionByWorkspace: { "workspace-a": transient.sessionHandle },
 		});
 		useComposerStore.getState().beginSession(transient.sessionHandle);
@@ -444,6 +529,7 @@ describe("transient Session navigation", () => {
 			currentSession: target,
 			sessionsByWorkspace: { "workspace-a": [target] },
 			retainedTransientByWorkspace: { "workspace-a": transient },
+			locallyCreatedTransientSessions: { [transient.sessionHandle]: true },
 			selectedSessionByWorkspace: { "workspace-a": target.sessionHandle },
 		});
 		useComposerStore.getState().beginSession(transient.sessionHandle);
@@ -458,6 +544,54 @@ describe("transient Session navigation", () => {
 		expect(unsubscribeSession).toHaveBeenCalledWith(transient.sessionHandle);
 		expect(useSessionDirectoryStore.getState().retainedTransientByWorkspace["workspace-a"]).toBeUndefined();
 		expect(useSessionDirectoryStore.getState().currentWorkspaceHandle).toBeNull();
+	});
+
+	it("abandons every local hot transient while only releasing recovered hot Runtimes", async () => {
+		const localA = session("local-a", false);
+		const localB = session("local-b", false);
+		const recovered = session("recovered-hot", false);
+		const target = session("session-history", true);
+		const abandon = vi.spyOn(api, "abandonTransientSession").mockResolvedValue({
+			ok: true,
+			abandoned: true,
+		});
+		vi.spyOn(api, "removeWorkspace").mockResolvedValue({ ok: true, nativeHistoryRetained: true });
+		vi.spyOn(api, "listWorkspaces").mockResolvedValue([]);
+		const releaseSession = vi.fn(() => true);
+		const unsubscribeSession = vi.fn();
+		sessionTransport.store.setState({
+			sessions: {
+				[localA.sessionHandle]: controlledTransient(localA.sessionHandle),
+				[localB.sessionHandle]: controlledTransient(localB.sessionHandle),
+				[recovered.sessionHandle]: controlledTransient(recovered.sessionHandle),
+			},
+			releaseSession,
+			unsubscribeSession,
+			subscribeSession: vi.fn(),
+			claimSession: vi.fn(() => true),
+			invalidateSessionSnapshot: vi.fn(() => false),
+		});
+		useSessionDirectoryStore.setState({
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: target,
+			sessionsByWorkspace: { "workspace-a": [target] },
+			hotSessionsByWorkspace: { "workspace-a": [localA, localB, recovered] },
+			locallyCreatedTransientSessions: {
+				[localA.sessionHandle]: true,
+				[localB.sessionHandle]: true,
+			},
+			selectedSessionByWorkspace: { "workspace-a": target.sessionHandle },
+		});
+
+		await useSessionDirectoryStore.getState().removeWorkspace("workspace-a");
+
+		expect(abandon.mock.calls.map(([, sessionHandle]) => sessionHandle).sort()).toEqual([
+			"local-a",
+			"local-b",
+		]);
+		expect(abandon).not.toHaveBeenCalledWith("workspace-a", recovered.sessionHandle, expect.anything());
+		expect(releaseSession).toHaveBeenCalledWith(recovered.sessionHandle);
+		expect(unsubscribeSession).toHaveBeenCalledWith(recovered.sessionHandle);
 	});
 
 	it("preserves a hidden local draft when removing its Workspace preference fails", async () => {
@@ -544,6 +678,7 @@ describe("transient Session navigation", () => {
 			],
 			currentWorkspaceHandle: "workspace-a",
 			currentSession: transient,
+			locallyCreatedTransientSessions: { [transient.sessionHandle]: true },
 			sessionsByWorkspace: { "workspace-a": [], "workspace-b": [] },
 			selectedSessionByWorkspace: { "workspace-a": transient.sessionHandle },
 		});
@@ -583,6 +718,7 @@ describe("transient Session navigation", () => {
 			currentWorkspaceHandle: "workspace-a",
 			currentSession: transient,
 			sessionsByWorkspace: { "workspace-a": [target] },
+			locallyCreatedTransientSessions: { [transient.sessionHandle]: true },
 			selectedSessionByWorkspace: { "workspace-a": transient.sessionHandle },
 		});
 		useComposerStore.getState().beginSession(transient.sessionHandle);

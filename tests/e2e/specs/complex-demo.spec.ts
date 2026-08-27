@@ -75,15 +75,24 @@ test("settled complex turn renders rich content and restores tool context", asyn
 	expect(backToLatestBox).not.toBeNull();
 	expect(backToLatestBox?.width ?? 0).toBeGreaterThanOrEqual(40);
 	expect(backToLatestBox?.height ?? 0).toBeGreaterThanOrEqual(40);
+	const originalSession = page.locator("[data-session-row]").filter({ hasText: COMPLEX_PROMPT });
+	await expect(originalSession).toHaveCount(1);
+	await expect(originalSession).toHaveAttribute("data-current", "true");
 	await page
 		.locator("nav")
 		.getByRole("button", { name: /^(New session|新建会话)$/ })
 		.first()
 		.click();
-	await expect(page.locator("[data-session-row]")).toHaveCount(1);
-	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(0);
-	const originalSession = page.locator("[data-session-row]").filter({ hasText: COMPLEX_PROMPT });
+	await expect(page.locator("[data-session-row]")).toHaveCount(2);
+	const freshCurrent = page.locator('[data-session-row][data-current="true"]');
+	await expect(freshCurrent).toHaveCount(1);
+	await expect(originalSession).toHaveAttribute("data-current", "false");
+	await expect(freshCurrent).not.toContainText(COMPLEX_PROMPT);
+	await expect(
+		page.locator("header").getByRole("button", { name: /^(Empty session|空会话)$/ }),
+	).toBeVisible();
 	await originalSession.getByRole("button").first().click();
+	await expect(originalSession).toHaveAttribute("data-current", "true");
 	await expect(page.getByRole("heading", { name: "Synthetic change review", level: 2 })).toBeVisible();
 	await expect
 		.poll(async () => {

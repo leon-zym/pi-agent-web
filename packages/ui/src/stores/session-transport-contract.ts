@@ -2,6 +2,7 @@ import type {
 	ExtensionUiRequestDto,
 	ExtensionUiResponseDto,
 	GatewayProtocolVersionDto,
+	HotRuntimeInventoryDto,
 	SessionCommandDto,
 	SessionCommandResponseDto,
 	SessionReplayFrameDto,
@@ -127,6 +128,8 @@ export interface SessionTransportOptions {
 
 export interface SessionTransportState {
 	connectionState: SessionTransportConnectionState;
+	/** Latest authoritative full replacement for the negotiated Gateway epoch. */
+	hotRuntimeInventory: HotRuntimeInventoryDto | null;
 	sessions: Record<string, SessionChannelState>;
 	connect: () => void;
 	disconnect: () => void;
@@ -145,6 +148,11 @@ export interface SessionTransportState {
 	manualRetryResync: (sessionHandle: string) => boolean;
 }
 
+export interface HotRuntimeInventoryToken {
+	serverEpoch: string;
+	revision: number;
+}
+
 export interface SessionTransportController {
 	store: StoreApi<SessionTransportState>;
 	frameBus: OrderedSessionFrameBus;
@@ -157,5 +165,7 @@ export interface SessionTransportController {
 	isSnapshotSuffixProjectionPending: (sessionHandle: string, generation: number) => boolean;
 	/** Fail closed and request a cursorless baseline after deferred projection work throws. */
 	reportProjectionFailure: (sessionHandle: string, generation: number, error?: unknown) => boolean;
+	/** Resolve after the current connection has received its ordered initial hot inventory. */
+	waitForInitialHotInventory: () => Promise<HotRuntimeInventoryToken>;
 	dispose: () => void;
 }

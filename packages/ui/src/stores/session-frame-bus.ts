@@ -106,7 +106,7 @@ export class OrderedSessionFrameBus {
 
 export type GlobalSessionTransportMessage = Extract<
 	SessionWsServerMessage,
-	{ type: "session_directory_changed" } | { type: "auth_changed" }
+	{ type: "session_directory_changed" } | { type: "auth_changed" } | { type: "hot_runtime_inventory" }
 >;
 
 export class SessionTransportGlobalBus {

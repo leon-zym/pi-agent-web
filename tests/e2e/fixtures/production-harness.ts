@@ -22,6 +22,7 @@ export interface HarnessSession {
 	workspaceHandle: string;
 	nativeSessionId: string;
 	sessionFile: string | null;
+	persisted: boolean;
 	firstMessage: string;
 	messageCount: number;
 }

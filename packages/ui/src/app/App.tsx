@@ -7,10 +7,12 @@ import { ExtensionDialogs, OnboardingWizard, SettingsDialog } from "../features/
 import { api } from "../lib/api";
 import { displayError } from "../lib/format";
 import { tt } from "../lib/i18n";
-import { newSession } from "../lib/session-controller";
+import { loadDirectoryAfterStableHotInventory } from "../lib/initial-inventory-bootstrap";
+import { ensureInitialSession } from "../lib/session-controller";
 import { initPipeline } from "../lib/stream-pipeline";
 import { useTheme } from "../lib/use-theme";
 import { useSessionDirectoryStore } from "../stores/session-directory";
+import { sessionTransport } from "../stores/session-transport";
 import { AppShell } from "./AppShell";
 
 function AppBootstrapSkeleton() {
@@ -56,13 +58,18 @@ export function App() {
 			.then(async () => {
 				if (cancelled) return;
 				initPipeline();
-				await useSessionDirectoryStore.getState().loadWorkspaces();
-				if (cancelled) return;
+				const ready = await loadDirectoryAfterStableHotInventory({
+					waitForInitialHotInventory: sessionTransport.waitForInitialHotInventory,
+					loadWorkspaces: () => useSessionDirectoryStore.getState().loadWorkspaces(),
+					readTransportState: () => sessionTransport.store.getState(),
+					isCancelled: () => cancelled,
+				});
+				if (!ready) return;
 				const directory = useSessionDirectoryStore.getState();
 				const workspace = directory.workspaces.find(
 					(candidate) => candidate.workspaceHandle === directory.currentWorkspaceHandle,
 				);
-				if (workspace?.available) void newSession();
+				if (workspace?.available) void ensureInitialSession();
 				setBootstrapped(true);
 			})
 			.catch((error) => {

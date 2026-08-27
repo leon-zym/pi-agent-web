@@ -23,7 +23,14 @@ const markerPath = process.env.PI_WEB_E2E_MARKER;
 const controlDir = process.env.PI_WEB_E2E_CONTROL_DIR;
 const slowDelayMs = positiveNumber(process.env.PI_WEB_E2E_SLOW_DELAY_MS, 5_000);
 const existingStateDelayMs = positiveNumber(process.env.PI_WEB_E2E_EXISTING_STATE_DELAY_MS, 0);
-const deferNewSessionFile = process.env.PI_WEB_E2E_DEFER_NEW_SESSION_FILE === "1" && !requestedFile;
+const deferNewSessionFileAfterStarts = positiveNumber(
+	process.env.PI_WEB_E2E_DEFER_NEW_SESSION_FILE_AFTER_STARTS,
+	Number.POSITIVE_INFINITY,
+);
+const deferNewSessionFile =
+	!requestedFile &&
+	(process.env.PI_WEB_E2E_DEFER_NEW_SESSION_FILE === "1" ||
+		countRecordedStarts(markerPath) >= deferNewSessionFileAfterStarts);
 const recoveryFeatures = process.env.PI_WEB_E2E_RECOVERY_FEATURES === "1";
 let delayedExistingState = false;
 
@@ -54,6 +61,9 @@ const models = recoveryFeatures
 let currentModel = models[0];
 let thinkingLevel = recoveryFeatures ? "medium" : "off";
 record("started", { pid: process.pid, sessionId, sessionFile, cwd: process.cwd() });
+if (deferNewSessionFile && process.env.PI_WEB_E2E_AUTOSTART_UNPERSISTED_HOT === "1") {
+	setTimeout(() => startUnpersistedHotRuntime(), 25);
+}
 
 process.on("SIGTERM", () => {
 	record("terminated", { pid: process.pid, sessionId });
@@ -75,6 +85,20 @@ process.stdin.on("data", (chunk) => {
 function positiveNumber(value, fallback) {
 	const parsed = Number(value);
 	return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function countRecordedStarts(file) {
+	if (!file || !fs.existsSync(file)) return 0;
+	let count = 0;
+	for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+		if (!line) continue;
+		try {
+			if (JSON.parse(line)?.type === "started") count += 1;
+		} catch {
+			// Another fixture process may still be appending the final marker line.
+		}
+	}
+	return count;
 }
 
 function ensureSessionFile() {
@@ -790,6 +814,33 @@ function streamStressPrompt(command, text, user, userEntryId) {
 			activeRun = null;
 		});
 	});
+}
+
+function startUnpersistedHotRuntime() {
+	if (activeRun) return;
+	const run = {
+		kind: "unpersisted-hot",
+		label: "unpersisted-hot",
+		timers: [],
+		assembled: "",
+	};
+	activeRun = run;
+	send({ type: "agent_start" });
+	send({ type: "turn_start" });
+	const pending = assistantMessageWithContent([], "pending");
+	send({ type: "message_start", message: pending });
+	const partialText = `E2E_UNPERSISTED_PARTIAL:${sessionId}`;
+	send({
+		type: "message_update",
+		usage: pending.usage,
+		assistantMessageEvent: { type: "text_start", contentIndex: 0 },
+	});
+	send({
+		type: "message_update",
+		usage: pending.usage,
+		assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: partialText },
+	});
+	record("unpersisted_hot_checkpoint", { text: sessionId, partialText });
 }
 
 function streamExtensionPrompt(command, text, user, userEntryId) {

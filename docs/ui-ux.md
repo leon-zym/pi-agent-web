@@ -10,8 +10,26 @@ selected Session 只是显示指针，不能被误写成 Gateway 或 Pi 的唯�
 - **Workspace 来源与管理**：Workspace 来源于 Pi 历史记录的 Header `cwd`，也可以由用户 Pin 本地目录创建。添加操作调用 Gateway 所在系统的原生目录选择器，不要求用户手输绝对路径。
 - **偏好隔离**：移除 Workspace 只移除展示/发现偏好，绝不删除 Native history。项目级自定义 `sessionDir` 可能因此暂时不再出现在目录中；重新添加同一路径立即恢复发现，确认文案必须清晰说明。
 - **后台多会话并发感知**：Session 行的运行状态严格独立于选中状态。在会话 A 正在执行流式生成或工具调用时切换到会话 B，A 继续在后台运行并在 Sidebar 实时更新其状态指示（`running` / `waiting_ui`）；切回 A 立即呈现已有最新投影，不向 Pi 发送冗余的 `switch_session`。
-- **启动与新建会话**：启动时根据 Web 的 `lastOpenedAt` 选择默认 Workspace，并自动进入一个新的空 Session，绝不自动打开历史第一项。展开/收起 Workspace 树只加载或折叠目录，不改变当前选中的 Workspace/Session、订阅通道或 Lease。
-- **未落盘瞬态防污染**：新建且尚无对话的 Session 只存在于当前 Header/Composer 表面，不进入 Sidebar 列表，不计入 Workspace 历史数量。只有当 Pi 成功落盘包含首条 User 消息的 JSONL 后，才由 Catalog Refresh 一次性发布列表项与标题；未交互即离开的 Transient Session 自动执行 Abandon，不在文件系统留下垃圾。
+- **Startup reconciliation before creation**: After hello, the Browser waits for the authoritative
+  initial hot Runtime inventory, then loads the REST directory under the same connection epoch. It
+  resumes an eligible hot transient for the default Workspace before creating a fresh empty Session,
+  and it never opens the first dormant history row automatically. An inventory-only row has unknown
+  persistence until the native catalog contains it or a full-identity Runtime baseline resolves it.
+  Automatic creation waits for that result. A matching degraded, manual-only recovery leaves the
+  Workspace empty instead of creating another Session, while the user can still choose New Session.
+  Automatic and explicit creation share one in-flight request per Workspace. Inventory revisions may
+  continue changing during the REST load without trapping the page in its bootstrap skeleton. A new
+  epoch restarts reconciliation.
+- **Durable history plus hot overlay**: The Sidebar merges native catalog rows with every current hot
+  Runtime by Session handle. Persisted entries are deduplicated, while multiple unpersisted hot-only
+  Sessions remain visible across reload. The overlay is process state, not history. A local empty
+  Session enters durable history only after Pi materializes and the catalog publishes its JSONL.
+  Removing an overlay must not activate a dormant row.
+- **Workspace counts**: Once a Workspace catalog is loaded, its badge shows the deduplicated merged
+  row count. Before that catalog is loaded, the badge preserves the known durable count and adds only
+  hot rows known to be unpersisted, because a persisted hot row may already be included in the REST
+  total. Catalog absence is not evidence that a hot row is unpersisted. Runtime persistence counts
+  only when its epoch, Workspace, handle, and generation match the current inventory identity.
 - **多感官与后台 Tab 感知**：
   - **轻柔提示音**：任务执行完成或触发 Extension UI 等待确认时，通过 Web Audio API 播放 120ms 正弦升调提示音（440Hz $\to$ 880Hz），可在偏好设置中一键静音；
   - **动态标题与 Favicon 徽标**：页面处于后台标签页时，根据 Session 状态动态更新 `document.title`（如 `[运行中] Pi Agent Web`、`[待确认] Pi Agent Web`）并在 Favicon 绘制状态红点/蓝点。
@@ -26,10 +44,26 @@ selected Session 只是显示指针，不能被误写成 Gateway 或 Pi 的唯�
 - **权威 Baseline 门禁**：订阅、rekey、reload 或 resync 期间，在原子 `session_snapshot` 与连续 suffix 完成前保持陈旧内容可辨识但不可修改。Composer、Abort、Fork、设置变更与 Extension UI 响应全部禁用；只读检查仍可使用。普通命令响应也必须等投影越过 `barrierSeq` 才显示完成。
 - **有界恢复状态**：自动 resync 只进行有限次数，使用退避与 jitter，不递归触发连接或错误 Toast。恢复期间显示稳定的同步提示；预算耗尽后停在 degraded 状态，保留陈旧内容并提供单一“重试同步”操作。Manual retry 从 cursorless baseline 重新开始，不能绕过 Mutation 门禁。
 - **Hard reload 边界**：页面能从一个权威 snapshot 恢复本地已知并重新打开的 Session，包括流式文本、Thinking、运行中工具 partial result、Queue 与阻塞对话框。新连接发现 Gateway 持有的全部后台 hot Runtime 属于 hot-runtime inventory reconciliation，不从 selected pointer 或 dormant 历史列表推断。
-- **WebSocket 订阅 LRU admission target（带 Running 活性守卫）**：
-  - `MAX_ACTIVE_SUBSCRIPTIONS = 6` 是 idle/persisted 订阅的软 admission target，不是所有状态下的硬上限；
-  - **前置活性守卫**：达到目标后，仅允许淘汰 `state === "idle"` 或 `"dormant"`、已持久化且没有待处理 Extension 请求的会话。处于 `running`、`waiting_ui`、`starting`、`unpersisted` 的会话必须常驻订阅，受保护会话可能使活跃数暂时超过目标，确保后台任务流、音频提示与审批弹窗持续生效。
-- **瞬态收敛 (Transient Abandon)**：离开未落盘、idle、无草稿/Command Tag/附件及处理、queue、对话或 Extension UI 的 Session 时，使用 exact generation + fencing token 请求 Transient Abandon，Gateway 仅停止并清理内存 Runtime，绝不误删文件。
+- **Hot Runtime reconciliation**: Every inventory entry becomes a desired background observer under
+  its full epoch, Workspace, handle, and generation identity. Fresh exact baselines are recovered
+  one at a time. The selected Session requests a claim only after its snapshot and suffix are
+  authoritative and a fresh matching lease snapshot has arrived. Background observers continue
+  projecting without acquiring controller capability.
+- **Stable degraded recovery**: If one full identity exhausts bounded resync attempts, it stays
+  degraded and manual-only across reconnects. It neither occupies the global exact recovery slot nor
+  blocks other hot Sessions. Manual retry starts a cursorless attempt. A changed epoch, handle, or
+  generation is a new identity and may reconcile normally.
+- **WebSocket subscription admission with a hot Runtime guard**:
+  - `MAX_ACTIVE_SUBSCRIPTIONS = 6` is a soft target for ordinary idle, persisted subscriptions, not a hard connection limit.
+  - Every authoritative inventory member remains an observer, including a persisted idle Runtime, so the hot set may exceed the target.
+  - A non-inventory Session is eligible for LRU eviction only when it is idle or dormant, persisted, and has no pending Extension request.
+- **Transient abandon**: Only an unpersisted Session created by the current Browser has abandon
+  provenance. After leaving it, the Browser may request transient abandon only when exact baseline,
+  fresh lease, controller, idle, and untouched checks all pass. A recovered hot-only Session can be
+  released but is never inferred safe to abandon. The Gateway does not delete a file on this path.
+- **Inventory removal and rekey**: A full replacement that removes a hot identity releases its
+  observer surface without selecting historical content. Rekey follows the authoritative child
+  identity; the parent remains an independently reopenable dormant Session when its JSONL exists.
 - **崩溃结算与状态隔离**：进程 Crash 时先将当前 Step/Turn 结算为可见错误，再释放资源；Draft、附件、模型配置、命令目录、Token 用量与 Extension UI 完全按 `sessionHandle` 隔离。
 
 ---
@@ -159,7 +193,11 @@ Composer Visual Seat 固定于 Center 底部，同一 DOM 延续焦点，数据�
 - **结构化单选与问答卡片 (QuestionCard)**：
   - 严格遵循 Pi Extension UI 的 `{ value: string }` / `{ confirmed: boolean }` 响应规范；
   - 支持键盘 `1~9` 数字键直选、推荐项（Recommended）默认高亮以及 Write-in 自定义文本输入。
-- **状态与挂件**：`setStatus` 聚合在 Composer 附近，`setWidget` 放置在明确的 Before/After 区，`setTitle` 同步更新 Tab Title，`notify` 只 Toast 一次。
+- **Status, widgets, title, and notifications**: `setStatus` appears near the Composer, `setWidget`
+  uses an explicit Before or After region, and `setTitle` updates the tab title. `notify` produces one
+  Toast. A fresh notification journaled during exact hot catch-up is shown once under bounded full
+  identity dedupe even when its seq is at or below snapshot `asOfSeq`; it never changes the
+  conversation projection waterline.
 
 ---
 

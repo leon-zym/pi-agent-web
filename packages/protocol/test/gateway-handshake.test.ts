@@ -1,12 +1,23 @@
 import { describe, expect, it } from "vitest";
 import {
+	GATEWAY_CLIENT_REQUIRED_CAPABILITIES,
+	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 	GATEWAY_PROTOCOL_VERSION,
+	GATEWAY_REQUIRED_CAPABILITIES,
+	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
 	isGatewayClientHello,
 	isGatewayProtocolError,
 	isGatewayServerHello,
 } from "../src/gateway-handshake.js";
 
 describe("Gateway hello DTOs", () => {
+	it("negotiates hot-runtime inventory as a required protocol 1.1 capability", () => {
+		expect(GATEWAY_PROTOCOL_VERSION).toEqual({ major: 1, minor: 1 });
+		expect(GATEWAY_CLIENT_REQUIRED_CAPABILITIES).not.toContain(GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY);
+		expect(GATEWAY_SERVER_REQUIRED_CAPABILITIES).toContain(GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY);
+		expect(GATEWAY_REQUIRED_CAPABILITIES).toEqual(GATEWAY_CLIENT_REQUIRED_CAPABILITIES);
+	});
+
 	it("accepts a bounded versioned client hello", () => {
 		expect(
 			isGatewayClientHello({
@@ -15,6 +26,15 @@ describe("Gateway hello DTOs", () => {
 				clientBuild: "0.1.0",
 				capabilities: ["session-multiplex-v1"],
 				limits: { maxServerFrameBytes: 32 * 1024 * 1024 },
+			}),
+		).toBe(true);
+		expect(
+			isGatewayClientHello({
+				type: "client_hello",
+				protocol: { major: 1, minor: 0 },
+				clientBuild: "0.1.0",
+				capabilities: [...GATEWAY_CLIENT_REQUIRED_CAPABILITIES],
+				limits: { maxServerFrameBytes: 1024 },
 			}),
 		).toBe(true);
 	});

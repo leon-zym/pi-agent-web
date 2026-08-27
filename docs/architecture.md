@@ -14,9 +14,11 @@
    `barrierSeq`。
 6. **本机同源控制面**：只监听 loopback；Cookie、Host、Origin/Fetch Metadata 共同阻止
    任意网页驱动本机 Agent。它不是远程账户或多用户安全边界。
-7. **客户端订阅 LRU admission target（带 Running 活性守卫）**：单连接 idle/persisted 订阅的软目标为 6；
-   **严格仅允许淘汰 `state === 'idle' || state === 'dormant'` 且已持久化、无待处理 Extension 请求的会话**；
-   处于 `running`、`waiting_ui`、`starting`、`unpersisted` 的会话常驻订阅，受保护会话可能使活跃数暂时超过目标。
+7. **Client subscription LRU with a hot Runtime guard**: Six is the soft admission target for
+   ordinary idle, persisted subscriptions. Every Runtime in the authoritative hot inventory keeps
+   an observer subscription regardless of phase or persistence, so the hot set may exceed the
+   target. A non-inventory Session is eligible for LRU eviction only when it is idle or dormant,
+   persisted, and has no pending Extension request.
 8. **悬挂工具状态只在权威边界收敛**：进程崩溃、用户 Abort 或已结算 Turn 中未收到结果的工具调用
    收敛为 `interrupted`。短暂断线或 resync 不提前中断工具；权威快照继续保留 running 与 partial result。
 9. **乐观 User 消息以 ContentShape 对齐**：前端提交即刻乐观挂载；权威 `message_start` 到达时按
@@ -30,7 +32,7 @@
 
 ```text
 Browser · React SPA
-  ├─ Native directory + selected view pointer
+  ├─ Native directory + ephemeral hot overlay + selected view pointer
   ├─ one SessionTransport WebSocket
   │    └─ N isolated channels {runtime, lease, cursor, replay/resync}
   └─ per-Session projection/composer/model/stats/extension stores
@@ -178,6 +180,70 @@ Snapshot 有 item、byte 与 depth 上限。无法生成合法 snapshot 的 Runt
 response 都 fail closed。已知 Session 的 hard reload 使用同一 snapshot 路径；新 Browser 连接发现并
 恢复所有 hot Runtime 的 inventory 属于独立的 hot-runtime reconciliation 契约。
 
+## Authoritative hot Runtime inventory and Browser reconciliation
+
+The decision rationale is recorded in
+[ADR 0009](decisions/0009-authoritative-hot-runtime-inventory-and-browser-reconciliation.md).
+
+`SessionSupervisor` is the sole authority for which Sessions currently own a live Pi process. It
+publishes a bounded, full-replacement inventory:
+
+```text
+{type: hot_runtime_inventory, serverEpoch, revision, runtimes[]}
+```
+
+Each entry contains the exact `{serverEpoch, workspaceId, sessionHandle, generation}` identity and
+one live phase: `starting`, `idle`, `running`, or `waiting_ui`. The revision increases monotonically
+within one Gateway epoch whenever the set, identity, or phase changes. The inventory excludes
+crashed and dormant Sessions. It is ephemeral process ownership, not durable history, and it never
+replaces Pi JSONL or the native catalog.
+
+The negotiated `session.hot_runtime_inventory` capability is required by the Browser. After a
+successful hello, the Bridge sends the current full inventory before the Browser starts Session
+reconciliation. Later revisions are broadcast as full replacements. The Supervisor computes each
+revision under its pool serialization boundary, while the Bridge retains only the latest deferred
+revision when a catch-up contains a pending rekey ordering fence.
+
+An inventory entry is observed with `session_subscribe.expectedHotRuntime`. This is an exact,
+only-if-hot subscription. The Gateway compares the complete identity, captures the live process
+incarnation, builds the replay or snapshot baseline, and revalidates that observation immediately
+before making it visible. A mismatch returns an explicit subscribe error and never activates a
+dormant Session. Exact catch-up is transactional: failure preserves any previous live subscription,
+catch-up, and lease; success installs one authoritative baseline followed by its contiguous suffix.
+A duplicate exact request for an identity already live on that connection is a no-op.
+
+Browser startup waits for the initial inventory before loading and reconciling the REST directory or
+creating a Session. The REST load is fenced to the same online connection epoch, but inventory
+revision changes within that epoch do not restart bootstrap. The newest same-epoch full replacement
+is applied independently. The Browser then treats every inventory entry as a desired background
+observer, recovers exact baselines one at a time, and pins those channels above the ordinary LRU
+target. The selected Session requests controller ownership only after an authoritative baseline and
+a fresh matching lease snapshot exist.
+
+Persistence reconciliation has three states: persisted, unpersisted, and unknown. A matching native
+catalog row proves persistence. Its absence does not prove that a Session is unpersisted because the
+directory may filter a materialized empty Session. Runtime evidence is accepted only when
+`{serverEpoch, workspaceId, sessionHandle, generation}` matches the current inventory entry. A new
+incarnation invalidates earlier persistence evidence and returns the overlay row to unknown.
+
+Automatic initial creation waits while a relevant hot Runtime remains unknown. If exact recovery for
+that identity becomes degraded and manual-only, the Browser stops waiting without creating a Session;
+the user may still choose New Session explicitly. Automatic startup and explicit New Session calls
+share one in-flight create operation per Workspace within one Browser. The Gateway Workspace
+reservation remains the file-identity serialization boundary across requests.
+
+The directory merges durable native rows with the ephemeral hot overlay by Session handle. This
+allows multiple unpersisted hot Runtimes to remain visible across reload while preventing duplicate
+rows for persisted Sessions. A full inventory removal removes the overlay and ends desired hot
+observation. It does not select or activate a historical Session. Rekey changes the desired exact
+identity without turning the parent into an alias for dormant activation.
+
+Transient cleanup is provenance-sensitive. Only an unpersisted Session created by this Browser may
+use the fenced abandon path after it is authoritative, controlled, idle, and untouched. A recovered
+hot-only Session can be released or observed, but the Browser cannot infer that it is safe to
+abandon. Dormant history remains an on-demand native catalog concern and is intentionally absent
+from hot reconciliation.
+
 当 Runtime hot、idle 且没有 agent、compaction、awaiting-start、queue、in-flight command、dialog 或
 transition 时，可以用 compare-and-swap 压缩 live suffix：先记录 projection-owned incarnation 与
 `expectedAsOfSeq`，异步读取新的 settled base，提交时再次确认仍为 idle 且 waterline 未变化。成功后
@@ -199,9 +265,9 @@ resync，也不能推进 snapshot waterline。fork/clone 的 `previousSessionHan
 
 | 层 | 所有权 |
 |---|---|
-| `session-transport` | 单 socket、连接状态，以及每 Session runtime/cursor/lease/resync/raw-event 有界窗口；以 6 个活跃订阅为软 admission target，保护运行中 Session，并管理 LRU 淘汰 |
+| `session-transport` | One socket, hello and inventory reconciliation, bounded per-Session runtime/cursor/lease/resync/raw-event windows, serialized exact hot recovery, and ordinary subscription LRU admission |
 | `session-frame-bus` | 按 Session 保序分发；组件不直接订阅 WebSocket |
-| `session-directory` | 原生 Workspace/Session 摘要、selected pointer、请求 generation |
+| `session-directory` | Native Workspace and Session summaries, full-replacement hot overlay, transient provenance, selected pointer, and request generation |
 | `projection` | 按 Session 的 turn/step/block 投影；处理 ContentShape 乐观回填与悬挂工具 interrupted 收敛 |
 | `composer` | 按 Session 的 draft、原子 Slash Command Token、附件、提交状态、70vh 模式、delivery mode 与 queue 意图；管理 prompt 历史 |
 | `model` / `slash` / `stats` | 按 Session 的 Host 快照与刷新状态，动态 thinking levels 分段映射 |
@@ -210,10 +276,10 @@ resync，也不能推进 snapshot waterline。fork/clone 的 `previousSessionHan
 
 ### 客户端生命周期四大不变量
 
-1. **WebSocket 活跃订阅 admission target（带 Running 活性守卫）**：
-   - `MAX_ACTIVE_SUBSCRIPTIONS = 6` 是单连接 idle/persisted 订阅的软目标，不是所有状态下的硬上限；
-   - **严格活性守卫**：达到目标后，只有 `state === 'idle'` 或 `dormant`、已落盘持久化且没有待处理 Extension 请求的会话才允许由 LRU 策略退订；
-   - `running`、`waiting_ui`、`starting` 或 `unpersisted` 会话受保护，因此受保护会话可能使活跃数暂时超过目标。
+1. **WebSocket subscription admission with a hot Runtime guard**:
+   - `MAX_ACTIVE_SUBSCRIPTIONS = 6` is a soft target for ordinary idle, persisted subscriptions, not a hard connection limit.
+   - Every Session in hot inventory keeps an observer subscription, including a persisted idle Runtime. These channels do not participate in LRU eviction, so inventory membership may exceed the target.
+   - A non-inventory Session is eligible for LRU unsubscribe only when it is idle or dormant, persisted, and has no pending Extension request.
 2. **悬挂工具状态收敛为 `interrupted`**：
    - 当 dormant settled history 加载、当前 Turn 权威结算、进程 Crash 或用户触发 Abort 时，若仍有尚未收到结果的工具调用，视图层将其状态置为 `interrupted`；
    - reload、短暂断线或 resync 本身不是结算边界，live snapshot 中的 running tool 与 partial result 保持不变；

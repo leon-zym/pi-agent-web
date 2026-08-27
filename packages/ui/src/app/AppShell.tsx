@@ -10,7 +10,7 @@ import { WorkspaceSidebar } from "../features/sidebar/WorkspaceSidebar";
 import { tt } from "../lib/i18n";
 import { newSession, openSession } from "../lib/session-controller";
 import { cn } from "../lib/utils";
-import { useSessionDirectoryStore } from "../stores/session-directory";
+import { selectVisibleSessionsByWorkspace, useSessionDirectoryStore } from "../stores/session-directory";
 import { useViewStore } from "../stores/view";
 
 const SIDEBAR_MIN = 264;
@@ -67,7 +67,7 @@ export function AppShell() {
 	const workspaces = useSessionDirectoryStore((s) => s.workspaces);
 	const currentWorkspaceHandle = useSessionDirectoryStore((s) => s.currentWorkspaceHandle);
 	const currentSession = useSessionDirectoryStore((s) => s.currentSession);
-	const sessionsByWorkspace = useSessionDirectoryStore((s) => s.sessionsByWorkspace);
+	const sessionsByWorkspace = useSessionDirectoryStore(selectVisibleSessionsByWorkspace);
 
 	const detailsOpen = useViewStore((state) => state.rightPanelOpen);
 	const setDetailsOpen = useViewStore((state) => state.setRightPanelOpen);

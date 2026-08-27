@@ -4,6 +4,7 @@ import path from "node:path";
 import type {
 	ExtensionUiRequestDto,
 	ExtensionUiResponseDto,
+	HotRuntimeInventoryEntryDto,
 	ProductSessionEventDto,
 	SessionCommandDto,
 	SessionCommandResponseDto,
@@ -92,6 +93,11 @@ export interface SessionIdentityTransitionCommit {
 	commitStaged: () => SessionSupervisorMessage[];
 }
 
+export interface SessionHotRuntimeObservation {
+	entry: HotRuntimeInventoryEntryDto;
+	processToken: number;
+}
+
 export interface SessionRuntimeOptions {
 	serverEpoch: string;
 	target: SessionTarget;
@@ -108,6 +114,7 @@ export interface SessionRuntimeOptions {
 	initialGeneration?: number;
 	commandTimeoutFor?: (commandType: string) => number;
 	emit: (message: SessionSupervisorMessage) => void;
+	onHotSetChanged?: (runtime: SessionRuntime) => void;
 	onCrash: (runtime: SessionRuntime) => void;
 	commitIdentityTransition: (
 		runtime: SessionRuntime,
@@ -223,6 +230,49 @@ export class SessionRuntime {
 
 	get running(): boolean {
 		return this.stopPromise !== null || this.proc?.running === true;
+	}
+
+	/** Capture exact live Pi ownership without treating stop cleanup as hot. */
+	captureHotRuntimeObservation(): SessionHotRuntimeObservation | null {
+		if (
+			this.manuallyStopped ||
+			this.stopPromise !== null ||
+			this.proc?.running !== true ||
+			this.state === "crashed" ||
+			this.state === "dormant"
+		) {
+			return null;
+		}
+		if (
+			this.state !== "starting" &&
+			this.state !== "idle" &&
+			this.state !== "running" &&
+			this.state !== "waiting_ui"
+		) {
+			return null;
+		}
+		return {
+			entry: {
+				serverEpoch: this.opts.serverEpoch,
+				sessionHandle: this.sessionHandle,
+				workspaceId: this.workspaceId,
+				generation: this.generation,
+				state: this.state,
+			},
+			processToken: this.processToken,
+		};
+	}
+
+	isHotRuntimeObservationCurrent(observation: SessionHotRuntimeObservation): boolean {
+		const current = this.captureHotRuntimeObservation();
+		return (
+			current !== null &&
+			current.processToken === observation.processToken &&
+			current.entry.serverEpoch === observation.entry.serverEpoch &&
+			current.entry.sessionHandle === observation.entry.sessionHandle &&
+			current.entry.workspaceId === observation.entry.workspaceId &&
+			current.entry.generation === observation.entry.generation
+		);
 	}
 
 	get transitioning(): boolean {
@@ -372,7 +422,9 @@ export class SessionRuntime {
 		this.proc = proc;
 
 		try {
-			await proc.start();
+			const ready = proc.start();
+			this.opts.onHotSetChanged?.(this);
+			await ready;
 			await this.initializeProjectionBase(processToken, proc);
 			this.deferredStartupEmits = [];
 			this.setState(this.pendingDialogs.size > 0 ? "waiting_ui" : "idle");
@@ -845,6 +897,7 @@ export class SessionRuntime {
 		const proc = this.proc;
 		const starting = this.startPromise;
 		this.proc = null;
+		this.opts.onHotSetChanged?.(this);
 		this.clearOwnedOperationalState(!this.snapshotOverflow);
 		let stopping!: Promise<void>;
 		stopping = (async () => {
@@ -1159,6 +1212,7 @@ export class SessionRuntime {
 		if (processToken !== this.processToken || this.failedProcessToken === processToken) return;
 		this.failedProcessToken = processToken;
 		this.proc = null;
+		this.opts.onHotSetChanged?.(this);
 		this.finishProcessFinalization();
 		this.clearOwnedOperationalState(!this.snapshotOverflow);
 		this.terminalProtocolIncompatible = info.reason === "protocol_incompatible";
@@ -1221,6 +1275,7 @@ export class SessionRuntime {
 	private setState(state: SessionRuntimeSnapshot["state"]): void {
 		if (this.state === state && state !== "starting") return;
 		this.state = state;
+		this.opts.onHotSetChanged?.(this);
 		this.liveProjection?.setRuntimePhase(this.projectionIdentity(), state);
 		this.touch();
 		if (!this.startupReady && state !== "starting" && state !== "crashed" && state !== "dormant") return;
@@ -1419,6 +1474,7 @@ export class SessionRuntime {
 		const proc = this.proc;
 		const starting = this.startPromise;
 		this.proc = null;
+		this.opts.onHotSetChanged?.(this);
 		this.clearOwnedOperationalState(false);
 		this.startupReady = false;
 		this.state = "crashed";

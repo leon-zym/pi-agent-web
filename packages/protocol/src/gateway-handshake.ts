@@ -1,13 +1,23 @@
-export const GATEWAY_PROTOCOL_VERSION = { major: 1, minor: 0 } as const;
+export const GATEWAY_PROTOCOL_VERSION = { major: 1, minor: 1 } as const;
 export const MAX_GATEWAY_HELLO_CAPABILITIES = 64;
 export const MAX_GATEWAY_HELLO_CAPABILITY_LENGTH = 128;
 export const MIN_GATEWAY_SERVER_FRAME_BYTES = 1024;
-export const GATEWAY_REQUIRED_CAPABILITIES = [
+export const GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY = "session.hot_runtime_inventory";
+const GATEWAY_BASE_CAPABILITIES = [
 	"rpc.commands",
 	"rpc.events",
 	"rpc.extension_ui",
 	"session.multiplex",
 ] as const;
+/** Capabilities a Gateway requires before accepting a client connection. */
+export const GATEWAY_CLIENT_REQUIRED_CAPABILITIES = [...GATEWAY_BASE_CAPABILITIES] as const;
+/** Capabilities the current Browser requires the negotiated Gateway to provide. */
+export const GATEWAY_SERVER_REQUIRED_CAPABILITIES = [
+	...GATEWAY_BASE_CAPABILITIES,
+	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+] as const;
+/** @deprecated Use the directional required-capability sets. */
+export const GATEWAY_REQUIRED_CAPABILITIES = GATEWAY_CLIENT_REQUIRED_CAPABILITIES;
 
 export interface GatewayProtocolVersionDto {
 	major: number;

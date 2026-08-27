@@ -38,13 +38,25 @@ class FakeSocket implements SessionWebSocket {
 			serverEpoch: SERVER_EPOCH,
 			piVersion: "test",
 			adapterId: "test",
-			capabilities: ["rpc.commands", "rpc.events", "rpc.extension_ui", "session.multiplex"],
+			capabilities: [
+				"rpc.commands",
+				"rpc.events",
+				"rpc.extension_ui",
+				"session.multiplex",
+				"session.hot_runtime_inventory",
+			],
 			limits: {
 				maxClientFrameBytes: 8 * 1024 * 1024,
 				maxSnapshotFrameBytes: 32 * 1024 * 1024,
 				maxExtensionRequests: 256,
 			},
 		} satisfies GatewayServerHelloDto);
+		this.receive({
+			type: "hot_runtime_inventory",
+			serverEpoch: SERVER_EPOCH,
+			revision: 0,
+			runtimes: [],
+		});
 	}
 
 	receive(message: object): void {

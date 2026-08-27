@@ -6,6 +6,7 @@ import { useProjectionStore } from "../stores/projection";
 import {
 	isSessionBeingAbandoned,
 	reconcileHiddenSessionLifecycle,
+	resolveHotSessionPersistence,
 	useSessionDirectoryStore,
 } from "../stores/session-directory";
 import { sessionTransport } from "../stores/session-transport";
@@ -32,6 +33,87 @@ function currentSession(): NativeSessionDto {
 
 function currentSessionHandle(): string {
 	return currentSession().sessionHandle;
+}
+
+const initialSessionByWorkspace = new Map<string, Promise<void>>();
+
+interface SessionCreationFlight {
+	promise: Promise<void>;
+	creationToken: number | null;
+}
+
+const sessionCreationByWorkspace = new Map<string, SessionCreationFlight>();
+
+type InitialHotTransientDecision = "ready" | "pending" | "terminal" | "none";
+
+function initialHotTransientDecision(workspaceHandle: string): InitialHotTransientDecision {
+	const directory = useSessionDirectoryStore.getState();
+	const transport = sessionTransport.store.getState();
+	let pending = false;
+	let terminal = false;
+	for (const session of directory.hotSessionsByWorkspace[workspaceHandle] ?? []) {
+		const identity = directory.hotRuntimeIdentityBySession[session.sessionHandle];
+		const persistence = resolveHotSessionPersistence(
+			session,
+			identity,
+			directory.sessionsByWorkspace[workspaceHandle],
+		);
+		if (persistence.status === "unpersisted") return "ready";
+		if (persistence.status !== "unknown") continue;
+		const recovery = transport.sessions[session.sessionHandle]?.recovery;
+		if (
+			identity &&
+			recovery?.phase === "degraded" &&
+			recovery.identity.serverEpoch === identity.serverEpoch &&
+			recovery.identity.workspaceId === identity.workspaceId &&
+			recovery.identity.sessionHandle === identity.sessionHandle &&
+			recovery.identity.generation === identity.generation
+		) {
+			terminal = true;
+		} else {
+			pending = true;
+		}
+	}
+	if (pending) return "pending";
+	return terminal ? "terminal" : "none";
+}
+
+async function waitForHotTransientDecision(workspaceHandle: string): Promise<boolean> {
+	for (;;) {
+		const current = useSessionDirectoryStore.getState();
+		if (current.currentWorkspaceHandle !== workspaceHandle) return false;
+		if (current.currentSession || current.sessionCreation) return false;
+		const decision = initialHotTransientDecision(workspaceHandle);
+		if (decision === "terminal") return false;
+		if (decision !== "pending") return true;
+		await new Promise<void>((resolve) => {
+			let directoryUnsubscribe = () => {};
+			let transportUnsubscribe = () => {};
+			let finished = false;
+			const finish = () => {
+				if (finished) return;
+				finished = true;
+				directoryUnsubscribe();
+				transportUnsubscribe();
+				resolve();
+			};
+			const inspect = () => {
+				const state = useSessionDirectoryStore.getState();
+				if (
+					state.currentWorkspaceHandle === workspaceHandle &&
+					!state.currentSession &&
+					!state.sessionCreation &&
+					initialHotTransientDecision(workspaceHandle) === "pending"
+				) {
+					return;
+				}
+				finish();
+			};
+			directoryUnsubscribe = useSessionDirectoryStore.subscribe(inspect);
+			transportUnsubscribe = sessionTransport.store.subscribe(inspect);
+			inspect();
+		});
+	}
 }
 
 function controllerChannel(sessionHandle: string) {
@@ -72,14 +154,17 @@ export async function openSession(session: NativeSessionDto): Promise<void> {
 	await Promise.all([activation, directory.reloadSessions(session.workspaceHandle)]);
 }
 
-/** Create a new Pi-native Session and attach its dedicated runtime. */
-export async function newSession(): Promise<void> {
+async function performSessionCreation(
+	workspaceHandle: string,
+	onCreationIntent: (token: number) => void,
+): Promise<void> {
 	let creationToken: number | undefined;
 	try {
-		const workspaceHandle = currentWorkspaceHandle();
 		const directoryBeforeCreation = useSessionDirectoryStore.getState();
+		if (directoryBeforeCreation.currentWorkspaceHandle !== workspaceHandle) return;
 		if (directoryBeforeCreation.resumeTransientSession(workspaceHandle)) return;
 		creationToken = directoryBeforeCreation.beginSessionCreation(workspaceHandle);
+		onCreationIntent(creationToken);
 		const created = await api.createSession(workspaceHandle);
 		const directory = useSessionDirectoryStore.getState();
 		directory.completeSessionCreation(creationToken, created.session);
@@ -95,6 +180,87 @@ export async function newSession(): Promise<void> {
 			description: displayError(error),
 		});
 	}
+}
+
+/** Create a new Pi-native Session and attach its dedicated runtime. */
+export function newSession(): Promise<void> {
+	let workspaceHandle: string;
+	try {
+		workspaceHandle = currentWorkspaceHandle();
+	} catch (error) {
+		toast.error(tt("session.newFailed"), {
+			description: displayError(error),
+		});
+		return Promise.resolve();
+	}
+	const existing = sessionCreationByWorkspace.get(workspaceHandle);
+	if (existing) {
+		const directory = useSessionDirectoryStore.getState();
+		if (
+			existing.creationToken === null ||
+			(directory.currentWorkspaceHandle === workspaceHandle &&
+				directory.navigationToken === existing.creationToken &&
+				directory.sessionCreation?.token === existing.creationToken)
+		) {
+			return existing.promise;
+		}
+		const requestedNavigationToken = directory.navigationToken;
+		return existing.promise.then(() => {
+			const current = useSessionDirectoryStore.getState();
+			if (
+				current.currentWorkspaceHandle !== workspaceHandle ||
+				current.navigationToken !== requestedNavigationToken
+			) {
+				return;
+			}
+			return newSession();
+		});
+	}
+	let resolveCompletion = () => {};
+	const completion = new Promise<void>((resolve) => {
+		resolveCompletion = resolve;
+	});
+	const flight: SessionCreationFlight = { promise: completion, creationToken: null };
+	sessionCreationByWorkspace.set(workspaceHandle, flight);
+	const settle = () => {
+		if (sessionCreationByWorkspace.get(workspaceHandle) === flight) {
+			sessionCreationByWorkspace.delete(workspaceHandle);
+		}
+		resolveCompletion();
+	};
+	void performSessionCreation(workspaceHandle, (token) => {
+		flight.creationToken = token;
+	}).then(
+		() => {
+			settle();
+		},
+		() => {
+			settle();
+		},
+	);
+	return completion;
+}
+
+/** Reconcile recovered hot state before the app creates its initial empty Session. */
+export function ensureInitialSession(): Promise<void> {
+	const workspaceHandle = currentWorkspaceHandle();
+	const existing = initialSessionByWorkspace.get(workspaceHandle);
+	if (existing) return existing;
+	const completion = (async () => {
+		const initial = useSessionDirectoryStore.getState();
+		if (initial.resumeTransientSession(workspaceHandle)) return;
+		if (!(await waitForHotTransientDecision(workspaceHandle))) return;
+		const resolved = useSessionDirectoryStore.getState();
+		if (resolved.currentWorkspaceHandle !== workspaceHandle) return;
+		if (resolved.currentSession || resolved.sessionCreation) return;
+		await newSession();
+	})().finally(() => {
+		if (initialSessionByWorkspace.get(workspaceHandle) === completion) {
+			initialSessionByWorkspace.delete(workspaceHandle);
+		}
+	});
+	initialSessionByWorkspace.set(workspaceHandle, completion);
+	return completion;
 }
 
 export async function deleteSession(session: NativeSessionDto): Promise<void> {

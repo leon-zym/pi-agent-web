@@ -50,7 +50,7 @@ test("two Sessions in one Workspace stream independently while the user switches
 	await openWorkbench(page, harness);
 
 	const selectedARow = page.locator('[data-session-row][data-current="true"]');
-	await expect(selectedARow).toHaveCount(0);
+	await expect(selectedARow).toHaveCount(1);
 	await sendPrompt(page, A_PROMPT);
 	await expect
 		.poll(() => eventFor(harness, (event) => event.type === "prompt" && event.text === A_PROMPT))
@@ -70,8 +70,8 @@ test("two Sessions in one Workspace stream independently while the user switches
 		.first()
 		.click();
 	await expect.poll(async () => (await listSessions(harness)).length).toBe(3);
-	await expect(page.locator("[data-session-row]")).toHaveCount(1);
-	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(0);
+	await expect(page.locator("[data-session-row]")).toHaveCount(2);
+	await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(1);
 	await expect(page.locator("textarea")).toBeEnabled();
 
 	await sendPrompt(page, B_PROMPT);
