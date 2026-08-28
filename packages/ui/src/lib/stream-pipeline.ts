@@ -1,4 +1,9 @@
-import type { SessionRuntimeDto, SessionWsServerMessage } from "@pi-agent-web/protocol";
+import type {
+	FutureProductSessionEventDto,
+	SessionEventDto,
+	SessionRuntimeDto,
+	SessionWsServerMessage,
+} from "@pi-agent-web/protocol";
 import { toast } from "sonner";
 import { migrateComposerHistory } from "../features/composer/use-composer-history";
 import { useComposerStore } from "../stores/composer";
@@ -6,6 +11,7 @@ import { useExtensionUiStore } from "../stores/extension-ui";
 import { useModelDirectoryStore } from "../stores/model-directory";
 import { useProjectionStore } from "../stores/projection";
 import { reconcileHiddenSessionLifecycle, useSessionDirectoryStore } from "../stores/session-directory";
+import type { SessionFrameBusMessage, SessionFrameProductMode } from "../stores/session-frame-bus";
 import { useSessionStatsStore } from "../stores/session-stats";
 import { hasFreshLeaseBaseline, SESSION_FRAME_DEFERRED, sessionTransport } from "../stores/session-transport";
 import { useSlashCommandsStore } from "../stores/slash-commands";
@@ -13,13 +19,10 @@ import { playAttentionChime, playCompletionChime } from "./audio-feedback";
 import { displayLabel, stripAnsi } from "./format";
 import { tt } from "./i18n";
 import { isSoftIdempotentError } from "./session-controller";
-import { isCoalescibleMessageUpdate, SessionEventScheduler } from "./session-event-scheduler";
+import { type CoalescibleMessageUpdate, SessionEventScheduler } from "./session-event-scheduler";
 import { updateTabBadge } from "./tab-badge";
 
-type SessionFrameMessage = Exclude<
-	SessionWsServerMessage,
-	{ type: "response" } | { type: "session_directory_changed" } | { type: "auth_changed" }
->;
+type ProjectionSessionEvent = SessionEventDto | FutureProductSessionEventDto;
 
 let initialized = false;
 const directoryReloadTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -56,7 +59,7 @@ export function initPipeline(): void {
 	if (initialized) return;
 	initialized = true;
 
-	sessionTransport.frameBus.subscribeAll((frame) => routeSessionFrame(frame.message));
+	sessionTransport.frameBus.subscribeAll((frame) => routeSessionFrame(frame.message, frame.productMode));
 	sessionTransport.globalBus.subscribe((message) => {
 		if (message.type === "hot_runtime_inventory") {
 			useSessionDirectoryStore.getState().applyHotRuntimeInventory(message);
@@ -72,10 +75,13 @@ export function initPipeline(): void {
 	sessionTransport.store.getState().connect();
 }
 
-function routeSessionFrame(message: SessionFrameMessage): void | typeof SESSION_FRAME_DEFERRED {
+function routeSessionFrame(
+	message: SessionFrameBusMessage,
+	productMode: SessionFrameProductMode,
+): void | typeof SESSION_FRAME_DEFERRED {
 	switch (message.type) {
 		case "event":
-			return routeEvent(message);
+			return routeEvent(message, productMode);
 		case "extension_ui_request":
 			projectionEventScheduler.flushSession(message.sessionHandle, message.generation);
 			routeExtensionRequest(message);
@@ -117,6 +123,7 @@ function routeSessionFrame(message: SessionFrameMessage): void | typeof SESSION_
 				message.sessionHandle,
 				message.settledMessages,
 				message.projectionEvents.map((frame) => frame.event),
+				productMode,
 			);
 			useComposerStore.getState().setQueueForSession(message.sessionHandle, {
 				steering: [...message.queue.steering],
@@ -231,15 +238,17 @@ function scheduleHiddenLifecycleAfterLease(
 }
 
 function routeEvent(
-	message: Extract<SessionWsServerMessage, { type: "event" }>,
+	message: Extract<SessionFrameBusMessage, { type: "event" }>,
+	productMode: SessionFrameProductMode,
 ): void | typeof SESSION_FRAME_DEFERRED {
 	const { event, generation, seq, sessionHandle, workspaceId } = message;
-	if (event.type === "message_update" && isCoalescibleMessageUpdate(event)) {
+	const coalescible = coalescibleMessageUpdate(event);
+	if (coalescible) {
 		const enqueueResult = projectionEventScheduler.enqueue(
 			sessionHandle,
 			generation,
 			currentMessageIdentity(sessionHandle, generation),
-			event,
+			coalescible,
 		);
 		if (enqueueResult === "rejected") throw new Error("Projection scheduler rejected a live event");
 		return enqueueResult === "deferred" ? SESSION_FRAME_DEFERRED : undefined;
@@ -255,7 +264,7 @@ function routeEvent(
 		return SESSION_FRAME_DEFERRED;
 	}
 	if (
-		(event.type === "message_start" && (event.message as { role?: string }).role === "assistant") ||
+		(event.type === "message_start" && event.message.role === "assistant") ||
 		(event.type === "message_update" && event.assistantMessageEvent.type === "start")
 	) {
 		activeMessageIdentities.set(sessionHandle, {
@@ -304,9 +313,9 @@ function routeEvent(
 			break;
 	}
 
-	useProjectionStore.getState().applyEvent(sessionHandle, event);
+	useProjectionStore.getState().applyEvent(sessionHandle, event, productMode);
 	if (
-		(event.type === "message_end" && (event.message as { role?: string }).role === "assistant") ||
+		(event.type === "message_end" && event.message.role === "assistant") ||
 		(event.type === "message_update" &&
 			(event.assistantMessageEvent.type === "done" || event.assistantMessageEvent.type === "error")) ||
 		event.type === "turn_end" ||
@@ -316,6 +325,19 @@ function routeEvent(
 	}
 }
 
+function coalescibleMessageUpdate(event: ProjectionSessionEvent): CoalescibleMessageUpdate | null {
+	if (event.type !== "message_update") return null;
+	const inner = event.assistantMessageEvent;
+	if (inner.type !== "text_delta" && inner.type !== "thinking_delta" && inner.type !== "toolcall_delta") {
+		return null;
+	}
+	return {
+		type: "message_update",
+		usage: event.usage,
+		assistantMessageEvent: inner,
+	};
+}
+
 function currentMessageIdentity(sessionHandle: string, generation: number): string {
 	const active = activeMessageIdentities.get(sessionHandle);
 	return active?.generation === generation ? active.identity : `${String(generation)}:unframed`;
@@ -323,7 +345,7 @@ function currentMessageIdentity(sessionHandle: string, generation: number): stri
 
 function applyLiveUsage(
 	sessionHandle: string,
-	event: Extract<import("@pi-agent-web/protocol").SessionEventDto, { type: "message_update" }>,
+	event: Extract<ProjectionSessionEvent, { type: "message_update" }>,
 ): void {
 	useSessionStatsStore.getState().applyLiveUsageForSession(sessionHandle, {
 		input: event.usage.input,

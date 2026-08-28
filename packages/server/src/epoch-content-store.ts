@@ -14,14 +14,17 @@ import { addAbortSignal, Readable } from "node:stream";
 import { finished } from "node:stream/promises";
 import {
 	isSessionAttachmentRefDto,
+	isSessionContentRefDto,
 	SESSION_ATTACHMENT_BLOB_MAX_BYTES,
 	SESSION_ATTACHMENT_CACHE_MAX_BYTES,
 	SESSION_ATTACHMENT_CACHE_MAX_ITEMS,
+	SESSION_CONTENT_BLOB_MAX_BYTES,
 	type SessionAttachmentRefDto,
+	type SessionContentRefDto,
 } from "@pi-agent-web/protocol";
 import lockfile from "proper-lockfile";
 
-export type { SessionAttachmentRefDto } from "@pi-agent-web/protocol";
+export type { SessionAttachmentRefDto, SessionContentRefDto } from "@pi-agent-web/protocol";
 
 const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -34,6 +37,7 @@ const MANIFEST_FILE = "manifest.json";
 
 export interface EpochContentStoreLimits {
 	maxBlobBytes: number;
+	maxContentBlobBytes: number;
 	maxCacheBytes: number;
 	maxCacheItems: number;
 }
@@ -60,25 +64,34 @@ export interface EpochContentPutInput {
 	signal?: AbortSignal;
 }
 
-export interface EpochContentHold {
-	readonly ref: SessionAttachmentRefDto;
+export interface EpochUtf8ContentPutInput {
+	source: Readable;
+	expectedSha256?: string;
+	expectedByteLength?: number;
+	signal?: AbortSignal;
 }
 
-export interface EpochContentPin {
-	readonly ref: SessionAttachmentRefDto;
+export type EpochStoredContentRef = SessionAttachmentRefDto | SessionContentRefDto;
+
+export interface EpochContentHold<TRef extends EpochStoredContentRef = SessionAttachmentRefDto> {
+	readonly ref: TRef;
 }
 
-export interface StagedEpochContent {
-	readonly ref: SessionAttachmentRefDto;
-	readonly hold: EpochContentHold;
+export interface EpochContentPin<TRef extends EpochStoredContentRef = SessionAttachmentRefDto> {
+	readonly ref: TRef;
+}
+
+export interface StagedEpochContent<TRef extends EpochStoredContentRef = SessionAttachmentRefDto> {
+	readonly ref: TRef;
+	readonly hold: EpochContentHold<TRef>;
 	/** True only when this stage committed a new digest directory. */
 	readonly created: boolean;
 }
 
-export interface PinnedEpochContent {
-	readonly ref: SessionAttachmentRefDto;
+export interface PinnedEpochContent<TRef extends EpochStoredContentRef = SessionAttachmentRefDto> {
+	readonly ref: TRef;
 	readonly stream: Readable;
-	readonly pin: EpochContentPin;
+	readonly pin: EpochContentPin<TRef>;
 }
 
 export type EpochContentStoreErrorCode =
@@ -125,9 +138,21 @@ export class EpochContentStoreError extends Error {
 type StoreState = "uninitialized" | "initializing" | "ready" | "closed";
 type FileHandle = Awaited<ReturnType<typeof open>>;
 type FileStats = Awaited<ReturnType<typeof lstat>>;
-type Manifest = { version: 1; published: boolean; ref: SessionAttachmentRefDto };
+type ContentNamespace = "attachment" | "utf8";
+type AttachmentManifest = { version: 1; published: boolean; ref: SessionAttachmentRefDto };
+type Utf8Manifest = {
+	version: 1;
+	published: boolean;
+	namespace: "utf8";
+	serverEpoch: string;
+	sha256: string;
+	byteLength: number;
+	encoding: "utf-8";
+};
+type Manifest = { published: boolean; ref: EpochStoredContentRef };
 type Entry = {
-	ref: SessionAttachmentRefDto;
+	namespace: ContentNamespace;
+	ref: EpochStoredContentRef;
 	published: boolean;
 	holds: number;
 	pins: number;
@@ -135,7 +160,7 @@ type Entry = {
 };
 type TombstoneEntry = { bytes: number; items: 1 };
 type Reservation = { bytes: number; active: boolean };
-type TokenState = { kind: "hold" | "pin"; digest: string; active: boolean; stream?: Readable };
+type TokenState = { kind: "hold" | "pin"; key: string; active: boolean; stream?: Readable };
 
 function errno(error: unknown, code: string): boolean {
 	return (error as NodeJS.ErrnoException)?.code === code;
@@ -160,21 +185,25 @@ function normalizeError(error: unknown): EpochContentStoreError {
 	return new EpochContentStoreError("io_failure", "Content store operation failed");
 }
 
-function refsEqual(left: SessionAttachmentRefDto, right: SessionAttachmentRefDto): boolean {
-	return (
-		left.type === right.type &&
-		left.serverEpoch === right.serverEpoch &&
-		left.sha256 === right.sha256 &&
-		left.mediaType === right.mediaType &&
-		left.byteLength === right.byteLength
-	);
+function refsEqual(left: EpochStoredContentRef, right: EpochStoredContentRef): boolean {
+	if (
+		left.type !== right.type ||
+		left.serverEpoch !== right.serverEpoch ||
+		left.sha256 !== right.sha256 ||
+		left.byteLength !== right.byteLength
+	) {
+		return false;
+	}
+	return left.type === "attachment_ref" && right.type === "attachment_ref"
+		? left.mediaType === right.mediaType
+		: left.type === "content_ref" && right.type === "content_ref" && left.encoding === right.encoding;
 }
 
-function immutableRef(ref: SessionAttachmentRefDto): SessionAttachmentRefDto {
-	return Object.freeze({ ...ref });
+function immutableRef(ref: EpochStoredContentRef): EpochStoredContentRef {
+	return ref.type === "attachment_ref" ? Object.freeze({ ...ref }) : Object.freeze({ ...ref });
 }
 
-function isManifest(value: unknown): value is Manifest {
+function isAttachmentManifest(value: unknown): value is AttachmentManifest {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	if (Object.getPrototypeOf(value) !== Object.prototype) return false;
 	const record = value as Record<string, unknown>;
@@ -187,6 +216,33 @@ function isManifest(value: unknown): value is Manifest {
 		record.version === 1 &&
 		typeof record.published === "boolean" &&
 		isSessionAttachmentRefDto(record.ref)
+	);
+}
+
+function isUtf8Manifest(value: unknown): value is Utf8Manifest {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	if (Object.getPrototypeOf(value) !== Object.prototype) return false;
+	const record = value as Record<string, unknown>;
+	const keys = Object.keys(record);
+	return (
+		keys.length === 7 &&
+		keys.includes("version") &&
+		keys.includes("published") &&
+		keys.includes("namespace") &&
+		keys.includes("serverEpoch") &&
+		keys.includes("sha256") &&
+		keys.includes("byteLength") &&
+		keys.includes("encoding") &&
+		record.version === 1 &&
+		typeof record.published === "boolean" &&
+		record.namespace === "utf8" &&
+		isSessionContentRefDto({
+			type: "content_ref",
+			serverEpoch: record.serverEpoch,
+			sha256: record.sha256,
+			byteLength: record.byteLength,
+			encoding: record.encoding,
+		})
 	);
 }
 
@@ -288,14 +344,20 @@ export class EpochContentStore {
 	readonly #epochsRoot: string;
 	readonly #epochRoot: string;
 	readonly #blobsRoot: string;
+	readonly #utf8Root: string;
 	readonly #lifecycleAbort = new AbortController();
 	readonly #active = new Set<Promise<unknown>>();
 	readonly #temporaryPaths = new Set<string>();
 	readonly #digestTails = new Map<string, Promise<void>>();
 	readonly #entries = new Map<string, Entry>();
 	readonly #tombstones = new Map<string, TombstoneEntry>();
-	readonly #tokens = new WeakMap<EpochContentHold | EpochContentPin, TokenState>();
-	readonly #tokenObjects = new Set<EpochContentHold | EpochContentPin>();
+	readonly #tokens = new WeakMap<
+		EpochContentHold<EpochStoredContentRef> | EpochContentPin<EpochStoredContentRef>,
+		TokenState
+	>();
+	readonly #tokenObjects = new Set<
+		EpochContentHold<EpochStoredContentRef> | EpochContentPin<EpochStoredContentRef>
+	>();
 	#state: StoreState = "uninitialized";
 	#initialization: Promise<void> | undefined;
 	#shutdownPromise: Promise<void> | undefined;
@@ -309,15 +371,24 @@ export class EpochContentStore {
 	constructor(options: EpochContentStoreOptions) {
 		const limits: EpochContentStoreLimits = {
 			maxBlobBytes: options.limits?.maxBlobBytes ?? SESSION_ATTACHMENT_BLOB_MAX_BYTES,
+			maxContentBlobBytes:
+				options.limits?.maxContentBlobBytes ??
+				Math.min(
+					SESSION_CONTENT_BLOB_MAX_BYTES,
+					options.limits?.maxCacheBytes ?? SESSION_ATTACHMENT_CACHE_MAX_BYTES,
+				),
 			maxCacheBytes: options.limits?.maxCacheBytes ?? SESSION_ATTACHMENT_CACHE_MAX_BYTES,
 			maxCacheItems: options.limits?.maxCacheItems ?? SESSION_ATTACHMENT_CACHE_MAX_ITEMS,
 		};
 		if (
 			!isPositiveInteger(limits.maxBlobBytes) ||
+			!isPositiveInteger(limits.maxContentBlobBytes) ||
 			!isPositiveInteger(limits.maxCacheBytes) ||
 			!isPositiveInteger(limits.maxCacheItems) ||
 			limits.maxBlobBytes > limits.maxCacheBytes ||
+			limits.maxContentBlobBytes > limits.maxCacheBytes ||
 			limits.maxBlobBytes > SESSION_ATTACHMENT_BLOB_MAX_BYTES ||
+			limits.maxContentBlobBytes > SESSION_CONTENT_BLOB_MAX_BYTES ||
 			limits.maxCacheBytes > SESSION_ATTACHMENT_CACHE_MAX_BYTES ||
 			limits.maxCacheItems > SESSION_ATTACHMENT_CACHE_MAX_ITEMS
 		) {
@@ -348,6 +419,7 @@ export class EpochContentStore {
 		const epochKey = createHash("sha256").update(this.#serverEpoch).digest("hex");
 		this.#epochRoot = path.join(this.#epochsRoot, epochKey);
 		this.#blobsRoot = path.join(this.#epochRoot, "blobs");
+		this.#utf8Root = path.join(this.#epochRoot, "utf8");
 	}
 
 	get usage(): Readonly<{ bytes: number; items: number }> {
@@ -373,13 +445,24 @@ export class EpochContentStore {
 	}
 
 	stage(input: EpochContentPutInput): Promise<StagedEpochContent> {
+		return this.#stage("attachment", input) as Promise<StagedEpochContent>;
+	}
+
+	stageUtf8(input: EpochUtf8ContentPutInput): Promise<StagedEpochContent<SessionContentRefDto>> {
+		return this.#stage("utf8", input) as Promise<StagedEpochContent<SessionContentRefDto>>;
+	}
+
+	#stage(
+		namespace: ContentNamespace,
+		input: EpochContentPutInput | EpochUtf8ContentPutInput,
+	): Promise<StagedEpochContent<EpochStoredContentRef>> {
 		const source = input?.source instanceof Readable ? input.source : undefined;
 		const observeSourceError = (): void => {};
 		source?.on("error", observeSourceError);
-		let staged: Promise<StagedEpochContent>;
+		let staged: Promise<StagedEpochContent<EpochStoredContentRef>>;
 		try {
 			this.#assertReady();
-			staged = this.#stageInternal(input);
+			staged = this.#stageInternal(namespace, input);
 		} catch (error) {
 			staged = Promise.reject(error);
 		}
@@ -388,7 +471,7 @@ export class EpochContentStore {
 		return operation;
 	}
 
-	publish(hold: EpochContentHold): Promise<void> {
+	publish(hold: EpochContentHold<EpochStoredContentRef>): Promise<void> {
 		try {
 			this.#assertReady();
 			const token = this.#requireToken(hold, "hold");
@@ -401,10 +484,25 @@ export class EpochContentStore {
 	}
 
 	pin(ref: SessionAttachmentRefDto, options: { signal?: AbortSignal } = {}): Promise<PinnedEpochContent> {
+		return this.#pin("attachment", ref, options) as Promise<PinnedEpochContent>;
+	}
+
+	pinUtf8(
+		ref: SessionContentRefDto,
+		options: { signal?: AbortSignal } = {},
+	): Promise<PinnedEpochContent<SessionContentRefDto>> {
+		return this.#pin("utf8", ref, options) as Promise<PinnedEpochContent<SessionContentRefDto>>;
+	}
+
+	#pin(
+		namespace: ContentNamespace,
+		ref: EpochStoredContentRef,
+		options: { signal?: AbortSignal },
+	): Promise<PinnedEpochContent<EpochStoredContentRef>> {
 		try {
 			this.#assertReady();
-			this.#validateRef(ref);
-			const operation = this.#publicOperation(this.#pinInternal(ref, options.signal));
+			this.#validateRef(namespace, ref);
+			const operation = this.#publicOperation(this.#pinInternal(namespace, ref, options.signal));
 			this.#track(operation);
 			return operation;
 		} catch (error) {
@@ -413,12 +511,27 @@ export class EpochContentStore {
 	}
 
 	pinByDigest(digest: string, options: { signal?: AbortSignal } = {}): Promise<PinnedEpochContent> {
+		return this.#pinByDigest("attachment", digest, options) as Promise<PinnedEpochContent>;
+	}
+
+	pinUtf8ByDigest(
+		digest: string,
+		options: { signal?: AbortSignal } = {},
+	): Promise<PinnedEpochContent<SessionContentRefDto>> {
+		return this.#pinByDigest("utf8", digest, options) as Promise<PinnedEpochContent<SessionContentRefDto>>;
+	}
+
+	#pinByDigest(
+		namespace: ContentNamespace,
+		digest: string,
+		options: { signal?: AbortSignal },
+	): Promise<PinnedEpochContent<EpochStoredContentRef>> {
 		try {
 			this.#assertReady();
 			if (!DIGEST_RE.test(digest)) fail("invalid_ref", "Attachment digest is invalid");
-			const entry = this.#entries.get(digest);
+			const entry = this.#entries.get(this.#entryKey(namespace, digest));
 			if (!entry || entry.deleting) fail("not_found", "Attachment content is unavailable");
-			const operation = this.#publicOperation(this.#pinInternal(entry.ref, options.signal));
+			const operation = this.#publicOperation(this.#pinInternal(namespace, entry.ref, options.signal));
 			this.#track(operation);
 			return operation;
 		} catch (error) {
@@ -431,10 +544,21 @@ export class EpochContentStore {
 	 * Callers must already own generation-authorized content identity; this does not admit or hash a body.
 	 */
 	holdPublished(ref: SessionAttachmentRefDto): Promise<EpochContentHold> {
+		return this.#holdPublished("attachment", ref) as Promise<EpochContentHold>;
+	}
+
+	holdPublishedUtf8(ref: SessionContentRefDto): Promise<EpochContentHold<SessionContentRefDto>> {
+		return this.#holdPublished("utf8", ref) as Promise<EpochContentHold<SessionContentRefDto>>;
+	}
+
+	#holdPublished(
+		namespace: ContentNamespace,
+		ref: EpochStoredContentRef,
+	): Promise<EpochContentHold<EpochStoredContentRef>> {
 		try {
 			this.#assertReady();
-			this.#validateRef(ref);
-			const operation = this.#publicOperation(this.#holdPublishedInternal(ref));
+			this.#validateRef(namespace, ref);
+			const operation = this.#publicOperation(this.#holdPublishedInternal(namespace, ref));
 			this.#track(operation);
 			return operation;
 		} catch (error) {
@@ -442,7 +566,9 @@ export class EpochContentStore {
 		}
 	}
 
-	release(handle: EpochContentHold | EpochContentPin): Promise<void> {
+	release(
+		handle: EpochContentHold<EpochStoredContentRef> | EpochContentPin<EpochStoredContentRef>,
+	): Promise<void> {
 		const token = this.#tokens.get(handle);
 		if (!token?.active) return Promise.resolve();
 		const operation = this.#publicOperation(this.#releaseInternal(handle, token));
@@ -479,15 +605,15 @@ export class EpochContentStore {
 			if (!token?.active) continue;
 			token.active = false;
 			token.stream?.destroy(this.#lifecycleAbort.signal.reason);
-			const entry = this.#entries.get(token.digest);
+			const entry = this.#entries.get(token.key);
 			if (!entry) continue;
 			if (token.kind === "hold") entry.holds = Math.max(0, entry.holds - 1);
 			else entry.pins = Math.max(0, entry.pins - 1);
 		}
 		if (initialization) await Promise.allSettled([initialization]);
 		await Promise.allSettled([...this.#active]);
-		for (const [digest, entry] of this.#entries) {
-			if (!entry.published) await this.#deleteEntry(digest, entry).catch(() => {});
+		for (const [key, entry] of this.#entries) {
+			if (!entry.published) await this.#deleteEntry(key, entry).catch(() => {});
 		}
 		await Promise.allSettled([...this.#temporaryPaths].map((temporaryPath) => unlink(temporaryPath)));
 		this.#temporaryPaths.clear();
@@ -514,6 +640,7 @@ export class EpochContentStore {
 		await secureDirectory(this.#epochRoot, false, this.#openFile);
 		await this.#ensureEpochMarker();
 		await secureDirectory(this.#blobsRoot, false, this.#openFile);
+		await secureDirectory(this.#utf8Root, false, this.#openFile);
 		await this.#scanCurrentEpoch();
 	}
 
@@ -559,71 +686,84 @@ export class EpochContentStore {
 	async #scanCurrentEpoch(): Promise<void> {
 		let bytes = 0;
 		let items = 0;
-		for (const entry of await readdir(this.#blobsRoot, { withFileTypes: true })) {
-			const entryPath = path.join(this.#blobsRoot, entry.name);
-			if (TOMBSTONE_RE.test(entry.name)) {
-				const metadata = await lstat(entryPath);
-				if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-					fail("unsafe_layout", "Blob tombstone is unsafe");
+		for (const namespace of ["attachment", "utf8"] as const) {
+			const root = this.#namespaceRoot(namespace);
+			for (const entry of await readdir(root, { withFileTypes: true })) {
+				const entryPath = path.join(root, entry.name);
+				if (TOMBSTONE_RE.test(entry.name)) {
+					const metadata = await lstat(entryPath);
+					if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+						fail("unsafe_layout", "Blob tombstone is unsafe");
+					}
+					await this.#remove(entryPath, { recursive: true, force: false });
+					continue;
 				}
-				await this.#remove(entryPath, { recursive: true, force: false });
-				continue;
+				if (TEMP_RE.test(entry.name)) {
+					await this.#removePlainTemp(entryPath);
+					continue;
+				}
+				if (!DIGEST_RE.test(entry.name)) fail("unsafe_layout", "Blob entry is malformed");
+				await secureExistingDirectory(entryPath, this.#openFile);
+				for (const child of (await readdir(entryPath)).filter((name) => TEMP_RE.test(name))) {
+					await this.#removePlainTemp(path.join(entryPath, child));
+				}
+				const remaining = await readdir(entryPath);
+				if (
+					remaining.length === 0 ||
+					(remaining.length === 1 && (remaining[0] === CONTENT_FILE || remaining[0] === MANIFEST_FILE))
+				) {
+					const tombstone = path.join(root, `.tombstone-${randomUUID()}`);
+					await this.#rename(entryPath, tombstone);
+					await this.#remove(tombstone, { recursive: true, force: false });
+					continue;
+				}
+				if (
+					remaining.length !== 2 ||
+					!remaining.includes(CONTENT_FILE) ||
+					!remaining.includes(MANIFEST_FILE)
+				) {
+					fail("unsafe_layout", "Blob digest directory is incomplete");
+				}
+				const manifest = await this.#readManifest(namespace, entry.name, "unsafe_layout");
+				if (!manifest.published) {
+					await this.#remove(entryPath, { recursive: true, force: false });
+					continue;
+				}
+				const ref = manifest.ref;
+				const verified = await this.#verifyBlob(namespace, ref, undefined, "unsafe_layout");
+				if (verified.bytes !== ref.byteLength || verified.digest !== ref.sha256) {
+					fail("unsafe_layout", "Stored blob does not match its manifest");
+				}
+				bytes += verified.bytes;
+				items += 1;
+				if (bytes > this.#limits.maxCacheBytes || items > this.#limits.maxCacheItems) {
+					fail("unsafe_layout", "Existing content exceeds cache limits");
+				}
+				this.#entries.set(this.#entryKey(namespace, entry.name), {
+					namespace,
+					ref,
+					published: true,
+					holds: 0,
+					pins: 0,
+					deleting: false,
+				});
 			}
-			if (TEMP_RE.test(entry.name)) {
-				await this.#removePlainTemp(entryPath);
-				continue;
-			}
-			if (!DIGEST_RE.test(entry.name)) fail("unsafe_layout", "Blob entry is malformed");
-			await secureExistingDirectory(entryPath, this.#openFile);
-			for (const child of (await readdir(entryPath)).filter((name) => TEMP_RE.test(name))) {
-				await this.#removePlainTemp(path.join(entryPath, child));
-			}
-			const remaining = await readdir(entryPath);
-			if (
-				remaining.length === 0 ||
-				(remaining.length === 1 && (remaining[0] === CONTENT_FILE || remaining[0] === MANIFEST_FILE))
-			) {
-				const tombstone = path.join(this.#blobsRoot, `.tombstone-${randomUUID()}`);
-				await this.#rename(entryPath, tombstone);
-				await this.#remove(tombstone, { recursive: true, force: false });
-				continue;
-			}
-			if (remaining.length !== 2 || !remaining.includes(CONTENT_FILE) || !remaining.includes(MANIFEST_FILE)) {
-				fail("unsafe_layout", "Blob digest directory is incomplete");
-			}
-			const manifest = await this.#readManifest(entry.name, "unsafe_layout");
-			if (!manifest.published) {
-				await this.#remove(entryPath, { recursive: true, force: false });
-				continue;
-			}
-			const verified = await this.#verifyBlob(manifest.ref, undefined, "unsafe_layout");
-			if (verified.bytes !== manifest.ref.byteLength || verified.digest !== manifest.ref.sha256) {
-				fail("unsafe_layout", "Stored blob does not match its manifest");
-			}
-			bytes += verified.bytes;
-			items += 1;
-			if (bytes > this.#limits.maxCacheBytes || items > this.#limits.maxCacheItems) {
-				fail("unsafe_layout", "Existing content exceeds cache limits");
-			}
-			this.#entries.set(entry.name, {
-				ref: manifest.ref,
-				published: true,
-				holds: 0,
-				pins: 0,
-				deleting: false,
-			});
 		}
 		this.#bytes = bytes;
 		this.#items = items;
 	}
 
-	async #stageInternal(input: EpochContentPutInput): Promise<StagedEpochContent> {
-		this.#validateInput(input);
-		const reservation = this.#reserve(input.expectedByteLength ?? this.#limits.maxBlobBytes);
+	async #stageInternal(
+		namespace: ContentNamespace,
+		input: EpochContentPutInput | EpochUtf8ContentPutInput,
+	): Promise<StagedEpochContent<EpochStoredContentRef>> {
+		this.#validateInput(namespace, input);
+		const blobLimit = this.#blobLimit(namespace);
+		const reservation = this.#reserve(input.expectedByteLength ?? blobLimit);
 		const signal = input.signal
 			? AbortSignal.any([input.signal, this.#lifecycleAbort.signal])
 			: this.#lifecycleAbort.signal;
-		const stagedPath = path.join(this.#blobsRoot, `.tmp-${randomUUID()}`);
+		const stagedPath = path.join(this.#namespaceRoot(namespace), `.tmp-${randomUUID()}`);
 		this.#temporaryPaths.add(stagedPath);
 		let bytes = 0;
 		let stagedHandle: FileHandle | undefined;
@@ -645,9 +785,9 @@ export class EpochContentStore {
 				if (input.expectedByteLength !== undefined && bytes > input.expectedByteLength) {
 					fail("declared_length_mismatch", "Blob exceeds its declared length");
 				}
-				if (bytes > this.#limits.maxBlobBytes) {
+				if (bytes > blobLimit) {
 					throw new EpochContentStoreError("blob_too_large", "Blob exceeds its limit", {
-						limit: this.#limits.maxBlobBytes,
+						limit: blobLimit,
 						actual: bytes,
 					});
 				}
@@ -671,15 +811,25 @@ export class EpochContentStore {
 				fail("declared_digest_mismatch", "Blob does not match its declared digest");
 			}
 			signal.throwIfAborted();
-			const ref = immutableRef({
-				type: "attachment_ref",
-				serverEpoch: this.#serverEpoch,
-				sha256: digest,
-				mediaType: input.mediaType,
-				byteLength: bytes,
-			});
-			return await this.#withDigestLock(digest, () =>
-				this.#commitStage(stagedPath, ref, reservation, signal),
+			const ref: EpochStoredContentRef =
+				namespace === "attachment"
+					? immutableRef({
+							type: "attachment_ref",
+							serverEpoch: this.#serverEpoch,
+							sha256: digest,
+							mediaType: (input as EpochContentPutInput).mediaType,
+							byteLength: bytes,
+						})
+					: immutableRef({
+							type: "content_ref",
+							serverEpoch: this.#serverEpoch,
+							sha256: digest,
+							byteLength: bytes,
+							encoding: "utf-8",
+						});
+			const key = this.#entryKey(namespace, digest);
+			return await this.#withDigestLock(key, () =>
+				this.#commitStage(namespace, stagedPath, ref, reservation, signal),
 			);
 		} finally {
 			await stagedHandle?.close().catch(() => {});
@@ -707,22 +857,25 @@ export class EpochContentStore {
 	}
 
 	async #commitStage(
+		namespace: ContentNamespace,
 		stagedPath: string,
-		ref: SessionAttachmentRefDto,
+		ref: EpochStoredContentRef,
 		reservation: Reservation,
 		signal: AbortSignal,
-	): Promise<StagedEpochContent> {
+	): Promise<StagedEpochContent<EpochStoredContentRef>> {
 		signal.throwIfAborted();
-		const existing = this.#entries.get(ref.sha256);
+		const key = this.#entryKey(namespace, ref.sha256);
+		const existing = this.#entries.get(key);
 		if (existing) {
 			if (existing.deleting || !refsEqual(existing.ref, ref))
 				fail("manifest_mismatch", "Digest metadata differs");
-			await this.#verifyEntry(existing.ref, undefined, existing.published);
+			await this.#verifyEntry(namespace, existing.ref, undefined, existing.published);
 			this.#rollbackReservation(reservation);
 			return Object.freeze({ ref: existing.ref, hold: this.#createHold(existing), created: false });
 		}
-		if (await this.#digestPathExists(ref.sha256)) fail("digest_collision", "Unowned digest path exists");
-		const directory = this.#blobDirectory(ref.sha256);
+		if (await this.#digestPathExists(namespace, ref.sha256))
+			fail("digest_collision", "Unowned digest path exists");
+		const directory = this.#blobDirectory(namespace, ref.sha256);
 		const innerTemp = path.join(directory, `.tmp-${randomUUID()}`);
 		let directoryOwned = false;
 		try {
@@ -733,13 +886,13 @@ export class EpochContentStore {
 			await this.#rename(stagedPath, innerTemp);
 			this.#temporaryPaths.delete(stagedPath);
 			signal.throwIfAborted();
-			await this.#rename(innerTemp, this.#blobPath(ref.sha256));
+			await this.#rename(innerTemp, this.#blobPath(namespace, ref.sha256));
 			this.#temporaryPaths.delete(innerTemp);
 			signal.throwIfAborted();
-			await this.#writeManifest(ref.sha256, { version: 1, published: false, ref });
+			await this.#writeManifest(namespace, ref, false);
 			signal.throwIfAborted();
-			const entry: Entry = { ref, published: false, holds: 0, pins: 0, deleting: false };
-			this.#entries.set(ref.sha256, entry);
+			const entry: Entry = { namespace, ref, published: false, holds: 0, pins: 0, deleting: false };
+			this.#entries.set(key, entry);
 			this.#commitReservation(reservation, ref.byteLength);
 			return Object.freeze({ ref: entry.ref, hold: this.#createHold(entry), created: true });
 		} catch (error) {
@@ -749,21 +902,26 @@ export class EpochContentStore {
 		}
 	}
 
-	async #publishInternal(hold: EpochContentHold, token: TokenState): Promise<void> {
-		await this.#withDigestLock(token.digest, async () => {
+	async #publishInternal(hold: EpochContentHold<EpochStoredContentRef>, token: TokenState): Promise<void> {
+		await this.#withDigestLock(token.key, async () => {
 			if (!token.active) fail("invalid_handle", "Content hold is inactive");
-			const entry = this.#entries.get(token.digest);
+			const entry = this.#entries.get(token.key);
 			if (!entry || entry.deleting || !refsEqual(entry.ref, hold.ref))
 				fail("invalid_handle", "Content hold is stale");
 			if (entry.published) return;
-			await this.#verifyEntry(entry.ref, undefined, false);
-			await this.#writeManifest(token.digest, { version: 1, published: true, ref: entry.ref });
+			await this.#verifyEntry(entry.namespace, entry.ref, undefined, false);
+			await this.#writeManifest(entry.namespace, entry.ref, true);
 			entry.published = true;
 		});
 	}
 
-	async #pinInternal(ref: SessionAttachmentRefDto, callerSignal?: AbortSignal): Promise<PinnedEpochContent> {
-		const entry = this.#entries.get(ref.sha256);
+	async #pinInternal(
+		namespace: ContentNamespace,
+		ref: EpochStoredContentRef,
+		callerSignal?: AbortSignal,
+	): Promise<PinnedEpochContent<EpochStoredContentRef>> {
+		const key = this.#entryKey(namespace, ref.sha256);
+		const entry = this.#entries.get(key);
 		if (!entry || entry.deleting) fail("not_found", "Attachment content is unavailable");
 		if (!refsEqual(entry.ref, ref)) fail("manifest_mismatch", "Attachment metadata differs");
 		if (!entry.published) fail("not_published", "Attachment is not published");
@@ -773,14 +931,14 @@ export class EpochContentStore {
 			: this.#lifecycleAbort.signal;
 		try {
 			signal.throwIfAborted();
-			await this.#verifyManifest(ref, true);
-			let handle: FileHandle | undefined = await this.#openVerifiedBlob(ref, signal);
+			await this.#verifyManifest(namespace, ref, true);
+			let handle: FileHandle | undefined = await this.#openVerifiedBlob(namespace, ref, signal);
 			try {
 				let stream = handle.createReadStream({ autoClose: true, start: 0, end: ref.byteLength - 1 });
 				stream = addAbortSignal(signal, stream);
 				handle = undefined;
-				const pin = Object.freeze({ ref: entry.ref }) satisfies EpochContentPin;
-				this.#tokens.set(pin, { kind: "pin", digest: ref.sha256, active: true, stream });
+				const pin = Object.freeze({ ref: entry.ref }) satisfies EpochContentPin<EpochStoredContentRef>;
+				this.#tokens.set(pin, { kind: "pin", key, active: true, stream });
 				this.#tokenObjects.add(pin);
 				this.#track(finished(stream).finally(() => this.release(pin)));
 				return Object.freeze({ ref: entry.ref, stream, pin });
@@ -793,38 +951,45 @@ export class EpochContentStore {
 		}
 	}
 
-	async #holdPublishedInternal(ref: SessionAttachmentRefDto): Promise<EpochContentHold> {
-		return this.#withDigestLock(ref.sha256, async () => {
-			const entry = this.#entries.get(ref.sha256);
+	async #holdPublishedInternal(
+		namespace: ContentNamespace,
+		ref: EpochStoredContentRef,
+	): Promise<EpochContentHold<EpochStoredContentRef>> {
+		const key = this.#entryKey(namespace, ref.sha256);
+		return this.#withDigestLock(key, async () => {
+			const entry = this.#entries.get(key);
 			if (!entry || entry.deleting) fail("not_found", "Attachment content is unavailable");
 			if (!refsEqual(entry.ref, ref)) fail("manifest_mismatch", "Attachment metadata differs");
 			if (!entry.published) fail("not_published", "Attachment is not published");
-			await this.#verifyManifest(ref, true);
+			await this.#verifyManifest(namespace, ref, true);
 			this.#assertReady();
 			return this.#createHold(entry);
 		});
 	}
 
-	async #releaseInternal(handle: EpochContentHold | EpochContentPin, token: TokenState): Promise<void> {
+	async #releaseInternal(
+		handle: EpochContentHold<EpochStoredContentRef> | EpochContentPin<EpochStoredContentRef>,
+		token: TokenState,
+	): Promise<void> {
 		if (!token.active) return;
 		token.active = false;
 		this.#tokenObjects.delete(handle);
 		if (token.kind === "pin") token.stream?.destroy();
 		let releasedEntry: Entry | undefined;
 		try {
-			await this.#withDigestLock(token.digest, async () => {
-				const entry = this.#entries.get(token.digest);
+			await this.#withDigestLock(token.key, async () => {
+				const entry = this.#entries.get(token.key);
 				if (!entry) return;
 				releasedEntry = entry;
 				if (token.kind === "hold") entry.holds = Math.max(0, entry.holds - 1);
 				else entry.pins = Math.max(0, entry.pins - 1);
 				if (!entry.published && entry.holds === 0 && entry.pins === 0 && !entry.deleting) {
 					entry.deleting = true;
-					await this.#deleteEntry(token.digest, entry);
+					await this.#deleteEntry(token.key, entry);
 				}
 			});
 		} catch (error) {
-			if (releasedEntry && this.#entries.get(token.digest) === releasedEntry) {
+			if (releasedEntry && this.#entries.get(token.key) === releasedEntry) {
 				if (token.kind === "hold") releasedEntry.holds += 1;
 				else releasedEntry.pins += 1;
 				releasedEntry.deleting = false;
@@ -839,29 +1004,29 @@ export class EpochContentStore {
 		const cleaned = await this.#cleanupBlobTombstones();
 		let bytes = cleaned.bytes;
 		let items = cleaned.items;
-		for (const [digest, entry] of candidates) {
+		for (const [key, entry] of candidates) {
 			try {
-				await this.#withDigestLock(digest, async () => {
+				await this.#withDigestLock(key, async () => {
 					if (entry.deleting || entry.holds !== 0 || entry.pins !== 0 || !entry.published) return;
 					entry.deleting = true;
-					const deleted = await this.#deleteEntry(digest, entry);
+					const deleted = await this.#deleteEntry(key, entry);
 					bytes += deleted.bytes;
 					items += deleted.items;
 				});
 			} catch (error) {
-				if (this.#entries.get(digest) === entry) entry.deleting = false;
+				if (this.#entries.get(key) === entry) entry.deleting = false;
 				throw error;
 			}
 		}
 		return { bytes, items };
 	}
 
-	async #deleteEntry(digest: string, entry: Entry): Promise<{ bytes: number; items: number }> {
+	async #deleteEntry(key: string, entry: Entry): Promise<{ bytes: number; items: number }> {
 		return this.#withTombstoneLock(async () => {
-			if (this.#entries.get(digest) !== entry) return { bytes: 0, items: 0 };
-			const tombstone = path.join(this.#blobsRoot, `.tombstone-${randomUUID()}`);
-			await this.#rename(this.#blobDirectory(digest), tombstone);
-			this.#entries.delete(digest);
+			if (this.#entries.get(key) !== entry) return { bytes: 0, items: 0 };
+			const tombstone = path.join(this.#namespaceRoot(entry.namespace), `.tombstone-${randomUUID()}`);
+			await this.#rename(this.#blobDirectory(entry.namespace, entry.ref.sha256), tombstone);
+			this.#entries.delete(key);
 			this.#tombstones.set(tombstone, { bytes: entry.ref.byteLength, items: 1 });
 			return this.#removeTrackedTombstone(tombstone);
 		});
@@ -871,16 +1036,19 @@ export class EpochContentStore {
 		return this.#withTombstoneLock(async () => {
 			let bytes = 0;
 			let items = 0;
-			for (const name of await readdir(this.#blobsRoot)) {
-				if (!TOMBSTONE_RE.test(name)) continue;
-				const tombstone = path.join(this.#blobsRoot, name);
-				const metadata = await lstat(tombstone);
-				if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-					fail("unsafe_layout", "Blob tombstone is unsafe");
+			for (const namespace of ["attachment", "utf8"] as const) {
+				const root = this.#namespaceRoot(namespace);
+				for (const name of await readdir(root)) {
+					if (!TOMBSTONE_RE.test(name)) continue;
+					const tombstone = path.join(root, name);
+					const metadata = await lstat(tombstone);
+					if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+						fail("unsafe_layout", "Blob tombstone is unsafe");
+					}
+					const removed = await this.#removeTrackedTombstone(tombstone);
+					bytes += removed.bytes;
+					items += removed.items;
 				}
-				const removed = await this.#removeTrackedTombstone(tombstone);
-				bytes += removed.bytes;
-				items += removed.items;
 			}
 			return { bytes, items };
 		});
@@ -896,8 +1064,24 @@ export class EpochContentStore {
 		return retained;
 	}
 
-	async #writeManifest(digest: string, manifest: Manifest): Promise<void> {
-		const temporaryPath = path.join(this.#blobDirectory(digest), `.tmp-${randomUUID()}`);
+	async #writeManifest(
+		namespace: ContentNamespace,
+		ref: EpochStoredContentRef,
+		published: boolean,
+	): Promise<void> {
+		const temporaryPath = path.join(this.#blobDirectory(namespace, ref.sha256), `.tmp-${randomUUID()}`);
+		const manifest: AttachmentManifest | Utf8Manifest =
+			namespace === "attachment" && ref.type === "attachment_ref"
+				? { version: 1, published, ref }
+				: {
+						version: 1,
+						published,
+						namespace: "utf8",
+						serverEpoch: ref.serverEpoch,
+						sha256: ref.sha256,
+						byteLength: ref.byteLength,
+						encoding: "utf-8",
+					};
 		this.#temporaryPaths.add(temporaryPath);
 		let handle: FileHandle | undefined;
 		try {
@@ -907,7 +1091,7 @@ export class EpochContentStore {
 			await handle.sync();
 			await handle.close();
 			handle = undefined;
-			await this.#rename(temporaryPath, this.#manifestPath(digest));
+			await this.#rename(temporaryPath, this.#manifestPath(namespace, ref.sha256));
 			this.#temporaryPaths.delete(temporaryPath);
 		} finally {
 			await handle?.close().catch(() => {});
@@ -916,10 +1100,14 @@ export class EpochContentStore {
 		}
 	}
 
-	async #readManifest(digest: string, errorCode: "unsafe_layout" | "manifest_mismatch"): Promise<Manifest> {
+	async #readManifest(
+		namespace: ContentNamespace,
+		digest: string,
+		errorCode: "unsafe_layout" | "manifest_mismatch",
+	): Promise<Manifest> {
 		let metadata: FileStats;
 		try {
-			metadata = await lstat(this.#manifestPath(digest));
+			metadata = await lstat(this.#manifestPath(namespace, digest));
 		} catch (error) {
 			if (errno(error, "ENOENT")) fail(errorCode, "Content manifest is missing");
 			throw error;
@@ -934,27 +1122,53 @@ export class EpochContentStore {
 		}
 		let parsed: unknown;
 		try {
-			parsed = JSON.parse(await readBoundedFile(this.#manifestPath(digest), MAX_MANIFEST_BYTES, errorCode));
+			parsed = JSON.parse(
+				await readBoundedFile(this.#manifestPath(namespace, digest), MAX_MANIFEST_BYTES, errorCode),
+			);
 		} catch {
 			fail(errorCode, "Content manifest is invalid");
 		}
-		if (!isManifest(parsed) || parsed.ref.serverEpoch !== this.#serverEpoch || parsed.ref.sha256 !== digest) {
+		if (namespace === "attachment") {
+			if (
+				!isAttachmentManifest(parsed) ||
+				parsed.ref.serverEpoch !== this.#serverEpoch ||
+				parsed.ref.sha256 !== digest
+			) {
+				fail(errorCode, "Content manifest has the wrong identity");
+			}
+			return Object.freeze({ published: parsed.published, ref: immutableRef(parsed.ref) });
+		}
+		if (!isUtf8Manifest(parsed) || parsed.serverEpoch !== this.#serverEpoch || parsed.sha256 !== digest) {
 			fail(errorCode, "Content manifest has the wrong identity");
 		}
-		return Object.freeze({ ...parsed, ref: immutableRef(parsed.ref) });
+		return Object.freeze({
+			published: parsed.published,
+			ref: immutableRef({
+				type: "content_ref",
+				serverEpoch: parsed.serverEpoch,
+				sha256: parsed.sha256,
+				byteLength: parsed.byteLength,
+				encoding: parsed.encoding,
+			}),
+		});
 	}
 
 	async #verifyEntry(
-		ref: SessionAttachmentRefDto,
+		namespace: ContentNamespace,
+		ref: EpochStoredContentRef,
 		signal?: AbortSignal,
 		expectedPublished?: boolean,
 	): Promise<void> {
-		await this.#verifyManifest(ref, expectedPublished);
-		await this.#verifyBlob(ref, signal);
+		await this.#verifyManifest(namespace, ref, expectedPublished);
+		await this.#verifyBlob(namespace, ref, signal);
 	}
 
-	async #verifyManifest(ref: SessionAttachmentRefDto, expectedPublished?: boolean): Promise<void> {
-		const manifest = await this.#readManifest(ref.sha256, "manifest_mismatch");
+	async #verifyManifest(
+		namespace: ContentNamespace,
+		ref: EpochStoredContentRef,
+		expectedPublished?: boolean,
+	): Promise<void> {
+		const manifest = await this.#readManifest(namespace, ref.sha256, "manifest_mismatch");
 		if (!refsEqual(manifest.ref, ref)) fail("manifest_mismatch", "Content manifest metadata differs");
 		if (expectedPublished !== undefined && manifest.published !== expectedPublished) {
 			fail("manifest_mismatch", "Content manifest publication state differs");
@@ -962,13 +1176,14 @@ export class EpochContentStore {
 	}
 
 	async #verifyBlob(
-		ref: SessionAttachmentRefDto,
+		namespace: ContentNamespace,
+		ref: EpochStoredContentRef,
 		signal?: AbortSignal,
 		errorCode: "digest_collision" | "unsafe_layout" = "digest_collision",
 	): Promise<{ digest: string; bytes: number }> {
 		let handle: FileHandle | undefined;
 		try {
-			handle = await this.#openVerifiedBlob(ref, signal, errorCode);
+			handle = await this.#openVerifiedBlob(namespace, ref, signal, errorCode);
 			return { digest: ref.sha256, bytes: ref.byteLength };
 		} finally {
 			await handle?.close().catch(() => {});
@@ -976,24 +1191,26 @@ export class EpochContentStore {
 	}
 
 	async #openVerifiedBlob(
-		ref: SessionAttachmentRefDto,
+		namespace: ContentNamespace,
+		ref: EpochStoredContentRef,
 		signal?: AbortSignal,
 		errorCode: "digest_collision" | "unsafe_layout" = "digest_collision",
 	): Promise<FileHandle> {
 		let handle: FileHandle | undefined;
 		try {
 			handle = await this.#openFile(
-				this.#blobPath(ref.sha256),
+				this.#blobPath(namespace, ref.sha256),
 				fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
 			);
 			const before = await handle.stat();
-			if (!before.isFile() || before.size <= 0 || before.size > this.#limits.maxBlobBytes) {
+			const blobLimit = this.#blobLimit(namespace);
+			if (!before.isFile() || before.size <= 0 || before.size > blobLimit) {
 				fail(errorCode, "Blob file is unsafe");
 			}
 			let readable = handle.createReadStream({
 				autoClose: false,
 				start: 0,
-				end: this.#limits.maxBlobBytes,
+				end: blobLimit,
 			});
 			if (signal) readable = addAbortSignal(signal, readable);
 			const verified = await hashReadable(readable);
@@ -1020,9 +1237,9 @@ export class EpochContentStore {
 		}
 	}
 
-	async #digestPathExists(digest: string): Promise<boolean> {
+	async #digestPathExists(namespace: ContentNamespace, digest: string): Promise<boolean> {
 		try {
-			await lstat(this.#blobDirectory(digest));
+			await lstat(this.#blobDirectory(namespace, digest));
 			return true;
 		} catch (error) {
 			if (errno(error, "ENOENT")) return false;
@@ -1036,29 +1253,40 @@ export class EpochContentStore {
 		await unlink(filePath);
 	}
 
-	#validateInput(input: EpochContentPutInput): void {
-		const probe: SessionAttachmentRefDto = {
-			type: "attachment_ref",
-			serverEpoch: this.#serverEpoch,
-			sha256: "0".repeat(64),
-			mediaType: input.mediaType,
-			byteLength: 1,
-		};
-		if (!(input.source instanceof Readable) || !isSessionAttachmentRefDto(probe))
-			fail("invalid_ref", "Input is invalid");
+	#validateInput(namespace: ContentNamespace, input: EpochContentPutInput | EpochUtf8ContentPutInput): void {
+		const validIdentity =
+			namespace === "attachment"
+				? isSessionAttachmentRefDto({
+						type: "attachment_ref",
+						serverEpoch: this.#serverEpoch,
+						sha256: "0".repeat(64),
+						mediaType: (input as EpochContentPutInput).mediaType,
+						byteLength: 1,
+					})
+				: isSessionContentRefDto({
+						type: "content_ref",
+						serverEpoch: this.#serverEpoch,
+						sha256: "0".repeat(64),
+						byteLength: 1,
+						encoding: "utf-8",
+					});
+		if (!(input.source instanceof Readable) || !validIdentity) fail("invalid_ref", "Input is invalid");
 		if (input.expectedSha256 !== undefined && !DIGEST_RE.test(input.expectedSha256))
 			fail("invalid_ref", "Digest is invalid");
 		if (
 			input.expectedByteLength !== undefined &&
-			(!isPositiveInteger(input.expectedByteLength) || input.expectedByteLength > this.#limits.maxBlobBytes)
+			(!isPositiveInteger(input.expectedByteLength) || input.expectedByteLength > this.#blobLimit(namespace))
 		) {
 			fail("invalid_ref", "Length is invalid");
 		}
 	}
 
-	#validateRef(ref: SessionAttachmentRefDto): void {
-		if (!isSessionAttachmentRefDto(ref) || ref.byteLength > this.#limits.maxBlobBytes)
-			fail("invalid_ref", "Reference is invalid");
+	#validateRef(namespace: ContentNamespace, ref: EpochStoredContentRef): void {
+		const valid =
+			namespace === "attachment"
+				? isSessionAttachmentRefDto(ref) && ref.byteLength <= this.#limits.maxBlobBytes
+				: isSessionContentRefDto(ref) && ref.byteLength <= this.#limits.maxContentBlobBytes;
+		if (!valid) fail("invalid_ref", "Reference is invalid");
 		if (ref.serverEpoch !== this.#serverEpoch) fail("epoch_mismatch", "Reference belongs to another epoch");
 	}
 
@@ -1098,15 +1326,22 @@ export class EpochContentStore {
 		this.#reservedItems -= 1;
 	}
 
-	#createHold(entry: Entry): EpochContentHold {
+	#createHold(entry: Entry): EpochContentHold<EpochStoredContentRef> {
 		entry.holds += 1;
-		const hold = Object.freeze({ ref: entry.ref }) satisfies EpochContentHold;
-		this.#tokens.set(hold, { kind: "hold", digest: entry.ref.sha256, active: true });
+		const hold = Object.freeze({ ref: entry.ref }) satisfies EpochContentHold<EpochStoredContentRef>;
+		this.#tokens.set(hold, {
+			kind: "hold",
+			key: this.#entryKey(entry.namespace, entry.ref.sha256),
+			active: true,
+		});
 		this.#tokenObjects.add(hold);
 		return hold;
 	}
 
-	#requireToken(handle: EpochContentHold | EpochContentPin, kind: TokenState["kind"]): TokenState {
+	#requireToken(
+		handle: EpochContentHold<EpochStoredContentRef> | EpochContentPin<EpochStoredContentRef>,
+		kind: TokenState["kind"],
+	): TokenState {
 		const token = this.#tokens.get(handle);
 		if (!token?.active || token.kind !== kind) fail("invalid_handle", "Content handle is invalid");
 		return token;
@@ -1144,16 +1379,28 @@ export class EpochContentStore {
 		}
 	}
 
-	#blobDirectory(digest: string): string {
-		return path.join(this.#blobsRoot, digest);
+	#namespaceRoot(namespace: ContentNamespace): string {
+		return namespace === "attachment" ? this.#blobsRoot : this.#utf8Root;
 	}
 
-	#blobPath(digest: string): string {
-		return path.join(this.#blobDirectory(digest), CONTENT_FILE);
+	#entryKey(namespace: ContentNamespace, digest: string): string {
+		return `${namespace}:${digest}`;
 	}
 
-	#manifestPath(digest: string): string {
-		return path.join(this.#blobDirectory(digest), MANIFEST_FILE);
+	#blobLimit(namespace: ContentNamespace): number {
+		return namespace === "attachment" ? this.#limits.maxBlobBytes : this.#limits.maxContentBlobBytes;
+	}
+
+	#blobDirectory(namespace: ContentNamespace, digest: string): string {
+		return path.join(this.#namespaceRoot(namespace), digest);
+	}
+
+	#blobPath(namespace: ContentNamespace, digest: string): string {
+		return path.join(this.#blobDirectory(namespace, digest), CONTENT_FILE);
+	}
+
+	#manifestPath(namespace: ContentNamespace, digest: string): string {
+		return path.join(this.#blobDirectory(namespace, digest), MANIFEST_FILE);
 	}
 
 	#assertReady(): void {

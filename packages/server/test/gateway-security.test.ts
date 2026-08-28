@@ -2,9 +2,13 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { GATEWAY_PAYLOAD_BUDGET_CAPABILITY, SESSION_PAYLOAD_BUDGET } from "@pi-agent-web/protocol";
+import {
+	GATEWAY_CONTENT_REF_CAPABILITY,
+	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+	SESSION_PAYLOAD_BUDGET,
+} from "@pi-agent-web/protocol";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { type ServerHandle, startServer } from "../src/main.js";
+import { type LegacyServerHandle, startServerWithCurrentMode } from "../src/main.js";
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-gateway-test-"));
 const workspacePath = path.join(tempRoot, "workspace");
@@ -18,7 +22,7 @@ const PROVIDER_ID_LIMIT = 256;
 const API_KEY_LIMIT = 16 * 1024;
 const WORKSPACE_PATH_LIMIT = 8192;
 
-let handle: ServerHandle;
+let handle: LegacyServerHandle;
 let base: string;
 let cookie: string;
 let workspaceHandle: string;
@@ -103,7 +107,7 @@ async function rawGet(pathname: string, headers: Record<string, string>): Promis
 
 beforeAll(async () => {
 	fs.mkdirSync(workspacePath, { recursive: true });
-	handle = await startServer({
+	handle = await startServerWithCurrentMode({
 		config: { port: 0, host: "127.0.0.1", agentDir, sessionRootDir, webDataDir },
 		piPath: fakePiPath,
 		handleSignals: false,
@@ -145,7 +149,7 @@ afterAll(async () => {
 
 describe("gateway access control", () => {
 	it("rejects non-loopback listener configuration", async () => {
-		await expect(startServer({ config: { host: "0.0.0.0" } })).rejects.toThrow("PI_WEB_HOST");
+		await expect(startServerWithCurrentMode({ config: { host: "0.0.0.0" } })).rejects.toThrow("PI_WEB_HOST");
 	});
 
 	it("boots only from the Gateway origin without exposing the session secret", async () => {
@@ -157,6 +161,49 @@ describe("gateway access control", () => {
 		expect(sessionCookie).toContain("HttpOnly");
 		expect(sessionCookie).toContain("SameSite=Strict");
 		expect((await fetch(`${base}/api/v1/bootstrap`, { headers: { Origin: viteOrigin } })).status).toBe(403);
+	});
+
+	it("keeps the generic content capability unavailable in the production 1.2 hello", async () => {
+		const WebSocketCtor = (await import("ws")).default;
+		const ws = new WebSocketCtor(`${base.replace("http", "ws")}/api/v1/ws`, {
+			headers: authenticatedHeaders(),
+		});
+		try {
+			await new Promise<void>((resolve, reject) => {
+				ws.once("open", resolve);
+				ws.once("error", reject);
+			});
+			const hello = new Promise<{
+				protocol: { major: number; minor: number };
+				capabilities: string[];
+			}>((resolve, reject) => {
+				const timeout = setTimeout(() => reject(new Error("server hello timed out")), 10_000);
+				ws.once("message", (raw) => {
+					clearTimeout(timeout);
+					resolve(JSON.parse(raw.toString()));
+				});
+			});
+			ws.send(
+				JSON.stringify({
+					type: "client_hello",
+					protocol: { major: 1, minor: 2 },
+					clientBuild: "generic-content-inert-test",
+					capabilities: [
+						"rpc.commands",
+						"rpc.events",
+						"rpc.extension_ui",
+						"session.multiplex",
+						GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+					],
+					limits: { maxServerFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes },
+				}),
+			);
+			const serverHello = await hello;
+			expect(serverHello.protocol).toEqual({ major: 1, minor: 2 });
+			expect(serverHello.capabilities).not.toContain(GATEWAY_CONTENT_REF_CAPABILITY);
+		} finally {
+			ws.close();
+		}
 	});
 
 	it("rejects a production cross-port origin even when it presents a valid cookie", async () => {
@@ -196,6 +243,33 @@ describe("gateway access control", () => {
 			headers: { "Sec-Fetch-Site": "cross-site" },
 		});
 		expect(crossSite.status).toBe(403);
+	});
+
+	it("protects generic content GETs with the same Cookie, target, Origin, and Fetch Metadata checks", async () => {
+		const url = `${base}/api/v1/content/${handle.serverEpoch}/${"a".repeat(64)}`;
+		const authorized = await fetch(url, {
+			headers: { "Sec-Fetch-Site": "same-origin", Cookie: cookie },
+		});
+		expect(authorized.status).toBe(404);
+		expect(authorized.headers.get("cache-control")).toBe("no-store");
+
+		for (const response of [
+			await fetch(url, { headers: { Origin: base } }),
+			await fetch(url, { headers: { Origin: viteOrigin, Cookie: cookie } }),
+			await fetch(url, { headers: { "Sec-Fetch-Site": "cross-site", Cookie: cookie } }),
+		]) {
+			expect(response.status).toBe(403);
+			expect(response.headers.get("cache-control")).toBe("no-store");
+		}
+
+		const port = new URL(base).port;
+		expect(
+			await rawGet(`/api/v1/content/${handle.serverEpoch}/${"a".repeat(64)}`, {
+				Host: `evil.example:${port}`,
+				"Sec-Fetch-Site": "same-origin",
+				Cookie: cookie,
+			}),
+		).toBe(403);
 	});
 
 	it("rejects DNS-rebinding requests with a non-loopback Host", async () => {

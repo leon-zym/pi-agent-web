@@ -1,26 +1,36 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
-import type {
-	ExtensionUiRequestDto,
-	ExtensionUiResponseDto,
-	ProductSessionEventDto,
-	SessionCommandDto,
-	SessionCommandResponseDto,
-	SessionCommandTypeDto,
-	SessionStateDto,
+import {
+	type ExtensionUiRequestDto,
+	type ExtensionUiResponseDto,
+	type FutureExtensionUiRequestDto,
+	type FutureProductSessionEventDto,
+	type FutureSessionCommandResponseDto,
+	isSessionCommandResponseDto,
+	type ProductSessionEventDto,
+	RpcError,
+	type SessionAttachmentRefDto,
+	type SessionCommandDto,
+	type SessionCommandResponseDto,
+	type SessionCommandTypeDto,
+	type SessionStateDto,
 } from "@pi-agent-web/protocol";
-import { RpcError } from "@pi-agent-web/protocol";
+import type { EpochStoredContentRef } from "./epoch-content-store.js";
 import {
 	attachJsonlLineReader,
 	JsonlLineTooLongError,
+	MAX_JSONL_FUTURE_CONTENT_LINE_BYTES,
 	MAX_JSONL_LINE_BYTES,
 	MAX_JSONL_SNAPSHOT_LINE_BYTES,
 } from "./jsonl.js";
 import { legacyRpcV1Adapter } from "./legacy-rpc-v1.js";
+import { isLegacyRpcV1FutureContentRawExtensionUiRequest } from "./legacy-rpc-v1-content-wire.js";
 import {
 	type PiHostAdapter,
 	type PiHostDecodeOutcome,
 	type PiHostDecodeResult,
+	type PiHostFuturePayloadExternalizer,
+	type PiHostFutureUnsolicitedFrame,
 	type PiHostPayloadExternalizer,
 	PiHostResponseExternalizationError,
 	PiProtocolIncompatibleError,
@@ -59,31 +69,40 @@ export interface PiProcessOptions {
 	/** Bounded allowance for Pi's single-line get_messages response. */
 	snapshotLineMaxBytes?: number;
 	adapter?: PiHostAdapter;
-	/** Disabled until a downstream generation owner is installed. */
+	/** Legacy payload seam; future Runtime installs the generation-owned externalizer. */
 	payloadExternalizer?: PiHostPayloadExternalizer;
 	/** Future Runtime seam: synchronously prepare an exact event handoff without seeing its transfer early. */
 	onDecodedEvent?: PiDecodedDeliveryConsumer<ProductSessionEventDto>;
+	/** Future-content seam; the legacy Runtime does not install this callback. */
+	onFutureDecodedEvent?: PiDecodedDeliveryConsumer<FutureProductSessionEventDto, EpochStoredContentRef>;
+	/** Future-only Extension seam. Current inline delivery remains on onExtensionUiRequest. */
+	onFutureDecodedExtensionUiRequest?: PiDecodedDeliveryConsumer<
+		FutureExtensionUiRequestDto,
+		EpochStoredContentRef
+	>;
 	onEvent?: (event: ProductSessionEventDto) => void;
 	onExtensionUiRequest?: (request: ExtensionUiRequestDto) => void;
 	onExit?: (info: PiProcessExitInfo) => void;
 	onReady?: (initialState: SessionStateDto) => void;
 }
 
-export interface PiDecodedDelivery<T> {
+export interface PiDecodedDelivery<T, TRef extends EpochStoredContentRef = SessionAttachmentRefDto> {
 	readonly value: T;
 	/**
 	 * Prepare a one-shot synchronous handoff after PiProcess rechecks spawn/pending identity.
 	 * Before returning literal true, commit must place the transfer in a bounded cleanup ledger
 	 * or atomically adopt it into the exact generation owner. PiProcess never releases after true.
 	 */
-	prepare(commit: (transfer: PiPayloadLeaseTransfer | null) => true): PiDecodedDeliveryPlan;
+	prepare(commit: (transfer: PiPayloadLeaseTransfer<TRef> | null) => true): PiDecodedDeliveryPlan;
 }
 
 export interface PiDecodedDeliveryPlan {
 	readonly kind: "pi_decoded_delivery_plan";
 }
 
-export type PiDecodedDeliveryConsumer<T> = (delivery: PiDecodedDelivery<T>) => PiDecodedDeliveryPlan;
+export type PiDecodedDeliveryConsumer<T, TRef extends EpochStoredContentRef = SessionAttachmentRefDto> = (
+	delivery: PiDecodedDelivery<T, TRef>,
+) => PiDecodedDeliveryPlan;
 
 export interface PiProcessExitInfo {
 	code: number | null;
@@ -115,14 +134,26 @@ class PiDecodeDeadlineError extends Error {
 	}
 }
 
-interface PendingRequest {
+interface PendingRequestBase {
 	command: SessionCommandTypeDto;
 	publicId: string;
-	consumeDecoded?: PiDecodedDeliveryConsumer<SessionCommandResponseDto>;
-	resolve: (r: SessionCommandResponseDto) => void;
 	reject: (e: Error) => void;
 	timer: NodeJS.Timeout;
 }
+
+interface CurrentPendingRequest extends PendingRequestBase {
+	kind: "current";
+	consumeDecoded?: PiDecodedDeliveryConsumer<SessionCommandResponseDto>;
+	resolve: (r: SessionCommandResponseDto) => void;
+}
+
+interface FuturePendingRequest extends PendingRequestBase {
+	kind: "future";
+	consumeDecoded: PiDecodedDeliveryConsumer<FutureSessionCommandResponseDto, EpochStoredContentRef>;
+	resolve: (r: FutureSessionCommandResponseDto) => void;
+}
+
+type PendingRequest = CurrentPendingRequest | FuturePendingRequest;
 
 interface SpawnIdentity {
 	child: ChildProcess;
@@ -143,6 +174,12 @@ function isRecord(value: unknown): value is UnknownFrame {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isFutureContentHistoryCommand(
+	command: unknown,
+): command is "get_messages" | "get_entries" | "get_tree" {
+	return command === "get_messages" || command === "get_entries" || command === "get_tree";
+}
+
 function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
 	try {
 		return (
@@ -156,17 +193,19 @@ function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
 	}
 }
 
-class PreparedDecodedDelivery<T> implements PiDecodedDelivery<T>, PiDecodedDeliveryPlan {
+class PreparedDecodedDelivery<T, TRef extends EpochStoredContentRef = SessionAttachmentRefDto>
+	implements PiDecodedDelivery<T, TRef>, PiDecodedDeliveryPlan
+{
 	readonly kind = "pi_decoded_delivery_plan" as const;
 	readonly value: T;
 	private state: "pending" | "prepared" | "committing" | "committed" | "failed" = "pending";
-	private commitPrepared: ((transfer: PiPayloadLeaseTransfer | null) => true) | null = null;
+	private commitPrepared: ((transfer: PiPayloadLeaseTransfer<TRef> | null) => true) | null = null;
 
 	constructor(value: T) {
 		this.value = value;
 	}
 
-	prepare(commit: (transfer: PiPayloadLeaseTransfer | null) => true): PiDecodedDeliveryPlan {
+	prepare(commit: (transfer: PiPayloadLeaseTransfer<TRef> | null) => true): PiDecodedDeliveryPlan {
 		if (this.state !== "pending" || typeof commit !== "function") {
 			throw new Error("Pi decoded delivery is already prepared");
 		}
@@ -179,7 +218,7 @@ class PreparedDecodedDelivery<T> implements PiDecodedDelivery<T>, PiDecodedDeliv
 		return plan === this && this.state === "prepared";
 	}
 
-	commit(transfer: PiPayloadLeaseTransfer | null): void {
+	commit(transfer: PiPayloadLeaseTransfer<TRef> | null): void {
 		if (this.state !== "prepared" || !this.commitPrepared) {
 			throw new Error("Pi decoded delivery plan is not prepared");
 		}
@@ -377,8 +416,24 @@ export class PiProcess {
 		consume: PiDecodedDeliveryConsumer<SessionCommandResponseDto>,
 		timeoutMs?: number,
 	): Promise<SessionCommandResponseDto> {
+		if (this.opts.payloadExternalizer?.mode === "future_content") {
+			return Promise.reject(new Error("current decoded delivery is not available in future content mode"));
+		}
 		const id = command.id ?? this.nextPublicId();
 		return this.sendRaw({ ...command, id }, timeoutMs, consume);
+	}
+
+	/** Future Runtime seam for responses that may contain typed content refs. */
+	sendFutureDecoded(
+		command: SessionCommandDto,
+		consume: PiDecodedDeliveryConsumer<FutureSessionCommandResponseDto, EpochStoredContentRef>,
+		timeoutMs?: number,
+	): Promise<FutureSessionCommandResponseDto> {
+		if (this.opts.payloadExternalizer?.mode !== "future_content") {
+			return Promise.reject(new Error("future Pi response delivery is not active"));
+		}
+		const id = command.id ?? this.nextPublicId();
+		return this.sendFutureRaw({ ...command, id }, consume, timeoutMs);
 	}
 
 	/** Send a no-response protocol frame (extension_ui_response etc.). */
@@ -412,7 +467,55 @@ export class PiProcess {
 				if (pending) this.deletePending(wireId, pending);
 				reject(new Error(`command timed out (${timeout / 1000}s): ${obj.type}`));
 			}, timeout);
-			const pending = { command: obj.type, publicId: obj.id, consumeDecoded, resolve, reject, timer };
+			const pending: CurrentPendingRequest = {
+				kind: "current",
+				command: obj.type,
+				publicId: obj.id,
+				consumeDecoded,
+				resolve,
+				reject,
+				timer,
+			};
+			this.pending.set(wireId, pending);
+			this.pendingPublicIds.set(obj.id, wireId);
+			void this.write(this.adapter.encodeCommand(encoded)).catch((error) => {
+				clearTimeout(timer);
+				this.deletePending(wireId, pending);
+				reject(error instanceof Error ? error : new Error(String(error)));
+			});
+		});
+	}
+
+	private sendFutureRaw(
+		obj: SessionCommandDto & { id: string },
+		consumeDecoded: PiDecodedDeliveryConsumer<FutureSessionCommandResponseDto, EpochStoredContentRef>,
+		timeoutMs?: number,
+	): Promise<FutureSessionCommandResponseDto> {
+		const identity = this.spawnIdentity;
+		if (!this.leaderRunning || !identity || identity.unexpectedFinalization) {
+			return Promise.reject(new Error("pi process is not running"));
+		}
+		if (this.pendingPublicIds.has(obj.id)) {
+			return Promise.reject(new RpcError(obj.type, `duplicate pending command id: ${obj.id}`));
+		}
+		const wireId = this.nextWireId();
+		const encoded = { ...obj, id: wireId };
+		const timeout = timeoutMs ?? this.opts.commandTimeoutMs;
+		return new Promise<FutureSessionCommandResponseDto>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				const pending = this.pending.get(wireId);
+				if (pending) this.deletePending(wireId, pending);
+				reject(new Error(`command timed out (${timeout / 1000}s): ${obj.type}`));
+			}, timeout);
+			const pending: FuturePendingRequest = {
+				kind: "future",
+				command: obj.type,
+				publicId: obj.id,
+				consumeDecoded,
+				resolve,
+				reject,
+				timer,
+			};
 			this.pending.set(wireId, pending);
 			this.pendingPublicIds.set(obj.id, wireId);
 			void this.write(this.adapter.encodeCommand(encoded)).catch((error) => {
@@ -606,14 +709,14 @@ export class PiProcess {
 		);
 	}
 
-	private decodeWithDeadline<T>(
+	private decodeWithDeadline<T, TRef extends EpochStoredContentRef = SessionAttachmentRefDto>(
 		identity: SpawnIdentity,
-		decode: (signal: AbortSignal) => PiHostDecodeResult<T>,
-	): Promise<PiHostDecodeOutcome<T>> {
+		decode: (signal: AbortSignal) => PiHostDecodeResult<T, TRef>,
+	): Promise<PiHostDecodeOutcome<T, TRef>> {
 		const deadline = new AbortController();
 		const signal = AbortSignal.any([identity.decodeAbortController.signal, deadline.signal]);
 		const operation = Promise.resolve().then(() => decode(signal));
-		return new Promise<PiHostDecodeOutcome<T>>((resolve, reject) => {
+		return new Promise<PiHostDecodeOutcome<T, TRef>>((resolve, reject) => {
 			let settled = false;
 			const settle = (): boolean => {
 				if (settled) return false;
@@ -644,7 +747,9 @@ export class PiProcess {
 		});
 	}
 
-	private observeDiscardedOutcome(outcome: PiHostDecodeOutcome<unknown>): void {
+	private observeDiscardedOutcome<TRef extends EpochStoredContentRef>(
+		outcome: PiHostDecodeOutcome<unknown, TRef>,
+	): void {
 		if (!outcome.lease) return;
 		void outcome.lease.release().catch(() => {
 			// The owning spawn already timed out or stopped. Observe cleanup failure
@@ -652,12 +757,14 @@ export class PiProcess {
 		});
 	}
 
-	private async releaseOutcome(outcome: PiHostDecodeOutcome<unknown>): Promise<void> {
+	private async releaseOutcome<TRef extends EpochStoredContentRef>(
+		outcome: PiHostDecodeOutcome<unknown, TRef>,
+	): Promise<void> {
 		await outcome.lease?.release();
 	}
 
-	private async releaseOutcomeAfterFailure(
-		outcome: PiHostDecodeOutcome<unknown>,
+	private async releaseOutcomeAfterFailure<TRef extends EpochStoredContentRef>(
+		outcome: PiHostDecodeOutcome<unknown, TRef>,
 		error: unknown,
 		message: string,
 	): Promise<never> {
@@ -669,9 +776,9 @@ export class PiProcess {
 		throw error;
 	}
 
-	private async transferOutcome(
-		outcome: PiHostDecodeOutcome<unknown>,
-	): Promise<PiPayloadLeaseTransfer | null> {
+	private async transferOutcome<TRef extends EpochStoredContentRef>(
+		outcome: PiHostDecodeOutcome<unknown, TRef>,
+	): Promise<PiPayloadLeaseTransfer<TRef> | null> {
 		const lease = outcome.lease;
 		if (!lease) return null;
 		try {
@@ -686,8 +793,8 @@ export class PiProcess {
 		}
 	}
 
-	private async releaseTransferAfterFailure(
-		transfer: PiPayloadLeaseTransfer | null,
+	private async releaseTransferAfterFailure<TRef extends EpochStoredContentRef>(
+		transfer: PiPayloadLeaseTransfer<TRef> | null,
 		error: unknown,
 		message: string,
 	): Promise<never> {
@@ -699,12 +806,12 @@ export class PiProcess {
 		throw error;
 	}
 
-	private async consumeDecodedOutcome<T>(
-		outcome: PiHostDecodeOutcome<T>,
-		consume: PiDecodedDeliveryConsumer<T>,
+	private async consumeDecodedOutcome<T, TRef extends EpochStoredContentRef = SessionAttachmentRefDto>(
+		outcome: PiHostDecodeOutcome<T, TRef>,
+		consume: PiDecodedDeliveryConsumer<T, TRef>,
 		isCurrent: () => boolean,
 	): Promise<boolean> {
-		const delivery = new PreparedDecodedDelivery(outcome.value);
+		const delivery = new PreparedDecodedDelivery<T, TRef>(outcome.value);
 		let plan: unknown;
 		try {
 			plan = consume(delivery);
@@ -745,8 +852,136 @@ export class PiProcess {
 		return true;
 	}
 
+	private async handleFuturePendingResponse(
+		frame: Record<string, unknown>,
+		id: string,
+		pending: PendingRequest,
+		identity: SpawnIdentity,
+		externalizer: PiHostFuturePayloadExternalizer,
+	): Promise<void> {
+		let outcome: PiHostDecodeOutcome<FutureSessionCommandResponseDto & { id: string }, EpochStoredContentRef>;
+		try {
+			outcome = await this.decodeWithDeadline(identity, (signal) =>
+				this.adapter.decodeFutureResponse(frame, pending.command, { signal, externalizer }),
+			);
+		} catch (error) {
+			const responseError =
+				error instanceof PiDecodeDeadlineError
+					? new PiHostResponseExternalizationError(pending.command, "deadline", { cause: error })
+					: error;
+			if (
+				responseError instanceof PiHostResponseExternalizationError &&
+				!identity.decodeAbortController.signal.aborted &&
+				this.ownsSpawn(identity) &&
+				this.pending.get(id) === pending
+			) {
+				this.deletePending(id, pending);
+				clearTimeout(pending.timer);
+				pending.reject(responseError);
+				return;
+			}
+			if (
+				responseError instanceof PiHostResponseExternalizationError &&
+				(!this.ownsSpawn(identity) || this.pending.get(id) !== pending)
+			) {
+				return;
+			}
+			throw responseError;
+		}
+		if (!this.ownsSpawn(identity) || this.pending.get(id) !== pending) {
+			await this.releaseOutcome(outcome);
+			return;
+		}
+		const response = { ...outcome.value, id: pending.publicId };
+		if (pending.kind === "current" && isFutureContentHistoryCommand(pending.command)) {
+			return this.releaseOutcomeAfterFailure(
+				outcome,
+				new Error("future content history responses require a decoded consumer"),
+				"Pi current history response cleanup failed",
+			);
+		}
+		if (pending.kind === "future") {
+			const accepted = await this.consumeDecodedOutcome(
+				{ value: response, lease: outcome.lease },
+				pending.consumeDecoded,
+				() => this.ownsSpawn(identity) && this.pending.get(id) === pending,
+			);
+			if (!accepted) return;
+			if (!this.ownsSpawn(identity) || this.pending.get(id) !== pending) return;
+			this.deletePending(id, pending);
+			clearTimeout(pending.timer);
+			pending.resolve(response);
+			return;
+		}
+
+		if (outcome.lease) {
+			return this.releaseOutcomeAfterFailure(
+				outcome,
+				new Error("inline-only Pi response delivery cannot carry future content holds"),
+				"Pi inline future response cleanup failed",
+			);
+		}
+		const attachmentContext = {
+			serverEpoch: externalizer.context.serverEpoch,
+			payloadBudget: externalizer.context.payloadBudget,
+		};
+		if (!isSessionCommandResponseDto(response, attachmentContext)) {
+			throw new PiProtocolIncompatibleError({
+				code: "protocol_incompatible",
+				adapterId: this.adapter.id,
+				frameKind: "response",
+				reason: "malformed_response",
+				frameType: pending.command,
+			});
+		}
+		if (!this.ownsSpawn(identity) || this.pending.get(id) !== pending) return;
+		this.deletePending(id, pending);
+		clearTimeout(pending.timer);
+		pending.resolve(response);
+	}
+
+	private async deliverFutureUnsolicited(
+		outcome: PiHostDecodeOutcome<PiHostFutureUnsolicitedFrame, EpochStoredContentRef>,
+		identity: SpawnIdentity,
+	): Promise<void> {
+		if (!this.ownsSpawn(identity)) {
+			await this.releaseOutcome(outcome);
+			return;
+		}
+		if (outcome.value.kind === "ignored") {
+			await this.releaseOutcome(outcome);
+			return;
+		}
+		if (outcome.value.kind === "event") {
+			const consume = this.opts.onFutureDecodedEvent;
+			if (!consume) {
+				return this.releaseOutcomeAfterFailure(
+					outcome,
+					new Error("future Pi event delivery requires a decoded consumer"),
+					"Pi future event cleanup failed",
+				);
+			}
+			await this.consumeDecodedOutcome({ value: outcome.value.event, lease: outcome.lease }, consume, () =>
+				this.ownsSpawn(identity),
+			);
+			return;
+		}
+		const consume = this.opts.onFutureDecodedExtensionUiRequest;
+		if (!consume) {
+			return this.releaseOutcomeAfterFailure(
+				outcome,
+				new Error("future Pi Extension UI delivery requires a decoded consumer"),
+				"Pi future Extension UI cleanup failed",
+			);
+		}
+		await this.consumeDecodedOutcome({ value: outcome.value.request, lease: outcome.lease }, consume, () =>
+			this.ownsSpawn(identity),
+		);
+	}
+
 	private async handleLine(line: string, identity: SpawnIdentity | null = this.spawnIdentity): Promise<void> {
-		const exceedsOrdinaryLimit = Buffer.byteLength(line) > MAX_JSONL_LINE_BYTES;
+		const lineBytes = Buffer.byteLength(line);
+		const exceedsOrdinaryLimit = lineBytes > MAX_JSONL_LINE_BYTES;
 		let data: unknown;
 		try {
 			data = JSON.parse(line);
@@ -762,7 +997,10 @@ export class PiProcess {
 			// Dirty line: tolerated and dropped (rpc-client.ts:305-311).
 			return;
 		}
-		if (exceedsOrdinaryLimit && !this.isPendingSnapshotResponse(data)) {
+		if (
+			lineBytes > this.currentJsonlLineBudget() ||
+			(exceedsOrdinaryLimit && !this.isAdmittedOversizedFrame(data))
+		) {
 			throw new PiProtocolIncompatibleError({
 				code: "protocol_incompatible",
 				adapterId: this.adapter.id,
@@ -772,12 +1010,15 @@ export class PiProcess {
 		}
 		if (!identity) throw new Error("cannot decode a Pi frame without an active spawn");
 		if (typeof data !== "object" || data === null) {
-			const outcome = await this.decodeWithDeadline(identity, (signal) =>
-				this.adapter.decodeUnsolicited(data, {
-					signal,
-					externalizer: this.opts.payloadExternalizer,
-				}),
-			);
+			const externalizer = this.opts.payloadExternalizer;
+			const outcome =
+				externalizer?.mode === "future_content"
+					? await this.decodeWithDeadline(identity, (signal) =>
+							this.adapter.decodeFutureUnsolicited(data, { signal, externalizer }),
+						)
+					: await this.decodeWithDeadline(identity, (signal) =>
+							this.adapter.decodeUnsolicited(data, { signal, externalizer }),
+						);
 			await this.releaseOutcome(outcome);
 			return;
 		}
@@ -788,12 +1029,20 @@ export class PiProcess {
 			if (id) {
 				const pending = this.pending.get(id);
 				if (pending) {
+					const futureExternalizer = this.opts.payloadExternalizer;
+					if (futureExternalizer?.mode === "future_content") {
+						await this.handleFuturePendingResponse(frame, id, pending, identity, futureExternalizer);
+						return;
+					}
+					if (pending.kind !== "current") {
+						throw new Error("future Pi response delivery is not active");
+					}
 					let outcome: PiHostDecodeOutcome<SessionCommandResponseDto & { id: string }>;
 					try {
 						outcome = await this.decodeWithDeadline(identity, (signal) =>
 							this.adapter.decodeResponse(frame, pending.command, {
 								signal,
-								externalizer: this.opts.payloadExternalizer,
+								externalizer: futureExternalizer,
 							}),
 						);
 					} catch (error) {
@@ -853,20 +1102,28 @@ export class PiProcess {
 			}
 			// Late or unknown-id responses are ignorable only after their complete
 			// command-specific shape has been validated by the adapter.
-			const orphaned = await this.decodeWithDeadline(identity, (signal) =>
-				this.adapter.decodeOrphanedResponse(frame, {
-					signal,
-				}),
-			);
+			const orphaned =
+				this.opts.payloadExternalizer?.mode === "future_content"
+					? await this.decodeWithDeadline(identity, (signal) =>
+							this.adapter.decodeFutureOrphanedResponse(frame, { signal }),
+						)
+					: await this.decodeWithDeadline(identity, (signal) =>
+							this.adapter.decodeOrphanedResponse(frame, { signal }),
+						);
 			await this.releaseOutcome(orphaned);
 			return;
 		}
 
+		const payloadExternalizer = this.opts.payloadExternalizer;
+		if (payloadExternalizer?.mode === "future_content") {
+			const futureOutcome = await this.decodeWithDeadline(identity, (signal) =>
+				this.adapter.decodeFutureUnsolicited(frame, { signal, externalizer: payloadExternalizer }),
+			);
+			await this.deliverFutureUnsolicited(futureOutcome, identity);
+			return;
+		}
 		const outcome = await this.decodeWithDeadline(identity, (signal) =>
-			this.adapter.decodeUnsolicited(frame, {
-				signal,
-				externalizer: this.opts.payloadExternalizer,
-			}),
+			this.adapter.decodeUnsolicited(frame, { signal, externalizer: payloadExternalizer }),
 		);
 		if (!this.ownsSpawn(identity)) {
 			await this.releaseOutcome(outcome);
@@ -928,6 +1185,33 @@ export class PiProcess {
 		return typeof data.id === "string" && this.pending.get(data.id)?.command === "get_messages";
 	}
 
+	private isAdmittedOversizedFrame(data: unknown): data is UnknownFrame {
+		if (this.opts.payloadExternalizer?.mode !== "future_content") {
+			return this.isPendingSnapshotResponse(data);
+		}
+		if (!isRecord(data)) return false;
+		if (data.type === "extension_ui_request") {
+			return isLegacyRpcV1FutureContentRawExtensionUiRequest(data);
+		}
+		if (data.type === "response") {
+			if (data.success !== true || typeof data.id !== "string") return false;
+			return isFutureContentHistoryCommand(data.command);
+		}
+		if (data.type === "message_update") {
+			return isRecord(data.assistantMessageEvent) && data.assistantMessageEvent.type === "toolcall_end";
+		}
+		return (
+			data.type === "agent_end" ||
+			data.type === "turn_end" ||
+			data.type === "message_start" ||
+			data.type === "message_end" ||
+			data.type === "entry_appended" ||
+			data.type === "tool_execution_start" ||
+			data.type === "tool_execution_update" ||
+			data.type === "tool_execution_end"
+		);
+	}
+
 	private rejectAll(error: Error): void {
 		for (const [, pending] of this.pending) {
 			clearTimeout(pending.timer);
@@ -938,6 +1222,9 @@ export class PiProcess {
 	}
 
 	private currentJsonlLineBudget(): number {
+		if (this.opts.payloadExternalizer?.mode === "future_content") {
+			return MAX_JSONL_FUTURE_CONTENT_LINE_BYTES;
+		}
 		for (const pending of this.pending.values()) {
 			if (pending.command === "get_messages") return this.opts.snapshotLineMaxBytes;
 		}

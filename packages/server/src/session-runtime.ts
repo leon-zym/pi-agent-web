@@ -4,31 +4,41 @@ import path from "node:path";
 import type {
 	ExtensionUiRequestDto,
 	ExtensionUiResponseDto,
+	FutureExtensionUiRequestDto,
+	FutureProductSessionEventDto,
+	FutureSessionCommandResponseDto,
+	FutureSessionMessageDto,
+	FutureSessionSnapshotDto,
 	HotRuntimeInventoryEntryDto,
 	ProductSessionEventDto,
+	SessionAttachmentRefDto,
 	SessionCommandDto,
 	SessionCommandResponseDto,
+	SessionMessageDto,
 	SessionSnapshotDto,
 	SessionStateDto,
 } from "@pi-agent-web/protocol";
 import {
+	analyzeFutureSessionCommandResponseLogicalBytes,
 	commandTimeoutMs,
 	expectCommandData,
-	isSessionAttachmentGuardContext,
-	isSessionSnapshotDto,
 	RpcError,
 	SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS,
 } from "@pi-agent-web/protocol";
-import type { EpochContentHold } from "./epoch-content-store.js";
+import type { EpochContentHold, EpochStoredContentRef } from "./epoch-content-store.js";
 import { GenerationContentOwner } from "./generation-content-owner.js";
 import { canonicalizeSessionFile, sessionHandleForCanonicalFile } from "./native-session-catalog.js";
-import type { PiHostPayloadExternalizer } from "./pi-host-adapter.js";
+import type {
+	PiHostAttachmentPayloadExternalizer,
+	PiHostFuturePayloadExternalizer,
+} from "./pi-host-adapter.js";
 import type { PiPayloadLeaseTransfer } from "./pi-payload-externalizer.js";
 import type {
 	PiDecodedDelivery,
 	PiDecodedDeliveryConsumer,
 	PiDecodedDeliveryPlan,
 	PiProcessExitInfo,
+	PiProcessOptions,
 } from "./pi-process.js";
 import { PiProcess } from "./pi-process.js";
 import type { ProbedPiRuntime } from "./resolver.js";
@@ -38,8 +48,15 @@ import {
 	type SessionLiveProjectionIdentity,
 	SessionLiveProjectionLimitError,
 	type SessionLiveProjectionLimits,
+	type SessionLiveProjectionPreparedBatch,
 	type SessionLiveProjectionPreparedCommit,
+	type SessionLiveProjectionSnapshot,
 } from "./session-live-projection.js";
+import {
+	createCurrentSessionProductSchema,
+	type SessionProductSchema,
+	SessionProductSchemaLogicalError,
+} from "./session-product-schema.js";
 import {
 	type ExistingSessionTarget,
 	eventSettlesWork,
@@ -61,17 +78,17 @@ const DEFAULT_EXTENSION_STATE_MAX_BYTES = 512 * 1024;
 const DEFAULT_EXTENSION_STATE_MAX_ITEMS = SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS;
 const DEFAULT_PENDING_DIALOG_LIMIT = 32;
 
-type BufferedFrame =
-	| { type: "event"; event: ProductSessionEventDto }
-	| { type: "extension_ui_request"; request: ExtensionUiRequestDto }
+type BufferedFrame<TEvent = ProductSessionEventDto, TExtensionRequest = ExtensionUiRequestDto> =
+	| { type: "event"; event: TEvent }
+	| { type: "extension_ui_request"; request: TExtensionRequest }
 	| {
 			type: "extension_ui_closed";
 			requestId: string;
 			reason: "answered" | "cancelled" | "expired" | "process_lost" | "replaced";
 	  };
 
-interface PendingDialog {
-	request: ExtensionUiRequestDto;
+interface PendingDialog<TExtensionRequest = ExtensionUiRequestDto> {
+	request: TExtensionRequest;
 	timer: NodeJS.Timeout | null;
 }
 
@@ -82,15 +99,19 @@ interface PendingTurnReservation {
 	timer: NodeJS.Timeout | null;
 }
 
-interface TransitionStage {
+interface TransitionStage<
+	TEvent = ProductSessionEventDto,
+	TExtensionRequest = ExtensionUiRequestDto,
+	TRef extends EpochStoredContentRef = SessionAttachmentRefDto,
+> {
 	phase: "awaiting_response" | "verifying" | "applying";
-	frames: BufferedFrame[];
+	frames: BufferedFrame<TEvent, TExtensionRequest>[];
 	bytes: number;
 	processToken: number;
 	parentGeneration: number;
-	parentOwner: GenerationContentOwner | null;
-	payloadLedger: TransitionPayloadLedger | null;
-	candidateOwner: GenerationContentOwner | null;
+	parentOwner: GenerationContentOwner<TRef> | null;
+	payloadLedger: TransitionPayloadLedger<TRef> | null;
+	candidateOwner: GenerationContentOwner<TRef> | null;
 	candidateOwnerFailure: unknown;
 }
 
@@ -102,24 +123,71 @@ interface FrozenSessionFileIdentity {
 	cwd: string;
 }
 
-interface PreparedActiveEventPublication {
-	projection: SessionLiveProjection;
+interface PreparedActiveEventPublication<
+	TMessage,
+	TEvent,
+	TExtensionRequest extends { readonly id: string; readonly method: string },
+> {
+	projection: SessionLiveProjection<TMessage, TEvent, TExtensionRequest>;
 	token: SessionLiveProjectionPreparedCommit;
-	frame: Extract<BufferedFrame, { type: "event" }>;
-	envelope: SessionReplayFrame;
-	turnBudget: { items: number; bytes: number };
-	replay: SessionReplayFrame[];
+	frame: Extract<BufferedFrame<TEvent, TExtensionRequest>, { type: "event" }>;
+	envelope: SessionReplayFrame<TEvent, TExtensionRequest>;
+	turnBudget: { items: number; bytes: number; logicalBytes: number };
+	replay: SessionReplayFrame<TEvent, TExtensionRequest>[];
 	replayFrameBytes: number[];
 	replayBytes: number;
 }
 
-export interface SessionIdentityTransitionCommit {
+interface PreparedExtensionSemanticOperation<
+	TMessage,
+	TEvent,
+	TExtensionRequest extends { readonly id: string; readonly method: string },
+> {
+	projection: SessionLiveProjection<TMessage, TEvent, TExtensionRequest>;
+	token: SessionLiveProjectionPreparedBatch;
+	semanticRevision: number;
+	envelopes: readonly SessionReplayFrame<TEvent, TExtensionRequest>[];
+	replay: SessionReplayFrame<TEvent, TExtensionRequest>[];
+	replayFrameBytes: number[];
+	replayBytes: number;
+	lastTransientSeq: number;
+	pendingDialogs: Map<string, PendingDialog<TExtensionRequest>>;
+	stickyExtension: Map<string, TExtensionRequest>;
+	timersToClear: readonly PendingDialog<TExtensionRequest>[];
+	timersToArm: readonly PendingDialog<TExtensionRequest>[];
+	processToken: number;
+	warnOversizedSticky: boolean;
+}
+
+interface ExtensionSemanticPlan<TEvent, TExtensionRequest> {
+	frames: readonly BufferedFrame<TEvent, TExtensionRequest>[];
+	pendingDialogs: Map<string, PendingDialog<TExtensionRequest>>;
+	stickyExtension: Map<string, TExtensionRequest>;
+	timersToClear: readonly PendingDialog<TExtensionRequest>[];
+	timersToArm: readonly PendingDialog<TExtensionRequest>[];
+	warnOversizedSticky: boolean;
+}
+
+interface PreparedStartupExtensionOperation<TEvent, TExtensionRequest>
+	extends ExtensionSemanticPlan<TEvent, TExtensionRequest> {
+	processToken: number;
+	semanticRevision: number;
+	startupFrameCount: number;
+	startupFrameBytesBefore: number;
+	startupFrames: BufferedFrame<TEvent, TExtensionRequest>[];
+	startupFrameBytes: number;
+}
+
+export interface SessionIdentityTransitionCommit<
+	TEvent = ProductSessionEventDto,
+	TExtensionRequest = ExtensionUiRequestDto,
+> {
 	previousSessionHandle: string;
 	nextTarget: ExistingSessionTarget;
 	/** Apply the verified identity exactly once while the Supervisor pool lock is held. */
 	apply: () => void;
 	/** Commit staged child frames to one waterline before the rekey becomes observable. */
-	commitStaged: () => SessionSupervisorMessage[];
+	commitStaged: () => SessionSupervisorMessage<TEvent, TExtensionRequest>[];
 }
 
 export interface SessionHotRuntimeObservation {
@@ -127,7 +195,72 @@ export interface SessionHotRuntimeObservation {
 	processToken: number;
 }
 
-export interface SessionRuntimeOptions {
+type SessionRuntimePiProcessOptions = Omit<
+	PiProcessOptions,
+	| "payloadExternalizer"
+	| "onDecodedEvent"
+	| "onFutureDecodedEvent"
+	| "onFutureDecodedExtensionUiRequest"
+	| "onEvent"
+	| "onExtensionUiRequest"
+>;
+
+export interface RuntimeProductMap {
+	current: {
+		message: SessionMessageDto;
+		event: ProductSessionEventDto;
+		response: SessionCommandResponseDto;
+		snapshot: SessionSnapshotDto;
+		ref: SessionAttachmentRefDto;
+		externalizer: PiHostAttachmentPayloadExternalizer;
+		extensionRequest: ExtensionUiRequestDto;
+	};
+	future_content: {
+		message: FutureSessionMessageDto;
+		event: FutureProductSessionEventDto;
+		response: FutureSessionCommandResponseDto;
+		snapshot: FutureSessionSnapshotDto;
+		ref: EpochStoredContentRef;
+		externalizer: PiHostFuturePayloadExternalizer;
+		extensionRequest: FutureExtensionUiRequestDto;
+	};
+}
+
+export type SessionRuntimeProductMode = keyof RuntimeProductMap;
+type RuntimeMessage<M extends SessionRuntimeProductMode> = RuntimeProductMap[M]["message"];
+type RuntimeEvent<M extends SessionRuntimeProductMode> = RuntimeProductMap[M]["event"];
+type RuntimeResponse<M extends SessionRuntimeProductMode> = RuntimeProductMap[M]["response"];
+type RuntimeSnapshot<M extends SessionRuntimeProductMode> = RuntimeProductMap[M]["snapshot"];
+type RuntimeRef<M extends SessionRuntimeProductMode> = RuntimeProductMap[M]["ref"];
+type RuntimeExternalizer<M extends SessionRuntimeProductMode> = RuntimeProductMap[M]["externalizer"];
+type RuntimeExtensionRequest<M extends SessionRuntimeProductMode> = RuntimeProductMap[M]["extensionRequest"];
+
+export interface SessionRuntimePayloadCustody<M extends SessionRuntimeProductMode> {
+	readonly externalizer: RuntimeExternalizer<M>;
+	readonly releaseHold: (hold: EpochContentHold<RuntimeRef<M>>) => Promise<void>;
+}
+
+export interface SessionRuntimePiPayloadServices<M extends SessionRuntimeProductMode = "current">
+	extends SessionRuntimePayloadCustody<M> {
+	readonly mode: M;
+	readonly productSchema: SessionProductSchema<
+		RuntimeMessage<M>,
+		RuntimeEvent<M>,
+		RuntimeSnapshot<M>,
+		RuntimeExtensionRequest<M>
+	>;
+}
+
+export type CurrentSessionRuntimePiPayloadServices = SessionRuntimePiPayloadServices<"current">;
+export type FutureSessionRuntimePiPayloadServices = SessionRuntimePiPayloadServices<"future_content">;
+
+export type SessionRuntimeProductEvent<M extends SessionRuntimeProductMode> = RuntimeEvent<M>;
+export type SessionRuntimeProductExtensionRequest<M extends SessionRuntimeProductMode> =
+	RuntimeExtensionRequest<M>;
+export type SessionRuntimeProductResponse<M extends SessionRuntimeProductMode> = RuntimeResponse<M>;
+export type SessionRuntimeProductSnapshot<M extends SessionRuntimeProductMode> = RuntimeSnapshot<M>;
+
+export interface SessionRuntimeCoreOptions<M extends SessionRuntimeProductMode = "current"> {
 	serverEpoch: string;
 	target: SessionTarget;
 	resolved: ProbedPiRuntime;
@@ -140,23 +273,172 @@ export interface SessionRuntimeOptions {
 	extensionStateMaxItems?: number;
 	pendingDialogLimit?: number;
 	projectionLimits?: Partial<SessionLiveProjectionLimits>;
-	/** Server-private and default-off until Main installs the complete attachment pipeline. */
-	piPayloadServices?: SessionRuntimePiPayloadServices;
+	productAdapter: SessionRuntimeProductAdapter<M>;
+	payloadCustody?: SessionRuntimePayloadCustody<M>;
 	initialGeneration?: number;
 	commandTimeoutFor?: (commandType: string) => number;
-	emit: (message: SessionSupervisorMessage) => void;
-	onHotSetChanged?: (runtime: SessionRuntime) => void;
-	onCrash: (runtime: SessionRuntime) => void;
+	emit: (message: SessionSupervisorMessage<RuntimeEvent<M>, RuntimeExtensionRequest<M>>) => void;
+	onHotSetChanged?: (runtime: SessionRuntimeCore<M>) => void;
+	onCrash: (runtime: SessionRuntimeCore<M>) => void;
 	commitIdentityTransition: (
-		runtime: SessionRuntime,
-		transition: SessionIdentityTransitionCommit,
+		runtime: SessionRuntimeCore<M>,
+		transition: SessionIdentityTransitionCommit<RuntimeEvent<M>, RuntimeExtensionRequest<M>>,
 	) => Promise<void>;
 	log?: (level: "info" | "warn" | "error", message: string) => void;
 }
 
-export interface SessionRuntimePiPayloadServices {
-	readonly externalizer: PiHostPayloadExternalizer;
-	readonly releaseHold: (hold: EpochContentHold) => Promise<void>;
+export interface SessionRuntimeOptions
+	extends Omit<SessionRuntimeCoreOptions<"current">, "productAdapter" | "payloadCustody"> {
+	/** Legacy current-mode payload services; production future mode installs the typed pipeline. */
+	piPayloadServices?: CurrentSessionRuntimePiPayloadServices;
+}
+
+export interface FutureSessionRuntimeOptions
+	extends Omit<SessionRuntimeCoreOptions<"future_content">, "productAdapter" | "payloadCustody"> {
+	piPayloadServices: FutureSessionRuntimePiPayloadServices;
+}
+
+export function createCurrentSessionRuntimePiPayloadServices(input: {
+	externalizer: PiHostAttachmentPayloadExternalizer;
+	productSchema: SessionProductSchema;
+	releaseHold: (hold: EpochContentHold) => Promise<void>;
+}): CurrentSessionRuntimePiPayloadServices {
+	const services: CurrentSessionRuntimePiPayloadServices = {
+		mode: "current",
+		...input,
+	};
+	return Object.freeze(services);
+}
+
+export function createFutureSessionRuntimePiPayloadServices(input: {
+	externalizer: PiHostFuturePayloadExternalizer;
+	productSchema: SessionProductSchema<
+		FutureSessionMessageDto,
+		FutureProductSessionEventDto,
+		FutureSessionSnapshotDto,
+		FutureExtensionUiRequestDto
+	>;
+	releaseHold: (hold: EpochContentHold<EpochStoredContentRef>) => Promise<void>;
+}): FutureSessionRuntimePiPayloadServices {
+	const services: FutureSessionRuntimePiPayloadServices = {
+		mode: "future_content",
+		...input,
+	};
+	return Object.freeze(services);
+}
+
+export interface SessionRuntimeProductAdapter<M extends SessionRuntimeProductMode> {
+	readonly mode: M;
+	readonly productSchema: SessionProductSchema<
+		RuntimeMessage<M>,
+		RuntimeEvent<M>,
+		RuntimeSnapshot<M>,
+		RuntimeExtensionRequest<M>
+	>;
+	createProcess(
+		options: SessionRuntimePiProcessOptions,
+		payloadCustody: SessionRuntimePayloadCustody<M> | null,
+		consumeEvent: (
+			proc: PiProcess,
+			delivery: PiDecodedDelivery<RuntimeEvent<M>, RuntimeRef<M>>,
+		) => PiDecodedDeliveryPlan,
+		consumeExtensionRequest: (request: RuntimeExtensionRequest<M>) => void,
+		consumeFutureExtensionRequest: (
+			proc: PiProcess,
+			delivery: PiDecodedDelivery<FutureExtensionUiRequestDto, EpochStoredContentRef>,
+		) => PiDecodedDeliveryPlan,
+	): PiProcess;
+	sendDecoded(
+		proc: PiProcess,
+		command: SessionCommandDto,
+		consume: PiDecodedDeliveryConsumer<RuntimeResponse<M>, RuntimeRef<M>>,
+		timeoutMs: number,
+	): Promise<RuntimeResponse<M>>;
+	messagesFrom(response: RuntimeResponse<M>): readonly RuntimeMessage<M>[];
+	transitionResponseLogicalBytes(response: RuntimeResponse<M>): number;
+}
+
+function createCurrentProductAdapter(
+	productSchema: SessionProductSchema = createCurrentSessionProductSchema(),
+): SessionRuntimeProductAdapter<"current"> {
+	const adapter: SessionRuntimeProductAdapter<"current"> = {
+		mode: "current",
+		productSchema,
+		createProcess: (
+			options,
+			payloadCustody,
+			consumeEvent,
+			consumeExtensionRequest,
+			_consumeFutureExtensionRequest,
+		) => {
+			let owner: PiProcess | undefined;
+			const proc = new PiProcess({
+				...options,
+				...(payloadCustody ? { payloadExternalizer: payloadCustody.externalizer } : {}),
+				onDecodedEvent: (delivery) => {
+					if (!owner) throw new RpcError("event", "session_process_not_installed");
+					return consumeEvent(owner, delivery);
+				},
+				onExtensionUiRequest: consumeExtensionRequest,
+			});
+			owner = proc;
+			return proc;
+		},
+		sendDecoded: (proc, command, consume, timeoutMs) => proc.sendDecoded(command, consume, timeoutMs),
+		messagesFrom: (response) => expectCommandData(response, "get_messages").messages,
+		transitionResponseLogicalBytes: () => 0,
+	};
+	return Object.freeze(adapter);
+}
+
+function createFutureProductAdapter(
+	productSchema: SessionProductSchema<
+		FutureSessionMessageDto,
+		FutureProductSessionEventDto,
+		FutureSessionSnapshotDto,
+		FutureExtensionUiRequestDto
+	>,
+): SessionRuntimeProductAdapter<"future_content"> {
+	const adapter: SessionRuntimeProductAdapter<"future_content"> = {
+		mode: "future_content",
+		productSchema,
+		createProcess: (
+			options,
+			payloadCustody,
+			consumeEvent,
+			_consumeExtensionRequest,
+			consumeFutureExtensionRequest,
+		) => {
+			if (!payloadCustody) throw new TypeError("Future Session Runtime requires payload custody");
+			let owner: PiProcess | undefined;
+			const proc = new PiProcess({
+				...options,
+				payloadExternalizer: payloadCustody.externalizer,
+				onFutureDecodedEvent: (delivery) => {
+					if (!owner) throw new RpcError("event", "session_process_not_installed");
+					return consumeEvent(owner, delivery);
+				},
+				onFutureDecodedExtensionUiRequest: (delivery) => {
+					if (!owner) throw new RpcError("extension_ui_request", "session_process_not_installed");
+					return consumeFutureExtensionRequest(owner, delivery);
+				},
+			});
+			owner = proc;
+			return proc;
+		},
+		sendDecoded: (proc, command, consume, timeoutMs) => proc.sendFutureDecoded(command, consume, timeoutMs),
+		messagesFrom: (response) => {
+			if (response.success !== true || response.command !== "get_messages") {
+				throw new RpcError("get_messages", "unexpected Pi response");
+			}
+			return response.data.messages;
+		},
+		transitionResponseLogicalBytes: (response) =>
+			analyzeFutureSessionCommandResponseLogicalBytes(response, {
+				maxBytes: productSchema.maxActiveTurnLogicalBytes,
+			}).byteLength,
+	};
+	return Object.freeze(adapter);
 }
 
 /**
@@ -166,10 +448,12 @@ export interface SessionRuntimePiPayloadServices {
  * gives every emitted frame a generation-local sequence, and keeps a bounded
  * replay ring for reconnect. Session navigation is deliberately absent.
  */
-export class SessionRuntime {
+export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current"> {
+	private readonly productAdapter: SessionRuntimeProductAdapter<M>;
+	private readonly payloadCustody: SessionRuntimePayloadCustody<M> | null;
 	private readonly opts: Required<
 		Pick<
-			SessionRuntimeOptions,
+			SessionRuntimeCoreOptions<M>,
 			| "readyTimeoutMs"
 			| "replayLimit"
 			| "replayMaxBytes"
@@ -179,7 +463,7 @@ export class SessionRuntime {
 			| "pendingDialogLimit"
 		>
 	> &
-		SessionRuntimeOptions;
+		SessionRuntimeCoreOptions<M>;
 	private proc: PiProcess | null = null;
 	private startPromise: Promise<void> | null = null;
 	private stopPromise: Promise<void> | null = null;
@@ -188,21 +472,27 @@ export class SessionRuntime {
 	private processToken = 0;
 	private failedProcessToken: number | null = null;
 	private startupReady = false;
-	private startupFrames: BufferedFrame[] = [];
+	private startupFrames: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[] = [];
 	private startupFrameBytes = 0;
-	private transitionStage: TransitionStage | null = null;
-	private replay: SessionReplayFrame[] = [];
+	private transitionStage: TransitionStage<
+		RuntimeEvent<M>,
+		RuntimeExtensionRequest<M>,
+		RuntimeRef<M>
+	> | null = null;
+	private replay: SessionReplayFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[] = [];
 	private replayFrameBytes: number[] = [];
 	private replayBytes = 0;
 	private lastTransientSeq = 0;
-	private pendingDialogs = new Map<string, PendingDialog>();
+	private pendingDialogs = new Map<string, PendingDialog<RuntimeExtensionRequest<M>>>();
+	private extensionSemanticRevision = 0;
 	private pendingTurnReservations = new Map<symbol, PendingTurnReservation>();
 	private nextTurnReservationId = 0n;
 	private queueReservationReleaseCutoff = 0n;
-	private stickyExtension = new Map<string, ExtensionUiRequestDto>();
+	private stickyExtension = new Map<string, RuntimeExtensionRequest<M>>();
 	private activeQueueDepth = 0;
 	private activeTurnProjectionItems = 0;
 	private activeTurnProjectionBytes = 0;
+	private activeTurnProjectionLogicalBytes = 0;
 	private activeTurnHeadroomReserved = false;
 	private agentBusy = false;
 	private compactionBusy = false;
@@ -213,12 +503,16 @@ export class SessionRuntime {
 	private terminalProtocolIncompatible = false;
 	private sessionFileIdentityVerified = false;
 	private hasConversationIntent = false;
-	private liveProjection: SessionLiveProjection | null = null;
-	private generationContentOwner: GenerationContentOwner | null = null;
+	private liveProjection: SessionLiveProjection<
+		RuntimeMessage<M>,
+		RuntimeEvent<M>,
+		RuntimeExtensionRequest<M>
+	> | null = null;
+	private generationContentOwner: GenerationContentOwner<RuntimeRef<M>> | null = null;
 	private retainedCrashedContentOwner: {
 		processToken: number;
 		generation: number;
-		owner: GenerationContentOwner;
+		owner: GenerationContentOwner<RuntimeRef<M>>;
 	} | null = null;
 	private crashedRecoverable: boolean | null = null;
 	private snapshotOverflow = false;
@@ -226,8 +520,12 @@ export class SessionRuntime {
 	private discardedCompactionTransferCleanup: Promise<void> | null = null;
 	private retiredGenerationContentCleanup: Promise<void> | null = null;
 	private generationContentCleanupFailure: Error | null = null;
-	private deferredStartupEmits: SessionSupervisorMessage[] | null = null;
-	private deferredTransitionEmits: SessionSupervisorMessage[] | null = null;
+	private deferredStartupEmits:
+		| SessionSupervisorMessage<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[]
+		| null = null;
+	private deferredTransitionEmits:
+		| SessionSupervisorMessage<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[]
+		| null = null;
 
 	sessionHandle: string;
 	readonly workspaceId: string;
@@ -240,7 +538,9 @@ export class SessionRuntime {
 	lastActivityAt = Date.now();
 	error: string | undefined;
 
-	constructor(opts: SessionRuntimeOptions) {
+	constructor(opts: SessionRuntimeCoreOptions<M>) {
+		this.productAdapter = opts.productAdapter;
+		this.payloadCustody = opts.payloadCustody ?? null;
 		const target: SessionTarget = {
 			...opts.target,
 			cwd: canonicalizePathAllowMissing(opts.target.cwd),
@@ -263,12 +563,10 @@ export class SessionRuntime {
 			pendingDialogLimit: Math.max(0, opts.pendingDialogLimit ?? DEFAULT_PENDING_DIALOG_LIMIT),
 		};
 		if (
-			opts.piPayloadServices &&
-			(!isSessionAttachmentGuardContext(opts.piPayloadServices.externalizer.context) ||
-				opts.piPayloadServices.externalizer.context.serverEpoch !== opts.serverEpoch ||
-				typeof opts.piPayloadServices.releaseHold !== "function")
+			opts.productAdapter.productSchema.serverEpoch !== undefined &&
+			opts.productAdapter.productSchema.serverEpoch !== opts.serverEpoch
 		) {
-			throw new TypeError("Session Runtime Pi payload services are invalid");
+			throw new TypeError("Session Runtime product adapter epoch does not match");
 		}
 		this.sessionHandle = target.sessionHandle;
 		this.workspaceId = target.workspaceId;
@@ -462,11 +760,12 @@ export class SessionRuntime {
 		this.crashedRecoverable = null;
 		this.retainedCrashedContentOwner = null;
 		this.generation += 1;
-		const contentOwner = this.opts.piPayloadServices
+		const contentOwnership = this.payloadCustody;
+		const contentOwner = contentOwnership
 			? new GenerationContentOwner({
 					serverEpoch: this.opts.serverEpoch,
 					generation: this.generation,
-					release: this.opts.piPayloadServices.releaseHold,
+					release: contentOwnership.releaseHold,
 				})
 			: null;
 		this.generationContentOwner = contentOwner;
@@ -476,28 +775,29 @@ export class SessionRuntime {
 		this.startupReady = false;
 		this.startupFrames = [];
 		this.startupFrameBytes = 0;
+		this.activeTurnProjectionLogicalBytes = 0;
 		this.stickyExtension.clear();
+		this.extensionSemanticRevision = 0;
 		this.error = undefined;
 		this.setState("starting");
 
-		const proc: PiProcess = new PiProcess({
+		const processOptions: SessionRuntimePiProcessOptions = {
 			cwd: this.cwd,
 			resolved: this.opts.resolved,
 			args: this.spawnArguments(),
 			adapter: this.opts.resolved.adapter,
-			payloadExternalizer: this.opts.piPayloadServices?.externalizer,
 			env: this.opts.env,
 			readyTimeoutMs: this.opts.readyTimeoutMs,
 			onReady: (state) => this.handleReady(processToken, state),
-			...(contentOwner
-				? {
-						onDecodedEvent: (delivery: PiDecodedDelivery<ProductSessionEventDto>) =>
-							this.prepareDecodedEvent(processToken, proc, delivery),
-					}
-				: { onEvent: (event: ProductSessionEventDto) => this.handleEvent(processToken, event) }),
-			onExtensionUiRequest: (request) => this.handleExtensionRequest(processToken, request),
 			onExit: (info) => this.handleFailure(processToken, info),
-		});
+		};
+		const proc = this.productAdapter.createProcess(
+			processOptions,
+			this.payloadCustody,
+			(owner, delivery) => this.prepareDecodedEvent(processToken, owner, delivery),
+			(request) => this.handleExtensionRequest(processToken, request),
+			(owner, delivery) => this.prepareDecodedExtensionRequest(processToken, owner, delivery),
+		);
 		this.proc = proc;
 		if (contentOwner) this.observeGenerationContentFailure(processToken, proc, contentOwner);
 
@@ -508,7 +808,11 @@ export class SessionRuntime {
 			await this.initializeProjectionBase(processToken, proc);
 			this.deferredStartupEmits = [];
 			this.setState(this.pendingDialogs.size > 0 ? "waiting_ui" : "idle");
-			this.flushFrames(this.startupFrames);
+			if (this.productAdapter.mode === "future_content") {
+				this.flushPreparedFutureStartupFrames(this.startupFrames);
+			} else {
+				this.flushFrames(this.startupFrames);
+			}
 			this.startupFrames = [];
 			this.startupFrameBytes = 0;
 			this.assertWireSnapshotFits();
@@ -620,62 +924,105 @@ export class SessionRuntime {
 		processToken: number,
 		proc: PiProcess,
 		identity: SessionLiveProjectionIdentity,
+		candidateRuntime?: SessionRuntimeSnapshot,
 		candidateOwnership?: {
-			owner: GenerationContentOwner;
+			owner: GenerationContentOwner<RuntimeRef<M>>;
 			isCurrent: () => boolean;
 		},
-	): Promise<SessionLiveProjection> {
-		let preparedProjection: SessionLiveProjection | null = null;
+	): Promise<SessionLiveProjection<RuntimeMessage<M>, RuntimeEvent<M>, RuntimeExtensionRequest<M>>> {
+		let preparedProjection: SessionLiveProjection<
+			RuntimeMessage<M>,
+			RuntimeEvent<M>,
+			RuntimeExtensionRequest<M>
+		> | null = null;
 		const contentOwner = candidateOwnership?.owner ?? this.generationContentOwner;
 		const ownerIsCurrent =
 			candidateOwnership?.isCurrent ??
 			(() =>
-				this.opts.piPayloadServices
+				this.payloadCustody
 					? contentOwner !== null && this.isCurrentGenerationContentOwner(processToken, proc, contentOwner)
 					: processToken === this.processToken && this.proc === proc);
-		const consume: PiDecodedDeliveryConsumer<SessionCommandResponseDto> = (delivery) => {
-			const { messages } = expectCommandData(delivery.value, "get_messages");
-			const candidate = new SessionLiveProjection({
+		const consume: PiDecodedDeliveryConsumer<RuntimeResponse<M>, RuntimeRef<M>> = (delivery) => {
+			const messages = this.productAdapter.messagesFrom(delivery.value);
+			const startupCandidate =
+				this.productAdapter.mode === "future_content" &&
+				!this.startupReady &&
+				this.transitionStage === null &&
+				candidateOwnership === undefined;
+			const semanticRevision = this.extensionSemanticRevision;
+			const startupFrameCount = this.startupFrames.length;
+			const startupFrameBytes = this.startupFrameBytes;
+			const startupFrames = startupCandidate ? this.authoritativeFutureStartupFrames(this.startupFrames) : [];
+			const extensionState = {
+				pendingDialogs: new Map(this.pendingDialogs),
+				stickyExtension: new Map(this.stickyExtension),
+			};
+			const candidate = new SessionLiveProjection<
+				RuntimeMessage<M>,
+				RuntimeEvent<M>,
+				RuntimeExtensionRequest<M>
+			>({
 				identity,
 				settledMessages: messages,
 				baseSeq: 0,
-				runtimePhase: this.pendingDialogs.size > 0 ? "waiting_ui" : "idle",
+				runtimePhase: extensionState.pendingDialogs.size > 0 ? "waiting_ui" : "idle",
 				limits: this.opts.projectionLimits,
-				attachmentGuardContext: this.opts.piPayloadServices?.externalizer.context,
+				schema: this.productAdapter.productSchema,
 			});
+			const projectionSnapshot =
+				startupFrames.length > 0
+					? candidate.previewPreparedBatch(candidate.prepareBatch(identity, startupFrames, this.state))
+					: candidate.snapshot();
+			if (!projectionSnapshot) {
+				throw new RpcError("get_messages", "startup_projection_preview_stale");
+			}
+			const runtimeSnapshot: SessionRuntimeSnapshot = {
+				...(candidateRuntime ?? this.snapshot()),
+				lastSeq: projectionSnapshot.asOfSeq,
+			};
+			const candidateSnapshot = this.buildSessionSnapshotFromProjection(
+				projectionSnapshot,
+				runtimeSnapshot,
+				extensionState,
+			);
+			this.assertProductSnapshotCandidateFits(candidateSnapshot);
 			return delivery.prepare((transfer) => {
-				if (!contentOwner || !ownerIsCurrent()) {
+				if (!ownerIsCurrent()) {
 					throw new RpcError("get_messages", "session_generation_stale");
 				}
-				if (transfer) contentOwner.adopt(transfer);
+				if (
+					startupCandidate &&
+					(semanticRevision !== this.extensionSemanticRevision ||
+						startupFrameCount !== this.startupFrames.length ||
+						startupFrameBytes !== this.startupFrameBytes)
+				) {
+					throw new RpcError("get_messages", "startup_extension_state_changed_before_base_commit");
+				}
+				if (transfer) {
+					if (!contentOwner) throw new RpcError("get_messages", "unexpected_payload_transfer");
+					contentOwner.adopt(transfer);
+				}
 				preparedProjection = candidate;
 				return true;
 			});
 		};
-		const response = this.opts.piPayloadServices
-			? await proc.sendDecoded({ type: "get_messages" }, consume, this.timeoutFor("get_messages"))
-			: await proc.send({ type: "get_messages" }, this.timeoutFor("get_messages"));
+		await this.productAdapter.sendDecoded(
+			proc,
+			{ type: "get_messages" },
+			consume,
+			this.timeoutFor("get_messages"),
+		);
 		if (processToken !== this.processToken || this.proc !== proc || !ownerIsCurrent()) {
 			throw new RpcError("get_messages", "session_generation_stale");
 		}
-		const { messages } = expectCommandData(response, "get_messages");
-		if (this.opts.piPayloadServices) {
-			if (!preparedProjection) throw new RpcError("get_messages", "decoded_projection_not_committed");
-			return preparedProjection;
-		}
-		return new SessionLiveProjection({
-			identity,
-			settledMessages: messages,
-			baseSeq: 0,
-			runtimePhase: this.pendingDialogs.size > 0 ? "waiting_ui" : "idle",
-			limits: this.opts.projectionLimits,
-		});
+		if (!preparedProjection) throw new RpcError("get_messages", "decoded_projection_not_committed");
+		return preparedProjection;
 	}
 
 	private isCurrentGenerationContentOwner(
 		processToken: number,
 		proc: PiProcess,
-		owner: GenerationContentOwner,
+		owner: GenerationContentOwner<RuntimeRef<M>>,
 	): boolean {
 		return (
 			processToken === this.processToken &&
@@ -686,7 +1033,11 @@ export class SessionRuntime {
 		);
 	}
 
-	private isCurrentPayloadTransition(processToken: number, proc: PiProcess, stage: TransitionStage): boolean {
+	private isCurrentPayloadTransition(
+		processToken: number,
+		proc: PiProcess,
+		stage: TransitionStage<RuntimeEvent<M>, RuntimeExtensionRequest<M>, RuntimeRef<M>>,
+	): boolean {
 		return (
 			this.transitionStage === stage &&
 			stage.processToken === processToken &&
@@ -701,22 +1052,21 @@ export class SessionRuntime {
 		);
 	}
 
-	private prepareTransitionPayloadDelivery<T extends SessionCommandResponseDto>(
+	private prepareTransitionPayloadDelivery(
 		proc: PiProcess,
-		stage: TransitionStage,
-		delivery: PiDecodedDelivery<T>,
+		stage: TransitionStage<RuntimeEvent<M>, RuntimeExtensionRequest<M>, RuntimeRef<M>>,
+		delivery: PiDecodedDelivery<RuntimeResponse<M>, RuntimeRef<M>>,
 		commandType: string,
 	): PiDecodedDeliveryPlan {
 		if (!stage.payloadLedger || !this.isCurrentPayloadTransition(stage.processToken, proc, stage)) {
 			throw new RpcError(commandType, "session_generation_stale");
 		}
+		const logicalBytes = this.productAdapter.transitionResponseLogicalBytes(delivery.value);
 		return delivery.prepare((transfer) => {
 			if (!stage.payloadLedger || !this.isCurrentPayloadTransition(stage.processToken, proc, stage)) {
 				throw new RpcError(commandType, "session_generation_stale");
 			}
-			if (transfer) {
-				stage.payloadLedger.append({ transfer, bytes: payloadTransferBytes(transfer) });
-			}
+			stage.payloadLedger.admit({ transfer, logicalBytes });
 			return true;
 		});
 	}
@@ -724,8 +1074,8 @@ export class SessionRuntime {
 	private beginRetiredGenerationContentCleanup(
 		processToken: number,
 		proc: PiProcess,
-		currentOwner: GenerationContentOwner,
-		retiredOwner: GenerationContentOwner,
+		currentOwner: GenerationContentOwner<RuntimeRef<M>>,
+		retiredOwner: GenerationContentOwner<RuntimeRef<M>>,
 	): Promise<void> {
 		if (this.retiredGenerationContentCleanup) {
 			throw new RpcError("session_transition", "retired_generation_content_cleanup_busy");
@@ -758,7 +1108,7 @@ export class SessionRuntime {
 	private observeGenerationContentFailure(
 		processToken: number,
 		proc: PiProcess,
-		owner: GenerationContentOwner,
+		owner: GenerationContentOwner<RuntimeRef<M>>,
 	): void {
 		void owner.fatalCleanup.catch((error) => {
 			if (!this.isCurrentGenerationContentOwner(processToken, proc, owner)) return;
@@ -769,7 +1119,7 @@ export class SessionRuntime {
 	private observeRetainedGenerationContentFailure(
 		processToken: number,
 		generation: number,
-		owner: GenerationContentOwner,
+		owner: GenerationContentOwner<RuntimeRef<M>>,
 	): void {
 		void owner.fatalCleanup.catch((error) => {
 			const retained = this.retainedCrashedContentOwner;
@@ -810,7 +1160,7 @@ export class SessionRuntime {
 		expectedGeneration: number,
 		admit: () => void,
 		timeoutMs?: number,
-	): Promise<SessionCommandResponseDto> {
+	): Promise<RuntimeResponse<M>> {
 		const admitted = await this.withCommandAdmission(async () => {
 			this.assertGeneration(command.type, expectedGeneration);
 			admit();
@@ -837,27 +1187,31 @@ export class SessionRuntime {
 			if (commandCarriesConversation(command.type)) this.hasConversationIntent = true;
 			if (expectsWork) this.setState("running");
 			this.touch();
-			let response: Promise<SessionCommandResponseDto>;
+			let response: Promise<RuntimeResponse<M>>;
 			try {
 				const processToken = this.processToken;
 				const contentOwner = this.generationContentOwner;
-				response = this.opts.piPayloadServices
-					? proc.sendDecoded(
-							command,
-							(delivery) =>
-								delivery.prepare((transfer) => {
-									if (
-										!contentOwner ||
-										!this.isCurrentGenerationContentOwner(processToken, proc, contentOwner)
-									) {
-										throw new RpcError(command.type, "session_generation_stale");
-									}
-									if (transfer) contentOwner.adopt(transfer);
-									return true;
-								}),
-							timeoutMs ?? this.timeoutFor(command.type),
-						)
-					: proc.send(command, timeoutMs ?? this.timeoutFor(command.type));
+				response = this.productAdapter.sendDecoded(
+					proc,
+					command,
+					(delivery) =>
+						delivery.prepare((transfer) => {
+							if (processToken !== this.processToken || this.proc !== proc) {
+								throw new RpcError(command.type, "session_generation_stale");
+							}
+							if (transfer) {
+								if (
+									!contentOwner ||
+									!this.isCurrentGenerationContentOwner(processToken, proc, contentOwner)
+								) {
+									throw new RpcError(command.type, "session_generation_stale");
+								}
+								contentOwner.adopt(transfer);
+							}
+							return true;
+						}),
+					timeoutMs ?? this.timeoutFor(command.type),
+				);
 			} catch (error) {
 				this.inFlight = Math.max(0, this.inFlight - 1);
 				if (turnReservation) this.releasePendingTurn(turnReservation);
@@ -901,7 +1255,7 @@ export class SessionRuntime {
 		command: SessionCommandDto,
 		expectedGeneration: number,
 		admit: () => void,
-	): Promise<{ response: SessionCommandResponseDto; previousSessionHandle?: string }> {
+	): Promise<{ response: RuntimeResponse<M>; previousSessionHandle?: string }> {
 		return this.withCommandAdmission(async () => {
 			this.assertGeneration(command.type, expectedGeneration);
 			admit();
@@ -912,13 +1266,13 @@ export class SessionRuntime {
 			const processToken = this.processToken;
 			const parentOwner = this.generationContentOwner;
 			if (
-				this.opts.piPayloadServices &&
+				this.payloadCustody &&
 				(!parentOwner || !this.isCurrentGenerationContentOwner(processToken, proc, parentOwner))
 			) {
 				throw new RpcError(command.type, "session_generation_stale");
 			}
-			const payloadBudget = this.opts.piPayloadServices?.externalizer.context.payloadBudget;
-			const stage: TransitionStage = {
+			const payloadBudget = this.payloadCustody?.externalizer.context.payloadBudget;
+			const stage: TransitionStage<RuntimeEvent<M>, RuntimeExtensionRequest<M>, RuntimeRef<M>> = {
 				phase: "awaiting_response",
 				frames: [],
 				bytes: 0,
@@ -927,8 +1281,11 @@ export class SessionRuntime {
 				parentOwner,
 				payloadLedger: payloadBudget
 					? new TransitionPayloadLedger({
-							maxBytes: payloadBudget.maxAttachmentCacheBytes,
-							maxHoldItems: payloadBudget.maxAttachmentCacheItems,
+							serverEpoch: this.opts.serverEpoch,
+							maxPhysicalBytes: payloadBudget.maxAttachmentCacheBytes,
+							maxPhysicalItems: payloadBudget.maxAttachmentCacheItems,
+							maxHeldItems: payloadBudget.maxAttachmentCacheItems,
+							maxLogicalBytes: this.productAdapter.productSchema.maxActiveTurnLogicalBytes,
 						})
 					: null,
 				candidateOwner: null,
@@ -941,26 +1298,40 @@ export class SessionRuntime {
 			let identityCommitted = false;
 			let retiredParentCleanup: Promise<void> | null = null;
 			try {
-				const response = this.opts.piPayloadServices
-					? await proc.sendDecoded(
-							command,
-							(delivery) => this.prepareTransitionPayloadDelivery(proc, stage, delivery, command.type),
-							this.timeoutFor(command.type),
-						)
-					: await proc.send(command, this.timeoutFor(command.type));
+				const response = await this.productAdapter.sendDecoded(
+					proc,
+					command,
+					(delivery) =>
+						this.payloadCustody
+							? this.prepareTransitionPayloadDelivery(proc, stage, delivery, command.type)
+							: delivery.prepare((transfer) => {
+									if (transfer || processToken !== this.processToken || this.proc !== proc) {
+										throw new RpcError(command.type, "session_generation_stale");
+									}
+									return true;
+								}),
+					this.timeoutFor(command.type),
+				);
 				if (response.success !== true) {
 					parentIdentityConfirmed = true;
 					this.commitParentConfirmedTransition(proc, stage);
 					return { response };
 				}
 				stage.phase = "verifying";
-				const stateResponse = this.opts.piPayloadServices
-					? await proc.sendDecoded(
-							{ type: "get_state" },
-							(delivery) => this.prepareTransitionPayloadDelivery(proc, stage, delivery, "get_state"),
-							this.timeoutFor("get_state"),
-						)
-					: await proc.send({ type: "get_state" }, this.timeoutFor("get_state"));
+				const stateResponse = await this.productAdapter.sendDecoded(
+					proc,
+					{ type: "get_state" },
+					(delivery) =>
+						this.payloadCustody
+							? this.prepareTransitionPayloadDelivery(proc, stage, delivery, "get_state")
+							: delivery.prepare((transfer) => {
+									if (transfer || processToken !== this.processToken || this.proc !== proc) {
+										throw new RpcError("get_state", "session_generation_stale");
+									}
+									return true;
+								}),
+					this.timeoutFor("get_state"),
+				);
 				if (
 					stateResponse.success !== true ||
 					stateResponse.command !== "get_state" ||
@@ -989,11 +1360,11 @@ export class SessionRuntime {
 					workspaceId: nextTarget.workspaceId,
 					generation: this.generation + 1,
 				};
-				const childOwner = this.opts.piPayloadServices
+				const childOwner = this.payloadCustody
 					? new GenerationContentOwner({
 							serverEpoch: this.opts.serverEpoch,
 							generation: childIdentity.generation,
-							release: this.opts.piPayloadServices.releaseHold,
+							release: this.payloadCustody.releaseHold,
 						})
 					: null;
 				stage.candidateOwner = childOwner;
@@ -1008,6 +1379,7 @@ export class SessionRuntime {
 					processToken,
 					proc,
 					childIdentity,
+					this.transitionRuntimeSnapshot(nextTarget, childIdentity, transition.frozenFile !== null),
 					childOwner
 						? {
 								owner: childOwner,
@@ -1029,7 +1401,7 @@ export class SessionRuntime {
 							processToken !== this.processToken ||
 							this.proc !== proc ||
 							!proc.running ||
-							(this.opts.piPayloadServices &&
+							(this.payloadCustody &&
 								(!childOwner ||
 									stage.candidateOwner !== childOwner ||
 									stage.candidateOwnerFailure !== undefined ||
@@ -1158,15 +1530,44 @@ export class SessionRuntime {
 		this.clearPendingTurnReservations();
 		this.activeTurnProjectionItems = 0;
 		this.activeTurnProjectionBytes = 0;
+		this.activeTurnProjectionLogicalBytes = 0;
 		this.activeTurnHeadroomReserved = false;
 		this.error = undefined;
 		this.state = this.pendingDialogs.size > 0 ? "waiting_ui" : "idle";
 		this.touch();
 	}
 
-	getReplay(requestedHandle: string, cursor?: ReplayCursor): ReplayResult {
+	private transitionRuntimeSnapshot(
+		target: ExistingSessionTarget,
+		identity: SessionLiveProjectionIdentity,
+		recoverable: boolean,
+	): SessionRuntimeSnapshot {
+		return {
+			serverEpoch: identity.serverEpoch,
+			sessionHandle: identity.sessionHandle,
+			workspaceId: identity.workspaceId,
+			nativeSessionId: target.nativeSessionId,
+			sessionFile: target.sessionFile,
+			cwd: target.cwd,
+			generation: identity.generation,
+			lastSeq: 0,
+			state: this.pendingDialogs.size > 0 ? "waiting_ui" : "idle",
+			lastActivityAt: this.lastActivityAt,
+			recoverable,
+		};
+	}
+
+	getReplay(
+		requestedHandle: string,
+		cursor?: ReplayCursor,
+	): ReplayResult<RuntimeEvent<M>, SessionRuntimeProductSnapshot<M>, RuntimeExtensionRequest<M>> {
 		const runtime = this.snapshot();
-		const resync = (reason: Extract<ReplayResult, { type: "resync_required" }>["reason"]): ReplayResult => ({
+		const resync = (
+			reason: Extract<
+				ReplayResult<RuntimeEvent<M>, SessionRuntimeProductSnapshot<M>, RuntimeExtensionRequest<M>>,
+				{ type: "resync_required" }
+			>["reason"],
+		): ReplayResult<RuntimeEvent<M>, SessionRuntimeProductSnapshot<M>, RuntimeExtensionRequest<M>> => ({
 			type: "resync_required",
 			runtime,
 			reason,
@@ -1188,20 +1589,48 @@ export class SessionRuntime {
 		};
 	}
 
-	sessionSnapshot(): SessionSnapshotDto {
+	sessionSnapshot(): SessionRuntimeProductSnapshot<M> {
 		const snapshot = this.buildSessionSnapshot();
-		if (!isSessionSnapshotDto(snapshot, this.opts.piPayloadServices?.externalizer.context)) {
+		if (!this.isProductSnapshot(snapshot)) {
+			this.terminalizeSnapshotOverflow();
+			throw new RpcError("session_snapshot", "session_snapshot_overflow");
+		}
+		try {
+			this.productAdapter.productSchema.snapshotLogicalBytes(snapshot);
+		} catch {
 			this.terminalizeSnapshotOverflow();
 			throw new RpcError("session_snapshot", "session_snapshot_overflow");
 		}
 		return snapshot;
 	}
 
-	private buildSessionSnapshot(): unknown {
-		const projection = this.liveProjection?.snapshot();
+	private buildSessionSnapshot(
+		source: SessionLiveProjection<
+			RuntimeMessage<M>,
+			RuntimeEvent<M>,
+			RuntimeExtensionRequest<M>
+		> | null = this.liveProjection,
+		runtime: SessionRuntimeSnapshot = this.snapshot(),
+		extensionState: {
+			pendingDialogs: ReadonlyMap<string, PendingDialog<RuntimeExtensionRequest<M>>>;
+			stickyExtension: ReadonlyMap<string, RuntimeExtensionRequest<M>>;
+		} = { pendingDialogs: this.pendingDialogs, stickyExtension: this.stickyExtension },
+	): unknown {
+		const projection = source?.snapshot();
 		if (!projection || projection.asOfSeq !== this.lastSeq) {
 			throw new RpcError("session_snapshot", "session_snapshot_unavailable");
 		}
+		return this.buildSessionSnapshotFromProjection(projection, runtime, extensionState);
+	}
+
+	private buildSessionSnapshotFromProjection(
+		projection: SessionLiveProjectionSnapshot<RuntimeMessage<M>, RuntimeEvent<M>, RuntimeExtensionRequest<M>>,
+		runtime: SessionRuntimeSnapshot = this.snapshot(),
+		extensionState: {
+			pendingDialogs: ReadonlyMap<string, PendingDialog<RuntimeExtensionRequest<M>>>;
+			stickyExtension: ReadonlyMap<string, RuntimeExtensionRequest<M>>;
+		} = { pendingDialogs: this.pendingDialogs, stickyExtension: this.stickyExtension },
+	): unknown {
 		return structuredClone({
 			type: "session_snapshot" as const,
 			snapshotId: randomUUID(),
@@ -1211,18 +1640,36 @@ export class SessionRuntime {
 			generation: projection.generation,
 			baseSeq: projection.baseSeq,
 			asOfSeq: projection.asOfSeq,
-			runtime: { ...this.snapshot(), state: projection.runtimePhase },
+			runtime: { ...runtime, state: projection.runtimePhase },
 			settledMessages: projection.settledMessages,
 			projectionEvents: projection.projectionEvents,
 			queue: projection.queue,
-			pendingExtensionRequests: [...this.pendingDialogs.values()].map((entry) => entry.request),
-			stickyExtensionState: [...this.stickyExtension.values()],
+			pendingExtensionRequests: [...extensionState.pendingDialogs.values()].map((entry) => entry.request),
+			stickyExtensionState: [...extensionState.stickyExtension.values()],
 		});
 	}
 
+	private assertProductSnapshotCandidateFits(candidateSnapshot: unknown): void {
+		if (!this.productAdapter.productSchema.guardSnapshot(candidateSnapshot)) {
+			throw new SessionLiveProjectionLimitError("snapshot");
+		}
+		try {
+			this.productAdapter.productSchema.snapshotLogicalBytes(candidateSnapshot);
+		} catch {
+			throw new SessionLiveProjectionLimitError("snapshot");
+		}
+	}
+
 	private assertWireSnapshotFits(): void {
-		if (isSessionSnapshotDto(this.buildSessionSnapshot(), this.opts.piPayloadServices?.externalizer.context))
-			return;
+		const snapshot = this.buildSessionSnapshot();
+		if (this.isProductSnapshot(snapshot)) {
+			try {
+				this.productAdapter.productSchema.snapshotLogicalBytes(snapshot);
+				return;
+			} catch {
+				// Fall through to the existing terminal overflow path.
+			}
+		}
 		if (this.startupReady) this.terminalizeSnapshotOverflow();
 		else {
 			this.snapshotOverflow = true;
@@ -1231,7 +1678,11 @@ export class SessionRuntime {
 		throw new RpcError("session_snapshot", "session_snapshot_overflow");
 	}
 
-	getPendingExtensionRequests(): ExtensionUiRequestDto[] {
+	private isProductSnapshot(value: unknown): value is SessionRuntimeProductSnapshot<M> {
+		return this.productAdapter.productSchema.guardSnapshot(value);
+	}
+
+	getPendingExtensionRequests(): RuntimeExtensionRequest<M>[] {
 		const pending = [...this.pendingDialogs.values()].map((entry) => entry.request);
 		return [...this.stickyExtension.values(), ...pending];
 	}
@@ -1269,7 +1720,7 @@ export class SessionRuntime {
 		this.retiredGenerationContentCleanup = null;
 		this.opts.onHotSetChanged?.(this);
 		this.clearOwnedOperationalState(!this.snapshotOverflow);
-		if (this.opts.piPayloadServices) this.liveProjection = null;
+		if (this.payloadCustody) this.liveProjection = null;
 		let stopping!: Promise<void>;
 		stopping = (async () => {
 			try {
@@ -1302,20 +1753,27 @@ export class SessionRuntime {
 		return stopping;
 	}
 
-	private handleEvent(processToken: number, event: ProductSessionEventDto): void {
-		if (processToken !== this.processToken) return;
-		this.verifyMaterializedSessionFile();
-		this.enqueueFrame({ type: "event", event });
-	}
-
 	private prepareDecodedEvent(
 		processToken: number,
 		proc: PiProcess,
-		delivery: PiDecodedDelivery<ProductSessionEventDto>,
+		delivery: PiDecodedDelivery<RuntimeEvent<M>, RuntimeRef<M>>,
 	): PiDecodedDeliveryPlan {
 		const transition = this.transitionStage;
 		const commitMaterializedIdentity = this.inspectMaterializedSessionFile();
-		const frame: BufferedFrame = { type: "event", event: delivery.value };
+		const frame: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>> = {
+			type: "event",
+			event: delivery.value,
+		};
+		if (!this.payloadCustody) {
+			return delivery.prepare((transfer) => {
+				if (transfer || processToken !== this.processToken || this.proc !== proc) {
+					throw new RpcError("event", "session_generation_stale");
+				}
+				if (commitMaterializedIdentity) this.sessionFileIdentityVerified = true;
+				this.enqueueFrame(frame);
+				return true;
+			});
+		}
 		if (transition?.payloadLedger && transition.phase !== "applying") {
 			if (!this.isCurrentPayloadTransition(processToken, proc, transition)) {
 				throw new RpcError("event", "session_generation_stale");
@@ -1326,16 +1784,12 @@ export class SessionRuntime {
 				throw new RpcError("session_transition", "transition_frame_buffer_limit_exceeded");
 			}
 			const nextFrames = [...transition.frames, frame];
+			const logicalBytes = this.productAdapter.productSchema.activeTurnEventLogicalBytes(frame.event);
 			return delivery.prepare((transfer) => {
 				if (!this.isCurrentPayloadTransition(processToken, proc, transition)) {
 					throw new RpcError("event", "session_generation_stale");
 				}
-				if (transfer) {
-					transition.payloadLedger!.append({
-						transfer,
-						bytes: payloadTransferBytes(transfer),
-					});
-				}
+				transition.payloadLedger!.admit({ transfer, logicalBytes });
 				if (commitMaterializedIdentity) this.sessionFileIdentityVerified = true;
 				transition.frames = nextFrames;
 				transition.bytes = nextBytes;
@@ -1386,8 +1840,8 @@ export class SessionRuntime {
 	}
 
 	private prepareActiveEventPublication(
-		frame: Extract<BufferedFrame, { type: "event" }>,
-	): PreparedActiveEventPublication {
+		frame: Extract<BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>, { type: "event" }>,
+	): PreparedActiveEventPublication<RuntimeMessage<M>, RuntimeEvent<M>, RuntimeExtensionRequest<M>> {
 		const projection = this.liveProjection;
 		if (!projection) throw new RpcError("session_snapshot", "session_snapshot_unavailable");
 		const reset = !this.agentBusy && eventStartsWork(frame.event);
@@ -1403,7 +1857,14 @@ export class SessionRuntime {
 		} catch (error) {
 			throw this.normalizeProjectionError(error);
 		}
-		const envelope: SessionReplayFrame = {
+		const logicalContribution = projection.activeTurnEventLogicalBytes(frame.event);
+		const logicalBase = reset ? 0 : this.activeTurnProjectionLogicalBytes;
+		const maxLogicalBytes = projection.maxActiveTurnLogicalBytes();
+		if (logicalContribution > maxLogicalBytes - logicalBase) {
+			throw this.normalizeProjectionError(new SessionLiveProjectionLimitError("live_events"));
+		}
+		const logicalBytes = logicalBase + logicalContribution;
+		const envelope: SessionReplayFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>> = {
 			...frame,
 			serverEpoch: this.opts.serverEpoch,
 			sessionHandle: this.sessionHandle,
@@ -1412,6 +1873,12 @@ export class SessionRuntime {
 			seq: token.nextSeq,
 		};
 		const envelopeBytes = Buffer.byteLength(JSON.stringify(envelope));
+		if (
+			this.productAdapter.mode === "future_content" &&
+			envelopeBytes > this.productAdapter.productSchema.maxReplayFrameWireBytes
+		) {
+			throw this.normalizeProjectionError(new SessionLiveProjectionLimitError("live_events"));
+		}
 		const replay = [...this.replay, envelope];
 		const replayFrameBytes = [...this.replayFrameBytes, envelopeBytes];
 		let replayBytes = this.replayBytes + envelopeBytes;
@@ -1429,14 +1896,16 @@ export class SessionRuntime {
 			token,
 			frame,
 			envelope,
-			turnBudget: { items, bytes },
+			turnBudget: { items, bytes, logicalBytes },
 			replay,
 			replayFrameBytes,
 			replayBytes,
 		};
 	}
 
-	private commitActiveEventPublication(prepared: PreparedActiveEventPublication): void {
+	private commitActiveEventPublication(
+		prepared: PreparedActiveEventPublication<RuntimeMessage<M>, RuntimeEvent<M>, RuntimeExtensionRequest<M>>,
+	): void {
 		if (this.liveProjection !== prepared.projection) {
 			throw new RpcError("event", "session_projection_changed_before_commit");
 		}
@@ -1446,6 +1915,7 @@ export class SessionRuntime {
 		}
 		this.activeTurnProjectionItems = prepared.turnBudget.items;
 		this.activeTurnProjectionBytes = prepared.turnBudget.bytes;
+		this.activeTurnProjectionLogicalBytes = prepared.turnBudget.logicalBytes;
 		this.replay = prepared.replay;
 		this.replayFrameBytes = prepared.replayFrameBytes;
 		this.replayBytes = prepared.replayBytes;
@@ -1458,7 +1928,7 @@ export class SessionRuntime {
 	private terminalizeGenerationContentFailure(
 		processToken: number,
 		proc: PiProcess,
-		owner: GenerationContentOwner,
+		owner: GenerationContentOwner<RuntimeRef<M>>,
 		error: unknown,
 	): void {
 		if (!this.isCurrentGenerationContentOwner(processToken, proc, owner)) return;
@@ -1517,7 +1987,7 @@ export class SessionRuntime {
 		return cleanup;
 	}
 
-	private applyEventState(event: ProductSessionEventDto): void {
+	private applyEventState(event: RuntimeEvent<M>): void {
 		if (event.type === "queue_update") {
 			const previousQueueDepth = this.activeQueueDepth;
 			this.activeQueueDepth = event.steering.length + event.followUp.length;
@@ -1548,6 +2018,7 @@ export class SessionRuntime {
 			this.agentBusy = false;
 			this.activeTurnProjectionItems = 0;
 			this.activeTurnProjectionBytes = 0;
+			this.activeTurnProjectionLogicalBytes = 0;
 			this.activeTurnHeadroomReserved = false;
 			if (this.activeQueueDepth === 0 && this.queueReservationReleaseCutoff > 0n) {
 				this.releasePendingTurnsThrough(this.queueReservationReleaseCutoff);
@@ -1559,9 +2030,15 @@ export class SessionRuntime {
 		if (this.state === "idle") this.maybeCompactIdleProjectionBase();
 	}
 
-	private handleExtensionRequest(processToken: number, request: ExtensionUiRequestDto): void {
+	private handleExtensionRequest(processToken: number, request: RuntimeExtensionRequest<M>): void {
 		if (processToken !== this.processToken) return;
 		this.verifyMaterializedSessionFile();
+		if (this.productAdapter.mode === "current" && this.startupReady && !this.transitionStage) {
+			this.commitExtensionSemanticOperation(
+				this.prepareExtensionRequestSemanticOperation(processToken, request),
+			);
+			return;
+		}
 		if (BLOCKING_DIALOG_METHODS.has(request.method)) {
 			const publishImmediately =
 				this.transitionStage?.phase === "awaiting_response" || this.transitionStage?.phase === "applying";
@@ -1573,6 +2050,230 @@ export class SessionRuntime {
 			}
 		}
 		this.enqueueFrame({ type: "extension_ui_request", request });
+	}
+
+	private prepareDecodedExtensionRequest(
+		processToken: number,
+		proc: PiProcess,
+		delivery: PiDecodedDelivery<FutureExtensionUiRequestDto, EpochStoredContentRef>,
+	): PiDecodedDeliveryPlan {
+		const owner = this.generationContentOwner;
+		if (this.productAdapter.mode !== "future_content" || !owner) {
+			return delivery.prepare((_transfer) => {
+				throw new RpcError("extension_ui_request", "future_extension_generation_owner_unavailable");
+			});
+		}
+		if (!this.startupReady && this.transitionStage === null) {
+			const prepared = this.prepareStartupExtensionOperation(processToken, delivery.value);
+			return delivery.prepare((transfer) => {
+				if (!this.isCurrentGenerationContentOwner(processToken, proc, owner)) {
+					throw new RpcError("extension_ui_request", "session_generation_stale");
+				}
+				if (!futureExtensionTransferMatches(delivery.value, transfer)) {
+					this.manuallyStopped = true;
+					throw new RpcError("extension_ui_request", "future_extension_payload_ref_mismatch");
+				}
+				if (!this.startupExtensionOperationEligible(prepared)) {
+					this.manuallyStopped = true;
+					throw new RpcError("extension_ui_request", "extension_semantic_operation_stale");
+				}
+				if (transfer) owner.adopt(transfer);
+				this.commitStartupExtensionOperation(prepared);
+				return true;
+			});
+		}
+		if (this.transitionStage !== null) {
+			const transitionStage = this.transitionStage;
+			if (transitionStage.phase !== "applying" && futureExtensionStagesDuringTransition(delivery.value)) {
+				if (
+					!transitionStage.payloadLedger ||
+					!this.isCurrentPayloadTransition(processToken, proc, transitionStage)
+				) {
+					throw new RpcError("extension_ui_request", "session_generation_stale");
+				}
+				const frame: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>> = {
+					type: "extension_ui_request",
+					request: delivery.value,
+				};
+				const frameBytes = bufferedFrameBytes(frame);
+				const nextBytes = transitionStage.bytes + frameBytes;
+				if (nextBytes > this.opts.transientBufferMaxBytes) {
+					throw new RpcError("session_transition", "transition_frame_buffer_limit_exceeded");
+				}
+				const nextFrames = [...transitionStage.frames, frame];
+				const logicalBytes = this.productAdapter.productSchema.extensionRequestLogicalBytes(delivery.value);
+				return delivery.prepare((transfer) => {
+					if (
+						this.transitionStage !== transitionStage ||
+						transitionStage.phase === "applying" ||
+						!transitionStage.payloadLedger ||
+						!this.isCurrentPayloadTransition(processToken, proc, transitionStage)
+					) {
+						throw new RpcError("extension_ui_request", "session_generation_stale");
+					}
+					if (!futureExtensionTransferMatches(delivery.value, transfer)) {
+						this.manuallyStopped = true;
+						throw new RpcError("extension_ui_request", "future_extension_payload_ref_mismatch");
+					}
+					transitionStage.payloadLedger.admit({ transfer, logicalBytes });
+					transitionStage.frames = nextFrames;
+					transitionStage.bytes = nextBytes;
+					this.touch();
+					return true;
+				});
+			}
+			if (transitionStage.phase === "applying") {
+				// The verified child generation is already authoritative. Reuse the
+				// normal owner/admission path instead of creating a second transition store.
+			} else {
+				return delivery.prepare((transfer) => {
+					if (!this.isCurrentGenerationContentOwner(processToken, proc, owner)) {
+						throw new RpcError("extension_ui_request", "session_generation_stale");
+					}
+					if (
+						this.startupReady &&
+						this.transitionStage === transitionStage &&
+						transitionStage?.phase === "awaiting_response" &&
+						BLOCKING_DIALOG_METHODS.has(delivery.value.method) &&
+						futureExtensionRequestRefs(delivery.value).length === 0 &&
+						transfer === null
+					) {
+						this.handleExtensionRequest(processToken, delivery.value);
+						return true;
+					}
+					this.manuallyStopped = true;
+					throw new RpcError("extension_ui_request", "future_extension_delivery_phase_unsupported");
+				});
+			}
+		}
+		this.verifyMaterializedSessionFile();
+		const prepared = this.prepareExtensionRequestSemanticOperation(processToken, delivery.value);
+		return delivery.prepare((transfer) => {
+			if (!this.isCurrentGenerationContentOwner(processToken, proc, owner)) {
+				throw new RpcError("extension_ui_request", "session_generation_stale");
+			}
+			if (!futureExtensionTransferMatches(delivery.value, transfer)) {
+				this.manuallyStopped = true;
+				throw new RpcError("extension_ui_request", "future_extension_payload_ref_mismatch");
+			}
+			if (!this.extensionSemanticOperationEligible(prepared)) {
+				this.manuallyStopped = true;
+				throw new RpcError("extension_ui_request", "extension_semantic_operation_stale");
+			}
+			if (transfer) owner.adopt(transfer);
+			try {
+				this.commitExtensionSemanticOperation(prepared);
+			} catch (error) {
+				this.terminalizeGenerationContentFailure(processToken, proc, owner, error);
+			}
+			return true;
+		});
+	}
+
+	private prepareStartupExtensionOperation(
+		processToken: number,
+		request: RuntimeExtensionRequest<M>,
+	): PreparedStartupExtensionOperation<RuntimeEvent<M>, RuntimeExtensionRequest<M>> {
+		const replaced = BLOCKING_DIALOG_METHODS.has(request.method)
+			? this.pendingDialogs.get(request.id)
+			: undefined;
+		const plan = this.planExtensionRequestSemanticMutation(request, false);
+		const retainedStartupFrames = replaced
+			? this.startupFrames.filter(
+					(frame) => frame.type !== "extension_ui_request" || frame.request !== replaced.request,
+				)
+			: this.startupFrames;
+		let startupFrameBytes = 0;
+		try {
+			let extensionLogicalBytes = 0;
+			for (const entry of plan.pendingDialogs.values()) {
+				const logicalBytes = this.productAdapter.productSchema.extensionRequestLogicalBytes(entry.request);
+				if (
+					logicalBytes >
+					this.productAdapter.productSchema.maxSnapshotLogicalBytes - extensionLogicalBytes
+				) {
+					throw new SessionLiveProjectionLimitError("extension_state");
+				}
+				extensionLogicalBytes += logicalBytes;
+			}
+			for (const stickyRequest of plan.stickyExtension.values()) {
+				const logicalBytes = this.productAdapter.productSchema.extensionRequestLogicalBytes(stickyRequest);
+				if (
+					logicalBytes >
+					this.productAdapter.productSchema.maxSnapshotLogicalBytes - extensionLogicalBytes
+				) {
+					throw new SessionLiveProjectionLimitError("extension_state");
+				}
+				extensionLogicalBytes += logicalBytes;
+			}
+			for (const frame of [...retainedStartupFrames, ...plan.frames]) {
+				if (frame.type === "extension_ui_request") {
+					this.productAdapter.productSchema.extensionRequestLogicalBytes(frame.request);
+				}
+				const frameBytes = bufferedFrameBytes(frame);
+				if (frameBytes > this.opts.transientBufferMaxBytes - startupFrameBytes) {
+					throw new RpcError("session_start", "startup_frame_buffer_limit_exceeded");
+				}
+				startupFrameBytes += frameBytes;
+			}
+		} catch (error) {
+			if (
+				error instanceof SessionProductSchemaLogicalError ||
+				error instanceof SessionLiveProjectionLimitError
+			) {
+				throw this.normalizeProjectionError(new SessionLiveProjectionLimitError("extension_state"));
+			}
+			throw error;
+		}
+		return {
+			...plan,
+			processToken,
+			semanticRevision: this.extensionSemanticRevision,
+			startupFrameCount: this.startupFrames.length,
+			startupFrameBytesBefore: this.startupFrameBytes,
+			startupFrames: [...retainedStartupFrames, ...plan.frames],
+			startupFrameBytes,
+		};
+	}
+
+	private startupExtensionOperationEligible(
+		prepared: PreparedStartupExtensionOperation<RuntimeEvent<M>, RuntimeExtensionRequest<M>>,
+	): boolean {
+		return (
+			prepared.processToken === this.processToken &&
+			!this.startupReady &&
+			this.transitionStage === null &&
+			this.liveProjection === null &&
+			prepared.semanticRevision === this.extensionSemanticRevision &&
+			prepared.startupFrameCount === this.startupFrames.length &&
+			prepared.startupFrameBytesBefore === this.startupFrameBytes
+		);
+	}
+
+	private commitStartupExtensionOperation(
+		prepared: PreparedStartupExtensionOperation<RuntimeEvent<M>, RuntimeExtensionRequest<M>>,
+	): void {
+		this.pendingDialogs = prepared.pendingDialogs;
+		this.stickyExtension = prepared.stickyExtension;
+		this.startupFrames = prepared.startupFrames;
+		this.startupFrameBytes = prepared.startupFrameBytes;
+		this.extensionSemanticRevision += 1;
+		this.touch();
+		for (const entry of prepared.timersToClear) {
+			this.runCommittedExtensionEffect("clear startup dialog timer", () => {
+				if (entry.timer) clearTimeout(entry.timer);
+			});
+		}
+		for (const entry of prepared.timersToArm) {
+			this.runCommittedExtensionEffect("arm startup dialog timer", () =>
+				this.armDialogTimer(prepared.processToken, entry),
+			);
+		}
+		if (prepared.warnOversizedSticky) {
+			this.runCommittedExtensionEffect("log oversized startup sticky Extension state", () =>
+				this.log("warn", `Dropping oversized sticky extension state for ${this.sessionHandle}`),
+			);
+		}
 	}
 
 	private verifyMaterializedSessionFile(): void {
@@ -1593,7 +2294,310 @@ export class SessionRuntime {
 		return true;
 	}
 
-	private trackDialog(request: ExtensionUiRequestDto, processToken: number, publishState: boolean): void {
+	private prepareExtensionRequestSemanticOperation(
+		processToken: number,
+		request: RuntimeExtensionRequest<M>,
+	): PreparedExtensionSemanticOperation<RuntimeMessage<M>, RuntimeEvent<M>, RuntimeExtensionRequest<M>> {
+		return this.prepareExtensionSemanticOperation({
+			processToken,
+			...this.planExtensionRequestSemanticMutation(request),
+		});
+	}
+
+	private planExtensionRequestSemanticMutation(
+		request: RuntimeExtensionRequest<M>,
+		publishReplacedClose = true,
+		extensionState: {
+			pendingDialogs: ReadonlyMap<string, PendingDialog<RuntimeExtensionRequest<M>>>;
+			stickyExtension: ReadonlyMap<string, RuntimeExtensionRequest<M>>;
+		} = { pendingDialogs: this.pendingDialogs, stickyExtension: this.stickyExtension },
+	): ExtensionSemanticPlan<RuntimeEvent<M>, RuntimeExtensionRequest<M>> {
+		const pendingDialogs = new Map(extensionState.pendingDialogs);
+		const stickyExtension = new Map(extensionState.stickyExtension);
+		const frames: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[] = [];
+		const timersToClear: PendingDialog<RuntimeExtensionRequest<M>>[] = [];
+		const timersToArm: PendingDialog<RuntimeExtensionRequest<M>>[] = [];
+		let warnOversizedSticky = false;
+
+		if (BLOCKING_DIALOG_METHODS.has(request.method)) {
+			const replaced = pendingDialogs.get(request.id);
+			if (replaced) {
+				pendingDialogs.delete(request.id);
+				timersToClear.push(replaced);
+				if (publishReplacedClose) {
+					frames.push({ type: "extension_ui_closed", requestId: request.id, reason: "replaced" });
+				}
+			}
+			const entry: PendingDialog<RuntimeExtensionRequest<M>> = { request, timer: null };
+			pendingDialogs.set(request.id, entry);
+			if (
+				pendingDialogs.size > this.opts.pendingDialogLimit ||
+				!this.extensionStateMapsFit(pendingDialogs, stickyExtension)
+			) {
+				throw new RpcError("extension_ui_request", "pending_dialog_state_limit_exceeded");
+			}
+			timersToArm.push(entry);
+			frames.push({ type: "extension_ui_request", request });
+		} else if (STICKY_EXTENSION_METHODS.has(request.method)) {
+			const key = stickyRequestKey(request);
+			if (stickyRequestClearsState(request)) {
+				stickyExtension.delete(key);
+				frames.push({ type: "extension_ui_request", request });
+			} else {
+				stickyExtension.delete(key);
+				while (stickyExtension.size > 0) {
+					stickyExtension.set(key, request);
+					if (this.extensionStateMapsFit(pendingDialogs, stickyExtension)) break;
+					stickyExtension.delete(key);
+					const oldestKey = stickyExtension.keys().next().value;
+					if (typeof oldestKey !== "string") break;
+					const oldest = stickyExtension.get(oldestKey);
+					if (!oldest) break;
+					stickyExtension.delete(oldestKey);
+					frames.push({ type: "extension_ui_request", request: this.stickyClearRequest(oldest) });
+				}
+				stickyExtension.set(key, request);
+				if (!this.extensionStateMapsFit(pendingDialogs, stickyExtension)) {
+					stickyExtension.delete(key);
+					frames.push({ type: "extension_ui_request", request: this.stickyClearRequest(request) });
+					warnOversizedSticky = true;
+				} else {
+					frames.push({ type: "extension_ui_request", request });
+				}
+			}
+		} else {
+			frames.push({ type: "extension_ui_request", request });
+		}
+
+		return {
+			frames,
+			pendingDialogs,
+			stickyExtension,
+			timersToClear,
+			timersToArm,
+			warnOversizedSticky,
+		};
+	}
+
+	private prepareExtensionCloseSemanticOperation(
+		processToken: number,
+		requestId: string,
+		reason: Extract<
+			BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>,
+			{ type: "extension_ui_closed" }
+		>["reason"],
+		dialog: PendingDialog<RuntimeExtensionRequest<M>>,
+	): PreparedExtensionSemanticOperation<RuntimeMessage<M>, RuntimeEvent<M>, RuntimeExtensionRequest<M>> {
+		const pendingDialogs = new Map(this.pendingDialogs);
+		pendingDialogs.delete(requestId);
+		return this.prepareExtensionSemanticOperation({
+			processToken,
+			frames: [{ type: "extension_ui_closed", requestId, reason }],
+			pendingDialogs,
+			stickyExtension: new Map(this.stickyExtension),
+			timersToClear: [dialog],
+			timersToArm: [],
+			warnOversizedSticky: false,
+		});
+	}
+
+	private prepareExtensionSemanticOperation(input: {
+		processToken: number;
+		frames: readonly BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[];
+		pendingDialogs: Map<string, PendingDialog<RuntimeExtensionRequest<M>>>;
+		stickyExtension: Map<string, RuntimeExtensionRequest<M>>;
+		timersToClear: readonly PendingDialog<RuntimeExtensionRequest<M>>[];
+		timersToArm: readonly PendingDialog<RuntimeExtensionRequest<M>>[];
+		warnOversizedSticky: boolean;
+	}): PreparedExtensionSemanticOperation<RuntimeMessage<M>, RuntimeEvent<M>, RuntimeExtensionRequest<M>> {
+		const projection = this.liveProjection;
+		if (!projection) throw new RpcError("session_snapshot", "session_snapshot_unavailable");
+		try {
+			const token = projection.prepareBatch(this.projectionIdentity(), input.frames, this.state);
+			const candidateProjection = projection.previewPreparedBatch(token);
+			if (!candidateProjection) {
+				throw new RpcError("extension_ui_request", "extension_projection_prepare_stale");
+			}
+			const candidateRuntime: SessionRuntimeSnapshot = {
+				...this.snapshot(),
+				lastSeq: token.lastSeq,
+			};
+			this.assertProductSnapshotCandidateFits(
+				this.buildSessionSnapshotFromProjection(candidateProjection, candidateRuntime, {
+					pendingDialogs: input.pendingDialogs,
+					stickyExtension: input.stickyExtension,
+				}),
+			);
+			const envelopes: SessionReplayFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[] = [];
+			for (const [index, frame] of input.frames.entries()) {
+				envelopes.push({
+					...frame,
+					serverEpoch: this.opts.serverEpoch,
+					sessionHandle: this.sessionHandle,
+					workspaceId: this.workspaceId,
+					generation: this.generation,
+					seq: token.firstSeq + index,
+				});
+			}
+			const replay = [...this.replay];
+			const replayFrameBytes = [...this.replayFrameBytes];
+			let replayBytes = this.replayBytes;
+			let lastTransientSeq = this.lastTransientSeq;
+			for (const [index, frame] of input.frames.entries()) {
+				const envelope = envelopes[index];
+				if (!envelope) throw new RpcError("extension_ui_request", "extension_envelope_missing");
+				const bytes = Buffer.byteLength(JSON.stringify(envelope));
+				if (isReplayableFrame(frame)) {
+					replay.push(envelope);
+					replayFrameBytes.push(bytes);
+					replayBytes += bytes;
+				} else {
+					lastTransientSeq = envelope.seq;
+				}
+			}
+			let removeCount = 0;
+			while (replay.length - removeCount > this.opts.replayLimit || replayBytes > this.opts.replayMaxBytes) {
+				replayBytes -= replayFrameBytes[removeCount] ?? 0;
+				removeCount += 1;
+			}
+			if (removeCount > 0) {
+				replay.splice(0, removeCount);
+				replayFrameBytes.splice(0, removeCount);
+			}
+			return {
+				projection,
+				token,
+				semanticRevision: this.extensionSemanticRevision,
+				envelopes,
+				replay,
+				replayFrameBytes,
+				replayBytes,
+				lastTransientSeq,
+				pendingDialogs: input.pendingDialogs,
+				stickyExtension: input.stickyExtension,
+				timersToClear: input.timersToClear,
+				timersToArm: input.timersToArm,
+				processToken: input.processToken,
+				warnOversizedSticky: input.warnOversizedSticky,
+			};
+		} catch (error) {
+			if (error instanceof SessionLiveProjectionLimitError) {
+				throw this.normalizeProjectionError(error);
+			}
+			throw error;
+		}
+	}
+
+	private commitExtensionSemanticOperation(
+		prepared: PreparedExtensionSemanticOperation<
+			RuntimeMessage<M>,
+			RuntimeEvent<M>,
+			RuntimeExtensionRequest<M>
+		>,
+	): void {
+		if (!this.extensionSemanticOperationEligible(prepared)) {
+			throw new RpcError("extension_ui_request", "extension_semantic_operation_stale");
+		}
+		const committed = prepared.projection.commitPreparedBatch(prepared.token);
+		if (committed === null || committed !== prepared.token.lastSeq) {
+			throw new RpcError("extension_ui_request", "extension_projection_commit_invariant_failed");
+		}
+		this.pendingDialogs = prepared.pendingDialogs;
+		this.stickyExtension = prepared.stickyExtension;
+		this.extensionSemanticRevision += 1;
+		this.replay = prepared.replay;
+		this.replayFrameBytes = prepared.replayFrameBytes;
+		this.replayBytes = prepared.replayBytes;
+		this.lastTransientSeq = prepared.lastTransientSeq;
+		this.lastSeq = prepared.token.lastSeq;
+		const stateChanged = prepared.pendingDialogs.size > 0 && this.state !== "waiting_ui";
+		if (stateChanged) this.state = "waiting_ui";
+		this.touch();
+
+		for (const entry of prepared.timersToClear) {
+			this.runCommittedExtensionEffect("clear dialog timer", () => {
+				if (entry.timer) clearTimeout(entry.timer);
+			});
+		}
+		for (const entry of prepared.timersToArm) {
+			this.runCommittedExtensionEffect("arm dialog timer", () =>
+				this.armDialogTimer(prepared.processToken, entry),
+			);
+		}
+		if (stateChanged) {
+			this.runCommittedExtensionEffect("refresh hot Runtime inventory", () =>
+				this.opts.onHotSetChanged?.(this),
+			);
+			this.runCommittedExtensionEffect("publish waiting Extension state", () =>
+				this.emitSupervisorMessage({ type: "runtime_state", runtime: this.snapshot() }),
+			);
+		}
+		for (const envelope of prepared.envelopes) {
+			this.runCommittedExtensionEffect("publish Extension frame", () => this.emitSupervisorMessage(envelope));
+		}
+		if (prepared.warnOversizedSticky) {
+			this.runCommittedExtensionEffect("log oversized sticky Extension state", () =>
+				this.log("warn", `Dropping oversized sticky extension state for ${this.sessionHandle}`),
+			);
+		}
+	}
+
+	private extensionSemanticOperationEligible(
+		prepared: PreparedExtensionSemanticOperation<
+			RuntimeMessage<M>,
+			RuntimeEvent<M>,
+			RuntimeExtensionRequest<M>
+		>,
+	): boolean {
+		return (
+			prepared.processToken === this.processToken &&
+			this.liveProjection === prepared.projection &&
+			prepared.semanticRevision === this.extensionSemanticRevision &&
+			prepared.projection.previewPreparedBatch(prepared.token) !== null
+		);
+	}
+
+	private runCommittedExtensionEffect(label: string, effect: () => void): void {
+		try {
+			effect();
+		} catch {
+			try {
+				this.log("error", `Committed Extension effect failed: ${label}`);
+			} catch {
+				// A committed projection cannot be rolled back because an observer failed.
+			}
+		}
+	}
+
+	private armDialogTimer(processToken: number, entry: PendingDialog<RuntimeExtensionRequest<M>>): void {
+		const request = entry.request;
+		const timeout =
+			"timeout" in request && typeof request.timeout === "number" && request.timeout > 0
+				? request.timeout
+				: undefined;
+		if (!timeout) return;
+		entry.timer = setTimeout(() => this.expireDialog(processToken, request.id, entry), timeout);
+		entry.timer.unref?.();
+	}
+
+	private extensionStateMapsFit(
+		pendingDialogs: ReadonlyMap<string, PendingDialog<RuntimeExtensionRequest<M>>>,
+		stickyExtension: ReadonlyMap<string, RuntimeExtensionRequest<M>>,
+	): boolean {
+		let bytes = 0;
+		for (const request of stickyExtension.values()) bytes += extensionRequestBytes(request);
+		for (const { request } of pendingDialogs.values()) bytes += extensionRequestBytes(request);
+		return (
+			bytes <= this.opts.extensionStateMaxBytes &&
+			pendingDialogs.size + stickyExtension.size <= this.opts.extensionStateMaxItems
+		);
+	}
+
+	private trackDialog(
+		request: RuntimeExtensionRequest<M>,
+		processToken: number,
+		publishState: boolean,
+	): void {
 		this.closeDialog(request.id, "replaced");
 		const requestBytes = extensionRequestBytes(request);
 		if (
@@ -1606,9 +2610,13 @@ export class SessionRuntime {
 			"timeout" in request && typeof request.timeout === "number" && request.timeout > 0
 				? request.timeout
 				: undefined;
-		const timer = timeout ? setTimeout(() => this.expireDialog(processToken, request.id), timeout) : null;
-		timer?.unref?.();
-		this.pendingDialogs.set(request.id, { request, timer });
+		const entry: PendingDialog<RuntimeExtensionRequest<M>> = { request, timer: null };
+		if (timeout) {
+			entry.timer = setTimeout(() => this.expireDialog(processToken, request.id, entry), timeout);
+			entry.timer.unref?.();
+		}
+		this.pendingDialogs.set(request.id, entry);
+		this.extensionSemanticRevision += 1;
 		if (publishState) this.setState("waiting_ui");
 	}
 
@@ -1626,7 +2634,7 @@ export class SessionRuntime {
 		return bytes;
 	}
 
-	private enqueueFrame(frame: BufferedFrame): void {
+	private enqueueFrame(frame: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>): void {
 		this.touch();
 		const bytes = bufferedFrameBytes(frame);
 		if (!this.startupReady) {
@@ -1652,7 +2660,7 @@ export class SessionRuntime {
 		this.publishFrame(frame);
 	}
 
-	private flushFrames(frames: BufferedFrame[]): void {
+	private flushFrames(frames: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[]): void {
 		for (const frame of frames) {
 			if (
 				frame.type === "extension_ui_request" &&
@@ -1665,7 +2673,34 @@ export class SessionRuntime {
 		}
 	}
 
-	private publishFrame(frame: BufferedFrame): void {
+	private flushPreparedFutureStartupFrames(
+		frames: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[],
+	): void {
+		for (const frame of this.authoritativeFutureStartupFrames(frames)) {
+			if (frame.type === "event") {
+				this.publishFrame(frame);
+			} else {
+				this.emitFrame(frame);
+			}
+		}
+	}
+
+	private authoritativeFutureStartupFrames(
+		frames: readonly BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[],
+	): BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[] {
+		return frames.filter(
+			(frame) =>
+				frame.type !== "extension_ui_request" ||
+				!BLOCKING_DIALOG_METHODS.has(frame.request.method) ||
+				this.pendingDialogs.get(frame.request.id)?.request === frame.request,
+		);
+	}
+
+	private publishFrame(frame: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>): void {
+		if (frame.type === "event") {
+			this.commitActiveEventPublication(this.prepareActiveEventPublication(frame));
+			return;
+		}
 		if (frame.type === "extension_ui_request" && STICKY_EXTENSION_METHODS.has(frame.request.method)) {
 			this.publishStickyRequest(frame.request);
 			return;
@@ -1674,11 +2709,12 @@ export class SessionRuntime {
 		this.applyFrameState(frame);
 	}
 
-	private publishStickyRequest(request: ExtensionUiRequestDto): void {
+	private publishStickyRequest(request: RuntimeExtensionRequest<M>): void {
 		const key = stickyRequestKey(request);
 		if (stickyRequestClearsState(request)) {
 			this.emitFrame({ type: "extension_ui_request", request }, () => {
 				this.stickyExtension.delete(key);
+				this.extensionSemanticRevision += 1;
 			});
 			return;
 		}
@@ -1691,14 +2727,16 @@ export class SessionRuntime {
 			if (!oldestKey) break;
 			const oldest = candidate.get(oldestKey);
 			if (!oldest) break;
-			this.emitFrame({ type: "extension_ui_request", request: stickyClearRequest(oldest) }, () => {
+			this.emitFrame({ type: "extension_ui_request", request: this.stickyClearRequest(oldest) }, () => {
 				this.stickyExtension.delete(oldestKey);
+				this.extensionSemanticRevision += 1;
 			});
 			candidate.delete(oldestKey);
 		}
 		if (!this.extensionStateCandidateFits(candidate, requestBytes, 1)) {
-			this.emitFrame({ type: "extension_ui_request", request: stickyClearRequest(request) }, () => {
+			this.emitFrame({ type: "extension_ui_request", request: this.stickyClearRequest(request) }, () => {
 				this.stickyExtension.delete(key);
+				this.extensionSemanticRevision += 1;
 			});
 			this.log("warn", `Dropping oversized sticky extension state for ${this.sessionHandle}`);
 			return;
@@ -1706,11 +2744,26 @@ export class SessionRuntime {
 		this.emitFrame({ type: "extension_ui_request", request }, () => {
 			this.stickyExtension.delete(key);
 			this.stickyExtension.set(key, request);
+			this.extensionSemanticRevision += 1;
 		});
 	}
 
+	private stickyClearRequest(request: RuntimeExtensionRequest<M>): RuntimeExtensionRequest<M> {
+		const id = `evicted:${randomUUID()}`;
+		let candidate: unknown;
+		if (request.method === "setStatus") candidate = { ...request, id, statusText: undefined };
+		else if (request.method === "setWidget") candidate = { ...request, id, widgetLines: undefined };
+		else if (request.method === "setTitle") candidate = { ...request, id, title: "" };
+		else if (request.method === "set_editor_text") candidate = { ...request, id, text: "" };
+		else throw new RpcError("extension_ui_request", "invalid_sticky_extension_method");
+		if (!this.productAdapter.productSchema.guardExtensionRequest(candidate)) {
+			throw new RpcError("extension_ui_request", "invalid_sticky_extension_clear");
+		}
+		return candidate;
+	}
+
 	private extensionStateCandidateFits(
-		sticky: ReadonlyMap<string, ExtensionUiRequestDto>,
+		sticky: ReadonlyMap<string, RuntimeExtensionRequest<M>>,
 		extraBytes: number,
 		extraItems: number,
 	): boolean {
@@ -1723,7 +2776,7 @@ export class SessionRuntime {
 		);
 	}
 
-	private applyFrameState(frame: BufferedFrame): void {
+	private applyFrameState(frame: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>): void {
 		if (frame.type === "event") {
 			this.applyEventState(frame.event);
 			return;
@@ -1741,19 +2794,26 @@ export class SessionRuntime {
 		this.transitionStage.bytes = 0;
 	}
 
-	private commitParentConfirmedTransition(proc: PiProcess, stage: TransitionStage): void {
+	private commitParentConfirmedTransition(
+		proc: PiProcess,
+		stage: TransitionStage<RuntimeEvent<M>, RuntimeExtensionRequest<M>, RuntimeRef<M>>,
+	): void {
 		if (stage.payloadLedger) {
 			if (!stage.parentOwner || !this.isCurrentPayloadTransition(stage.processToken, proc, stage)) {
 				throw new RpcError("session_transition", "session_generation_stale");
 			}
 			stage.payloadLedger.drainTo(stage.parentOwner);
 		}
-		this.flushTransitionFrames();
+		if (this.productAdapter.mode === "future_content") {
+			for (const message of this.commitTransitionFrames()) this.emitSupervisorMessage(message);
+		} else {
+			this.flushTransitionFrames();
+		}
 	}
 
 	private releaseTransitionStagePayloads(
-		stage: TransitionStage | null,
-		currentOwner: GenerationContentOwner | null,
+		stage: TransitionStage<RuntimeEvent<M>, RuntimeExtensionRequest<M>, RuntimeRef<M>> | null,
+		currentOwner: GenerationContentOwner<RuntimeRef<M>> | null,
 	): Promise<void> | undefined {
 		if (!stage) return undefined;
 		const attempts: Promise<void>[] = [];
@@ -1782,20 +2842,135 @@ export class SessionRuntime {
 		});
 	}
 
-	private commitTransitionFrames(): SessionSupervisorMessage[] {
+	private commitTransitionFrames(): SessionSupervisorMessage<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[] {
 		if (this.deferredTransitionEmits) {
 			throw new RpcError("session_transition", "transition_frame_commit_reentered");
 		}
 		this.deferredTransitionEmits = [];
 		try {
-			this.flushTransitionFrames();
+			if (this.productAdapter.mode === "future_content") {
+				try {
+					const stage = this.transitionStage;
+					if (!stage) throw new RpcError("session_transition", "session_generation_stale");
+					if (stage.frames.length === 0) return this.deferredTransitionEmits;
+					const plan = this.expandFutureTransitionSemanticPlan(stage);
+					const turnBudget = this.prepareTransitionTurnBudget(plan.frames);
+					const prepared = this.prepareExtensionSemanticOperation({
+						processToken: stage.processToken,
+						...plan,
+					});
+					this.commitExtensionSemanticOperation(prepared);
+					for (const frame of plan.frames) {
+						if (frame.type === "event") this.applyFrameState(frame);
+					}
+					this.activeTurnProjectionItems = turnBudget.items;
+					this.activeTurnProjectionBytes = turnBudget.bytes;
+					this.activeTurnProjectionLogicalBytes = turnBudget.logicalBytes;
+					stage.frames = [];
+					stage.bytes = 0;
+				} catch (error) {
+					throw this.normalizeProjectionError(error);
+				}
+			} else {
+				this.flushTransitionFrames();
+			}
 			return this.deferredTransitionEmits;
 		} finally {
 			this.deferredTransitionEmits = null;
 		}
 	}
 
-	private emitFrame(frame: BufferedFrame, afterProjectionCommit?: () => void): void {
+	private expandFutureTransitionSemanticPlan(
+		stage: TransitionStage<RuntimeEvent<M>, RuntimeExtensionRequest<M>, RuntimeRef<M>>,
+	): ExtensionSemanticPlan<RuntimeEvent<M>, RuntimeExtensionRequest<M>> {
+		let pendingDialogs = new Map(this.pendingDialogs);
+		let stickyExtension = new Map(this.stickyExtension);
+		const frames: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[] = [];
+		const timersToClear: PendingDialog<RuntimeExtensionRequest<M>>[] = [];
+		const timersToArm: PendingDialog<RuntimeExtensionRequest<M>>[] = [];
+		let warnOversizedSticky = false;
+		let bytes = 0;
+		for (const frame of stage.frames) {
+			if (frame.type === "extension_ui_request") {
+				const plan = this.planExtensionRequestSemanticMutation(frame.request, true, {
+					pendingDialogs,
+					stickyExtension,
+				});
+				pendingDialogs = plan.pendingDialogs;
+				stickyExtension = plan.stickyExtension;
+				timersToClear.push(...plan.timersToClear);
+				timersToArm.push(...plan.timersToArm);
+				warnOversizedSticky ||= plan.warnOversizedSticky;
+				for (const expanded of plan.frames) {
+					const frameBytes = bufferedFrameBytes(expanded);
+					if (frameBytes > this.opts.transientBufferMaxBytes - bytes) {
+						throw new RpcError("session_transition", "transition_frame_buffer_limit_exceeded");
+					}
+					bytes += frameBytes;
+					frames.push(expanded);
+				}
+				continue;
+			}
+			const frameBytes = bufferedFrameBytes(frame);
+			if (frameBytes > this.opts.transientBufferMaxBytes - bytes) {
+				throw new RpcError("session_transition", "transition_frame_buffer_limit_exceeded");
+			}
+			bytes += frameBytes;
+			frames.push(frame);
+		}
+		return {
+			frames,
+			pendingDialogs,
+			stickyExtension,
+			timersToClear,
+			timersToArm,
+			warnOversizedSticky,
+		};
+	}
+
+	private prepareTransitionTurnBudget(
+		frames: readonly BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[],
+	): { items: number; bytes: number; logicalBytes: number } {
+		const projection = this.liveProjection;
+		if (!projection) throw new RpcError("session_transition", "session_snapshot_unavailable");
+		let items = this.activeTurnProjectionItems;
+		let bytes = this.activeTurnProjectionBytes;
+		let logicalBytes = this.activeTurnProjectionLogicalBytes;
+		let agentBusy = this.agentBusy;
+		const limit = projection.activeTurnBudget();
+		const maxLogicalBytes = projection.maxActiveTurnLogicalBytes();
+		for (const frame of frames) {
+			if (frame.type !== "event") continue;
+			const reset = !agentBusy && eventStartsWork(frame.event);
+			items = (reset ? 0 : items) + 1;
+			bytes = (reset ? 0 : bytes) + projection.activeTurnEventBytes(frame.event);
+			const logicalContribution = projection.activeTurnEventLogicalBytes(frame.event);
+			const logicalBase = reset ? 0 : logicalBytes;
+			if (
+				items > limit.maxItems ||
+				bytes > limit.maxBytes ||
+				logicalContribution > maxLogicalBytes - logicalBase
+			) {
+				throw new SessionLiveProjectionLimitError("live_events");
+			}
+			logicalBytes = logicalBase + logicalContribution;
+			if (eventStartsWork(frame.event)) agentBusy = true;
+			if (eventSettlesWork(frame.event)) {
+				agentBusy = false;
+				items = 0;
+				bytes = 0;
+				logicalBytes = 0;
+			} else if (frame.event.type === "compaction_end" && frame.event.willRetry) {
+				agentBusy = true;
+			}
+		}
+		return { items, bytes, logicalBytes };
+	}
+
+	private emitFrame(
+		frame: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>,
+		afterProjectionCommit?: () => void,
+	): void {
 		const projection = this.liveProjection;
 		if (!projection) throw new RpcError("session_snapshot", "session_snapshot_unavailable");
 		let seq: number;
@@ -1812,15 +2987,11 @@ export class SessionRuntime {
 				}
 				turnBudget = { items, bytes };
 			}
-			if (this.opts.piPayloadServices) {
-				const committed = projection.commitPrepared(
-					projection.prepareCommit(this.projectionIdentity(), frame, this.state),
-				);
-				if (committed === null) throw new SessionLiveProjectionLimitError("snapshot");
-				seq = committed;
-			} else {
-				seq = projection.commitInlineOnly(this.projectionIdentity(), frame, this.state);
-			}
+			const committed = projection.commitPrepared(
+				projection.prepareCommit(this.projectionIdentity(), frame, this.state),
+			);
+			if (committed === null) throw new SessionLiveProjectionLimitError("snapshot");
+			seq = committed;
 		} catch (error) {
 			throw this.normalizeProjectionError(error);
 		}
@@ -1869,9 +3040,9 @@ export class SessionRuntime {
 		const recoveryTarget = this.rebuildTarget();
 		const recoverableCrash = recoveryTarget !== null;
 		const unexpectedLeaderCrash = info.reason === undefined && (info.code !== null || info.signal !== null);
-		this.crashedRecoverable = this.opts.piPayloadServices ? recoverableCrash : null;
+		this.crashedRecoverable = this.payloadCustody ? recoverableCrash : null;
 		let retainContent =
-			this.opts.piPayloadServices !== undefined &&
+			this.payloadCustody !== null &&
 			contentOwner !== null &&
 			unexpectedLeaderCrash &&
 			!recoverableCrash &&
@@ -1898,7 +3069,7 @@ export class SessionRuntime {
 		this.opts.onHotSetChanged?.(this);
 		this.finishProcessFinalization();
 		this.clearOwnedOperationalState(retainContent ? false : !this.snapshotOverflow);
-		if (this.opts.piPayloadServices && !retainContent) this.liveProjection = null;
+		if (this.payloadCustody && !retainContent) this.liveProjection = null;
 		this.terminalProtocolIncompatible = info.reason === "protocol_incompatible";
 		this.error = this.snapshotOverflow
 			? "session_snapshot_overflow"
@@ -1941,14 +3112,26 @@ export class SessionRuntime {
 
 	private closeDialog(
 		requestId: string,
-		reason: Extract<BufferedFrame, { type: "extension_ui_closed" }>["reason"],
+		reason: Extract<
+			BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>,
+			{ type: "extension_ui_closed" }
+		>["reason"],
 		emit = true,
 	): void {
 		const dialog = this.pendingDialogs.get(requestId);
 		if (!dialog) return;
+		if (emit && this.productAdapter.mode === "current" && this.startupReady && !this.transitionStage) {
+			this.commitExtensionSemanticOperation(
+				this.prepareExtensionCloseSemanticOperation(this.processToken, requestId, reason, dialog),
+			);
+			return;
+		}
 		const commitClose = () => {
 			if (dialog.timer) clearTimeout(dialog.timer);
-			this.pendingDialogs.delete(requestId);
+			if (this.pendingDialogs.get(requestId) === dialog) {
+				this.pendingDialogs.delete(requestId);
+				this.extensionSemanticRevision += 1;
+			}
 		};
 		if (emit && this.startupReady) {
 			this.emitFrame({ type: "extension_ui_closed", requestId, reason }, commitClose);
@@ -1958,14 +3141,26 @@ export class SessionRuntime {
 	}
 
 	private closeAllDialogs(
-		reason: Extract<BufferedFrame, { type: "extension_ui_closed" }>["reason"],
+		reason: Extract<
+			BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>,
+			{ type: "extension_ui_closed" }
+		>["reason"],
 		emit = true,
 	): void {
 		for (const requestId of [...this.pendingDialogs.keys()]) this.closeDialog(requestId, reason, emit);
 	}
 
-	private expireDialog(processToken: number, requestId: string): void {
-		if (processToken !== this.processToken || !this.pendingDialogs.has(requestId)) return;
+	private expireDialog(
+		processToken: number,
+		requestId: string,
+		expectedEntry?: PendingDialog<RuntimeExtensionRequest<M>>,
+	): void {
+		if (
+			processToken !== this.processToken ||
+			!this.pendingDialogs.has(requestId) ||
+			(expectedEntry !== undefined && this.pendingDialogs.get(requestId) !== expectedEntry)
+		)
+			return;
 		this.closeDialog(requestId, "expired");
 		if (this.proc?.running) {
 			this.proc.sendNoResponse({ type: "extension_ui_response", id: requestId, cancelled: true });
@@ -2028,51 +3223,60 @@ export class SessionRuntime {
 		const contentOwner = this.generationContentOwner;
 		let compaction!: Promise<void>;
 		compaction = (async () => {
-			if (this.opts.piPayloadServices) {
-				let committed = false;
-				await proc.sendDecoded(
-					{ type: "get_messages" },
-					(delivery) => {
-						const { messages } = expectCommandData(delivery.value, "get_messages");
-						const prepared =
-							contentOwner &&
-							this.isCurrentGenerationContentOwner(processToken, proc, contentOwner) &&
-							this.liveProjection === projection
-								? projection.prepareIdleBaseCompaction(token, messages)
-								: null;
-						return delivery.prepare((transfer) => {
-							if (
-								!prepared ||
-								!contentOwner ||
-								!this.isCurrentGenerationContentOwner(processToken, proc, contentOwner) ||
-								this.liveProjection !== projection
-							) {
+			let committed = false;
+			await this.productAdapter.sendDecoded(
+				proc,
+				{ type: "get_messages" },
+				(delivery) => {
+					const messages = this.productAdapter.messagesFrom(delivery.value);
+					const ownershipCurrent = contentOwner
+						? this.isCurrentGenerationContentOwner(processToken, proc, contentOwner)
+						: !this.payloadCustody && processToken === this.processToken && this.proc === proc;
+					const prepared =
+						ownershipCurrent && this.liveProjection === projection
+							? projection.prepareIdleBaseCompaction(token, messages)
+							: null;
+					return delivery.prepare((transfer) => {
+						const stillCurrent = contentOwner
+							? this.isCurrentGenerationContentOwner(processToken, proc, contentOwner)
+							: !this.payloadCustody && processToken === this.processToken && this.proc === proc;
+						if (!prepared || !stillCurrent || this.liveProjection !== projection) {
+							this.trackDiscardedCompactionTransfer(processToken, proc, contentOwner, transfer);
+							return true;
+						}
+						if (this.productAdapter.mode === "future_content") {
+							const candidateProjection = projection.previewPreparedIdleBaseCompaction(prepared);
+							if (!candidateProjection) {
 								this.trackDiscardedCompactionTransfer(processToken, proc, contentOwner, transfer);
 								return true;
 							}
-							if (transfer) contentOwner.adopt(transfer);
-							try {
-								if (!projection.commitPreparedIdleBaseCompaction(prepared)) {
-									throw new RpcError("get_messages", "session_compaction_commit_invariant_failed");
-								}
-								this.assertWireSnapshotFits();
-								committed = true;
-							} catch (error) {
-								this.terminalizeGenerationContentFailure(processToken, proc, contentOwner, error);
+							this.assertProductSnapshotCandidateFits(
+								this.buildSessionSnapshotFromProjection(candidateProjection),
+							);
+						}
+						if (transfer) {
+							if (!contentOwner) throw new RpcError("get_messages", "unexpected_payload_transfer");
+							contentOwner.adopt(transfer);
+						}
+						try {
+							if (!projection.commitPreparedIdleBaseCompaction(prepared)) {
+								throw new RpcError("get_messages", "session_compaction_commit_invariant_failed");
 							}
-							return true;
-						});
-					},
-					this.timeoutFor("get_messages"),
-				);
-				if (!committed) return;
-				return;
-			}
-			const response = await proc.send({ type: "get_messages" }, this.timeoutFor("get_messages"));
-			if (processToken !== this.processToken || this.proc !== proc || this.liveProjection !== projection)
-				return;
-			const { messages } = expectCommandData(response, "get_messages");
-			if (projection.commitIdleBaseCompactionInlineOnly(token, messages)) this.assertWireSnapshotFits();
+							if (this.productAdapter.mode !== "future_content") this.assertWireSnapshotFits();
+							committed = true;
+						} catch (error) {
+							if (contentOwner) {
+								this.terminalizeGenerationContentFailure(processToken, proc, contentOwner, error);
+							} else {
+								throw error;
+							}
+						}
+						return true;
+					});
+				},
+				this.timeoutFor("get_messages"),
+			);
+			if (!committed) return;
 		})()
 			.catch((error) => {
 				const normalized = this.normalizeProjectionError(error);
@@ -2093,8 +3297,8 @@ export class SessionRuntime {
 	private trackDiscardedCompactionTransfer(
 		processToken: number,
 		proc: PiProcess,
-		owner: GenerationContentOwner | null,
-		transfer: PiPayloadLeaseTransfer | null,
+		owner: GenerationContentOwner<RuntimeRef<M>> | null,
+		transfer: PiPayloadLeaseTransfer<RuntimeRef<M>> | null,
 	): void {
 		if (!transfer) return;
 		if (this.discardedCompactionTransferCleanup) {
@@ -2291,17 +3495,21 @@ export class SessionRuntime {
 		this.pendingDialogs.clear();
 		this.clearPendingTurnReservations();
 		this.stickyExtension.clear();
+		this.extensionSemanticRevision += 1;
 		this.clearReplay();
 		this.agentBusy = false;
 		this.compactionBusy = false;
 		this.activeQueueDepth = 0;
 		this.activeTurnProjectionItems = 0;
 		this.activeTurnProjectionBytes = 0;
+		this.activeTurnProjectionLogicalBytes = 0;
 		this.activeTurnHeadroomReserved = false;
 		this.inFlight = 0;
 	}
 
-	private emitSupervisorMessage(message: SessionSupervisorMessage): void {
+	private emitSupervisorMessage(
+		message: SessionSupervisorMessage<RuntimeEvent<M>, RuntimeExtensionRequest<M>>,
+	): void {
 		if (this.deferredStartupEmits) {
 			this.deferredStartupEmits.push(message);
 			return;
@@ -2332,6 +3540,35 @@ export class SessionRuntime {
 	}
 }
 
+/** Current protocol wrapper retained as the public Runtime API. */
+export class SessionRuntime extends SessionRuntimeCore<"current"> {
+	constructor(opts: SessionRuntimeOptions) {
+		const { piPayloadServices, ...coreOptions } = opts;
+		super({
+			...coreOptions,
+			productAdapter: createCurrentProductAdapter(piPayloadServices?.productSchema),
+			payloadCustody: piPayloadServices,
+		});
+	}
+}
+
+class FutureSessionRuntime extends SessionRuntimeCore<"future_content"> {
+	constructor(opts: FutureSessionRuntimeOptions) {
+		const { piPayloadServices, ...coreOptions } = opts;
+		super({
+			...coreOptions,
+			productAdapter: createFutureProductAdapter(piPayloadServices.productSchema),
+			payloadCustody: piPayloadServices,
+		});
+	}
+}
+
+export function createFutureSessionRuntime(
+	opts: FutureSessionRuntimeOptions,
+): SessionRuntimeCore<"future_content"> {
+	return new FutureSessionRuntime(opts);
+}
+
 function commandMayStartWork(commandType: string): boolean {
 	return commandType === "prompt" || commandType === "steer" || commandType === "follow_up";
 }
@@ -2345,55 +3582,102 @@ function commandReleasesQueuedWork(commandType: string): boolean {
 	return commandType === "abort" || commandType === "abort_retry";
 }
 
-function transitionWasCancelled(response: SessionCommandResponseDto): boolean {
+function transitionWasCancelled(
+	response: SessionCommandResponseDto | FutureSessionCommandResponseDto,
+): boolean {
 	if (response.success !== true || !("data" in response)) return false;
 	const data = response.data;
-	return typeof data === "object" && data !== null && (data as { cancelled?: unknown }).cancelled === true;
+	return typeof data === "object" && data !== null && "cancelled" in data && data.cancelled === true;
 }
 
-function bufferedFrameBytes(frame: BufferedFrame): number {
+function bufferedFrameBytes<TEvent, TExtensionRequest>(
+	frame: BufferedFrame<TEvent, TExtensionRequest>,
+): number {
 	return Buffer.byteLength(JSON.stringify(frame));
 }
 
-function payloadTransferBytes(transfer: PiPayloadLeaseTransfer): number {
-	let bytes = 0;
-	for (const ref of transfer.refs) {
-		bytes += ref.byteLength;
-		if (!Number.isSafeInteger(bytes)) {
-			throw new RpcError("session_transition", "transition_payload_byte_limit_exceeded");
-		}
-	}
-	return bytes;
-}
-
-function isReplayableFrame(frame: BufferedFrame): boolean {
+function isReplayableFrame<TEvent, TExtensionRequest extends { readonly method: string }>(
+	frame: BufferedFrame<TEvent, TExtensionRequest>,
+): boolean {
 	return !(frame.type === "extension_ui_request" && frame.request.method === "notify");
 }
 
-function extensionRequestBytes(request: ExtensionUiRequestDto): number {
+function extensionRequestBytes(request: ExtensionUiRequestDto | FutureExtensionUiRequestDto): number {
 	return Buffer.byteLength(JSON.stringify(request));
 }
 
-function stickyRequestKey(request: ExtensionUiRequestDto): string {
+function stickyRequestKey(request: ExtensionUiRequestDto | FutureExtensionUiRequestDto): string {
 	if (request.method === "setStatus") return `setStatus:${request.statusKey}`;
 	if (request.method === "setWidget") return `setWidget:${request.widgetKey}`;
 	return request.method;
 }
 
-function stickyRequestClearsState(request: ExtensionUiRequestDto): boolean {
+function stickyRequestClearsState(request: ExtensionUiRequestDto | FutureExtensionUiRequestDto): boolean {
 	return (
 		(request.method === "setStatus" && request.statusText === undefined) ||
 		(request.method === "setWidget" && request.widgetLines === undefined)
 	);
 }
 
-function stickyClearRequest(request: ExtensionUiRequestDto): ExtensionUiRequestDto {
-	const id = `evicted:${randomUUID()}`;
-	if (request.method === "setStatus") return { ...request, id, statusText: undefined };
-	if (request.method === "setWidget") return { ...request, id, widgetLines: undefined };
-	if (request.method === "setTitle") return { ...request, id, title: "" };
-	if (request.method === "set_editor_text") return { ...request, id, text: "" };
-	throw new RpcError("extension_ui_request", "invalid_sticky_extension_method");
+function futureExtensionRequestRefs(request: FutureExtensionUiRequestDto): readonly EpochStoredContentRef[] {
+	if (
+		request.method === "editor" &&
+		typeof request.prefill === "object" &&
+		request.prefill !== null &&
+		request.prefill.type === "external_text"
+	) {
+		return [request.prefill.ref];
+	}
+	if (
+		request.method === "set_editor_text" &&
+		typeof request.text === "object" &&
+		request.text !== null &&
+		request.text.type === "external_text"
+	) {
+		return [request.text.ref];
+	}
+	if (
+		request.method === "setWidget" &&
+		request.widgetLines !== undefined &&
+		!Array.isArray(request.widgetLines) &&
+		request.widgetLines.type === "external_json"
+	) {
+		return [request.widgetLines.ref];
+	}
+	return [];
+}
+
+function futureExtensionStagesDuringTransition(request: FutureExtensionUiRequestDto): boolean {
+	return !BLOCKING_DIALOG_METHODS.has(request.method);
+}
+
+function futureExtensionTransferMatches(
+	request: FutureExtensionUiRequestDto,
+	transfer: PiPayloadLeaseTransfer<EpochStoredContentRef> | null,
+): boolean {
+	const expected = futureExtensionRequestRefs(request);
+	const actual = transfer?.refs ?? [];
+	return (
+		expected.length === actual.length &&
+		expected.every((ref, index) => {
+			const candidate = actual[index];
+			return candidate !== undefined && storedContentRefsEqual(ref, candidate);
+		})
+	);
+}
+
+function storedContentRefsEqual(left: EpochStoredContentRef, right: EpochStoredContentRef): boolean {
+	if (
+		left.type !== right.type ||
+		left.serverEpoch !== right.serverEpoch ||
+		left.sha256 !== right.sha256 ||
+		left.byteLength !== right.byteLength
+	) {
+		return false;
+	}
+	return left.type === "attachment_ref"
+		? right.type === "attachment_ref" && left.mediaType === right.mediaType
+		: right.type === "content_ref" && left.encoding === right.encoding;
 }
 
 function inspectFrozenSessionFile(sessionFile: string): FrozenSessionFileIdentity {

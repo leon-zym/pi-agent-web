@@ -17,13 +17,13 @@ import {
 } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
-import { type ServerHandle, startServer } from "../src/main.js";
+import { type LegacyServerHandle, startServerWithCurrentMode } from "../src/main.js";
 
 const fixturePath = path.join(import.meta.dirname, "fixtures", "session-runtime-pi.mjs");
 const IMAGE_BYTES = 1024 * 1024 + 257;
 const PROMPT = "payload-reference-large-image-events";
 const roots: string[] = [];
-const handles: ServerHandle[] = [];
+const handles: LegacyServerHandle[] = [];
 const clients: ClientProbe[] = [];
 
 type GatewayFrame = GatewayServerHelloDto | SessionWsServerMessage;
@@ -109,7 +109,7 @@ function refsIn(value: unknown): SessionAttachmentRefDto[] {
 }
 
 async function createHarness(): Promise<{
-	handle: ServerHandle;
+	handle: LegacyServerHandle;
 	baseUrl: string;
 	cookie: string;
 	sessionHandle: string;
@@ -118,7 +118,7 @@ async function createHarness(): Promise<{
 	roots.push(root);
 	const workspacePath = path.join(root, "workspace");
 	fs.mkdirSync(workspacePath, { recursive: true });
-	const handle = await startServer({
+	const handle = await startServerWithCurrentMode({
 		config: {
 			port: 0,
 			host: "127.0.0.1",

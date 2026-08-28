@@ -1,4 +1,8 @@
-import { expectCommandData, type SessionEntryDto } from "@pi-agent-web/protocol";
+import {
+	expectCommandData,
+	type SessionEntryDto,
+	type SessionRuntimeIdentityDto,
+} from "@pi-agent-web/protocol";
 import {
 	Bot,
 	Brain,
@@ -28,8 +32,14 @@ import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { sessionTransport, useSessionTransportStore } from "../../stores/session-transport";
 import type { SessionRawEventRecord } from "../../stores/session-transport-contract";
 import { type RightPanelMode, useViewStore } from "../../stores/view";
+import type { AssistantStep, ContentBlock, UiToolResult } from "../../types/view-models";
 import { formatJsonCode, formatToolArguments, formatUnknownCode } from "../conversation/code-display";
 import { HighlightedCode } from "../conversation/HighlightedCode";
+import {
+	createSessionRuntimeIdentity,
+	type ToolCallBlock,
+	useLazyToolContent,
+} from "../conversation/use-lazy-tool-content";
 import {
 	type ConversationTreeRow,
 	flattenConversationTree,
@@ -44,14 +54,32 @@ const MODES: Array<{ mode: RightPanelMode; label: string; icon: typeof Wrench }>
 	{ mode: "debug", label: "details.debug", icon: Bug },
 ];
 
-function useSelectedToolBlock() {
+interface SelectedToolBlock {
+	block: ContentBlock;
+	results: UiToolResult[];
+	step: AssistantStep;
+	sessionHandle: string | null;
+	sessionIdentity: SessionRuntimeIdentityDto | null;
+}
+
+function useSelectedToolBlock(): SelectedToolBlock | undefined {
 	const selectedTool = useViewStore((s) => s.selectedTool);
 	const selectedSessionId = useViewStore((s) => s.selectedToolSessionId);
-	const currentSessionHandle = useSessionDirectoryStore((s) => s.currentSession?.sessionHandle ?? null);
+	const selectedChannel = useSessionTransportStore((state) =>
+		selectedSessionId ? state.sessions[selectedSessionId] : undefined,
+	);
 	const projection = useProjectionStore((s) =>
-		selectedSessionId && selectedSessionId === currentSessionHandle
-			? s.projections[selectedSessionId]
-			: undefined,
+		selectedSessionId ? s.projections[selectedSessionId] : undefined,
+	);
+	const sessionIdentity = useMemo(
+		() => createSessionRuntimeIdentity(selectedChannel?.runtime, selectedSessionId),
+		[
+			selectedChannel?.runtime?.generation,
+			selectedChannel?.runtime?.serverEpoch,
+			selectedChannel?.runtime?.sessionHandle,
+			selectedChannel?.runtime?.workspaceId,
+			selectedSessionId,
+		],
 	);
 	return useMemo(() => {
 		if (!projection || !selectedTool) return undefined;
@@ -62,17 +90,85 @@ function useSelectedToolBlock() {
 						const results = step.toolResults.filter(
 							(r) => r.toolCallId === (block.type === "tool_call" ? block.toolCallId : ""),
 						);
-						return { block, results, step };
+						return { block, results, step, sessionHandle: selectedSessionId, sessionIdentity };
 					}
 				}
 			}
 		}
 		return undefined;
-	}, [projection, selectedTool]);
+	}, [projection, selectedTool, selectedSessionId, sessionIdentity]);
 }
 
-function InspectorView() {
+function InspectorToolCall({
+	block,
+	results,
+	sessionIdentity,
+}: {
+	block: ToolCallBlock;
+	results: UiToolResult[];
+	sessionIdentity: SelectedToolBlock["sessionIdentity"];
+}) {
+	const lazyContent = useLazyToolContent({
+		enabled: true,
+		identity: sessionIdentity,
+		block,
+		results,
+	});
+	if (lazyContent.status !== "ready") {
+		return lazyContent.status === "error" ? (
+			<p role="alert" className="px-4 py-8 text-center text-[12px] text-danger">
+				{tt("tool.executionError")}
+			</p>
+		) : (
+			<div role="status" className="px-4 py-8 text-center text-[12px] text-ink-3">
+				{tt("common.loading")}
+			</div>
+		);
+	}
+
+	const materializedBlock = lazyContent.block;
+	const materializedResults = lazyContent.results;
+	const argsCode = formatToolArguments(materializedBlock.args, materializedBlock.argsText);
+	const resultCode = formatUnknownCode(
+		materializedResults[0]?.content ?? materializedBlock.result ?? materializedBlock.partialOutput ?? "",
+	);
+
+	return (
+		<div className="flex h-full flex-col">
+			<div className="flex flex-none items-center gap-2 border-b border-border px-4 py-3">
+				<Wrench className="size-4 text-ink-3" />
+				<span className="font-mono text-[13px] font-medium text-ink">{materializedBlock.toolName}</span>
+				<div className="flex-1" />
+				<Badge
+					variant={
+						materializedBlock.status === "error"
+							? "danger"
+							: materializedBlock.status === "done"
+								? "success"
+								: materializedBlock.status === "running"
+									? "primary"
+									: "default"
+					}
+				>
+					{materializedBlock.status === "preparing"
+						? tt("status.generatingArgs")
+						: materializedBlock.status === "running"
+							? tt("status.executing")
+							: materializedBlock.status === "done"
+								? tt("common.done")
+								: materializedBlock.status === "error"
+									? tt("common.error")
+									: tt("status.notExecuted")}
+				</Badge>
+			</div>
+			<InspectorCodeSections argsCode={argsCode} resultCode={resultCode} />
+		</div>
+	);
+}
+
+function InspectorView({ open }: { open: boolean }) {
 	const selected = useSelectedToolBlock();
+	if (!open) return null;
 	if (!selected) {
 		return <p className="px-4 py-8 text-center text-[13px] text-ink-3">{tt("details.inspectorEmpty")}</p>;
 	}
@@ -98,42 +194,8 @@ function InspectorView() {
 		);
 	}
 	if (block.type !== "tool_call") return null;
-
-	const argsCode = formatToolArguments(block.args, block.argsText);
-	const resultCode = formatUnknownCode(
-		selected.results[0]?.content ?? block.result ?? block.partialOutput ?? "",
-	);
-
 	return (
-		<div className="flex h-full flex-col">
-			<div className="flex flex-none items-center gap-2 border-b border-border px-4 py-3">
-				<Wrench className="size-4 text-ink-3" />
-				<span className="font-mono text-[13px] font-medium text-ink">{block.toolName}</span>
-				<div className="flex-1" />
-				<Badge
-					variant={
-						block.status === "error"
-							? "danger"
-							: block.status === "done"
-								? "success"
-								: block.status === "running"
-									? "primary"
-									: "default"
-					}
-				>
-					{block.status === "preparing"
-						? tt("status.generatingArgs")
-						: block.status === "running"
-							? tt("status.executing")
-							: block.status === "done"
-								? tt("common.done")
-								: block.status === "error"
-									? tt("common.error")
-									: tt("status.notExecuted")}
-				</Badge>
-			</div>
-			<InspectorCodeSections argsCode={argsCode} resultCode={resultCode} />
-		</div>
+		<InspectorToolCall block={block} results={selected.results} sessionIdentity={selected.sessionIdentity} />
 	);
 }
 
@@ -666,7 +728,7 @@ export function DetailsPanel({ open, onToggle }: { open: boolean; onToggle: () =
 				</Tooltip>
 			</div>
 			<div className="min-h-0 flex-1">
-				{mode === "tree" ? <TreeView /> : mode === "debug" ? <DebugView /> : <InspectorView />}
+				{mode === "tree" ? <TreeView /> : mode === "debug" ? <DebugView /> : <InspectorView open={open} />}
 			</div>
 		</div>
 	);

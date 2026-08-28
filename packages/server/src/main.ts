@@ -5,7 +5,11 @@ import type { Socket } from "node:net";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { type ServerType, serve } from "@hono/node-server";
-import { GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY } from "@pi-agent-web/protocol";
+import {
+	GATEWAY_CONTENT_REF_CAPABILITY,
+	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+} from "@pi-agent-web/protocol";
 import {
 	createGatewayAccessControl,
 	createGatewayAccessDenialReporter,
@@ -13,14 +17,28 @@ import {
 } from "./access-control.js";
 import { assertLoopbackHost, ENV_SESSION_DIR, loadConfig, type ServerConfig } from "./config.js";
 import { EpochContentStore } from "./epoch-content-store.js";
-import { createGatewayPayloadActivation } from "./gateway-payload-activation.js";
+import {
+	createGatewayFuturePayloadActivation,
+	createGatewayPayloadActivation,
+	type GatewayFuturePayloadActivation,
+	type GatewayPayloadActivation,
+} from "./gateway-payload-activation.js";
 import { NativeSessionCatalog, sessionHandleForCanonicalFile } from "./native-session-catalog.js";
 import { RecoverableSessionTrash } from "./recoverable-session-trash.js";
 import { type ProbedPiRuntime, resolvePiRuntime } from "./resolver.js";
 import { createApp } from "./routes.js";
 import { SessionLayoutResolver } from "./session-layout-resolver.js";
-import { SessionSupervisor } from "./session-supervisor.js";
-import { SessionWsBridge } from "./session-ws-bridge.js";
+import {
+	createFutureSessionSupervisor,
+	createFutureSessionSupervisorRouteFacade,
+	SessionSupervisor,
+	type SessionSupervisorBaseOptions,
+} from "./session-supervisor.js";
+import {
+	createFutureSessionWsBridge,
+	type FutureSessionWsBridge,
+	SessionWsBridge,
+} from "./session-ws-bridge.js";
 import { WorkspacePreferences } from "./workspace-preferences.js";
 
 /** Server bootstrap for Pi-native, Session-scoped runtime ownership. */
@@ -37,10 +55,22 @@ export interface StartServerOptions {
 	handleSignals?: boolean;
 }
 
-export interface ServerHandle {
+type FutureSessionSupervisor = ReturnType<typeof createFutureSessionSupervisor>;
+type ServerProductMode = "current" | "future_content";
+type PayloadActivationFor<M extends ServerProductMode> = M extends "future_content"
+	? GatewayFuturePayloadActivation
+	: GatewayPayloadActivation;
+type SupervisorFor<M extends ServerProductMode> = M extends "future_content"
+	? FutureSessionSupervisor
+	: SessionSupervisor;
+type BridgeFor<M extends ServerProductMode> = M extends "future_content"
+	? FutureSessionWsBridge
+	: SessionWsBridge;
+
+interface ServerHandleBase<S, B> {
 	server: ServerType;
-	supervisor: SessionSupervisor;
-	bridge: SessionWsBridge;
+	supervisor: S;
+	bridge: B;
 	catalog: NativeSessionCatalog;
 	layoutResolver: SessionLayoutResolver;
 	preferences: WorkspacePreferences;
@@ -52,6 +82,95 @@ export interface ServerHandle {
 	accessControl: GatewayAccessControl;
 	close: () => Promise<void>;
 }
+
+/** Production server handle after the atomic protocol 1.3 activation. */
+export interface ServerHandle extends ServerHandleBase<FutureSessionSupervisor, FutureSessionWsBridge> {}
+
+/** Legacy protocol 1.2 handle used only by explicit compatibility fixtures. */
+export interface LegacyServerHandle extends ServerHandleBase<SessionSupervisor, SessionWsBridge> {}
+
+export type FutureServerHandle = ServerHandle;
+
+type ServerHandleFor<M extends ServerProductMode> = ServerHandleBase<SupervisorFor<M>, BridgeFor<M>>;
+
+interface MainBridgeRuntime {
+	version: string;
+	adapterId: string;
+	capabilities: readonly string[];
+}
+
+interface MainModeFactory<M extends ServerProductMode> {
+	createPayloadActivation: (contentStore: EpochContentStore, serverEpoch: string) => PayloadActivationFor<M>;
+	createSupervisor: (
+		options: SessionSupervisorBaseOptions<M>,
+		piPayloadServices: PayloadActivationFor<M>["supervisorServices"],
+	) => SupervisorFor<M>;
+	createBridge: (options: {
+		supervisor: SupervisorFor<M>;
+		serverBuild: string;
+		runtime: MainBridgeRuntime;
+		log: (level: "info" | "warn" | "error", message: string) => void;
+		payloadActivation: PayloadActivationFor<M>;
+	}) => BridgeFor<M>;
+	broadcast: (
+		bridge: BridgeFor<M>,
+		message: Parameters<SessionSupervisorBaseOptions<M>["broadcast"]>[0],
+	) => void;
+	createRouteSupervisor: (supervisor: SupervisorFor<M>, resolved: ProbedPiRuntime) => SessionSupervisor;
+	bridgeRuntime: (runtime: ProbedPiRuntime) => MainBridgeRuntime;
+}
+
+const CURRENT_MAIN_MODE: MainModeFactory<"current"> = {
+	createPayloadActivation: createGatewayPayloadActivation,
+	createSupervisor: (options, piPayloadServices) => new SessionSupervisor({ ...options, piPayloadServices }),
+	createBridge: ({ supervisor, serverBuild, runtime, log, payloadActivation }) =>
+		new SessionWsBridge({
+			supervisor,
+			serverBuild,
+			runtime,
+			log,
+			payloadActivation: { context: payloadActivation.context },
+		}),
+	broadcast: (bridge, message) => bridge.broadcast(message),
+	createRouteSupervisor: (supervisor) => supervisor,
+	bridgeRuntime: (runtime) => ({
+		version: runtime.version,
+		adapterId: runtime.adapterId,
+		capabilities: [...runtime.capabilities, "session.multiplex", GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY],
+	}),
+};
+
+const FUTURE_MAIN_MODE: MainModeFactory<"future_content"> = {
+	createPayloadActivation: createGatewayFuturePayloadActivation,
+	createSupervisor: (options, piPayloadServices) =>
+		createFutureSessionSupervisor({ ...options, piPayloadServices }),
+	createBridge: ({ supervisor, serverBuild, runtime, log, payloadActivation }) =>
+		createFutureSessionWsBridge({
+			supervisor,
+			serverBuild,
+			runtime,
+			log,
+			payloadActivation: {
+				context: payloadActivation.context,
+				externalizer: payloadActivation.externalizer,
+				supervisorServices: payloadActivation.supervisorServices,
+			},
+		}),
+	broadcast: (bridge, message) => bridge.broadcast(message),
+	createRouteSupervisor: (supervisor, resolved) =>
+		createFutureSessionSupervisorRouteFacade(supervisor, resolved),
+	bridgeRuntime: (runtime) => ({
+		version: runtime.version,
+		adapterId: runtime.adapterId,
+		capabilities: [
+			...runtime.capabilities,
+			"session.multiplex",
+			GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+			GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+			GATEWAY_CONTENT_REF_CAPABILITY,
+		],
+	}),
+};
 
 function log(level: "info" | "warn" | "error", message: string): void {
 	const prefix = level === "error" ? "[pi-web] ERROR" : level === "warn" ? "[pi-web] WARN" : "[pi-web]";
@@ -85,6 +204,23 @@ function openBrowser(host: string, port: number): void {
 }
 
 export async function startServer(options: StartServerOptions = {}): Promise<ServerHandle> {
+	return startServerWithMode(options, FUTURE_MAIN_MODE);
+}
+
+/**
+ * Server-private legacy entry point used by explicit 1.2 compatibility tests.
+ * Production callers must use startServer(), which is the activated future mode.
+ */
+export async function startServerWithCurrentMode(
+	options: StartServerOptions = {},
+): Promise<LegacyServerHandle> {
+	return startServerWithMode(options, CURRENT_MAIN_MODE);
+}
+
+async function startServerWithMode<M extends ServerProductMode>(
+	options: StartServerOptions,
+	mode: MainModeFactory<M>,
+): Promise<ServerHandleFor<M>> {
 	const mergedConfig: ServerConfig = { ...loadConfig(), ...options.config };
 	const config: ServerConfig = { ...mergedConfig, webDataDir: path.resolve(mergedConfig.webDataDir) };
 	assertLoopbackHost(config.host);
@@ -112,8 +248,9 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 	});
 	let preferences: WorkspacePreferences | undefined;
 	let contentStore: EpochContentStore | undefined;
-	let supervisor: SessionSupervisor | undefined;
-	let bridge: SessionWsBridge | undefined;
+	let supervisor: SupervisorFor<M> | undefined;
+	let routeSupervisor: SessionSupervisor | undefined;
+	let bridge: BridgeFor<M> | undefined;
 	let server: ServerType | undefined;
 	const sockets = new Set<Socket>();
 	try {
@@ -128,57 +265,53 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 		const activeContentStore = new EpochContentStore({ webDataDir: config.webDataDir, serverEpoch });
 		contentStore = activeContentStore;
 		await activeContentStore.initialize();
-		const payloadActivation = createGatewayPayloadActivation(activeContentStore, serverEpoch);
+		const payloadActivation = mode.createPayloadActivation(activeContentStore, serverEpoch);
 
-		let activeBridge!: SessionWsBridge;
-		const activeSupervisor = new SessionSupervisor({
-			serverEpoch,
-			resolved: runtime,
-			envForWorkspace: (cwd) => layoutResolver.normalizedChildEnvForWorkspace(cwd),
-			resolveSession: async (sessionHandle) => {
-				const snapshot = await catalog.refresh({ force: true });
-				const session = snapshot.sessions.find((candidate) => candidate.sessionHandle === sessionHandle);
-				if (!session?.workspaceAvailable || !session.workspacePath) return undefined;
-				let canonicalFile: string;
-				try {
-					canonicalFile = await fs.promises.realpath(session.sessionFile);
-				} catch {
-					return undefined;
-				}
-				if (
-					canonicalFile !== session.sessionFile ||
-					sessionHandleForCanonicalFile(canonicalFile) !== sessionHandle
-				) {
-					return undefined;
-				}
-				return {
-					kind: "existing" as const,
-					sessionHandle: session.sessionHandle,
-					workspaceId: session.workspaceHandle,
-					cwd: session.workspacePath,
-					sessionFile: canonicalFile,
-					nativeSessionId: session.nativeSessionId,
-				};
+		let activeBridge!: BridgeFor<M>;
+		const activeSupervisor = mode.createSupervisor(
+			{
+				serverEpoch,
+				resolved: runtime,
+				envForWorkspace: (cwd) => layoutResolver.normalizedChildEnvForWorkspace(cwd),
+				resolveSession: async (sessionHandle) => {
+					const snapshot = await catalog.refresh({ force: true });
+					const session = snapshot.sessions.find((candidate) => candidate.sessionHandle === sessionHandle);
+					if (!session?.workspaceAvailable || !session.workspacePath) return undefined;
+					let canonicalFile: string;
+					try {
+						canonicalFile = await fs.promises.realpath(session.sessionFile);
+					} catch {
+						return undefined;
+					}
+					if (
+						canonicalFile !== session.sessionFile ||
+						sessionHandleForCanonicalFile(canonicalFile) !== sessionHandle
+					) {
+						return undefined;
+					}
+					return {
+						kind: "existing" as const,
+						sessionHandle: session.sessionHandle,
+						workspaceId: session.workspaceHandle,
+						cwd: session.workspacePath,
+						sessionFile: canonicalFile,
+						nativeSessionId: session.nativeSessionId,
+					};
+				},
+				broadcast: (message) => mode.broadcast(activeBridge, message),
+				onHotRuntimeInventory: (inventory) => activeBridge.broadcastHotRuntimeInventory(inventory),
+				log,
 			},
-			piPayloadServices: payloadActivation.supervisorServices,
-			broadcast: (message) => activeBridge.broadcast(message),
-			onHotRuntimeInventory: (inventory) => activeBridge.broadcastHotRuntimeInventory(inventory),
-			log,
-		});
+			payloadActivation.supervisorServices,
+		);
 		supervisor = activeSupervisor;
-		activeBridge = new SessionWsBridge({
+		const activeRouteSupervisor = mode.createRouteSupervisor(activeSupervisor, runtime);
+		routeSupervisor = activeRouteSupervisor;
+		activeBridge = mode.createBridge({
 			supervisor: activeSupervisor,
 			log,
 			serverBuild: "0.1.0",
-			runtime: {
-				version: runtime.version,
-				adapterId: runtime.adapterId,
-				capabilities: [
-					...runtime.capabilities,
-					"session.multiplex",
-					GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
-				],
-			},
+			runtime: mode.bridgeRuntime(runtime),
 			payloadActivation,
 		});
 		bridge = activeBridge;
@@ -191,7 +324,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 			catalog,
 			layoutResolver,
 			preferences: activePreferences,
-			supervisor: activeSupervisor,
+			supervisor: activeRouteSupervisor,
 			trash,
 			readiness: {
 				ready: true,
@@ -253,7 +386,10 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 				signalHandlers.clear();
 				const errors: unknown[] = [];
 				collectRejected(errors, await closeIngress(activeServer, activeBridge, sockets));
-				collectRejected(errors, await Promise.allSettled([activeSupervisor.stopAll()]));
+				const supervisorsToStop: Promise<void>[] = [activeSupervisor.stopAll()];
+				if (activeRouteSupervisor !== activeSupervisor)
+					supervisorsToStop.push(activeRouteSupervisor.stopAll());
+				collectRejected(errors, await Promise.allSettled(supervisorsToStop));
 				collectRejected(errors, await Promise.allSettled([activeContentStore.shutdown()]));
 				try {
 					activePreferences.close();
@@ -301,6 +437,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 			server,
 			bridge,
 			supervisor,
+			routeSupervisor,
 			contentStore,
 			preferences,
 		});
@@ -388,8 +525,9 @@ function waitForListening(server: ServerType): Promise<void> {
 
 async function cleanupFailedStartup(resources: {
 	server?: ServerType;
-	bridge?: SessionWsBridge;
-	supervisor?: SessionSupervisor;
+	bridge?: { close: () => Promise<void> };
+	supervisor?: { stopAll: () => Promise<void> };
+	routeSupervisor?: SessionSupervisor;
 	contentStore?: EpochContentStore;
 	preferences?: WorkspacePreferences;
 }): Promise<unknown[]> {
@@ -399,6 +537,8 @@ async function cleanupFailedStartup(resources: {
 	if (resources.bridge) collectRejected(errors, await Promise.allSettled([resources.bridge.close()]));
 	if (resources.supervisor)
 		collectRejected(errors, await Promise.allSettled([resources.supervisor.stopAll()]));
+	if (resources.routeSupervisor && resources.routeSupervisor !== resources.supervisor)
+		collectRejected(errors, await Promise.allSettled([resources.routeSupervisor.stopAll()]));
 	if (resources.contentStore)
 		collectRejected(errors, await Promise.allSettled([resources.contentStore.shutdown()]));
 	try {
@@ -417,7 +557,7 @@ function collectRejected(errors: unknown[], results: PromiseSettledResult<unknow
 
 async function closeIngress(
 	server: ServerType,
-	bridge: SessionWsBridge,
+	bridge: { close: () => Promise<void> },
 	sockets: Set<Socket>,
 ): Promise<PromiseSettledResult<void>[]> {
 	const closing = Promise.allSettled([closeHttpServer(server), bridge.close()]);
