@@ -19,8 +19,23 @@ export const SESSION_REPLAY_MAX_BYTES = 16 * MIB;
 export const SESSION_OUTBOUND_QUEUE_MAX_BYTES = MIB;
 export const SESSION_CATCH_UP_MAX_BYTES = MIB;
 export const SESSION_ATTACHMENT_BLOB_MAX_BYTES = 8 * MIB;
+/** Future protocol 1.3 ceiling for one externalized UTF-8 text or JSON payload. */
+export const SESSION_CONTENT_BLOB_MAX_BYTES = 48 * MIB;
+/** Future protocol 1.3 switches supported UTF-8 roots to references at this encoded byte size. */
+export const SESSION_CONTENT_INLINE_THRESHOLD_BYTES = 256 * 1024;
 export const SESSION_ATTACHMENT_CACHE_MAX_BYTES = 64 * MIB;
 export const SESSION_ATTACHMENT_CACHE_MAX_ITEMS = 256;
+
+/** Future-only protocol 1.3 budget. It is deliberately absent from the protocol 1.2 hello budget. */
+export interface SessionContentRefBudgetDto {
+	maxContentBlobBytes: number;
+	inlineContentThresholdBytes: number;
+}
+
+export const FUTURE_SESSION_CONTENT_REF_BUDGET = Object.freeze({
+	maxContentBlobBytes: SESSION_CONTENT_BLOB_MAX_BYTES,
+	inlineContentThresholdBytes: SESSION_CONTENT_INLINE_THRESHOLD_BYTES,
+}) satisfies SessionContentRefBudgetDto;
 
 export interface SessionPayloadBudgetDto {
 	maxCommandFrameBytes: number;
@@ -107,6 +122,17 @@ export function isSessionPayloadBudgetDto(value: unknown): value is SessionPaylo
 	);
 }
 
+export function isSessionContentRefBudgetDto(value: unknown): value is SessionContentRefBudgetDto {
+	return (
+		isCanonicalRecord(value, ["maxContentBlobBytes", "inlineContentThresholdBytes"]) &&
+		Object.keys(value).length === 2 &&
+		isSafePositiveInteger(value.maxContentBlobBytes) &&
+		value.maxContentBlobBytes <= SESSION_CONTENT_BLOB_MAX_BYTES &&
+		value.inlineContentThresholdBytes === SESSION_CONTENT_INLINE_THRESHOLD_BYTES &&
+		value.inlineContentThresholdBytes <= value.maxContentBlobBytes
+	);
+}
+
 export interface SessionAttachmentRefDto {
 	type: "attachment_ref";
 	serverEpoch: string;
@@ -155,6 +181,46 @@ export function isSessionAttachmentRefForNegotiatedBudget(
 		isSessionAttachmentRefDto(value) &&
 		value.serverEpoch === expectedServerEpoch &&
 		value.byteLength <= budget.maxAttachmentBlobBytes
+	);
+}
+
+export interface SessionContentRefDto {
+	type: "content_ref";
+	serverEpoch: string;
+	sha256: string;
+	byteLength: number;
+	encoding: "utf-8";
+}
+
+export function isSessionContentRefDto(value: unknown): value is SessionContentRefDto {
+	if (!isCanonicalRecord(value, ["type", "serverEpoch", "sha256", "byteLength", "encoding"])) {
+		return false;
+	}
+	return (
+		Object.keys(value).length === 5 &&
+		value.type === "content_ref" &&
+		typeof value.serverEpoch === "string" &&
+		value.serverEpoch.length > 0 &&
+		value.serverEpoch.length <= 128 &&
+		typeof value.sha256 === "string" &&
+		SHA256_RE.test(value.sha256) &&
+		isSafePositiveInteger(value.byteLength) &&
+		value.byteLength <= SESSION_CONTENT_BLOB_MAX_BYTES &&
+		value.encoding === "utf-8"
+	);
+}
+
+/** Admits a UTF-8 content reference only against the complete negotiated budget and exact epoch. */
+export function isSessionContentRefForNegotiatedBudget(
+	value: unknown,
+	expectedServerEpoch: string,
+	budget: SessionContentRefBudgetDto,
+): value is SessionContentRefDto {
+	return (
+		isSessionContentRefBudgetDto(budget) &&
+		isSessionContentRefDto(value) &&
+		value.serverEpoch === expectedServerEpoch &&
+		value.byteLength <= budget.maxContentBlobBytes
 	);
 }
 

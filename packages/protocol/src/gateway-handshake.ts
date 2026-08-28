@@ -10,6 +10,9 @@ export const MIN_GATEWAY_SERVER_FRAME_BYTES = 1024;
 export const GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY = "session.hot_runtime_inventory";
 export const GATEWAY_PAYLOAD_BUDGET_CAPABILITY = "payload.epoch_attachment_refs";
 export const GATEWAY_PAYLOAD_BUDGET_PROTOCOL_MINOR = 2;
+/** Reserved for the complete protocol 1.3 generic UTF-8 content-reference vertical. */
+export const GATEWAY_CONTENT_REF_CAPABILITY = "payload.epoch_content_refs";
+export const GATEWAY_CONTENT_REF_PROTOCOL_MINOR = 3;
 const GATEWAY_BASE_CAPABILITIES = [
 	"rpc.commands",
 	"rpc.events",
