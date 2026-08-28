@@ -220,6 +220,44 @@ function sendStartupExtensionState() {
 			prefill: "s".repeat(320 * 1024),
 		});
 	}
+	if (process.env.PI_WEB_FIXTURE_STARTUP_TIMEOUT_INPUT === "1") {
+		send({
+			type: "extension_ui_request",
+			id: `startup-timeout-input-${sessionId}`,
+			method: "input",
+			title: "Startup expiring input",
+			placeholder: "expires before ready",
+			timeout: configuredBytes("PI_WEB_FIXTURE_STARTUP_TIMEOUT_INPUT_MS") || 20,
+		});
+	}
+	if (process.env.PI_WEB_FIXTURE_STARTUP_FUTURE_EDITOR_LOGICAL_PAIR === "1") {
+		for (let index = 0; index < 2; index += 1) {
+			send({
+				type: "extension_ui_request",
+				id: `startup-future-editor-logical-${String(index)}-${sessionId}`,
+				method: "editor",
+				title: `Startup future logical editor ${String(index)}`,
+				prefill: String(index).repeat(320 * 1024),
+			});
+		}
+	}
+	if (process.env.PI_WEB_FIXTURE_STARTUP_FUTURE_EDITOR_REPLACEMENT === "1") {
+		const id = `startup-future-editor-replacement-${sessionId}`;
+		send({
+			type: "extension_ui_request",
+			id,
+			method: "editor",
+			title: "Unpublished old startup editor",
+			prefill: "o".repeat(320 * 1024),
+		});
+		send({
+			type: "extension_ui_request",
+			id,
+			method: "editor",
+			title: "Authoritative startup editor",
+			prefill: "n".repeat(320 * 1024),
+		});
+	}
 	const stickyCount = configuredCount("PI_WEB_FIXTURE_STICKY_COUNT");
 	for (let index = 0; index < stickyCount; index += 1) {
 		send({
