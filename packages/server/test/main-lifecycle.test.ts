@@ -3,6 +3,7 @@ import fs from "node:fs";
 import { createConnection, createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { EpochContentStore } from "../src/epoch-content-store.js";
 import { startServer } from "../src/main.js";
@@ -417,6 +418,63 @@ describe("production server lifecycle", () => {
 			socket.resume();
 			await socketClosed;
 			expect(Date.now() - startedAt).toBeLessThan(1_000);
+		} finally {
+			await handle.close();
+		}
+	});
+
+	it("serves directly seeded UTF-8 content from the production store without enabling uploads", async () => {
+		const root = temporaryRoot();
+		const handle = await startServer({
+			config: {
+				port: 0,
+				host: "127.0.0.1",
+				agentDir: path.join(root, "agent"),
+				sessionRootDir: path.join(root, "sessions"),
+				webDataDir: path.join(root, "web-data"),
+			},
+			piPath: fixturePath,
+			handleSignals: false,
+		});
+		try {
+			const { origin, headers } = await authenticatedOrigin(handle);
+			const bytes = Buffer.from('{"generic":"content"}');
+			const staged = await handle.contentStore.stageUtf8({
+				source: Readable.from([bytes]),
+				expectedByteLength: bytes.byteLength,
+			});
+			await handle.contentStore.publish(staged.hold);
+			await handle.contentStore.release(staged.hold);
+
+			const downloaded = await fetch(`${origin}/api/v1/content/${handle.serverEpoch}/${staged.ref.sha256}`, {
+				headers,
+			});
+			expect(downloaded.status).toBe(200);
+			expect(downloaded.headers.get("content-type")).toBe("application/octet-stream");
+			expect(downloaded.headers.get("content-length")).toBe(String(bytes.byteLength));
+			expect(downloaded.headers.get("cache-control")).toBe("no-store");
+			expect(downloaded.headers.get("cross-origin-resource-policy")).toBe("same-origin");
+			expect(downloaded.headers.get("x-content-type-options")).toBe("nosniff");
+			expect(Buffer.from(await downloaded.arrayBuffer())).toEqual(bytes);
+
+			const stale = await fetch(`${origin}/api/v1/content/old-epoch/${staged.ref.sha256}`, {
+				headers,
+			});
+			expect(stale.status).toBe(410);
+			const put = await fetch(`${origin}/api/v1/content/${handle.serverEpoch}/${staged.ref.sha256}`, {
+				method: "PUT",
+				headers,
+				body: "browser upload is forbidden",
+			});
+			expect(put.status).toBe(405);
+			expect(put.headers.get("allow")).toBe("GET");
+
+			let collected = { bytes: 0, items: 0 };
+			for (let attempt = 0; attempt < 20 && collected.items === 0; attempt += 1) {
+				collected = await handle.contentStore.gc();
+				if (collected.items === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+			}
+			expect(collected).toEqual({ bytes: bytes.byteLength, items: 1 });
 		} finally {
 			await handle.close();
 		}
