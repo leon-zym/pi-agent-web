@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
 	FUTURE_SESSION_CONTENT_REF_BUDGET,
+	isExtensionUiRequestDto,
+	isExtensionUiResponseDto,
+	isFutureExtensionUiRequestDto,
 	isFutureProductSessionEventDto,
 	isFutureSessionCommandResponseDto,
 	isFutureSessionEntryDto,
@@ -14,6 +17,7 @@ import {
 	isSessionCommandResponseDto,
 	isSessionMessageDto,
 	isSessionSnapshotDto,
+	isSessionWsClientMessage,
 	isSessionWsServerMessage,
 	SESSION_CONTENT_INLINE_THRESHOLD_BYTES,
 	SESSION_PAYLOAD_BUDGET,
@@ -128,6 +132,123 @@ function snapshot() {
 }
 
 describe("future protocol 1.3 content-bearing frames", () => {
+	it("admits only the three closed Extension UI roots with an exact future context", () => {
+		const requests = [
+			{
+				type: "extension_ui_request",
+				id: "editor-a",
+				method: "editor",
+				title: "Edit",
+				prefill: externalText,
+			},
+			{
+				type: "extension_ui_request",
+				id: "editor-text-a",
+				method: "set_editor_text",
+				text: externalText,
+			},
+			{
+				type: "extension_ui_request",
+				id: "widget-inline-a",
+				method: "setWidget",
+				widgetKey: "tests",
+				widgetLines: { type: "inline_json", value: ["one", "two"] },
+			},
+			{
+				type: "extension_ui_request",
+				id: "widget-external-a",
+				method: "setWidget",
+				widgetKey: "tests",
+				widgetLines: externalJson,
+			},
+		] as const;
+		for (const request of requests) {
+			expect(isFutureExtensionUiRequestDto(request, context)).toBe(true);
+			expect(isFutureExtensionUiRequestDto(request)).toBe(false);
+			expect(isFutureExtensionUiRequestDto(request, { ...context, serverEpoch: "wrong" })).toBe(
+				request.id === "widget-inline-a",
+			);
+			expect(isExtensionUiRequestDto(request)).toBe(false);
+		}
+
+		expect(
+			isFutureExtensionUiRequestDto(
+				{
+					type: "extension_ui_request",
+					id: "widget-clear",
+					method: "setWidget",
+					widgetKey: "tests",
+				},
+				context,
+			),
+		).toBe(true);
+		expect(
+			isFutureExtensionUiRequestDto(
+				{
+					type: "extension_ui_request",
+					id: "widget-bare",
+					method: "setWidget",
+					widgetKey: "tests",
+					widgetLines: ["not-normalized"],
+				},
+				context,
+			),
+		).toBe(false);
+		expect(
+			isFutureExtensionUiRequestDto(
+				{
+					type: "extension_ui_request",
+					id: "widget-wrong-shape",
+					method: "setWidget",
+					widgetKey: "tests",
+					widgetLines: { type: "inline_json", value: [{ type: "external_json", ref }] },
+				},
+				context,
+			),
+		).toBe(false);
+		expect(
+			isFutureExtensionUiRequestDto(
+				{
+					type: "extension_ui_request",
+					id: "status-a",
+					method: "setStatus",
+					statusKey: "status",
+					statusText: externalText,
+				},
+				context,
+			),
+		).toBe(false);
+		expect(
+			isExtensionUiResponseDto({
+				type: "extension_ui_response",
+				id: "editor-a",
+				value: externalText,
+			}),
+		).toBe(false);
+		expect(
+			isSessionWsClientMessage({
+				type: "extension_ui_response",
+				sessionHandle: "session-a",
+				expectedGeneration: 2,
+				fencingToken: "lease-a",
+				response: {
+					type: "extension_ui_response",
+					id: "editor-a",
+					value: externalText,
+				},
+			}),
+		).toBe(false);
+		expect(
+			isSessionWsClientMessage({
+				type: "extension_ui_response",
+				sessionHandle: "session-a",
+				expectedGeneration: 2,
+				fencingToken: "lease-a",
+				response: { type: "extension_ui_response", id: "editor-a", value: "inline" },
+			}),
+		).toBe(true);
+	});
+
 	it("admits every reviewed message slot only with the exact future context", () => {
 		const messages = [
 			assistant(),
@@ -335,25 +456,62 @@ describe("future protocol 1.3 content-bearing frames", () => {
 				context,
 			),
 		).toBe(true);
-		expect(
-			isFutureSessionReplayFrameDto(
+		const futureExtensionFrame = {
+			type: "extension_ui_request",
+			serverEpoch,
+			sessionHandle: "session-a",
+			workspaceId: "workspace-a",
+			generation: 2,
+			seq: 3,
+			request: {
+				type: "extension_ui_request",
+				id: "editor-a",
+				method: "set_editor_text",
+				text: externalText,
+			},
+		} as const;
+		expect(isFutureSessionReplayFrameDto(futureExtensionFrame, context)).toBe(true);
+		expect(isSessionWsServerMessage(futureExtensionFrame, attachmentContext)).toBe(false);
+		const extensionSnapshot = {
+			type: "extension_ui_snapshot",
+			serverEpoch,
+			sessionHandle: "session-a",
+			generation: 2,
+			requests: [futureExtensionFrame.request],
+		} as const;
+		expect(isFutureSessionWsServerMessage(extensionSnapshot, context)).toBe(true);
+		expect(isSessionWsServerMessage(extensionSnapshot, attachmentContext)).toBe(false);
+
+		const snapshotWithExtension = {
+			...snapshot(),
+			pendingExtensionRequests: [
 				{
 					type: "extension_ui_request",
-					serverEpoch,
-					sessionHandle: "session-a",
-					workspaceId: "workspace-a",
-					generation: 2,
-					seq: 3,
-					request: {
-						type: "extension_ui_request",
-						id: "editor-a",
-						method: "set_editor_text",
-						text: externalText,
-					},
+					id: "editor-prefill-a",
+					method: "editor",
+					title: "Edit",
+					prefill: externalText,
 				},
-				context,
-			),
-		).toBe(false);
+			],
+			stickyExtensionState: [
+				{
+					...futureExtensionFrame.request,
+					text: { type: "external_text", ref: { ...ref } },
+				},
+			],
+		} as const;
+		expect(isFutureExtensionUiRequestDto(snapshotWithExtension.pendingExtensionRequests[0], context)).toBe(
+			true,
+		);
+		expect(isFutureExtensionUiRequestDto(snapshotWithExtension.stickyExtensionState[0], context)).toBe(true);
+		expect(isFutureSessionSnapshotDto({ ...snapshotWithExtension, stickyExtensionState: [] }, context)).toBe(
+			true,
+		);
+		expect(
+			isFutureSessionSnapshotDto({ ...snapshotWithExtension, pendingExtensionRequests: [] }, context),
+		).toBe(true);
+		expect(isFutureSessionSnapshotDto(snapshotWithExtension, context)).toBe(true);
+		expect(isSessionSnapshotDto(snapshotWithExtension, attachmentContext)).toBe(false);
 	});
 
 	it("keeps current 1.2 full-frame guards and wire budgets frozen", () => {

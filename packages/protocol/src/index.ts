@@ -1,14 +1,18 @@
 /** Browser-safe, product-owned WebSocket and REST DTOs shared by the gateway and UI. */
 
 import {
+	isFutureExtensionUiRequestDto,
 	isFutureProductSessionEventDto,
 	isFutureSessionCommandResponseDto,
 	isFutureSessionMessageDto,
 } from "./future-product-decoders.js";
 import type {
+	FutureBlockingExtensionUiRequestDto,
+	FutureExtensionUiRequestDto,
 	FutureProductSessionEventDto,
 	FutureSessionCommandResponseDto,
 	FutureSessionMessageDto,
+	FutureStickyExtensionUiRequestDto,
 } from "./future-product-dto.js";
 import {
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
@@ -601,25 +605,46 @@ export type SessionWsServerMessage =
 
 export type FutureSessionReplayFrameDto =
 	| (SessionSequencedEnvelopeDto & { type: "event"; event: FutureProductSessionEventDto })
-	| Exclude<SessionReplayFrameDto, { type: "event" }>;
+	| (SessionSequencedEnvelopeDto & {
+			type: "extension_ui_request";
+			request: FutureExtensionUiRequestDto;
+	  })
+	| Exclude<SessionReplayFrameDto, { type: "event" | "extension_ui_request" }>;
 
 export type FutureSessionProjectionEventDto = Extract<FutureSessionReplayFrameDto, { type: "event" }>;
 
 export interface FutureSessionSnapshotDto
-	extends Omit<SessionSnapshotDto, "settledMessages" | "projectionEvents"> {
+	extends Omit<
+		SessionSnapshotDto,
+		"settledMessages" | "projectionEvents" | "pendingExtensionRequests" | "stickyExtensionState"
+	> {
 	settledMessages: FutureSessionMessageDto[];
 	projectionEvents: FutureSessionProjectionEventDto[];
+	pendingExtensionRequests: FutureBlockingExtensionUiRequestDto[];
+	stickyExtensionState: FutureStickyExtensionUiRequestDto[];
 }
 
 export interface FutureSessionResponseFrameDto extends Omit<SessionResponseFrameDto, "response"> {
 	response: FutureSessionCommandResponseDto;
 }
 
+export interface FutureExtensionUiSnapshotDto {
+	type: "extension_ui_snapshot";
+	serverEpoch: string;
+	sessionHandle: string;
+	generation: number;
+	requests: FutureExtensionUiRequestDto[];
+}
+
 export type FutureSessionWsServerMessage =
 	| FutureSessionResponseFrameDto
 	| FutureSessionReplayFrameDto
 	| FutureSessionSnapshotDto
-	| Exclude<SessionWsServerMessage, SessionResponseFrameDto | SessionReplayFrameDto | SessionSnapshotDto>;
+	| FutureExtensionUiSnapshotDto
+	| Exclude<
+			SessionWsServerMessage,
+			SessionResponseFrameDto | SessionReplayFrameDto | SessionSnapshotDto | { type: "extension_ui_snapshot" }
+	  >;
 
 export function isSessionRuntimeIdentityDto(value: unknown): value is SessionRuntimeIdentityDto {
 	return (
@@ -1175,8 +1200,44 @@ export function isFutureSessionReplayFrameDto(
 ): value is FutureSessionReplayFrameDto {
 	if (!context || !isFutureSessionContentRefGuardContext(context) || !isRecord(value)) return false;
 	if (value.type === "event") return isFutureSessionProjectionEventDto(value, context);
-	if (value.type !== "extension_ui_request" && value.type !== "extension_ui_closed") return false;
+	if (value.type === "extension_ui_request") {
+		return (
+			hasOnlyKeys(value, [
+				"type",
+				"serverEpoch",
+				"sessionHandle",
+				"workspaceId",
+				"generation",
+				"seq",
+				"request",
+			]) &&
+			hasSessionEnvelope(value) &&
+			value.serverEpoch === context.serverEpoch &&
+			isFutureExtensionUiRequestDto(value.request, context)
+		);
+	}
+	if (value.type !== "extension_ui_closed") return false;
 	return isSessionWsServerMessage(value, futureAttachmentContext(context));
+}
+
+function isFutureBlockingExtensionRequest(
+	value: unknown,
+	context: FutureSessionContentRefGuardContext,
+): value is FutureBlockingExtensionUiRequestDto {
+	return (
+		isFutureExtensionUiRequestDto(value, context) &&
+		["select", "confirm", "input", "editor"].includes(value.method)
+	);
+}
+
+function isFutureStickyExtensionRequest(
+	value: unknown,
+	context: FutureSessionContentRefGuardContext,
+): value is FutureStickyExtensionUiRequestDto {
+	return (
+		isFutureExtensionUiRequestDto(value, context) &&
+		["setStatus", "setWidget", "setTitle", "set_editor_text"].includes(value.method)
+	);
 }
 
 function isCanonicalFutureSessionSnapshotDto(
@@ -1229,10 +1290,10 @@ function isCanonicalFutureSessionSnapshotDto(
 		!value.queue.followUp.every((item) => isBoundedString(item, SESSION_TEXT_MAX_BYTES)) ||
 		!Array.isArray(value.pendingExtensionRequests) ||
 		value.pendingExtensionRequests.length > SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS ||
-		!value.pendingExtensionRequests.every(isBlockingExtensionRequest) ||
+		!value.pendingExtensionRequests.every((request) => isFutureBlockingExtensionRequest(request, context)) ||
 		!Array.isArray(value.stickyExtensionState) ||
 		value.stickyExtensionState.length > SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS ||
-		!value.stickyExtensionState.every(isStickyExtensionRequest)
+		!value.stickyExtensionState.every((request) => isFutureStickyExtensionRequest(request, context))
 	) {
 		return false;
 	}
@@ -1276,6 +1337,17 @@ export function isFutureSessionWsServerMessage(
 	if (value.type === "event") return isFutureSessionProjectionEventDto(value, context);
 	if (value.type === "extension_ui_request" || value.type === "extension_ui_closed") {
 		return isFutureSessionReplayFrameDto(value, context);
+	}
+	if (value.type === "extension_ui_snapshot") {
+		return (
+			hasOnlyKeys(value, ["type", "serverEpoch", "sessionHandle", "generation", "requests"]) &&
+			value.serverEpoch === context.serverEpoch &&
+			isString(value.sessionHandle) &&
+			isGeneration(value.generation) &&
+			Array.isArray(value.requests) &&
+			value.requests.length <= SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS &&
+			value.requests.every((request) => isFutureExtensionUiRequestDto(request, context))
+		);
 	}
 	if (value.type === "response") {
 		return (
