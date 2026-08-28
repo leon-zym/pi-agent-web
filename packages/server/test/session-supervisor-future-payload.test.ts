@@ -75,6 +75,12 @@ function createFutureSupervisorFixture(
 	projectionLimits?: Partial<SessionLiveProjectionLimits>,
 	maxAutoRestarts = 0,
 	env?: Record<string, string>,
+	runtimeLimits?: {
+		extensionStateMaxBytes?: number;
+		extensionStateMaxItems?: number;
+		readyTimeoutMs?: number;
+		transientBufferMaxBytes?: number;
+	},
 ) {
 	return createFutureSessionSupervisor({
 		serverEpoch: "future-epoch",
@@ -95,7 +101,8 @@ function createFutureSupervisorFixture(
 		projectionLimits,
 		maxAutoRestarts,
 		env,
-		readyTimeoutMs: 2_000,
+		...runtimeLimits,
+		readyTimeoutMs: runtimeLimits?.readyTimeoutMs ?? 2_000,
 	});
 }
 
@@ -186,6 +193,59 @@ function instrumentExtensionExternalizer(
 					},
 				},
 				lease,
+			});
+		},
+	});
+}
+
+function logicalPairExtensionExternalizer(
+	base: PiHostFuturePayloadExternalizer,
+	counters: ExtensionLeaseCounters,
+): PiHostFuturePayloadExternalizer {
+	return Object.freeze({
+		...base,
+		async externalize(input: PiPayloadExternalizerInput, signal: AbortSignal) {
+			if (
+				input.kind !== "extension_ui_request" ||
+				!isRecord(input.value) ||
+				typeof input.value.id !== "string" ||
+				!input.value.id.startsWith("startup-future-editor-logical-")
+			) {
+				return base.externalize(input, signal);
+			}
+			const second = input.value.id.includes("logical-1-");
+			const ref: EpochStoredContentRef = Object.freeze({
+				type: "content_ref",
+				serverEpoch: "future-epoch",
+				sha256: (second ? "b" : "a").repeat(64),
+				byteLength: 33 * 1024 * 1024,
+				encoding: "utf-8",
+			});
+			const holds: readonly EpochContentHold<EpochStoredContentRef>[] = Object.freeze([
+				Object.freeze({ ref }),
+			]);
+			let state: "provisional" | "transferred" = "provisional";
+			const lease: PiPayloadLease<EpochStoredContentRef> = Object.freeze({
+				refs: Object.freeze([ref]),
+				transfer() {
+					if (state !== "provisional") throw new Error("logical Extension lease already transferred");
+					state = "transferred";
+					return Object.freeze({
+						refs: Object.freeze([ref]),
+						adopt(accept: (entries: readonly EpochContentHold<EpochStoredContentRef>[]) => true) {
+							if (accept(holds) !== true) throw new Error("logical Extension lease adoption rejected");
+						},
+						async release() {},
+					});
+				},
+				async release() {},
+			});
+			return Object.freeze({
+				value: Object.freeze({
+					...input.value,
+					prefill: Object.freeze({ type: "external_text", ref }),
+				}),
+				lease: instrumentExtensionLease(lease, counters),
 			});
 		},
 	});
@@ -644,7 +704,7 @@ describe("future Session Supervisor payload mode", () => {
 		expect(supervisor.getRuntime(target.sessionHandle)?.generation).toBe(beforeIncoming.generation);
 	});
 
-	it("fails closed without restart when startup delivers a leased future blocking Extension request", async () => {
+	it("adopts and publishes a leased 320 KiB future editor delivered during startup", async () => {
 		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-future-runtime-"));
 		const target = createTarget(root);
 		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
@@ -666,21 +726,268 @@ describe("future Session Supervisor payload mode", () => {
 		});
 		stop = () => supervisor.stopAll();
 
-		await expect(supervisor.activate(target.sessionHandle)).rejects.toThrow(
-			"future_extension_delivery_phase_unsupported",
+		await expect(supervisor.activate(target.sessionHandle)).resolves.toMatchObject({ state: "waiting_ui" });
+		const frame = messages.find(
+			(message) =>
+				message.type === "extension_ui_request" &&
+				message.request.id === `startup-future-editor-${target.nativeSessionId}`,
 		);
-		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "crashed");
-		await waitFor(() => counters.transferRelease === 1);
-		const failed = supervisor.getRuntime(target.sessionHandle);
-		expect(failed).toMatchObject({ state: "crashed", lastSeq: 0 });
+		if (frame?.type !== "extension_ui_request" || frame.request.method !== "editor") {
+			throw new Error("startup future editor request was not published");
+		}
+		if (
+			typeof frame.request.prefill !== "object" ||
+			frame.request.prefill === null ||
+			frame.request.prefill.type !== "external_text"
+		) {
+			throw new Error("startup future editor request was not externalized");
+		}
+		expect(counters).toEqual({ transfer: 1, adopt: 1, transferRelease: 0, leaseRelease: 0 });
+		expect(generationOwnerRefs(exactRuntime(supervisor, target.sessionHandle))).toEqual([
+			frame.request.prefill.ref,
+		]);
+		const initial = await supervisor.subscribe(target.sessionHandle);
+		expect(initial).toMatchObject({
+			type: "resync_required",
+			snapshot: {
+				runtime: { state: "waiting_ui", lastSeq: frame.seq },
+				pendingExtensionRequests: [expect.objectContaining({ id: frame.request.id })],
+			},
+		});
+	});
+
+	it("publishes only the authoritative leased editor when startup replaces an unpublished request", async () => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-future-runtime-"));
+		const target = createTarget(root);
+		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
+		await store.initialize();
+		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const counters: ExtensionLeaseCounters = {
+			transfer: 0,
+			adopt: 0,
+			transferRelease: 0,
+			leaseRelease: 0,
+		};
+		const services: FutureSessionRuntimePiPayloadServices = Object.freeze({
+			...activation.supervisorServices,
+			externalizer: instrumentExtensionExternalizer(activation.externalizer, counters),
+		});
+		const messages: FutureSupervisorMessage[] = [];
+		const supervisor = createFutureSupervisorFixture(target, services, messages, undefined, 0, {
+			PI_WEB_FIXTURE_STARTUP_FUTURE_EDITOR_REPLACEMENT: "1",
+		});
+		stop = () => supervisor.stopAll();
+
+		await expect(supervisor.activate(target.sessionHandle)).resolves.toMatchObject({ state: "waiting_ui" });
+		const requestId = `startup-future-editor-replacement-${target.nativeSessionId}`;
+		const published = messages.filter(
+			(message) => message.type === "extension_ui_request" && message.request.id === requestId,
+		);
+		expect(published).toHaveLength(1);
+		expect(published[0]).toMatchObject({
+			type: "extension_ui_request",
+			request: { id: requestId, method: "editor", title: "Authoritative startup editor" },
+		});
+		expect(
+			messages.some((message) => message.type === "extension_ui_closed" && message.requestId === requestId),
+		).toBe(false);
+		expect(counters).toEqual({ transfer: 2, adopt: 2, transferRelease: 0, leaseRelease: 0 });
+		const initial = await supervisor.subscribe(target.sessionHandle);
+		expect(initial).toMatchObject({
+			type: "resync_required",
+			snapshot: {
+				pendingExtensionRequests: [
+					expect.objectContaining({ id: requestId, title: "Authoritative startup editor" }),
+				],
+			},
+		});
+	});
+
+	it("flushes the planned future startup sticky sequence without reapplying final-map eviction", async () => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-future-runtime-"));
+		const target = createTarget(root);
+		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
+		await store.initialize();
+		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const messages: FutureSupervisorMessage[] = [];
+		const supervisor = createFutureSupervisorFixture(
+			target,
+			activation.supervisorServices,
+			messages,
+			undefined,
+			0,
+			{ PI_WEB_FIXTURE_STICKY_COUNT: "3" },
+			{ extensionStateMaxItems: 2 },
+		);
+		stop = () => supervisor.stopAll();
+
+		await expect(supervisor.activate(target.sessionHandle)).resolves.toMatchObject({ state: "idle" });
+		const stickyFrames = messages.filter(
+			(message): message is Extract<FutureSupervisorMessage, { type: "extension_ui_request" }> =>
+				message.type === "extension_ui_request" && message.request.method === "setStatus",
+		);
+		expect(stickyFrames.map((frame) => frame.request)).toEqual([
+			expect.objectContaining({ statusKey: "status-0", statusText: "value-0" }),
+			expect.objectContaining({ statusKey: "status-1", statusText: "value-1" }),
+			expect.objectContaining({ statusKey: "status-0", statusText: undefined }),
+			expect.objectContaining({ statusKey: "status-2", statusText: "value-2" }),
+		]);
+		const initial = await supervisor.subscribe(target.sessionHandle);
+		expect(initial).toMatchObject({
+			type: "resync_required",
+			snapshot: {
+				stickyExtensionState: [
+					expect.objectContaining({ statusKey: "status-1", statusText: "value-1" }),
+					expect.objectContaining({ statusKey: "status-2", statusText: "value-2" }),
+				],
+			},
+		});
+	});
+
+	it("rejects the second 33 MiB startup editor before transfer when combined logical state exceeds 64 MiB", async () => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-future-runtime-"));
+		const target = createTarget(root);
+		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
+		await store.initialize();
+		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const counters: ExtensionLeaseCounters = {
+			transfer: 0,
+			adopt: 0,
+			transferRelease: 0,
+			leaseRelease: 0,
+		};
+		const released: EpochStoredContentRef[] = [];
+		const services: FutureSessionRuntimePiPayloadServices = Object.freeze({
+			...activation.supervisorServices,
+			externalizer: logicalPairExtensionExternalizer(activation.externalizer, counters),
+			async releaseHold(hold: EpochContentHold<EpochStoredContentRef>) {
+				released.push(hold.ref);
+			},
+		});
+		const messages: FutureSupervisorMessage[] = [];
+		const supervisor = createFutureSupervisorFixture(target, services, messages, undefined, 3, {
+			PI_WEB_FIXTURE_STARTUP_FUTURE_EDITOR_LOGICAL_PAIR: "1",
+		});
+		stop = () => supervisor.stopAll();
+
+		await expect(supervisor.activate(target.sessionHandle)).rejects.toThrow("session_snapshot_overflow");
+		await waitFor(() => released.length === 1 && counters.leaseRelease === 1, 10_000);
+		expect(counters).toEqual({ transfer: 1, adopt: 1, transferRelease: 0, leaseRelease: 1 });
+		expect(released).toHaveLength(1);
 		expect(messages.filter((message) => message.type === "extension_ui_request")).toEqual([]);
-		expect(counters).toEqual({ transfer: 1, adopt: 0, transferRelease: 1, leaseRelease: 0 });
-		await new Promise<void>((resolve) => setTimeout(resolve, 750));
+		expect(supervisor.getPendingExtensionRequests(target.sessionHandle)).toEqual([]);
 		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({
 			state: "crashed",
-			generation: failed?.generation,
+			generation: 1,
+			lastSeq: 0,
+			error: "session_snapshot_overflow",
+		});
+		await new Promise<void>((resolve) => setTimeout(resolve, 750));
+		expect(supervisor.getRuntime(target.sessionHandle)?.generation).toBe(1);
+		expect(released).toHaveLength(1);
+	});
+
+	it("releases a startup Extension transfer when semantic revision changes after prepare", async () => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-future-runtime-"));
+		const target = createTarget(root);
+		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
+		await store.initialize();
+		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const counters: ExtensionLeaseCounters = {
+			transfer: 0,
+			adopt: 0,
+			transferRelease: 0,
+			leaseRelease: 0,
+		};
+		let beforeTransfer = () => {};
+		const services: FutureSessionRuntimePiPayloadServices = Object.freeze({
+			...activation.supervisorServices,
+			externalizer: instrumentExtensionExternalizer(activation.externalizer, counters, false, () =>
+				beforeTransfer(),
+			),
+		});
+		const messages: FutureSupervisorMessage[] = [];
+		const supervisor = createFutureSupervisorFixture(target, services, messages, undefined, 3, {
+			PI_WEB_FIXTURE_STARTUP_FUTURE_EDITOR: "1",
+		});
+		stop = () => supervisor.stopAll();
+		beforeTransfer = () => {
+			const runtime = exactRuntime(supervisor, target.sessionHandle);
+			const revision = Reflect.get(runtime, "extensionSemanticRevision");
+			if (typeof revision !== "number") throw new Error("startup semantic revision is unavailable");
+			Reflect.set(runtime, "extensionSemanticRevision", revision + 1);
+		};
+
+		await expect(supervisor.activate(target.sessionHandle)).rejects.toThrow(
+			"extension_semantic_operation_stale",
+		);
+		await waitFor(() => counters.transferRelease === 1);
+		expect(counters).toEqual({ transfer: 1, adopt: 0, transferRelease: 1, leaseRelease: 0 });
+		expect(messages.filter((message) => message.type === "extension_ui_request")).toEqual([]);
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({
+			state: "crashed",
+			generation: 1,
 			lastSeq: 0,
 		});
+		await new Promise<void>((resolve) => setTimeout(resolve, 750));
+		expect(supervisor.getRuntime(target.sessionHandle)?.generation).toBe(1);
+	});
+
+	it("filters a timed-out startup editor before ready and releases its hold only on stop", async () => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-future-runtime-"));
+		const target = createTarget(root);
+		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
+		await store.initialize();
+		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const counters: ExtensionLeaseCounters = {
+			transfer: 0,
+			adopt: 0,
+			transferRelease: 0,
+			leaseRelease: 0,
+		};
+		const released: EpochStoredContentRef[] = [];
+		const services: FutureSessionRuntimePiPayloadServices = Object.freeze({
+			...activation.supervisorServices,
+			externalizer: instrumentExtensionExternalizer(activation.externalizer, counters),
+			async releaseHold(hold: EpochContentHold<EpochStoredContentRef>) {
+				released.push(hold.ref);
+				await activation.supervisorServices.releaseHold(hold);
+			},
+		});
+		const messages: FutureSupervisorMessage[] = [];
+		const supervisor = createFutureSupervisorFixture(target, services, messages, undefined, 0, {
+			PI_WEB_FIXTURE_READY_DELAY_MS: "100",
+			PI_WEB_FIXTURE_STARTUP_FUTURE_EDITOR: "1",
+			PI_WEB_FIXTURE_STARTUP_TIMEOUT_INPUT: "1",
+			PI_WEB_FIXTURE_STARTUP_TIMEOUT_INPUT_MS: "20",
+		});
+		stop = () => supervisor.stopAll();
+
+		await expect(supervisor.activate(target.sessionHandle)).resolves.toMatchObject({
+			state: "waiting_ui",
+			lastSeq: 1,
+		});
+		const requestFrames = messages.filter((message) => message.type === "extension_ui_request");
+		expect(requestFrames).toHaveLength(1);
+		expect(requestFrames[0]).toMatchObject({
+			type: "extension_ui_request",
+			request: { id: `startup-future-editor-${target.nativeSessionId}`, method: "editor" },
+		});
+		expect(messages.filter((message) => message.type === "extension_ui_closed")).toEqual([]);
+		expect(supervisor.getPendingExtensionRequests(target.sessionHandle)).toEqual([
+			expect.objectContaining({
+				id: `startup-future-editor-${target.nativeSessionId}`,
+				method: "editor",
+			}),
+		]);
+		expect(counters).toEqual({ transfer: 1, adopt: 1, transferRelease: 0, leaseRelease: 1 });
+		expect(generationOwnerRefs(exactRuntime(supervisor, target.sessionHandle))).toHaveLength(1);
+		expect(released).toEqual([]);
+
+		await supervisor.stop(target.sessionHandle);
+		await waitFor(() => released.length === 1);
+		expect(released).toHaveLength(1);
+		expect(counters).toEqual({ transfer: 1, adopt: 1, transferRelease: 0, leaseRelease: 1 });
 	});
 
 	it("terminalizes an awaiting-response leased future blocking request without adoption or restart", async () => {

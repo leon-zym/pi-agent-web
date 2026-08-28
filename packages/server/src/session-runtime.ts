@@ -52,7 +52,11 @@ import {
 	type SessionLiveProjectionPreparedCommit,
 	type SessionLiveProjectionSnapshot,
 } from "./session-live-projection.js";
-import { createCurrentSessionProductSchema, type SessionProductSchema } from "./session-product-schema.js";
+import {
+	createCurrentSessionProductSchema,
+	type SessionProductSchema,
+	SessionProductSchemaLogicalError,
+} from "./session-product-schema.js";
 import {
 	type ExistingSessionTarget,
 	eventSettlesWork,
@@ -152,6 +156,26 @@ interface PreparedExtensionSemanticOperation<
 	timersToClear: readonly PendingDialog<TExtensionRequest>[];
 	timersToArm: readonly PendingDialog<TExtensionRequest>[];
 	processToken: number;
+	warnOversizedSticky: boolean;
+}
+
+interface ExtensionSemanticPlan<TEvent, TExtensionRequest> {
+	frames: readonly BufferedFrame<TEvent, TExtensionRequest>[];
+	pendingDialogs: Map<string, PendingDialog<TExtensionRequest>>;
+	stickyExtension: Map<string, TExtensionRequest>;
+	timersToClear: readonly PendingDialog<TExtensionRequest>[];
+	timersToArm: readonly PendingDialog<TExtensionRequest>[];
+	warnOversizedSticky: boolean;
+}
+
+interface PreparedStartupExtensionOperation<TEvent, TExtensionRequest>
+	extends ExtensionSemanticPlan<TEvent, TExtensionRequest> {
+	processToken: number;
+	semanticRevision: number;
+	startupFrameCount: number;
+	startupFrameBytesBefore: number;
+	startupFrames: BufferedFrame<TEvent, TExtensionRequest>[];
+	startupFrameBytes: number;
 }
 
 export interface SessionIdentityTransitionCommit<
@@ -784,7 +808,11 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			await this.initializeProjectionBase(processToken, proc);
 			this.deferredStartupEmits = [];
 			this.setState(this.pendingDialogs.size > 0 ? "waiting_ui" : "idle");
-			this.flushFrames(this.startupFrames);
+			if (this.productAdapter.mode === "future_content") {
+				this.flushPreparedFutureStartupFrames(this.startupFrames);
+			} else {
+				this.flushFrames(this.startupFrames);
+			}
 			this.startupFrames = [];
 			this.startupFrameBytes = 0;
 			this.assertWireSnapshotFits();
@@ -916,6 +944,19 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 					: processToken === this.processToken && this.proc === proc);
 		const consume: PiDecodedDeliveryConsumer<RuntimeResponse<M>, RuntimeRef<M>> = (delivery) => {
 			const messages = this.productAdapter.messagesFrom(delivery.value);
+			const startupCandidate =
+				this.productAdapter.mode === "future_content" &&
+				!this.startupReady &&
+				this.transitionStage === null &&
+				candidateOwnership === undefined;
+			const semanticRevision = this.extensionSemanticRevision;
+			const startupFrameCount = this.startupFrames.length;
+			const startupFrameBytes = this.startupFrameBytes;
+			const startupFrames = startupCandidate ? this.authoritativeFutureStartupFrames(this.startupFrames) : [];
+			const extensionState = {
+				pendingDialogs: new Map(this.pendingDialogs),
+				stickyExtension: new Map(this.stickyExtension),
+			};
 			const candidate = new SessionLiveProjection<
 				RuntimeMessage<M>,
 				RuntimeEvent<M>,
@@ -924,15 +965,38 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 				identity,
 				settledMessages: messages,
 				baseSeq: 0,
-				runtimePhase: this.pendingDialogs.size > 0 ? "waiting_ui" : "idle",
+				runtimePhase: extensionState.pendingDialogs.size > 0 ? "waiting_ui" : "idle",
 				limits: this.opts.projectionLimits,
 				schema: this.productAdapter.productSchema,
 			});
-			const candidateSnapshot = this.buildSessionSnapshot(candidate, candidateRuntime);
+			const projectionSnapshot =
+				startupFrames.length > 0
+					? candidate.previewPreparedBatch(candidate.prepareBatch(identity, startupFrames, this.state))
+					: candidate.snapshot();
+			if (!projectionSnapshot) {
+				throw new RpcError("get_messages", "startup_projection_preview_stale");
+			}
+			const runtimeSnapshot: SessionRuntimeSnapshot = {
+				...(candidateRuntime ?? this.snapshot()),
+				lastSeq: projectionSnapshot.asOfSeq,
+			};
+			const candidateSnapshot = this.buildSessionSnapshotFromProjection(
+				projectionSnapshot,
+				runtimeSnapshot,
+				extensionState,
+			);
 			this.assertProductSnapshotCandidateFits(candidateSnapshot);
 			return delivery.prepare((transfer) => {
 				if (!ownerIsCurrent()) {
 					throw new RpcError("get_messages", "session_generation_stale");
+				}
+				if (
+					startupCandidate &&
+					(semanticRevision !== this.extensionSemanticRevision ||
+						startupFrameCount !== this.startupFrames.length ||
+						startupFrameBytes !== this.startupFrameBytes)
+				) {
+					throw new RpcError("get_messages", "startup_extension_state_changed_before_base_commit");
 				}
 				if (transfer) {
 					if (!contentOwner) throw new RpcError("get_messages", "unexpected_payload_transfer");
@@ -1547,12 +1611,16 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			RuntimeExtensionRequest<M>
 		> | null = this.liveProjection,
 		runtime: SessionRuntimeSnapshot = this.snapshot(),
+		extensionState: {
+			pendingDialogs: ReadonlyMap<string, PendingDialog<RuntimeExtensionRequest<M>>>;
+			stickyExtension: ReadonlyMap<string, RuntimeExtensionRequest<M>>;
+		} = { pendingDialogs: this.pendingDialogs, stickyExtension: this.stickyExtension },
 	): unknown {
 		const projection = source?.snapshot();
 		if (!projection || projection.asOfSeq !== this.lastSeq) {
 			throw new RpcError("session_snapshot", "session_snapshot_unavailable");
 		}
-		return this.buildSessionSnapshotFromProjection(projection, runtime);
+		return this.buildSessionSnapshotFromProjection(projection, runtime, extensionState);
 	}
 
 	private buildSessionSnapshotFromProjection(
@@ -1995,7 +2063,26 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 				throw new RpcError("extension_ui_request", "future_extension_generation_owner_unavailable");
 			});
 		}
-		if (!this.startupReady || this.transitionStage !== null) {
+		if (!this.startupReady && this.transitionStage === null) {
+			const prepared = this.prepareStartupExtensionOperation(processToken, delivery.value);
+			return delivery.prepare((transfer) => {
+				if (!this.isCurrentGenerationContentOwner(processToken, proc, owner)) {
+					throw new RpcError("extension_ui_request", "session_generation_stale");
+				}
+				if (!futureExtensionTransferMatches(delivery.value, transfer)) {
+					this.manuallyStopped = true;
+					throw new RpcError("extension_ui_request", "future_extension_payload_ref_mismatch");
+				}
+				if (!this.startupExtensionOperationEligible(prepared)) {
+					this.manuallyStopped = true;
+					throw new RpcError("extension_ui_request", "extension_semantic_operation_stale");
+				}
+				if (transfer) owner.adopt(transfer);
+				this.commitStartupExtensionOperation(prepared);
+				return true;
+			});
+		}
+		if (this.transitionStage !== null) {
 			const transitionStage = this.transitionStage;
 			return delivery.prepare((transfer) => {
 				if (!this.isCurrentGenerationContentOwner(processToken, proc, owner)) {
@@ -2040,6 +2127,112 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		});
 	}
 
+	private prepareStartupExtensionOperation(
+		processToken: number,
+		request: RuntimeExtensionRequest<M>,
+	): PreparedStartupExtensionOperation<RuntimeEvent<M>, RuntimeExtensionRequest<M>> {
+		const replaced = BLOCKING_DIALOG_METHODS.has(request.method)
+			? this.pendingDialogs.get(request.id)
+			: undefined;
+		const plan = this.planExtensionRequestSemanticMutation(request, false);
+		const retainedStartupFrames = replaced
+			? this.startupFrames.filter(
+					(frame) => frame.type !== "extension_ui_request" || frame.request !== replaced.request,
+				)
+			: this.startupFrames;
+		let startupFrameBytes = 0;
+		try {
+			let extensionLogicalBytes = 0;
+			for (const entry of plan.pendingDialogs.values()) {
+				const logicalBytes = this.productAdapter.productSchema.extensionRequestLogicalBytes(entry.request);
+				if (
+					logicalBytes >
+					this.productAdapter.productSchema.maxSnapshotLogicalBytes - extensionLogicalBytes
+				) {
+					throw new SessionLiveProjectionLimitError("extension_state");
+				}
+				extensionLogicalBytes += logicalBytes;
+			}
+			for (const stickyRequest of plan.stickyExtension.values()) {
+				const logicalBytes = this.productAdapter.productSchema.extensionRequestLogicalBytes(stickyRequest);
+				if (
+					logicalBytes >
+					this.productAdapter.productSchema.maxSnapshotLogicalBytes - extensionLogicalBytes
+				) {
+					throw new SessionLiveProjectionLimitError("extension_state");
+				}
+				extensionLogicalBytes += logicalBytes;
+			}
+			for (const frame of [...retainedStartupFrames, ...plan.frames]) {
+				if (frame.type === "extension_ui_request") {
+					this.productAdapter.productSchema.extensionRequestLogicalBytes(frame.request);
+				}
+				const frameBytes = bufferedFrameBytes(frame);
+				if (frameBytes > this.opts.transientBufferMaxBytes - startupFrameBytes) {
+					throw new RpcError("session_start", "startup_frame_buffer_limit_exceeded");
+				}
+				startupFrameBytes += frameBytes;
+			}
+		} catch (error) {
+			if (
+				error instanceof SessionProductSchemaLogicalError ||
+				error instanceof SessionLiveProjectionLimitError
+			) {
+				throw this.normalizeProjectionError(new SessionLiveProjectionLimitError("extension_state"));
+			}
+			throw error;
+		}
+		return {
+			...plan,
+			processToken,
+			semanticRevision: this.extensionSemanticRevision,
+			startupFrameCount: this.startupFrames.length,
+			startupFrameBytesBefore: this.startupFrameBytes,
+			startupFrames: [...retainedStartupFrames, ...plan.frames],
+			startupFrameBytes,
+		};
+	}
+
+	private startupExtensionOperationEligible(
+		prepared: PreparedStartupExtensionOperation<RuntimeEvent<M>, RuntimeExtensionRequest<M>>,
+	): boolean {
+		return (
+			prepared.processToken === this.processToken &&
+			!this.startupReady &&
+			this.transitionStage === null &&
+			this.liveProjection === null &&
+			prepared.semanticRevision === this.extensionSemanticRevision &&
+			prepared.startupFrameCount === this.startupFrames.length &&
+			prepared.startupFrameBytesBefore === this.startupFrameBytes
+		);
+	}
+
+	private commitStartupExtensionOperation(
+		prepared: PreparedStartupExtensionOperation<RuntimeEvent<M>, RuntimeExtensionRequest<M>>,
+	): void {
+		this.pendingDialogs = prepared.pendingDialogs;
+		this.stickyExtension = prepared.stickyExtension;
+		this.startupFrames = prepared.startupFrames;
+		this.startupFrameBytes = prepared.startupFrameBytes;
+		this.extensionSemanticRevision += 1;
+		this.touch();
+		for (const entry of prepared.timersToClear) {
+			this.runCommittedExtensionEffect("clear startup dialog timer", () => {
+				if (entry.timer) clearTimeout(entry.timer);
+			});
+		}
+		for (const entry of prepared.timersToArm) {
+			this.runCommittedExtensionEffect("arm startup dialog timer", () =>
+				this.armDialogTimer(prepared.processToken, entry),
+			);
+		}
+		if (prepared.warnOversizedSticky) {
+			this.runCommittedExtensionEffect("log oversized startup sticky Extension state", () =>
+				this.log("warn", `Dropping oversized sticky extension state for ${this.sessionHandle}`),
+			);
+		}
+	}
+
 	private verifyMaterializedSessionFile(): void {
 		if (this.inspectMaterializedSessionFile()) this.sessionFileIdentityVerified = true;
 	}
@@ -2062,18 +2255,31 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		processToken: number,
 		request: RuntimeExtensionRequest<M>,
 	): PreparedExtensionSemanticOperation<RuntimeMessage<M>, RuntimeEvent<M>, RuntimeExtensionRequest<M>> {
+		return this.prepareExtensionSemanticOperation({
+			processToken,
+			...this.planExtensionRequestSemanticMutation(request),
+		});
+	}
+
+	private planExtensionRequestSemanticMutation(
+		request: RuntimeExtensionRequest<M>,
+		publishReplacedClose = true,
+	): ExtensionSemanticPlan<RuntimeEvent<M>, RuntimeExtensionRequest<M>> {
 		const pendingDialogs = new Map(this.pendingDialogs);
 		const stickyExtension = new Map(this.stickyExtension);
 		const frames: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[] = [];
 		const timersToClear: PendingDialog<RuntimeExtensionRequest<M>>[] = [];
 		const timersToArm: PendingDialog<RuntimeExtensionRequest<M>>[] = [];
+		let warnOversizedSticky = false;
 
 		if (BLOCKING_DIALOG_METHODS.has(request.method)) {
 			const replaced = pendingDialogs.get(request.id);
 			if (replaced) {
 				pendingDialogs.delete(request.id);
 				timersToClear.push(replaced);
-				frames.push({ type: "extension_ui_closed", requestId: request.id, reason: "replaced" });
+				if (publishReplacedClose) {
+					frames.push({ type: "extension_ui_closed", requestId: request.id, reason: "replaced" });
+				}
 			}
 			const entry: PendingDialog<RuntimeExtensionRequest<M>> = { request, timer: null };
 			pendingDialogs.set(request.id, entry);
@@ -2107,7 +2313,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 				if (!this.extensionStateMapsFit(pendingDialogs, stickyExtension)) {
 					stickyExtension.delete(key);
 					frames.push({ type: "extension_ui_request", request: this.stickyClearRequest(request) });
-					this.log("warn", `Dropping oversized sticky extension state for ${this.sessionHandle}`);
+					warnOversizedSticky = true;
 				} else {
 					frames.push({ type: "extension_ui_request", request });
 				}
@@ -2116,14 +2322,14 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			frames.push({ type: "extension_ui_request", request });
 		}
 
-		return this.prepareExtensionSemanticOperation({
-			processToken,
+		return {
 			frames,
 			pendingDialogs,
 			stickyExtension,
 			timersToClear,
 			timersToArm,
-		});
+			warnOversizedSticky,
+		};
 	}
 
 	private prepareExtensionCloseSemanticOperation(
@@ -2144,6 +2350,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			stickyExtension: new Map(this.stickyExtension),
 			timersToClear: [dialog],
 			timersToArm: [],
+			warnOversizedSticky: false,
 		});
 	}
 
@@ -2154,6 +2361,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		stickyExtension: Map<string, RuntimeExtensionRequest<M>>;
 		timersToClear: readonly PendingDialog<RuntimeExtensionRequest<M>>[];
 		timersToArm: readonly PendingDialog<RuntimeExtensionRequest<M>>[];
+		warnOversizedSticky: boolean;
 	}): PreparedExtensionSemanticOperation<RuntimeMessage<M>, RuntimeEvent<M>, RuntimeExtensionRequest<M>> {
 		const projection = this.liveProjection;
 		if (!projection) throw new RpcError("session_snapshot", "session_snapshot_unavailable");
@@ -2223,6 +2431,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 				timersToClear: input.timersToClear,
 				timersToArm: input.timersToArm,
 				processToken: input.processToken,
+				warnOversizedSticky: input.warnOversizedSticky,
 			};
 		} catch (error) {
 			if (error instanceof SessionLiveProjectionLimitError) {
@@ -2278,6 +2487,11 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		}
 		for (const envelope of prepared.envelopes) {
 			this.runCommittedExtensionEffect("publish Extension frame", () => this.emitSupervisorMessage(envelope));
+		}
+		if (prepared.warnOversizedSticky) {
+			this.runCommittedExtensionEffect("log oversized sticky Extension state", () =>
+				this.log("warn", `Dropping oversized sticky extension state for ${this.sessionHandle}`),
+			);
 		}
 	}
 
@@ -2410,6 +2624,29 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			}
 			this.publishFrame(frame);
 		}
+	}
+
+	private flushPreparedFutureStartupFrames(
+		frames: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[],
+	): void {
+		for (const frame of this.authoritativeFutureStartupFrames(frames)) {
+			if (frame.type === "event") {
+				this.publishFrame(frame);
+			} else {
+				this.emitFrame(frame);
+			}
+		}
+	}
+
+	private authoritativeFutureStartupFrames(
+		frames: readonly BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[],
+	): BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[] {
+		return frames.filter(
+			(frame) =>
+				frame.type !== "extension_ui_request" ||
+				!BLOCKING_DIALOG_METHODS.has(frame.request.method) ||
+				this.pendingDialogs.get(frame.request.id)?.request === frame.request,
+		);
 	}
 
 	private publishFrame(frame: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>): void {
