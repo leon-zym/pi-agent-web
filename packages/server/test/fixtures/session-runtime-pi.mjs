@@ -34,6 +34,7 @@ let failNextState = false;
 let delayNextTransitionState = false;
 let pendingBash;
 let pendingBashTimer;
+let pendingInlineTransition;
 let startupFloodSent = false;
 let initialStateRequest = true;
 let getMessagesRequestCount = 0;
@@ -210,6 +211,15 @@ function configuredCount(name) {
 }
 
 function sendStartupExtensionState() {
+	if (process.env.PI_WEB_FIXTURE_STARTUP_FUTURE_EDITOR === "1") {
+		send({
+			type: "extension_ui_request",
+			id: `startup-future-editor-${sessionId}`,
+			method: "editor",
+			title: "Startup future editor",
+			prefill: "s".repeat(320 * 1024),
+		});
+	}
 	const stickyCount = configuredCount("PI_WEB_FIXTURE_STICKY_COUNT");
 	for (let index = 0; index < stickyCount; index += 1) {
 		send({
@@ -473,6 +483,17 @@ function streamPrompt(command) {
 		send({ type: "agent_settled" });
 		return;
 	}
+	if (text === "future-extension-large-editor") {
+		response(command);
+		send({
+			type: "extension_ui_request",
+			id: `future-editor-${sessionId}`,
+			method: "editor",
+			title: "Future editor",
+			prefill: "e".repeat(320 * 1024),
+		});
+		return;
+	}
 	if (text === "notify-then-event") {
 		send({
 			type: "extension_ui_request",
@@ -626,6 +647,26 @@ function streamPrompt(command) {
 }
 
 function transition(command) {
+	if (process.env.PI_WEB_FIXTURE_TRANSITION_INLINE_DIALOG === "1") {
+		pendingInlineTransition = command;
+		send({
+			type: "extension_ui_request",
+			id: `transition-inline-dialog-${sessionId}`,
+			method: "confirm",
+			title: "Transition inline dialog",
+			message: "confirm transition veto",
+		});
+		return;
+	}
+	if (process.env.PI_WEB_FIXTURE_TRANSITION_FUTURE_EDITOR === "1") {
+		send({
+			type: "extension_ui_request",
+			id: `transition-future-editor-${sessionId}`,
+			method: "editor",
+			title: "Transition future editor",
+			prefill: "t".repeat(320 * 1024),
+		});
+	}
 	const stagedLogicalBytes = configuredLogicalBytes("PI_WEB_FIXTURE_TRANSITION_STAGED_LOGICAL_BYTES");
 	const stagedLogicalCount = Math.max(
 		0,
@@ -797,6 +838,18 @@ function handleLine(line) {
 						: {}),
 				});
 			}
+			if (
+				process.env.PI_WEB_FIXTURE_TRANSITION_VERIFYING_FUTURE_EDITOR === "1" &&
+				getMessagesRequestCount === 2
+			) {
+				send({
+					type: "extension_ui_request",
+					id: `transition-verifying-future-editor-${sessionId}`,
+					method: "editor",
+					title: "Transition verifying future editor",
+					prefill: "v".repeat(320 * 1024),
+				});
+			}
 			response(command, { messages });
 			if (
 				process.env.PI_WEB_FIXTURE_TRANSITION_DIALOG_DURING_PARENT_CLEANUP === "1" &&
@@ -938,6 +991,10 @@ function handleLine(line) {
 			transition(command);
 			return;
 		case "extension_ui_response":
+			if (pendingInlineTransition) {
+				response(pendingInlineTransition, { cancelled: true });
+				pendingInlineTransition = undefined;
+			}
 			return;
 		default:
 			response(command);
