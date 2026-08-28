@@ -1,13 +1,19 @@
 import type {
 	AssistantMessageDto,
 	ExtensionUiRequestDto,
+	FutureProductSessionEventDto,
+	FutureSessionMessageDto,
+	FutureToolResultMessageDto,
 	ProductSessionEventDto,
 	SessionAttachmentRefDto,
+	SessionContentRefDto,
+	SessionExternalTextDto,
 	SessionMessageDto,
 	SessionRuntimeDto,
 	UsageDto,
 } from "@pi-agent-web/protocol";
 import {
+	FUTURE_SESSION_CONTENT_REF_BUDGET,
 	isSessionSnapshotDto,
 	SESSION_PAYLOAD_BUDGET,
 	SESSION_SNAPSHOT_MAX_MESSAGES,
@@ -20,6 +26,10 @@ import {
 	SessionLiveProjectionLimitError,
 	SessionLiveProjectionPayloadError,
 } from "../src/session-live-projection.js";
+import {
+	createCurrentSessionProductSchema,
+	createFutureSessionProductSchema,
+} from "../src/session-product-schema.js";
 
 const identity: SessionLiveProjectionIdentity = {
 	serverEpoch: "epoch-a",
@@ -46,6 +56,44 @@ const attachmentRef: SessionAttachmentRefDto = {
 	mediaType: "image/png",
 	byteLength: 4,
 };
+
+const futureContext = {
+	serverEpoch: identity.serverEpoch,
+	payloadBudget: SESSION_PAYLOAD_BUDGET,
+	contentRefBudget: FUTURE_SESSION_CONTENT_REF_BUDGET,
+};
+
+function contentRef(byteLength: number, sha = "b"): SessionContentRefDto {
+	return {
+		type: "content_ref",
+		serverEpoch: identity.serverEpoch,
+		sha256: sha.repeat(64),
+		byteLength,
+		encoding: "utf-8",
+	};
+}
+
+function externalText(byteLength: number, sha = "b"): SessionExternalTextDto {
+	return { type: "external_text", ref: contentRef(byteLength, sha) };
+}
+
+function futureToolResult(text: string | SessionExternalTextDto): FutureToolResultMessageDto {
+	return {
+		role: "toolResult",
+		toolCallId: "tool-1",
+		toolName: "read",
+		content: [{ type: "text", text }],
+		isError: false,
+		timestamp: 1,
+	};
+}
+
+function futureEvent(value: FutureProductSessionEventDto): {
+	type: "event";
+	event: FutureProductSessionEventDto;
+} {
+	return { type: "event", event: value };
+}
 
 function userMessage(text: string): SessionMessageDto {
 	return { role: "user", content: text, timestamp: 1 };
@@ -101,6 +149,176 @@ function wireSnapshot(projection: ReturnType<SessionLiveProjection["snapshot"]>)
 }
 
 describe("SessionLiveProjection", () => {
+	it("keeps omitted and explicit current schemas behaviorally identical", () => {
+		const implicit = new SessionLiveProjection({ identity, baseSeq: 0, runtimePhase: "idle" });
+		const explicit = new SessionLiveProjection({
+			identity,
+			baseSeq: 0,
+			runtimePhase: "idle",
+			schema: createCurrentSessionProductSchema(),
+		});
+		const input = event({ type: "agent_start" });
+
+		expect(implicit.commitInlineOnly(identity, input, "running")).toBe(1);
+		expect(explicit.commitInlineOnly(identity, input, "running")).toBe(1);
+		expect(explicit.snapshot()).toEqual(implicit.snapshot());
+		expect(explicit.activeTurnEventBytes(input.event)).toBe(implicit.activeTurnEventBytes(input.event));
+	});
+
+	it("injects the future guard and keeps the inline-only seam closed to refs", () => {
+		const schema = createFutureSessionProductSchema(futureContext);
+		const projection = new SessionLiveProjection<FutureSessionMessageDto, FutureProductSessionEventDto>({
+			identity,
+			baseSeq: 0,
+			runtimePhase: "running",
+			schema,
+		});
+		const input = futureEvent({
+			type: "message_end",
+			message: futureToolResult(externalText(48 * 1024 * 1024)),
+		});
+
+		expect(() => projection.commitInlineOnly(identity, input)).toThrow(SessionLiveProjectionPayloadError);
+		const prepared = projection.prepareCommit(identity, input);
+		expect(projection.commitPrepared(prepared)).toBe(1);
+		expect(projection.snapshot().projectionEvents[0]?.event).toEqual(input.event);
+	});
+
+	it("separates the future 64 MiB logical limit from the small normalized wire frame", () => {
+		const schema = createFutureSessionProductSchema(futureContext);
+		const projection = new SessionLiveProjection<FutureSessionMessageDto, FutureProductSessionEventDto>({
+			identity,
+			baseSeq: 0,
+			runtimePhase: "running",
+			schema,
+		});
+		const accepted = futureEvent({
+			type: "message_end",
+			message: futureToolResult(externalText(48 * 1024 * 1024)),
+		});
+
+		expect(projection.maxActiveTurnLogicalBytes()).toBe(64 * 1024 * 1024);
+		expect(projection.activeTurnEventLogicalBytes(accepted.event)).toBeGreaterThan(48 * 1024 * 1024);
+		expect(projection.activeTurnEventBytes(accepted.event)).toBeLessThan(4 * 1024);
+		expect(projection.commitPrepared(projection.prepareCommit(identity, accepted))).toBe(1);
+
+		const oversized = futureEvent({
+			type: "message_end",
+			message: {
+				...futureToolResult(externalText(40 * 1024 * 1024, "c")),
+				content: [
+					{ type: "text", text: externalText(40 * 1024 * 1024, "c") },
+					{ type: "text", text: externalText(25 * 1024 * 1024, "d") },
+				],
+			},
+		});
+		const before = projection.snapshot();
+		expect(() => projection.prepareCommit(identity, oversized)).toThrow(SessionLiveProjectionLimitError);
+		expect(projection.snapshot()).toEqual(before);
+	});
+
+	it("enforces the 8 MiB plus 4 KiB normalized frame independently from configurable suffix bytes", () => {
+		const schema = createFutureSessionProductSchema(futureContext);
+		const projection = new SessionLiveProjection<FutureSessionMessageDto, FutureProductSessionEventDto>({
+			identity,
+			baseSeq: 0,
+			runtimePhase: "running",
+			schema,
+			limits: { maxLiveEventBytes: 16 * 1024 * 1024 },
+		});
+		const inline = "x".repeat(255 * 1024);
+		const messages = Array.from({ length: 33 }, () => futureToolResult(inline));
+		const input = futureEvent({ type: "agent_end", messages, willRetry: false });
+		const before = projection.snapshot();
+
+		expect(projection.activeTurnEventBytes(input.event)).toBeGreaterThan(schema.maxNormalizedEventWireBytes);
+		expect(() => projection.prepareCommit(identity, input)).toThrow(SessionLiveProjectionLimitError);
+		expect(projection.snapshot()).toEqual(before);
+	});
+
+	it("bounds the future serialized projection suffix at 8 MiB across individually valid frames", () => {
+		const schema = createFutureSessionProductSchema(futureContext);
+		const projection = new SessionLiveProjection<FutureSessionMessageDto, FutureProductSessionEventDto>({
+			identity,
+			baseSeq: 0,
+			runtimePhase: "running",
+			schema,
+			limits: { maxLiveEventBytes: 16 * 1024 * 1024 },
+		});
+		const inline = "x".repeat(255 * 1024);
+		const input = futureEvent({
+			type: "agent_end",
+			messages: Array.from({ length: 12 }, () => futureToolResult(inline)),
+			willRetry: false,
+		});
+
+		const first = projection.prepareCommit(identity, input);
+		expect(projection.commitPrepared(first)).toBe(1);
+		const second = projection.prepareCommit(identity, input);
+		expect(projection.commitPrepared(second)).toBe(2);
+		const before = projection.snapshot();
+		expect(() => projection.prepareCommit(identity, input)).toThrow(SessionLiveProjectionLimitError);
+		expect(projection.snapshot()).toEqual(before);
+	});
+
+	it("clamps future canonical snapshots without changing current override semantics", () => {
+		const futureSchema = {
+			...createFutureSessionProductSchema(futureContext),
+			maxSnapshotCanonicalWireBytes: 1024,
+		};
+		const limits = {
+			maxSettledMessageBytes: 4096,
+			maxLiveEventBytes: 4096,
+			maxSnapshotBytes: 4096,
+		};
+		const projection = new SessionLiveProjection<FutureSessionMessageDto, FutureProductSessionEventDto>({
+			identity,
+			baseSeq: 0,
+			runtimePhase: "idle",
+			schema: futureSchema,
+			limits,
+		});
+		const beforeEvent = projection.snapshot();
+		expect(() =>
+			projection.prepareCommit(
+				identity,
+				futureEvent({
+					type: "extension_error",
+					extensionPath: "fixture",
+					event: "snapshot-overflow",
+					error: "x".repeat(800),
+				}),
+			),
+		).toThrow(SessionLiveProjectionLimitError);
+		expect(projection.snapshot()).toEqual(beforeEvent);
+
+		const compaction = new SessionLiveProjection<FutureSessionMessageDto, FutureProductSessionEventDto>({
+			identity,
+			baseSeq: 0,
+			runtimePhase: "idle",
+			schema: futureSchema,
+			limits,
+		});
+		const token = compaction.beginIdleBaseCompaction();
+		if (!token) throw new Error("expected idle compaction token");
+		const beforeCompaction = compaction.snapshot();
+		expect(() =>
+			compaction.prepareIdleBaseCompaction(token, [{ role: "user", content: "x".repeat(800), timestamp: 1 }]),
+		).toThrow(SessionLiveProjectionLimitError);
+		expect(compaction.snapshot()).toEqual(beforeCompaction);
+
+		const currentSchema = { ...createCurrentSessionProductSchema(), maxSnapshotCanonicalWireBytes: 1 };
+		expect(
+			new SessionLiveProjection({
+				identity,
+				baseSeq: 0,
+				runtimePhase: "idle",
+				schema: currentSchema,
+				limits,
+			}).commitInlineOnly(identity, event({ type: "agent_start" })),
+		).toBe(1);
+	});
+
 	it("checks its current waterline without materializing a snapshot", () => {
 		const projection = new SessionLiveProjection({ identity, baseSeq: 7, runtimePhase: "idle" });
 

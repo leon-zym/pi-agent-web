@@ -13,6 +13,10 @@ import {
 	type SessionMessageDto,
 	type SessionProjectionEventDto,
 } from "@pi-agent-web/protocol";
+import {
+	SessionProductSchemaLogicalError,
+	type SessionProjectionProductSchema,
+} from "./session-product-schema.js";
 
 const BLOCKING_EXTENSION_METHODS = new Set(["select", "confirm", "input", "editor"]);
 const SNAPSHOT_RUNTIME_ENVELOPE_RESERVE_BYTES = 2 * 1024 * 1024;
@@ -49,17 +53,19 @@ export interface SessionLiveProjectionLimits {
 	maxSnapshotBytes: number;
 }
 
-export interface SessionLiveProjectionOptions {
+export interface SessionLiveProjectionOptions<TMessage = SessionMessageDto, TEvent = ProductSessionEventDto> {
 	identity: SessionLiveProjectionIdentity;
-	settledMessages?: readonly SessionMessageDto[];
+	settledMessages?: readonly TMessage[];
 	baseSeq: number;
 	runtimePhase?: SessionLiveRuntimePhase;
 	limits?: Partial<SessionLiveProjectionLimits>;
 	attachmentGuardContext?: SessionAttachmentGuardContext;
+	/** Explicit future schema; omission preserves the protocol 1.2 projection path. */
+	schema?: SessionProjectionProductSchema<TMessage, TEvent>;
 }
 
-export type SessionLiveProjectionInput =
-	| { type: "event"; event: ProductSessionEventDto }
+export type SessionLiveProjectionInput<TEvent = ProductSessionEventDto> =
+	| { type: "event"; event: TEvent }
 	| { type: "extension_ui_request"; request: ExtensionUiRequestDto }
 	| {
 			type: "extension_ui_closed";
@@ -67,14 +73,18 @@ export type SessionLiveProjectionInput =
 			reason: "answered" | "cancelled" | "expired" | "process_lost" | "replaced";
 	  };
 
-export type SessionLiveProjectionEventFrame = SessionProjectionEventDto;
+export type SessionLiveProjectionEventFrame<TEvent = ProductSessionEventDto> = Omit<
+	SessionProjectionEventDto,
+	"event"
+> & { event: TEvent };
 
-export interface SessionLiveProjectionSnapshot extends SessionLiveProjectionIdentity {
+export interface SessionLiveProjectionSnapshot<TMessage = SessionMessageDto, TEvent = ProductSessionEventDto>
+	extends SessionLiveProjectionIdentity {
 	baseSeq: number;
 	asOfSeq: number;
 	runtimePhase: SessionLiveRuntimePhase;
-	settledMessages: readonly SessionMessageDto[];
-	projectionEvents: readonly SessionLiveProjectionEventFrame[];
+	settledMessages: readonly TMessage[];
+	projectionEvents: readonly SessionLiveProjectionEventFrame<TEvent>[];
 	queue: {
 		readonly steering: readonly string[];
 		readonly followUp: readonly string[];
@@ -104,10 +114,10 @@ interface InternalCompactionToken extends SessionLiveProjectionCompactionToken {
 	owner: symbol;
 }
 
-interface PreparedCommitState {
+interface PreparedCommitState<TEvent> {
 	revision: number;
 	nextSeq: number;
-	projectionEvents: readonly SessionLiveProjectionEventFrame[];
+	projectionEvents: readonly SessionLiveProjectionEventFrame<TEvent>[];
 	projectionEventFrameBytes: readonly number[];
 	projectionEventBytes: number;
 	queue: { readonly steering: readonly string[]; readonly followUp: readonly string[] };
@@ -115,9 +125,9 @@ interface PreparedCommitState {
 	runtimePhase: SessionLiveRuntimePhase;
 }
 
-interface PreparedCompactionState {
+interface PreparedCompactionState<TMessage> {
 	revision: number;
-	settledMessages: readonly SessionMessageDto[];
+	settledMessages: readonly TMessage[];
 	settledMessageBytes: number;
 	baseSeq: number;
 }
@@ -153,20 +163,21 @@ export class SessionLiveProjectionPayloadError extends Error {
  * suffix needed to reconstruct live state. It does not duplicate the UI's
  * ConversationProjection reducer and it never persists a second Session truth.
  */
-export class SessionLiveProjection {
+export class SessionLiveProjection<TMessage = SessionMessageDto, TEvent = ProductSessionEventDto> {
 	private readonly identity: SessionLiveProjectionIdentity;
 	private readonly limits: SessionLiveProjectionLimits;
 	private readonly attachmentGuardContext: SessionAttachmentGuardContext | undefined;
+	private readonly schema: SessionProjectionProductSchema<TMessage, TEvent> | null;
 	private readonly compactionOwner = Symbol("session-live-projection");
 	private readonly compactionTokens = new WeakMap<object, { revision: number }>();
-	private readonly preparedCommits = new WeakMap<object, PreparedCommitState>();
-	private readonly preparedCompactions = new WeakMap<object, PreparedCompactionState>();
+	private readonly preparedCommits = new WeakMap<object, PreparedCommitState<TEvent>>();
+	private readonly preparedCompactions = new WeakMap<object, PreparedCompactionState<TMessage>>();
 	private revision = 0;
 	private baseSeq: number;
 	private asOfSeq: number;
-	private settledMessages: readonly SessionMessageDto[];
+	private settledMessages: readonly TMessage[];
 	private settledMessageBytes: number;
-	private projectionEvents: readonly SessionLiveProjectionEventFrame[] = [];
+	private projectionEvents: readonly SessionLiveProjectionEventFrame<TEvent>[] = [];
 	private projectionEventFrameBytes: readonly number[] = [];
 	private projectionEventBytes = 0;
 	private queue: { readonly steering: readonly string[]; readonly followUp: readonly string[] } = {
@@ -176,7 +187,7 @@ export class SessionLiveProjection {
 	private pendingExtensionRequests = new Map<string, ExtensionUiRequestDto>();
 	private runtimePhase: SessionLiveRuntimePhase;
 
-	constructor(options: SessionLiveProjectionOptions) {
+	constructor(options: SessionLiveProjectionOptions<TMessage, TEvent>) {
 		assertIdentityShape(options.identity);
 		assertSequence(options.baseSeq);
 		this.identity = clone(options.identity);
@@ -184,6 +195,9 @@ export class SessionLiveProjection {
 		this.asOfSeq = options.baseSeq;
 		this.runtimePhase = options.runtimePhase ?? "dormant";
 		this.limits = normalizeLimits(options.limits);
+		if (options.schema && options.attachmentGuardContext) {
+			throw new SessionLiveProjectionPayloadError();
+		}
 		if (
 			options.attachmentGuardContext !== undefined &&
 			(!isSessionAttachmentGuardContext(options.attachmentGuardContext) ||
@@ -194,6 +208,13 @@ export class SessionLiveProjection {
 		this.attachmentGuardContext = options.attachmentGuardContext
 			? clone(options.attachmentGuardContext)
 			: undefined;
+		if (
+			options.schema?.serverEpoch !== undefined &&
+			options.schema.serverEpoch !== options.identity.serverEpoch
+		) {
+			throw new SessionLiveProjectionPayloadError();
+		}
+		this.schema = options.schema ?? null;
 		const settledMessages = clone(options.settledMessages ?? []);
 		this.assertMessagesValid(settledMessages);
 		this.assertSettledMessagesFit(settledMessages);
@@ -204,7 +225,7 @@ export class SessionLiveProjection {
 
 	prepareCommit(
 		identity: SessionLiveProjectionIdentity,
-		input: SessionLiveProjectionInput,
+		input: SessionLiveProjectionInput<TEvent>,
 		runtimePhase?: SessionLiveRuntimePhase,
 	): SessionLiveProjectionPreparedCommit {
 		this.assertIdentity(identity);
@@ -218,10 +239,10 @@ export class SessionLiveProjection {
 
 		if (input.type === "event") {
 			const eventValue = clone(input.event);
-			if (!isProductSessionEventDto(eventValue, this.attachmentGuardContext)) {
+			if (!this.guardEvent(eventValue)) {
 				throw new SessionLiveProjectionPayloadError();
 			}
-			const frame: SessionLiveProjectionEventFrame = {
+			const frame: SessionLiveProjectionEventFrame<TEvent> = {
 				type: "event",
 				...this.identity,
 				seq: nextSeq,
@@ -230,21 +251,34 @@ export class SessionLiveProjection {
 			const previousFrame = this.projectionEvents.at(-1);
 			const mergedEvent =
 				previousFrame?.seq === this.asOfSeq
-					? mergeCompatibleDelta(previousFrame.event, eventValue, this.attachmentGuardContext)
+					? this.schema
+						? this.schema.mergeCompatibleDelta(previousFrame.event, eventValue)
+						: mergeCompatibleDelta(previousFrame.event, eventValue, (candidate) => this.guardEvent(candidate))
 					: null;
 			const nextFrame = mergedEvent === null ? frame : { ...frame, event: mergedEvent };
+			try {
+				this.schema?.activeTurnEventLogicalBytes(nextFrame.event);
+			} catch (error) {
+				if (error instanceof SessionProductSchemaLogicalError) {
+					throw new SessionLiveProjectionLimitError("live_events");
+				}
+				throw error;
+			}
 			const frameBytes = jsonBytes(nextFrame, "live_events");
+			if (this.schema?.mode === "future_content" && frameBytes > this.schema.maxNormalizedEventWireBytes) {
+				throw new SessionLiveProjectionLimitError("live_events");
+			}
 			const merging = mergedEvent !== null;
 			const previousFrameBytes = merging ? (this.projectionEventFrameBytes.at(-1) ?? 0) : 0;
 			const nextEventCount = this.projectionEvents.length + (merging ? 0 : 1);
 			const nextEventBytes = this.projectionEventBytes - previousFrameBytes + frameBytes;
-			if (nextEventCount > this.limits.maxLiveEventItems || nextEventBytes > this.limits.maxLiveEventBytes) {
+			if (nextEventCount > this.limits.maxLiveEventItems || nextEventBytes > this.maxLiveEventWireBytes()) {
 				throw new SessionLiveProjectionLimitError("live_events");
 			}
-			queue =
-				eventValue.type === "queue_update"
-					? { steering: [...eventValue.steering], followUp: [...eventValue.followUp] }
-					: this.queue;
+			const queueUpdate = this.schema ? this.schema.queueUpdate(eventValue) : currentQueueUpdate(eventValue);
+			queue = queueUpdate
+				? { steering: [...queueUpdate.steering], followUp: [...queueUpdate.followUp] }
+				: this.queue;
 			if (
 				queue.steering.length > this.limits.maxQueueItems ||
 				queue.followUp.length > this.limits.maxQueueItems
@@ -321,7 +355,7 @@ export class SessionLiveProjection {
 	/** Temporary default-off seam. C2b must replace this with prepare/adopt/commit. */
 	commitInlineOnly(
 		identity: SessionLiveProjectionIdentity,
-		input: SessionLiveProjectionInput,
+		input: SessionLiveProjectionInput<TEvent>,
 		runtimePhase?: SessionLiveRuntimePhase,
 	): number {
 		if (input.type === "event" && !isProductSessionEventDto(input.event)) {
@@ -344,8 +378,8 @@ export class SessionLiveProjection {
 		return Number.isSafeInteger(seq) && seq >= 0 && this.asOfSeq === seq;
 	}
 
-	snapshot(): SessionLiveProjectionSnapshot {
-		const value: SessionLiveProjectionSnapshot = {
+	snapshot(): SessionLiveProjectionSnapshot<TMessage, TEvent> {
+		const value: SessionLiveProjectionSnapshot<TMessage, TEvent> = {
 			...this.identity,
 			baseSeq: this.baseSeq,
 			asOfSeq: this.asOfSeq,
@@ -373,18 +407,18 @@ export class SessionLiveProjection {
 	shouldCompactIdleBase(): boolean {
 		if (this.snapshotRuntimePhase() !== "idle") return false;
 		const itemHighWater = Math.max(1, Math.floor(this.limits.maxLiveEventItems * 0.5));
-		const byteHighWater = Math.max(1, Math.floor(this.limits.maxLiveEventBytes * 0.5));
+		const byteHighWater = Math.max(1, Math.floor(this.maxLiveEventWireBytes() * 0.5));
 		return this.projectionEvents.length >= itemHighWater || this.projectionEventBytes >= byteHighWater;
 	}
 
 	activeTurnBudget(): SessionLiveProjectionTurnBudget {
 		return {
 			maxItems: Math.max(1, Math.floor(this.limits.maxLiveEventItems * 0.5)),
-			maxBytes: Math.max(1, Math.floor(this.limits.maxLiveEventBytes * 0.5)),
+			maxBytes: Math.max(1, Math.floor(this.maxLiveEventWireBytes() * 0.5)),
 		};
 	}
 
-	activeTurnEventBytes(event: ProductSessionEventDto): number {
+	activeTurnEventBytes(event: TEvent): number {
 		return jsonBytes(
 			{
 				type: "event",
@@ -394,6 +428,16 @@ export class SessionLiveProjection {
 			},
 			"live_events",
 		);
+	}
+
+	/** Logical contribution of one event; Runtime owns cross-event active-turn accumulation. */
+	activeTurnEventLogicalBytes(event: TEvent): number {
+		return this.schema?.activeTurnEventLogicalBytes(event) ?? 0;
+	}
+
+	/** Logical ceiling for Runtime-owned cross-event active-turn accumulation. */
+	maxActiveTurnLogicalBytes(): number {
+		return this.schema?.maxActiveTurnLogicalBytes ?? Number.MAX_SAFE_INTEGER;
 	}
 
 	needsIdleBaseCompactionBeforeTurn(): boolean {
@@ -418,14 +462,14 @@ export class SessionLiveProjection {
 			this.projectionEvents.length + input.pendingReservations * budget.maxItems + activeItems <=
 				this.limits.maxLiveEventItems &&
 			this.projectionEventBytes + input.pendingReservations * budget.maxBytes + activeBytes <=
-				this.limits.maxLiveEventBytes
+				this.maxLiveEventWireBytes()
 		);
 	}
 
 	/** Temporary default-off seam. C2b must replace this with prepare/adopt/commit. */
 	commitIdleBaseCompactionInlineOnly(
 		token: SessionLiveProjectionCompactionToken,
-		settledMessages: readonly SessionMessageDto[],
+		settledMessages: readonly TMessage[],
 	): boolean {
 		if (!settledMessages.every((message) => isSessionMessageDto(message))) {
 			this.compactionTokens.delete(token);
@@ -437,7 +481,7 @@ export class SessionLiveProjection {
 
 	prepareIdleBaseCompaction(
 		token: SessionLiveProjectionCompactionToken,
-		settledMessages: readonly SessionMessageDto[],
+		settledMessages: readonly TMessage[],
 	): SessionLiveProjectionPreparedCompaction | null {
 		const captured = this.compactionTokens.get(token);
 		this.compactionTokens.delete(token);
@@ -492,11 +536,17 @@ export class SessionLiveProjection {
 		return this.pendingExtensionRequests.size > 0 ? "waiting_ui" : this.runtimePhase;
 	}
 
+	private maxLiveEventWireBytes(): number {
+		return this.schema?.mode === "future_content"
+			? Math.min(this.limits.maxLiveEventBytes, this.schema.maxProjectionSuffixWireBytes)
+			: this.limits.maxLiveEventBytes;
+	}
+
 	private assertIdentity(identity: SessionLiveProjectionIdentity): void {
 		if (!sameIdentity(this.identity, identity)) throw new SessionLiveProjectionIdentityError();
 	}
 
-	private assertSettledMessagesFit(messages: readonly SessionMessageDto[]): void {
+	private assertSettledMessagesFit(messages: readonly TMessage[]): void {
 		if (
 			messages.length > this.limits.maxSettledMessageItems ||
 			jsonBytes(messages, "settled_messages") > this.limits.maxSettledMessageBytes
@@ -505,10 +555,21 @@ export class SessionLiveProjection {
 		}
 	}
 
-	private assertMessagesValid(messages: readonly SessionMessageDto[]): void {
-		if (!messages.every((message) => isSessionMessageDto(message, this.attachmentGuardContext))) {
+	private assertMessagesValid(messages: readonly TMessage[]): void {
+		if (!messages.every((message) => this.guardMessage(message))) {
 			throw new SessionLiveProjectionPayloadError();
 		}
+	}
+
+	private guardMessage(value: unknown): boolean {
+		return this.schema
+			? this.schema.guardMessage(value)
+			: isSessionMessageDto(value, this.attachmentGuardContext);
+	}
+
+	private guardEvent(value: unknown): value is TEvent {
+		if (this.schema) return this.schema.guardEvent(value);
+		return isProductSessionEventDto(value, this.attachmentGuardContext);
 	}
 
 	private assertSnapshotFits(
@@ -546,9 +607,15 @@ export class SessionLiveProjection {
 			serializedArrayContentsBytes(settledMessageBytes) +
 			serializedItemsArrayContentsBytes(projectionEventBytes, projectionEventCount) +
 			serializedArrayContentsBytes(jsonBytes(pending, "extension_state"));
-		if (estimatedBytes > this.limits.maxSnapshotBytes) {
+		if (estimatedBytes > this.maxSnapshotWireBytes()) {
 			throw new SessionLiveProjectionLimitError("snapshot");
 		}
+	}
+
+	private maxSnapshotWireBytes(): number {
+		return this.schema?.mode === "future_content"
+			? Math.min(this.limits.maxSnapshotBytes, this.schema.maxSnapshotCanonicalWireBytes)
+			: this.limits.maxSnapshotBytes;
 	}
 
 	private assertExtensionStateFits(pending: ReadonlyMap<string, ExtensionUiRequestDto>): void {
@@ -599,40 +666,64 @@ function normalizeLimits(
 	return limits;
 }
 
-function mergeCompatibleDelta(
-	previous: ProductSessionEventDto,
-	next: ProductSessionEventDto,
-	attachmentGuardContext?: SessionAttachmentGuardContext,
-): ProductSessionEventDto | null {
-	if (previous.type !== "message_update" || next.type !== "message_update") return null;
-	const previousDelta = previous.assistantMessageEvent;
-	const nextDelta = next.assistantMessageEvent;
+function mergeCompatibleDelta<TEvent>(
+	previous: TEvent,
+	next: TEvent,
+	guard: (value: unknown) => boolean,
+): TEvent | null {
+	const previousValue = clone(previous);
+	const nextValue = clone(next);
 	if (
-		!isDeltaEvent(previousDelta) ||
-		!isDeltaEvent(nextDelta) ||
+		!isRecord(previousValue) ||
+		!isRecord(nextValue) ||
+		previousValue.type !== "message_update" ||
+		nextValue.type !== "message_update" ||
+		!isRecord(previousValue.assistantMessageEvent) ||
+		!isRecord(nextValue.assistantMessageEvent)
+	) {
+		return null;
+	}
+	const previousDelta = previousValue.assistantMessageEvent;
+	const nextDelta = nextValue.assistantMessageEvent;
+	if (
+		!isDeltaRecord(previousDelta) ||
+		!isDeltaRecord(nextDelta) ||
 		previousDelta.type !== nextDelta.type ||
 		previousDelta.contentIndex !== nextDelta.contentIndex
 	) {
 		return null;
 	}
-	const merged: ProductSessionEventDto = {
-		...next,
-		assistantMessageEvent: {
-			...nextDelta,
-			delta: previousDelta.delta + nextDelta.delta,
-		},
-	};
-	return isProductSessionEventDto(merged, attachmentGuardContext) ? merged : null;
+	nextDelta.delta = previousDelta.delta + nextDelta.delta;
+	return guard(nextValue) ? nextValue : null;
 }
 
-type MessageUpdateEvent = Extract<ProductSessionEventDto, { type: "message_update" }>;
-type MessageDeltaEvent = Extract<
-	MessageUpdateEvent["assistantMessageEvent"],
-	{ type: "text_delta" | "thinking_delta" | "toolcall_delta" }
->;
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
-function isDeltaEvent(event: MessageUpdateEvent["assistantMessageEvent"]): event is MessageDeltaEvent {
-	return event.type === "text_delta" || event.type === "thinking_delta" || event.type === "toolcall_delta";
+function isDeltaRecord(
+	value: Record<string, unknown>,
+): value is Record<string, unknown> & { type: string; contentIndex: number; delta: string } {
+	return (
+		(value.type === "text_delta" || value.type === "thinking_delta" || value.type === "toolcall_delta") &&
+		typeof value.contentIndex === "number" &&
+		typeof value.delta === "string"
+	);
+}
+
+function currentQueueUpdate(
+	event: unknown,
+): { readonly steering: readonly string[]; readonly followUp: readonly string[] } | null {
+	if (!isRecord(event) || event.type !== "queue_update") return null;
+	if (
+		!Array.isArray(event.steering) ||
+		!event.steering.every((item) => typeof item === "string") ||
+		!Array.isArray(event.followUp) ||
+		!event.followUp.every((item) => typeof item === "string")
+	) {
+		return null;
+	}
+	return { steering: event.steering, followUp: event.followUp };
 }
 
 function serializedArrayContentsBytes(serializedArrayBytes: number): number {
