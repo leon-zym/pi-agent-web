@@ -1,7 +1,11 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { FutureProductSessionEventDto, SessionContentRefDto } from "@pi-agent-web/protocol";
+import type {
+	FutureExtensionUiRequestDto,
+	FutureProductSessionEventDto,
+	SessionContentRefDto,
+} from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	type EpochContentHold,
@@ -18,6 +22,10 @@ import type { ExistingSessionTarget, SessionSupervisorMessage } from "../src/ses
 import { createFutureSessionSupervisor } from "../src/session-supervisor.js";
 
 const fixturePath = path.join(import.meta.dirname, "fixtures", "session-runtime-pi.mjs");
+type FutureSupervisorMessage = SessionSupervisorMessage<
+	FutureProductSessionEventDto,
+	FutureExtensionUiRequestDto
+>;
 
 function createTarget(root: string): ExistingSessionTarget {
 	const cwd = path.join(root, "workspace");
@@ -296,7 +304,7 @@ function auditPayloadCustody(services: FutureSessionRuntimePiPayloadServices): {
 function createFixture(
 	target: ExistingSessionTarget,
 	piPayloadServices: FutureSessionRuntimePiPayloadServices,
-	messages: SessionSupervisorMessage<FutureProductSessionEventDto>[],
+	messages: FutureSupervisorMessage[],
 	env?: Record<string, string>,
 	additionalTargets: readonly ExistingSessionTarget[] = [],
 ) {
@@ -359,7 +367,7 @@ describe("future Session Supervisor identity transitions", () => {
 		const childLogicalBytes = activation.supervisorServices.productSchema.activeTurnEventLogicalBytes(
 			stagedLogicalEvent(1024 * 1024),
 		);
-		const messages: SessionSupervisorMessage<FutureProductSessionEventDto>[] = [];
+		const messages: FutureSupervisorMessage[] = [];
 		const supervisor = createFixture(target, audit.services, messages, {
 			PI_WEB_FIXTURE_TRANSITION_STAGED_LOGICAL_BYTES: String(1024 * 1024),
 			PI_WEB_FIXTURE_TRANSITION_STAGED_LOGICAL_COUNT: "1",
@@ -435,7 +443,7 @@ describe("future Session Supervisor identity transitions", () => {
 			activation.supervisorServices.productSchema.activeTurnEventLogicalBytes(
 				stagedLogicalEvent(1024 * 1024),
 			);
-		const messages: SessionSupervisorMessage<FutureProductSessionEventDto>[] = [];
+		const messages: FutureSupervisorMessage[] = [];
 		const supervisor = createFixture(target, audit.services, messages, {
 			...env,
 			PI_WEB_FIXTURE_TRANSITION_STAGED_LOGICAL_BYTES: String(1024 * 1024),
@@ -485,7 +493,7 @@ describe("future Session Supervisor identity transitions", () => {
 		await store.initialize();
 		const activation = createGatewayFuturePayloadActivation(store, "future-transition-epoch");
 		const trackedServices = withTrackedLogicalPayloads(activation.supervisorServices);
-		const messages: SessionSupervisorMessage<FutureProductSessionEventDto>[] = [];
+		const messages: FutureSupervisorMessage[] = [];
 		const supervisor = createFixture(target, trackedServices, messages, {
 			PI_WEB_FIXTURE_TRANSITION_STAGED_LOGICAL_BYTES: String(40 * 1024 * 1024),
 			PI_WEB_FIXTURE_TRANSITION_STAGED_LOGICAL_COUNT: "2",
@@ -524,7 +532,7 @@ describe("future Session Supervisor identity transitions", () => {
 		await store.initialize();
 		const activation = createGatewayFuturePayloadActivation(store, "future-transition-epoch");
 		const trackedServices = withTrackedLogicalPayloads(activation.supervisorServices);
-		const messages: SessionSupervisorMessage<FutureProductSessionEventDto>[] = [];
+		const messages: FutureSupervisorMessage[] = [];
 		const supervisor = createFixture(target, trackedServices, messages, {
 			PI_WEB_FIXTURE_TRANSITION_STAGED_LOGICAL_BYTES: String(40 * 1024 * 1024),
 			PI_WEB_FIXTURE_TRANSITION_STAGED_LOGICAL_COUNT: "1",
@@ -582,7 +590,7 @@ describe("future Session Supervisor identity transitions", () => {
 		const activation = createGatewayFuturePayloadActivation(store, "future-transition-epoch");
 		const trackedServices = withTrackedLogicalPayloads(activation.supervisorServices);
 		const audit = auditPayloadCustody(trackedServices);
-		const messages: SessionSupervisorMessage<FutureProductSessionEventDto>[] = [];
+		const messages: FutureSupervisorMessage[] = [];
 		const supervisor = createFixture(target, audit.services, messages, {
 			PI_WEB_FIXTURE_FAIL_TRANSITION_STATE: "1",
 			PI_WEB_FIXTURE_TRANSITION_STAGED_LOGICAL_BYTES: String(1024 * 1024),
@@ -630,7 +638,7 @@ describe("future Session Supervisor identity transitions", () => {
 		const activation = createGatewayFuturePayloadActivation(store, "future-transition-epoch");
 		const trackedServices = withTrackedLogicalPayloads(activation.supervisorServices);
 		const audit = auditPayloadCustody(trackedServices);
-		const messages: SessionSupervisorMessage<FutureProductSessionEventDto>[] = [];
+		const messages: FutureSupervisorMessage[] = [];
 		const supervisor = createFixture(
 			target,
 			audit.services,
@@ -685,7 +693,7 @@ describe("future Session Supervisor identity transitions", () => {
 			...trackedServices,
 			externalizer: forged.externalizer,
 		});
-		const messages: SessionSupervisorMessage<FutureProductSessionEventDto>[] = [];
+		const messages: FutureSupervisorMessage[] = [];
 		const supervisor = createFixture(target, audited.services, messages, {
 			PI_WEB_FIXTURE_TRANSITION_STAGED_LOGICAL_BYTES: String(1024 * 1024),
 			PI_WEB_FIXTURE_TRANSITION_STAGED_LOGICAL_COUNT: "2",
@@ -730,7 +738,7 @@ describe("future Session Supervisor identity transitions", () => {
 		});
 		await store.initialize();
 		const activation = createGatewayFuturePayloadActivation(store, "future-transition-epoch");
-		const messages: SessionSupervisorMessage<FutureProductSessionEventDto>[] = [];
+		const messages: FutureSupervisorMessage[] = [];
 		const supervisor = createFixture(target, activation.supervisorServices, messages, {
 			PI_WEB_FIXTURE_UNPERSISTED_TRANSITION: "1",
 		});

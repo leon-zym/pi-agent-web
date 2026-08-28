@@ -1,7 +1,11 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { FutureProductSessionEventDto, SessionContentRefDto } from "@pi-agent-web/protocol";
+import type {
+	FutureExtensionUiRequestDto,
+	FutureProductSessionEventDto,
+	SessionContentRefDto,
+} from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	type EpochContentHold,
@@ -20,6 +24,10 @@ import type { ExistingSessionTarget, SessionSupervisorMessage } from "../src/ses
 import { createFutureSessionSupervisor } from "../src/session-supervisor.js";
 
 const fixturePath = path.join(import.meta.dirname, "fixtures", "session-runtime-pi.mjs");
+type FutureSupervisorMessage = SessionSupervisorMessage<
+	FutureProductSessionEventDto,
+	FutureExtensionUiRequestDto
+>;
 
 function createTarget(root: string): ExistingSessionTarget {
 	const cwd = path.join(root, "workspace");
@@ -59,7 +67,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<voi
 function createFutureSupervisorFixture(
 	target: ExistingSessionTarget,
 	piPayloadServices: FutureSessionRuntimePiPayloadServices,
-	messages: SessionSupervisorMessage<FutureProductSessionEventDto>[],
+	messages: FutureSupervisorMessage[],
 	projectionLimits?: Partial<SessionLiveProjectionLimits>,
 	maxAutoRestarts = 0,
 ) {
@@ -100,8 +108,8 @@ function exactRuntime(supervisor: object, sessionHandle: string): object {
 }
 
 function isEventMessage(
-	message: SessionSupervisorMessage<FutureProductSessionEventDto>,
-): message is Extract<SessionSupervisorMessage<FutureProductSessionEventDto>, { type: "event" }> {
+	message: FutureSupervisorMessage,
+): message is Extract<FutureSupervisorMessage, { type: "event" }> {
 	return message.type === "event";
 }
 
@@ -177,7 +185,7 @@ describe("future Session Supervisor payload mode", () => {
 		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
 		await store.initialize();
 		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
-		const messages: SessionSupervisorMessage<FutureProductSessionEventDto>[] = [];
+		const messages: FutureSupervisorMessage[] = [];
 		const supervisor = createFutureSupervisorFixture(target, activation.supervisorServices, messages);
 		stop = () => supervisor.stopAll();
 
@@ -213,7 +221,7 @@ describe("future Session Supervisor payload mode", () => {
 		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
 		await store.initialize();
 		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
-		const messages: SessionSupervisorMessage<FutureProductSessionEventDto>[] = [];
+		const messages: FutureSupervisorMessage[] = [];
 		const supervisor = createFutureSupervisorFixture(target, activation.supervisorServices, messages);
 		stop = () => supervisor.stopAll();
 
@@ -271,7 +279,7 @@ describe("future Session Supervisor payload mode", () => {
 		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
 		await store.initialize();
 		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
-		const messages: SessionSupervisorMessage<FutureProductSessionEventDto>[] = [];
+		const messages: FutureSupervisorMessage[] = [];
 		const supervisor = createFutureSupervisorFixture(target, activation.supervisorServices, messages);
 		stop = () => supervisor.stopAll();
 
@@ -356,7 +364,7 @@ describe("future Session Supervisor payload mode", () => {
 				releasedHolds.push(hold.ref);
 			},
 		});
-		const messages: SessionSupervisorMessage<FutureProductSessionEventDto>[] = [];
+		const messages: FutureSupervisorMessage[] = [];
 		const supervisor = createFutureSupervisorFixture(
 			target,
 			piPayloadServices,

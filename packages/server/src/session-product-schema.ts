@@ -1,4 +1,6 @@
 import type {
+	ExtensionUiRequestDto,
+	FutureExtensionUiRequestDto,
 	FutureProductSessionEventDto,
 	FutureSessionContentRefGuardContext,
 	FutureSessionMessageDto,
@@ -9,9 +11,12 @@ import type {
 	SessionSnapshotDto,
 } from "@pi-agent-web/protocol";
 import {
+	analyzeFutureExtensionUiRequestLogicalBytes,
 	analyzeFutureProductSessionEventLogicalBytes,
 	analyzeFutureSessionSnapshotLogicalBytes,
 	FutureSessionLogicalBytesError,
+	isExtensionUiRequestDto,
+	isFutureExtensionUiRequestDto,
 	isFutureProductSessionEventDto,
 	isFutureSessionContentRefGuardContext,
 	isFutureSessionMessageDto,
@@ -33,6 +38,7 @@ const FUTURE_CONTEXT_KEYS = ["serverEpoch", "payloadBudget", "contentRefBudget"]
 export interface SessionProjectionProductSchema<
 	TMessage = SessionMessageDto,
 	TEvent = ProductSessionEventDto,
+	TExtensionRequest = ExtensionUiRequestDto,
 > {
 	readonly mode: "current" | "future_content";
 	readonly serverEpoch: string | undefined;
@@ -44,19 +50,23 @@ export interface SessionProjectionProductSchema<
 	readonly maxSnapshotLogicalBytes: number;
 	guardMessage(value: unknown): value is TMessage;
 	guardEvent(value: unknown): value is TEvent;
+	guardExtensionRequest(value: unknown): value is TExtensionRequest;
 	mergeCompatibleDelta(previous: TEvent, next: TEvent): TEvent | null;
 	queueUpdate(
 		event: TEvent,
 	): { readonly steering: readonly string[]; readonly followUp: readonly string[] } | null;
 	/** Count a value that already passed guardEvent without materializing an encoded copy. */
 	activeTurnEventLogicalBytes(event: TEvent): number;
+	/** Count a value that already passed guardExtensionRequest without materializing an encoded copy. */
+	extensionRequestLogicalBytes(request: TExtensionRequest): number;
 }
 
 export interface SessionProductSchema<
 	TMessage = SessionMessageDto,
 	TEvent = ProductSessionEventDto,
 	TSnapshot = SessionSnapshotDto,
-> extends SessionProjectionProductSchema<TMessage, TEvent> {
+	TExtensionRequest = ExtensionUiRequestDto,
+> extends SessionProjectionProductSchema<TMessage, TEvent, TExtensionRequest> {
 	guardSnapshot(value: unknown): value is TSnapshot;
 	/** Count a value that already passed guardSnapshot without materializing an encoded copy. */
 	snapshotLogicalBytes(snapshot: TSnapshot): number;
@@ -92,11 +102,13 @@ export function createCurrentSessionProductSchema(
 		guardMessage: (value: unknown): value is SessionMessageDto => isSessionMessageDto(value, exactContext),
 		guardEvent: (value: unknown): value is ProductSessionEventDto =>
 			isProductSessionEventDto(value, exactContext),
+		guardExtensionRequest: (value: unknown): value is ExtensionUiRequestDto => isExtensionUiRequestDto(value),
 		guardSnapshot: (value: unknown): value is SessionSnapshotDto => isSessionSnapshotDto(value, exactContext),
 		mergeCompatibleDelta: (previous: ProductSessionEventDto, next: ProductSessionEventDto) =>
 			mergeCurrentCompatibleDelta(previous, next, exactContext),
 		queueUpdate: currentQueueUpdate,
 		activeTurnEventLogicalBytes: () => 0,
+		extensionRequestLogicalBytes: () => 0,
 		snapshotLogicalBytes: () => 0,
 	};
 	return Object.freeze(schema);
@@ -104,12 +116,18 @@ export function createCurrentSessionProductSchema(
 
 export function createFutureSessionProductSchema(
 	context: FutureSessionContentRefGuardContext,
-): SessionProductSchema<FutureSessionMessageDto, FutureProductSessionEventDto, FutureSessionSnapshotDto> {
+): SessionProductSchema<
+	FutureSessionMessageDto,
+	FutureProductSessionEventDto,
+	FutureSessionSnapshotDto,
+	FutureExtensionUiRequestDto
+> {
 	const exactContext = snapshotFutureContext(context);
 	const schema: SessionProductSchema<
 		FutureSessionMessageDto,
 		FutureProductSessionEventDto,
-		FutureSessionSnapshotDto
+		FutureSessionSnapshotDto,
+		FutureExtensionUiRequestDto
 	> = {
 		mode: "future_content",
 		serverEpoch: exactContext.serverEpoch,
@@ -123,6 +141,8 @@ export function createFutureSessionProductSchema(
 			isFutureSessionMessageDto(value, exactContext),
 		guardEvent: (value: unknown): value is FutureProductSessionEventDto =>
 			isFutureProductSessionEventDto(value, exactContext),
+		guardExtensionRequest: (value: unknown): value is FutureExtensionUiRequestDto =>
+			isFutureExtensionUiRequestDto(value, exactContext),
 		guardSnapshot: (value: unknown): value is FutureSessionSnapshotDto =>
 			isFutureSessionSnapshotDto(value, exactContext),
 		mergeCompatibleDelta: (previous: FutureProductSessionEventDto, next: FutureProductSessionEventDto) =>
@@ -131,6 +151,12 @@ export function createFutureSessionProductSchema(
 		activeTurnEventLogicalBytes: (event: FutureProductSessionEventDto) =>
 			futureLogicalBytes(() =>
 				analyzeFutureProductSessionEventLogicalBytes(event, {
+					maxBytes: SESSION_PI_SNAPSHOT_JSONL_MAX_BYTES,
+				}),
+			),
+		extensionRequestLogicalBytes: (request: FutureExtensionUiRequestDto) =>
+			futureLogicalBytes(() =>
+				analyzeFutureExtensionUiRequestLogicalBytes(request, {
 					maxBytes: SESSION_PI_SNAPSHOT_JSONL_MAX_BYTES,
 				}),
 			),
