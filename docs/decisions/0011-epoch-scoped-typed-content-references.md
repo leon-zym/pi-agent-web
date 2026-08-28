@@ -75,8 +75,9 @@ atomicity protocol to every hold, download, materialization, and recovery path.
    for the original field. Two different serializations of equivalent JSON may have different
    digests without changing product semantics.
 5. The externalizer uses a closed root-slot allowlist:
-   - Text slots are string-form user or custom message content, `TextContentDto.text` in reviewed
-     message and entry paths, Extension `editor.prefill`, and Extension `set_editor_text.text`.
+   - Text slots are `TextContentDto.text` in reviewed tool-result and custom message or entry paths,
+     `BashExecutionMessage.output`, Extension `editor.prefill`, and Extension
+     `set_editor_text.text`.
    - JSON slots are `ToolCallContentDto.arguments`, tool execution `args`, `partialResult`, and
      `result`, tool-result or custom message `details`, custom-message entry `details`, and the whole
      Extension `setWidget.widgetLines` array.
@@ -89,9 +90,10 @@ atomicity protocol to every hold, download, materialization, and recovery path.
    Objects with the same shapes below that root also remain ordinary JSON and are not traversed.
 6. This decision does not externalize arbitrary nested JSON, assistant diagnostics, deferred data,
    custom entry data, compaction details or results, streaming text, thinking, or tool-call deltas,
-   queue content, Bash responses, Extension titles, prompts, options, notifications, or status text.
-   Browser-to-Gateway commands and Extension responses remain inline. It does not add a generic
-   binary type, remote hosting, durable Session storage, or a per-connection inline fallback.
+   queue content, user prompts, bare user or custom message strings, Extension titles, prompts,
+   options, notifications, or status text. Browser-to-Gateway commands and Extension responses
+   remain inline. It does not add a generic binary type, remote hosting, durable Session storage, or
+   a per-connection inline fallback.
 7. Text whose encoded UTF-8 byte length is strictly less than 256 KiB remains a string. A JSON root
    below the same threshold uses `inline_json`. Any allowlisted text or JSON value whose encoded byte
    length is at least 256 KiB uses `external_text` or `external_json`, up to a 48 MiB generic-content
