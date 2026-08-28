@@ -16,7 +16,11 @@ import { createGatewayFuturePayloadActivation } from "../src/gateway-payload-act
 import { legacyRpcV1Adapter } from "../src/legacy-rpc-v1.js";
 import { canonicalizeSessionFile, sessionHandleForFile } from "../src/native-session-catalog.js";
 import type { PiHostFuturePayloadExternalizer } from "../src/pi-host-adapter.js";
-import type { PiPayloadExternalizerInput, PiPayloadLease } from "../src/pi-payload-externalizer.js";
+import type {
+	PiPayloadExternalizerInput,
+	PiPayloadLease,
+	PiPayloadLeaseTransfer,
+} from "../src/pi-payload-externalizer.js";
 import type { SessionLiveProjectionLimits } from "../src/session-live-projection.js";
 import { SessionLiveProjection } from "../src/session-live-projection.js";
 import type { FutureSessionRuntimePiPayloadServices } from "../src/session-runtime.js";
@@ -70,6 +74,7 @@ function createFutureSupervisorFixture(
 	messages: FutureSupervisorMessage[],
 	projectionLimits?: Partial<SessionLiveProjectionLimits>,
 	maxAutoRestarts = 0,
+	env?: Record<string, string>,
 ) {
 	return createFutureSessionSupervisor({
 		serverEpoch: "future-epoch",
@@ -89,6 +94,7 @@ function createFutureSupervisorFixture(
 		piPayloadServices,
 		projectionLimits,
 		maxAutoRestarts,
+		env,
 		readyTimeoutMs: 2_000,
 	});
 }
@@ -105,6 +111,84 @@ function exactRuntime(supervisor: object, sessionHandle: string): object {
 	const runtime = runtimes.get(sessionHandle);
 	if (typeof runtime !== "object" || runtime === null) throw new Error("future runtime is unavailable");
 	return runtime;
+}
+
+function generationOwnerRefs(runtime: object): readonly EpochStoredContentRef[] {
+	const owner = Reflect.get(runtime, "generationContentOwner");
+	if (typeof owner !== "object" || owner === null) throw new Error("future generation owner is unavailable");
+	const refs = Reflect.get(owner, "refs");
+	if (!Array.isArray(refs)) throw new Error("future generation owner refs are unavailable");
+	return refs;
+}
+
+interface ExtensionLeaseCounters {
+	transfer: number;
+	adopt: number;
+	transferRelease: number;
+	leaseRelease: number;
+}
+
+function instrumentExtensionLease(
+	lease: PiPayloadLease<EpochStoredContentRef>,
+	counters: ExtensionLeaseCounters,
+	beforeTransfer?: () => void,
+): PiPayloadLease<EpochStoredContentRef> {
+	return Object.freeze({
+		refs: lease.refs,
+		transfer() {
+			counters.transfer += 1;
+			beforeTransfer?.();
+			const transfer = lease.transfer();
+			const wrapped: PiPayloadLeaseTransfer<EpochStoredContentRef> = Object.freeze({
+				refs: transfer.refs,
+				adopt(accept: (holds: readonly EpochContentHold<EpochStoredContentRef>[]) => true) {
+					counters.adopt += 1;
+					transfer.adopt(accept);
+				},
+				async release() {
+					counters.transferRelease += 1;
+					await transfer.release();
+				},
+			});
+			return wrapped;
+		},
+		async release() {
+			counters.leaseRelease += 1;
+			await lease.release();
+		},
+	});
+}
+
+function instrumentExtensionExternalizer(
+	base: PiHostFuturePayloadExternalizer,
+	counters: ExtensionLeaseCounters,
+	forgeRequestRef = false,
+	beforeTransfer?: () => void,
+): PiHostFuturePayloadExternalizer {
+	return Object.freeze({
+		...base,
+		async externalize(input: PiPayloadExternalizerInput, signal: AbortSignal) {
+			const outcome = await base.externalize(input, signal);
+			if (input.kind !== "extension_ui_request") return outcome;
+			const lease = instrumentExtensionLease(outcome.lease, counters, beforeTransfer);
+			if (!forgeRequestRef) return Object.freeze({ value: outcome.value, lease });
+			if (!isRecord(outcome.value) || !isRecord(outcome.value.prefill)) {
+				throw new Error("future Extension externalized prefill is unavailable");
+			}
+			const ref = outcome.value.prefill.ref;
+			if (!isRecord(ref)) throw new Error("future Extension externalized ref is unavailable");
+			return Object.freeze({
+				value: {
+					...outcome.value,
+					prefill: {
+						type: "external_text",
+						ref: { ...ref, sha256: "f".repeat(64) },
+					},
+				},
+				lease,
+			});
+		},
+	});
 }
 
 function isEventMessage(
@@ -177,6 +261,530 @@ describe("future Session Supervisor payload mode", () => {
 		stop = undefined;
 		store = undefined;
 		root = undefined;
+	});
+
+	it("publishes a normal 320 KiB editor request only after its exact future ref is generation-owned", async () => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-future-runtime-"));
+		const target = createTarget(root);
+		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
+		await store.initialize();
+		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const messages: FutureSupervisorMessage[] = [];
+		const supervisor = createFutureSupervisorFixture(target, activation.supervisorServices, messages);
+		stop = () => supervisor.stopAll();
+
+		const lease = await supervisor.claim(target.sessionHandle, "future-controller");
+		const before = supervisor.getRuntime(target.sessionHandle);
+		if (!before) throw new Error("future runtime was not activated");
+		await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "prompt", message: "future-extension-large-editor" },
+			{
+				connectionId: "future-controller",
+				expectedGeneration: before.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		await waitFor(() =>
+			messages.some(
+				(message) =>
+					message.type === "extension_ui_request" &&
+					message.request.id === `future-editor-${target.nativeSessionId}`,
+			),
+		);
+		const requestFrame = messages.find(
+			(message) =>
+				message.type === "extension_ui_request" &&
+				message.request.id === `future-editor-${target.nativeSessionId}`,
+		);
+		if (requestFrame?.type !== "extension_ui_request" || requestFrame.request.method !== "editor") {
+			throw new Error("future editor request was not published");
+		}
+		expect(requestFrame.request.prefill).toMatchObject({ type: "external_text" });
+		if (
+			typeof requestFrame.request.prefill !== "object" ||
+			requestFrame.request.prefill === null ||
+			requestFrame.request.prefill.type !== "external_text"
+		) {
+			throw new Error("future editor prefill was not externalized");
+		}
+		expect(generationOwnerRefs(exactRuntime(supervisor, target.sessionHandle))).toEqual([
+			requestFrame.request.prefill.ref,
+		]);
+	});
+
+	it("rejects a forged future Extension wrapper-to-transfer ref mismatch before adoption", async () => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-future-runtime-"));
+		const target = createTarget(root);
+		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
+		await store.initialize();
+		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const counters: ExtensionLeaseCounters = {
+			transfer: 0,
+			adopt: 0,
+			transferRelease: 0,
+			leaseRelease: 0,
+		};
+		const services: FutureSessionRuntimePiPayloadServices = Object.freeze({
+			...activation.supervisorServices,
+			externalizer: instrumentExtensionExternalizer(activation.externalizer, counters, true),
+		});
+		const messages: FutureSupervisorMessage[] = [];
+		const supervisor = createFutureSupervisorFixture(target, services, messages);
+		stop = () => supervisor.stopAll();
+
+		const lease = await supervisor.claim(target.sessionHandle, "future-controller");
+		const before = supervisor.getRuntime(target.sessionHandle);
+		if (!before) throw new Error("future runtime was not activated");
+		await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "prompt", message: "future-extension-large-editor" },
+			{
+				connectionId: "future-controller",
+				expectedGeneration: before.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "crashed");
+		await waitFor(() => counters.transferRelease === 1);
+		expect(messages.filter((message) => message.type === "extension_ui_request")).toEqual([]);
+		expect(counters).toEqual({ transfer: 1, adopt: 0, transferRelease: 1, leaseRelease: 0 });
+	});
+
+	it("releases generation ownership exactly once when Extension CAS fails after adoption", async () => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-future-runtime-"));
+		const target = createTarget(root);
+		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
+		await store.initialize();
+		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const counters: ExtensionLeaseCounters = {
+			transfer: 0,
+			adopt: 0,
+			transferRelease: 0,
+			leaseRelease: 0,
+		};
+		const released: EpochStoredContentRef[] = [];
+		const services: FutureSessionRuntimePiPayloadServices = Object.freeze({
+			...activation.supervisorServices,
+			externalizer: instrumentExtensionExternalizer(activation.externalizer, counters),
+			async releaseHold(hold: EpochContentHold<EpochStoredContentRef>) {
+				released.push(hold.ref);
+				await activation.supervisorServices.releaseHold(hold);
+			},
+		});
+		const messages: FutureSupervisorMessage[] = [];
+		const supervisor = createFutureSupervisorFixture(target, services, messages, undefined, 3);
+		stop = () => supervisor.stopAll();
+
+		const lease = await supervisor.claim(target.sessionHandle, "future-controller");
+		const before = supervisor.getRuntime(target.sessionHandle);
+		if (!before) throw new Error("future runtime was not activated");
+		const runtime = exactRuntime(supervisor, target.sessionHandle);
+		const projection = Reflect.get(runtime, "liveProjection");
+		if (!(projection instanceof SessionLiveProjection)) {
+			throw new Error("future live projection is unavailable");
+		}
+		const commitPreparedBatch = projection.commitPreparedBatch.bind(projection);
+		let rejectNextBatch = true;
+		Reflect.set(projection, "commitPreparedBatch", (token: Parameters<typeof commitPreparedBatch>[0]) => {
+			if (rejectNextBatch) {
+				rejectNextBatch = false;
+				return null;
+			}
+			return commitPreparedBatch(token);
+		});
+
+		await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "prompt", message: "future-extension-large-editor" },
+			{
+				connectionId: "future-controller",
+				expectedGeneration: before.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "crashed");
+		await waitFor(() => released.length === 1);
+		expect(counters).toEqual({ transfer: 1, adopt: 1, transferRelease: 0, leaseRelease: 0 });
+		expect(released).toHaveLength(1);
+		expect(messages.filter((message) => message.type === "extension_ui_request")).toEqual([]);
+		expect(supervisor.getPendingExtensionRequests(target.sessionHandle)).toEqual([]);
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({
+			state: "crashed",
+			generation: before.generation,
+			lastSeq: before.lastSeq + 1,
+		});
+		await new Promise<void>((resolve) => setTimeout(resolve, 750));
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({
+			state: "crashed",
+			generation: before.generation,
+			lastSeq: before.lastSeq + 1,
+		});
+		expect(released).toHaveLength(1);
+	});
+
+	it("retains a closed future Extension ref until exact generation stop releases its owner", async () => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-future-runtime-"));
+		const target = createTarget(root);
+		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
+		await store.initialize();
+		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const counters: ExtensionLeaseCounters = {
+			transfer: 0,
+			adopt: 0,
+			transferRelease: 0,
+			leaseRelease: 0,
+		};
+		const released: EpochStoredContentRef[] = [];
+		const services: FutureSessionRuntimePiPayloadServices = Object.freeze({
+			...activation.supervisorServices,
+			externalizer: instrumentExtensionExternalizer(activation.externalizer, counters),
+			async releaseHold(hold: EpochContentHold<EpochStoredContentRef>) {
+				released.push(hold.ref);
+				await activation.supervisorServices.releaseHold(hold);
+			},
+		});
+		const messages: FutureSupervisorMessage[] = [];
+		const supervisor = createFutureSupervisorFixture(target, services, messages);
+		stop = () => supervisor.stopAll();
+
+		const lease = await supervisor.claim(target.sessionHandle, "future-controller");
+		const before = supervisor.getRuntime(target.sessionHandle);
+		if (!before) throw new Error("future runtime was not activated");
+		await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "prompt", message: "future-extension-large-editor" },
+			{
+				connectionId: "future-controller",
+				expectedGeneration: before.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		await waitFor(() => supervisor.getPendingExtensionRequests(target.sessionHandle)?.length === 1);
+		const owned = generationOwnerRefs(exactRuntime(supervisor, target.sessionHandle));
+		expect(owned).toHaveLength(1);
+		expect(
+			await supervisor.sendExtensionUiResponse(
+				target.sessionHandle,
+				{
+					type: "extension_ui_response",
+					id: `future-editor-${target.nativeSessionId}`,
+					value: "accepted",
+				},
+				{
+					connectionId: "future-controller",
+					expectedGeneration: before.generation,
+					fencingToken: lease.fencingToken,
+				},
+			),
+		).toBe("accepted");
+		expect(generationOwnerRefs(exactRuntime(supervisor, target.sessionHandle))).toEqual(owned);
+		expect(released).toEqual([]);
+
+		await supervisor.stop(target.sessionHandle);
+		await waitFor(() => released.length === 1);
+		expect(released).toEqual(owned);
+		expect(counters).toEqual({ transfer: 1, adopt: 1, transferRelease: 0, leaseRelease: 0 });
+		const restarted = await supervisor.restart(target.sessionHandle);
+		expect(restarted).toMatchObject({ generation: before.generation + 1, lastSeq: 0, state: "idle" });
+		expect(generationOwnerRefs(exactRuntime(supervisor, target.sessionHandle))).toEqual([]);
+		expect(released).toEqual(owned);
+	});
+
+	it("keeps an awaiting-response inline future blocking dialog visible and lets its veto finish", async () => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-future-runtime-"));
+		const target = createTarget(root);
+		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
+		await store.initialize();
+		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const messages: FutureSupervisorMessage[] = [];
+		const supervisor = createFutureSupervisorFixture(
+			target,
+			activation.supervisorServices,
+			messages,
+			undefined,
+			0,
+			{ PI_WEB_FIXTURE_TRANSITION_INLINE_DIALOG: "1" },
+		);
+		stop = () => supervisor.stopAll();
+
+		const lease = await supervisor.claim(target.sessionHandle, "future-controller");
+		const before = supervisor.getRuntime(target.sessionHandle);
+		if (!before) throw new Error("future runtime was not activated");
+		const clone = supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "clone" },
+			{
+				connectionId: "future-controller",
+				expectedGeneration: before.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		const dialogId = `transition-inline-dialog-${target.nativeSessionId}`;
+		await waitFor(() =>
+			messages.some(
+				(message) =>
+					message.type === "extension_ui_request" &&
+					message.request.id === dialogId &&
+					message.request.method === "confirm",
+			),
+		);
+		expect(supervisor.getPendingExtensionRequests(target.sessionHandle)).toContainEqual(
+			expect.objectContaining({ id: dialogId, method: "confirm" }),
+		);
+		expect(
+			await supervisor.sendExtensionUiResponse(
+				target.sessionHandle,
+				{ type: "extension_ui_response", id: dialogId, confirmed: false },
+				{
+					connectionId: "future-controller",
+					expectedGeneration: before.generation,
+					fencingToken: lease.fencingToken,
+				},
+			),
+		).toBe("accepted");
+		await expect(clone).resolves.toMatchObject({
+			sessionHandle: target.sessionHandle,
+			generation: before.generation,
+		});
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({ state: "idle" });
+		expect(supervisor.getPendingExtensionRequests(target.sessionHandle)).toEqual([]);
+	});
+
+	it("releases a stale future Extension transfer before adoption when semantic revision changes after prepare", async () => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-future-runtime-"));
+		const target = createTarget(root);
+		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
+		await store.initialize();
+		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const counters: ExtensionLeaseCounters = {
+			transfer: 0,
+			adopt: 0,
+			transferRelease: 0,
+			leaseRelease: 0,
+		};
+		let beforeTransfer = () => {};
+		const services: FutureSessionRuntimePiPayloadServices = Object.freeze({
+			...activation.supervisorServices,
+			externalizer: instrumentExtensionExternalizer(activation.externalizer, counters, false, () =>
+				beforeTransfer(),
+			),
+		});
+		const messages: FutureSupervisorMessage[] = [];
+		const supervisor = createFutureSupervisorFixture(target, services, messages, undefined, 3);
+		stop = () => supervisor.stopAll();
+
+		const lease = await supervisor.claim(target.sessionHandle, "future-controller");
+		const before = supervisor.getRuntime(target.sessionHandle);
+		if (!before) throw new Error("future runtime was not activated");
+		await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "prompt", message: "open-dialog-no-agent" },
+			{
+				connectionId: "future-controller",
+				expectedGeneration: before.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		const oldDialogId = `dialog-${target.nativeSessionId}`;
+		await waitFor(() => supervisor.getPendingExtensionRequests(target.sessionHandle)?.length === 1);
+		counters.transfer = 0;
+		counters.adopt = 0;
+		counters.transferRelease = 0;
+		counters.leaseRelease = 0;
+		const beforeIncoming = supervisor.getRuntime(target.sessionHandle);
+		if (!beforeIncoming) throw new Error("future runtime disappeared before stale delivery");
+		beforeTransfer = () => {
+			void supervisor.sendExtensionUiResponse(
+				target.sessionHandle,
+				{ type: "extension_ui_response", id: oldDialogId, cancelled: true },
+				{
+					connectionId: "future-controller",
+					expectedGeneration: beforeIncoming.generation,
+					fencingToken: lease.fencingToken,
+				},
+			);
+		};
+		messages.length = 0;
+
+		await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "prompt", message: "future-extension-large-editor" },
+			{
+				connectionId: "future-controller",
+				expectedGeneration: beforeIncoming.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "crashed");
+		await waitFor(() => counters.transferRelease === 1);
+		expect(counters).toEqual({ transfer: 1, adopt: 0, transferRelease: 1, leaseRelease: 0 });
+		expect(
+			messages.some(
+				(message) =>
+					message.type === "extension_ui_request" &&
+					message.request.id === `future-editor-${target.nativeSessionId}`,
+			),
+		).toBe(false);
+		const closeFrames = messages.filter((message) => message.type === "extension_ui_closed");
+		expect(closeFrames).toEqual([
+			expect.objectContaining({ type: "extension_ui_closed", requestId: oldDialogId }),
+		]);
+		const closeFrame = closeFrames[0];
+		if (closeFrame?.type !== "extension_ui_closed") {
+			throw new Error("semantic race dialog close frame is unavailable");
+		}
+		expect(supervisor.getPendingExtensionRequests(target.sessionHandle)).toEqual([]);
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({
+			state: "crashed",
+			generation: beforeIncoming.generation,
+			lastSeq: closeFrame.seq,
+		});
+		await new Promise<void>((resolve) => setTimeout(resolve, 750));
+		expect(supervisor.getRuntime(target.sessionHandle)?.generation).toBe(beforeIncoming.generation);
+	});
+
+	it("fails closed without restart when startup delivers a leased future blocking Extension request", async () => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-future-runtime-"));
+		const target = createTarget(root);
+		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
+		await store.initialize();
+		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const counters: ExtensionLeaseCounters = {
+			transfer: 0,
+			adopt: 0,
+			transferRelease: 0,
+			leaseRelease: 0,
+		};
+		const services: FutureSessionRuntimePiPayloadServices = Object.freeze({
+			...activation.supervisorServices,
+			externalizer: instrumentExtensionExternalizer(activation.externalizer, counters),
+		});
+		const messages: FutureSupervisorMessage[] = [];
+		const supervisor = createFutureSupervisorFixture(target, services, messages, undefined, 3, {
+			PI_WEB_FIXTURE_STARTUP_FUTURE_EDITOR: "1",
+		});
+		stop = () => supervisor.stopAll();
+
+		await expect(supervisor.activate(target.sessionHandle)).rejects.toThrow(
+			"future_extension_delivery_phase_unsupported",
+		);
+		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "crashed");
+		await waitFor(() => counters.transferRelease === 1);
+		const failed = supervisor.getRuntime(target.sessionHandle);
+		expect(failed).toMatchObject({ state: "crashed", lastSeq: 0 });
+		expect(messages.filter((message) => message.type === "extension_ui_request")).toEqual([]);
+		expect(counters).toEqual({ transfer: 1, adopt: 0, transferRelease: 1, leaseRelease: 0 });
+		await new Promise<void>((resolve) => setTimeout(resolve, 750));
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({
+			state: "crashed",
+			generation: failed?.generation,
+			lastSeq: 0,
+		});
+	});
+
+	it("terminalizes an awaiting-response leased future blocking request without adoption or restart", async () => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-future-runtime-"));
+		const target = createTarget(root);
+		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
+		await store.initialize();
+		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const counters: ExtensionLeaseCounters = {
+			transfer: 0,
+			adopt: 0,
+			transferRelease: 0,
+			leaseRelease: 0,
+		};
+		const services: FutureSessionRuntimePiPayloadServices = Object.freeze({
+			...activation.supervisorServices,
+			externalizer: instrumentExtensionExternalizer(activation.externalizer, counters),
+		});
+		const messages: FutureSupervisorMessage[] = [];
+		const supervisor = createFutureSupervisorFixture(target, services, messages, undefined, 3, {
+			PI_WEB_FIXTURE_TRANSITION_FUTURE_EDITOR: "1",
+		});
+		stop = () => supervisor.stopAll();
+
+		const lease = await supervisor.claim(target.sessionHandle, "future-controller");
+		const before = supervisor.getRuntime(target.sessionHandle);
+		if (!before) throw new Error("future runtime was not activated");
+		await expect(
+			supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "clone" },
+				{
+					connectionId: "future-controller",
+					expectedGeneration: before.generation,
+					fencingToken: lease.fencingToken,
+				},
+			),
+		).rejects.toThrow("future_extension_delivery_phase_unsupported");
+		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "dormant");
+		await waitFor(() => counters.transferRelease === 1);
+		expect(messages.filter((message) => message.type === "extension_ui_request")).toEqual([]);
+		expect(counters).toEqual({ transfer: 1, adopt: 0, transferRelease: 1, leaseRelease: 0 });
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({
+			state: "dormant",
+			generation: before.generation,
+			lastSeq: before.lastSeq,
+		});
+		await new Promise<void>((resolve) => setTimeout(resolve, 750));
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({
+			state: "dormant",
+			generation: before.generation,
+			lastSeq: before.lastSeq,
+		});
+	});
+
+	it("fails closed for a leased future editor delivered during transition verification", async () => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-future-runtime-"));
+		const target = createTarget(root);
+		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
+		await store.initialize();
+		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const counters: ExtensionLeaseCounters = {
+			transfer: 0,
+			adopt: 0,
+			transferRelease: 0,
+			leaseRelease: 0,
+		};
+		const services: FutureSessionRuntimePiPayloadServices = Object.freeze({
+			...activation.supervisorServices,
+			externalizer: instrumentExtensionExternalizer(activation.externalizer, counters),
+		});
+		const messages: FutureSupervisorMessage[] = [];
+		const supervisor = createFutureSupervisorFixture(target, services, messages, undefined, 3, {
+			PI_WEB_FIXTURE_TRANSITION_VERIFYING_FUTURE_EDITOR: "1",
+		});
+		stop = () => supervisor.stopAll();
+
+		const lease = await supervisor.claim(target.sessionHandle, "future-controller");
+		const before = supervisor.getRuntime(target.sessionHandle);
+		if (!before) throw new Error("future runtime was not activated");
+		await expect(
+			supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "clone" },
+				{
+					connectionId: "future-controller",
+					expectedGeneration: before.generation,
+					fencingToken: lease.fencingToken,
+				},
+			),
+		).rejects.toThrow("future_extension_delivery_phase_unsupported");
+		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "dormant");
+		await waitFor(() => counters.transferRelease === 1);
+		expect(messages.filter((message) => message.type === "session_rekeyed")).toEqual([]);
+		expect(messages.filter((message) => message.type === "extension_ui_request")).toEqual([]);
+		expect(supervisor.getPendingExtensionRequests(target.sessionHandle)).toEqual([]);
+		expect(counters).toEqual({ transfer: 1, adopt: 0, transferRelease: 1, leaseRelease: 0 });
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({
+			state: "dormant",
+			generation: before.generation,
+			lastSeq: before.lastSeq,
+		});
+		await new Promise<void>((resolve) => setTimeout(resolve, 750));
+		expect(supervisor.getRuntime(target.sessionHandle)?.generation).toBe(before.generation);
 	});
 
 	it("keeps startup history, ordinary responses, replay, and snapshots in the private future family", async () => {

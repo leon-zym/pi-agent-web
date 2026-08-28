@@ -319,6 +319,10 @@ export interface SessionRuntimeProductAdapter<M extends SessionRuntimeProductMod
 			delivery: PiDecodedDelivery<RuntimeEvent<M>, RuntimeRef<M>>,
 		) => PiDecodedDeliveryPlan,
 		consumeExtensionRequest: (request: RuntimeExtensionRequest<M>) => void,
+		consumeFutureExtensionRequest: (
+			proc: PiProcess,
+			delivery: PiDecodedDelivery<FutureExtensionUiRequestDto, EpochStoredContentRef>,
+		) => PiDecodedDeliveryPlan,
 	): PiProcess;
 	sendDecoded(
 		proc: PiProcess,
@@ -336,7 +340,13 @@ function createCurrentProductAdapter(
 	const adapter: SessionRuntimeProductAdapter<"current"> = {
 		mode: "current",
 		productSchema,
-		createProcess: (options, payloadCustody, consumeEvent, consumeExtensionRequest) => {
+		createProcess: (
+			options,
+			payloadCustody,
+			consumeEvent,
+			consumeExtensionRequest,
+			_consumeFutureExtensionRequest,
+		) => {
 			let owner: PiProcess | undefined;
 			const proc = new PiProcess({
 				...options,
@@ -368,7 +378,13 @@ function createFutureProductAdapter(
 	const adapter: SessionRuntimeProductAdapter<"future_content"> = {
 		mode: "future_content",
 		productSchema,
-		createProcess: (options, payloadCustody, consumeEvent, _consumeExtensionRequest) => {
+		createProcess: (
+			options,
+			payloadCustody,
+			consumeEvent,
+			_consumeExtensionRequest,
+			consumeFutureExtensionRequest,
+		) => {
 			if (!payloadCustody) throw new TypeError("Future Session Runtime requires payload custody");
 			let owner: PiProcess | undefined;
 			const proc = new PiProcess({
@@ -377,6 +393,10 @@ function createFutureProductAdapter(
 				onFutureDecodedEvent: (delivery) => {
 					if (!owner) throw new RpcError("event", "session_process_not_installed");
 					return consumeEvent(owner, delivery);
+				},
+				onFutureDecodedExtensionUiRequest: (delivery) => {
+					if (!owner) throw new RpcError("extension_ui_request", "session_process_not_installed");
+					return consumeFutureExtensionRequest(owner, delivery);
 				},
 			});
 			owner = proc;
@@ -752,6 +772,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			this.payloadCustody,
 			(owner, delivery) => this.prepareDecodedEvent(processToken, owner, delivery),
 			(request) => this.handleExtensionRequest(processToken, request),
+			(owner, delivery) => this.prepareDecodedExtensionRequest(processToken, owner, delivery),
 		);
 		this.proc = proc;
 		if (contentOwner) this.observeGenerationContentFailure(processToken, proc, contentOwner);
@@ -1963,6 +1984,62 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		this.enqueueFrame({ type: "extension_ui_request", request });
 	}
 
+	private prepareDecodedExtensionRequest(
+		processToken: number,
+		proc: PiProcess,
+		delivery: PiDecodedDelivery<FutureExtensionUiRequestDto, EpochStoredContentRef>,
+	): PiDecodedDeliveryPlan {
+		const owner = this.generationContentOwner;
+		if (this.productAdapter.mode !== "future_content" || !owner) {
+			return delivery.prepare((_transfer) => {
+				throw new RpcError("extension_ui_request", "future_extension_generation_owner_unavailable");
+			});
+		}
+		if (!this.startupReady || this.transitionStage !== null) {
+			const transitionStage = this.transitionStage;
+			return delivery.prepare((transfer) => {
+				if (!this.isCurrentGenerationContentOwner(processToken, proc, owner)) {
+					throw new RpcError("extension_ui_request", "session_generation_stale");
+				}
+				if (
+					this.startupReady &&
+					this.transitionStage === transitionStage &&
+					transitionStage?.phase === "awaiting_response" &&
+					BLOCKING_DIALOG_METHODS.has(delivery.value.method) &&
+					futureExtensionRequestRefs(delivery.value).length === 0 &&
+					transfer === null
+				) {
+					this.handleExtensionRequest(processToken, delivery.value);
+					return true;
+				}
+				this.manuallyStopped = true;
+				throw new RpcError("extension_ui_request", "future_extension_delivery_phase_unsupported");
+			});
+		}
+		this.verifyMaterializedSessionFile();
+		const prepared = this.prepareExtensionRequestSemanticOperation(processToken, delivery.value);
+		return delivery.prepare((transfer) => {
+			if (!this.isCurrentGenerationContentOwner(processToken, proc, owner)) {
+				throw new RpcError("extension_ui_request", "session_generation_stale");
+			}
+			if (!futureExtensionTransferMatches(delivery.value, transfer)) {
+				this.manuallyStopped = true;
+				throw new RpcError("extension_ui_request", "future_extension_payload_ref_mismatch");
+			}
+			if (!this.extensionSemanticOperationEligible(prepared)) {
+				this.manuallyStopped = true;
+				throw new RpcError("extension_ui_request", "extension_semantic_operation_stale");
+			}
+			if (transfer) owner.adopt(transfer);
+			try {
+				this.commitExtensionSemanticOperation(prepared);
+			} catch (error) {
+				this.terminalizeGenerationContentFailure(processToken, proc, owner, error);
+			}
+			return true;
+		});
+	}
+
 	private verifyMaterializedSessionFile(): void {
 		if (this.inspectMaterializedSessionFile()) this.sessionFileIdentityVerified = true;
 	}
@@ -2162,12 +2239,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			RuntimeExtensionRequest<M>
 		>,
 	): void {
-		if (
-			prepared.processToken !== this.processToken ||
-			this.liveProjection !== prepared.projection ||
-			prepared.semanticRevision !== this.extensionSemanticRevision ||
-			prepared.projection.previewPreparedBatch(prepared.token) === null
-		) {
+		if (!this.extensionSemanticOperationEligible(prepared)) {
 			throw new RpcError("extension_ui_request", "extension_semantic_operation_stale");
 		}
 		const committed = prepared.projection.commitPreparedBatch(prepared.token);
@@ -2207,6 +2279,21 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		for (const envelope of prepared.envelopes) {
 			this.runCommittedExtensionEffect("publish Extension frame", () => this.emitSupervisorMessage(envelope));
 		}
+	}
+
+	private extensionSemanticOperationEligible(
+		prepared: PreparedExtensionSemanticOperation<
+			RuntimeMessage<M>,
+			RuntimeEvent<M>,
+			RuntimeExtensionRequest<M>
+		>,
+	): boolean {
+		return (
+			prepared.processToken === this.processToken &&
+			this.liveProjection === prepared.projection &&
+			prepared.semanticRevision === this.extensionSemanticRevision &&
+			prepared.projection.previewPreparedBatch(prepared.token) !== null
+		);
 	}
 
 	private runCommittedExtensionEffect(label: string, effect: () => void): void {
@@ -3186,6 +3273,63 @@ function stickyRequestClearsState(request: ExtensionUiRequestDto | FutureExtensi
 		(request.method === "setStatus" && request.statusText === undefined) ||
 		(request.method === "setWidget" && request.widgetLines === undefined)
 	);
+}
+
+function futureExtensionRequestRefs(request: FutureExtensionUiRequestDto): readonly EpochStoredContentRef[] {
+	if (
+		request.method === "editor" &&
+		typeof request.prefill === "object" &&
+		request.prefill !== null &&
+		request.prefill.type === "external_text"
+	) {
+		return [request.prefill.ref];
+	}
+	if (
+		request.method === "set_editor_text" &&
+		typeof request.text === "object" &&
+		request.text !== null &&
+		request.text.type === "external_text"
+	) {
+		return [request.text.ref];
+	}
+	if (
+		request.method === "setWidget" &&
+		request.widgetLines !== undefined &&
+		!Array.isArray(request.widgetLines) &&
+		request.widgetLines.type === "external_json"
+	) {
+		return [request.widgetLines.ref];
+	}
+	return [];
+}
+
+function futureExtensionTransferMatches(
+	request: FutureExtensionUiRequestDto,
+	transfer: PiPayloadLeaseTransfer<EpochStoredContentRef> | null,
+): boolean {
+	const expected = futureExtensionRequestRefs(request);
+	const actual = transfer?.refs ?? [];
+	return (
+		expected.length === actual.length &&
+		expected.every((ref, index) => {
+			const candidate = actual[index];
+			return candidate !== undefined && storedContentRefsEqual(ref, candidate);
+		})
+	);
+}
+
+function storedContentRefsEqual(left: EpochStoredContentRef, right: EpochStoredContentRef): boolean {
+	if (
+		left.type !== right.type ||
+		left.serverEpoch !== right.serverEpoch ||
+		left.sha256 !== right.sha256 ||
+		left.byteLength !== right.byteLength
+	) {
+		return false;
+	}
+	return left.type === "attachment_ref"
+		? right.type === "attachment_ref" && left.mediaType === right.mediaType
+		: right.type === "content_ref" && left.encoding === right.encoding;
 }
 
 function inspectFrozenSessionFile(sessionFile: string): FrozenSessionFileIdentity {
