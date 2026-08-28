@@ -1,6 +1,5 @@
 import {
 	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
-	GATEWAY_PROTOCOL_VERSION,
 	type GatewayClientHelloDto,
 	type GatewayServerHelloDto,
 	SESSION_PAYLOAD_BUDGET,
@@ -35,7 +34,7 @@ class FakeSocket implements SessionWebSocket {
 		this.onopen?.();
 		this.receive({
 			type: "server_hello",
-			protocol: GATEWAY_PROTOCOL_VERSION,
+			protocol: { major: 1, minor: 2 },
 			serverBuild: "test",
 			serverEpoch: SERVER_EPOCH,
 			piVersion: "test",
@@ -130,6 +129,7 @@ function setup() {
 			return socket;
 		},
 		url: () => "ws://test",
+		protocolVersion: { major: 1, minor: 2 },
 	});
 	controllers.push(controller);
 	controller.store.getState().connect();

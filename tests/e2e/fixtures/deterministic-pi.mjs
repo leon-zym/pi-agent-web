@@ -33,6 +33,8 @@ const deferNewSessionFile =
 	(process.env.PI_WEB_E2E_DEFER_NEW_SESSION_FILE === "1" ||
 		countRecordedStarts(markerPath) >= deferNewSessionFileAfterStarts);
 const recoveryFeatures = process.env.PI_WEB_E2E_RECOVERY_FEATURES === "1";
+// This branch is inert unless the explicitly opt-in private Browser fixture asks for it.
+const futureContentRefFixture = process.env.PI_WEB_E2E_CONTENT_REF_FIXTURE === "1";
 let delayedExistingState = false;
 
 let sessionId = requestedId ?? `browser-e2e-${String(process.pid)}`;
@@ -926,6 +928,17 @@ function streamExtensionPrompt(command, text, user, userEntryId) {
 
 function finishExtensionPrompt(response) {
 	const run = activeRun;
+	if (run?.kind === "future-content" && response.id === run.requestId) {
+		run.extensionResponse = response;
+		record("extension_response", {
+			commandId: run.command.id,
+			text: run.text,
+			confirmed: response.confirmed === true,
+			cancelled: response.cancelled === true,
+		});
+		finishFutureContentPrompt(run);
+		return;
+	}
 	if (run?.kind === "reload-checkpoint" && response.id === run.requestId) {
 		run.extensionResponse = response;
 		record("extension_response", {
@@ -1124,6 +1137,191 @@ function streamReloadCheckpointPrompt(command, text, user, userEntryId) {
 	});
 }
 
+function futureText(label, targetBytes = 320 * 1024) {
+	const prefix = `${label}:START\n`;
+	const suffix = `\n${label}:END`;
+	const available = targetBytes - Buffer.byteLength(prefix + suffix);
+	const lineBytes = Buffer.byteLength(`${label}:000000:abcdefghijklmnopqrstuvwxyz0123456789\n`);
+	const lineCount = Math.ceil(available / lineBytes);
+	const body = Array.from(
+		{ length: lineCount },
+		(_, index) => `${label}:${String(index).padStart(6, "0")}:abcdefghijklmnopqrstuvwxyz0123456789\n`,
+	).join("");
+	return `${prefix}${body.slice(0, available)}${suffix}`;
+}
+
+function futureJson(label) {
+	return {
+		fixture: "private-content-ref-l3",
+		root: label,
+		markerStart: `${label}:JSON_START`,
+		body: futureText(`${label}:BODY`),
+		markerEnd: `${label}:JSON_END`,
+	};
+}
+
+function finishFutureContentPrompt(run) {
+	if (activeRun !== run || !run.extensionResponse) return;
+	const final = assistantMessage("E2E_FUTURE_CONTENT_REFS_READY");
+	send({ type: "message_start", message: final });
+	send({ type: "message_end", message: final });
+	send({ type: "turn_end", message: final, toolResults: [run.toolResult] });
+	messages.push(final);
+	persistMessage(final, run.toolResultEntryId);
+	send({ type: "agent_end", messages: [run.user, run.toolUse, run.toolResult, final], willRetry: false });
+	send({ type: "agent_settled" });
+	record("settled", {
+		commandId: run.command.id,
+		text: run.text,
+		label: "future-content-refs",
+		extensionConfirmed: run.extensionResponse.confirmed === true,
+	});
+	activeRun = null;
+}
+
+function streamFutureContentPrompt(command, text, user, userEntryId) {
+	const toolCallId = `${sessionId}-future-content-tool`;
+	const requestId = `${sessionId}-future-editor`;
+	const toolArgs = futureJson("FUTURE_TOOL_ARGS");
+	const partialResult = futureJson("FUTURE_PARTIAL_RESULT");
+	const result = futureJson("FUTURE_TOOL_RESULT");
+	const toolDetails = futureJson("FUTURE_TOOL_DETAILS");
+	const toolCall = { type: "toolCall", id: toolCallId, name: "future-edit", arguments: toolArgs };
+	const toolResult = toolResultMessage(
+		toolCallId,
+		toolDetails,
+		Date.now(),
+		"future-edit",
+		futureText("FUTURE_TOOL_TEXT"),
+	);
+	const run = {
+		kind: "future-content",
+		command,
+		label: "future-content-refs",
+		timers: [],
+		assembled: "",
+		user,
+		userEntryId,
+		text,
+		toolCallId,
+		toolCall,
+		toolArgs,
+		partialResult,
+		result,
+		toolDetails,
+		toolResult,
+		requestId,
+		extensionResponse: null,
+		toolUse: null,
+		toolResultEntryId: null,
+	};
+	activeRun = run;
+	record("prompt", {
+		commandId: command.id,
+		text,
+		imageCount: 0,
+		imageMimeTypes: [],
+		imageChars: 0,
+		slow: false,
+		futureContentRefs: true,
+	});
+
+	send({ type: "agent_start" });
+	send({ type: "turn_start" });
+	send({ type: "message_start", message: user });
+	send({ type: "message_end", message: user });
+	send({ type: "session_info_changed" });
+	const pending = assistantMessageWithContent([], "pending");
+	send({ type: "message_start", message: pending });
+	respond(command);
+
+	schedule(run, 25, () => {
+		send({
+			type: "message_update",
+			usage: pending.usage,
+			assistantMessageEvent: { type: "toolcall_start", contentIndex: 0 },
+		});
+		send({
+			type: "message_update",
+			usage: pending.usage,
+			assistantMessageEvent: {
+				type: "toolcall_delta",
+				contentIndex: 0,
+				delta: '{"fixture":"streaming"}',
+			},
+		});
+		const toolUse = assistantMessageWithContent([toolCall], "toolUse");
+		run.toolUse = toolUse;
+		send({
+			type: "message_update",
+			usage: toolUse.usage,
+			assistantMessageEvent: { type: "toolcall_end", contentIndex: 0, toolCall },
+		});
+		send({ type: "message_end", message: toolUse });
+		messages.push(toolUse);
+		const toolUseEntryId = persistMessage(toolUse, userEntryId);
+
+		send({ type: "tool_execution_start", toolCallId, toolName: "future-edit", args: toolArgs });
+		send({
+			type: "tool_execution_update",
+			toolCallId,
+			toolName: "future-edit",
+			args: toolArgs,
+			partialResult,
+		});
+		send({
+			type: "tool_execution_end",
+			toolCallId,
+			toolName: "future-edit",
+			result,
+			isError: false,
+		});
+		send({ type: "message_start", message: toolResult });
+		send({ type: "message_end", message: toolResult });
+		messages.push(toolResult);
+		run.toolResultEntryId = persistMessage(toolResult, toolUseEntryId);
+
+		send({
+			type: "extension_ui_request",
+			id: `${sessionId}-future-editor-text`,
+			method: "set_editor_text",
+			text: futureText("FUTURE_SET_EDITOR_TEXT"),
+		});
+		send({
+			type: "extension_ui_request",
+			id: `${sessionId}-future-widget`,
+			method: "setWidget",
+			widgetKey: "future-content",
+			widgetLines: [futureText("FUTURE_WIDGET_LINE_1"), futureText("FUTURE_WIDGET_LINE_2")],
+			widgetPlacement: "belowEditor",
+		});
+		send({
+			type: "extension_ui_request",
+			id: requestId,
+			method: "editor",
+			title: "Future content reference editor",
+			prefill: futureText("FUTURE_EDITOR_PREFILL"),
+		});
+		record("future_content_checkpoint", {
+			commandId: command.id,
+			text,
+			toolCallId,
+			requestId,
+			roots: [
+				"tool.arguments",
+				"tool.execution.args",
+				"tool.execution.partialResult",
+				"tool.execution.result",
+				"toolResult.content.text",
+				"toolResult.details",
+				"extension.set_editor_text.text",
+				"extension.setWidget.widgetLines",
+				"extension.editor.prefill",
+			],
+		});
+	});
+}
+
 function streamPrompt(command) {
 	const text = typeof command.message === "string" ? command.message : "";
 	const images = Array.isArray(command.images) ? command.images : [];
@@ -1139,6 +1337,10 @@ function streamPrompt(command) {
 	const user = { role: "user", content: userContent, timestamp: Date.now() };
 	const userEntryId = persistMessage(user, null);
 	messages.push(user);
+	if (futureContentRefFixture && text === "E2E_FUTURE_CONTENT_REFS" && images.length === 0) {
+		streamFutureContentPrompt(command, text, user, userEntryId);
+		return;
+	}
 	if (text === "E2E_COMPLEX_DEMO" && images.length === 0) {
 		streamComplexPrompt(command, text, user, userEntryId);
 		return;

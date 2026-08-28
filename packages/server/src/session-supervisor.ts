@@ -80,7 +80,8 @@ interface HotRuntimeSubscriptionObservation<M extends SessionRuntimeProductMode 
 	observation: SessionHotRuntimeObservation;
 }
 
-interface SessionSupervisorBaseOptions<M extends SessionRuntimeProductMode = "current"> {
+/** Shared constructor seam used by the private future Main activation. */
+export interface SessionSupervisorBaseOptions<M extends SessionRuntimeProductMode = "current"> {
 	serverEpoch?: string;
 	resolved: ProbedPiRuntime;
 	env?: Record<string, string>;
@@ -113,7 +114,7 @@ interface SessionSupervisorBaseOptions<M extends SessionRuntimeProductMode = "cu
 }
 
 export interface SessionSupervisorOptions extends SessionSupervisorBaseOptions<"current"> {
-	/** Server-private and default-off until Main installs the complete attachment pipeline. */
+	/** Legacy current-mode payload services; production future mode installs the typed pipeline. */
 	piPayloadServices?: SessionRuntimePiPayloadServices<"current">;
 }
 
@@ -143,7 +144,7 @@ interface Alias {
  * most one hot runtime. Historical Sessions remain dormant. Control leases,
  * crash budgets, replay, and capacity are isolated per Session handle.
  */
-class SessionSupervisorCore<M extends SessionRuntimeProductMode = "current"> {
+export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "current"> {
 	private readonly hotRuntimeSubscriptionObservations = new WeakMap<
 		HotRuntimeSubscriptionToken,
 		HotRuntimeSubscriptionObservation<M>
@@ -1370,6 +1371,82 @@ export class SessionSupervisor extends SessionSupervisorCore<"current"> {
 		const { piPayloadServices, ...coreOptions } = opts;
 		super(coreOptions, (runtimeOptions) => new SessionRuntime({ ...runtimeOptions, piPayloadServices }));
 	}
+}
+
+/**
+ * Route-only compatibility view for the private future Main activation.
+ * It owns no Session runtime; every REST operation delegates to the future
+ * Supervisor, while the inherited current shell only supplies routes' legacy
+ * nominal type and a disposable idle timer.
+ */
+class FutureSessionSupervisorRouteFacade extends SessionSupervisor {
+	constructor(
+		private readonly delegate: SessionSupervisorCore<"future_content">,
+		resolved: ProbedPiRuntime,
+	) {
+		super({
+			serverEpoch: delegate.serverEpoch,
+			resolved,
+			resolveSession: async () => undefined,
+			broadcast: () => {},
+			maxHotRuntimes: 1,
+			idleTtlMs: 60_000,
+			transientIdleTtlMs: 60_000,
+		});
+	}
+
+	override listRuntimes(): SessionRuntimeSnapshot[] {
+		return this.delegate.listRuntimes();
+	}
+
+	override getRuntime(sessionHandle: string): SessionRuntimeSnapshot | undefined {
+		return this.delegate.getRuntime(sessionHandle);
+	}
+
+	override async createSession(request: CreateSessionRequest): Promise<SessionRuntimeSnapshot> {
+		return this.delegate.createSession(request);
+	}
+
+	override async abandonTransient(
+		workspaceId: string,
+		sessionHandle: string,
+		context: SessionManagementContext,
+	): Promise<void> {
+		return this.delegate.abandonTransient(workspaceId, sessionHandle, context);
+	}
+
+	override async withControlledSessionDeletion<T>(
+		workspaceId: string,
+		sessionHandle: string,
+		context: SessionManagementContext,
+		operation: () => Promise<T>,
+	): Promise<T> {
+		return this.delegate.withControlledSessionDeletion(workspaceId, sessionHandle, context, operation);
+	}
+
+	override async withSessionDeletion<T>(
+		workspaceId: string,
+		sessionHandle: string,
+		operation: () => Promise<T>,
+	): Promise<T> {
+		return this.delegate.withSessionDeletion(workspaceId, sessionHandle, operation);
+	}
+
+	override notifyAuthChanged(workspaceId?: string): void {
+		this.delegate.notifyAuthChanged(workspaceId);
+	}
+
+	override notifySessionDirectoryChanged(workspaceId: string): void {
+		this.delegate.notifySessionDirectoryChanged(workspaceId);
+	}
+}
+
+/** Build the route-only view without exposing it from the server package barrel. */
+export function createFutureSessionSupervisorRouteFacade(
+	delegate: SessionSupervisorCore<"future_content">,
+	resolved: ProbedPiRuntime,
+): SessionSupervisor {
+	return new FutureSessionSupervisorRouteFacade(delegate, resolved);
 }
 
 export function createFutureSessionSupervisor(opts: FutureSessionSupervisorOptions) {

@@ -31,5 +31,11 @@ export {
 	SessionSupervisor,
 	type SessionSupervisorOptions,
 } from "./session-supervisor.js";
-export * from "./session-ws-bridge.js";
+export {
+	MAX_SESSION_WS_BUFFERED_BYTES,
+	MAX_SESSION_WS_IN_FLIGHT_COMMANDS,
+	MAX_SESSION_WS_IN_FLIGHT_EXACT_SUBSCRIPTIONS,
+	SessionWsBridge,
+	type SessionWsBridgeOptions,
+} from "./session-ws-bridge.js";
 export * from "./workspace-preferences.js";

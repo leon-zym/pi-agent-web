@@ -289,7 +289,7 @@ export interface SessionRuntimeCoreOptions<M extends SessionRuntimeProductMode =
 
 export interface SessionRuntimeOptions
 	extends Omit<SessionRuntimeCoreOptions<"current">, "productAdapter" | "payloadCustody"> {
-	/** Server-private and default-off until the complete attachment pipeline is active. */
+	/** Legacy current-mode payload services; production future mode installs the typed pipeline. */
 	piPayloadServices?: CurrentSessionRuntimePiPayloadServices;
 }
 

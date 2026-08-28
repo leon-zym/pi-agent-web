@@ -7,7 +7,6 @@ import {
 	type FutureSessionSnapshotDto,
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
-	GATEWAY_PROTOCOL_VERSION,
 	type GatewayClientHelloDto,
 	type GatewayProtocolErrorDto,
 	type GatewayServerHelloDto,
@@ -85,7 +84,7 @@ class FakeSocket implements SessionWebSocket {
 function serverHello(overrides: Partial<GatewayServerHelloDto> = {}): GatewayServerHelloDto {
 	return {
 		type: "server_hello",
-		protocol: GATEWAY_PROTOCOL_VERSION,
+		protocol: { major: 1, minor: 2 },
 		serverBuild: "9.7.0-independent-server",
 		serverEpoch: "test-server-epoch",
 		piVersion: "0.84.2",
@@ -156,6 +155,7 @@ function harness(
 			return socket;
 		},
 		url: () => "ws://session-transport.test/api/v1/ws",
+		protocolVersion: { major: 1, minor: 2 },
 		now: () => {
 			clock += 1;
 			return clock;
@@ -517,7 +517,7 @@ describe("session transport Gateway negotiation", () => {
 		socket.open(false);
 		expect(socket.sent[0]).toEqual({
 			type: "client_hello",
-			protocol: GATEWAY_PROTOCOL_VERSION,
+			protocol: { major: 1, minor: 2 },
 			clientBuild: "2.4.1-independent-ui",
 			capabilities: [
 				"rpc.commands",
