@@ -1,20 +1,38 @@
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import {
+	type FutureSessionContentRefGuardContext,
+	isFutureSessionContentRefGuardContext,
 	isProductSessionEventDto,
 	isSessionAttachmentGuardContext,
 	isSessionCommandResponseDto,
+	isSessionJsonRootDto,
+	isSessionTextPayloadDto,
 	type SessionAttachmentGuardContext,
 	type SessionAttachmentRefDto,
 	type SessionCommandTypeDto,
+	type SessionContentRefBudgetDto,
+	type SessionContentRefDto,
 	type SessionPayloadBudgetDto,
+	type SessionTextPayloadDto,
 } from "@pi-agent-web/protocol";
+import {
+	BoundedUtf8CodecError,
+	type PreparedBoundedUtf8Encoding,
+	prepareBoundedUtf8Encoding,
+} from "./bounded-utf8-codec.js";
 import {
 	type EpochContentHold,
 	type EpochContentPutInput,
 	EpochContentStoreError,
+	type EpochStoredContentRef,
+	type EpochUtf8ContentPutInput,
 	type StagedEpochContent,
 } from "./epoch-content-store.js";
+import {
+	isLegacyRpcV1FutureContentRawEvent,
+	isLegacyRpcV1FutureContentRawResponse,
+} from "./legacy-rpc-v1-content-wire.js";
 import { isLegacyRpcV1RawEvent, isLegacyRpcV1RawResponse } from "./legacy-rpc-v1-wire.js";
 import { createRasterAdmissionValidator, RasterAdmissionError } from "./raster-admission.js";
 
@@ -22,9 +40,14 @@ type UnknownRecord = Record<string, unknown>;
 
 export interface PiPayloadExternalizerContentStore {
 	stage(input: EpochContentPutInput): Promise<StagedEpochContent>;
-	publish(hold: EpochContentHold): Promise<void>;
+	publish(hold: EpochContentHold<EpochStoredContentRef>): Promise<void>;
 	holdPublished(ref: SessionAttachmentRefDto): Promise<EpochContentHold>;
-	release(hold: EpochContentHold): Promise<void>;
+	release(hold: EpochContentHold<EpochStoredContentRef>): Promise<void>;
+}
+
+export interface PiGenericPayloadExternalizerContentStore extends PiPayloadExternalizerContentStore {
+	stageUtf8(input: EpochUtf8ContentPutInput): Promise<StagedEpochContent<SessionContentRefDto>>;
+	holdPublishedUtf8(ref: SessionContentRefDto): Promise<EpochContentHold<SessionContentRefDto>>;
 }
 
 export type PiPayloadExternalizerInput =
@@ -52,28 +75,29 @@ export class PiPayloadExternalizationError extends Error {
 	}
 }
 
-export interface PiPayloadLeaseTransfer {
-	readonly refs: readonly SessionAttachmentRefDto[];
+export interface PiPayloadLeaseTransfer<TRef extends EpochStoredContentRef = SessionAttachmentRefDto> {
+	readonly refs: readonly TRef[];
 	/** Atomically transfers holds through a synchronous, all-or-nothing owner callback. */
-	adopt(accept: (holds: readonly EpochContentHold[]) => true): void;
+	adopt(accept: (holds: readonly EpochContentHold<TRef>[]) => true): void;
 	/** Releases ownership instead of adopting it. Repeated calls share one promise. */
 	release(): Promise<void>;
 }
 
-export interface PiPayloadLease {
-	readonly refs: readonly SessionAttachmentRefDto[];
+export interface PiPayloadLease<TRef extends EpochStoredContentRef = SessionAttachmentRefDto> {
+	readonly refs: readonly TRef[];
 	/** Moves ownership into a one-shot adopt-or-release token. */
-	transfer(): PiPayloadLeaseTransfer;
+	transfer(): PiPayloadLeaseTransfer<TRef>;
 	/** Safe disposal for rejected, timed-out, stale, or otherwise unused outcomes. */
 	release(): Promise<void>;
 }
 
-export interface Externalized<T = unknown> {
+export interface Externalized<T = unknown, TRef extends EpochStoredContentRef = SessionAttachmentRefDto> {
 	readonly value: T;
-	readonly lease: PiPayloadLease;
+	readonly lease: PiPayloadLease<TRef>;
 }
 
 export type ExternalizedPiPayload<T = unknown> = Externalized<T>;
+export type ExternalizedGenericPiPayload<T = unknown> = Externalized<T, EpochStoredContentRef>;
 
 export interface PiPayloadExternalizerOptions {
 	contentStore: PiPayloadExternalizerContentStore;
@@ -89,42 +113,86 @@ export interface PiPayloadExternalizerOptions {
 	) => boolean;
 }
 
+export interface PiGenericPayloadExternalizerOptions
+	extends Omit<PiPayloadExternalizerOptions, "contentStore" | "productGuard"> {
+	contentStore: PiGenericPayloadExternalizerContentStore;
+	genericContent: Readonly<{ contentRefBudget: SessionContentRefBudgetDto }>;
+	/** Deterministic supplemental future-product guard after built-in provenance validation. */
+	productGuard?: (
+		candidate: unknown,
+		context: FutureSessionContentRefGuardContext,
+		input: PiPayloadExternalizerInput,
+	) => boolean;
+}
+
+type AnyPiPayloadExternalizerOptions = PiPayloadExternalizerOptions | PiGenericPayloadExternalizerOptions;
+
 type ExactContent = {
 	ref: SessionAttachmentRefDto;
 	hold: EpochContentHold;
 };
 
+type ExactUtf8Content = {
+	ref: SessionContentRefDto;
+	hold: EpochContentHold<SessionContentRefDto>;
+};
+
 type FrameState = {
-	options: PiPayloadExternalizerOptions;
+	options: AnyPiPayloadExternalizerOptions;
 	maxDecodedImageBytes: number;
 	byInlineIdentity: Map<string, Map<string, SessionAttachmentRefDto>>;
 	byDigest: Map<string, ExactContent>;
-	holds: EpochContentHold[];
+	utf8ByDigest: Map<string, ExactUtf8Content>;
+	textByIdentity: Map<string, SessionTextPayloadDto>;
+	holds: EpochContentHold<EpochStoredContentRef>[];
 };
 
-export async function externalizePiPayload<T = unknown>(
+export function externalizePiPayload<T = unknown>(
+	input: PiPayloadExternalizerInput,
+	options: PiGenericPayloadExternalizerOptions,
+): Promise<ExternalizedGenericPiPayload<T>>;
+export function externalizePiPayload<T = unknown>(
 	input: PiPayloadExternalizerInput,
 	options: PiPayloadExternalizerOptions,
-): Promise<ExternalizedPiPayload<T>> {
+): Promise<ExternalizedPiPayload<T>>;
+export async function externalizePiPayload<T = unknown>(
+	input: PiPayloadExternalizerInput,
+	options: AnyPiPayloadExternalizerOptions,
+): Promise<Externalized<T, EpochStoredContentRef>> {
 	assertOptions(options);
-	assertRawInput(input);
+	const generic = isGenericOptions(options);
+	assertRawInput(input, generic);
 	const state: FrameState = {
 		options,
 		maxDecodedImageBytes: options.maxDecodedImageBytes ?? options.payloadBudget.maxAttachmentBlobBytes,
 		byInlineIdentity: new Map(),
 		byDigest: new Map(),
+		utf8ByDigest: new Map(),
+		textByIdentity: new Map(),
 		holds: [],
 	};
 	try {
 		throwIfAborted(options.signal);
-		const value = await externalizeFrame(input, state);
+		const transformed = generic
+			? await externalizeGenericFrame(input, state)
+			: { value: await externalizeFrame(input, state), currentGuardShadow: undefined };
+		const value = transformed.value;
 		throwIfAborted(options.signal);
-		const context = { serverEpoch: options.serverEpoch, payloadBudget: options.payloadBudget };
+		const attachmentContext = { serverEpoch: options.serverEpoch, payloadBudget: options.payloadBudget };
+		const context = generic ? futureContext(options) : attachmentContext;
+		const guardCandidate = generic ? transformed.currentGuardShadow : value;
 		const productValid =
 			input.kind === "event"
-				? isProductSessionEventDto(value, context)
-				: isSessionCommandResponseDto(value, context);
-		const valid = productValid && (!options.productGuard || options.productGuard(value, context, input));
+				? isProductSessionEventDto(guardCandidate, attachmentContext)
+				: isSessionCommandResponseDto(guardCandidate, attachmentContext);
+		const supplementalGuard = options.productGuard as
+			| ((
+					candidate: unknown,
+					guardContext: typeof context,
+					guardInput: PiPayloadExternalizerInput,
+			  ) => boolean)
+			| undefined;
+		const valid = productValid && (!supplementalGuard || supplementalGuard(value, context, input));
 		if (!valid) {
 			throw new PiPayloadExternalizationError(
 				"invalid_product_payload",
@@ -145,7 +213,21 @@ export async function externalizePiPayload<T = unknown>(
 	}
 }
 
-function assertOptions(options: PiPayloadExternalizerOptions): void {
+function isGenericOptions(
+	options: AnyPiPayloadExternalizerOptions,
+): options is PiGenericPayloadExternalizerOptions {
+	return "genericContent" in options;
+}
+
+function futureContext(options: PiGenericPayloadExternalizerOptions): FutureSessionContentRefGuardContext {
+	return {
+		serverEpoch: options.serverEpoch,
+		payloadBudget: options.payloadBudget,
+		contentRefBudget: options.genericContent.contentRefBudget,
+	};
+}
+
+function assertOptions(options: AnyPiPayloadExternalizerOptions): void {
 	const maxDecoded = options.maxDecodedImageBytes ?? options.payloadBudget?.maxAttachmentBlobBytes;
 	if (
 		!options ||
@@ -160,11 +242,22 @@ function assertOptions(options: PiPayloadExternalizerOptions): void {
 	) {
 		throw new TypeError("Pi payload externalizer options are invalid");
 	}
+	if (
+		isGenericOptions(options) &&
+		(!isFutureSessionContentRefGuardContext(futureContext(options)) ||
+			typeof options.contentStore.stageUtf8 !== "function" ||
+			typeof options.contentStore.holdPublishedUtf8 !== "function")
+	) {
+		throw new TypeError("Pi generic payload externalizer options are invalid");
+	}
 }
 
-function assertRawInput(input: PiPayloadExternalizerInput): void {
-	const valid =
-		input.kind === "event"
+function assertRawInput(input: PiPayloadExternalizerInput, generic: boolean): void {
+	const valid = generic
+		? input.kind === "event"
+			? isLegacyRpcV1FutureContentRawEvent(input.value)
+			: isLegacyRpcV1FutureContentRawResponse(input.value, input.expectedCommand)
+		: input.kind === "event"
 			? isLegacyRpcV1RawEvent(input.value)
 			: isLegacyRpcV1RawResponse(input.value, input.expectedCommand);
 	if (!valid) {
@@ -271,6 +364,421 @@ async function externalizeContent(value: unknown, state: FrameState): Promise<un
 		content.push(await externalizeImage(block, state));
 	}
 	return changed ? content : value;
+}
+
+type GenericTraversalResult = {
+	value: unknown;
+	currentGuardShadow: unknown;
+};
+
+function unchangedGeneric(value: unknown): GenericTraversalResult {
+	return { value, currentGuardShadow: value };
+}
+
+async function externalizeGenericFrame(
+	input: PiPayloadExternalizerInput,
+	state: FrameState,
+): Promise<GenericTraversalResult> {
+	const value = input.value as UnknownRecord;
+	return input.kind === "response"
+		? externalizeGenericResponse(value, state)
+		: externalizeGenericEvent(value, state);
+}
+
+async function externalizeGenericResponse(
+	value: UnknownRecord,
+	state: FrameState,
+): Promise<GenericTraversalResult> {
+	if (value.success !== true || !isRecord(value.data)) return unchangedGeneric(value);
+	let field: "messages" | "entries" | "tree";
+	let items: GenericTraversalResult[];
+	switch (value.command) {
+		case "get_messages":
+			field = "messages";
+			items = await mapGeneric(value.data.messages, (message) => externalizeGenericMessage(message, state));
+			break;
+		case "get_entries":
+			field = "entries";
+			items = await mapGeneric(value.data.entries, (entry) => externalizeGenericEntry(entry, state));
+			break;
+		case "get_tree":
+			field = "tree";
+			items = await mapGeneric(value.data.tree, (node) => externalizeGenericTreeNode(node, state));
+			break;
+		default:
+			return unchangedGeneric(value);
+	}
+	const productItems = items.map((item) => item.value);
+	const shadowItems = items.map((item) => item.currentGuardShadow);
+	return {
+		value: { ...value, data: { ...value.data, [field]: productItems } },
+		currentGuardShadow: { ...value, data: { ...value.data, [field]: shadowItems } },
+	};
+}
+
+async function externalizeGenericEvent(
+	value: UnknownRecord,
+	state: FrameState,
+): Promise<GenericTraversalResult> {
+	switch (value.type) {
+		case "agent_end": {
+			const messages = await mapGeneric(value.messages, (message) =>
+				externalizeGenericMessage(message, state),
+			);
+			return pairRecordArray(value, "messages", messages);
+		}
+		case "turn_end": {
+			const message = await externalizeGenericMessage(value.message, state);
+			const toolResults = await mapGeneric(value.toolResults, (candidate) =>
+				externalizeGenericMessage(candidate, state),
+			);
+			return {
+				value: {
+					...value,
+					message: message.value,
+					toolResults: toolResults.map((item) => item.value),
+				},
+				currentGuardShadow: {
+					...value,
+					message: message.currentGuardShadow,
+					toolResults: toolResults.map((item) => item.currentGuardShadow),
+				},
+			};
+		}
+		case "message_start":
+		case "message_end": {
+			const message = await externalizeGenericMessage(value.message, state);
+			return pairRecordField(value, "message", message);
+		}
+		case "entry_appended": {
+			const entry = await externalizeGenericEntry(value.entry, state);
+			return pairRecordField(value, "entry", entry);
+		}
+		case "message_update": {
+			const streamEvent = value.assistantMessageEvent as UnknownRecord;
+			if (streamEvent.type !== "toolcall_end") return unchangedGeneric(value);
+			const toolCall = await externalizeGenericToolCall(streamEvent.toolCall, state);
+			return {
+				value: {
+					...value,
+					assistantMessageEvent: { ...streamEvent, toolCall: toolCall.value },
+				},
+				currentGuardShadow: {
+					...value,
+					assistantMessageEvent: { ...streamEvent, toolCall: toolCall.currentGuardShadow },
+				},
+			};
+		}
+		case "tool_execution_start": {
+			const args = await externalizeJsonRoot(value.args, state);
+			return pairRecordField(value, "args", args);
+		}
+		case "tool_execution_update": {
+			const args = await externalizeJsonRoot(value.args, state);
+			const partialResult = await externalizeJsonRoot(value.partialResult, state);
+			return {
+				value: { ...value, args: args.value, partialResult: partialResult.value },
+				currentGuardShadow: {
+					...value,
+					args: args.currentGuardShadow,
+					partialResult: partialResult.currentGuardShadow,
+				},
+			};
+		}
+		case "tool_execution_end": {
+			const result = await externalizeJsonRoot(value.result, state);
+			return pairRecordField(value, "result", result);
+		}
+		default:
+			return unchangedGeneric(value);
+	}
+}
+
+async function externalizeGenericMessage(value: unknown, state: FrameState): Promise<GenericTraversalResult> {
+	const message = value as UnknownRecord;
+	switch (message.role) {
+		case "user": {
+			const content = await externalizeGenericContentBlocks(message.content, state, {
+				images: true,
+			});
+			return pairRecordField(message, "content", content);
+		}
+		case "assistant": {
+			const content = await externalizeGenericContentBlocks(message.content, state, {
+				toolCalls: true,
+			});
+			return pairRecordField(message, "content", content);
+		}
+		case "toolResult": {
+			const content = await externalizeGenericContentBlocks(message.content, state, {
+				images: true,
+				text: true,
+			});
+			const details =
+				message.details === undefined
+					? unchangedGeneric(undefined)
+					: await externalizeJsonRoot(message.details, state);
+			return pairRecordFields(message, { content, ...(message.details === undefined ? {} : { details }) });
+		}
+		case "custom": {
+			const content = Array.isArray(message.content)
+				? await externalizeGenericContentBlocks(message.content, state, { images: true, text: true })
+				: unchangedGeneric(message.content);
+			const details =
+				message.details === undefined
+					? unchangedGeneric(undefined)
+					: await externalizeJsonRoot(message.details, state);
+			return pairRecordFields(message, { content, ...(message.details === undefined ? {} : { details }) });
+		}
+		case "bashExecution": {
+			const output = await externalizeTextRoot(message.output as string, state);
+			return pairRecordField(message, "output", output);
+		}
+		default:
+			return unchangedGeneric(value);
+	}
+}
+
+async function externalizeGenericEntry(value: unknown, state: FrameState): Promise<GenericTraversalResult> {
+	const entry = value as UnknownRecord;
+	if (entry.type === "message") {
+		return pairRecordField(entry, "message", await externalizeGenericMessage(entry.message, state));
+	}
+	if (entry.type === "custom_message") {
+		const content = Array.isArray(entry.content)
+			? await externalizeGenericContentBlocks(entry.content, state, { images: true, text: true })
+			: unchangedGeneric(entry.content);
+		const details =
+			entry.details === undefined
+				? unchangedGeneric(undefined)
+				: await externalizeJsonRoot(entry.details, state);
+		return pairRecordFields(entry, { content, ...(entry.details === undefined ? {} : { details }) });
+	}
+	return unchangedGeneric(value);
+}
+
+async function externalizeGenericTreeNode(
+	value: unknown,
+	state: FrameState,
+): Promise<GenericTraversalResult> {
+	const node = value as UnknownRecord;
+	const entry = await externalizeGenericEntry(node.entry, state);
+	const children = await mapGeneric(node.children, (child) => externalizeGenericTreeNode(child, state));
+	return {
+		value: { ...node, entry: entry.value, children: children.map((item) => item.value) },
+		currentGuardShadow: {
+			...node,
+			entry: entry.currentGuardShadow,
+			children: children.map((item) => item.currentGuardShadow),
+		},
+	};
+}
+
+async function externalizeGenericContentBlocks(
+	value: unknown,
+	state: FrameState,
+	options: Readonly<{ images?: boolean; text?: boolean; toolCalls?: boolean }>,
+): Promise<GenericTraversalResult> {
+	if (!Array.isArray(value)) return unchangedGeneric(value);
+	const items: GenericTraversalResult[] = [];
+	for (const block of value) {
+		if (!isRecord(block)) {
+			items.push(unchangedGeneric(block));
+			continue;
+		}
+		if (options.images && block.type === "image") {
+			const image = await externalizeImage(block, state);
+			items.push({ value: image, currentGuardShadow: image });
+			continue;
+		}
+		if (options.text && block.type === "text") {
+			const text = await externalizeTextRoot(block.text as string, state);
+			items.push(pairRecordField(block, "text", text));
+			continue;
+		}
+		if (options.toolCalls && block.type === "toolCall") {
+			items.push(await externalizeGenericToolCall(block, state));
+			continue;
+		}
+		items.push(unchangedGeneric(block));
+	}
+	return {
+		value: items.map((item) => item.value),
+		currentGuardShadow: items.map((item) => item.currentGuardShadow),
+	};
+}
+
+async function externalizeGenericToolCall(
+	value: unknown,
+	state: FrameState,
+): Promise<GenericTraversalResult> {
+	const toolCall = value as UnknownRecord;
+	const args = await externalizeJsonRoot(toolCall.arguments, state);
+	return pairRecordField(toolCall, "arguments", args);
+}
+
+async function externalizeTextRoot(value: string, state: FrameState): Promise<GenericTraversalResult> {
+	const cached = state.textByIdentity.get(value);
+	if (cached !== undefined) {
+		return { value: cached, currentGuardShadow: typeof cached === "string" ? cached : "" };
+	}
+	const options = requireGenericOptions(state);
+	const prepared = await prepareBoundedUtf8Encoding(
+		{ kind: "text", value },
+		{ signal: options.signal, maxBytes: options.genericContent.contentRefBudget.maxContentBlobBytes },
+	);
+	let product: SessionTextPayloadDto;
+	let shadow: unknown = value;
+	if (prepared.byteLength < options.genericContent.contentRefBudget.inlineContentThresholdBytes) {
+		product = value;
+	} else {
+		const exact = await acquireExactUtf8Content(prepared, state);
+		product = Object.freeze({ type: "external_text" as const, ref: exact.ref });
+		shadow = "";
+	}
+	if (!isSessionTextPayloadDto(product, futureContext(options))) {
+		throw new PiPayloadExternalizationError(
+			"invalid_product_payload",
+			"Externalized Pi text failed its product guard",
+		);
+	}
+	state.textByIdentity.set(value, product);
+	return { value: product, currentGuardShadow: shadow };
+}
+
+async function externalizeJsonRoot(value: unknown, state: FrameState): Promise<GenericTraversalResult> {
+	const options = requireGenericOptions(state);
+	const prepared = await prepareBoundedUtf8Encoding(
+		{ kind: "json", value },
+		{ signal: options.signal, maxBytes: options.genericContent.contentRefBudget.maxContentBlobBytes },
+	);
+	let product: unknown;
+	let shadow: unknown = value;
+	if (prepared.byteLength < options.genericContent.contentRefBudget.inlineContentThresholdBytes) {
+		product = Object.freeze({ type: "inline_json" as const, value });
+	} else {
+		const exact = await acquireExactUtf8Content(prepared, state);
+		product = Object.freeze({ type: "external_json" as const, ref: exact.ref });
+		shadow = null;
+	}
+	if (!isSessionJsonRootDto(product, futureContext(options))) {
+		throw new PiPayloadExternalizationError(
+			"invalid_product_payload",
+			"Externalized Pi JSON failed its product guard",
+		);
+	}
+	return { value: product, currentGuardShadow: shadow };
+}
+
+function requireGenericOptions(state: FrameState): PiGenericPayloadExternalizerOptions {
+	if (!isGenericOptions(state.options)) throw new Error("Generic payload traversal requires generic options");
+	return state.options;
+}
+
+async function acquireExactUtf8Content(
+	prepared: PreparedBoundedUtf8Encoding,
+	state: FrameState,
+): Promise<ExactUtf8Content> {
+	const options = requireGenericOptions(state);
+	const computedRef = Object.freeze({
+		type: "content_ref" as const,
+		serverEpoch: options.serverEpoch,
+		sha256: prepared.sha256,
+		byteLength: prepared.byteLength,
+		encoding: "utf-8" as const,
+	});
+	const digestMatch = state.utf8ByDigest.get(computedRef.sha256);
+	if (digestMatch) {
+		if (!contentRefsEqual(digestMatch.ref, computedRef)) {
+			throw new PiPayloadExternalizationError(
+				"digest_metadata_mismatch",
+				"Equal Pi UTF-8 digests carried different metadata",
+			);
+		}
+		return digestMatch;
+	}
+
+	let exact: ExactUtf8Content;
+	try {
+		const hold = await options.contentStore.holdPublishedUtf8(computedRef);
+		state.holds.push(hold);
+		throwIfAborted(options.signal);
+		if (!contentRefsEqual(hold.ref, computedRef)) {
+			throw new PiPayloadExternalizationError(
+				"digest_metadata_mismatch",
+				"Published Pi UTF-8 metadata differed from computed content",
+			);
+		}
+		exact = { ref: hold.ref, hold };
+	} catch (error) {
+		if (
+			!(error instanceof EpochContentStoreError) ||
+			(error.code !== "not_found" && error.code !== "not_published")
+		) {
+			throw error;
+		}
+		throwIfAborted(options.signal);
+		const staged = await options.contentStore.stageUtf8({
+			source: prepared.createReadable({ signal: options.signal }),
+			expectedSha256: computedRef.sha256,
+			expectedByteLength: computedRef.byteLength,
+			signal: options.signal,
+		});
+		state.holds.push(staged.hold);
+		if (!contentRefsEqual(staged.ref, computedRef) || !contentRefsEqual(staged.hold.ref, computedRef)) {
+			throw new PiPayloadExternalizationError(
+				"digest_metadata_mismatch",
+				"Staged Pi UTF-8 metadata differed from computed content",
+			);
+		}
+		throwIfAborted(options.signal);
+		await options.contentStore.publish(staged.hold);
+		throwIfAborted(options.signal);
+		exact = { ref: staged.ref, hold: staged.hold };
+	}
+	state.utf8ByDigest.set(computedRef.sha256, exact);
+	return exact;
+}
+
+function pairRecordField(
+	record: UnknownRecord,
+	key: string,
+	pair: GenericTraversalResult,
+): GenericTraversalResult {
+	return pairRecordFields(record, { [key]: pair });
+}
+
+function pairRecordFields(
+	record: UnknownRecord,
+	fields: Readonly<Record<string, GenericTraversalResult>>,
+): GenericTraversalResult {
+	const product: UnknownRecord = { ...record };
+	const shadow: UnknownRecord = { ...record };
+	for (const [key, pair] of Object.entries(fields)) {
+		product[key] = pair.value;
+		shadow[key] = pair.currentGuardShadow;
+	}
+	return { value: product, currentGuardShadow: shadow };
+}
+
+function pairRecordArray(
+	record: UnknownRecord,
+	key: string,
+	items: readonly GenericTraversalResult[],
+): GenericTraversalResult {
+	return {
+		value: { ...record, [key]: items.map((item) => item.value) },
+		currentGuardShadow: { ...record, [key]: items.map((item) => item.currentGuardShadow) },
+	};
+}
+
+async function mapGeneric(
+	value: unknown,
+	mapper: (item: unknown) => Promise<GenericTraversalResult>,
+): Promise<GenericTraversalResult[]> {
+	const result: GenericTraversalResult[] = [];
+	for (const item of value as unknown[]) result.push(await mapper(item));
+	return result;
 }
 
 async function externalizeImage(block: UnknownRecord, state: FrameState): Promise<unknown> {
@@ -414,10 +922,10 @@ function base64Sextet(code: number): number {
 	return code === 43 ? 62 : 63;
 }
 
-function createLease(
+function createLease<TRef extends EpochStoredContentRef>(
 	store: PiPayloadExternalizerContentStore,
-	holds: readonly EpochContentHold[],
-): PiPayloadLease {
+	holds: readonly EpochContentHold<TRef>[],
+): PiPayloadLease<TRef> {
 	const owned = Object.freeze([...holds]);
 	const refs = Object.freeze(owned.map((hold) => hold.ref));
 	let state: "provisional" | "releasing" | "released" | "transferred" = "provisional";
@@ -441,16 +949,16 @@ function createLease(
 	});
 }
 
-function createTransfer(
+function createTransfer<TRef extends EpochStoredContentRef>(
 	store: PiPayloadExternalizerContentStore,
-	holds: readonly EpochContentHold[],
-	refs: readonly SessionAttachmentRefDto[],
-): PiPayloadLeaseTransfer {
+	holds: readonly EpochContentHold<TRef>[],
+	refs: readonly TRef[],
+): PiPayloadLeaseTransfer<TRef> {
 	let state: "pending" | "adopting" | "adopted" | "releasing" | "released" = "pending";
 	let releasePromise: Promise<void> | undefined;
 	return Object.freeze({
 		refs,
-		adopt(accept: (holds: readonly EpochContentHold[]) => true) {
+		adopt(accept: (holds: readonly EpochContentHold<TRef>[]) => true) {
 			if (state !== "pending") throw new Error("Pi payload lease transfer is no longer adoptable");
 			state = "adopting";
 			try {
@@ -478,7 +986,7 @@ function createTransfer(
 
 async function releaseHolds(
 	store: PiPayloadExternalizerContentStore,
-	holds: readonly EpochContentHold[],
+	holds: readonly EpochContentHold<EpochStoredContentRef>[],
 ): Promise<void> {
 	let failure: unknown;
 	for (const hold of [...holds].reverse()) {
@@ -501,6 +1009,16 @@ function refsEqual(left: SessionAttachmentRefDto, right: SessionAttachmentRefDto
 	);
 }
 
+function contentRefsEqual(left: SessionContentRefDto, right: SessionContentRefDto): boolean {
+	return (
+		left.type === right.type &&
+		left.serverEpoch === right.serverEpoch &&
+		left.sha256 === right.sha256 &&
+		left.byteLength === right.byteLength &&
+		left.encoding === right.encoding
+	);
+}
+
 function throwIfAborted(signal?: AbortSignal): void {
 	if (!signal?.aborted) return;
 	throw new PiPayloadExternalizationError("aborted", "Pi payload externalization was aborted");
@@ -509,6 +1027,24 @@ function throwIfAborted(signal?: AbortSignal): void {
 function normalizeExternalizationError(error: unknown): unknown {
 	if (error instanceof RasterAdmissionError) return error;
 	if (error instanceof PiPayloadExternalizationError || error instanceof EpochContentStoreError) return error;
+	if (error instanceof BoundedUtf8CodecError) {
+		if (error.code === "aborted") {
+			return new PiPayloadExternalizationError("aborted", "Pi payload externalization was aborted");
+		}
+		if (
+			error.code === "byte_limit_exceeded" &&
+			Number.isSafeInteger(error.limit) &&
+			(error.limit ?? 0) > 0 &&
+			Number.isSafeInteger(error.actual) &&
+			(error.actual ?? 0) > (error.limit ?? 0)
+		) {
+			return new EpochContentStoreError("blob_too_large", "Pi UTF-8 content exceeded the blob limit", {
+				limit: error.limit,
+				actual: error.actual,
+			});
+		}
+		return error;
+	}
 	if (error instanceof Error && error.name === "AbortError") {
 		return new PiPayloadExternalizationError("aborted", "Pi payload externalization was aborted");
 	}
