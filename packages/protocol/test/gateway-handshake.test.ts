@@ -169,6 +169,12 @@ describe("Gateway hello DTOs", () => {
 		expect(
 			isGatewayServerHello({
 				...server,
+				payloadBudget: { ...SESSION_PAYLOAD_BUDGET, maxContentBlobBytes: 48 * 1024 * 1024 },
+			}),
+		).toBe(false);
+		expect(
+			isGatewayServerHello({
+				...server,
 				capabilities: server.capabilities.filter(
 					(capability) => capability !== GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 				),
