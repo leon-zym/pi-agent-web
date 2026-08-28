@@ -1,6 +1,6 @@
-import type { SessionAttachmentRefDto } from "@pi-agent-web/protocol";
+import type { SessionAttachmentRefDto, SessionContentRefDto } from "@pi-agent-web/protocol";
 import { describe, expect, it } from "vitest";
-import type { EpochContentHold } from "../src/epoch-content-store.js";
+import type { EpochContentHold, EpochStoredContentRef } from "../src/epoch-content-store.js";
 import { GenerationContentOwner } from "../src/generation-content-owner.js";
 import type { PiPayloadLeaseTransfer } from "../src/pi-payload-externalizer.js";
 import { TransitionPayloadLedger, TransitionPayloadLedgerError } from "../src/transition-payload-ledger.js";
@@ -14,6 +14,38 @@ function ref(sha256: string, serverEpoch = SERVER_EPOCH): SessionAttachmentRefDt
 		sha256,
 		mediaType: "image/png",
 		byteLength: 4,
+	});
+}
+
+function contentRef(sha256: string, serverEpoch = SERVER_EPOCH): SessionContentRefDto {
+	return Object.freeze({
+		type: "content_ref",
+		serverEpoch,
+		sha256,
+		byteLength: 4,
+		encoding: "utf-8",
+	});
+}
+
+function trackedStoredTransfer<TRef extends EpochStoredContentRef>(
+	refs: readonly TRef[],
+	tracking: { adopted: number; released: number },
+): PiPayloadLeaseTransfer<TRef> {
+	const holds = Object.freeze(refs.map((candidate) => Object.freeze({ ref: candidate })));
+	let state: "pending" | "adopted" | "released" = "pending";
+	return Object.freeze({
+		refs: Object.freeze([...refs]),
+		adopt(accept: Parameters<PiPayloadLeaseTransfer<TRef>["adopt"]>[0]) {
+			if (state !== "pending") throw new Error("test transfer is not pending");
+			if (accept(holds) !== true) throw new Error("test transfer was rejected");
+			state = "adopted";
+			tracking.adopted += 1;
+		},
+		async release() {
+			if (state !== "pending") return;
+			state = "released";
+			tracking.released += 1;
+		},
 	});
 }
 
@@ -59,6 +91,41 @@ function owner(released: EpochContentHold[] = []): GenerationContentOwner {
 }
 
 describe("TransitionPayloadLedger", () => {
+	it("accounts mixed physical holds and drains namespace-separated refs without coalescing", async () => {
+		const digest = "0".repeat(64);
+		const firstTracking = { adopted: 0, released: 0 };
+		const duplicateTracking = { adopted: 0, released: 0 };
+		const mixed = trackedStoredTransfer<EpochStoredContentRef>(
+			[ref(digest), contentRef(digest)],
+			firstTracking,
+		);
+		const duplicateUtf8 = trackedStoredTransfer([contentRef(digest)], duplicateTracking);
+		const ledger = new TransitionPayloadLedger<EpochStoredContentRef>({ maxBytes: 12, maxHoldItems: 3 });
+		const released: EpochContentHold<EpochStoredContentRef>[] = [];
+		const target = new GenerationContentOwner<EpochStoredContentRef>({
+			serverEpoch: SERVER_EPOCH,
+			generation: 2,
+			release: async (entry) => {
+				released.push(entry);
+			},
+		});
+
+		ledger.append({ transfer: mixed, bytes: 8 });
+		ledger.append({ transfer: duplicateUtf8, bytes: 4 });
+		expect(ledger.bytes).toBe(12);
+		expect(ledger.holdItems).toBe(3);
+
+		ledger.drainTo(target);
+		expect(target.size).toBe(2);
+		expect(new Set(target.refs.map((candidate) => candidate.type))).toEqual(
+			new Set(["attachment_ref", "content_ref"]),
+		);
+		await target.release();
+		expect(released).toHaveLength(3);
+		expect(firstTracking).toEqual({ adopted: 1, released: 0 });
+		expect(duplicateTracking).toEqual({ adopted: 1, released: 0 });
+	});
+
 	it("enforces byte and hold-item ceilings before taking transfer custody", async () => {
 		const ledger = new TransitionPayloadLedger({ maxBytes: 10, maxHoldItems: 2 });
 		const firstTracking = { adopted: 0, released: 0 };

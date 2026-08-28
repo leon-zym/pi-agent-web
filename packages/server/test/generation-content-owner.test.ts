@@ -1,6 +1,6 @@
-import type { SessionAttachmentRefDto } from "@pi-agent-web/protocol";
+import type { SessionAttachmentRefDto, SessionContentRefDto } from "@pi-agent-web/protocol";
 import { describe, expect, it, vi } from "vitest";
-import type { EpochContentHold } from "../src/epoch-content-store.js";
+import type { EpochContentHold, EpochStoredContentRef } from "../src/epoch-content-store.js";
 import { GenerationContentOwner, GenerationContentOwnerError } from "../src/generation-content-owner.js";
 import type { PiPayloadLeaseTransfer } from "../src/pi-payload-externalizer.js";
 
@@ -19,6 +19,34 @@ function ref(sha256: string, overrides: Partial<SessionAttachmentRefDto> = {}): 
 
 function hold(value: SessionAttachmentRefDto): EpochContentHold {
 	return Object.freeze({ ref: value });
+}
+
+function contentRef(sha256: string, overrides: Partial<SessionContentRefDto> = {}): SessionContentRefDto {
+	return Object.freeze({
+		type: "content_ref",
+		serverEpoch: SERVER_EPOCH,
+		sha256,
+		byteLength: 4,
+		encoding: "utf-8",
+		...overrides,
+	});
+}
+
+function storedHold<TRef extends EpochStoredContentRef>(value: TRef): EpochContentHold<TRef> {
+	return Object.freeze({ ref: value });
+}
+
+function storedTransfer<TRef extends EpochStoredContentRef>(
+	holds: readonly EpochContentHold<TRef>[],
+	refs: readonly TRef[] = holds.map((entry) => entry.ref),
+): PiPayloadLeaseTransfer<TRef> {
+	return Object.freeze({
+		refs: Object.freeze([...refs]),
+		adopt(accept: Parameters<PiPayloadLeaseTransfer<TRef>["adopt"]>[0]) {
+			if (accept(holds) !== true) throw new Error("callback returned false");
+		},
+		async release() {},
+	});
 }
 
 function transfer(
@@ -49,6 +77,66 @@ function transfer(
 }
 
 describe("GenerationContentOwner", () => {
+	it("keeps attachment and UTF-8 namespaces distinct for an equal digest", async () => {
+		const digest = "0".repeat(64);
+		const raster = storedHold(ref(digest));
+		const utf8 = storedHold(contentRef(digest));
+		const released: EpochContentHold<EpochStoredContentRef>[] = [];
+		const owner = new GenerationContentOwner<EpochStoredContentRef>({
+			serverEpoch: SERVER_EPOCH,
+			generation: 1,
+			release: async (entry) => {
+				released.push(entry);
+			},
+		});
+
+		owner.adopt(storedTransfer<EpochStoredContentRef>([raster, utf8]));
+
+		expect(owner.size).toBe(2);
+		expect(owner.refs).toEqual([raster.ref, utf8.ref]);
+		await owner.release();
+		expect(released).toEqual([utf8, raster]);
+	});
+
+	it("deduplicates exact UTF-8 refs while retaining one physical primary hold", async () => {
+		const exact = contentRef("1".repeat(64));
+		const retained = storedHold(exact);
+		const duplicate = storedHold(exact);
+		const released: EpochContentHold<SessionContentRefDto>[] = [];
+		const owner = new GenerationContentOwner<SessionContentRefDto>({
+			serverEpoch: SERVER_EPOCH,
+			generation: 1,
+			release: async (entry) => {
+				released.push(entry);
+			},
+		});
+
+		owner.adopt(storedTransfer([retained, duplicate]));
+		await Promise.resolve();
+		expect(owner.size).toBe(1);
+		expect(owner.refs).toEqual([exact]);
+		await owner.release();
+		expect(released).toEqual([duplicate, retained]);
+	});
+
+	it("rejects UTF-8 digest metadata collisions without partial mixed registration", () => {
+		const digest = "2".repeat(64);
+		const raster = storedHold(ref("3".repeat(64)));
+		const utf8 = storedHold(contentRef(digest));
+		const collision = storedHold(contentRef(digest, { byteLength: 5 }));
+		const owner = new GenerationContentOwner<EpochStoredContentRef>({
+			serverEpoch: SERVER_EPOCH,
+			generation: 1,
+			release: async () => {},
+		});
+
+		expect(() => owner.adopt(storedTransfer<EpochStoredContentRef>([raster, utf8, collision]))).toThrow(
+			/metadata collision/i,
+		);
+		expect(owner.size).toBe(0);
+		expect(owner.refs).toEqual([]);
+	});
+
 	it("atomically adopts exact unique holds and releases them in reverse order", async () => {
 		const released: EpochContentHold[] = [];
 		const owner = new GenerationContentOwner({

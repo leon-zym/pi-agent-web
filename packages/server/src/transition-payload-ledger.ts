@@ -1,3 +1,5 @@
+import type { SessionAttachmentRefDto } from "@pi-agent-web/protocol";
+import type { EpochStoredContentRef } from "./epoch-content-store.js";
 import { GenerationContentOwner } from "./generation-content-owner.js";
 import type { PiPayloadLeaseTransfer } from "./pi-payload-externalizer.js";
 
@@ -15,15 +17,15 @@ export interface TransitionPayloadLedgerOptions {
 	maxHoldItems: number;
 }
 
-export interface TransitionPayloadLedgerAppend {
-	transfer: PiPayloadLeaseTransfer;
+export interface TransitionPayloadLedgerAppend<TRef extends EpochStoredContentRef = SessionAttachmentRefDto> {
+	transfer: PiPayloadLeaseTransfer<TRef>;
 	bytes: number;
 }
 
 type EntryState = "pending" | "adopted" | "released";
 
-interface LedgerEntry {
-	readonly transfer: PiPayloadLeaseTransfer;
+interface LedgerEntry<TRef extends EpochStoredContentRef> {
+	readonly transfer: PiPayloadLeaseTransfer<TRef>;
 	readonly bytes: number;
 	readonly holdItems: number;
 	state: EntryState;
@@ -40,11 +42,11 @@ export class TransitionPayloadLedgerError extends Error {
  * Owns undecided Pi payload transfers until one transition outcome routes them
  * into an exact generation owner or releases every still-unassigned transfer.
  */
-export class TransitionPayloadLedger {
+export class TransitionPayloadLedger<TRef extends EpochStoredContentRef = SessionAttachmentRefDto> {
 	private readonly maxBytes: number;
 	private readonly maxHoldItems: number;
-	private readonly entries: LedgerEntry[] = [];
-	private readonly seenTransfers = new Set<PiPayloadLeaseTransfer>();
+	private readonly entries: LedgerEntry<TRef>[] = [];
+	private readonly seenTransfers = new Set<PiPayloadLeaseTransfer<TRef>>();
 	private currentState: TransitionPayloadLedgerState = "open";
 	private currentBytes = 0;
 	private currentHoldItems = 0;
@@ -84,7 +86,7 @@ export class TransitionPayloadLedger {
 	}
 
 	/** Takes exclusive cleanup responsibility only after all accounting preflights pass. */
-	append(input: TransitionPayloadLedgerAppend): void {
+	append(input: TransitionPayloadLedgerAppend<TRef>): void {
 		if (this.currentState !== "open") {
 			throw new TransitionPayloadLedgerError("transition payload ledger is already consumed");
 		}
@@ -112,7 +114,7 @@ export class TransitionPayloadLedger {
 	}
 
 	/** One-shot synchronous routing. A failed suffix remains owned only for releaseRemaining(). */
-	drainTo(owner: GenerationContentOwner): void {
+	drainTo(owner: GenerationContentOwner<TRef>): void {
 		if (this.currentState !== "open") {
 			throw new TransitionPayloadLedgerError("transition payload ledger is already consumed");
 		}
@@ -180,7 +182,7 @@ function isLimit(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
-function isTransfer(value: unknown): value is PiPayloadLeaseTransfer {
+function isTransfer(value: unknown): value is PiPayloadLeaseTransfer<EpochStoredContentRef> {
 	return (
 		typeof value === "object" &&
 		value !== null &&
