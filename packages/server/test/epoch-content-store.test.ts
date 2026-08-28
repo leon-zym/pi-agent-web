@@ -21,7 +21,9 @@ import {
 	EpochContentStore,
 	EpochContentStoreError,
 	type EpochContentStoreLimits,
+	type EpochUtf8ContentPutInput,
 	type SessionAttachmentRefDto,
+	type SessionContentRefDto,
 } from "../src/epoch-content-store.js";
 
 const epochKey = (epoch: string): string => createHash("sha256").update(epoch).digest("hex");
@@ -34,6 +36,7 @@ function storePaths(webDataDir: string, epoch: string) {
 		storeRoot,
 		epochRoot,
 		blobsRoot: path.join(epochRoot, "blobs"),
+		utf8Root: path.join(epochRoot, "utf8"),
 		blobDirectory(digest: string) {
 			return path.join(epochRoot, "blobs", digest);
 		},
@@ -42,6 +45,15 @@ function storePaths(webDataDir: string, epoch: string) {
 		},
 		manifestPath(digest: string) {
 			return path.join(epochRoot, "blobs", digest, "manifest.json");
+		},
+		utf8Directory(digest: string) {
+			return path.join(epochRoot, "utf8", digest);
+		},
+		utf8BlobPath(digest: string) {
+			return path.join(epochRoot, "utf8", digest, "content");
+		},
+		utf8ManifestPath(digest: string) {
+			return path.join(epochRoot, "utf8", digest, "manifest.json");
 		},
 	};
 }
@@ -108,6 +120,231 @@ describe("EpochContentStore", () => {
 			await store.release(pinned.pin);
 		}
 	}
+
+	async function publishUtf8(
+		store: EpochContentStore,
+		input: EpochUtf8ContentPutInput,
+	): Promise<SessionContentRefDto> {
+		const staged = await store.stageUtf8(input);
+		await store.publish(staged.hold);
+		await store.release(staged.hold);
+		return staged.ref;
+	}
+
+	async function readUtf8(store: EpochContentStore, ref: SessionContentRefDto): Promise<Buffer> {
+		const pinned = await store.pinUtf8(ref);
+		try {
+			return await readStream(pinned.stream);
+		} finally {
+			await store.release(pinned.pin);
+		}
+	}
+
+	it("deduplicates generic UTF-8 bytes without binding text or JSON semantics into the manifest", async () => {
+		const epoch = "epoch-utf8-dedupe";
+		const store = await createStore(epoch);
+		const [first, duplicate] = await Promise.all([
+			store.stageUtf8({ source: source('{"answer":42}'), expectedByteLength: 13 }),
+			store.stageUtf8({ source: source('{"answer":42}'), expectedByteLength: 13 }),
+		]);
+
+		expect([first.created, duplicate.created].sort()).toEqual([false, true]);
+		expect(duplicate.ref).toBe(first.ref);
+		expect(first.ref).toEqual({
+			type: "content_ref",
+			serverEpoch: epoch,
+			sha256: digestOf('{"answer":42}'),
+			byteLength: 13,
+			encoding: "utf-8",
+		});
+		expect(store.usage).toEqual({ bytes: 13, items: 1 });
+
+		await store.publish(first.hold);
+		await store.publish(duplicate.hold);
+		await store.release(first.hold);
+		await store.release(duplicate.hold);
+		const paths = storePaths(webDataDir, epoch);
+		expect(JSON.parse(await readFile(paths.utf8ManifestPath(first.ref.sha256), "utf8"))).toEqual({
+			version: 1,
+			published: true,
+			namespace: "utf8",
+			serverEpoch: epoch,
+			sha256: first.ref.sha256,
+			byteLength: first.ref.byteLength,
+			encoding: "utf-8",
+		});
+		await expect(readUtf8(store, first.ref)).resolves.toEqual(Buffer.from('{"answer":42}'));
+		const pinnedByDigest = await store.pinUtf8ByDigest(first.ref.sha256);
+		expect(pinnedByDigest.ref).toBe(first.ref);
+		await expect(readStream(pinnedByDigest.stream)).resolves.toEqual(Buffer.from('{"answer":42}'));
+		await store.release(pinnedByDigest.pin);
+	});
+
+	it("isolates identical generic and raster bytes while charging one combined quota", async () => {
+		const epoch = "epoch-namespace-isolation";
+		const store = await createStore(epoch, {
+			maxBlobBytes: 4,
+			maxContentBlobBytes: 4,
+			maxCacheBytes: 8,
+			maxCacheItems: 2,
+		});
+		const raster = await publishContent(store, { source: source("same"), mediaType: "image/png" });
+		const generic = await publishUtf8(store, { source: source("same") });
+
+		expect(generic.sha256).toBe(raster.sha256);
+		expect(store.usage).toEqual({ bytes: 8, items: 2 });
+		const paths = storePaths(webDataDir, epoch);
+		await expect(access(paths.blobPath(raster.sha256))).resolves.toBeUndefined();
+		await expect(access(paths.utf8BlobPath(generic.sha256))).resolves.toBeUndefined();
+		await expect(readContent(store, raster)).resolves.toEqual(Buffer.from("same"));
+		await expect(readUtf8(store, generic)).resolves.toEqual(Buffer.from("same"));
+		await expect(store.stageUtf8({ source: source("x"), expectedByteLength: 1 })).rejects.toMatchObject({
+			code: "cache_bytes_exhausted",
+		});
+		await store.shutdown();
+
+		const itemStore = await createStore("epoch-namespace-item-quota", {
+			maxBlobBytes: 4,
+			maxContentBlobBytes: 4,
+			maxCacheBytes: 8,
+			maxCacheItems: 1,
+		});
+		await publishContent(itemStore, { source: source("a"), mediaType: "image/png" });
+		await expect(itemStore.stageUtf8({ source: source("b"), expectedByteLength: 1 })).rejects.toMatchObject({
+			code: "cache_items_exhausted",
+		});
+	});
+
+	it("keeps the raster and generic blob ceilings independent", async () => {
+		const store = await createStore("epoch-independent-limits");
+		await expect(
+			store.stage({
+				source: source("x"),
+				mediaType: "image/png",
+				expectedByteLength: 8 * 1024 * 1024,
+			}),
+		).rejects.toMatchObject({ code: "declared_length_mismatch" });
+		await expect(
+			store.stage({
+				source: source("x"),
+				mediaType: "image/png",
+				expectedByteLength: 8 * 1024 * 1024 + 1,
+			}),
+		).rejects.toMatchObject({ code: "invalid_ref" });
+		await expect(
+			store.stageUtf8({ source: source("x"), expectedByteLength: 48 * 1024 * 1024 }),
+		).rejects.toMatchObject({ code: "declared_length_mismatch" });
+		await expect(
+			store.stageUtf8({ source: source("x"), expectedByteLength: 48 * 1024 * 1024 + 1 }),
+		).rejects.toMatchObject({ code: "invalid_ref" });
+	});
+
+	it("shares reservation and item admission atomically across namespaces", async () => {
+		const store = await createStore("epoch-combined-reservation", {
+			maxBlobBytes: 4,
+			maxContentBlobBytes: 4,
+			maxCacheBytes: 4,
+			maxCacheItems: 1,
+		});
+		const controller = new AbortController();
+		const pendingSource = new PassThrough();
+		const pending = store.stageUtf8({
+			source: pendingSource,
+			expectedByteLength: 4,
+			signal: controller.signal,
+		});
+		await expect(
+			store.stage({ source: source("x"), mediaType: "image/png", expectedByteLength: 1 }),
+		).rejects.toMatchObject({ code: "cache_bytes_exhausted" });
+		controller.abort();
+		await expect(pending).rejects.toMatchObject({ code: "aborted" });
+		expect(store.usage).toEqual({ bytes: 0, items: 0 });
+	});
+
+	it("retains generic holds through restart and collects utf8 orphans and released content", async () => {
+		const epoch = "epoch-utf8-lifecycle";
+		const store = await createStore(epoch);
+		const ref = await publishUtf8(store, { source: source("persistent") });
+		const hold = await store.holdPublishedUtf8(ref);
+		expect(await store.gc()).toEqual({ bytes: 0, items: 0 });
+		await store.release(hold);
+		await store.shutdown();
+
+		const paths = storePaths(webDataDir, epoch);
+		await writeFile(path.join(paths.utf8Root, ".tmp-00000000-0000-4000-8000-000000000000"), "orphan", {
+			mode: 0o600,
+		});
+		const incompleteDigest = digestOf("incomplete");
+		await mkdir(paths.utf8Directory(incompleteDigest), { mode: 0o700 });
+		await writeFile(paths.utf8BlobPath(incompleteDigest), "incomplete", { mode: 0o600 });
+		const reopened = await createStore(epoch);
+		expect(reopened.usage).toEqual({ bytes: ref.byteLength, items: 1 });
+		await expect(readUtf8(reopened, ref)).resolves.toEqual(Buffer.from("persistent"));
+		expect(await readdir(paths.utf8Root)).toEqual([ref.sha256]);
+		expect(await reopened.gc()).toEqual({ bytes: ref.byteLength, items: 1 });
+		expect(reopened.usage).toEqual({ bytes: 0, items: 0 });
+	});
+
+	it("rejects cross-namespace refs and generic manifest semantic or intrinsic substitution", async () => {
+		const epoch = "epoch-utf8-manifest";
+		const store = await createStore(epoch);
+		const raster = await publishContent(store, { source: source("raster"), mediaType: "image/png" });
+		const generic = await publishUtf8(store, { source: source("generic") });
+		await expect(store.pinUtf8(raster as unknown as SessionContentRefDto)).rejects.toMatchObject({
+			code: "invalid_ref",
+		});
+		await expect(store.pin(generic as unknown as SessionAttachmentRefDto)).rejects.toMatchObject({
+			code: "invalid_ref",
+		});
+		await store.shutdown();
+
+		const paths = storePaths(webDataDir, epoch);
+		const manifest = JSON.parse(await readFile(paths.utf8ManifestPath(generic.sha256), "utf8"));
+		const { namespace: _namespace, ...missingNamespace } = manifest;
+		await writeFile(paths.utf8ManifestPath(generic.sha256), JSON.stringify(missingNamespace));
+		const semanticSubstitution = new EpochContentStore({ webDataDir, serverEpoch: epoch });
+		stores.push(semanticSubstitution);
+		await expect(semanticSubstitution.initialize()).rejects.toMatchObject({ code: "unsafe_layout" });
+
+		await writeFile(
+			paths.utf8ManifestPath(generic.sha256),
+			JSON.stringify({ ...manifest, semanticKind: "json" }),
+		);
+		await expect(semanticSubstitution.initialize()).rejects.toMatchObject({ code: "unsafe_layout" });
+
+		await writeFile(
+			paths.utf8ManifestPath(generic.sha256),
+			JSON.stringify({ ...manifest, namespace: "attachment" }),
+		);
+		await expect(semanticSubstitution.initialize()).rejects.toMatchObject({ code: "unsafe_layout" });
+
+		await writeFile(
+			paths.utf8ManifestPath(generic.sha256),
+			JSON.stringify({ ...manifest, byteLength: generic.byteLength + 1 }),
+		);
+		await expect(semanticSubstitution.initialize()).rejects.toMatchObject({ code: "unsafe_layout" });
+	});
+
+	it("does not leak generic holds or pins when a live manifest loses its namespace provenance", async () => {
+		const epoch = "epoch-utf8-live-namespace";
+		const store = await createStore(epoch);
+		const generic = await publishUtf8(store, { source: source("collect-after-tamper") });
+		const paths = storePaths(webDataDir, epoch);
+		const manifest = JSON.parse(await readFile(paths.utf8ManifestPath(generic.sha256), "utf8"));
+		const { namespace: _namespace, ...missingNamespace } = manifest;
+
+		await writeFile(paths.utf8ManifestPath(generic.sha256), JSON.stringify(missingNamespace));
+		await expect(store.holdPublishedUtf8(generic)).rejects.toMatchObject({ code: "manifest_mismatch" });
+		await writeFile(
+			paths.utf8ManifestPath(generic.sha256),
+			JSON.stringify({ ...manifest, namespace: "attachment" }),
+		);
+		await expect(store.pinUtf8(generic)).rejects.toMatchObject({ code: "manifest_mismatch" });
+
+		await writeFile(paths.utf8ManifestPath(generic.sha256), JSON.stringify(manifest));
+		expect(await store.gc()).toEqual({ bytes: generic.byteLength, items: 1 });
+		expect(store.usage).toEqual({ bytes: 0, items: 0 });
+	});
 
 	it("accepts blobs below and at the per-blob limit and rejects the first byte above it", async () => {
 		const store = await createStore("epoch-a", {

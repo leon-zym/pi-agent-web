@@ -1,24 +1,35 @@
 import { randomUUID } from "node:crypto";
 import {
+	analyzeFutureSessionResponseFrameLogicalBytes,
+	FUTURE_SESSION_CONTENT_REF_BUDGET,
+	type FutureSessionWsServerMessage,
 	GATEWAY_CLIENT_REQUIRED_CAPABILITIES,
+	GATEWAY_CONTENT_REF_CAPABILITY,
+	GATEWAY_CONTENT_REF_PROTOCOL_MINOR,
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 	GATEWAY_PROTOCOL_VERSION,
+	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
+	type GatewayContentRefServerHelloDto,
 	type GatewayProtocolErrorDto,
 	type GatewayServerHelloDto,
 	type HotRuntimeInventoryDto,
+	isFutureSessionContentRefGuardContext,
+	isFutureSessionWsServerMessage,
 	isGatewayClientHello,
+	isGatewayContentRefClientHello,
 	isSessionAttachmentGuardContext,
 	isSessionWsClientMessage,
+	negotiateGatewayContentRef,
 	negotiateGatewayPayloadBudget,
 	negotiateHotRuntimeInventory,
 	RpcError,
+	SESSION_HOT_RUNTIME_INVENTORY_MAX_BYTES,
+	SESSION_PAYLOAD_BUDGET,
 	SESSION_WS_CLIENT_MAX_BYTES,
 	SESSION_WS_SERVER_MAX_BYTES,
 	type SessionCommandDto,
-	type SessionCommandResponseDto,
 	type SessionReplayCursorDto,
-	type SessionReplayFrameDto,
 	type SessionRuntimeDto,
 	type SessionRuntimeIdentityDto,
 	type SessionWsClientMessage,
@@ -26,16 +37,30 @@ import {
 } from "@pi-agent-web/protocol";
 import type { WebSocket } from "ws";
 import { WebSocketServer } from "ws";
-import type { GatewayPayloadActivation } from "./gateway-payload-activation.js";
+import type {
+	GatewayFuturePayloadActivation,
+	GatewayPayloadActivation,
+} from "./gateway-payload-activation.js";
+import type {
+	SessionRuntimeProductEvent,
+	SessionRuntimeProductExtensionRequest,
+	SessionRuntimeProductMode,
+	SessionRuntimeProductResponse,
+	SessionRuntimeProductSnapshot,
+} from "./session-runtime.js";
 import type { ReplayResult, SessionSupervisorMessage } from "./session-runtime-types.js";
-import type { HotRuntimeSubscriptionToken, SessionSupervisor } from "./session-supervisor.js";
+import type {
+	HotRuntimeSubscriptionToken,
+	SessionSupervisor,
+	SessionSupervisorCore,
+} from "./session-supervisor.js";
 
-interface ConnectionState {
+interface ConnectionState<M extends SessionRuntimeProductMode = "current"> {
 	connectionId: string;
 	ws: WebSocket;
 	subscriptions: Set<string>;
 	subscriptionAliases: Map<string, string>;
-	catchUps: Set<SessionCatchUp>;
+	catchUps: Set<SessionCatchUp<M>>;
 	catchUpSmallBufferedBytes: number;
 	catchUpLargeItems: number;
 	nextCatchUpOrder: number;
@@ -63,16 +88,33 @@ interface OutboundPayload {
 	large: boolean;
 }
 
-interface BufferedCatchUpMessage {
-	message: SessionSupervisorMessage;
+type BridgeEvent<M extends SessionRuntimeProductMode> = SessionRuntimeProductEvent<M>;
+type BridgeExtensionRequest<M extends SessionRuntimeProductMode> = SessionRuntimeProductExtensionRequest<M>;
+type BridgeResponse<M extends SessionRuntimeProductMode> = SessionRuntimeProductResponse<M>;
+type BridgeSnapshot<M extends SessionRuntimeProductMode> = SessionRuntimeProductSnapshot<M>;
+type BridgeSupervisorMessage<M extends SessionRuntimeProductMode> = SessionSupervisorMessage<
+	BridgeEvent<M>,
+	BridgeExtensionRequest<M>
+>;
+type BridgeReplayResult<M extends SessionRuntimeProductMode> = ReplayResult<
+	BridgeEvent<M>,
+	BridgeSnapshot<M>,
+	BridgeExtensionRequest<M>
+>;
+type BridgeServerMessage<M extends SessionRuntimeProductMode> = M extends "future_content"
+	? FutureSessionWsServerMessage
+	: SessionWsServerMessage;
+
+interface BufferedCatchUpMessage<M extends SessionRuntimeProductMode = "current"> {
+	message: BridgeSupervisorMessage<M>;
 	payload: string;
 }
 
-interface SessionCatchUp {
+interface SessionCatchUp<M extends SessionRuntimeProductMode = "current"> {
 	requestedHandle: string;
 	currentHandle: string;
 	handles: Set<string>;
-	buffered: BufferedCatchUpMessage[];
+	buffered: BufferedCatchUpMessage<M>[];
 	bufferedSmallBytes: number;
 	bufferedLargeItems: number;
 	order: number;
@@ -85,62 +127,117 @@ interface BashCommandIdMapping {
 	clientId: string;
 }
 
-export interface SessionWsBridgeOptions {
-	supervisor: SessionSupervisor;
+type SessionWsBridgeSupervisor<M extends SessionRuntimeProductMode> = Pick<
+	SessionSupervisorCore<M>,
+	| "serverEpoch"
+	| "getRuntime"
+	| "getHotRuntimeInventory"
+	| "subscribe"
+	| "subscribeHotExact"
+	| "revalidateHotExactSubscription"
+	| "claim"
+	| "release"
+	| "releaseConnection"
+	| "leaseFor"
+	| "sendCommand"
+	| "sendExtensionUiResponse"
+>;
+
+interface SessionWsBridgeOptionsBase<M extends SessionRuntimeProductMode> {
+	supervisor: SessionWsBridgeSupervisor<M>;
 	serverBuild: string;
 	runtime: {
 		version: string;
 		adapterId: string;
 		capabilities: readonly string[];
 	};
-	/** Required production activation for epoch attachment references and the negotiated budget. */
-	payloadActivation?: Pick<GatewayPayloadActivation, "context">;
 	heartbeatIntervalMs?: number;
 	helloTimeoutMs?: number;
 	log?: (level: "info" | "warn" | "error", message: string) => void;
 }
 
+export interface SessionWsBridgeOptions extends SessionWsBridgeOptionsBase<"current"> {
+	supervisor: SessionSupervisor;
+	/** Required production activation for epoch attachment references and the negotiated budget. */
+	payloadActivation?: Pick<GatewayPayloadActivation, "context">;
+}
+
+/** Server-private future Bridge options. This is intentionally not part of the 1.2 activation. */
+export interface FutureSessionWsBridgeOptions extends SessionWsBridgeOptionsBase<"future_content"> {
+	payloadActivation: Pick<GatewayFuturePayloadActivation, "context" | "externalizer" | "supervisorServices">;
+}
+
+type FutureBridgeActivation = FutureSessionWsBridgeOptions["payloadActivation"];
+type SessionWsBridgeCoreOptions<M extends SessionRuntimeProductMode> = SessionWsBridgeOptionsBase<M> & {
+	payloadActivation?: SessionWsBridgeOptions["payloadActivation"] | FutureBridgeActivation;
+};
+
 export const MAX_SESSION_WS_IN_FLIGHT_COMMANDS = 32;
 export const MAX_SESSION_WS_IN_FLIGHT_EXACT_SUBSCRIPTIONS = 256;
 export const MAX_SESSION_WS_BUFFERED_BYTES = 1024 * 1024;
 const MAX_SESSION_WS_FRAME_BYTES = SESSION_WS_SERVER_MAX_BYTES;
+const LEGACY_GATEWAY_PROTOCOL_MINOR = 2;
+const LEGACY_GATEWAY_CLIENT_REQUIRED_CAPABILITIES = [
+	"rpc.commands",
+	"rpc.events",
+	"rpc.extension_ui",
+	"session.multiplex",
+	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+] as const;
 
 /** Multiplexes one browser socket across any number of independent Sessions. */
-export class SessionWsBridge {
+class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 	readonly wss: WebSocketServer;
-	private readonly supervisor: SessionSupervisor;
-	private readonly connections = new Set<ConnectionState>();
+	private readonly supervisor: SessionWsBridgeSupervisor<M>;
+	private readonly connections = new Set<ConnectionState<M>>();
 	private readonly heartbeatTimer: NodeJS.Timeout;
 	private readonly log: (level: "info" | "warn" | "error", message: string) => void;
 	private readonly serverEpoch: string;
 	private readonly serverBuild: string;
 	private readonly runtime: SessionWsBridgeOptions["runtime"];
 	private readonly payloadActivation: SessionWsBridgeOptions["payloadActivation"];
+	private readonly futureActivation: FutureBridgeActivation | undefined;
 	private readonly helloTimeoutMs: number;
 	private requestCounter = 0;
 	private closePromise: Promise<void> | null = null;
 	private readonly bashCommandIds = new Map<string, BashCommandIdMapping>();
 
-	constructor(opts: SessionWsBridgeOptions) {
+	constructor(opts: SessionWsBridgeCoreOptions<M>) {
 		this.supervisor = opts.supervisor;
 		this.log = opts.log ?? (() => {});
 		this.serverEpoch = opts.supervisor.serverEpoch;
 		this.serverBuild = opts.serverBuild;
-		if (
-			opts.runtime.capabilities.includes(GATEWAY_PAYLOAD_BUDGET_CAPABILITY) ||
-			(opts.payloadActivation !== undefined &&
-				(!isSessionAttachmentGuardContext(opts.payloadActivation.context) ||
-					opts.payloadActivation.context.serverEpoch !== this.serverEpoch))
-		) {
-			throw new TypeError("Session WebSocket payload activation is invalid");
+		const activation = opts.payloadActivation;
+		if (isFutureBridgeActivation(activation)) {
+			assertFutureBridgeActivation(activation, this.serverEpoch);
+			this.futureActivation = activation;
+			this.payloadActivation = undefined;
+		} else {
+			if (
+				opts.runtime.capabilities.includes(GATEWAY_PAYLOAD_BUDGET_CAPABILITY) ||
+				opts.runtime.capabilities.includes(GATEWAY_CONTENT_REF_CAPABILITY) ||
+				(activation !== undefined &&
+					(!isSessionAttachmentGuardContext(activation.context) ||
+						activation.context.serverEpoch !== this.serverEpoch))
+			) {
+				throw new TypeError("Session WebSocket payload activation is invalid");
+			}
+			this.payloadActivation = activation;
 		}
-		this.payloadActivation = opts.payloadActivation;
+		const capabilities = [...opts.runtime.capabilities];
+		if (this.futureActivation) {
+			if (!capabilities.includes(GATEWAY_PAYLOAD_BUDGET_CAPABILITY)) {
+				capabilities.push(GATEWAY_PAYLOAD_BUDGET_CAPABILITY);
+			}
+			if (!capabilities.includes(GATEWAY_CONTENT_REF_CAPABILITY)) {
+				capabilities.push(GATEWAY_CONTENT_REF_CAPABILITY);
+			}
+		} else if (opts.payloadActivation) {
+			capabilities.push(GATEWAY_PAYLOAD_BUDGET_CAPABILITY);
+		}
 		this.runtime = {
 			...opts.runtime,
-			capabilities: [
-				...opts.runtime.capabilities,
-				...(opts.payloadActivation ? [GATEWAY_PAYLOAD_BUDGET_CAPABILITY] : []),
-			],
+			capabilities,
 		};
 		this.helloTimeoutMs = Math.max(1, opts.helloTimeoutMs ?? 5_000);
 		this.wss = new WebSocketServer({ noServer: true, maxPayload: SESSION_WS_CLIENT_MAX_BYTES });
@@ -192,12 +289,12 @@ export class SessionWsBridge {
 	}
 
 	/** SessionSupervisor broadcast sink. */
-	broadcast(message: SessionSupervisorMessage): void {
+	broadcast(message: BridgeSupervisorMessage<M>): void {
 		if (message.type === "session_rekeyed") {
 			this.broadcastRekey(message);
 			return;
 		}
-		const sharedPayload = JSON.stringify(message satisfies SessionWsServerMessage);
+		const sharedPayload = this.serializeMessage(message);
 		for (const connection of this.connections) {
 			if (connection.closed || !connection.helloComplete) continue;
 			const payload = this.payloadForConnection(connection, message, sharedPayload);
@@ -225,7 +322,7 @@ export class SessionWsBridge {
 		}
 	}
 
-	private broadcastSessionHandle(message: SessionSupervisorMessage): string | null {
+	private broadcastSessionHandle(message: BridgeSupervisorMessage<M>): string | null {
 		switch (message.type) {
 			case "event":
 			case "extension_ui_request":
@@ -241,8 +338,8 @@ export class SessionWsBridge {
 		}
 	}
 
-	private broadcastRekey(message: Extract<SessionSupervisorMessage, { type: "session_rekeyed" }>): void {
-		const payload = JSON.stringify(message satisfies SessionWsServerMessage);
+	private broadcastRekey(message: Extract<BridgeSupervisorMessage<M>, { type: "session_rekeyed" }>): void {
+		const payload = this.serializeMessage(message);
 		for (const connection of this.connections) {
 			if (connection.closed) continue;
 			const catchUps = this.findCatchUps(connection, message.previousSessionHandle);
@@ -265,7 +362,7 @@ export class SessionWsBridge {
 	}
 
 	private handleConnection(ws: WebSocket): void {
-		const connection: ConnectionState = {
+		const connection: ConnectionState<M> = {
 			connectionId: randomUUID(),
 			ws,
 			subscriptions: new Set(),
@@ -322,7 +419,7 @@ export class SessionWsBridge {
 		});
 	}
 
-	private async handleClientMessage(connection: ConnectionState, raw: string): Promise<void> {
+	private async handleClientMessage(connection: ConnectionState<M>, raw: string): Promise<void> {
 		if (connection.closed) return;
 		let value: unknown;
 		try {
@@ -363,7 +460,11 @@ export class SessionWsBridge {
 		}
 	}
 
-	private handleClientHello(connection: ConnectionState, value: unknown): void {
+	private handleClientHello(connection: ConnectionState<M>, value: unknown): void {
+		if (this.futureActivation) {
+			this.handleFutureClientHello(connection, value);
+			return;
+		}
 		if (!isGatewayClientHello(value)) {
 			const code =
 				typeof value === "object" && value !== null && "type" in value && value.type === "client_hello"
@@ -379,7 +480,7 @@ export class SessionWsBridge {
 
 		const requestedCapabilities = new Set(value.capabilities);
 		if (
-			GATEWAY_CLIENT_REQUIRED_CAPABILITIES.some(
+			LEGACY_GATEWAY_CLIENT_REQUIRED_CAPABILITIES.some(
 				(capability) =>
 					!requestedCapabilities.has(capability) || !this.runtime.capabilities.includes(capability),
 			)
@@ -398,7 +499,7 @@ export class SessionWsBridge {
 			type: "server_hello",
 			protocol: {
 				major: GATEWAY_PROTOCOL_VERSION.major,
-				minor: Math.min(value.protocol.minor, GATEWAY_PROTOCOL_VERSION.minor),
+				minor: Math.min(value.protocol.minor, LEGACY_GATEWAY_PROTOCOL_MINOR),
 			},
 			serverBuild: this.serverBuild,
 			serverEpoch: this.serverEpoch,
@@ -438,8 +539,102 @@ export class SessionWsBridge {
 		}
 	}
 
+	private handleFutureClientHello(connection: ConnectionState<M>, value: unknown): void {
+		const activation = this.futureActivation;
+		if (!activation) {
+			this.sendProtocolErrorAndClose(connection, "capability_unsupported");
+			return;
+		}
+		if (!isGatewayContentRefClientHello(value)) {
+			if (isGatewayClientHello(value) && value.protocol.major !== GATEWAY_PROTOCOL_VERSION.major) {
+				this.sendProtocolErrorAndClose(connection, "protocol_major_unsupported");
+				return;
+			}
+			const code =
+				isGatewayClientHello(value) && value.protocol.minor === GATEWAY_CONTENT_REF_PROTOCOL_MINOR
+					? "capability_unsupported"
+					: typeof value === "object" && value !== null && "type" in value && value.type === "client_hello"
+						? "capability_unsupported"
+						: "hello_required";
+			this.sendProtocolErrorAndClose(connection, code);
+			return;
+		}
+
+		const requestedCapabilities = new Set(value.capabilities);
+		const requiredCapabilities = [...GATEWAY_CLIENT_REQUIRED_CAPABILITIES];
+		if (
+			requiredCapabilities.some(
+				(capability) =>
+					!requestedCapabilities.has(capability) || !this.runtime.capabilities.includes(capability),
+			)
+		) {
+			this.sendProtocolErrorAndClose(connection, "capability_unsupported");
+			return;
+		}
+		if (
+			GATEWAY_SERVER_REQUIRED_CAPABILITIES.some(
+				(capability) => !this.runtime.capabilities.includes(capability),
+			)
+		) {
+			this.sendProtocolErrorAndClose(connection, "capability_unsupported");
+			return;
+		}
+
+		connection.negotiatedMaxServerFrameBytes = Math.min(
+			value.limits.maxServerFrameBytes,
+			MAX_SESSION_WS_FRAME_BYTES,
+		);
+		const negotiatedCapabilities = this.runtime.capabilities.filter((capability) =>
+			requestedCapabilities.has(capability),
+		);
+		const hello: GatewayContentRefServerHelloDto = {
+			type: "server_hello",
+			protocol: {
+				major: GATEWAY_PROTOCOL_VERSION.major,
+				minor: GATEWAY_CONTENT_REF_PROTOCOL_MINOR,
+			},
+			serverBuild: this.serverBuild,
+			serverEpoch: this.serverEpoch,
+			piVersion: this.runtime.version,
+			adapterId: this.runtime.adapterId,
+			capabilities: negotiatedCapabilities,
+			limits: {
+				maxClientFrameBytes: SESSION_WS_CLIENT_MAX_BYTES,
+				maxSnapshotFrameBytes: connection.negotiatedMaxServerFrameBytes,
+				maxExtensionRequests: 128,
+			},
+			payloadBudget: activation.context.payloadBudget,
+			contentRefBudget: activation.context.contentRefBudget,
+		};
+		const payloadNegotiation = negotiateGatewayContentRef(value, hello);
+		if (payloadNegotiation.negotiated === false) {
+			this.sendProtocolErrorAndClose(connection, "capability_unsupported");
+			return;
+		}
+
+		const hasInventoryCapability =
+			value.capabilities.includes(GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY) &&
+			hello.capabilities.includes(GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY);
+		const inventoryFrameFits =
+			value.limits.maxServerFrameBytes >= SESSION_HOT_RUNTIME_INVENTORY_MAX_BYTES &&
+			hello.limits.maxSnapshotFrameBytes >= SESSION_HOT_RUNTIME_INVENTORY_MAX_BYTES;
+		if (hasInventoryCapability && !inventoryFrameFits) {
+			this.sendProtocolErrorAndClose(connection, "capability_unsupported");
+			return;
+		}
+
+		connection.helloComplete = true;
+		connection.hotInventoryNegotiated = hasInventoryCapability;
+		if (connection.helloTimer) clearTimeout(connection.helloTimer);
+		connection.helloTimer = undefined;
+		this.sendPayload(connection, JSON.stringify(hello));
+		if (hasInventoryCapability) {
+			this.sendHotRuntimeInventory(connection, this.supervisor.getHotRuntimeInventory());
+		}
+	}
+
 	private sendProtocolErrorAndClose(
-		connection: ConnectionState,
+		connection: ConnectionState<M>,
 		code: GatewayProtocolErrorDto["code"],
 	): void {
 		if (connection.closed) return;
@@ -448,8 +643,8 @@ export class SessionWsBridge {
 			code,
 			supported: {
 				major: GATEWAY_PROTOCOL_VERSION.major,
-				minMinor: 0,
-				maxMinor: GATEWAY_PROTOCOL_VERSION.minor,
+				minMinor: this.futureActivation ? GATEWAY_CONTENT_REF_PROTOCOL_MINOR : 0,
+				maxMinor: this.futureActivation ? GATEWAY_CONTENT_REF_PROTOCOL_MINOR : LEGACY_GATEWAY_PROTOCOL_MINOR,
 			},
 		};
 		try {
@@ -467,7 +662,7 @@ export class SessionWsBridge {
 	}
 
 	private async subscribe(
-		connection: ConnectionState,
+		connection: ConnectionState<M>,
 		sessionHandle: string,
 		cursor?: SessionReplayCursorDto,
 		expectedHotRuntime?: SessionRuntimeIdentityDto,
@@ -503,7 +698,7 @@ export class SessionWsBridge {
 		try {
 			let observedRekeyVersion = catchUp.rekeyVersion;
 			let exactObservationToken: HotRuntimeSubscriptionToken | undefined;
-			let result: ReplayResult;
+			let result: BridgeReplayResult<M>;
 			if (expectedHotRuntime) {
 				const exact = await this.supervisor.subscribeHotExact(expectedHotRuntime, cursor);
 				exactObservationToken = exact.observationToken;
@@ -569,9 +764,9 @@ export class SessionWsBridge {
 					runtime: result.runtime,
 					reason: result.reason === "server_epoch_changed" ? "epoch_changed" : result.reason,
 				});
-				this.send(connection, result.snapshot);
+				this.send(connection, result.snapshot as BridgeServerMessage<M>);
 			} else {
-				for (const frame of result.frames) this.send(connection, frame as SessionReplayFrameDto);
+				for (const frame of result.frames) this.send(connection, frame as BridgeServerMessage<M>);
 			}
 			this.sendLease(connection, this.supervisor.leaseFor(resolvedHandle, connection.connectionId));
 
@@ -605,13 +800,13 @@ export class SessionWsBridge {
 	}
 
 	private beginCatchUp(
-		connection: ConnectionState,
+		connection: ConnectionState<M>,
 		requestedHandle: string,
 		exactHotRuntime = false,
-	): SessionCatchUp | null {
+	): SessionCatchUp<M> | null {
 		if (connection.closed) return null;
 		if (exactHotRuntime) {
-			const catchUp: SessionCatchUp = {
+			const catchUp: SessionCatchUp<M> = {
 				requestedHandle,
 				currentHandle: requestedHandle,
 				handles: new Set([requestedHandle]),
@@ -631,7 +826,7 @@ export class SessionWsBridge {
 		connection.subscriptionAliases.delete(requestedHandle);
 		const activeHandle = this.supervisor.getRuntime(requestedHandle)?.sessionHandle ?? requestedHandle;
 		const handles = new Set([requestedHandle, activeHandle]);
-		const catchUp: SessionCatchUp = {
+		const catchUp: SessionCatchUp<M> = {
 			requestedHandle,
 			currentHandle: activeHandle,
 			handles,
@@ -653,7 +848,7 @@ export class SessionWsBridge {
 		return catchUp;
 	}
 
-	private unsubscribe(connection: ConnectionState, sessionHandle: string): void {
+	private unsubscribe(connection: ConnectionState<M>, sessionHandle: string): void {
 		const canonicalHandle = this.connectionSessionHandle(connection, sessionHandle);
 		for (const catchUp of [...connection.catchUps]) {
 			if (
@@ -674,8 +869,8 @@ export class SessionWsBridge {
 	}
 
 	private adoptCatchUpHandle(
-		connection: ConnectionState,
-		catchUp: SessionCatchUp,
+		connection: ConnectionState<M>,
+		catchUp: SessionCatchUp<M>,
 		resolvedHandle: string,
 		observedRekeyVersion: number,
 	): boolean {
@@ -694,8 +889,8 @@ export class SessionWsBridge {
 	}
 
 	private isCurrentCatchUp(
-		connection: ConnectionState,
-		catchUp: SessionCatchUp,
+		connection: ConnectionState<M>,
+		catchUp: SessionCatchUp<M>,
 		lifecycleEpoch: number,
 	): boolean {
 		return (
@@ -706,8 +901,8 @@ export class SessionWsBridge {
 		);
 	}
 
-	private findCatchUp(connection: ConnectionState, sessionHandle: string): SessionCatchUp | undefined {
-		let match: SessionCatchUp | undefined;
+	private findCatchUp(connection: ConnectionState<M>, sessionHandle: string): SessionCatchUp<M> | undefined {
+		let match: SessionCatchUp<M> | undefined;
 		for (const catchUp of connection.catchUps) {
 			if (!catchUp.handles.has(sessionHandle)) continue;
 			if (!match || catchUp.order > match.order) match = catchUp;
@@ -715,16 +910,16 @@ export class SessionWsBridge {
 		return match;
 	}
 
-	private findCatchUps(connection: ConnectionState, sessionHandle: string): SessionCatchUp[] {
+	private findCatchUps(connection: ConnectionState<M>, sessionHandle: string): SessionCatchUp<M>[] {
 		return [...connection.catchUps]
 			.filter((catchUp) => catchUp.handles.has(sessionHandle))
 			.sort((left, right) => left.order - right.order);
 	}
 
 	private bufferCatchUpMessage(
-		connection: ConnectionState,
-		catchUp: SessionCatchUp,
-		message: SessionSupervisorMessage,
+		connection: ConnectionState<M>,
+		catchUp: SessionCatchUp<M>,
+		message: BridgeSupervisorMessage<M>,
 		payload: string,
 	): void {
 		if (!connection.catchUps.has(catchUp) || connection.closed) return;
@@ -749,7 +944,7 @@ export class SessionWsBridge {
 		catchUp.buffered.push({ message, payload });
 	}
 
-	private cancelCatchUp(connection: ConnectionState, catchUp: SessionCatchUp): void {
+	private cancelCatchUp(connection: ConnectionState<M>, catchUp: SessionCatchUp<M>): void {
 		if (!connection.catchUps.delete(catchUp)) return;
 		connection.catchUpSmallBufferedBytes = Math.max(
 			0,
@@ -761,21 +956,21 @@ export class SessionWsBridge {
 		catchUp.bufferedLargeItems = 0;
 	}
 
-	private rollbackExactCatchUp(connection: ConnectionState, catchUp: SessionCatchUp): void {
+	private rollbackExactCatchUp(connection: ConnectionState<M>, catchUp: SessionCatchUp<M>): void {
 		this.enqueueBufferedRekeys(connection, catchUp);
 		this.cancelCatchUp(connection, catchUp);
 	}
 
-	private enqueueBufferedRekeys(connection: ConnectionState, catchUp: SessionCatchUp): void {
+	private enqueueBufferedRekeys(connection: ConnectionState<M>, catchUp: SessionCatchUp<M>): void {
 		for (const entry of catchUp.buffered) {
 			if (entry.message.type === "session_rekeyed") this.sendPayload(connection, entry.payload);
 		}
 	}
 
 	private transferCatchUpJournalAndCancel(
-		connection: ConnectionState,
-		from: SessionCatchUp,
-		to: SessionCatchUp,
+		connection: ConnectionState<M>,
+		from: SessionCatchUp<M>,
+		to: SessionCatchUp<M>,
 	): void {
 		const retained = from.buffered.filter(
 			(entry) =>
@@ -789,8 +984,8 @@ export class SessionWsBridge {
 	}
 
 	private establishLiveSubscription(
-		connection: ConnectionState,
-		catchUp: SessionCatchUp,
+		connection: ConnectionState<M>,
+		catchUp: SessionCatchUp<M>,
 		resolvedHandle: string,
 	): void {
 		this.cancelCatchUp(connection, catchUp);
@@ -800,7 +995,7 @@ export class SessionWsBridge {
 		connection.subscriptionAliases.set(resolvedHandle, resolvedHandle);
 	}
 
-	private removeLiveSubscription(connection: ConnectionState, sessionHandle: string): boolean {
+	private removeLiveSubscription(connection: ConnectionState<M>, sessionHandle: string): boolean {
 		const deleted = connection.subscriptions.delete(sessionHandle);
 		for (const [alias, current] of connection.subscriptionAliases) {
 			if (current === sessionHandle) connection.subscriptionAliases.delete(alias);
@@ -809,7 +1004,7 @@ export class SessionWsBridge {
 	}
 
 	private migrateLiveSubscription(
-		connection: ConnectionState,
+		connection: ConnectionState<M>,
 		previousHandle: string,
 		nextHandle: string,
 	): boolean {
@@ -823,11 +1018,11 @@ export class SessionWsBridge {
 		return true;
 	}
 
-	private isSubscribed(connection: ConnectionState, sessionHandle: string): boolean {
+	private isSubscribed(connection: ConnectionState<M>, sessionHandle: string): boolean {
 		return connection.subscriptions.has(sessionHandle);
 	}
 
-	private findBaselineMarker(buffered: BufferedCatchUpMessage[], baseline: SessionRuntimeDto): number {
+	private findBaselineMarker(buffered: BufferedCatchUpMessage<M>[], baseline: SessionRuntimeDto): number {
 		let marker = -1;
 		for (const [index, entry] of buffered.entries()) {
 			if (entry.message.type !== "runtime_state") continue;
@@ -846,7 +1041,7 @@ export class SessionWsBridge {
 	}
 
 	private isNewerThanBaseline(
-		message: SessionSupervisorMessage,
+		message: BridgeSupervisorMessage<M>,
 		baseline: SessionRuntimeDto,
 		bufferIndex: number,
 		baselineMarker: number,
@@ -866,11 +1061,11 @@ export class SessionWsBridge {
 		);
 	}
 
-	private isNonReplayableCatchUpMessage(message: SessionSupervisorMessage): boolean {
+	private isNonReplayableCatchUpMessage(message: BridgeSupervisorMessage<M>): boolean {
 		return message.type === "extension_ui_request" && message.request.method === "notify";
 	}
 
-	private async claim(connection: ConnectionState, sessionHandle: string): Promise<void> {
+	private async claim(connection: ConnectionState<M>, sessionHandle: string): Promise<void> {
 		if (!this.isSubscribed(connection, sessionHandle)) {
 			this.sendSessionError(connection, sessionHandle, "claim", "session_not_subscribed");
 			return;
@@ -900,7 +1095,7 @@ export class SessionWsBridge {
 		}
 	}
 
-	private release(connection: ConnectionState, sessionHandle: string): void {
+	private release(connection: ConnectionState<M>, sessionHandle: string): void {
 		try {
 			const canonicalHandle = this.connectionSessionHandle(connection, sessionHandle);
 			this.supervisor.release(canonicalHandle, connection.connectionId);
@@ -913,7 +1108,7 @@ export class SessionWsBridge {
 	}
 
 	private async handleCommand(
-		connection: ConnectionState,
+		connection: ConnectionState<M>,
 		message: Extract<SessionWsClientMessage, { type: "command" }>,
 	): Promise<void> {
 		if (!this.isSubscribed(connection, message.sessionHandle)) {
@@ -938,7 +1133,7 @@ export class SessionWsBridge {
 				expectedGeneration: message.expectedGeneration,
 				fencingToken: message.fencingToken,
 			});
-			this.send(connection, {
+			const responseFrame = {
 				type: "response",
 				serverEpoch: result.serverEpoch,
 				sessionHandle: result.sessionHandle,
@@ -946,7 +1141,8 @@ export class SessionWsBridge {
 				barrierSeq: result.barrierSeq,
 				response: this.restoreClientId(result.response, clientId),
 				...(result.previousSessionHandle ? { previousSessionHandle: result.previousSessionHandle } : {}),
-			});
+			} as BridgeServerMessage<M>;
+			this.send(connection, responseFrame);
 		} catch (error) {
 			this.sendCommandError(connection, message, error);
 			this.log("warn", `command ${message.command.type} failed: ${this.errorText(error)}`);
@@ -957,7 +1153,7 @@ export class SessionWsBridge {
 	}
 
 	private async handleExtensionUiResponse(
-		connection: ConnectionState,
+		connection: ConnectionState<M>,
 		message: Extract<SessionWsClientMessage, { type: "extension_ui_response" }>,
 	): Promise<void> {
 		if (!this.isSubscribed(connection, message.sessionHandle)) {
@@ -989,7 +1185,7 @@ export class SessionWsBridge {
 	}
 
 	private sendCommandError(
-		connection: ConnectionState,
+		connection: ConnectionState<M>,
 		message: Extract<SessionWsClientMessage, { type: "command" }>,
 		error: unknown,
 	): void {
@@ -1013,9 +1209,9 @@ export class SessionWsBridge {
 	}
 
 	private sendSessionError(
-		connection: ConnectionState,
+		connection: ConnectionState<M>,
 		sessionHandle: string,
-		operation: Extract<SessionWsServerMessage, { type: "session_error" }>["operation"],
+		operation: Extract<BridgeServerMessage<M>, { type: "session_error" }>["operation"],
 		error: unknown,
 	): void {
 		this.send(connection, {
@@ -1027,22 +1223,17 @@ export class SessionWsBridge {
 		});
 	}
 
-	private nextInternalId(connection: ConnectionState): string {
+	private nextInternalId(connection: ConnectionState<M>): string {
 		this.requestCounter += 1;
 		return `bridge-${connection.connectionId}-${this.requestCounter.toString(36)}`;
 	}
 
-	private restoreClientId(
-		response: SessionCommandResponseDto,
-		clientId: string | undefined,
-	): SessionCommandResponseDto {
+	private restoreClientId(response: BridgeResponse<M>, clientId: string | undefined): BridgeResponse<M> {
 		const { id: _internalId, ...rest } = response;
-		return clientId
-			? ({ ...rest, id: clientId } as SessionCommandResponseDto)
-			: (rest as SessionCommandResponseDto);
+		return clientId ? ({ ...rest, id: clientId } as BridgeResponse<M>) : (rest as BridgeResponse<M>);
 	}
 
-	private disconnect(connection: ConnectionState): void {
+	private disconnect(connection: ConnectionState<M>): void {
 		if (connection.closed) return;
 		connection.closed = true;
 		if (connection.helloTimer) clearTimeout(connection.helloTimer);
@@ -1083,7 +1274,7 @@ export class SessionWsBridge {
 		}
 	}
 
-	private closeForPolicyViolation(connection: ConnectionState, reason: string): void {
+	private closeForPolicyViolation(connection: ConnectionState<M>, reason: string): void {
 		if (connection.closed) return;
 		this.log("warn", `closing ws ${connection.connectionId}: ${reason}`);
 		try {
@@ -1098,11 +1289,11 @@ export class SessionWsBridge {
 		}
 	}
 
-	private sendLease(connection: ConnectionState, lease: Omit<SessionLeaseSnapshot, "type">): void {
+	private sendLease(connection: ConnectionState<M>, lease: Omit<SessionLeaseSnapshot, "type">): void {
 		this.send(connection, { type: "lease_status", ...lease });
 	}
 
-	private sendHotRuntimeInventory(connection: ConnectionState, inventory: HotRuntimeInventoryDto): void {
+	private sendHotRuntimeInventory(connection: ConnectionState<M>, inventory: HotRuntimeInventoryDto): void {
 		if (
 			connection.closed ||
 			!connection.helloComplete ||
@@ -1122,21 +1313,21 @@ export class SessionWsBridge {
 		this.send(connection, inventory);
 	}
 
-	private hasPendingCatchUpRekey(connection: ConnectionState): boolean {
+	private hasPendingCatchUpRekey(connection: ConnectionState<M>): boolean {
 		for (const catchUp of connection.catchUps) {
 			if (catchUp.buffered.some((entry) => entry.message.type === "session_rekeyed")) return true;
 		}
 		return false;
 	}
 
-	private flushDeferredHotInventory(connection: ConnectionState): void {
+	private flushDeferredHotInventory(connection: ConnectionState<M>): void {
 		if (this.hasPendingCatchUpRekey(connection)) return;
 		const inventory = connection.deferredHotInventory;
 		connection.deferredHotInventory = undefined;
 		if (inventory) this.sendHotRuntimeInventory(connection, inventory);
 	}
 
-	private send(connection: ConnectionState, message: SessionWsServerMessage): void {
+	private send(connection: ConnectionState<M>, message: BridgeServerMessage<M>): void {
 		this.sendPayload(
 			connection,
 			this.payloadForConnection(connection, message),
@@ -1144,32 +1335,37 @@ export class SessionWsBridge {
 		);
 	}
 
-	private connectionSessionHandle(connection: ConnectionState, sessionHandle: string): string {
+	private connectionSessionHandle(connection: ConnectionState<M>, sessionHandle: string): string {
 		const subscribedHandle = connection.subscriptionAliases.get(sessionHandle);
 		if (subscribedHandle) return subscribedHandle;
 		return this.findCatchUp(connection, sessionHandle)?.currentHandle ?? sessionHandle;
 	}
 
 	private payloadForConnection(
-		connection: ConnectionState,
-		message: SessionWsServerMessage | SessionSupervisorMessage,
+		connection: ConnectionState<M>,
+		message: BridgeServerMessage<M> | BridgeSupervisorMessage<M>,
 		sharedPayload?: string,
 	): string {
 		if (message.type !== "event" || message.event.type !== "bash_execution_update" || !message.event.id) {
-			return sharedPayload ?? JSON.stringify(message);
+			return sharedPayload ?? this.serializeMessage(message);
 		}
 		const mapping = this.bashCommandIds.get(message.event.id);
 		if (!mapping || mapping.connectionId !== connection.connectionId) {
-			return sharedPayload ?? JSON.stringify(message);
+			return sharedPayload ?? this.serializeMessage(message);
 		}
-		return JSON.stringify({
+		return this.serializeMessage({
 			...message,
 			event: { ...message.event, id: mapping.clientId },
 		});
 	}
 
+	private serializeMessage(message: BridgeServerMessage<M> | BridgeSupervisorMessage<M>): string {
+		if (!this.futureActivation) return JSON.stringify(message);
+		return serializeFutureBridgeMessage(message, this.futureActivation);
+	}
+
 	private classifyPayload(
-		connection: ConnectionState,
+		connection: ConnectionState<M>,
 		bytes: number,
 		allowLarge: boolean,
 	): boolean | undefined {
@@ -1189,7 +1385,7 @@ export class SessionWsBridge {
 		return large;
 	}
 
-	private sendPayload(connection: ConnectionState, payload: string, allowLarge = false): void {
+	private sendPayload(connection: ConnectionState<M>, payload: string, allowLarge = false): void {
 		if (connection.closed) return;
 		if (connection.ws.readyState !== connection.ws.OPEN) return;
 		const bytes = Buffer.byteLength(payload);
@@ -1219,7 +1415,7 @@ export class SessionWsBridge {
 		this.startPayloadSend(connection, { payload, bytes, large });
 	}
 
-	private startPayloadSend(connection: ConnectionState, item: OutboundPayload): void {
+	private startPayloadSend(connection: ConnectionState<M>, item: OutboundPayload): void {
 		connection.outboundSending = true;
 		try {
 			connection.ws.send(item.payload, (error) => {
@@ -1252,6 +1448,121 @@ export class SessionWsBridge {
 	private errorText(error: unknown): string {
 		return error instanceof RpcError ? error.message : error instanceof Error ? error.message : String(error);
 	}
+}
+
+function isFutureBridgeActivation(
+	value: SessionWsBridgeOptions["payloadActivation"] | FutureBridgeActivation | undefined,
+): value is FutureBridgeActivation {
+	return value !== undefined && Object.hasOwn(value.context, "contentRefBudget");
+}
+
+function assertFutureBridgeActivation(value: FutureBridgeActivation, serverEpoch: string): void {
+	const { context, externalizer, supervisorServices } = value;
+	const canonicalPayloadBudget =
+		JSON.stringify(context.payloadBudget) === JSON.stringify(SESSION_PAYLOAD_BUDGET);
+	const canonicalContentRefBudget =
+		JSON.stringify(context.contentRefBudget) === JSON.stringify(FUTURE_SESSION_CONTENT_REF_BUDGET);
+	if (
+		!isFutureSessionContentRefGuardContext(context) ||
+		context.serverEpoch !== serverEpoch ||
+		!canonicalPayloadBudget ||
+		!canonicalContentRefBudget ||
+		externalizer.mode !== "future_content" ||
+		externalizer.context !== context ||
+		supervisorServices.mode !== "future_content" ||
+		supervisorServices.externalizer !== externalizer ||
+		supervisorServices.productSchema.mode !== "future_content" ||
+		supervisorServices.productSchema.serverEpoch !== serverEpoch
+	) {
+		throw new TypeError("Future Session WebSocket payload activation is invalid");
+	}
+}
+
+function serializeFutureBridgeMessage(message: unknown, activation: FutureBridgeActivation): string {
+	if (!isFutureSessionWsServerMessage(message, activation.context)) {
+		throw new TypeError("Future Session WebSocket message failed its exact context guard");
+	}
+	const schema = activation.supervisorServices.productSchema;
+	if (message.type === "event") {
+		if (!schema.guardEvent(message.event)) {
+			throw new TypeError("Future Session event failed its product provenance guard");
+		}
+		assertLogicalBytes(() => schema.activeTurnEventLogicalBytes(message.event), "event");
+	}
+	if (message.type === "extension_ui_request") {
+		if (!schema.guardExtensionRequest(message.request)) {
+			throw new TypeError("Future Session Extension request failed its product provenance guard");
+		}
+		assertLogicalBytes(() => schema.extensionRequestLogicalBytes(message.request), "Extension request");
+	}
+	if (message.type === "extension_ui_snapshot") {
+		for (const request of message.requests) {
+			if (!schema.guardExtensionRequest(request)) {
+				throw new TypeError("Future Session Extension snapshot failed its product provenance guard");
+			}
+			assertLogicalBytes(() => schema.extensionRequestLogicalBytes(request), "Extension snapshot request");
+		}
+	}
+	if (message.type === "session_snapshot") {
+		if (!schema.guardSnapshot(message)) {
+			throw new TypeError("Future Session snapshot failed its product provenance guard");
+		}
+		assertLogicalBytes(() => schema.snapshotLogicalBytes(message), "snapshot");
+	}
+	if (message.type === "response") {
+		assertLogicalBytes(
+			() =>
+				analyzeFutureSessionResponseFrameLogicalBytes(message, { maxBytes: schema.maxSnapshotLogicalBytes })
+					.byteLength,
+			"response",
+		);
+	}
+	const payload = JSON.stringify(message);
+	if (typeof payload !== "string")
+		throw new TypeError("Future Session WebSocket message is not serializable");
+	const bytes = Buffer.byteLength(payload);
+	if (message.type === "event" && bytes > schema.maxNormalizedEventWireBytes) {
+		throw new TypeError("Future Session event exceeded its normalized wire budget");
+	}
+	if (
+		message.type === "event" ||
+		message.type === "extension_ui_request" ||
+		message.type === "extension_ui_closed"
+	) {
+		if (bytes > schema.maxReplayFrameWireBytes) {
+			throw new TypeError("Future Session replay frame exceeded its wire budget");
+		}
+	}
+	if (message.type === "session_snapshot" && bytes > schema.maxSnapshotCanonicalWireBytes) {
+		throw new TypeError("Future Session snapshot exceeded its canonical wire budget");
+	}
+	return payload;
+}
+
+function assertLogicalBytes(read: () => number, label: string): void {
+	try {
+		read();
+	} catch (error) {
+		throw new TypeError(`Future Session ${label} exceeded its logical content budget`, { cause: error });
+	}
+}
+
+/** Public current wrapper; its 1.2 serialization and hello behavior remain unchanged. */
+export class SessionWsBridge extends SessionWsBridgeCore<"current"> {
+	// biome-ignore lint/complexity/noUselessConstructor: keep the public current-only option boundary.
+	constructor(opts: SessionWsBridgeOptions) {
+		super(opts);
+	}
+}
+
+/** Server-private future Bridge handle. It is deliberately omitted from the server public barrel. */
+export type FutureSessionWsBridge = Pick<
+	SessionWsBridgeCore<"future_content">,
+	"wss" | "close" | "broadcast" | "broadcastHotRuntimeInventory"
+>;
+
+export function createFutureSessionWsBridge(opts: FutureSessionWsBridgeOptions): FutureSessionWsBridge {
+	return new SessionWsBridgeCore<"future_content">(opts);
 }
 
 interface SessionLeaseSnapshot {

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { type ServerHandle, startServer } from "../src/main.js";
+import { type LegacyServerHandle, startServerWithCurrentMode } from "../src/main.js";
 import { sessionHandleForFile } from "../src/native-session-catalog.js";
 import { workspaceHandleForPath } from "../src/session-layout-resolver.js";
 
@@ -14,7 +14,7 @@ const sessionRootDir = path.join(tempRoot, "sessions");
 const webDataDir = path.join(tempRoot, "web-data");
 const fakePiPath = path.join(import.meta.dirname, "fixtures", "session-runtime-pi.mjs");
 
-let handle: ServerHandle;
+let handle: LegacyServerHandle;
 let base: string;
 let cookie: string;
 let workspaceHandle: string;
@@ -82,7 +82,7 @@ beforeAll(async () => {
 	fs.mkdirSync(workspacePath, { recursive: true });
 	fs.mkdirSync(otherWorkspacePath, { recursive: true });
 	workspaceRealpath = fs.realpathSync(workspacePath);
-	handle = await startServer({
+	handle = await startServerWithCurrentMode({
 		config: { port: 0, host: "127.0.0.1", agentDir, sessionRootDir, webDataDir },
 		piPath: fakePiPath,
 		handleSignals: false,

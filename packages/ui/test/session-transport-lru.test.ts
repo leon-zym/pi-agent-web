@@ -4,11 +4,7 @@ import type {
 	SessionRuntimeDto,
 	SessionWsClientMessage,
 } from "@pi-agent-web/protocol";
-import {
-	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
-	GATEWAY_PROTOCOL_VERSION,
-	SESSION_PAYLOAD_BUDGET,
-} from "@pi-agent-web/protocol";
+import { GATEWAY_PAYLOAD_BUDGET_CAPABILITY, SESSION_PAYLOAD_BUDGET } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	createSessionTransport,
@@ -40,7 +36,7 @@ function open(socket: FakeSocket | undefined): void {
 	socket.onmessage?.({
 		data: JSON.stringify({
 			type: "server_hello",
-			protocol: GATEWAY_PROTOCOL_VERSION,
+			protocol: { major: 1, minor: 2 },
 			serverBuild: "test-server",
 			serverEpoch: "test-epoch",
 			piVersion: "0.84.2",
@@ -87,6 +83,7 @@ function harness(options: { maxActiveSubscriptions?: number } = {}): Harness {
 			return socket;
 		},
 		url: () => "ws://test/ws",
+		protocolVersion: { major: 1, minor: 2 },
 		...options,
 	});
 	controllers.push(controller);

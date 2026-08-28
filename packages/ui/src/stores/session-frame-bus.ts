@@ -1,16 +1,25 @@
 import type { SessionWsServerMessage } from "@pi-agent-web/protocol";
+import type { ProjectedFutureSessionFrameMessage } from "../lib/future-session-content-adapter";
 
-export type SessionFrameBusMessage = Exclude<
+export type SessionFrameProductMode = "current" | "future";
+
+export type CurrentSessionFrameBusMessage = Exclude<
 	SessionWsServerMessage,
 	{ type: "response" } | { type: "session_directory_changed" } | { type: "auth_changed" }
 >;
+export type SessionFrameBusMessage = CurrentSessionFrameBusMessage | ProjectedFutureSessionFrameMessage;
 
-export interface OrderedSessionFrame {
+interface OrderedSessionFrameEnvelope {
 	order: number;
 	receivedAt: number;
 	sessionHandle: string;
-	message: SessionFrameBusMessage;
 }
+
+export type OrderedSessionFrame = OrderedSessionFrameEnvelope &
+	(
+		| { productMode: "current"; message: CurrentSessionFrameBusMessage }
+		| { productMode: "future"; message: ProjectedFutureSessionFrameMessage }
+	);
 
 /** A listener may retain a frame for bounded asynchronous projection work. */
 export const SESSION_FRAME_DEFERRED = Symbol("session-frame-deferred");
@@ -54,12 +63,39 @@ export class OrderedSessionFrameBus {
 
 	emit(
 		sessionHandle: string,
-		message: SessionFrameBusMessage,
+		message: CurrentSessionFrameBusMessage,
 		receivedAt: number,
+	): SessionFrameDeliveryResult;
+	emit(
+		sessionHandle: string,
+		message: ProjectedFutureSessionFrameMessage,
+		receivedAt: number,
+		productMode: "future",
+	): SessionFrameDeliveryResult;
+	emit(
+		sessionHandle: string,
+		...args:
+			| [message: CurrentSessionFrameBusMessage, receivedAt: number]
+			| [message: ProjectedFutureSessionFrameMessage, receivedAt: number, productMode: "future"]
 	): SessionFrameDeliveryResult {
 		const order = (this.orderBySession.get(sessionHandle) ?? 0) + 1;
 		this.orderBySession.set(sessionHandle, order);
-		const frame = { order, receivedAt, sessionHandle, message } satisfies OrderedSessionFrame;
+		const frame: OrderedSessionFrame =
+			args.length === 2
+				? {
+						order,
+						receivedAt: args[1],
+						sessionHandle,
+						productMode: "current",
+						message: args[0],
+					}
+				: {
+						order,
+						receivedAt: args[1],
+						sessionHandle,
+						productMode: "future",
+						message: args[0],
+					};
 		const result: SessionFrameDeliveryResult = { deferred: false, errors: [] };
 		for (const listener of this.listeners.get(sessionHandle) ?? []) this.deliver(listener, frame, result);
 		for (const listener of this.allListeners) this.deliver(listener, frame, result);
