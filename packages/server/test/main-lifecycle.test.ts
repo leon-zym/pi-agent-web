@@ -3,10 +3,9 @@ import fs from "node:fs";
 import { createConnection, createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { Readable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { EpochContentStore } from "../src/epoch-content-store.js";
-import { startServerWithCurrentMode } from "../src/main.js";
+import { startServer } from "../src/main.js";
 import { WorkspacePreferences } from "../src/workspace-preferences.js";
 
 const temporaryRoots: string[] = [];
@@ -31,7 +30,7 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 	return { promise, resolve };
 }
 
-async function authenticatedOrigin(handle: Awaited<ReturnType<typeof startServerWithCurrentMode>>): Promise<{
+async function authenticatedOrigin(handle: Awaited<ReturnType<typeof startServer>>): Promise<{
 	origin: string;
 	headers: Record<string, string>;
 }> {
@@ -58,7 +57,7 @@ describe("production server lifecycle", () => {
 	it("resolves only after binding and cannot resurrect after an immediate close", async () => {
 		const root = temporaryRoot();
 		const webDataDir = path.join(root, "web-data");
-		const handle = await startServerWithCurrentMode({
+		const handle = await startServer({
 			config: {
 				port: 0,
 				host: "127.0.0.1",
@@ -98,7 +97,7 @@ describe("production server lifecycle", () => {
 		const webDataDir = path.join(root, "web-data");
 		try {
 			await expect(
-				startServerWithCurrentMode({
+				startServer({
 					config: {
 						port: address.port,
 						host: "127.0.0.1",
@@ -129,7 +128,7 @@ describe("production server lifecycle", () => {
 		fs.mkdirSync(webDataDir, { recursive: true });
 		fs.writeFileSync(path.join(webDataDir, "content"), "unsafe non-directory");
 		await expect(
-			startServerWithCurrentMode({
+			startServer({
 				config: {
 					port: 0,
 					host: "127.0.0.1",
@@ -146,7 +145,7 @@ describe("production server lifecycle", () => {
 
 		fs.rmSync(path.join(webDataDir, "content"), { force: true });
 		await expect(
-			startServerWithCurrentMode({
+			startServer({
 				config: {
 					port: -1,
 					host: "127.0.0.1",
@@ -168,7 +167,7 @@ describe("production server lifecycle", () => {
 	it("force-closes an active streaming attachment upload within the shutdown bound", async () => {
 		const root = temporaryRoot();
 		const webDataDir = path.join(root, "web-data");
-		const handle = await startServerWithCurrentMode({
+		const handle = await startServer({
 			config: {
 				port: 0,
 				host: "127.0.0.1",
@@ -240,7 +239,7 @@ describe("production server lifecycle", () => {
 		const privateFile = path.join(root, "private.txt");
 		fs.writeFileSync(privateFile, "must not leak");
 		fs.symlinkSync(privateFile, path.join(staticDir, "leak.txt"));
-		const handle = await startServerWithCurrentMode({
+		const handle = await startServer({
 			config: {
 				port: 0,
 				host: "127.0.0.1",
@@ -313,7 +312,7 @@ describe("production server lifecycle", () => {
 		const root = temporaryRoot();
 		const canonicalWebDataDir = path.join(root, "web-data");
 		const relativeWebDataDir = path.relative(process.cwd(), canonicalWebDataDir);
-		const handle = await startServerWithCurrentMode({
+		const handle = await startServer({
 			config: {
 				port: 0,
 				host: "127.0.0.1",
@@ -423,67 +422,10 @@ describe("production server lifecycle", () => {
 		}
 	});
 
-	it("serves directly seeded UTF-8 content from the production store without enabling uploads", async () => {
-		const root = temporaryRoot();
-		const handle = await startServerWithCurrentMode({
-			config: {
-				port: 0,
-				host: "127.0.0.1",
-				agentDir: path.join(root, "agent"),
-				sessionRootDir: path.join(root, "sessions"),
-				webDataDir: path.join(root, "web-data"),
-			},
-			piPath: fixturePath,
-			handleSignals: false,
-		});
-		try {
-			const { origin, headers } = await authenticatedOrigin(handle);
-			const bytes = Buffer.from('{"generic":"content"}');
-			const staged = await handle.contentStore.stageUtf8({
-				source: Readable.from([bytes]),
-				expectedByteLength: bytes.byteLength,
-			});
-			await handle.contentStore.publish(staged.hold);
-			await handle.contentStore.release(staged.hold);
-
-			const downloaded = await fetch(`${origin}/api/v1/content/${handle.serverEpoch}/${staged.ref.sha256}`, {
-				headers,
-			});
-			expect(downloaded.status).toBe(200);
-			expect(downloaded.headers.get("content-type")).toBe("application/octet-stream");
-			expect(downloaded.headers.get("content-length")).toBe(String(bytes.byteLength));
-			expect(downloaded.headers.get("cache-control")).toBe("no-store");
-			expect(downloaded.headers.get("cross-origin-resource-policy")).toBe("same-origin");
-			expect(downloaded.headers.get("x-content-type-options")).toBe("nosniff");
-			expect(Buffer.from(await downloaded.arrayBuffer())).toEqual(bytes);
-
-			const stale = await fetch(`${origin}/api/v1/content/old-epoch/${staged.ref.sha256}`, {
-				headers,
-			});
-			expect(stale.status).toBe(410);
-			const put = await fetch(`${origin}/api/v1/content/${handle.serverEpoch}/${staged.ref.sha256}`, {
-				method: "PUT",
-				headers,
-				body: "browser upload is forbidden",
-			});
-			expect(put.status).toBe(405);
-			expect(put.headers.get("allow")).toBe("GET");
-
-			let collected = { bytes: 0, items: 0 };
-			for (let attempt = 0; attempt < 20 && collected.items === 0; attempt += 1) {
-				collected = await handle.contentStore.gc();
-				if (collected.items === 0) await new Promise<void>((resolve) => setImmediate(resolve));
-			}
-			expect(collected).toEqual({ bytes: bytes.byteLength, items: 1 });
-		} finally {
-			await handle.close();
-		}
-	});
-
 	it("continues shutdown through a content-store lock failure and releases preferences", async () => {
 		const root = temporaryRoot();
 		const webDataDir = path.join(root, "web-data");
-		const handle = await startServerWithCurrentMode({
+		const handle = await startServer({
 			config: {
 				port: 0,
 				host: "127.0.0.1",

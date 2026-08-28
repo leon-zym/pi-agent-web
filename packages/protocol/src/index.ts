@@ -1,20 +1,6 @@
 /** Browser-safe, product-owned WebSocket and REST DTOs shared by the gateway and UI. */
 
 import {
-	isFutureExtensionUiRequestDto,
-	isFutureProductSessionEventDto,
-	isFutureSessionCommandResponseDto,
-	isFutureSessionMessageDto,
-} from "./future-product-decoders.js";
-import type {
-	FutureBlockingExtensionUiRequestDto,
-	FutureExtensionUiRequestDto,
-	FutureProductSessionEventDto,
-	FutureSessionCommandResponseDto,
-	FutureSessionMessageDto,
-	FutureStickyExtensionUiRequestDto,
-} from "./future-product-dto.js";
-import {
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 	GATEWAY_PROTOCOL_VERSION,
 	type GatewayClientHelloDto,
@@ -31,10 +17,8 @@ import {
 	type SessionPayloadAdmissionErrorDto,
 } from "./payload-budget.js";
 import {
-	type FutureSessionContentRefGuardContext,
 	isExtensionUiRequestDto,
 	isExtensionUiResponseDto,
-	isFutureSessionContentRefGuardContext,
 	isProductSessionEventDto,
 	isSessionAttachmentGuardContext,
 	isSessionCommandResponseDto,
@@ -52,9 +36,6 @@ import type {
 	SessionMessageDto,
 } from "./product-dto.js";
 
-export * from "./future-logical-bytes.js";
-export * from "./future-product-decoders.js";
-export * from "./future-product-dto.js";
 export * from "./gateway-handshake.js";
 export * from "./payload-budget.js";
 export * from "./product-decoders.js";
@@ -603,49 +584,6 @@ export type SessionWsServerMessage =
 	| { type: "session_directory_changed"; workspaceId: string }
 	| { type: "auth_changed"; workspaceId?: string };
 
-export type FutureSessionReplayFrameDto =
-	| (SessionSequencedEnvelopeDto & { type: "event"; event: FutureProductSessionEventDto })
-	| (SessionSequencedEnvelopeDto & {
-			type: "extension_ui_request";
-			request: FutureExtensionUiRequestDto;
-	  })
-	| Exclude<SessionReplayFrameDto, { type: "event" | "extension_ui_request" }>;
-
-export type FutureSessionProjectionEventDto = Extract<FutureSessionReplayFrameDto, { type: "event" }>;
-
-export interface FutureSessionSnapshotDto
-	extends Omit<
-		SessionSnapshotDto,
-		"settledMessages" | "projectionEvents" | "pendingExtensionRequests" | "stickyExtensionState"
-	> {
-	settledMessages: FutureSessionMessageDto[];
-	projectionEvents: FutureSessionProjectionEventDto[];
-	pendingExtensionRequests: FutureBlockingExtensionUiRequestDto[];
-	stickyExtensionState: FutureStickyExtensionUiRequestDto[];
-}
-
-export interface FutureSessionResponseFrameDto extends Omit<SessionResponseFrameDto, "response"> {
-	response: FutureSessionCommandResponseDto;
-}
-
-export interface FutureExtensionUiSnapshotDto {
-	type: "extension_ui_snapshot";
-	serverEpoch: string;
-	sessionHandle: string;
-	generation: number;
-	requests: FutureExtensionUiRequestDto[];
-}
-
-export type FutureSessionWsServerMessage =
-	| FutureSessionResponseFrameDto
-	| FutureSessionReplayFrameDto
-	| FutureSessionSnapshotDto
-	| FutureExtensionUiSnapshotDto
-	| Exclude<
-			SessionWsServerMessage,
-			SessionResponseFrameDto | SessionReplayFrameDto | SessionSnapshotDto | { type: "extension_ui_snapshot" }
-	  >;
-
 export function isSessionRuntimeIdentityDto(value: unknown): value is SessionRuntimeIdentityDto {
 	return (
 		isRecord(value) &&
@@ -1162,214 +1100,6 @@ export function isSessionWsServerMessage(
 		default:
 			return false;
 	}
-}
-
-function futureAttachmentContext(
-	context: FutureSessionContentRefGuardContext,
-): SessionAttachmentGuardContext {
-	return { serverEpoch: context.serverEpoch, payloadBudget: context.payloadBudget };
-}
-
-export function isFutureSessionProjectionEventDto(
-	value: unknown,
-	context?: FutureSessionContentRefGuardContext,
-): value is FutureSessionProjectionEventDto {
-	return (
-		context !== undefined &&
-		isFutureSessionContentRefGuardContext(context) &&
-		isRecord(value) &&
-		hasOnlyKeys(value, [
-			"type",
-			"serverEpoch",
-			"sessionHandle",
-			"workspaceId",
-			"generation",
-			"seq",
-			"event",
-		]) &&
-		value.type === "event" &&
-		hasSessionEnvelope(value) &&
-		value.serverEpoch === context.serverEpoch &&
-		isFutureProductSessionEventDto(value.event, context)
-	);
-}
-
-export function isFutureSessionReplayFrameDto(
-	value: unknown,
-	context?: FutureSessionContentRefGuardContext,
-): value is FutureSessionReplayFrameDto {
-	if (!context || !isFutureSessionContentRefGuardContext(context) || !isRecord(value)) return false;
-	if (value.type === "event") return isFutureSessionProjectionEventDto(value, context);
-	if (value.type === "extension_ui_request") {
-		return (
-			hasOnlyKeys(value, [
-				"type",
-				"serverEpoch",
-				"sessionHandle",
-				"workspaceId",
-				"generation",
-				"seq",
-				"request",
-			]) &&
-			hasSessionEnvelope(value) &&
-			value.serverEpoch === context.serverEpoch &&
-			isFutureExtensionUiRequestDto(value.request, context)
-		);
-	}
-	if (value.type !== "extension_ui_closed") return false;
-	return isSessionWsServerMessage(value, futureAttachmentContext(context));
-}
-
-function isFutureBlockingExtensionRequest(
-	value: unknown,
-	context: FutureSessionContentRefGuardContext,
-): value is FutureBlockingExtensionUiRequestDto {
-	return (
-		isFutureExtensionUiRequestDto(value, context) &&
-		["select", "confirm", "input", "editor"].includes(value.method)
-	);
-}
-
-function isFutureStickyExtensionRequest(
-	value: unknown,
-	context: FutureSessionContentRefGuardContext,
-): value is FutureStickyExtensionUiRequestDto {
-	return (
-		isFutureExtensionUiRequestDto(value, context) &&
-		["setStatus", "setWidget", "setTitle", "set_editor_text"].includes(value.method)
-	);
-}
-
-function isCanonicalFutureSessionSnapshotDto(
-	value: unknown,
-	context: FutureSessionContentRefGuardContext,
-): value is FutureSessionSnapshotDto {
-	if (
-		!isRecord(value) ||
-		!hasOnlyKeys(value, [
-			"type",
-			"snapshotId",
-			"serverEpoch",
-			"sessionHandle",
-			"workspaceId",
-			"generation",
-			"baseSeq",
-			"asOfSeq",
-			"runtime",
-			"settledMessages",
-			"projectionEvents",
-			"queue",
-			"pendingExtensionRequests",
-			"stickyExtensionState",
-		]) ||
-		value.type !== "session_snapshot" ||
-		!isString(value.snapshotId) ||
-		!isString(value.serverEpoch, 128) ||
-		value.serverEpoch !== context.serverEpoch ||
-		!isString(value.sessionHandle) ||
-		!isString(value.workspaceId) ||
-		!isGeneration(value.generation) ||
-		!isGeneration(value.baseSeq) ||
-		!isGeneration(value.asOfSeq) ||
-		value.baseSeq > value.asOfSeq ||
-		!isSessionRuntimeDto(value.runtime) ||
-		!isSameRuntimeIncarnation(value as unknown as SessionRuntimeIdentityDto, value.runtime) ||
-		value.runtime.lastSeq !== value.asOfSeq ||
-		!Array.isArray(value.settledMessages) ||
-		value.settledMessages.length > SESSION_SNAPSHOT_MAX_MESSAGES ||
-		!value.settledMessages.every((message) => isFutureSessionMessageDto(message, context)) ||
-		!Array.isArray(value.projectionEvents) ||
-		value.projectionEvents.length > SESSION_SNAPSHOT_MAX_PROJECTION_EVENTS ||
-		!isRecord(value.queue) ||
-		!hasOnlyKeys(value.queue, ["steering", "followUp"]) ||
-		!Array.isArray(value.queue.steering) ||
-		value.queue.steering.length > SESSION_SNAPSHOT_MAX_QUEUE_ITEMS ||
-		!value.queue.steering.every((item) => isBoundedString(item, SESSION_TEXT_MAX_BYTES)) ||
-		!Array.isArray(value.queue.followUp) ||
-		value.queue.followUp.length > SESSION_SNAPSHOT_MAX_QUEUE_ITEMS ||
-		!value.queue.followUp.every((item) => isBoundedString(item, SESSION_TEXT_MAX_BYTES)) ||
-		!Array.isArray(value.pendingExtensionRequests) ||
-		value.pendingExtensionRequests.length > SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS ||
-		!value.pendingExtensionRequests.every((request) => isFutureBlockingExtensionRequest(request, context)) ||
-		!Array.isArray(value.stickyExtensionState) ||
-		value.stickyExtensionState.length > SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS ||
-		!value.stickyExtensionState.every((request) => isFutureStickyExtensionRequest(request, context))
-	) {
-		return false;
-	}
-
-	let previousSeq = value.baseSeq;
-	for (const event of value.projectionEvents) {
-		if (
-			!isFutureSessionProjectionEventDto(event, context) ||
-			!isSameRuntimeIncarnation(value as unknown as SessionRuntimeIdentityDto, event) ||
-			event.seq <= previousSeq ||
-			event.seq > value.asOfSeq
-		) {
-			return false;
-		}
-		previousSeq = event.seq;
-	}
-	return true;
-}
-
-export function isFutureSessionSnapshotDto(
-	value: unknown,
-	context?: FutureSessionContentRefGuardContext,
-): value is FutureSessionSnapshotDto {
-	if (!context || !isFutureSessionContentRefGuardContext(context)) return false;
-	const serialized = boundedCanonicalSnapshotJson(value);
-	if (serialized === null) return false;
-	try {
-		return isCanonicalFutureSessionSnapshotDto(JSON.parse(serialized), context);
-	} catch {
-		return false;
-	}
-}
-
-export function isFutureSessionWsServerMessage(
-	value: unknown,
-	context?: FutureSessionContentRefGuardContext,
-): value is FutureSessionWsServerMessage {
-	if (!context || !isFutureSessionContentRefGuardContext(context) || !isRecord(value)) return false;
-	if (value.type === "session_snapshot") return isFutureSessionSnapshotDto(value, context);
-	if (sessionWsServerMessageBytes(value) > SESSION_WS_SERVER_MAX_BYTES) return false;
-	if (value.type === "event") return isFutureSessionProjectionEventDto(value, context);
-	if (value.type === "extension_ui_request" || value.type === "extension_ui_closed") {
-		return isFutureSessionReplayFrameDto(value, context);
-	}
-	if (value.type === "extension_ui_snapshot") {
-		return (
-			hasOnlyKeys(value, ["type", "serverEpoch", "sessionHandle", "generation", "requests"]) &&
-			value.serverEpoch === context.serverEpoch &&
-			isString(value.sessionHandle) &&
-			isGeneration(value.generation) &&
-			Array.isArray(value.requests) &&
-			value.requests.length <= SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS &&
-			value.requests.every((request) => isFutureExtensionUiRequestDto(request, context))
-		);
-	}
-	if (value.type === "response") {
-		return (
-			hasOnlyKeys(value, [
-				"type",
-				"serverEpoch",
-				"sessionHandle",
-				"generation",
-				"barrierSeq",
-				"response",
-				"previousSessionHandle",
-			]) &&
-			isString(value.serverEpoch, 128) &&
-			value.serverEpoch === context.serverEpoch &&
-			isString(value.sessionHandle) &&
-			isGeneration(value.generation) &&
-			isGeneration(value.barrierSeq) &&
-			(value.previousSessionHandle === undefined || isString(value.previousSessionHandle)) &&
-			isFutureSessionCommandResponseDto(value.response, context)
-		);
-	}
-	return isSessionWsServerMessage(value, futureAttachmentContext(context));
 }
 
 // ============================================================================

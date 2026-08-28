@@ -1,10 +1,6 @@
 /** Product-owned Browser/Gateway DTOs. No upstream Pi types may cross this module. */
 
-import type {
-	SessionAttachmentRefDto,
-	SessionContentRefDto,
-	SessionPayloadAdmissionErrorDto,
-} from "./payload-budget.js";
+import type { SessionAttachmentRefDto, SessionPayloadAdmissionErrorDto } from "./payload-budget.js";
 
 export type ThinkingLevelDto = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -26,34 +22,6 @@ export interface TextContentDto {
 	text: string;
 	textSignature?: string;
 }
-
-export interface SessionExternalTextDto {
-	type: "external_text";
-	ref: SessionContentRefDto;
-}
-
-export type SessionTextPayloadDto = string | SessionExternalTextDto;
-
-export type SessionJsonValueDto =
-	| null
-	| boolean
-	| number
-	| string
-	| SessionJsonValueDto[]
-	| { [key: string]: SessionJsonValueDto };
-
-export interface SessionInlineJsonDto {
-	type: "inline_json";
-	value: SessionJsonValueDto;
-}
-
-export interface SessionExternalJsonDto {
-	type: "external_json";
-	ref: SessionContentRefDto;
-}
-
-/** Every reviewed JSON root uses an envelope so Pi-owned lookalikes remain data inside inline_json.value. */
-export type SessionJsonRootDto = SessionInlineJsonDto | SessionExternalJsonDto;
 
 export interface ThinkingContentDto {
 	type: "thinking";

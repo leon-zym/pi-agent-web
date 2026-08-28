@@ -2,24 +2,13 @@ import { spawn, spawnSync } from "node:child_process";
 import type {
 	ExtensionUiRequestDto,
 	ExtensionUiResponseDto,
-	FutureExtensionUiRequestDto,
-	FutureProductSessionEventDto,
-	FutureSessionCommandResponseDto,
-	FutureSessionContentRefGuardContext,
 	ProductSessionEventDto,
 	SessionAttachmentGuardContext,
-	SessionAttachmentRefDto,
 	SessionCommandDto,
 	SessionCommandResponseDto,
 	SessionCommandTypeDto,
 } from "@pi-agent-web/protocol";
-import type { EpochContentHold, EpochStoredContentRef } from "./epoch-content-store.js";
-import type {
-	Externalized,
-	PiPayloadExternalizerInput,
-	PiPayloadLease,
-	PiPayloadLeaseTransfer,
-} from "./pi-payload-externalizer.js";
+import type { Externalized, PiPayloadExternalizerInput, PiPayloadLease } from "./pi-payload-externalizer.js";
 
 const MAX_VERSION_LENGTH = 64;
 const EXACT_SEMVER = /^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/;
@@ -87,84 +76,29 @@ export class PiProtocolIncompatibleError extends Error {
 	}
 }
 
-export type PiHostUnsolicitedFrame<
-	TEvent = ProductSessionEventDto,
-	TExtensionRequest = ExtensionUiRequestDto,
-> =
-	| { kind: "event"; event: TEvent }
-	| { kind: "extension_ui_request"; request: TExtensionRequest }
+export type PiHostUnsolicitedFrame =
+	| { kind: "event"; event: ProductSessionEventDto }
+	| { kind: "extension_ui_request"; request: ExtensionUiRequestDto }
 	| { kind: "ignored"; frameType: string };
 
-export type PiHostFutureUnsolicitedFrame = PiHostUnsolicitedFrame<
-	FutureProductSessionEventDto,
-	FutureExtensionUiRequestDto
->;
-
-export type PiHostPayloadLease = PiPayloadLease<EpochStoredContentRef>;
-export type PiHostPayloadLeaseTransfer = PiPayloadLeaseTransfer<EpochStoredContentRef>;
-
-/** Safely widen a namespace-specific lease without casting its holds or refs. */
-export function adaptPiPayloadLease<TRef extends EpochStoredContentRef>(
-	lease: PiPayloadLease<TRef>,
-): PiHostPayloadLease {
-	const adaptTransfer = (transfer: PiPayloadLeaseTransfer<TRef>): PiHostPayloadLeaseTransfer =>
-		Object.freeze({
-			refs: transfer.refs,
-			adopt(accept: (holds: readonly EpochContentHold<EpochStoredContentRef>[]) => true) {
-				transfer.adopt((holds) => accept(holds));
-			},
-			release: () => transfer.release(),
-		});
-	return Object.freeze({
-		refs: lease.refs,
-		transfer: () => adaptTransfer(lease.transfer()),
-		release: () => lease.release(),
-	});
-}
-
-export interface PiHostDecodeOutcome<T, TRef extends EpochStoredContentRef = SessionAttachmentRefDto> {
+export interface PiHostDecodeOutcome<T> {
 	readonly value: T;
-	readonly lease: PiPayloadLease<TRef> | null;
+	readonly lease: PiPayloadLease | null;
 }
 
-export interface PiHostAttachmentPayloadExternalizer {
-	/** Omission is the backwards-compatible current attachment mode. */
-	readonly mode?: "attachment";
+export interface PiHostPayloadExternalizer {
 	readonly context: SessionAttachmentGuardContext;
 	externalize(input: PiPayloadExternalizerInput, signal: AbortSignal): Promise<Externalized<unknown>>;
 }
 
-export interface PiHostFuturePayloadExternalizer {
-	readonly mode: "future_content";
-	readonly context: FutureSessionContentRefGuardContext;
-	externalize(
-		input: PiPayloadExternalizerInput,
-		signal: AbortSignal,
-	): Promise<Externalized<unknown, EpochStoredContentRef>>;
-}
-
-export type PiHostPayloadExternalizer = PiHostAttachmentPayloadExternalizer | PiHostFuturePayloadExternalizer;
-
 /** Adapter normalization may be synchronous today or asynchronously externalize bounded payloads. */
-export type PiHostDecodeResult<T, TRef extends EpochStoredContentRef = SessionAttachmentRefDto> =
-	| PiHostDecodeOutcome<T, TRef>
-	| PromiseLike<PiHostDecodeOutcome<T, TRef>>;
+export type PiHostDecodeResult<T> = PiHostDecodeOutcome<T> | PromiseLike<PiHostDecodeOutcome<T>>;
 
 /** Spawn-scoped cancellation passed to asynchronous normalization/externalization work. */
 export interface PiHostDecodeContext {
 	readonly signal: AbortSignal;
 	/** Server-private and disabled unless the complete downstream ownership path is installed. */
-	readonly externalizer?: PiHostAttachmentPayloadExternalizer;
-}
-
-export interface PiHostFutureDecodeContext {
-	readonly signal: AbortSignal;
-	readonly externalizer: PiHostFuturePayloadExternalizer;
-}
-
-export interface PiHostFutureOrphanDecodeContext {
-	readonly signal: AbortSignal;
-	readonly externalizer?: never;
+	readonly externalizer?: PiHostPayloadExternalizer;
 }
 
 export type PiHostResponseExternalizationFailure =
@@ -204,27 +138,8 @@ export interface PiHostAdapter {
 			id: string;
 		}
 	>;
-	decodeFutureResponse(
-		value: unknown,
-		expectedCommand: SessionCommandTypeDto,
-		context: PiHostFutureDecodeContext,
-	): PiHostDecodeResult<
-		FutureSessionCommandResponseDto & {
-			id: string;
-		},
-		EpochStoredContentRef
-	>;
 	/** Validate a late/unknown-id response before explicitly ignoring it. */
 	decodeOrphanedResponse(value: unknown, context?: PiHostDecodeContext): PiHostDecodeResult<void>;
-	/** Future raw validation for an ownerless response; externalization is intentionally unavailable. */
-	decodeFutureOrphanedResponse(
-		value: unknown,
-		context?: PiHostFutureOrphanDecodeContext,
-	): PiHostDecodeResult<void>;
-	decodeFutureUnsolicited(
-		value: unknown,
-		context: PiHostFutureDecodeContext,
-	): PiHostDecodeResult<PiHostFutureUnsolicitedFrame, EpochStoredContentRef>;
 	decodeUnsolicited(
 		value: unknown,
 		context?: PiHostDecodeContext,

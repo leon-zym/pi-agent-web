@@ -3,13 +3,7 @@ import { expect, test } from "../fixtures/test";
 
 const MIB = 1024 * 1024;
 const PAYLOAD_CAPABILITY = "payload.epoch_attachment_refs";
-const CONTENT_REF_CAPABILITY = "payload.epoch_content_refs";
-const CONTENT_REF_PROTOCOL_MINOR = 3;
 const MAX_SERVER_FRAME_BYTES = 65 * MIB;
-const CONTENT_REF_BUDGET = {
-	maxContentBlobBytes: 48 * MIB,
-	inlineContentThresholdBytes: 256 * 1024,
-};
 
 interface HelloOverride {
 	clientBuild: string;
@@ -96,7 +90,7 @@ test("a real browser negotiates an independently versioned client hello", async 
 	await overrideClientHello(page, {
 		clientBuild: "7.3.1-browser-test",
 		major: 1,
-		minor: CONTENT_REF_PROTOCOL_MINOR,
+		minor: 7,
 		maxServerFrameBytes: MAX_SERVER_FRAME_BYTES,
 	});
 	const observed = observeSockets(page);
@@ -106,7 +100,7 @@ test("a real browser negotiates an independently versioned client hello", async 
 	await expect
 		.poll(() => observed.received.find((frame) => frame.type === "server_hello"))
 		.toMatchObject({
-			protocol: { major: 1, minor: CONTENT_REF_PROTOCOL_MINOR },
+			protocol: { major: 1, minor: 2 },
 			serverBuild: "0.1.0",
 			piVersion: "0.84.2",
 			adapterId: "legacy-rpc-v1",
@@ -117,16 +111,14 @@ test("a real browser negotiates an independently versioned client hello", async 
 				"session.multiplex",
 				"session.hot_runtime_inventory",
 				PAYLOAD_CAPABILITY,
-				CONTENT_REF_CAPABILITY,
 			],
 			limits: { maxSnapshotFrameBytes: MAX_SERVER_FRAME_BYTES },
 			payloadBudget: { maxServerFrameBytes: MAX_SERVER_FRAME_BYTES },
-			contentRefBudget: CONTENT_REF_BUDGET,
 		});
 	expect(observed.sent[0]).toMatchObject({
 		type: "client_hello",
 		clientBuild: "7.3.1-browser-test",
-		protocol: { major: 1, minor: CONTENT_REF_PROTOCOL_MINOR },
+		protocol: { major: 1, minor: 7 },
 		limits: { maxServerFrameBytes: MAX_SERVER_FRAME_BYTES },
 	});
 });

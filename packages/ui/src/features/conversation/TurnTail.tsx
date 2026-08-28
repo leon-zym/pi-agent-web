@@ -6,6 +6,7 @@ import { displayError, formatCost, formatDuration, formatTokens, stripAnsi } fro
 import { tt } from "../../lib/i18n";
 import { isSessionControlReady } from "../../lib/session-capabilities";
 import { forkFromEntry, sendReadCommand } from "../../lib/session-controller";
+import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { useSessionTransportStore } from "../../stores/session-transport";
 import type { ProductTurn } from "../../types/view-models";
 
@@ -14,8 +15,9 @@ import type { ProductTurn } from "../../types/view-models";
  * aborted markers live here, not on every assistant fragment. Fork acts on
  * the newest forkable user message of the session (get_fork_messages).
  */
-export function TurnTail({ turn, sessionHandle }: { turn: ProductTurn; sessionHandle: string | null }) {
+export function TurnTail({ turn }: { turn: ProductTurn }) {
 	const [copied, setCopied] = useState(false);
+	const sessionHandle = useSessionDirectoryStore((s) => s.currentSession?.sessionHandle ?? null);
 	const canControl = useSessionTransportStore((state) => {
 		const channel = sessionHandle ? state.sessions[sessionHandle] : undefined;
 		return isSessionControlReady(channel);
@@ -37,16 +39,15 @@ export function TurnTail({ turn, sessionHandle }: { turn: ProductTurn; sessionHa
 
 	const forkLast = async () => {
 		if (!sessionHandle) return;
-		const targetSessionHandle = sessionHandle;
 		try {
-			const response = await sendReadCommand(targetSessionHandle, { type: "get_fork_messages" });
+			const response = await sendReadCommand(sessionHandle, { type: "get_fork_messages" });
 			const { messages } = expectCommandData(response, "get_fork_messages");
 			const last = messages[messages.length - 1];
 			if (!last) {
 				toast.info(tt("tail.noForkMessages"));
 				return;
 			}
-			await forkFromEntry(last.entryId, targetSessionHandle);
+			await forkFromEntry(last.entryId);
 		} catch (error) {
 			toast.error(tt("tail.forkFailed"), {
 				description: displayError(error),

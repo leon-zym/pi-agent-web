@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { GATEWAY_PAYLOAD_BUDGET_CAPABILITY, SESSION_PAYLOAD_BUDGET } from "@pi-agent-web/protocol";
-import { startServerWithCurrentMode } from "../src/main.js";
+import { startServer } from "../src/main.js";
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-smoke-"));
 const workspacePath = path.join(tempRoot, "workspace");
@@ -12,10 +12,10 @@ const webDataDir = path.join(tempRoot, "web-data");
 const fakePiPath = path.join(import.meta.dirname, "fixtures", "session-runtime-pi.mjs");
 fs.mkdirSync(workspacePath, { recursive: true });
 
-let handle: Awaited<ReturnType<typeof startServerWithCurrentMode>> | undefined;
+let handle: Awaited<ReturnType<typeof startServer>> | undefined;
 
 try {
-	const started = await startServerWithCurrentMode({
+	const started = await startServer({
 		config: { port: 0, host: "127.0.0.1", agentDir, sessionRootDir, webDataDir },
 		piPath: fakePiPath,
 		handleSignals: false,

@@ -14,7 +14,6 @@ import {
 	type PinnedEpochContent,
 	type StagedEpochContent,
 } from "./epoch-content-store.js";
-import { managedDownloadBody } from "./managed-download-body.js";
 import {
 	createRasterAdmissionValidator,
 	isRasterMediaType,
@@ -153,24 +152,17 @@ export function createAttachmentRoutes(ctx: AttachmentRoutesContext): Hono {
 					"Stored attachment metadata is invalid",
 				);
 			}
-			return new Response(
-				managedDownloadBody({
-					stream: pinned.stream,
-					release: () => ctx.contentStore.release(pinned.pin),
-					failureMessage: "Attachment stream failed",
-				}),
-				{
-					status: 200,
-					headers: {
-						"Cache-Control": "no-store",
-						"Content-Disposition": `attachment; filename="${pinned.ref.sha256}.${rasterFileExtension(pinned.ref.mediaType)}"`,
-						"Content-Length": String(pinned.ref.byteLength),
-						"Content-Type": pinned.ref.mediaType,
-						"Cross-Origin-Resource-Policy": "same-origin",
-						"X-Content-Type-Options": "nosniff",
-					},
+			return new Response(managedDownloadBody(pinned, ctx.contentStore), {
+				status: 200,
+				headers: {
+					"Cache-Control": "no-store",
+					"Content-Disposition": `attachment; filename="${pinned.ref.sha256}.${rasterFileExtension(pinned.ref.mediaType)}"`,
+					"Content-Length": String(pinned.ref.byteLength),
+					"Content-Type": pinned.ref.mediaType,
+					"Cross-Origin-Resource-Policy": "same-origin",
+					"X-Content-Type-Options": "nosniff",
 				},
-			);
+			});
 		} catch (error) {
 			return attachmentErrorResponse(error);
 		}
@@ -417,6 +409,45 @@ async function validateRepeatBody(
 			"Attachment does not match its declared digest",
 		);
 	}
+}
+
+function managedDownloadBody(
+	pinned: PinnedEpochContent,
+	store: AttachmentContentStore,
+): ReadableStream<Uint8Array> {
+	const reader = Readable.toWeb(pinned.stream).getReader();
+	let settled = false;
+	let releasePromise: Promise<void> | undefined;
+	const releaseOnce = (): Promise<void> => {
+		releasePromise ??= store.release(pinned.pin);
+		return releasePromise;
+	};
+	return new ReadableStream<Uint8Array>({
+		async pull(controller) {
+			if (settled) return;
+			try {
+				const next = await reader.read();
+				if (!next.done) {
+					controller.enqueue(next.value);
+					return;
+				}
+				settled = true;
+				await releaseOnce();
+				controller.close();
+			} catch {
+				settled = true;
+				await releaseOnce().catch(() => undefined);
+				controller.error(new Error("Attachment stream failed"));
+			}
+		},
+		async cancel(reason) {
+			if (!settled) {
+				settled = true;
+				await reader.cancel(reason).catch(() => undefined);
+			}
+			await releaseOnce();
+		},
+	});
 }
 
 function attachmentErrorResponse(error: unknown, headers?: Record<string, string>): Response {

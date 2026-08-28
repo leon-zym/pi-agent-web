@@ -175,30 +175,6 @@ Composer Visual Seat 固定于 Center 底部，同一 DOM 延续焦点，数据�
 - 流式生成期间渐进渲染标题、粗斜体、列表与代码块外框，消除从纯文本到富文本的跳闪；
 - 当代码块超过 32KB 字符（`MAX_SYNTAX_HIGHLIGHT_CHARACTERS`）或 64KB UTF-8 字节时，跳过高亮与 DiffBlock，降级为轻量原生 `<pre><code>` 文本容器；这只限制高亮开销，不等同于完整 Markdown 解析或浏览器主线程预算。
 
-### 7.6 大型 Tool 与 Extension 内容的按需加载
-
-Protocol minor 3 的 `content_ref` 只在 exact `serverEpoch` 内有效。Projection、replay 和 snapshot 保存
-typed reference，不把最多 48 MiB 的 UTF-8 内容复制进 Zustand 或 WebSocket frame。Tool 与 message 的
-`external_text`、`external_json` 默认 lazy：折叠的 Tool、未打开的 Inspector 和未选中的 Session 不发起
-GET；展开 Tool 或打开 Inspector 后，才用同源 Cookie 认证的 `/api/v1/content/:serverEpoch/:sha256` 加载，
-再按 wrapper 做 bounded UTF-8 decode 或 JSON parse，并重跑该 slot 的 field guard。缺失、过期或解析失败
-不会显示空字符串、`null` 或半截结果。
-
-GET 和 decode 属于发起该次加载的 `{serverEpoch, sessionHandle, generation}` consumer。collapse、切换 Session、unmount、
-disconnect、rekey、dispose、command timeout 或取消都会 Abort；完成回调必须再次核对这三个身份和 captured
-pending token。身份已变化或请求已失效的 late completion 只释放资源，不能写入当前选中的 Session，也不
-触发 Toast 或 resync。
-
-Extension 的 `editor.prefill`、`set_editor_text.text` 与完整 `setWidget.widgetLines` 是 eager roots。它们
-必须在对应 semantic state、Dialog 可见状态或 seq barrier 提交前完成 materialization；失败时保留原有
-Extension state，按 exact Session/generation 进入一次 recovery，不能发布缺字段的卡片或 widget。`select`、
-`confirm`、`input` 的 response 仍是 inline，并继续受当前 Extension response deadline 与 fencing token 保护。
-
-已提交 authoritative baseline 且 identity 仍精确匹配时，content GET 的 404/410、错误 metadata、malformed
-UTF-8、JSON parse 或 field guard failure 只触发一次 cursorless resync。baseline 尚未提交、identity 已改变、
-consumer 已 Abort 或 pending token 已失效时静默忽略。Recovery 期间保留可辨识的旧内容并禁用 mutation；预算
-耗尽后停在 degraded，只提供一次手动“重试同步”。
-
 ---
 
 ## 8. 滚动感知与对话大纲轨 (Conversation TOC)

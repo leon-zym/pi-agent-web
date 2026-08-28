@@ -1,4 +1,3 @@
-import type { SessionRuntimeIdentityDto } from "@pi-agent-web/protocol";
 import { memo, useMemo } from "react";
 import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
@@ -14,14 +13,10 @@ const BlockView = memo(function BlockView({
 	block,
 	results,
 	isLast,
-	sessionHandle,
-	sessionIdentity,
 }: {
 	block: ContentBlock;
 	results: import("../../types/view-models").UiToolResult[];
 	isLast: boolean;
-	sessionHandle?: string | null;
-	sessionIdentity?: SessionRuntimeIdentityDto | null;
 }) {
 	switch (block.type) {
 		case "thinking":
@@ -36,14 +31,7 @@ const BlockView = memo(function BlockView({
 		case "text":
 			return <MarkdownBlock text={block.markdown} streaming={block.isStreaming} />;
 		case "tool_call":
-			return (
-				<ToolCallRow
-					block={block}
-					results={results}
-					sessionHandle={sessionHandle}
-					sessionIdentity={sessionIdentity}
-				/>
-			);
+			return <ToolCallRow block={block} results={results} />;
 		default:
 			return null;
 	}
@@ -60,13 +48,9 @@ type GroupedBlockItem =
  */
 export const AssistantStepView = memo(function AssistantStepView({
 	step,
-	sessionHandle,
-	sessionIdentity,
 }: {
 	turnId: string;
 	step: AssistantStep;
-	sessionHandle?: string | null;
-	sessionIdentity?: SessionRuntimeIdentityDto | null;
 }) {
 	const resultsByToolCallId = useMemo(() => {
 		const index = new Map<string, import("../../types/view-models").UiToolResult[]>();
@@ -155,8 +139,6 @@ export const AssistantStepView = memo(function AssistantStepView({
 							tools={item.tools}
 							resultsByToolCallId={resultsByToolCallId}
 							durationMs={stepDurationMs}
-							sessionHandle={sessionHandle}
-							sessionIdentity={sessionIdentity}
 						/>
 					);
 				}
@@ -172,8 +154,6 @@ export const AssistantStepView = memo(function AssistantStepView({
 								: EMPTY_RESULTS
 						}
 						isLast={item.isLast}
-						sessionHandle={sessionHandle}
-						sessionIdentity={sessionIdentity}
 					/>
 				);
 			})}

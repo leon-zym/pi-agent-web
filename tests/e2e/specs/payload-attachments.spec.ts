@@ -7,11 +7,6 @@ const LARGE_IMAGE_PROMPT = "E2E_PAYLOAD_ATTACHMENT";
 const AFTER_ATTACHMENT_PROMPT = "E2E_AFTER_PAYLOAD_ATTACHMENT";
 const PNG_BASE64_PREFIX = "iVBORw0KGgo";
 const MIB = 1024 * 1024;
-const CONTENT_REF_PROTOCOL_MINOR = 3;
-const CONTENT_REF_BUDGET = {
-	maxContentBlobBytes: 48 * MIB,
-	inlineContentThresholdBytes: 256 * 1024,
-};
 const EXPECTED_SERVER_CAPABILITIES = [
 	"rpc.commands",
 	"rpc.events",
@@ -19,7 +14,6 @@ const EXPECTED_SERVER_CAPABILITIES = [
 	"session.multiplex",
 	"session.hot_runtime_inventory",
 	"payload.epoch_attachment_refs",
-	"payload.epoch_content_refs",
 ];
 const EXPECTED_PAYLOAD_BUDGET = {
 	maxCommandFrameBytes: 8 * MIB,
@@ -157,10 +151,9 @@ test("a packaged Browser renders a large Pi image by authenticated attachment re
 	await expect
 		.poll(() => receivedFrames(wire).find((frame) => frame.type === "server_hello"))
 		.toMatchObject({
-			protocol: { major: 1, minor: CONTENT_REF_PROTOCOL_MINOR },
+			protocol: { major: 1, minor: 2 },
 			capabilities: EXPECTED_SERVER_CAPABILITIES,
 			payloadBudget: EXPECTED_PAYLOAD_BUDGET,
-			contentRefBudget: CONTENT_REF_BUDGET,
 		});
 
 	const attachmentResponse = page.waitForResponse((response) =>

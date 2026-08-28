@@ -407,8 +407,9 @@ export async function abortCurrentRun(): Promise<void> {
 	}
 }
 
-export async function forkFromEntry(entryId: string, sessionHandle: string): Promise<void> {
+export async function forkFromEntry(entryId: string): Promise<void> {
 	try {
+		const sessionHandle = currentSessionHandle();
 		const response = await sendControlCommand(sessionHandle, { type: "fork", entryId });
 		const data = expectCommandData(response, "fork");
 		if (data.cancelled) {

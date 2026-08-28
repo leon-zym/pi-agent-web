@@ -1,22 +1,18 @@
-import {
-	isSessionAttachmentRefDto,
-	isSessionContentRefDto,
-	type SessionAttachmentRefDto,
-} from "@pi-agent-web/protocol";
-import type { EpochContentHold, EpochStoredContentRef } from "./epoch-content-store.js";
+import { isSessionAttachmentRefDto, type SessionAttachmentRefDto } from "@pi-agent-web/protocol";
+import type { EpochContentHold } from "./epoch-content-store.js";
 import type { PiPayloadLeaseTransfer } from "./pi-payload-externalizer.js";
 
 type OwnerState = "active" | "adopting" | "sealed" | "poisoned" | "closing" | "closed";
 
-interface OwnedContent<TRef extends EpochStoredContentRef> {
-	ref: TRef;
-	hold: EpochContentHold<TRef>;
+interface OwnedContent {
+	ref: SessionAttachmentRefDto;
+	hold: EpochContentHold;
 }
 
-export interface GenerationContentOwnerOptions<TRef extends EpochStoredContentRef = SessionAttachmentRefDto> {
+export interface GenerationContentOwnerOptions {
 	serverEpoch: string;
 	generation: number;
-	release: (hold: EpochContentHold<TRef>) => Promise<void>;
+	release: (hold: EpochContentHold) => Promise<void>;
 }
 
 export class GenerationContentOwnerError extends Error {
@@ -26,25 +22,25 @@ export class GenerationContentOwnerError extends Error {
 	}
 }
 
-/** Owns every exact content hold made reachable by one Session generation. */
-export class GenerationContentOwner<TRef extends EpochStoredContentRef = SessionAttachmentRefDto> {
+/** Owns every exact attachment hold made reachable by one Session generation. */
+export class GenerationContentOwner {
 	readonly serverEpoch: string;
 	readonly generation: number;
 	/** Rejects on the first asynchronous duplicate-cleanup failure. */
 	readonly fatalCleanup: Promise<never>;
-	private readonly releaseHold: (hold: EpochContentHold<TRef>) => Promise<void>;
-	private readonly byContentKey = new Map<string, OwnedContent<TRef>>();
-	private readonly primaryHolds: EpochContentHold<TRef>[] = [];
-	private readonly duplicateHolds = new Set<EpochContentHold<TRef>>();
-	private readonly ownedHolds = new Set<EpochContentHold<TRef>>();
-	private readonly duplicateCleanupInFlight = new Map<EpochContentHold<TRef>, Promise<void>>();
+	private readonly releaseHold: (hold: EpochContentHold) => Promise<void>;
+	private readonly byDigest = new Map<string, OwnedContent>();
+	private readonly primaryHolds: EpochContentHold[] = [];
+	private readonly duplicateHolds = new Set<EpochContentHold>();
+	private readonly ownedHolds = new Set<EpochContentHold>();
+	private readonly duplicateCleanupInFlight = new Map<EpochContentHold, Promise<void>>();
 	private readonly rejectFatalCleanup: (reason: unknown) => void;
 	private state: OwnerState = "active";
 	private fatalCleanupSignaled = false;
 	private releasePromise: Promise<void> | null = null;
 	private closedPromise: Promise<void> | null = null;
 
-	constructor(options: GenerationContentOwnerOptions<TRef>) {
+	constructor(options: GenerationContentOwnerOptions) {
 		if (
 			typeof options.serverEpoch !== "string" ||
 			options.serverEpoch.length === 0 ||
@@ -68,11 +64,11 @@ export class GenerationContentOwner<TRef extends EpochStoredContentRef = Session
 	}
 
 	get size(): number {
-		return this.byContentKey.size;
+		return this.byDigest.size;
 	}
 
-	get refs(): readonly TRef[] {
-		return Object.freeze([...this.byContentKey.values()].map((entry) => entry.ref));
+	get refs(): readonly SessionAttachmentRefDto[] {
+		return Object.freeze([...this.byDigest.values()].map((entry) => entry.ref));
 	}
 
 	/** Closes adoption without releasing content that is still reachable. */
@@ -85,7 +81,7 @@ export class GenerationContentOwner<TRef extends EpochStoredContentRef = Session
 	}
 
 	/** Atomically adopts a trusted transfer after preflighting every exact hold/reference pair. */
-	adopt(transfer: PiPayloadLeaseTransfer<TRef>): void {
+	adopt(transfer: PiPayloadLeaseTransfer): void {
 		this.assertActive();
 		this.state = "adopting";
 		let accepted = false;
@@ -98,7 +94,7 @@ export class GenerationContentOwner<TRef extends EpochStoredContentRef = Session
 				// PiPayloadLeaseTransfer is a trusted server-private token. Its contract
 				// requires ownership to be complete before this callback returns true.
 				for (const entry of prepared.additions) {
-					this.byContentKey.set(contentKey(entry.ref), entry);
+					this.byDigest.set(entry.ref.sha256, entry);
 					this.primaryHolds.push(entry.hold);
 					this.ownedHolds.add(entry.hold);
 				}
@@ -132,7 +128,7 @@ export class GenerationContentOwner<TRef extends EpochStoredContentRef = Session
 			return this.closedPromise;
 		}
 		this.state = "closing";
-		this.byContentKey.clear();
+		this.byDigest.clear();
 		const attempt = (async () => {
 			await Promise.all([...this.duplicateCleanupInFlight.values()]);
 			const failures: unknown[] = [];
@@ -170,24 +166,24 @@ export class GenerationContentOwner<TRef extends EpochStoredContentRef = Session
 	}
 
 	private prepareAdoption(
-		refs: readonly TRef[],
-		holds: readonly EpochContentHold<TRef>[],
-	): { additions: OwnedContent<TRef>[]; duplicates: EpochContentHold<TRef>[] } {
+		refs: readonly SessionAttachmentRefDto[],
+		holds: readonly EpochContentHold[],
+	): { additions: OwnedContent[]; duplicates: EpochContentHold[] } {
 		if (refs.length !== holds.length) {
 			throw new GenerationContentOwnerError("generation content refs and holds differ in length");
 		}
-		const additions: OwnedContent<TRef>[] = [];
-		const duplicates: EpochContentHold<TRef>[] = [];
-		const stagedByContentKey = new Map<string, OwnedContent<TRef>>();
-		const seenHolds = new Set<EpochContentHold<TRef>>();
+		const additions: OwnedContent[] = [];
+		const duplicates: EpochContentHold[] = [];
+		const stagedByDigest = new Map<string, OwnedContent>();
+		const seenHolds = new Set<EpochContentHold>();
 		for (let index = 0; index < refs.length; index += 1) {
 			const candidateRef = refs[index];
 			const candidateHold = holds[index];
 			if (
 				!candidateRef ||
 				!candidateHold ||
-				!isStoredContentRef(candidateRef) ||
-				!isStoredContentRef(candidateHold.ref) ||
+				!isSessionAttachmentRefDto(candidateRef) ||
+				!isSessionAttachmentRefDto(candidateHold.ref) ||
 				candidateRef.serverEpoch !== this.serverEpoch ||
 				!refsEqual(candidateRef, candidateHold.ref)
 			) {
@@ -197,8 +193,7 @@ export class GenerationContentOwner<TRef extends EpochStoredContentRef = Session
 				throw new GenerationContentOwnerError("generation content hold is already registered");
 			}
 			seenHolds.add(candidateHold);
-			const key = contentKey(candidateRef);
-			const existing = this.byContentKey.get(key) ?? stagedByContentKey.get(key);
+			const existing = this.byDigest.get(candidateRef.sha256) ?? stagedByDigest.get(candidateRef.sha256);
 			if (existing) {
 				if (!refsEqual(existing.ref, candidateRef)) {
 					throw new GenerationContentOwnerError("generation content digest metadata collision");
@@ -207,13 +202,13 @@ export class GenerationContentOwner<TRef extends EpochStoredContentRef = Session
 				continue;
 			}
 			const addition = { ref: candidateRef, hold: candidateHold };
-			stagedByContentKey.set(key, addition);
+			stagedByDigest.set(candidateRef.sha256, addition);
 			additions.push(addition);
 		}
 		return { additions, duplicates };
 	}
 
-	private enqueueDuplicateCleanup(duplicates: readonly EpochContentHold<TRef>[]): void {
+	private enqueueDuplicateCleanup(duplicates: readonly EpochContentHold[]): void {
 		for (const entry of [...duplicates].reverse()) {
 			const cleanup = this.releaseDuplicate(entry);
 			this.duplicateCleanupInFlight.set(entry, cleanup);
@@ -225,7 +220,7 @@ export class GenerationContentOwner<TRef extends EpochStoredContentRef = Session
 		}
 	}
 
-	private async releaseDuplicate(entry: EpochContentHold<TRef>): Promise<void> {
+	private async releaseDuplicate(entry: EpochContentHold): Promise<void> {
 		try {
 			await this.releaseHold(entry);
 			this.duplicateHolds.delete(entry);
@@ -250,25 +245,12 @@ export class GenerationContentOwner<TRef extends EpochStoredContentRef = Session
 	}
 }
 
-function isStoredContentRef(value: unknown): value is EpochStoredContentRef {
-	return isSessionAttachmentRefDto(value) || isSessionContentRefDto(value);
-}
-
-function contentKey(ref: EpochStoredContentRef): string {
-	const namespace = ref.type === "attachment_ref" ? "attachment" : "utf8";
-	return `${namespace}:${ref.sha256}`;
-}
-
-function refsEqual(left: EpochStoredContentRef, right: EpochStoredContentRef): boolean {
-	if (
-		left.type !== right.type ||
-		left.serverEpoch !== right.serverEpoch ||
-		left.sha256 !== right.sha256 ||
-		left.byteLength !== right.byteLength
-	) {
-		return false;
-	}
-	return left.type === "attachment_ref"
-		? right.type === "attachment_ref" && left.mediaType === right.mediaType
-		: right.type === "content_ref" && left.encoding === right.encoding;
+function refsEqual(left: SessionAttachmentRefDto, right: SessionAttachmentRefDto): boolean {
+	return (
+		left.type === right.type &&
+		left.serverEpoch === right.serverEpoch &&
+		left.sha256 === right.sha256 &&
+		left.mediaType === right.mediaType &&
+		left.byteLength === right.byteLength
+	);
 }
