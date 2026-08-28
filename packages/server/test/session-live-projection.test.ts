@@ -306,6 +306,8 @@ describe("SessionLiveProjection", () => {
 			compaction.prepareIdleBaseCompaction(token, [{ role: "user", content: "x".repeat(800), timestamp: 1 }]),
 		).toThrow(SessionLiveProjectionLimitError);
 		expect(compaction.snapshot()).toEqual(beforeCompaction);
+		expect(compaction.prepareIdleBaseCompaction(token, [])).toBeNull();
+		expect(compaction.snapshot()).toEqual(beforeCompaction);
 
 		const currentSchema = { ...createCurrentSessionProductSchema(), maxSnapshotCanonicalWireBytes: 1 };
 		expect(
@@ -946,6 +948,15 @@ describe("SessionLiveProjection", () => {
 		const before = projection.snapshot();
 
 		expect(prepared).not.toBeNull();
+		const preview = projection.previewPreparedIdleBaseCompaction(prepared!);
+		expect(preview).toMatchObject({
+			baseSeq: 1,
+			asOfSeq: 1,
+			settledMessages: [userMessage("new")],
+			projectionEvents: [],
+		});
+		expect(Object.isFrozen(preview)).toBe(true);
+		expect(Object.isFrozen(preview?.settledMessages)).toBe(true);
 		expect(projection.snapshot()).toEqual(before);
 		expect(other.commitPreparedIdleBaseCompaction(prepared!)).toBe(false);
 		expect(projection.commitPreparedIdleBaseCompaction(prepared!)).toBe(true);
@@ -959,6 +970,27 @@ describe("SessionLiveProjection", () => {
 			settledMessages: [userMessage("new")],
 			projectionEvents: [],
 		});
+	});
+
+	it("destroys a stale prepared compaction during a zero-mutation preview", () => {
+		const projection = new SessionLiveProjection({
+			identity,
+			baseSeq: 0,
+			settledMessages: [userMessage("old")],
+			runtimePhase: "idle",
+		});
+		projection.commitInlineOnly(identity, event({ type: "message_end", message: userMessage("done") }));
+		projection.setRuntimePhase(identity, "idle");
+		const token = projection.beginIdleBaseCompaction()!;
+		const prepared = projection.prepareIdleBaseCompaction(token, [userMessage("new")]);
+		if (!prepared) throw new Error("expected prepared compaction");
+		projection.setRuntimePhase(identity, "idle");
+		const beforePreview = projection.snapshot();
+
+		expect(projection.previewPreparedIdleBaseCompaction(prepared)).toBeNull();
+		expect(projection.snapshot()).toEqual(beforePreview);
+		expect(projection.commitPreparedIdleBaseCompaction(prepared)).toBe(false);
+		expect(projection.snapshot()).toEqual(beforePreview);
 	});
 
 	it("keeps the inline-only compaction seam closed to refs even with trusted context", () => {

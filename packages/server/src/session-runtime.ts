@@ -48,6 +48,7 @@ import {
 	SessionLiveProjectionLimitError,
 	type SessionLiveProjectionLimits,
 	type SessionLiveProjectionPreparedCommit,
+	type SessionLiveProjectionSnapshot,
 } from "./session-live-projection.js";
 import { createCurrentSessionProductSchema, type SessionProductSchema } from "./session-product-schema.js";
 import {
@@ -838,14 +839,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 				schema: this.productAdapter.productSchema,
 			});
 			const candidateSnapshot = this.buildSessionSnapshot(candidate, candidateRuntime);
-			if (!this.productAdapter.productSchema.guardSnapshot(candidateSnapshot)) {
-				throw new SessionLiveProjectionLimitError("snapshot");
-			}
-			try {
-				this.productAdapter.productSchema.snapshotLogicalBytes(candidateSnapshot);
-			} catch {
-				throw new SessionLiveProjectionLimitError("snapshot");
-			}
+			this.assertProductSnapshotCandidateFits(candidateSnapshot);
 			return delivery.prepare((transfer) => {
 				if (!ownerIsCurrent()) {
 					throw new RpcError("get_messages", "session_generation_stale");
@@ -1466,6 +1460,13 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		if (!projection || projection.asOfSeq !== this.lastSeq) {
 			throw new RpcError("session_snapshot", "session_snapshot_unavailable");
 		}
+		return this.buildSessionSnapshotFromProjection(projection, runtime);
+	}
+
+	private buildSessionSnapshotFromProjection(
+		projection: SessionLiveProjectionSnapshot<RuntimeMessage<M>, RuntimeEvent<M>>,
+		runtime: SessionRuntimeSnapshot = this.snapshot(),
+	): unknown {
 		return structuredClone({
 			type: "session_snapshot" as const,
 			snapshotId: randomUUID(),
@@ -1482,6 +1483,17 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			pendingExtensionRequests: [...this.pendingDialogs.values()].map((entry) => entry.request),
 			stickyExtensionState: [...this.stickyExtension.values()],
 		});
+	}
+
+	private assertProductSnapshotCandidateFits(candidateSnapshot: unknown): void {
+		if (!this.productAdapter.productSchema.guardSnapshot(candidateSnapshot)) {
+			throw new SessionLiveProjectionLimitError("snapshot");
+		}
+		try {
+			this.productAdapter.productSchema.snapshotLogicalBytes(candidateSnapshot);
+		} catch {
+			throw new SessionLiveProjectionLimitError("snapshot");
+		}
 	}
 
 	private assertWireSnapshotFits(): void {
@@ -2344,6 +2356,16 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 							this.trackDiscardedCompactionTransfer(processToken, proc, contentOwner, transfer);
 							return true;
 						}
+						if (this.productAdapter.mode === "future_content") {
+							const candidateProjection = projection.previewPreparedIdleBaseCompaction(prepared);
+							if (!candidateProjection) {
+								this.trackDiscardedCompactionTransfer(processToken, proc, contentOwner, transfer);
+								return true;
+							}
+							this.assertProductSnapshotCandidateFits(
+								this.buildSessionSnapshotFromProjection(candidateProjection),
+							);
+						}
 						if (transfer) {
 							if (!contentOwner) throw new RpcError("get_messages", "unexpected_payload_transfer");
 							contentOwner.adopt(transfer);
@@ -2352,7 +2374,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 							if (!projection.commitPreparedIdleBaseCompaction(prepared)) {
 								throw new RpcError("get_messages", "session_compaction_commit_invariant_failed");
 							}
-							this.assertWireSnapshotFits();
+							if (this.productAdapter.mode !== "future_content") this.assertWireSnapshotFits();
 							committed = true;
 						} catch (error) {
 							if (contentOwner) {
