@@ -16,11 +16,13 @@ import { canonicalizeSessionFile, sessionHandleForFile } from "../src/native-ses
 import type { PiHostAdapter, PiHostDecodeOutcome } from "../src/pi-host-adapter.js";
 import type { PiPayloadLease } from "../src/pi-payload-externalizer.js";
 import type { SessionLiveProjectionLimits } from "../src/session-live-projection.js";
+import { createCurrentSessionProductSchema } from "../src/session-product-schema.js";
 import type {
 	SessionIdentityTransitionCommit,
 	SessionRuntime,
 	SessionRuntimePiPayloadServices,
 } from "../src/session-runtime.js";
+import { createCurrentSessionRuntimePiPayloadServices } from "../src/session-runtime.js";
 import type {
 	ExistingSessionTarget,
 	SessionRuntimeSnapshot,
@@ -141,8 +143,9 @@ function attachmentRef(sha256: string): SessionAttachmentRefDto {
 function trackedLease(
 	ref: SessionAttachmentRefDto,
 	tracking: { adopted: EpochContentHold[][]; released: EpochContentHold[] },
+	holdRef: SessionAttachmentRefDto = ref,
 ): { hold: EpochContentHold; lease: PiPayloadLease } {
-	const hold: EpochContentHold = Object.freeze({ ref });
+	const hold: EpochContentHold = Object.freeze({ ref: holdRef });
 	let state: "pending" | "transferred" | "adopted" | "released" = "pending";
 	const lease: PiPayloadLease = Object.freeze({
 		refs: Object.freeze([ref]),
@@ -201,20 +204,23 @@ function rejectingTransferLease(
 }
 
 function testPayloadServices(released: EpochContentHold[]): SessionRuntimePiPayloadServices {
-	return {
+	const context = {
+		serverEpoch: "session-supervisor-test-epoch",
+		payloadBudget: SESSION_PAYLOAD_BUDGET,
+	};
+	return createCurrentSessionRuntimePiPayloadServices({
 		externalizer: {
-			context: {
-				serverEpoch: "session-supervisor-test-epoch",
-				payloadBudget: SESSION_PAYLOAD_BUDGET,
-			},
+			mode: "attachment",
+			context,
 			externalize: async () => {
 				throw new Error("the carrier fixture owns decoded outcomes");
 			},
 		},
+		productSchema: createCurrentSessionProductSchema(context),
 		releaseHold: async (entry) => {
 			released.push(entry);
 		},
-	};
+	});
 }
 
 function startupBaseAdapter(ref: SessionAttachmentRefDto, lease: PiPayloadLease): PiHostAdapter {
@@ -3752,7 +3758,7 @@ describe("SessionSupervisor", () => {
 			...attachmentRef("3".repeat(64)),
 			serverEpoch: "foreign-transition-epoch",
 		});
-		const stagedInvalid = trackedLease(foreignRef, tracking);
+		const stagedInvalid = trackedLease(attachmentRef("3".repeat(64)), tracking, foreignRef);
 		const services = testPayloadServices(released);
 		const { supervisor, messages } = createHarness({
 			targets: [parent],

@@ -7,7 +7,6 @@ import type {
 	HotRuntimeInventoryDto,
 	HotRuntimeInventoryEntryDto,
 	SessionCommandDto,
-	SessionCommandResponseDto,
 	SessionRuntimeIdentityDto,
 } from "@pi-agent-web/protocol";
 import { RpcError, SESSION_HOT_RUNTIME_INVENTORY_MAX_ITEMS } from "@pi-agent-web/protocol";
@@ -15,10 +14,17 @@ import type { ProbedPiRuntime } from "./resolver.js";
 import { canonicalizePathAllowMissing } from "./session-layout-resolver.js";
 import type { SessionLiveProjectionLimits } from "./session-live-projection.js";
 import {
+	createFutureSessionRuntime,
 	type SessionHotRuntimeObservation,
 	type SessionIdentityTransitionCommit,
 	SessionRuntime,
+	type SessionRuntimeCore,
+	type SessionRuntimeCoreOptions,
 	type SessionRuntimePiPayloadServices,
+	type SessionRuntimeProductEvent,
+	type SessionRuntimeProductMode,
+	type SessionRuntimeProductResponse,
+	type SessionRuntimeProductSnapshot,
 } from "./session-runtime.js";
 import {
 	type ExistingSessionTarget,
@@ -59,23 +65,26 @@ export interface HotRuntimeSubscriptionToken {
 	readonly kind: "hot_runtime_subscription";
 }
 
-export type HotRuntimeSubscriptionResult = ReplayResult & {
+export type HotRuntimeSubscriptionResult<M extends SessionRuntimeProductMode = "current"> = ReplayResult<
+	SessionRuntimeProductEvent<M>,
+	SessionRuntimeProductSnapshot<M>
+> & {
 	observationToken: HotRuntimeSubscriptionToken;
 };
 
-interface HotRuntimeSubscriptionObservation {
-	runtime: SessionRuntime;
+interface HotRuntimeSubscriptionObservation<M extends SessionRuntimeProductMode = "current"> {
+	runtime: SessionRuntimeCore<M>;
 	expected: SessionRuntimeIdentityDto;
 	observation: SessionHotRuntimeObservation;
 }
 
-export interface SessionSupervisorOptions {
+interface SessionSupervisorBaseOptions<M extends SessionRuntimeProductMode = "current"> {
 	serverEpoch?: string;
 	resolved: ProbedPiRuntime;
 	env?: Record<string, string>;
 	envForWorkspace?: (cwd: string) => Record<string, string>;
 	resolveSession: (sessionHandle: string) => Promise<ExistingSessionTarget | undefined>;
-	broadcast: (message: SessionSupervisorMessage) => void;
+	broadcast: (message: SessionSupervisorMessage<SessionRuntimeProductEvent<M>>) => void;
 	onHotRuntimeInventory?: (inventory: HotRuntimeInventoryDto) => void;
 	log?: (level: "info" | "warn" | "error", message: string) => void;
 	readyTimeoutMs?: number;
@@ -86,8 +95,6 @@ export interface SessionSupervisorOptions {
 	extensionStateMaxItems?: number;
 	pendingDialogLimit?: number;
 	projectionLimits?: Partial<SessionLiveProjectionLimits>;
-	/** Server-private and default-off until Main installs the complete attachment pipeline. */
-	piPayloadServices?: SessionRuntimePiPayloadServices;
 	commandTimeoutFor?: (commandType: string) => number;
 	maxHotRuntimes?: number;
 	idleTtlMs?: number;
@@ -97,6 +104,20 @@ export interface SessionSupervisorOptions {
 	maxAutoRestarts?: number;
 	restartBaseDelayMs?: number;
 }
+
+export interface SessionSupervisorOptions extends SessionSupervisorBaseOptions<"current"> {
+	/** Server-private and default-off until Main installs the complete attachment pipeline. */
+	piPayloadServices?: SessionRuntimePiPayloadServices<"current">;
+}
+
+export interface FutureSessionSupervisorOptions extends SessionSupervisorBaseOptions<"future_content"> {
+	piPayloadServices: SessionRuntimePiPayloadServices<"future_content">;
+}
+
+type SupervisorRuntimeOptions<M extends SessionRuntimeProductMode> = Omit<
+	SessionRuntimeCoreOptions<M>,
+	"productAdapter" | "payloadCustody"
+>;
 
 interface Lease {
 	connectionId: string;
@@ -115,15 +136,15 @@ interface Alias {
  * most one hot runtime. Historical Sessions remain dormant. Control leases,
  * crash budgets, replay, and capacity are isolated per Session handle.
  */
-export class SessionSupervisor {
+class SessionSupervisorCore<M extends SessionRuntimeProductMode = "current"> {
 	private readonly hotRuntimeSubscriptionObservations = new WeakMap<
 		HotRuntimeSubscriptionToken,
-		HotRuntimeSubscriptionObservation
+		HotRuntimeSubscriptionObservation<M>
 	>();
 	readonly serverEpoch: string;
 	private readonly opts: Required<
 		Pick<
-			SessionSupervisorOptions,
+			SessionSupervisorBaseOptions<M>,
 			| "readyTimeoutMs"
 			| "replayLimit"
 			| "maxHotRuntimes"
@@ -134,9 +155,10 @@ export class SessionSupervisor {
 			| "restartBaseDelayMs"
 		>
 	> &
-		SessionSupervisorOptions;
-	private runtimes = new Map<string, SessionRuntime>();
-	private activationPromises = new Map<string, Promise<SessionRuntime>>();
+		SessionSupervisorBaseOptions<M>;
+	private readonly runtimeFactory: (options: SupervisorRuntimeOptions<M>) => SessionRuntimeCore<M>;
+	private runtimes = new Map<string, SessionRuntimeCore<M>>();
+	private activationPromises = new Map<string, Promise<SessionRuntimeCore<M>>>();
 	private leases = new Map<string, Lease>();
 	private aliases = new Map<string, Alias>();
 	private crashTimes = new Map<string, number[]>();
@@ -154,7 +176,11 @@ export class SessionSupervisor {
 	private closed = false;
 	private closePromise: Promise<void> | null = null;
 
-	constructor(opts: SessionSupervisorOptions) {
+	constructor(
+		opts: SessionSupervisorBaseOptions<M>,
+		runtimeFactory: (options: SupervisorRuntimeOptions<M>) => SessionRuntimeCore<M>,
+	) {
+		this.runtimeFactory = runtimeFactory;
 		this.serverEpoch = opts.serverEpoch ?? randomUUID();
 		const configuredMaxHotRuntimes = Number.isFinite(opts.maxHotRuntimes)
 			? Math.floor(opts.maxHotRuntimes ?? 8)
@@ -271,7 +297,10 @@ export class SessionSupervisor {
 		return runtime.snapshot();
 	}
 
-	async subscribe(sessionHandle: string, cursor?: ReplayCursor): Promise<ReplayResult> {
+	async subscribe(
+		sessionHandle: string,
+		cursor?: ReplayCursor,
+	): Promise<ReplayResult<SessionRuntimeProductEvent<M>, SessionRuntimeProductSnapshot<M>>> {
 		const runtime = await this.ensureRuntime(sessionHandle);
 		return runtime.getReplay(sessionHandle, cursor);
 	}
@@ -279,7 +308,7 @@ export class SessionSupervisor {
 	async subscribeHotExact(
 		expected: SessionRuntimeIdentityDto,
 		cursor?: ReplayCursor,
-	): Promise<HotRuntimeSubscriptionResult> {
+	): Promise<HotRuntimeSubscriptionResult<M>> {
 		return this.withPoolLock(async () => {
 			this.assertOpen();
 			const runtime = this.runtimes.get(expected.sessionHandle);
@@ -388,7 +417,7 @@ export class SessionSupervisor {
 		sessionHandle: string,
 		command: SessionCommandDto,
 		context: SessionCommandContext,
-	): Promise<SessionCommandResult> {
+	): Promise<SessionCommandResult<SessionRuntimeProductResponse<M>>> {
 		if (HOST_MANAGED_COMMANDS.has(command.type)) {
 			throw new RpcError(command.type, "host_managed_session_lifecycle");
 		}
@@ -578,7 +607,7 @@ export class SessionSupervisor {
 	): Promise<void> {
 		this.assertOpen();
 		const handle = this.resolveAlias(sessionHandle);
-		let runtime: SessionRuntime | undefined;
+		let runtime: SessionRuntimeCore<M> | undefined;
 		let sessionFile: string | null = null;
 		await this.withPoolLock(async () => {
 			this.assertOpen();
@@ -639,7 +668,7 @@ export class SessionSupervisor {
 	): Promise<T> {
 		this.assertOpen();
 		const handle = this.resolveAlias(sessionHandle);
-		let runtime: SessionRuntime | undefined;
+		let runtime: SessionRuntimeCore<M> | undefined;
 		await this.withPoolLock(async () => {
 			this.assertOpen();
 			if (this.deletionReservations.has(handle)) throw new RpcError("delete", "session_deleting");
@@ -763,7 +792,7 @@ export class SessionSupervisor {
 		this.safeBroadcast({ type: "session_directory_changed", workspaceId });
 	}
 
-	private async ensureRuntime(sessionHandle: string): Promise<SessionRuntime> {
+	private async ensureRuntime(sessionHandle: string): Promise<SessionRuntimeCore<M>> {
 		this.assertOpen();
 		const handle = this.resolveAlias(sessionHandle);
 		if (this.deletionReservations.has(handle)) throw new RpcError("activate", "session_deleting");
@@ -828,7 +857,7 @@ export class SessionSupervisor {
 
 	private async acquireRuntime(
 		sessionHandle: string,
-	): Promise<{ runtime: SessionRuntime; release: () => void }> {
+	): Promise<{ runtime: SessionRuntimeCore<M>; release: () => void }> {
 		const runtime = await this.ensureRuntime(sessionHandle);
 		let release: (() => void) | undefined;
 		await this.withPoolLock(async () => {
@@ -860,7 +889,7 @@ export class SessionSupervisor {
 		}
 	}
 
-	private async startRuntimeWithCapacity(runtime: SessionRuntime): Promise<void> {
+	private async startRuntimeWithCapacity(runtime: SessionRuntimeCore<M>): Promise<void> {
 		let release: (() => void) | undefined;
 		await this.withPoolLock(async () => {
 			this.assertOpen();
@@ -892,8 +921,8 @@ export class SessionSupervisor {
 	private createRuntime(
 		target: ExistingSessionTarget | NewSessionTarget,
 		initialGeneration?: number,
-	): SessionRuntime {
-		return new SessionRuntime({
+	): SessionRuntimeCore<M> {
+		return this.runtimeFactory({
 			serverEpoch: this.serverEpoch,
 			target,
 			resolved: this.opts.resolved,
@@ -909,7 +938,6 @@ export class SessionSupervisor {
 			extensionStateMaxItems: this.opts.extensionStateMaxItems,
 			pendingDialogLimit: this.opts.pendingDialogLimit,
 			projectionLimits: this.opts.projectionLimits,
-			piPayloadServices: this.opts.piPayloadServices,
 			initialGeneration,
 			commandTimeoutFor: this.opts.commandTimeoutFor,
 			emit: (message) => this.safeBroadcast(message),
@@ -921,8 +949,8 @@ export class SessionSupervisor {
 	}
 
 	private async commitIdentityTransition(
-		runtime: SessionRuntime,
-		transition: SessionIdentityTransitionCommit,
+		runtime: SessionRuntimeCore<M>,
+		transition: SessionIdentityTransitionCommit<SessionRuntimeProductEvent<M>>,
 	): Promise<void> {
 		await this.withPoolLock(async () => {
 			this.assertOpen();
@@ -947,7 +975,7 @@ export class SessionSupervisor {
 			transition.apply();
 			this.rekeyRuntime(previousSessionHandle, runtime, false);
 			const committedRuntime = runtime.snapshot();
-			let stagedMessages: SessionSupervisorMessage[];
+			let stagedMessages: SessionSupervisorMessage<SessionRuntimeProductEvent<M>>[];
 			try {
 				stagedMessages = transition.commitStaged();
 			} catch (error) {
@@ -1038,7 +1066,7 @@ export class SessionSupervisor {
 		);
 	}
 
-	private rekeyRuntime(previousHandle: string, runtime: SessionRuntime, keepAlias: boolean): void {
+	private rekeyRuntime(previousHandle: string, runtime: SessionRuntimeCore<M>, keepAlias: boolean): void {
 		const nextHandle = runtime.sessionHandle;
 		const collision = this.runtimes.get(nextHandle);
 		if (collision && collision !== runtime) {
@@ -1075,13 +1103,13 @@ export class SessionSupervisor {
 		return handle;
 	}
 
-	private assertGeneration(runtime: SessionRuntime, command: string, expected: number): void {
+	private assertGeneration(runtime: SessionRuntimeCore<M>, command: string, expected: number): void {
 		if (expected !== runtime.generation) {
 			throw new RpcError(command, "session_generation_stale");
 		}
 	}
 
-	private assertLease(runtime: SessionRuntime, command: string, context: SessionCommandContext): void {
+	private assertLease(runtime: SessionRuntimeCore<M>, command: string, context: SessionCommandContext): void {
 		const lease = this.leases.get(runtime.sessionHandle);
 		if (
 			!lease ||
@@ -1092,7 +1120,7 @@ export class SessionSupervisor {
 		}
 	}
 
-	private handleCrash(runtime: SessionRuntime): void {
+	private handleCrash(runtime: SessionRuntimeCore<M>): void {
 		if (this.closed) return;
 		if (runtime.protocolIncompatible) {
 			this.log("warn", `Not restarting protocol-incompatible Session ${runtime.sessionHandle}`);
@@ -1212,7 +1240,7 @@ export class SessionSupervisor {
 		});
 	}
 
-	private isEvictable(runtime: SessionRuntime): boolean {
+	private isEvictable(runtime: SessionRuntimeCore<M>): boolean {
 		return runtime.canEvict && !this.leases.has(runtime.sessionHandle);
 	}
 
@@ -1244,7 +1272,7 @@ export class SessionSupervisor {
 
 	private commitHotRuntimeInventoryIfChanged(): void {
 		const entries: HotRuntimeInventoryEntryDto[] = [];
-		const seen = new Set<SessionRuntime>();
+		const seen = new Set<SessionRuntimeCore<M>>();
 		for (const [trackedHandle, runtime] of this.runtimes) {
 			if (seen.has(runtime)) continue;
 			seen.add(runtime);
@@ -1299,7 +1327,7 @@ export class SessionSupervisor {
 		this.opts.log?.(level, message);
 	}
 
-	private safeBroadcast(message: SessionSupervisorMessage): void {
+	private safeBroadcast(message: SessionSupervisorMessage<SessionRuntimeProductEvent<M>>): void {
 		try {
 			this.opts.broadcast(message);
 		} catch (error) {
@@ -1310,6 +1338,21 @@ export class SessionSupervisor {
 	private assertOpen(): void {
 		if (this.closed) throw new RpcError("supervisor", "session_supervisor_closed");
 	}
+}
+
+/** Current protocol wrapper retained as the public Supervisor API. */
+export class SessionSupervisor extends SessionSupervisorCore<"current"> {
+	constructor(opts: SessionSupervisorOptions) {
+		const { piPayloadServices, ...coreOptions } = opts;
+		super(coreOptions, (runtimeOptions) => new SessionRuntime({ ...runtimeOptions, piPayloadServices }));
+	}
+}
+
+export function createFutureSessionSupervisor(opts: FutureSessionSupervisorOptions) {
+	const { piPayloadServices, ...coreOptions } = opts;
+	return new SessionSupervisorCore<"future_content">(coreOptions, (runtimeOptions) =>
+		createFutureSessionRuntime({ ...runtimeOptions, piPayloadServices }),
+	);
 }
 
 function sessionPathEntryExists(sessionFile: string): boolean {
@@ -1329,19 +1372,22 @@ function sessionPathEntryExists(sessionFile: string): boolean {
 	}
 }
 
-async function attachExportHtmlUrl(
+async function attachExportHtmlUrl<TResponse extends { readonly command: string; readonly success: boolean }>(
 	command: SessionCommandDto,
-	response: SessionCommandResponseDto,
+	response: TResponse,
 	cwd: string,
-): Promise<SessionCommandResponseDto> {
+): Promise<TResponse> {
 	if (command.type !== "export_html" || response.success !== true || response.command !== "export_html") {
 		return response;
 	}
-	const data = response.data;
-	if (typeof data !== "object" || data === null || typeof (data as { path?: unknown }).path !== "string") {
+	if (!("data" in response)) {
 		throw new RpcError("export_html", "Pi returned an invalid exported HTML path");
 	}
-	const piPath = (data as { path: string }).path;
+	const data = response.data;
+	if (typeof data !== "object" || data === null || !("path" in data) || typeof data.path !== "string") {
+		throw new RpcError("export_html", "Pi returned an invalid exported HTML path");
+	}
+	const piPath = data.path;
 	if (!piPath) throw new RpcError("export_html", "Pi returned an invalid exported HTML path");
 
 	let exportedPath: string;
@@ -1358,12 +1404,10 @@ async function attachExportHtmlUrl(
 	}
 	if (!stat.isFile()) throw new RpcError("export_html", "exported HTML path is not a regular file");
 
-	return {
-		...response,
-		data: {
-			...data,
+	return Object.assign({}, response, {
+		data: Object.assign({}, data, {
 			path: exportedPath,
 			url: pathToFileURL(exportedPath).href,
-		},
-	} as SessionCommandResponseDto;
+		}),
+	});
 }

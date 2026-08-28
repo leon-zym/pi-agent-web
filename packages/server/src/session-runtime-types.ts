@@ -109,7 +109,7 @@ export const READ_ONLY_COMMANDS = READ_ONLY_RPC_COMMAND_TYPES;
 export const HOST_MANAGED_COMMANDS = new Set(["new_session", "switch_session"]);
 export const IDENTITY_TRANSITION_COMMANDS = new Set(["fork", "clone"]);
 
-export function eventStartsWork(event: ProductSessionEventDto): boolean {
+export function eventStartsWork(event: { readonly type: string }): boolean {
 	return (
 		event.type === "agent_start" ||
 		event.type === "turn_start" ||
@@ -118,6 +118,6 @@ export function eventStartsWork(event: ProductSessionEventDto): boolean {
 	);
 }
 
-export function eventSettlesWork(event: ProductSessionEventDto): boolean {
+export function eventSettlesWork(event: { readonly type: string }): boolean {
 	return event.type === "agent_settled";
 }

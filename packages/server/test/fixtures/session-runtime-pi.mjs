@@ -489,6 +489,33 @@ function streamPrompt(command) {
 		send({ type: "agent_settled" });
 		return;
 	}
+	if (text === "logical-settle-boundary") {
+		send({ type: "turn_start" });
+		send({ type: "agent_end", messages: [], willRetry: false });
+		setTimeout(() => {
+			send({ type: "agent_settled" });
+			send({ type: "queue_update", steering: ["post-settle-marker"], followUp: [] });
+		}, 75);
+		return;
+	}
+	if (text === "logical-cleanup-boundary") {
+		send({ type: "turn_start" });
+		return;
+	}
+	if (text === "future-compaction-overflow") {
+		messages.push({
+			role: "toolResult",
+			toolCallId: "future-compaction-tool",
+			toolName: "fixture",
+			content: [{ type: "text", text: "x".repeat(300 * 1024) }],
+			details: { source: "future-compaction-overflow" },
+			isError: false,
+			timestamp: Date.now(),
+		});
+		send({ type: "agent_end", messages: [], willRetry: false });
+		send({ type: "agent_settled" });
+		return;
+	}
 	if (typeof text === "string" && text.startsWith("structural-count:")) {
 		const count = Number(text.slice("structural-count:".length));
 		for (let index = 0; index < count; index += 1) send({ type: "turn_start" });
