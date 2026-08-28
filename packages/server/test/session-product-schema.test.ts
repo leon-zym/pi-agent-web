@@ -1,4 +1,6 @@
 import type {
+	ExtensionUiRequestDto,
+	FutureExtensionUiRequestDto,
 	FutureProductSessionEventDto,
 	FutureSessionSnapshotDto,
 	FutureToolResultMessageDto,
@@ -8,6 +10,7 @@ import type {
 	SessionRuntimeDto,
 } from "@pi-agent-web/protocol";
 import {
+	analyzeFutureExtensionUiRequestLogicalBytes,
 	FUTURE_SESSION_CONTENT_REF_BUDGET,
 	SESSION_NORMALIZED_EVENT_MAX_BYTES,
 	SESSION_PAYLOAD_BUDGET,
@@ -97,6 +100,38 @@ function snapshot(firstBytes: number, secondBytes: number): FutureSessionSnapsho
 }
 
 describe("Session product schema", () => {
+	it("closes Extension request guards and logical accounting over the selected product family", () => {
+		const futureRequest = {
+			type: "extension_ui_request",
+			id: "future-editor",
+			method: "editor",
+			title: "Edit",
+			prefill: externalText(48 * MIB),
+		} satisfies FutureExtensionUiRequestDto;
+		const currentRequest = {
+			type: "extension_ui_request",
+			id: "current-editor",
+			method: "editor",
+			title: "Edit",
+			prefill: "inline",
+		} satisfies ExtensionUiRequestDto;
+		const future = createFutureSessionProductSchema(futureContext);
+		const current = createCurrentSessionProductSchema({
+			serverEpoch,
+			payloadBudget: SESSION_PAYLOAD_BUDGET,
+		});
+
+		expect(future.guardExtensionRequest(futureRequest)).toBe(true);
+		expect(future.extensionRequestLogicalBytes(futureRequest)).toBe(
+			analyzeFutureExtensionUiRequestLogicalBytes(futureRequest, {
+				maxBytes: SESSION_PI_SNAPSHOT_JSONL_MAX_BYTES,
+			}).byteLength,
+		);
+		expect(current.guardExtensionRequest(futureRequest)).toBe(false);
+		expect(current.guardExtensionRequest(currentRequest)).toBe(true);
+		expect(current.extensionRequestLogicalBytes(currentRequest)).toBe(0);
+	});
+
 	it("snapshots a mutable current context before guards can observe caller changes", () => {
 		const mutableContext = {
 			serverEpoch,

@@ -1,5 +1,7 @@
 import type {
 	ExtensionUiRequestDto,
+	ExtensionUiResponseDto,
+	FutureExtensionUiRequestDto,
 	FutureProductSessionEventDto,
 	FutureSessionCommandResponseDto,
 	FutureSessionSnapshotDto,
@@ -8,6 +10,7 @@ import type {
 	SessionSnapshotDto,
 } from "@pi-agent-web/protocol";
 import { describe, expect, expectTypeOf, it } from "vitest";
+import type { SessionRuntimeCore } from "../src/session-runtime.js";
 import type {
 	ReplayResult,
 	SessionCommandResult,
@@ -81,10 +84,12 @@ function futureSnapshot(event: SessionReplayFrame<FutureProductSessionEventDto>)
 describe("Session Runtime current-defaulted payload carriers", () => {
 	it("keeps zero-parameter aliases on the exact protocol 1.2 event, response, and snapshot types", () => {
 		type CurrentEvent = Extract<SessionReplayFrame, { type: "event" }>["event"];
+		type CurrentExtension = Extract<SessionReplayFrame, { type: "extension_ui_request" }>["request"];
 		type CurrentResponse = SessionCommandResult["response"];
 		type CurrentSnapshot = Extract<ReplayResult, { type: "resync_required" }>["snapshot"];
 
 		expectTypeOf<CurrentEvent>().toEqualTypeOf<ProductSessionEventDto>();
+		expectTypeOf<CurrentExtension>().toEqualTypeOf<ExtensionUiRequestDto>();
 		expectTypeOf<CurrentResponse>().toEqualTypeOf<SessionCommandResponseDto>();
 		expectTypeOf<CurrentSnapshot>().toEqualTypeOf<SessionSnapshotDto>();
 
@@ -98,10 +103,27 @@ describe("Session Runtime current-defaulted payload carriers", () => {
 			// @ts-expect-error A future external-text event must not enter the default 1.2 carrier.
 			event: futureEvent,
 		};
+		const currentExtensionFrame: SessionReplayFrame = {
+			type: "extension_ui_request",
+			serverEpoch,
+			sessionHandle: "session-a",
+			workspaceId: "workspace-a",
+			generation: 1,
+			seq: 2,
+			request: {
+				type: "extension_ui_request",
+				id: "future-editor",
+				method: "editor",
+				title: "Edit",
+				// @ts-expect-error A future external-text request must not enter the default 1.2 carrier.
+				prefill: externalText,
+			},
+		};
 		expect(currentFrame.type).toBe("event");
+		expect(currentExtensionFrame.type).toBe("extension_ui_request");
 	});
 
-	it("carries future events, responses, replay, and snapshots without widening Extension UI", () => {
+	it("closes future events, Extension requests, responses, replay, and snapshots independently", () => {
 		const frame: SessionReplayFrame<FutureProductSessionEventDto> = {
 			type: "event",
 			serverEpoch,
@@ -125,14 +147,38 @@ describe("Session Runtime current-defaulted payload carriers", () => {
 			barrierSeq: 1,
 			response: futureResponse,
 		};
+		const extensionFrame: SessionReplayFrame<FutureProductSessionEventDto, FutureExtensionUiRequestDto> = {
+			type: "extension_ui_request",
+			serverEpoch,
+			sessionHandle: "session-a",
+			workspaceId: "workspace-a",
+			generation: 1,
+			seq: 2,
+			request: {
+				type: "extension_ui_request",
+				id: "future-editor",
+				method: "editor",
+				title: "Edit",
+				prefill: externalText,
+			},
+		};
 		const supervisor: SessionSupervisorMessage<FutureProductSessionEventDto> = frame;
+		const extensionSupervisor: SessionSupervisorMessage<
+			FutureProductSessionEventDto,
+			FutureExtensionUiRequestDto
+		> = extensionFrame;
 
 		type FutureExtension = Extract<
-			SessionReplayFrame<FutureProductSessionEventDto>,
+			SessionReplayFrame<FutureProductSessionEventDto, FutureExtensionUiRequestDto>,
 			{ type: "extension_ui_request" }
 		>["request"];
-		expectTypeOf<FutureExtension>().toEqualTypeOf<ExtensionUiRequestDto>();
+		type FutureExtensionResponse = Parameters<
+			SessionRuntimeCore<"future_content">["sendExtensionUiResponse"]
+		>[0];
+		expectTypeOf<FutureExtension>().toEqualTypeOf<FutureExtensionUiRequestDto>();
+		expectTypeOf<FutureExtensionResponse>().toEqualTypeOf<ExtensionUiResponseDto>();
 		expect(supervisor).toBe(frame);
+		expect(extensionSupervisor).toBe(extensionFrame);
 		expect(command.response).toBe(futureResponse);
 		expect(replay.snapshot).toBe(snapshot);
 	});

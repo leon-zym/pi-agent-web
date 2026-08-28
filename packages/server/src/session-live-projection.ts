@@ -1,5 +1,6 @@
 import {
 	type ExtensionUiRequestDto,
+	isExtensionUiRequestDto,
 	isProductSessionEventDto,
 	isSessionAttachmentGuardContext,
 	isSessionMessageDto,
@@ -53,7 +54,11 @@ export interface SessionLiveProjectionLimits {
 	maxSnapshotBytes: number;
 }
 
-export interface SessionLiveProjectionOptions<TMessage = SessionMessageDto, TEvent = ProductSessionEventDto> {
+export interface SessionLiveProjectionOptions<
+	TMessage = SessionMessageDto,
+	TEvent = ProductSessionEventDto,
+	TExtensionRequest extends { readonly id: string; readonly method: string } = ExtensionUiRequestDto,
+> {
 	identity: SessionLiveProjectionIdentity;
 	settledMessages?: readonly TMessage[];
 	baseSeq: number;
@@ -61,12 +66,15 @@ export interface SessionLiveProjectionOptions<TMessage = SessionMessageDto, TEve
 	limits?: Partial<SessionLiveProjectionLimits>;
 	attachmentGuardContext?: SessionAttachmentGuardContext;
 	/** Explicit future schema; omission preserves the protocol 1.2 projection path. */
-	schema?: SessionProjectionProductSchema<TMessage, TEvent>;
+	schema?: SessionProjectionProductSchema<TMessage, TEvent, TExtensionRequest>;
 }
 
-export type SessionLiveProjectionInput<TEvent = ProductSessionEventDto> =
+export type SessionLiveProjectionInput<
+	TEvent = ProductSessionEventDto,
+	TExtensionRequest = ExtensionUiRequestDto,
+> =
 	| { type: "event"; event: TEvent }
-	| { type: "extension_ui_request"; request: ExtensionUiRequestDto }
+	| { type: "extension_ui_request"; request: TExtensionRequest }
 	| {
 			type: "extension_ui_closed";
 			requestId: string;
@@ -78,8 +86,11 @@ export type SessionLiveProjectionEventFrame<TEvent = ProductSessionEventDto> = O
 	"event"
 > & { event: TEvent };
 
-export interface SessionLiveProjectionSnapshot<TMessage = SessionMessageDto, TEvent = ProductSessionEventDto>
-	extends SessionLiveProjectionIdentity {
+export interface SessionLiveProjectionSnapshot<
+	TMessage = SessionMessageDto,
+	TEvent = ProductSessionEventDto,
+	TExtensionRequest = ExtensionUiRequestDto,
+> extends SessionLiveProjectionIdentity {
 	baseSeq: number;
 	asOfSeq: number;
 	runtimePhase: SessionLiveRuntimePhase;
@@ -89,8 +100,8 @@ export interface SessionLiveProjectionSnapshot<TMessage = SessionMessageDto, TEv
 		readonly steering: readonly string[];
 		readonly followUp: readonly string[];
 	};
-	pendingExtensionRequests: readonly ExtensionUiRequestDto[];
-	stickyExtensionState: readonly ExtensionUiRequestDto[];
+	pendingExtensionRequests: readonly TExtensionRequest[];
+	stickyExtensionState: readonly TExtensionRequest[];
 }
 
 export interface SessionLiveProjectionCompactionToken extends SessionLiveProjectionIdentity {
@@ -120,22 +131,22 @@ interface InternalCompactionToken extends SessionLiveProjectionCompactionToken {
 	owner: symbol;
 }
 
-interface ProjectionCandidate<TEvent> {
+interface ProjectionCandidate<TEvent, TExtensionRequest> {
 	asOfSeq: number;
 	projectionEvents: readonly SessionLiveProjectionEventFrame<TEvent>[];
 	projectionEventFrameBytes: readonly number[];
 	projectionEventBytes: number;
 	queue: { readonly steering: readonly string[]; readonly followUp: readonly string[] };
-	pendingExtensionRequests: Map<string, ExtensionUiRequestDto>;
+	pendingExtensionRequests: Map<string, TExtensionRequest>;
 	runtimePhase: SessionLiveRuntimePhase;
 }
 
-interface PreparedBatchState<TEvent> {
+interface PreparedBatchState<TEvent, TExtensionRequest> {
 	revision: number;
 	firstSeq: number;
 	lastSeq: number;
 	count: number;
-	candidate: ProjectionCandidate<TEvent>;
+	candidate: ProjectionCandidate<TEvent, TExtensionRequest>;
 }
 
 interface PreparedCompactionState<TMessage> {
@@ -176,14 +187,18 @@ export class SessionLiveProjectionPayloadError extends Error {
  * suffix needed to reconstruct live state. It does not duplicate the UI's
  * ConversationProjection reducer and it never persists a second Session truth.
  */
-export class SessionLiveProjection<TMessage = SessionMessageDto, TEvent = ProductSessionEventDto> {
+export class SessionLiveProjection<
+	TMessage = SessionMessageDto,
+	TEvent = ProductSessionEventDto,
+	TExtensionRequest extends { readonly id: string; readonly method: string } = ExtensionUiRequestDto,
+> {
 	private readonly identity: SessionLiveProjectionIdentity;
 	private readonly limits: SessionLiveProjectionLimits;
 	private readonly attachmentGuardContext: SessionAttachmentGuardContext | undefined;
-	private readonly schema: SessionProjectionProductSchema<TMessage, TEvent> | null;
+	private readonly schema: SessionProjectionProductSchema<TMessage, TEvent, TExtensionRequest> | null;
 	private readonly compactionOwner = Symbol("session-live-projection");
 	private readonly compactionTokens = new WeakMap<object, { revision: number }>();
-	private readonly preparedBatches = new WeakMap<object, PreparedBatchState<TEvent>>();
+	private readonly preparedBatches = new WeakMap<object, PreparedBatchState<TEvent, TExtensionRequest>>();
 	private readonly preparedCompactions = new WeakMap<object, PreparedCompactionState<TMessage>>();
 	private revision = 0;
 	private baseSeq: number;
@@ -197,10 +212,10 @@ export class SessionLiveProjection<TMessage = SessionMessageDto, TEvent = Produc
 		steering: [],
 		followUp: [],
 	};
-	private pendingExtensionRequests = new Map<string, ExtensionUiRequestDto>();
+	private pendingExtensionRequests = new Map<string, TExtensionRequest>();
 	private runtimePhase: SessionLiveRuntimePhase;
 
-	constructor(options: SessionLiveProjectionOptions<TMessage, TEvent>) {
+	constructor(options: SessionLiveProjectionOptions<TMessage, TEvent, TExtensionRequest>) {
 		assertIdentityShape(options.identity);
 		assertSequence(options.baseSeq);
 		this.identity = clone(options.identity);
@@ -238,7 +253,7 @@ export class SessionLiveProjection<TMessage = SessionMessageDto, TEvent = Produc
 
 	prepareCommit(
 		identity: SessionLiveProjectionIdentity,
-		input: SessionLiveProjectionInput<TEvent>,
+		input: SessionLiveProjectionInput<TEvent, TExtensionRequest>,
 		runtimePhase?: SessionLiveRuntimePhase,
 	): SessionLiveProjectionPreparedCommit {
 		this.assertIdentity(identity);
@@ -255,7 +270,7 @@ export class SessionLiveProjection<TMessage = SessionMessageDto, TEvent = Produc
 
 	prepareBatch(
 		identity: SessionLiveProjectionIdentity,
-		inputs: readonly SessionLiveProjectionInput<TEvent>[],
+		inputs: readonly SessionLiveProjectionInput<TEvent, TExtensionRequest>[],
 		runtimePhase?: SessionLiveRuntimePhase,
 	): SessionLiveProjectionPreparedBatch {
 		this.assertIdentity(identity);
@@ -272,7 +287,7 @@ export class SessionLiveProjection<TMessage = SessionMessageDto, TEvent = Produc
 
 	previewPreparedBatch(
 		token: SessionLiveProjectionPreparedBatch,
-	): SessionLiveProjectionSnapshot<TMessage, TEvent> | null {
+	): SessionLiveProjectionSnapshot<TMessage, TEvent, TExtensionRequest> | null {
 		const prepared = this.eligiblePreparedBatch(token);
 		if (!prepared) return null;
 		return this.snapshotCandidate(prepared.candidate);
@@ -285,7 +300,7 @@ export class SessionLiveProjection<TMessage = SessionMessageDto, TEvent = Produc
 	/** Temporary default-off seam. C2b must replace this with prepare/adopt/commit. */
 	commitInlineOnly(
 		identity: SessionLiveProjectionIdentity,
-		input: SessionLiveProjectionInput<TEvent>,
+		input: SessionLiveProjectionInput<TEvent, TExtensionRequest>,
 		runtimePhase?: SessionLiveRuntimePhase,
 	): number {
 		if (input.type === "event" && !isProductSessionEventDto(input.event)) {
@@ -308,8 +323,8 @@ export class SessionLiveProjection<TMessage = SessionMessageDto, TEvent = Produc
 		return Number.isSafeInteger(seq) && seq >= 0 && this.asOfSeq === seq;
 	}
 
-	snapshot(): SessionLiveProjectionSnapshot<TMessage, TEvent> {
-		const value: SessionLiveProjectionSnapshot<TMessage, TEvent> = {
+	snapshot(): SessionLiveProjectionSnapshot<TMessage, TEvent, TExtensionRequest> {
+		const value: SessionLiveProjectionSnapshot<TMessage, TEvent, TExtensionRequest> = {
 			...this.identity,
 			baseSeq: this.baseSeq,
 			asOfSeq: this.asOfSeq,
@@ -462,10 +477,10 @@ export class SessionLiveProjection<TMessage = SessionMessageDto, TEvent = Produc
 
 	previewPreparedIdleBaseCompaction(
 		token: SessionLiveProjectionPreparedCompaction,
-	): SessionLiveProjectionSnapshot<TMessage, TEvent> | null {
+	): SessionLiveProjectionSnapshot<TMessage, TEvent, TExtensionRequest> | null {
 		const prepared = this.eligiblePreparedIdleBaseCompaction(token);
 		if (!prepared) return null;
-		const candidate: SessionLiveProjectionSnapshot<TMessage, TEvent> = {
+		const candidate: SessionLiveProjectionSnapshot<TMessage, TEvent, TExtensionRequest> = {
 			...this.identity,
 			baseSeq: prepared.baseSeq,
 			asOfSeq: this.asOfSeq,
@@ -493,11 +508,11 @@ export class SessionLiveProjection<TMessage = SessionMessageDto, TEvent = Produc
 	}
 
 	private prepareBatchCore(
-		inputs: readonly SessionLiveProjectionInput<TEvent>[],
+		inputs: readonly SessionLiveProjectionInput<TEvent, TExtensionRequest>[],
 		runtimePhase: SessionLiveRuntimePhase | undefined,
 		token: object,
 	): void {
-		let candidate: ProjectionCandidate<TEvent> = {
+		let candidate: ProjectionCandidate<TEvent, TExtensionRequest> = {
 			asOfSeq: this.asOfSeq,
 			projectionEvents: this.projectionEvents,
 			projectionEventFrameBytes: this.projectionEventFrameBytes,
@@ -517,10 +532,10 @@ export class SessionLiveProjection<TMessage = SessionMessageDto, TEvent = Produc
 	}
 
 	private reduceCandidate(
-		candidate: ProjectionCandidate<TEvent>,
-		input: SessionLiveProjectionInput<TEvent>,
+		candidate: ProjectionCandidate<TEvent, TExtensionRequest>,
+		input: SessionLiveProjectionInput<TEvent, TExtensionRequest>,
 		runtimePhase: SessionLiveRuntimePhase | undefined,
-	): ProjectionCandidate<TEvent> {
+	): ProjectionCandidate<TEvent, TExtensionRequest> {
 		const nextSeq = candidate.asOfSeq + 1;
 		if (!Number.isSafeInteger(nextSeq)) throw new SessionLiveProjectionLimitError("live_events");
 		const nextRuntimePhase = runtimePhase ?? candidate.runtimePhase;
@@ -585,6 +600,17 @@ export class SessionLiveProjection<TMessage = SessionMessageDto, TEvent = Produc
 			projectionEventBytes = nextEventBytes;
 		} else if (input.type === "extension_ui_request") {
 			const requestValue = clone(input.request);
+			if (!this.guardExtensionRequest(requestValue)) {
+				throw new SessionLiveProjectionPayloadError();
+			}
+			try {
+				this.schema?.extensionRequestLogicalBytes(requestValue);
+			} catch (error) {
+				if (error instanceof SessionProductSchemaLogicalError) {
+					throw new SessionLiveProjectionLimitError("extension_state");
+				}
+				throw error;
+			}
 			pendingExtensionRequests = new Map(candidate.pendingExtensionRequests);
 			if (BLOCKING_EXTENSION_METHODS.has(requestValue.method)) {
 				pendingExtensionRequests.delete(requestValue.id);
@@ -615,7 +641,7 @@ export class SessionLiveProjection<TMessage = SessionMessageDto, TEvent = Produc
 		};
 	}
 
-	private eligiblePreparedBatch(token: object): PreparedBatchState<TEvent> | null {
+	private eligiblePreparedBatch(token: object): PreparedBatchState<TEvent, TExtensionRequest> | null {
 		if (typeof token !== "object" || token === null) return null;
 		const prepared = this.preparedBatches.get(token);
 		if (!prepared) return null;
@@ -648,9 +674,9 @@ export class SessionLiveProjection<TMessage = SessionMessageDto, TEvent = Produc
 	}
 
 	private snapshotCandidate(
-		candidate: ProjectionCandidate<TEvent>,
-	): SessionLiveProjectionSnapshot<TMessage, TEvent> {
-		const value: SessionLiveProjectionSnapshot<TMessage, TEvent> = {
+		candidate: ProjectionCandidate<TEvent, TExtensionRequest>,
+	): SessionLiveProjectionSnapshot<TMessage, TEvent, TExtensionRequest> {
+		const value: SessionLiveProjectionSnapshot<TMessage, TEvent, TExtensionRequest> = {
 			...this.identity,
 			baseSeq: this.baseSeq,
 			asOfSeq: candidate.asOfSeq,
@@ -704,6 +730,11 @@ export class SessionLiveProjection<TMessage = SessionMessageDto, TEvent = Produc
 		return isProductSessionEventDto(value, this.attachmentGuardContext);
 	}
 
+	private guardExtensionRequest(value: unknown): value is TExtensionRequest {
+		if (this.schema) return this.schema.guardExtensionRequest(value);
+		return isExtensionUiRequestDto(value);
+	}
+
 	private assertSnapshotFits(
 		overrides: {
 			baseSeq?: number;
@@ -713,7 +744,7 @@ export class SessionLiveProjection<TMessage = SessionMessageDto, TEvent = Produc
 			projectionEventBytes?: number;
 			projectionEventCount?: number;
 			queue?: { readonly steering: readonly string[]; readonly followUp: readonly string[] };
-			pendingExtensionRequests?: ReadonlyMap<string, ExtensionUiRequestDto>;
+			pendingExtensionRequests?: ReadonlyMap<string, TExtensionRequest>;
 		} = {},
 	): void {
 		const settledMessageBytes = overrides.settledMessageBytes ?? this.settledMessageBytes;
@@ -750,7 +781,7 @@ export class SessionLiveProjection<TMessage = SessionMessageDto, TEvent = Produc
 			: this.limits.maxSnapshotBytes;
 	}
 
-	private assertExtensionStateFits(pending: ReadonlyMap<string, ExtensionUiRequestDto>): void {
+	private assertExtensionStateFits(pending: ReadonlyMap<string, TExtensionRequest>): void {
 		const requests = [...pending.values()];
 		if (
 			requests.length > this.limits.maxExtensionItems ||

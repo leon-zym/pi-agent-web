@@ -42,11 +42,11 @@ interface SessionEnvelopeBase {
 	seq: number;
 }
 
-export type SessionReplayFrame<TEvent = ProductSessionEventDto> =
+export type SessionReplayFrame<TEvent = ProductSessionEventDto, TExtensionRequest = ExtensionUiRequestDto> =
 	| (SessionEnvelopeBase & { type: "event"; event: TEvent })
 	| (SessionEnvelopeBase & {
 			type: "extension_ui_request";
-			request: ExtensionUiRequestDto;
+			request: TExtensionRequest;
 	  })
 	| (SessionEnvelopeBase & {
 			type: "extension_ui_closed";
@@ -54,8 +54,11 @@ export type SessionReplayFrame<TEvent = ProductSessionEventDto> =
 			reason: "answered" | "cancelled" | "expired" | "process_lost" | "replaced";
 	  });
 
-export type SessionSupervisorMessage<TEvent = ProductSessionEventDto> =
-	| SessionReplayFrame<TEvent>
+export type SessionSupervisorMessage<
+	TEvent = ProductSessionEventDto,
+	TExtensionRequest = ExtensionUiRequestDto,
+> =
+	| SessionReplayFrame<TEvent, TExtensionRequest>
 	| { type: "runtime_state"; runtime: SessionRuntimeSnapshot }
 	| {
 			type: "session_rekeyed";
@@ -72,11 +75,15 @@ export interface ReplayCursor {
 	seq: number;
 }
 
-export type ReplayResult<TEvent = ProductSessionEventDto, TSnapshot = SessionSnapshotDto> =
+export type ReplayResult<
+	TEvent = ProductSessionEventDto,
+	TSnapshot = SessionSnapshotDto,
+	TExtensionRequest = ExtensionUiRequestDto,
+> =
 	| {
 			type: "replay";
 			runtime: SessionRuntimeSnapshot;
-			frames: SessionReplayFrame<TEvent>[];
+			frames: SessionReplayFrame<TEvent, TExtensionRequest>[];
 	  }
 	| {
 			type: "resync_required";

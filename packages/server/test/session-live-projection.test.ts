@@ -1,6 +1,7 @@
 import type {
 	AssistantMessageDto,
 	ExtensionUiRequestDto,
+	FutureExtensionUiRequestDto,
 	FutureProductSessionEventDto,
 	FutureSessionMessageDto,
 	FutureToolResultMessageDto,
@@ -149,6 +150,24 @@ function wireSnapshot(projection: ReturnType<SessionLiveProjection["snapshot"]>)
 }
 
 describe("SessionLiveProjection", () => {
+	it("keeps Extension request validation inside the selected product family", () => {
+		const futureRequest = {
+			type: "extension_ui_request",
+			id: "future-editor",
+			method: "editor",
+			title: "Edit",
+			prefill: externalText(48 * 1024 * 1024),
+		} satisfies FutureExtensionUiRequestDto;
+		const future = new SessionLiveProjection<
+			FutureSessionMessageDto,
+			FutureProductSessionEventDto,
+			FutureExtensionUiRequestDto
+		>({ identity, baseSeq: 0, schema: createFutureSessionProductSchema(futureContext) });
+
+		future.commitInlineOnly(identity, { type: "extension_ui_request", request: futureRequest });
+		expect(future.snapshot().pendingExtensionRequests).toEqual([futureRequest]);
+	});
+
 	it("keeps omitted and explicit current schemas behaviorally identical", () => {
 		const implicit = new SessionLiveProjection({ identity, baseSeq: 0, runtimePhase: "idle" });
 		const explicit = new SessionLiveProjection({
@@ -167,7 +186,11 @@ describe("SessionLiveProjection", () => {
 
 	it("injects the future guard and keeps the inline-only seam closed to refs", () => {
 		const schema = createFutureSessionProductSchema(futureContext);
-		const projection = new SessionLiveProjection<FutureSessionMessageDto, FutureProductSessionEventDto>({
+		const projection = new SessionLiveProjection<
+			FutureSessionMessageDto,
+			FutureProductSessionEventDto,
+			FutureExtensionUiRequestDto
+		>({
 			identity,
 			baseSeq: 0,
 			runtimePhase: "running",
@@ -186,7 +209,11 @@ describe("SessionLiveProjection", () => {
 
 	it("separates the future 64 MiB logical limit from the small normalized wire frame", () => {
 		const schema = createFutureSessionProductSchema(futureContext);
-		const projection = new SessionLiveProjection<FutureSessionMessageDto, FutureProductSessionEventDto>({
+		const projection = new SessionLiveProjection<
+			FutureSessionMessageDto,
+			FutureProductSessionEventDto,
+			FutureExtensionUiRequestDto
+		>({
 			identity,
 			baseSeq: 0,
 			runtimePhase: "running",
@@ -219,7 +246,11 @@ describe("SessionLiveProjection", () => {
 
 	it("enforces the 8 MiB plus 4 KiB normalized frame independently from configurable suffix bytes", () => {
 		const schema = createFutureSessionProductSchema(futureContext);
-		const projection = new SessionLiveProjection<FutureSessionMessageDto, FutureProductSessionEventDto>({
+		const projection = new SessionLiveProjection<
+			FutureSessionMessageDto,
+			FutureProductSessionEventDto,
+			FutureExtensionUiRequestDto
+		>({
 			identity,
 			baseSeq: 0,
 			runtimePhase: "running",
@@ -238,7 +269,11 @@ describe("SessionLiveProjection", () => {
 
 	it("bounds the future serialized projection suffix at 8 MiB across individually valid frames", () => {
 		const schema = createFutureSessionProductSchema(futureContext);
-		const projection = new SessionLiveProjection<FutureSessionMessageDto, FutureProductSessionEventDto>({
+		const projection = new SessionLiveProjection<
+			FutureSessionMessageDto,
+			FutureProductSessionEventDto,
+			FutureExtensionUiRequestDto
+		>({
 			identity,
 			baseSeq: 0,
 			runtimePhase: "running",
@@ -271,7 +306,11 @@ describe("SessionLiveProjection", () => {
 			maxLiveEventBytes: 4096,
 			maxSnapshotBytes: 4096,
 		};
-		const projection = new SessionLiveProjection<FutureSessionMessageDto, FutureProductSessionEventDto>({
+		const projection = new SessionLiveProjection<
+			FutureSessionMessageDto,
+			FutureProductSessionEventDto,
+			FutureExtensionUiRequestDto
+		>({
 			identity,
 			baseSeq: 0,
 			runtimePhase: "idle",
@@ -292,7 +331,11 @@ describe("SessionLiveProjection", () => {
 		).toThrow(SessionLiveProjectionLimitError);
 		expect(projection.snapshot()).toEqual(beforeEvent);
 
-		const compaction = new SessionLiveProjection<FutureSessionMessageDto, FutureProductSessionEventDto>({
+		const compaction = new SessionLiveProjection<
+			FutureSessionMessageDto,
+			FutureProductSessionEventDto,
+			FutureExtensionUiRequestDto
+		>({
 			identity,
 			baseSeq: 0,
 			runtimePhase: "idle",

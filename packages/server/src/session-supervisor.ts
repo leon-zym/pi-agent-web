@@ -22,6 +22,7 @@ import {
 	type SessionRuntimeCoreOptions,
 	type SessionRuntimePiPayloadServices,
 	type SessionRuntimeProductEvent,
+	type SessionRuntimeProductExtensionRequest,
 	type SessionRuntimeProductMode,
 	type SessionRuntimeProductResponse,
 	type SessionRuntimeProductSnapshot,
@@ -67,7 +68,8 @@ export interface HotRuntimeSubscriptionToken {
 
 export type HotRuntimeSubscriptionResult<M extends SessionRuntimeProductMode = "current"> = ReplayResult<
 	SessionRuntimeProductEvent<M>,
-	SessionRuntimeProductSnapshot<M>
+	SessionRuntimeProductSnapshot<M>,
+	SessionRuntimeProductExtensionRequest<M>
 > & {
 	observationToken: HotRuntimeSubscriptionToken;
 };
@@ -84,7 +86,12 @@ interface SessionSupervisorBaseOptions<M extends SessionRuntimeProductMode = "cu
 	env?: Record<string, string>;
 	envForWorkspace?: (cwd: string) => Record<string, string>;
 	resolveSession: (sessionHandle: string) => Promise<ExistingSessionTarget | undefined>;
-	broadcast: (message: SessionSupervisorMessage<SessionRuntimeProductEvent<M>>) => void;
+	broadcast: (
+		message: SessionSupervisorMessage<
+			SessionRuntimeProductEvent<M>,
+			SessionRuntimeProductExtensionRequest<M>
+		>,
+	) => void;
 	onHotRuntimeInventory?: (inventory: HotRuntimeInventoryDto) => void;
 	log?: (level: "info" | "warn" | "error", message: string) => void;
 	readyTimeoutMs?: number;
@@ -300,7 +307,13 @@ class SessionSupervisorCore<M extends SessionRuntimeProductMode = "current"> {
 	async subscribe(
 		sessionHandle: string,
 		cursor?: ReplayCursor,
-	): Promise<ReplayResult<SessionRuntimeProductEvent<M>, SessionRuntimeProductSnapshot<M>>> {
+	): Promise<
+		ReplayResult<
+			SessionRuntimeProductEvent<M>,
+			SessionRuntimeProductSnapshot<M>,
+			SessionRuntimeProductExtensionRequest<M>
+		>
+	> {
 		const runtime = await this.ensureRuntime(sessionHandle);
 		return runtime.getReplay(sessionHandle, cursor);
 	}
@@ -950,7 +963,10 @@ class SessionSupervisorCore<M extends SessionRuntimeProductMode = "current"> {
 
 	private async commitIdentityTransition(
 		runtime: SessionRuntimeCore<M>,
-		transition: SessionIdentityTransitionCommit<SessionRuntimeProductEvent<M>>,
+		transition: SessionIdentityTransitionCommit<
+			SessionRuntimeProductEvent<M>,
+			SessionRuntimeProductExtensionRequest<M>
+		>,
 	): Promise<void> {
 		await this.withPoolLock(async () => {
 			this.assertOpen();
@@ -975,7 +991,10 @@ class SessionSupervisorCore<M extends SessionRuntimeProductMode = "current"> {
 			transition.apply();
 			this.rekeyRuntime(previousSessionHandle, runtime, false);
 			const committedRuntime = runtime.snapshot();
-			let stagedMessages: SessionSupervisorMessage<SessionRuntimeProductEvent<M>>[];
+			let stagedMessages: SessionSupervisorMessage<
+				SessionRuntimeProductEvent<M>,
+				SessionRuntimeProductExtensionRequest<M>
+			>[];
 			try {
 				stagedMessages = transition.commitStaged();
 			} catch (error) {
@@ -1327,7 +1346,12 @@ class SessionSupervisorCore<M extends SessionRuntimeProductMode = "current"> {
 		this.opts.log?.(level, message);
 	}
 
-	private safeBroadcast(message: SessionSupervisorMessage<SessionRuntimeProductEvent<M>>): void {
+	private safeBroadcast(
+		message: SessionSupervisorMessage<
+			SessionRuntimeProductEvent<M>,
+			SessionRuntimeProductExtensionRequest<M>
+		>,
+	): void {
 		try {
 			this.opts.broadcast(message);
 		} catch (error) {

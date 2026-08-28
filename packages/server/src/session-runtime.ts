@@ -4,6 +4,7 @@ import path from "node:path";
 import type {
 	ExtensionUiRequestDto,
 	ExtensionUiResponseDto,
+	FutureExtensionUiRequestDto,
 	FutureProductSessionEventDto,
 	FutureSessionCommandResponseDto,
 	FutureSessionMessageDto,
@@ -72,17 +73,17 @@ const DEFAULT_EXTENSION_STATE_MAX_BYTES = 512 * 1024;
 const DEFAULT_EXTENSION_STATE_MAX_ITEMS = SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS;
 const DEFAULT_PENDING_DIALOG_LIMIT = 32;
 
-type BufferedFrame<TEvent = ProductSessionEventDto> =
+type BufferedFrame<TEvent = ProductSessionEventDto, TExtensionRequest = ExtensionUiRequestDto> =
 	| { type: "event"; event: TEvent }
-	| { type: "extension_ui_request"; request: ExtensionUiRequestDto }
+	| { type: "extension_ui_request"; request: TExtensionRequest }
 	| {
 			type: "extension_ui_closed";
 			requestId: string;
 			reason: "answered" | "cancelled" | "expired" | "process_lost" | "replaced";
 	  };
 
-interface PendingDialog {
-	request: ExtensionUiRequestDto;
+interface PendingDialog<TExtensionRequest = ExtensionUiRequestDto> {
+	request: TExtensionRequest;
 	timer: NodeJS.Timeout | null;
 }
 
@@ -95,10 +96,11 @@ interface PendingTurnReservation {
 
 interface TransitionStage<
 	TEvent = ProductSessionEventDto,
+	TExtensionRequest = ExtensionUiRequestDto,
 	TRef extends EpochStoredContentRef = SessionAttachmentRefDto,
 > {
 	phase: "awaiting_response" | "verifying" | "applying";
-	frames: BufferedFrame<TEvent>[];
+	frames: BufferedFrame<TEvent, TExtensionRequest>[];
 	bytes: number;
 	processToken: number;
 	parentGeneration: number;
@@ -116,24 +118,31 @@ interface FrozenSessionFileIdentity {
 	cwd: string;
 }
 
-interface PreparedActiveEventPublication<TMessage, TEvent> {
-	projection: SessionLiveProjection<TMessage, TEvent>;
+interface PreparedActiveEventPublication<
+	TMessage,
+	TEvent,
+	TExtensionRequest extends { readonly id: string; readonly method: string },
+> {
+	projection: SessionLiveProjection<TMessage, TEvent, TExtensionRequest>;
 	token: SessionLiveProjectionPreparedCommit;
-	frame: Extract<BufferedFrame<TEvent>, { type: "event" }>;
-	envelope: SessionReplayFrame<TEvent>;
+	frame: Extract<BufferedFrame<TEvent, TExtensionRequest>, { type: "event" }>;
+	envelope: SessionReplayFrame<TEvent, TExtensionRequest>;
 	turnBudget: { items: number; bytes: number; logicalBytes: number };
-	replay: SessionReplayFrame<TEvent>[];
+	replay: SessionReplayFrame<TEvent, TExtensionRequest>[];
 	replayFrameBytes: number[];
 	replayBytes: number;
 }
 
-export interface SessionIdentityTransitionCommit<TEvent = ProductSessionEventDto> {
+export interface SessionIdentityTransitionCommit<
+	TEvent = ProductSessionEventDto,
+	TExtensionRequest = ExtensionUiRequestDto,
+> {
 	previousSessionHandle: string;
 	nextTarget: ExistingSessionTarget;
 	/** Apply the verified identity exactly once while the Supervisor pool lock is held. */
 	apply: () => void;
 	/** Commit staged child frames to one waterline before the rekey becomes observable. */
-	commitStaged: () => SessionSupervisorMessage<TEvent>[];
+	commitStaged: () => SessionSupervisorMessage<TEvent, TExtensionRequest>[];
 }
 
 export interface SessionHotRuntimeObservation {
@@ -143,7 +152,12 @@ export interface SessionHotRuntimeObservation {
 
 type SessionRuntimePiProcessOptions = Omit<
 	PiProcessOptions,
-	"payloadExternalizer" | "onDecodedEvent" | "onFutureDecodedEvent" | "onEvent"
+	| "payloadExternalizer"
+	| "onDecodedEvent"
+	| "onFutureDecodedEvent"
+	| "onFutureDecodedExtensionUiRequest"
+	| "onEvent"
+	| "onExtensionUiRequest"
 >;
 
 export interface RuntimeProductMap {
@@ -154,6 +168,7 @@ export interface RuntimeProductMap {
 		snapshot: SessionSnapshotDto;
 		ref: SessionAttachmentRefDto;
 		externalizer: PiHostAttachmentPayloadExternalizer;
+		extensionRequest: ExtensionUiRequestDto;
 	};
 	future_content: {
 		message: FutureSessionMessageDto;
@@ -162,6 +177,7 @@ export interface RuntimeProductMap {
 		snapshot: FutureSessionSnapshotDto;
 		ref: EpochStoredContentRef;
 		externalizer: PiHostFuturePayloadExternalizer;
+		extensionRequest: FutureExtensionUiRequestDto;
 	};
 }
 
@@ -172,6 +188,7 @@ type RuntimeResponse<M extends SessionRuntimeProductMode> = RuntimeProductMap[M]
 type RuntimeSnapshot<M extends SessionRuntimeProductMode> = RuntimeProductMap[M]["snapshot"];
 type RuntimeRef<M extends SessionRuntimeProductMode> = RuntimeProductMap[M]["ref"];
 type RuntimeExternalizer<M extends SessionRuntimeProductMode> = RuntimeProductMap[M]["externalizer"];
+type RuntimeExtensionRequest<M extends SessionRuntimeProductMode> = RuntimeProductMap[M]["extensionRequest"];
 
 export interface SessionRuntimePayloadCustody<M extends SessionRuntimeProductMode> {
 	readonly externalizer: RuntimeExternalizer<M>;
@@ -181,13 +198,20 @@ export interface SessionRuntimePayloadCustody<M extends SessionRuntimeProductMod
 export interface SessionRuntimePiPayloadServices<M extends SessionRuntimeProductMode = "current">
 	extends SessionRuntimePayloadCustody<M> {
 	readonly mode: M;
-	readonly productSchema: SessionProductSchema<RuntimeMessage<M>, RuntimeEvent<M>, RuntimeSnapshot<M>>;
+	readonly productSchema: SessionProductSchema<
+		RuntimeMessage<M>,
+		RuntimeEvent<M>,
+		RuntimeSnapshot<M>,
+		RuntimeExtensionRequest<M>
+	>;
 }
 
 export type CurrentSessionRuntimePiPayloadServices = SessionRuntimePiPayloadServices<"current">;
 export type FutureSessionRuntimePiPayloadServices = SessionRuntimePiPayloadServices<"future_content">;
 
 export type SessionRuntimeProductEvent<M extends SessionRuntimeProductMode> = RuntimeEvent<M>;
+export type SessionRuntimeProductExtensionRequest<M extends SessionRuntimeProductMode> =
+	RuntimeExtensionRequest<M>;
 export type SessionRuntimeProductResponse<M extends SessionRuntimeProductMode> = RuntimeResponse<M>;
 export type SessionRuntimeProductSnapshot<M extends SessionRuntimeProductMode> = RuntimeSnapshot<M>;
 
@@ -208,12 +232,12 @@ export interface SessionRuntimeCoreOptions<M extends SessionRuntimeProductMode =
 	payloadCustody?: SessionRuntimePayloadCustody<M>;
 	initialGeneration?: number;
 	commandTimeoutFor?: (commandType: string) => number;
-	emit: (message: SessionSupervisorMessage<RuntimeEvent<M>>) => void;
+	emit: (message: SessionSupervisorMessage<RuntimeEvent<M>, RuntimeExtensionRequest<M>>) => void;
 	onHotSetChanged?: (runtime: SessionRuntimeCore<M>) => void;
 	onCrash: (runtime: SessionRuntimeCore<M>) => void;
 	commitIdentityTransition: (
 		runtime: SessionRuntimeCore<M>,
-		transition: SessionIdentityTransitionCommit<RuntimeEvent<M>>,
+		transition: SessionIdentityTransitionCommit<RuntimeEvent<M>, RuntimeExtensionRequest<M>>,
 	) => Promise<void>;
 	log?: (level: "info" | "warn" | "error", message: string) => void;
 }
@@ -246,7 +270,8 @@ export function createFutureSessionRuntimePiPayloadServices(input: {
 	productSchema: SessionProductSchema<
 		FutureSessionMessageDto,
 		FutureProductSessionEventDto,
-		FutureSessionSnapshotDto
+		FutureSessionSnapshotDto,
+		FutureExtensionUiRequestDto
 	>;
 	releaseHold: (hold: EpochContentHold<EpochStoredContentRef>) => Promise<void>;
 }): FutureSessionRuntimePiPayloadServices {
@@ -259,7 +284,12 @@ export function createFutureSessionRuntimePiPayloadServices(input: {
 
 export interface SessionRuntimeProductAdapter<M extends SessionRuntimeProductMode> {
 	readonly mode: M;
-	readonly productSchema: SessionProductSchema<RuntimeMessage<M>, RuntimeEvent<M>, RuntimeSnapshot<M>>;
+	readonly productSchema: SessionProductSchema<
+		RuntimeMessage<M>,
+		RuntimeEvent<M>,
+		RuntimeSnapshot<M>,
+		RuntimeExtensionRequest<M>
+	>;
 	createProcess(
 		options: SessionRuntimePiProcessOptions,
 		payloadCustody: SessionRuntimePayloadCustody<M> | null,
@@ -267,6 +297,7 @@ export interface SessionRuntimeProductAdapter<M extends SessionRuntimeProductMod
 			proc: PiProcess,
 			delivery: PiDecodedDelivery<RuntimeEvent<M>, RuntimeRef<M>>,
 		) => PiDecodedDeliveryPlan,
+		consumeExtensionRequest: (request: RuntimeExtensionRequest<M>) => void,
 	): PiProcess;
 	sendDecoded(
 		proc: PiProcess,
@@ -284,7 +315,7 @@ function createCurrentProductAdapter(
 	const adapter: SessionRuntimeProductAdapter<"current"> = {
 		mode: "current",
 		productSchema,
-		createProcess: (options, payloadCustody, consumeEvent) => {
+		createProcess: (options, payloadCustody, consumeEvent, consumeExtensionRequest) => {
 			let owner: PiProcess | undefined;
 			const proc = new PiProcess({
 				...options,
@@ -293,6 +324,7 @@ function createCurrentProductAdapter(
 					if (!owner) throw new RpcError("event", "session_process_not_installed");
 					return consumeEvent(owner, delivery);
 				},
+				onExtensionUiRequest: consumeExtensionRequest,
 			});
 			owner = proc;
 			return proc;
@@ -308,13 +340,14 @@ function createFutureProductAdapter(
 	productSchema: SessionProductSchema<
 		FutureSessionMessageDto,
 		FutureProductSessionEventDto,
-		FutureSessionSnapshotDto
+		FutureSessionSnapshotDto,
+		FutureExtensionUiRequestDto
 	>,
 ): SessionRuntimeProductAdapter<"future_content"> {
 	const adapter: SessionRuntimeProductAdapter<"future_content"> = {
 		mode: "future_content",
 		productSchema,
-		createProcess: (options, payloadCustody, consumeEvent) => {
+		createProcess: (options, payloadCustody, consumeEvent, _consumeExtensionRequest) => {
 			if (!payloadCustody) throw new TypeError("Future Session Runtime requires payload custody");
 			let owner: PiProcess | undefined;
 			const proc = new PiProcess({
@@ -374,18 +407,22 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	private processToken = 0;
 	private failedProcessToken: number | null = null;
 	private startupReady = false;
-	private startupFrames: BufferedFrame<RuntimeEvent<M>>[] = [];
+	private startupFrames: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[] = [];
 	private startupFrameBytes = 0;
-	private transitionStage: TransitionStage<RuntimeEvent<M>, RuntimeRef<M>> | null = null;
-	private replay: SessionReplayFrame<RuntimeEvent<M>>[] = [];
+	private transitionStage: TransitionStage<
+		RuntimeEvent<M>,
+		RuntimeExtensionRequest<M>,
+		RuntimeRef<M>
+	> | null = null;
+	private replay: SessionReplayFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[] = [];
 	private replayFrameBytes: number[] = [];
 	private replayBytes = 0;
 	private lastTransientSeq = 0;
-	private pendingDialogs = new Map<string, PendingDialog>();
+	private pendingDialogs = new Map<string, PendingDialog<RuntimeExtensionRequest<M>>>();
 	private pendingTurnReservations = new Map<symbol, PendingTurnReservation>();
 	private nextTurnReservationId = 0n;
 	private queueReservationReleaseCutoff = 0n;
-	private stickyExtension = new Map<string, ExtensionUiRequestDto>();
+	private stickyExtension = new Map<string, RuntimeExtensionRequest<M>>();
 	private activeQueueDepth = 0;
 	private activeTurnProjectionItems = 0;
 	private activeTurnProjectionBytes = 0;
@@ -400,7 +437,11 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	private terminalProtocolIncompatible = false;
 	private sessionFileIdentityVerified = false;
 	private hasConversationIntent = false;
-	private liveProjection: SessionLiveProjection<RuntimeMessage<M>, RuntimeEvent<M>> | null = null;
+	private liveProjection: SessionLiveProjection<
+		RuntimeMessage<M>,
+		RuntimeEvent<M>,
+		RuntimeExtensionRequest<M>
+	> | null = null;
 	private generationContentOwner: GenerationContentOwner<RuntimeRef<M>> | null = null;
 	private retainedCrashedContentOwner: {
 		processToken: number;
@@ -413,8 +454,12 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	private discardedCompactionTransferCleanup: Promise<void> | null = null;
 	private retiredGenerationContentCleanup: Promise<void> | null = null;
 	private generationContentCleanupFailure: Error | null = null;
-	private deferredStartupEmits: SessionSupervisorMessage<RuntimeEvent<M>>[] | null = null;
-	private deferredTransitionEmits: SessionSupervisorMessage<RuntimeEvent<M>>[] | null = null;
+	private deferredStartupEmits:
+		| SessionSupervisorMessage<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[]
+		| null = null;
+	private deferredTransitionEmits:
+		| SessionSupervisorMessage<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[]
+		| null = null;
 
 	sessionHandle: string;
 	readonly workspaceId: string;
@@ -677,11 +722,13 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			env: this.opts.env,
 			readyTimeoutMs: this.opts.readyTimeoutMs,
 			onReady: (state) => this.handleReady(processToken, state),
-			onExtensionUiRequest: (request) => this.handleExtensionRequest(processToken, request),
 			onExit: (info) => this.handleFailure(processToken, info),
 		};
-		const proc = this.productAdapter.createProcess(processOptions, this.payloadCustody, (owner, delivery) =>
-			this.prepareDecodedEvent(processToken, owner, delivery),
+		const proc = this.productAdapter.createProcess(
+			processOptions,
+			this.payloadCustody,
+			(owner, delivery) => this.prepareDecodedEvent(processToken, owner, delivery),
+			(request) => this.handleExtensionRequest(processToken, request),
 		);
 		this.proc = proc;
 		if (contentOwner) this.observeGenerationContentFailure(processToken, proc, contentOwner);
@@ -810,8 +857,12 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			owner: GenerationContentOwner<RuntimeRef<M>>;
 			isCurrent: () => boolean;
 		},
-	): Promise<SessionLiveProjection<RuntimeMessage<M>, RuntimeEvent<M>>> {
-		let preparedProjection: SessionLiveProjection<RuntimeMessage<M>, RuntimeEvent<M>> | null = null;
+	): Promise<SessionLiveProjection<RuntimeMessage<M>, RuntimeEvent<M>, RuntimeExtensionRequest<M>>> {
+		let preparedProjection: SessionLiveProjection<
+			RuntimeMessage<M>,
+			RuntimeEvent<M>,
+			RuntimeExtensionRequest<M>
+		> | null = null;
 		const contentOwner = candidateOwnership?.owner ?? this.generationContentOwner;
 		const ownerIsCurrent =
 			candidateOwnership?.isCurrent ??
@@ -821,7 +872,11 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 					: processToken === this.processToken && this.proc === proc);
 		const consume: PiDecodedDeliveryConsumer<RuntimeResponse<M>, RuntimeRef<M>> = (delivery) => {
 			const messages = this.productAdapter.messagesFrom(delivery.value);
-			const candidate = new SessionLiveProjection<RuntimeMessage<M>, RuntimeEvent<M>>({
+			const candidate = new SessionLiveProjection<
+				RuntimeMessage<M>,
+				RuntimeEvent<M>,
+				RuntimeExtensionRequest<M>
+			>({
 				identity,
 				settledMessages: messages,
 				baseSeq: 0,
@@ -873,7 +928,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	private isCurrentPayloadTransition(
 		processToken: number,
 		proc: PiProcess,
-		stage: TransitionStage<RuntimeEvent<M>, RuntimeRef<M>>,
+		stage: TransitionStage<RuntimeEvent<M>, RuntimeExtensionRequest<M>, RuntimeRef<M>>,
 	): boolean {
 		return (
 			this.transitionStage === stage &&
@@ -891,7 +946,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 
 	private prepareTransitionPayloadDelivery(
 		proc: PiProcess,
-		stage: TransitionStage<RuntimeEvent<M>, RuntimeRef<M>>,
+		stage: TransitionStage<RuntimeEvent<M>, RuntimeExtensionRequest<M>, RuntimeRef<M>>,
 		delivery: PiDecodedDelivery<RuntimeResponse<M>, RuntimeRef<M>>,
 		commandType: string,
 	): PiDecodedDeliveryPlan {
@@ -1109,7 +1164,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 				throw new RpcError(command.type, "session_generation_stale");
 			}
 			const payloadBudget = this.payloadCustody?.externalizer.context.payloadBudget;
-			const stage: TransitionStage<RuntimeEvent<M>, RuntimeRef<M>> = {
+			const stage: TransitionStage<RuntimeEvent<M>, RuntimeExtensionRequest<M>, RuntimeRef<M>> = {
 				phase: "awaiting_response",
 				frames: [],
 				bytes: 0,
@@ -1397,14 +1452,14 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	getReplay(
 		requestedHandle: string,
 		cursor?: ReplayCursor,
-	): ReplayResult<RuntimeEvent<M>, SessionRuntimeProductSnapshot<M>> {
+	): ReplayResult<RuntimeEvent<M>, SessionRuntimeProductSnapshot<M>, RuntimeExtensionRequest<M>> {
 		const runtime = this.snapshot();
 		const resync = (
 			reason: Extract<
-				ReplayResult<RuntimeEvent<M>, SessionRuntimeProductSnapshot<M>>,
+				ReplayResult<RuntimeEvent<M>, SessionRuntimeProductSnapshot<M>, RuntimeExtensionRequest<M>>,
 				{ type: "resync_required" }
 			>["reason"],
-		): ReplayResult<RuntimeEvent<M>, SessionRuntimeProductSnapshot<M>> => ({
+		): ReplayResult<RuntimeEvent<M>, SessionRuntimeProductSnapshot<M>, RuntimeExtensionRequest<M>> => ({
 			type: "resync_required",
 			runtime,
 			reason,
@@ -1442,7 +1497,11 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	}
 
 	private buildSessionSnapshot(
-		source: SessionLiveProjection<RuntimeMessage<M>, RuntimeEvent<M>> | null = this.liveProjection,
+		source: SessionLiveProjection<
+			RuntimeMessage<M>,
+			RuntimeEvent<M>,
+			RuntimeExtensionRequest<M>
+		> | null = this.liveProjection,
 		runtime: SessionRuntimeSnapshot = this.snapshot(),
 	): unknown {
 		const projection = source?.snapshot();
@@ -1453,7 +1512,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	}
 
 	private buildSessionSnapshotFromProjection(
-		projection: SessionLiveProjectionSnapshot<RuntimeMessage<M>, RuntimeEvent<M>>,
+		projection: SessionLiveProjectionSnapshot<RuntimeMessage<M>, RuntimeEvent<M>, RuntimeExtensionRequest<M>>,
 		runtime: SessionRuntimeSnapshot = this.snapshot(),
 	): unknown {
 		return structuredClone({
@@ -1507,7 +1566,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		return this.productAdapter.productSchema.guardSnapshot(value);
 	}
 
-	getPendingExtensionRequests(): ExtensionUiRequestDto[] {
+	getPendingExtensionRequests(): RuntimeExtensionRequest<M>[] {
 		const pending = [...this.pendingDialogs.values()].map((entry) => entry.request);
 		return [...this.stickyExtension.values(), ...pending];
 	}
@@ -1585,7 +1644,10 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	): PiDecodedDeliveryPlan {
 		const transition = this.transitionStage;
 		const commitMaterializedIdentity = this.inspectMaterializedSessionFile();
-		const frame: BufferedFrame<RuntimeEvent<M>> = { type: "event", event: delivery.value };
+		const frame: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>> = {
+			type: "event",
+			event: delivery.value,
+		};
 		if (!this.payloadCustody) {
 			return delivery.prepare((transfer) => {
 				if (transfer || processToken !== this.processToken || this.proc !== proc) {
@@ -1662,8 +1724,8 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	}
 
 	private prepareActiveEventPublication(
-		frame: Extract<BufferedFrame<RuntimeEvent<M>>, { type: "event" }>,
-	): PreparedActiveEventPublication<RuntimeMessage<M>, RuntimeEvent<M>> {
+		frame: Extract<BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>, { type: "event" }>,
+	): PreparedActiveEventPublication<RuntimeMessage<M>, RuntimeEvent<M>, RuntimeExtensionRequest<M>> {
 		const projection = this.liveProjection;
 		if (!projection) throw new RpcError("session_snapshot", "session_snapshot_unavailable");
 		const reset = !this.agentBusy && eventStartsWork(frame.event);
@@ -1686,7 +1748,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			throw this.normalizeProjectionError(new SessionLiveProjectionLimitError("live_events"));
 		}
 		const logicalBytes = logicalBase + logicalContribution;
-		const envelope: SessionReplayFrame<RuntimeEvent<M>> = {
+		const envelope: SessionReplayFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>> = {
 			...frame,
 			serverEpoch: this.opts.serverEpoch,
 			sessionHandle: this.sessionHandle,
@@ -1726,7 +1788,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	}
 
 	private commitActiveEventPublication(
-		prepared: PreparedActiveEventPublication<RuntimeMessage<M>, RuntimeEvent<M>>,
+		prepared: PreparedActiveEventPublication<RuntimeMessage<M>, RuntimeEvent<M>, RuntimeExtensionRequest<M>>,
 	): void {
 		if (this.liveProjection !== prepared.projection) {
 			throw new RpcError("event", "session_projection_changed_before_commit");
@@ -1852,7 +1914,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		if (this.state === "idle") this.maybeCompactIdleProjectionBase();
 	}
 
-	private handleExtensionRequest(processToken: number, request: ExtensionUiRequestDto): void {
+	private handleExtensionRequest(processToken: number, request: RuntimeExtensionRequest<M>): void {
 		if (processToken !== this.processToken) return;
 		this.verifyMaterializedSessionFile();
 		if (BLOCKING_DIALOG_METHODS.has(request.method)) {
@@ -1886,7 +1948,11 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		return true;
 	}
 
-	private trackDialog(request: ExtensionUiRequestDto, processToken: number, publishState: boolean): void {
+	private trackDialog(
+		request: RuntimeExtensionRequest<M>,
+		processToken: number,
+		publishState: boolean,
+	): void {
 		this.closeDialog(request.id, "replaced");
 		const requestBytes = extensionRequestBytes(request);
 		if (
@@ -1919,7 +1985,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		return bytes;
 	}
 
-	private enqueueFrame(frame: BufferedFrame<RuntimeEvent<M>>): void {
+	private enqueueFrame(frame: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>): void {
 		this.touch();
 		const bytes = bufferedFrameBytes(frame);
 		if (!this.startupReady) {
@@ -1945,7 +2011,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		this.publishFrame(frame);
 	}
 
-	private flushFrames(frames: BufferedFrame<RuntimeEvent<M>>[]): void {
+	private flushFrames(frames: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[]): void {
 		for (const frame of frames) {
 			if (
 				frame.type === "extension_ui_request" &&
@@ -1958,7 +2024,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		}
 	}
 
-	private publishFrame(frame: BufferedFrame<RuntimeEvent<M>>): void {
+	private publishFrame(frame: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>): void {
 		if (frame.type === "event") {
 			this.commitActiveEventPublication(this.prepareActiveEventPublication(frame));
 			return;
@@ -1971,7 +2037,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		this.applyFrameState(frame);
 	}
 
-	private publishStickyRequest(request: ExtensionUiRequestDto): void {
+	private publishStickyRequest(request: RuntimeExtensionRequest<M>): void {
 		const key = stickyRequestKey(request);
 		if (stickyRequestClearsState(request)) {
 			this.emitFrame({ type: "extension_ui_request", request }, () => {
@@ -1988,13 +2054,13 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			if (!oldestKey) break;
 			const oldest = candidate.get(oldestKey);
 			if (!oldest) break;
-			this.emitFrame({ type: "extension_ui_request", request: stickyClearRequest(oldest) }, () => {
+			this.emitFrame({ type: "extension_ui_request", request: this.stickyClearRequest(oldest) }, () => {
 				this.stickyExtension.delete(oldestKey);
 			});
 			candidate.delete(oldestKey);
 		}
 		if (!this.extensionStateCandidateFits(candidate, requestBytes, 1)) {
-			this.emitFrame({ type: "extension_ui_request", request: stickyClearRequest(request) }, () => {
+			this.emitFrame({ type: "extension_ui_request", request: this.stickyClearRequest(request) }, () => {
 				this.stickyExtension.delete(key);
 			});
 			this.log("warn", `Dropping oversized sticky extension state for ${this.sessionHandle}`);
@@ -2006,8 +2072,22 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		});
 	}
 
+	private stickyClearRequest(request: RuntimeExtensionRequest<M>): RuntimeExtensionRequest<M> {
+		const id = `evicted:${randomUUID()}`;
+		let candidate: unknown;
+		if (request.method === "setStatus") candidate = { ...request, id, statusText: undefined };
+		else if (request.method === "setWidget") candidate = { ...request, id, widgetLines: undefined };
+		else if (request.method === "setTitle") candidate = { ...request, id, title: "" };
+		else if (request.method === "set_editor_text") candidate = { ...request, id, text: "" };
+		else throw new RpcError("extension_ui_request", "invalid_sticky_extension_method");
+		if (!this.productAdapter.productSchema.guardExtensionRequest(candidate)) {
+			throw new RpcError("extension_ui_request", "invalid_sticky_extension_clear");
+		}
+		return candidate;
+	}
+
 	private extensionStateCandidateFits(
-		sticky: ReadonlyMap<string, ExtensionUiRequestDto>,
+		sticky: ReadonlyMap<string, RuntimeExtensionRequest<M>>,
 		extraBytes: number,
 		extraItems: number,
 	): boolean {
@@ -2020,7 +2100,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		);
 	}
 
-	private applyFrameState(frame: BufferedFrame<RuntimeEvent<M>>): void {
+	private applyFrameState(frame: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>): void {
 		if (frame.type === "event") {
 			this.applyEventState(frame.event);
 			return;
@@ -2040,7 +2120,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 
 	private commitParentConfirmedTransition(
 		proc: PiProcess,
-		stage: TransitionStage<RuntimeEvent<M>, RuntimeRef<M>>,
+		stage: TransitionStage<RuntimeEvent<M>, RuntimeExtensionRequest<M>, RuntimeRef<M>>,
 	): void {
 		if (stage.payloadLedger) {
 			if (!stage.parentOwner || !this.isCurrentPayloadTransition(stage.processToken, proc, stage)) {
@@ -2052,7 +2132,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	}
 
 	private releaseTransitionStagePayloads(
-		stage: TransitionStage<RuntimeEvent<M>, RuntimeRef<M>> | null,
+		stage: TransitionStage<RuntimeEvent<M>, RuntimeExtensionRequest<M>, RuntimeRef<M>> | null,
 		currentOwner: GenerationContentOwner<RuntimeRef<M>> | null,
 	): Promise<void> | undefined {
 		if (!stage) return undefined;
@@ -2082,7 +2162,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		});
 	}
 
-	private commitTransitionFrames(): SessionSupervisorMessage<RuntimeEvent<M>>[] {
+	private commitTransitionFrames(): SessionSupervisorMessage<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[] {
 		if (this.deferredTransitionEmits) {
 			throw new RpcError("session_transition", "transition_frame_commit_reentered");
 		}
@@ -2109,7 +2189,11 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		}
 	}
 
-	private previewTransitionFrames(): SessionLiveProjectionSnapshot<RuntimeMessage<M>, RuntimeEvent<M>> {
+	private previewTransitionFrames(): SessionLiveProjectionSnapshot<
+		RuntimeMessage<M>,
+		RuntimeEvent<M>,
+		RuntimeExtensionRequest<M>
+	> {
 		const stage = this.transitionStage;
 		const projection = this.liveProjection;
 		if (!stage || !projection) {
@@ -2119,7 +2203,11 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		if (source.asOfSeq !== source.baseSeq || source.projectionEvents.length !== 0) {
 			throw new RpcError("session_transition", "transition_child_projection_not_pristine");
 		}
-		const candidate = new SessionLiveProjection<RuntimeMessage<M>, RuntimeEvent<M>>({
+		const candidate = new SessionLiveProjection<
+			RuntimeMessage<M>,
+			RuntimeEvent<M>,
+			RuntimeExtensionRequest<M>
+		>({
 			identity: {
 				serverEpoch: source.serverEpoch,
 				sessionHandle: source.sessionHandle,
@@ -2143,7 +2231,10 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		return candidate.snapshot();
 	}
 
-	private emitFrame(frame: BufferedFrame<RuntimeEvent<M>>, afterProjectionCommit?: () => void): void {
+	private emitFrame(
+		frame: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>,
+		afterProjectionCommit?: () => void,
+	): void {
 		const projection = this.liveProjection;
 		if (!projection) throw new RpcError("session_snapshot", "session_snapshot_unavailable");
 		let seq: number;
@@ -2285,7 +2376,10 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 
 	private closeDialog(
 		requestId: string,
-		reason: Extract<BufferedFrame, { type: "extension_ui_closed" }>["reason"],
+		reason: Extract<
+			BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>,
+			{ type: "extension_ui_closed" }
+		>["reason"],
 		emit = true,
 	): void {
 		const dialog = this.pendingDialogs.get(requestId);
@@ -2302,7 +2396,10 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	}
 
 	private closeAllDialogs(
-		reason: Extract<BufferedFrame, { type: "extension_ui_closed" }>["reason"],
+		reason: Extract<
+			BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>,
+			{ type: "extension_ui_closed" }
+		>["reason"],
 		emit = true,
 	): void {
 		for (const requestId of [...this.pendingDialogs.keys()]) this.closeDialog(requestId, reason, emit);
@@ -2655,7 +2752,9 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		this.inFlight = 0;
 	}
 
-	private emitSupervisorMessage(message: SessionSupervisorMessage<RuntimeEvent<M>>): void {
+	private emitSupervisorMessage(
+		message: SessionSupervisorMessage<RuntimeEvent<M>, RuntimeExtensionRequest<M>>,
+	): void {
 		if (this.deferredStartupEmits) {
 			this.deferredStartupEmits.push(message);
 			return;
@@ -2736,38 +2835,33 @@ function transitionWasCancelled(
 	return typeof data === "object" && data !== null && "cancelled" in data && data.cancelled === true;
 }
 
-function bufferedFrameBytes<TEvent>(frame: BufferedFrame<TEvent>): number {
+function bufferedFrameBytes<TEvent, TExtensionRequest>(
+	frame: BufferedFrame<TEvent, TExtensionRequest>,
+): number {
 	return Buffer.byteLength(JSON.stringify(frame));
 }
 
-function isReplayableFrame<TEvent>(frame: BufferedFrame<TEvent>): boolean {
+function isReplayableFrame<TEvent, TExtensionRequest extends { readonly method: string }>(
+	frame: BufferedFrame<TEvent, TExtensionRequest>,
+): boolean {
 	return !(frame.type === "extension_ui_request" && frame.request.method === "notify");
 }
 
-function extensionRequestBytes(request: ExtensionUiRequestDto): number {
+function extensionRequestBytes(request: ExtensionUiRequestDto | FutureExtensionUiRequestDto): number {
 	return Buffer.byteLength(JSON.stringify(request));
 }
 
-function stickyRequestKey(request: ExtensionUiRequestDto): string {
+function stickyRequestKey(request: ExtensionUiRequestDto | FutureExtensionUiRequestDto): string {
 	if (request.method === "setStatus") return `setStatus:${request.statusKey}`;
 	if (request.method === "setWidget") return `setWidget:${request.widgetKey}`;
 	return request.method;
 }
 
-function stickyRequestClearsState(request: ExtensionUiRequestDto): boolean {
+function stickyRequestClearsState(request: ExtensionUiRequestDto | FutureExtensionUiRequestDto): boolean {
 	return (
 		(request.method === "setStatus" && request.statusText === undefined) ||
 		(request.method === "setWidget" && request.widgetLines === undefined)
 	);
-}
-
-function stickyClearRequest(request: ExtensionUiRequestDto): ExtensionUiRequestDto {
-	const id = `evicted:${randomUUID()}`;
-	if (request.method === "setStatus") return { ...request, id, statusText: undefined };
-	if (request.method === "setWidget") return { ...request, id, widgetLines: undefined };
-	if (request.method === "setTitle") return { ...request, id, title: "" };
-	if (request.method === "set_editor_text") return { ...request, id, text: "" };
-	throw new RpcError("extension_ui_request", "invalid_sticky_extension_method");
 }
 
 function inspectFrozenSessionFile(sessionFile: string): FrozenSessionFileIdentity {
