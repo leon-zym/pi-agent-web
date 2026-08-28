@@ -45,6 +45,8 @@ describe("gateway payload activation", () => {
 			payloadBudget: expect.any(Object),
 			contentRefBudget: FUTURE_SESSION_CONTENT_REF_BUDGET,
 		});
-		expect(activation).not.toHaveProperty("supervisorServices");
+		expect(activation.supervisorServices.externalizer).toBe(activation.externalizer);
+		expect(activation.supervisorServices.productSchema.mode).toBe("future_content");
+		expect(activation.supervisorServices.productSchema.serverEpoch).toBe("future-epoch");
 	});
 });
