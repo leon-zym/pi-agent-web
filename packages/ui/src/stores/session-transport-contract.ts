@@ -1,6 +1,9 @@
 import type {
 	ExtensionUiRequestDto,
 	ExtensionUiResponseDto,
+	FutureExtensionUiSnapshotDto,
+	FutureSessionReplayFrameDto,
+	FutureSessionSnapshotDto,
 	GatewayProtocolVersionDto,
 	HotRuntimeInventoryDto,
 	SessionCommandDto,
@@ -11,6 +14,7 @@ import type {
 	SessionWsServerMessage,
 } from "@pi-agent-web/protocol";
 import type { StoreApi } from "zustand/vanilla";
+import type { FutureSessionContentAdapter } from "../lib/future-session-content-adapter";
 import type { SessionResyncState as SessionRecoveryState, SessionResyncClock } from "../lib/session-resync";
 import type { OrderedSessionFrameBus, SessionTransportGlobalBus } from "./session-frame-bus";
 
@@ -38,8 +42,15 @@ export interface SessionRawEventRecord {
 	generation: number;
 	seq: number;
 	eventType: string;
-	payload: Extract<SessionReplayFrameDto, { type: "event" }>["event"];
+	payload:
+		| Extract<SessionReplayFrameDto, { type: "event" }>["event"]
+		| Extract<FutureSessionReplayFrameDto, { type: "event" }>["event"];
 }
+
+export type FutureSessionTransportFrameMessage =
+	| FutureSessionReplayFrameDto
+	| FutureSessionSnapshotDto
+	| FutureExtensionUiSnapshotDto;
 
 export interface SessionChannelState {
 	sessionHandle: string;
@@ -124,6 +135,8 @@ export interface SessionTransportOptions {
 	onResyncRequired?: (message: Extract<SessionWsServerMessage, { type: "resync_required" }>) => void;
 	resyncClock?: SessionResyncClock;
 	resyncRandom?: () => number;
+	/** Private protocol 1.3 seam; production remains disabled until the atomic hello activation. */
+	futureContentAdapter?: FutureSessionContentAdapter;
 }
 
 export interface SessionTransportState {
@@ -159,6 +172,8 @@ export interface SessionTransportController {
 	globalBus: SessionTransportGlobalBus;
 	/** Public for deterministic protocol tests and non-WebSocket adapters. */
 	ingestServerMessage: (message: SessionWsServerMessage) => void;
+	/** Queue one already-guarded private protocol 1.3 frame for exact-identity materialization. */
+	ingestFutureFrameMessage: (message: FutureSessionTransportFrameMessage, rawWireBytes: number) => boolean;
 	/** Confirm that deferred projection work has applied every retained frame through lastSeq. */
 	confirmProjectionDelivery: (sessionHandle: string, generation: number) => boolean;
 	/** True only while the matching resync attempt is projecting its guarded snapshot suffix. */
