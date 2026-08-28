@@ -1,4 +1,5 @@
 import type {
+	FutureExtensionUiRequestDto,
 	FutureProductSessionEventDto,
 	FutureSessionCommandResponseDto,
 	FutureSessionEntryDto,
@@ -7,6 +8,7 @@ import type {
 } from "./future-product-dto.js";
 import {
 	type FutureSessionContentRefGuardContext,
+	isExtensionUiRequestDto,
 	isFutureSessionContentRefGuardContext,
 	isProductSessionEventDto,
 	isSessionCommandResponseDto,
@@ -39,6 +41,42 @@ function shadowText(value: unknown, context: FutureSessionContentRefGuardContext
 
 function shadowJson(value: unknown, context: FutureSessionContentRefGuardContext): Shadow {
 	return isSessionJsonRootDto(value, context) ? null : INVALID;
+}
+
+function shadowWidgetLines(value: unknown, context: FutureSessionContentRefGuardContext): Shadow {
+	if (!isSessionJsonRootDto(value, context)) return INVALID;
+	return isRecord(value) && value.type === "inline_json" ? value.value : [];
+}
+
+function shadowExtensionRequest(value: unknown, context: FutureSessionContentRefGuardContext): Shadow {
+	if (!isRecord(value)) return INVALID;
+	switch (value.method) {
+		case "editor": {
+			if (value.prefill === undefined) return value;
+			const prefill = shadowText(value.prefill, context);
+			return prefill === INVALID ? INVALID : { ...value, prefill };
+		}
+		case "set_editor_text": {
+			const text = shadowText(value.text, context);
+			return text === INVALID ? INVALID : { ...value, text };
+		}
+		case "setWidget": {
+			if (value.widgetLines === undefined) return value;
+			const widgetLines = shadowWidgetLines(value.widgetLines, context);
+			return widgetLines === INVALID ? INVALID : { ...value, widgetLines };
+		}
+		default:
+			return value;
+	}
+}
+
+export function isFutureExtensionUiRequestDto(
+	value: unknown,
+	context?: FutureSessionContentRefGuardContext,
+): value is FutureExtensionUiRequestDto {
+	if (!context || !isFutureSessionContentRefGuardContext(context)) return false;
+	const shadow = shadowExtensionRequest(value, context);
+	return shadow !== INVALID && isExtensionUiRequestDto(shadow);
 }
 
 function shadowReviewedBlocks(value: unknown, context: FutureSessionContentRefGuardContext): Shadow {

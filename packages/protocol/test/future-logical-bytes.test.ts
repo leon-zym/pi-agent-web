@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type {
+	FutureExtensionUiRequestDto,
 	FutureProductSessionEventDto,
 	FutureSessionCommandResponseDto,
 	FutureSessionEntryDto,
@@ -15,6 +16,7 @@ import type {
 	SessionRuntimeDto,
 } from "../src/index.js";
 import {
+	analyzeFutureExtensionUiRequestLogicalBytes,
 	analyzeFutureProductSessionEventLogicalBytes,
 	analyzeFutureSessionCommandResponseLogicalBytes,
 	analyzeFutureSessionEntryLogicalBytes,
@@ -149,6 +151,65 @@ describe("future logical payload byte analysis", () => {
 		expect(oneRoot - emptyRoot).toBe(MIB);
 		expect(twoRoots - oneRoot).toBeGreaterThan(MIB);
 		expect(twoRoots - oneRoot).toBeLessThan(MIB + 64);
+	});
+
+	it("charges Extension text and whole widget JSON roots by logical content for every occurrence", () => {
+		const text = "界".repeat(16);
+		const textBytes = utf8Bytes(text);
+		const inlineEditor = {
+			type: "extension_ui_request",
+			id: "editor-a",
+			method: "editor",
+			title: "Edit",
+			prefill: text,
+		} satisfies FutureExtensionUiRequestDto;
+		const externalEditor = {
+			...inlineEditor,
+			prefill: externalText(textBytes),
+		} satisfies FutureExtensionUiRequestDto;
+		expect(analyzeFutureExtensionUiRequestLogicalBytes(inlineEditor)).toEqual(
+			analyzeFutureExtensionUiRequestLogicalBytes(externalEditor),
+		);
+		const inlineSetEditorText = {
+			type: "extension_ui_request",
+			id: "set-editor-a",
+			method: "set_editor_text",
+			text,
+		} satisfies FutureExtensionUiRequestDto;
+		const externalSetEditorText = {
+			...inlineSetEditorText,
+			text: externalText(textBytes),
+		} satisfies FutureExtensionUiRequestDto;
+		expect(analyzeFutureExtensionUiRequestLogicalBytes(inlineSetEditorText)).toEqual(
+			analyzeFutureExtensionUiRequestLogicalBytes(externalSetEditorText),
+		);
+
+		const lines = ["one", "界"];
+		const widgetBytes = utf8Bytes(JSON.stringify(lines));
+		const inlineWidget = {
+			type: "extension_ui_request",
+			id: "widget-a",
+			method: "setWidget",
+			widgetKey: "tests",
+			widgetLines: { type: "inline_json", value: lines },
+		} satisfies FutureExtensionUiRequestDto;
+		const externalWidget = {
+			...inlineWidget,
+			widgetLines: { type: "external_json", ref: contentRef(widgetBytes) },
+		} satisfies FutureExtensionUiRequestDto;
+		expect(analyzeFutureExtensionUiRequestLogicalBytes(inlineWidget)).toEqual(
+			analyzeFutureExtensionUiRequestLogicalBytes(externalWidget),
+		);
+
+		const oneOccurrence = analyzeFutureSessionSnapshotLogicalBytes({
+			...snapshot(MIB, MIB),
+			pendingExtensionRequests: [externalEditor],
+		}).byteLength;
+		const twoOccurrences = analyzeFutureSessionSnapshotLogicalBytes({
+			...snapshot(MIB, MIB),
+			pendingExtensionRequests: [externalEditor, { ...externalEditor, id: "editor-b" }],
+		}).byteLength;
+		expect(twoOccurrences - oneOccurrence).toBeGreaterThanOrEqual(textBytes);
 	});
 
 	it("keeps nested wrapper/ref lookalikes ordinary inside inline JSON", () => {

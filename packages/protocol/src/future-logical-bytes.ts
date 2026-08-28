@@ -1,4 +1,5 @@
 import type {
+	FutureExtensionUiRequestDto,
 	FutureProductSessionEventDto,
 	FutureSessionCommandResponseDto,
 	FutureSessionEntryDto,
@@ -31,6 +32,8 @@ type Schema =
 	| "tree"
 	| "tree_node"
 	| "event"
+	| "extension_request"
+	| "extension_requests"
 	| "stream_event"
 	| "response"
 	| "response_messages_data"
@@ -188,6 +191,8 @@ function arrayItemSchema(schema: Schema): Schema {
 			return "tree_node";
 		case "projection_events":
 			return "projection";
+		case "extension_requests":
+			return "extension_request";
 		default:
 			return "ordinary";
 	}
@@ -251,6 +256,17 @@ function objectChildSchema(schema: Schema, value: UnknownRecord, key: string): S
 				default:
 					return "ordinary";
 			}
+		case "extension_request":
+			switch (value.method) {
+				case "editor":
+					return key === "prefill" ? "text_root" : "ordinary";
+				case "set_editor_text":
+					return key === "text" ? "text_root" : "ordinary";
+				case "setWidget":
+					return key === "widgetLines" ? "json_root" : "ordinary";
+				default:
+					return "ordinary";
+			}
 		case "stream_event":
 			return value.type === "toolcall_end" && key === "toolCall" ? "tool_call" : "ordinary";
 		case "response":
@@ -266,14 +282,20 @@ function objectChildSchema(schema: Schema, value: UnknownRecord, key: string): S
 			return key === "tree" ? "tree" : "ordinary";
 		case "projection":
 		case "replay":
-			return value.type === "event" && key === "event" ? "event" : "ordinary";
+			if (value.type === "event" && key === "event") return "event";
+			return value.type === "extension_ui_request" && key === "request" ? "extension_request" : "ordinary";
 		case "snapshot":
 			if (key === "settledMessages") return "messages";
-			return key === "projectionEvents" ? "projection_events" : "ordinary";
+			if (key === "projectionEvents") return "projection_events";
+			return key === "pendingExtensionRequests" || key === "stickyExtensionState"
+				? "extension_requests"
+				: "ordinary";
 		case "response_frame":
 			return key === "response" ? "response" : "ordinary";
 		case "ws":
 			if (value.type === "event" && key === "event") return "event";
+			if (value.type === "extension_ui_request" && key === "request") return "extension_request";
+			if (value.type === "extension_ui_snapshot" && key === "requests") return "extension_requests";
 			if (value.type === "response" && key === "response") return "response";
 			if (value.type === "session_snapshot") return objectChildSchema("snapshot", value, key);
 			return "ordinary";
@@ -390,6 +412,13 @@ export function analyzeFutureProductSessionEventLogicalBytes(
 	options?: FutureSessionLogicalBytesOptions,
 ): FutureSessionLogicalBytesResult {
 	return analyze(value, "event", options);
+}
+
+export function analyzeFutureExtensionUiRequestLogicalBytes(
+	value: FutureExtensionUiRequestDto,
+	options?: FutureSessionLogicalBytesOptions,
+): FutureSessionLogicalBytesResult {
+	return analyze(value, "extension_request", options);
 }
 
 export function analyzeFutureSessionCommandResponseLogicalBytes(

@@ -6,6 +6,7 @@ import type {
 	BashExecutionMessageDto,
 	CustomMessageDto,
 	ExtensionErrorEventDto,
+	ExtensionUiRequestDto,
 	SessionCommandDataMap,
 	SessionCommandResponseDto,
 	SessionCommandTypeDto,
@@ -51,6 +52,44 @@ export type FutureSessionMessageDto =
 	| FutureToolResultMessageDto
 	| FutureBashExecutionMessageDto
 	| FutureCustomMessageDto;
+
+type FutureEditorExtensionUiRequestDto = Omit<
+	Extract<ExtensionUiRequestDto, { method: "editor" }>,
+	"prefill"
+> & {
+	prefill?: SessionTextPayloadDto;
+};
+
+type FutureSetEditorTextExtensionUiRequestDto = Omit<
+	Extract<ExtensionUiRequestDto, { method: "set_editor_text" }>,
+	"text"
+> & {
+	text: SessionTextPayloadDto;
+};
+
+type FutureSetWidgetExtensionUiRequestDto = Omit<
+	Extract<ExtensionUiRequestDto, { method: "setWidget" }>,
+	"widgetLines"
+> & {
+	/** The whole string-array root is normalized; individual lines never carry wrappers. */
+	widgetLines?: SessionJsonRootDto;
+};
+
+export type FutureExtensionUiRequestDto =
+	| Exclude<ExtensionUiRequestDto, { method: "editor" | "setWidget" | "set_editor_text" }>
+	| FutureEditorExtensionUiRequestDto
+	| FutureSetWidgetExtensionUiRequestDto
+	| FutureSetEditorTextExtensionUiRequestDto;
+
+export type FutureBlockingExtensionUiRequestDto = Extract<
+	FutureExtensionUiRequestDto,
+	{ method: "select" | "confirm" | "input" | "editor" }
+>;
+
+export type FutureStickyExtensionUiRequestDto = Extract<
+	FutureExtensionUiRequestDto,
+	{ method: "setStatus" | "setWidget" | "setTitle" | "set_editor_text" }
+>;
 
 type FutureMessageEntryDto = Omit<Extract<SessionEntryDto, { type: "message" }>, "message"> & {
 	message: FutureSessionMessageDto;
