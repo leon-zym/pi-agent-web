@@ -29,6 +29,11 @@ import {
 } from "@pi-agent-web/protocol";
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
+import type {
+	ProjectedFutureExtensionUiSnapshot,
+	ProjectedFutureSessionReplayFrame,
+	ProjectedFutureSessionSnapshot,
+} from "../lib/future-session-content-adapter";
 import {
 	createSessionResyncCoordinator,
 	type SessionResyncAttemptContext,
@@ -36,6 +41,7 @@ import {
 } from "../lib/session-resync";
 import { OrderedSessionFrameBus, SessionTransportGlobalBus } from "./session-frame-bus";
 import {
+	type FutureSessionTransportFrameMessage,
 	type HotRuntimeInventoryToken,
 	hasFreshLeaseBaseline,
 	type SessionChannelState,
@@ -90,6 +96,32 @@ const CLIENT_BUILD = "0.1.0";
 const CLIENT_CAPABILITIES = [...GATEWAY_SERVER_REQUIRED_CAPABILITIES];
 
 type WireSendResult = "sent" | "payload_too_large" | "unavailable";
+type TransportReplayFrame = SessionReplayFrameDto | ProjectedFutureSessionReplayFrame;
+
+type BufferedReplayFrame =
+	| { message: SessionReplayFrameDto; productMode: "current" }
+	| { message: ProjectedFutureSessionReplayFrame; productMode: "future" };
+
+type TransportSessionSnapshotFrame =
+	| { message: SessionSnapshotDto; productMode: "current" }
+	| { message: ProjectedFutureSessionSnapshot; productMode: "future" };
+
+type TransportExtensionSnapshotFrame =
+	| {
+			message: Extract<SessionWsServerMessage, { type: "extension_ui_snapshot" }>;
+			productMode: "current";
+	  }
+	| { message: ProjectedFutureExtensionUiSnapshot; productMode: "future" };
+
+interface FutureProjectionTail {
+	identity: SessionRuntimeIdentityDto;
+	controller: AbortController;
+	promise: Promise<void>;
+	pendingReplayFrames: number;
+	pendingReplayBytes: number;
+	snapshotPending: boolean;
+	snapshotWaiter: SnapshotWaiter | null;
+}
 
 type ResponseMessage = Extract<SessionWsServerMessage, { type: "response" }>;
 
@@ -203,7 +235,7 @@ function normalizeExtensionRequests(requests: ExtensionUiRequestDto[]): Extensio
 
 function applyReplayExtensionState(
 	requests: ExtensionUiRequestDto[],
-	message: SessionReplayFrameDto,
+	message: TransportReplayFrame,
 ): ExtensionUiRequestDto[] {
 	if (message.type === "extension_ui_request") return replaceExtensionRequest(requests, message.request);
 	if (message.type === "extension_ui_closed") {
@@ -224,7 +256,7 @@ function serializedBytes(value: unknown): number {
 	}
 }
 
-function replayFrameBytes(message: SessionReplayFrameDto): number {
+function replayFrameBytes(message: TransportReplayFrame): number {
 	return serializedBytes(message);
 }
 
@@ -300,6 +332,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	const helloTimeoutMs = Math.max(1, options.helloTimeoutMs ?? DEFAULT_HELLO_TIMEOUT_MS);
 	const maxActiveSubscriptions = Math.max(1, options.maxActiveSubscriptions ?? MAX_ACTIVE_SUBSCRIPTIONS);
 	const protocolVersion = options.protocolVersion ?? GATEWAY_PROTOCOL_VERSION;
+	const futureContentAdapter = options.futureContentAdapter;
 	const clientHello: GatewayClientHelloDto = {
 		type: "client_hello",
 		protocol: protocolVersion,
@@ -310,7 +343,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	const frameBus = new OrderedSessionFrameBus();
 	const globalBus = new SessionTransportGlobalBus();
 	const pendingCommands = new Map<string, PendingCommand>();
-	const resyncBuffers = new Map<string, SessionReplayFrameDto[]>();
+	const resyncBuffers = new Map<string, BufferedReplayFrame[]>();
 	const resyncBufferBytes = new Map<string, number>();
 	const snapshotWaiters = new Map<string, SnapshotWaiter>();
 	const skipNextResubscribe = new Set<string>();
@@ -339,6 +372,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	let hotRuntimeRevision = -1;
 	let hotRuntimeByHandle = new Map<string, HotRuntimeInventoryEntryDto>();
 	const connectionObservations = new Map<string, SessionRuntimeIdentityDto>();
+	const futureProjectionTails = new Map<string, FutureProjectionTail>();
 	const initialInventoryWaiters = new Set<InitialInventoryWaiter>();
 	const exactHotRecoveryQueue: string[] = [];
 	const queuedExactHotRecoveries = new Set<string>();
@@ -463,7 +497,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			waiter.reject(new SessionTransportError("stale_resync"));
 		}
 		for (const [key, frames] of resyncBuffers) {
-			if (frames[0]?.sessionHandle === sessionHandle) {
+			if (frames[0]?.message.sessionHandle === sessionHandle) {
 				resyncBuffers.delete(key);
 				resyncBufferBytes.delete(key);
 				skipNextResubscribe.delete(key);
@@ -602,7 +636,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		next.onmessage = (event) => {
 			if (socket !== next) return;
 			const raw = String(event.data);
-			if (new TextEncoder().encode(raw).byteLength > negotiatedMaxServerFrameBytes) {
+			const rawWireBytes = new TextEncoder().encode(raw).byteLength;
+			if (rawWireBytes > negotiatedMaxServerFrameBytes) {
 				enterIncompatible(next);
 				return;
 			}
@@ -741,6 +776,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	}
 
 	function resetDisconnectedState(connectionState: "offline" | "incompatible"): void {
+		abortAllFutureProjections();
 		clearHelloTimer();
 		negotiatedMaxClientFrameBytes = SESSION_WS_CLIENT_MAX_BYTES;
 		negotiatedMaxServerFrameBytes = SESSION_WS_SERVER_MAX_BYTES;
@@ -833,6 +869,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	function unsubscribeSession(sessionHandle: string): void {
 		const channel = store.getState().sessions[sessionHandle];
 		if (!channel?.subscribed) return;
+		abortFutureProjection(sessionHandle);
 		const lruIdx = subscribedLruOrder.indexOf(sessionHandle);
 		if (lruIdx !== -1) subscribedLruOrder.splice(lruIdx, 1);
 		setChannel(sessionHandle, (current) => ({
@@ -858,6 +895,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	function invalidateSessionSnapshot(sessionHandle: string): boolean {
 		const channel = store.getState().sessions[sessionHandle];
 		if (channel?.subscribed) return false;
+		abortFutureProjection(sessionHandle);
 		rejectPendingForSession(
 			sessionHandle,
 			new SessionTransportError("session_not_ready", "Dormant Session snapshot was invalidated"),
@@ -1256,6 +1294,181 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		}
 	}
 
+	function ingestFutureFrameMessage(
+		message: FutureSessionTransportFrameMessage,
+		rawWireBytes: number,
+	): boolean {
+		if (!futureContentAdapter || disposed) return false;
+		if (
+			!Number.isSafeInteger(rawWireBytes) ||
+			rawWireBytes <= 0 ||
+			rawWireBytes > negotiatedMaxServerFrameBytes
+		) {
+			return false;
+		}
+		const identity = futureFrameIdentity(message);
+		if (!identity || !isCurrentFutureProjectionIdentity(identity)) return false;
+		switch (message.type) {
+			case "event":
+			case "extension_ui_request":
+			case "extension_ui_closed":
+				return enqueueFutureProjection(identity, rawWireBytes, null, async (signal) => {
+					const projected = await futureContentAdapter.materializeReplayFrame(message, signal);
+					return () => handleReplayFrame(projected, "future");
+				});
+			case "session_snapshot": {
+				const key = identityKey(identity);
+				const waiter = snapshotWaiters.get(key);
+				if (!waiter) return false;
+				return enqueueFutureProjection(identity, rawWireBytes, waiter, async (signal) => {
+					const projected = await futureContentAdapter.materializeSnapshot(message, signal);
+					return () => {
+						if (snapshotWaiters.get(key)?.token !== waiter.token) return;
+						commitSessionSnapshot(projected, "future");
+					};
+				});
+			}
+			case "extension_ui_snapshot":
+				return enqueueFutureProjection(identity, rawWireBytes, null, async (signal) => {
+					const projected = await futureContentAdapter.materializeExtensionSnapshot(message, signal);
+					return () => handleExtensionSnapshot(projected, "future");
+				});
+		}
+	}
+
+	function futureFrameIdentity(
+		message: FutureSessionTransportFrameMessage,
+	): SessionRuntimeIdentityDto | null {
+		if (message.type === "extension_ui_snapshot") {
+			const runtime = store.getState().sessions[message.sessionHandle]?.runtime;
+			if (
+				!runtime ||
+				runtime.serverEpoch !== message.serverEpoch ||
+				runtime.generation !== message.generation
+			) {
+				return null;
+			}
+			return runtime;
+		}
+		return {
+			serverEpoch: message.serverEpoch,
+			workspaceId: message.workspaceId,
+			sessionHandle: message.sessionHandle,
+			generation: message.generation,
+		};
+	}
+
+	function isCurrentFutureProjectionIdentity(identity: SessionRuntimeIdentityDto): boolean {
+		const channel = store.getState().sessions[identity.sessionHandle];
+		return Boolean(channel?.subscribed && identitiesMatch(channel.runtime, identity));
+	}
+
+	function enqueueFutureProjection(
+		identity: SessionRuntimeIdentityDto,
+		rawWireBytes: number,
+		snapshotWaiter: SnapshotWaiter | null,
+		prepare: (signal: AbortSignal) => Promise<() => void>,
+	): boolean {
+		const isSnapshot = snapshotWaiter !== null;
+		const existing = futureProjectionTails.get(identity.sessionHandle);
+		if (existing && !identitiesMatch(existing.identity, identity)) {
+			discardFutureProjectionTail(identity.sessionHandle, existing);
+		}
+		let current = futureProjectionTails.get(identity.sessionHandle);
+		if (!current) {
+			current = {
+				identity,
+				controller: new AbortController(),
+				promise: Promise.resolve(),
+				pendingReplayFrames: 0,
+				pendingReplayBytes: 0,
+				snapshotPending: false,
+				snapshotWaiter: null,
+			};
+			futureProjectionTails.set(identity.sessionHandle, current);
+		}
+		const replayOverflow =
+			!isSnapshot &&
+			(current.pendingReplayFrames >= MAX_RESYNC_BUFFERED_FRAMES ||
+				current.pendingReplayBytes + rawWireBytes > MAX_RESYNC_BUFFERED_BYTES);
+		if ((isSnapshot && current.snapshotPending) || replayOverflow) {
+			const failure = new SessionTransportError(
+				"payload_too_large",
+				"Pending future Session projection exceeded its bounded admission",
+			);
+			const pendingSnapshotWaiter = current.snapshotWaiter;
+			discardFutureProjectionTail(identity.sessionHandle, current);
+			if (pendingSnapshotWaiter) {
+				failFutureSnapshotProjection(identity, failure, pendingSnapshotWaiter);
+			} else reportProjectionFailure(identity.sessionHandle, identity.generation, failure);
+			return true;
+		}
+		if (isSnapshot) {
+			current.snapshotPending = true;
+			current.snapshotWaiter = snapshotWaiter;
+		} else {
+			current.pendingReplayFrames += 1;
+			current.pendingReplayBytes += rawWireBytes;
+		}
+		const controller = current.controller;
+		const previous = current.promise;
+		let promise: Promise<void>;
+		promise = previous
+			.then(async () => {
+				if (controller.signal.aborted || !isCurrentFutureProjectionIdentity(identity)) return;
+				const commit = await prepare(controller.signal);
+				if (controller.signal.aborted || !isCurrentFutureProjectionIdentity(identity)) return;
+				commit();
+			})
+			.catch((error: unknown) => {
+				if (controller.signal.aborted || !isCurrentFutureProjectionIdentity(identity)) return;
+				const pendingSnapshotWaiter = current.snapshotWaiter;
+				discardFutureProjectionTail(identity.sessionHandle, current);
+				if (pendingSnapshotWaiter) {
+					const failure = error instanceof Error ? error : new Error(String(error));
+					failFutureSnapshotProjection(identity, failure, pendingSnapshotWaiter);
+				} else reportProjectionFailure(identity.sessionHandle, identity.generation, error);
+			})
+			.finally(() => {
+				if (futureProjectionTails.get(identity.sessionHandle) !== current) return;
+				if (isSnapshot) {
+					current.snapshotPending = false;
+					current.snapshotWaiter = null;
+				} else {
+					current.pendingReplayFrames -= 1;
+					current.pendingReplayBytes -= rawWireBytes;
+				}
+				if (current.promise === promise && current.pendingReplayFrames === 0 && !current.snapshotPending) {
+					futureProjectionTails.delete(identity.sessionHandle);
+				}
+			});
+		current.promise = promise;
+		return true;
+	}
+
+	function discardFutureProjectionTail(sessionHandle: string, entry: FutureProjectionTail): void {
+		if (futureProjectionTails.get(sessionHandle) === entry) {
+			futureProjectionTails.delete(sessionHandle);
+		}
+		entry.pendingReplayFrames = 0;
+		entry.pendingReplayBytes = 0;
+		entry.snapshotPending = false;
+		entry.snapshotWaiter = null;
+		entry.controller.abort();
+	}
+
+	function abortFutureProjection(sessionHandle: string): void {
+		const entry = futureProjectionTails.get(sessionHandle);
+		if (!entry) return;
+		discardFutureProjectionTail(sessionHandle, entry);
+	}
+
+	function abortAllFutureProjections(): void {
+		for (const [sessionHandle, entry] of futureProjectionTails) {
+			discardFutureProjectionTail(sessionHandle, entry);
+		}
+	}
+
 	function handleSessionError(message: Extract<SessionWsServerMessage, { type: "session_error" }>): void {
 		const activeExact = activeExactHotRecovery;
 		const exactErrorMatches =
@@ -1276,6 +1489,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			return;
 		}
 		if (message.operation === "subscribe") {
+			abortFutureProjection(message.sessionHandle);
 			subscriptionBaselines.delete(message.sessionHandle);
 			baselineRefreshes.delete(message.sessionHandle);
 			claimAttempts.delete(message.sessionHandle);
@@ -1372,6 +1586,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		}
 		const identityChanged = current.runtime !== null && !identitiesMatch(current.runtime, message.runtime);
 		if (identityChanged) {
+			abortFutureProjection(sessionHandle);
 			clearSessionResyncData(sessionHandle);
 			resyncCoordinator.unsubscribe(sessionHandle);
 			acknowledgedExtensionRequests.delete(sessionHandle);
@@ -1407,7 +1622,18 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		resolvePendingResponsesForSession(sessionHandle);
 	}
 
-	function handleReplayFrame(message: SessionReplayFrameDto): void {
+	function handleReplayFrame(message: SessionReplayFrameDto): void;
+	function handleReplayFrame(message: ProjectedFutureSessionReplayFrame, productMode: "future"): void;
+	function handleReplayFrame(
+		...input:
+			| [message: SessionReplayFrameDto]
+			| [message: ProjectedFutureSessionReplayFrame, productMode: "future"]
+	): void {
+		const frame: BufferedReplayFrame =
+			input.length === 1
+				? { message: input[0], productMode: "current" }
+				: { message: input[0], productMode: "future" };
+		const { message } = frame;
 		const current = store.getState().sessions[message.sessionHandle];
 		const currentRuntime = current?.runtime;
 		if (
@@ -1423,14 +1649,14 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			message.type === "extension_ui_request" && message.request.method === "notify" ? message : null;
 		if (journaledNotify && hasDeliveredNotify(currentRuntime, journaledNotify)) return;
 		if (journaledNotify && message.seq <= current.lastSeq) {
-			const delivery = frameBus.emit(message.sessionHandle, message, receivedAt);
+			const delivery = emitReplayFrame(frame, receivedAt);
 			if (delivery.errors.length === 0) rememberDeliveredNotify(currentRuntime, journaledNotify);
 			return;
 		}
 
 		if (current.resync) {
 			if (message.seq <= current.resync.barrierSeq) return;
-			const result = bufferReplayFrame(message);
+			const result = bufferReplayFrame(frame);
 			if (result === "buffered" && message.type === "event") {
 				appendRawEvent(message.sessionHandle, message, receivedAt);
 			}
@@ -1448,7 +1674,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				runtime,
 				reason: "gap",
 			} satisfies Extract<SessionWsServerMessage, { type: "resync_required" }>;
-			const result = bufferReplayFrame(message);
+			const result = bufferReplayFrame(frame);
 			if (result === "overflow") return;
 			if (result === "buffered" && message.type === "event") {
 				appendRawEvent(message.sessionHandle, message, receivedAt);
@@ -1457,7 +1683,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			return;
 		}
 
-		const delivery = frameBus.emit(message.sessionHandle, message, receivedAt);
+		const delivery = emitReplayFrame(frame, receivedAt);
 		if (delivery.errors.length > 0) {
 			reportProjectionFailure(message.sessionHandle, message.generation, delivery.errors[0]);
 			return;
@@ -1470,9 +1696,15 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		resolvePendingResponsesForSession(message.sessionHandle);
 	}
 
+	function emitReplayFrame(frame: BufferedReplayFrame, receivedAt: number) {
+		return frame.productMode === "future"
+			? frameBus.emit(frame.message.sessionHandle, frame.message, receivedAt, "future")
+			: frameBus.emit(frame.message.sessionHandle, frame.message, receivedAt);
+	}
+
 	function appendRawEvent(
 		sessionHandle: string,
-		message: Extract<SessionReplayFrameDto, { type: "event" }>,
+		message: Extract<TransportReplayFrame, { type: "event" }>,
 		receivedAt: number,
 	): void {
 		const record = {
@@ -1564,7 +1796,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	}
 
 	function applyReplayFrameState(
-		message: SessionReplayFrameDto,
+		message: TransportReplayFrame,
 		projected: boolean,
 		ignoredExtensionRequestIds?: ReadonlySet<string>,
 	): void {
@@ -1580,11 +1812,15 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		}));
 	}
 
-	function bufferReplayFrame(message: SessionReplayFrameDto): "buffered" | "duplicate" | "overflow" {
+	function bufferReplayFrame(frame: BufferedReplayFrame): "buffered" | "duplicate" | "overflow" {
+		const { message } = frame;
 		const key = identityKey(message);
 		const buffer = resyncBuffers.get(key) ?? [];
 		if (
-			buffer.some((candidate) => candidate.generation === message.generation && candidate.seq === message.seq)
+			buffer.some(
+				(candidate) =>
+					candidate.message.generation === message.generation && candidate.message.seq === message.seq,
+			)
 		) {
 			return "duplicate";
 		}
@@ -1594,8 +1830,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			forceReplayResync(message);
 			return "overflow";
 		}
-		buffer.push(message);
-		buffer.sort((left, right) => left.seq - right.seq);
+		buffer.push(frame);
+		buffer.sort((left, right) => left.message.seq - right.message.seq);
 		resyncBuffers.set(key, buffer);
 		resyncBufferBytes.set(key, nextBytes);
 		setChannel(message.sessionHandle, (channel) => ({
@@ -1607,7 +1843,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		return "buffered";
 	}
 
-	function forceReplayResync(message: SessionReplayFrameDto): void {
+	function forceReplayResync(message: TransportReplayFrame): void {
 		const current = store.getState().sessions[message.sessionHandle];
 		if (!current?.subscribed || !current.runtime) return;
 		const barrierSeq = current.resync?.barrierSeq ?? current.runtime.lastSeq;
@@ -1773,6 +2009,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		}
 		const sameIdentity = identitiesMatch(current.runtime, message.runtime);
 		if (!sameIdentity && current.runtime) {
+			abortFutureProjection(message.sessionHandle);
 			clearIdentityBuffers(current.runtime);
 			resyncCoordinator.unsubscribe(message.sessionHandle);
 			claimAttempts.delete(message.sessionHandle);
@@ -1782,14 +2019,15 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		}
 		const key = identityKey(message.runtime);
 		const retained = (resyncBuffers.get(key) ?? []).filter(
-			(frame) => identitiesMatch(frame, message.runtime) && frame.seq > message.runtime.lastSeq,
+			(frame) =>
+				identitiesMatch(frame.message, message.runtime) && frame.message.seq > message.runtime.lastSeq,
 		);
-		retained.sort((left, right) => left.seq - right.seq);
+		retained.sort((left, right) => left.message.seq - right.message.seq);
 		if (retained.length > 0) {
 			resyncBuffers.set(key, retained);
 			resyncBufferBytes.set(
 				key,
-				retained.reduce((total, frame) => total + replayFrameBytes(frame), 0),
+				retained.reduce((total, frame) => total + replayFrameBytes(frame.message), 0),
 			);
 		} else {
 			resyncBuffers.delete(key);
@@ -1803,7 +2041,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				new SessionTransportError("response_mismatch", "Session generation changed during resync"),
 			);
 		}
-		const retainedLastSeq = retained.at(-1)?.seq ?? message.runtime.lastSeq;
+		const retainedLastSeq = retained.at(-1)?.message.seq ?? message.runtime.lastSeq;
 		const requiresFreshBaseline = current.resync?.requiresFreshBaseline === true || message.reason !== "gap";
 		setChannel(message.sessionHandle, (channel) => ({
 			...channel,
@@ -1852,6 +2090,44 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		if (!waiter || (expectedWaiter && waiter.token !== expectedWaiter.token)) return;
 		snapshotWaiters.delete(key);
 		waiter.reject(error);
+	}
+
+	function failFutureSnapshotProjection(
+		identity: SessionRuntimeIdentityDto,
+		error: Error,
+		waiter: SnapshotWaiter,
+	): void {
+		const key = identityKey(identity);
+		const channel = store.getState().sessions[identity.sessionHandle];
+		if (
+			snapshotWaiters.get(key)?.token !== waiter.token ||
+			!channel?.subscribed ||
+			!channel.resync ||
+			!identitiesMatch(channel.runtime, identity)
+		) {
+			return;
+		}
+		resyncBuffers.delete(key);
+		resyncBufferBytes.delete(key);
+		acknowledgedExtensionRequests.delete(identity.sessionHandle);
+		baselineRefreshes.delete(identity.sessionHandle);
+		subscriptionBaselines.delete(identity.sessionHandle);
+		discardRawEvents(identity.sessionHandle);
+		setChannel(identity.sessionHandle, (current) => ({
+			...current,
+			baselineAuthoritative: false,
+			freshLeaseBaseline: null,
+			lastSeq: current.projectedSeq,
+			pendingExtensionRequests: [],
+			resync: {
+				reason: "gap",
+				generation: identity.generation,
+				barrierSeq: current.projectedSeq,
+				bufferedFrameCount: 0,
+				requiresFreshBaseline: true,
+			},
+		}));
+		failSnapshot(identity, error, waiter);
 	}
 
 	function finishSnapshot(
@@ -1906,16 +2182,29 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	function handleSessionSnapshot(message: SessionSnapshotDto): void {
 		const guardContext = attachmentGuardContext;
 		if (guardContext === null || !isSessionSnapshotDto(message, guardContext)) return;
+		commitSessionSnapshot(message);
+	}
+
+	function commitSessionSnapshot(message: SessionSnapshotDto): void;
+	function commitSessionSnapshot(message: ProjectedFutureSessionSnapshot, productMode: "future"): void;
+	function commitSessionSnapshot(
+		...input: [message: SessionSnapshotDto] | [message: ProjectedFutureSessionSnapshot, productMode: "future"]
+	): void {
+		const snapshotFrame: TransportSessionSnapshotFrame =
+			input.length === 1
+				? { message: input[0], productMode: "current" }
+				: { message: input[0], productMode: "future" };
+		const { message } = snapshotFrame;
 		const channel = store.getState().sessions[message.sessionHandle];
 		if (!channel?.subscribed || !channel.resync || !identitiesMatch(channel.runtime, message)) return;
 		const key = identityKey(message);
 		const waiter = snapshotWaiters.get(key);
 		if (!waiter) return;
 		const buffered = (resyncBuffers.get(key) ?? [])
-			.filter((frame) => identitiesMatch(frame, message) && frame.seq > message.asOfSeq)
-			.sort((left, right) => left.seq - right.seq);
+			.filter((frame) => identitiesMatch(frame.message, message) && frame.message.seq > message.asOfSeq)
+			.sort((left, right) => left.message.seq - right.message.seq);
 		let contiguousSeq = message.asOfSeq;
-		for (const frame of buffered) {
+		for (const { message: frame } of buffered) {
 			if (frame.seq !== contiguousSeq + 1) {
 				failSnapshot(message, new SessionTransportError("stale_resync", "Snapshot suffix has a gap"), waiter);
 				return;
@@ -1937,19 +2226,35 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		waiter.pendingCompletion = { snapshotId: message.snapshotId, endpointSeq: contiguousSeq };
 
 		const acknowledged = acknowledgedExtensionRequestIds(message);
-		const snapshotForProjection: SessionSnapshotDto =
+		const snapshotForProjection: TransportSessionSnapshotFrame =
 			acknowledged.size === 0
-				? message
-				: {
-						...message,
-						pendingExtensionRequests: message.pendingExtensionRequests.filter(
-							(request) => !acknowledged.has(request.id),
-						),
-						stickyExtensionState: message.stickyExtensionState.filter(
-							(request) => !acknowledged.has(request.id),
-						),
-					};
-		const snapshotDelivery = frameBus.emit(message.sessionHandle, snapshotForProjection, now());
+				? snapshotFrame
+				: snapshotFrame.productMode === "future"
+					? {
+							productMode: "future",
+							message: {
+								...snapshotFrame.message,
+								pendingExtensionRequests: snapshotFrame.message.pendingExtensionRequests.filter(
+									(request) => !acknowledged.has(request.id),
+								),
+								stickyExtensionState: snapshotFrame.message.stickyExtensionState.filter(
+									(request) => !acknowledged.has(request.id),
+								),
+							},
+						}
+					: {
+							productMode: "current",
+							message: {
+								...snapshotFrame.message,
+								pendingExtensionRequests: snapshotFrame.message.pendingExtensionRequests.filter(
+									(request) => !acknowledged.has(request.id),
+								),
+								stickyExtensionState: snapshotFrame.message.stickyExtensionState.filter(
+									(request) => !acknowledged.has(request.id),
+								),
+							},
+						};
+		const snapshotDelivery = emitSessionSnapshot(snapshotForProjection);
 		if (snapshotDelivery.errors.length > 0 || snapshotDelivery.deferred) {
 			failSnapshot(
 				message,
@@ -1967,20 +2272,21 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			lastSeq: message.asOfSeq,
 			projectedSeq: message.asOfSeq,
 			pendingExtensionRequests: normalizeExtensionRequests([
-				...snapshotForProjection.pendingExtensionRequests,
-				...snapshotForProjection.stickyExtensionState,
+				...snapshotForProjection.message.pendingExtensionRequests,
+				...snapshotForProjection.message.stickyExtensionState,
 			]),
 		}));
 
 		let suffixDeferred = false;
-		for (const frame of buffered) {
+		for (const bufferedFrame of buffered) {
+			const { message: frame } = bufferedFrame;
 			const skipAcknowledgedRequest =
 				frame.type === "extension_ui_request" && acknowledged.has(frame.request.id);
 			if (skipAcknowledgedRequest) {
 				applyReplayFrameState(frame, !suffixDeferred, acknowledged);
 				continue;
 			}
-			const delivery = frameBus.emit(message.sessionHandle, frame, now());
+			const delivery = emitReplayFrame(bufferedFrame, now());
 			if (delivery.errors.length > 0) {
 				failSnapshot(message, new SessionTransportError("stale_resync", "Snapshot suffix failed"), waiter);
 				reportProjectionFailure(message.sessionHandle, message.generation, delivery.errors[0]);
@@ -2000,9 +2306,26 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		finishSnapshot(message, waiter, message.snapshotId, contiguousSeq);
 	}
 
+	function emitSessionSnapshot(frame: TransportSessionSnapshotFrame) {
+		return frame.productMode === "future"
+			? frameBus.emit(frame.message.sessionHandle, frame.message, now(), "future")
+			: frameBus.emit(frame.message.sessionHandle, frame.message, now());
+	}
+
 	function handleExtensionSnapshot(
 		message: Extract<SessionWsServerMessage, { type: "extension_ui_snapshot" }>,
+	): void;
+	function handleExtensionSnapshot(message: ProjectedFutureExtensionUiSnapshot, productMode: "future"): void;
+	function handleExtensionSnapshot(
+		...input:
+			| [message: Extract<SessionWsServerMessage, { type: "extension_ui_snapshot" }>]
+			| [message: ProjectedFutureExtensionUiSnapshot, productMode: "future"]
 	): void {
+		const frame: TransportExtensionSnapshotFrame =
+			input.length === 1
+				? { message: input[0], productMode: "current" }
+				: { message: input[0], productMode: "future" };
+		const { message } = frame;
 		const current = store.getState().sessions[message.sessionHandle];
 		if (
 			!current?.subscribed ||
@@ -2016,7 +2339,10 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			...channel,
 			pendingExtensionRequests: normalizeExtensionRequests(message.requests),
 		}));
-		const delivery = frameBus.emit(message.sessionHandle, message, now());
+		const delivery =
+			frame.productMode === "future"
+				? frameBus.emit(message.sessionHandle, frame.message, now(), "future")
+				: frameBus.emit(message.sessionHandle, frame.message, now());
 		if (delivery.errors.length > 0) {
 			reportProjectionFailure(message.sessionHandle, message.generation, delivery.errors[0]);
 			return;
@@ -2062,6 +2388,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		const state = store.getState();
 		const previous = state.sessions[previousSessionHandle];
 		if (!previous?.subscribed) return;
+		abortFutureProjection(previousSessionHandle);
+		abortFutureProjection(sessionHandle);
 		const exactRekeyInFlight = activeExactHotRecovery?.identity.sessionHandle === previousSessionHandle;
 		if (!exactRekeyInFlight) {
 			const previousObservation = connectionObservations.get(previousSessionHandle);
@@ -2168,6 +2496,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 
 	function dispose(): void {
 		if (disposed) return;
+		abortAllFutureProjections();
 		disconnect();
 		disposed = true;
 		rejectInitialInventoryWaiters(new SessionTransportError("unavailable", "Session transport disposed"));
@@ -2194,6 +2523,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		frameBus,
 		globalBus,
 		ingestServerMessage,
+		ingestFutureFrameMessage,
 		confirmProjectionDelivery,
 		isSnapshotSuffixProjectionPending,
 		reportProjectionFailure,

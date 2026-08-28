@@ -1,8 +1,16 @@
-import type { SessionImageContentDto, SessionProjectionEventDto } from "@pi-agent-web/protocol";
+import type { SessionImageContentDto } from "@pi-agent-web/protocol";
 import { create } from "zustand";
 import { type ConversationProjection, createEmptyProjection } from "../types/view-models";
 import { useComposerStore } from "./composer";
-import { convergeHangingToolCalls, reduceProjection } from "./projection-reducer";
+import {
+	convergeHangingToolCalls,
+	createSettledProjectionTextBlock,
+	type ProjectionSessionEvent,
+	projectProjectionJsonValue,
+	projectProjectionTextSequence,
+	reduceProjection,
+} from "./projection-reducer";
+import type { SessionFrameProductMode } from "./session-frame-bus";
 import { sessionTransport } from "./session-transport";
 
 const MAX_CACHED_SESSIONS = 3;
@@ -12,16 +20,29 @@ interface ProjectionState {
 	order: string[];
 	currentSessionId: string | null;
 	/** Apply one session event through the assembler state machine. */
-	applyEvent: (sessionId: string, event: Parameters<typeof reduceProjection>[1]) => void;
+	applyEvent: (
+		sessionId: string,
+		event: Parameters<typeof reduceProjection>[1],
+		productMode?: SessionFrameProductMode,
+	) => void;
 	/** Reduce an ordered event batch and publish one Zustand commit. */
-	applyEvents: (sessionId: string, events: Parameters<typeof reduceProjection>[1][]) => void;
+	applyEvents: (
+		sessionId: string,
+		events: Parameters<typeof reduceProjection>[1][],
+		productMode?: SessionFrameProductMode,
+	) => void;
 	/** Rebuild the projection from a get_messages snapshot (reconnect/first load). */
-	rebuildFromMessages: (sessionId: string, messages: unknown[]) => void;
+	rebuildFromMessages: (
+		sessionId: string,
+		messages: unknown[],
+		productMode?: SessionFrameProductMode,
+	) => void;
 	/** Atomically build and publish one authoritative snapshot projection. */
 	applyAuthoritativeSnapshot: (
 		sessionId: string,
 		settledMessages: unknown[],
-		projectionEvents: SessionProjectionEventDto["event"][],
+		projectionEvents: ProjectionSessionEvent[],
+		productMode?: SessionFrameProductMode,
 	) => void;
 	/** Settle a locally active turn when the owning Pi process is lost. */
 	markRuntimeFailure: (sessionId: string, error?: string) => void;
@@ -55,15 +76,16 @@ export const useProjectionStore = create<ProjectionState>()((set, get) => ({
 	order: [],
 	currentSessionId: null,
 
-	applyEvent: (sessionId, event) => get().applyEvents(sessionId, [event]),
+	applyEvent: (sessionId, event, productMode) => get().applyEvents(sessionId, [event], productMode),
 
-	applyEvents: (sessionId, events) => {
+	applyEvents: (sessionId, events, productMode) => {
 		if (events.length === 0) return;
 		const state = get();
 		let next = state.projections[sessionId] ?? createEmptyProjection(sessionId);
 		for (const event of events) {
 			next = reduceProjection(next, event, {
 				now: Date.now(),
+				productMode,
 				resolveInjectionSource: (text) =>
 					useComposerStore.getState().consumeInjectionSourceForSession(sessionId, text),
 			});
@@ -72,23 +94,24 @@ export const useProjectionStore = create<ProjectionState>()((set, get) => ({
 		set(prune({ ...state, projections: { ...state.projections, [sessionId]: next }, order }));
 	},
 
-	rebuildFromMessages: (sessionId, messages) => {
+	rebuildFromMessages: (sessionId, messages, productMode) => {
 		const state = get();
 		// A snapshot is applied only while the Session transport holds later
 		// frames behind a resync barrier, so it is authoritative even if the
 		// previous local projection appeared to be streaming.
-		const next = rebuildProjectionFromMessages(sessionId, messages);
+		const next = rebuildProjectionFromMessages(sessionId, messages, productMode);
 		const order = touch(state.order, sessionId);
 		set(prune({ ...state, projections: { ...state.projections, [sessionId]: next }, order }));
 	},
 
-	applyAuthoritativeSnapshot: (sessionId, settledMessages, projectionEvents) => {
+	applyAuthoritativeSnapshot: (sessionId, settledMessages, projectionEvents, productMode) => {
 		const state = get();
-		let next = rebuildProjectionFromMessages(sessionId, settledMessages);
+		let next = rebuildProjectionFromMessages(sessionId, settledMessages, productMode);
 		for (const event of projectionEvents) {
 			if (event.type === "extension_error") continue;
 			next = reduceProjection(next, event, {
 				now: Date.now(),
+				productMode,
 				resolveInjectionSource: (text) =>
 					useComposerStore.getState().consumeInjectionSourceForSession(sessionId, text),
 			});
@@ -167,6 +190,7 @@ export function selectActiveTurnId(state: ProjectionState): string | null {
 export function rebuildProjectionFromMessages(
 	sessionId: string,
 	messages: unknown[],
+	productMode: SessionFrameProductMode = "current",
 ): ConversationProjection {
 	type LiteBlock = {
 		type?: string;
@@ -261,17 +285,24 @@ export function rebuildProjectionFromMessages(
 						};
 					}
 					if (block.type === "toolCall") {
+						const args = projectProjectionJsonValue(block.arguments, productMode);
 						return {
 							type: "tool_call" as const,
 							key,
 							toolCallId: block.id ?? "",
 							toolName: block.name ?? "",
-							argsText: JSON.stringify(block.arguments ?? {}),
-							args: block.arguments,
+							argsText:
+								productMode === "future"
+									? args.payload?.kind === "external"
+										? ""
+										: (JSON.stringify(args.value) ?? "")
+									: (JSON.stringify(block.arguments ?? {}) ?? ""),
+							args: args.value,
+							...(args.payload ? { argsPayload: args.payload } : {}),
 							status: "preparing" as const,
 						};
 					}
-					return { type: "text" as const, key, markdown: block.text ?? "", isStreaming: false };
+					return createSettledProjectionTextBlock(key, block.text);
 				},
 			);
 			turn.steps.push({
@@ -302,20 +333,19 @@ export function rebuildProjectionFromMessages(
 		if (message.role === "toolResult") {
 			const step = turn.steps[turn.steps.length - 1];
 			if (!step) continue;
-			const blocks = Array.isArray(message.content) ? (message.content as LiteBlock[]) : [];
-			const content =
-				typeof message.content === "string"
-					? message.content
-					: blocks
-							.filter((b) => b.type === "text")
-							.map((b) => b.text ?? "")
-							.join("\n");
+			const content = projectProjectionTextSequence(message.content, productMode);
+			const details =
+				productMode === "future" && message.details !== undefined
+					? projectProjectionJsonValue(message.details, productMode)
+					: { value: message.details };
 			const result = {
 				toolCallId: message.toolCallId ?? "",
 				toolName: message.toolName ?? "",
-				content,
+				content: content.text,
+				...(content.payloads ? { textPayloads: content.payloads } : {}),
 				isError: message.isError ?? false,
-				details: message.details,
+				details: details.value,
+				...(details.payload ? { detailsPayload: details.payload } : {}),
 			};
 			applyToolResult(step, result);
 		}
