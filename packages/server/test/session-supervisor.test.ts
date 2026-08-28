@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type {
+	ExtensionUiRequestDto,
 	HotRuntimeInventoryDto,
 	SessionAttachmentRefDto,
 	SessionCommandResponseDto,
@@ -15,7 +16,7 @@ import { legacyRpcV1Adapter } from "../src/legacy-rpc-v1.js";
 import { canonicalizeSessionFile, sessionHandleForFile } from "../src/native-session-catalog.js";
 import type { PiHostAdapter, PiHostDecodeOutcome } from "../src/pi-host-adapter.js";
 import type { PiPayloadLease } from "../src/pi-payload-externalizer.js";
-import type { SessionLiveProjectionLimits } from "../src/session-live-projection.js";
+import { SessionLiveProjection, type SessionLiveProjectionLimits } from "../src/session-live-projection.js";
 import { createCurrentSessionProductSchema } from "../src/session-product-schema.js";
 import type {
 	SessionIdentityTransitionCommit,
@@ -128,6 +129,68 @@ function createHarness(options: {
 	});
 	supervisors.push(supervisor);
 	return { supervisor, messages, targets };
+}
+
+function exactRuntimeObject(supervisor: SessionSupervisor, sessionHandle: string): object {
+	const runtimes: unknown = Reflect.get(supervisor, "runtimes");
+	if (!(runtimes instanceof Map)) throw new Error("Supervisor runtime pool is unavailable");
+	const runtime: unknown = runtimes.get(sessionHandle);
+	if (typeof runtime !== "object" || runtime === null) throw new Error("Session Runtime is unavailable");
+	return runtime;
+}
+
+function deliverCurrentExtension(runtime: object, request: ExtensionUiRequestDto): void {
+	const processToken: unknown = Reflect.get(runtime, "processToken");
+	const handler: unknown = Reflect.get(runtime, "handleExtensionRequest");
+	if (typeof processToken !== "number" || typeof handler !== "function") {
+		throw new Error("Runtime Extension delivery seam is unavailable");
+	}
+	Reflect.apply(handler, runtime, [processToken, request]);
+}
+
+function runtimeMap(runtime: object, key: "pendingDialogs" | "stickyExtension"): Map<unknown, unknown> {
+	const value: unknown = Reflect.get(runtime, key);
+	if (!(value instanceof Map)) throw new Error(`Runtime ${key} map is unavailable`);
+	return value;
+}
+
+function runtimeProjection(runtime: object): SessionLiveProjection {
+	const projection: unknown = Reflect.get(runtime, "liveProjection");
+	if (!(projection instanceof SessionLiveProjection)) throw new Error("Runtime projection is unavailable");
+	return projection;
+}
+
+function runtimeSemanticWaterline(runtime: object): {
+	projectionAsOfSeq: number;
+	runtimeLastSeq: number;
+	replayLastSeq: number;
+} {
+	const runtimeLastSeq: unknown = Reflect.get(runtime, "lastSeq");
+	const replay: unknown = Reflect.get(runtime, "replay");
+	if (typeof runtimeLastSeq !== "number" || !Array.isArray(replay)) {
+		throw new Error("Runtime semantic waterline is unavailable");
+	}
+	const replayTail: unknown = replay.at(-1);
+	const replayLastSeq =
+		typeof replayTail === "object" &&
+		replayTail !== null &&
+		typeof Reflect.get(replayTail, "seq") === "number"
+			? Reflect.get(replayTail, "seq")
+			: 0;
+	return {
+		projectionAsOfSeq: runtimeProjection(runtime).snapshot().asOfSeq,
+		runtimeLastSeq,
+		replayLastSeq,
+	};
+}
+
+function expireDialogEntry(runtime: object, requestId: string, entry: unknown): void {
+	const processToken: unknown = Reflect.get(runtime, "processToken");
+	const expire: unknown = Reflect.get(runtime, "expireDialog");
+	if (typeof processToken !== "number" || typeof expire !== "function") {
+		throw new Error("Runtime dialog expiry seam is unavailable");
+	}
+	Reflect.apply(expire, runtime, [processToken, requestId, entry]);
 }
 
 function attachmentRef(sha256: string): SessionAttachmentRefDto {
@@ -2690,6 +2753,336 @@ describe("SessionSupervisor", () => {
 			),
 		).toEqual(["status-8", "status-9", "status-10", "status-11"]);
 		expect(Buffer.byteLength(JSON.stringify(replay.snapshot.stickyExtensionState))).toBeLessThan(4_096);
+	});
+
+	it("keeps an existing dialog and timer when its same-id replacement exceeds the state limit", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "dialog-replacement-atomic");
+		const { supervisor, messages } = createHarness({
+			targets: [target],
+			extensionStateMaxBytes: 256,
+			maxAutoRestarts: 0,
+		});
+
+		await supervisor.activate(target.sessionHandle);
+		const runtime = exactRuntimeObject(supervisor, target.sessionHandle);
+		deliverCurrentExtension(runtime, {
+			type: "extension_ui_request",
+			id: "same-dialog",
+			method: "confirm",
+			title: "Original",
+			message: "Keep me",
+			timeout: 75,
+		});
+		messages.length = 0;
+
+		expect(() =>
+			deliverCurrentExtension(runtime, {
+				type: "extension_ui_request",
+				id: "same-dialog",
+				method: "confirm",
+				title: "Replacement",
+				message: "x".repeat(1_024),
+			}),
+		).toThrow("pending_dialog_state_limit_exceeded");
+		expect(messages).toEqual([]);
+		expect(supervisor.getRuntime(target.sessionHandle)?.lastSeq).toBe(1);
+		expect(supervisor.getPendingExtensionRequests(target.sessionHandle)).toEqual([
+			expect.objectContaining({ id: "same-dialog", title: "Original" }),
+		]);
+
+		await waitFor(() =>
+			messages.some(
+				(message) =>
+					message.type === "extension_ui_closed" &&
+					message.requestId === "same-dialog" &&
+					message.reason === "expired",
+			),
+		);
+		expect(supervisor.getPendingExtensionRequests(target.sessionHandle)).toEqual([]);
+	});
+
+	it("terminalizes an atomically rejected sticky batch without publishing partial Extension frames", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "sticky-batch-atomic");
+		const { supervisor, messages } = createHarness({
+			targets: [target],
+			extensionStateMaxItems: 2,
+			maxAutoRestarts: 0,
+		});
+
+		await supervisor.activate(target.sessionHandle);
+		const runtime = exactRuntimeObject(supervisor, target.sessionHandle);
+		for (const statusKey of ["oldest", "newer"]) {
+			deliverCurrentExtension(runtime, {
+				type: "extension_ui_request",
+				id: `status-${statusKey}`,
+				method: "setStatus",
+				statusKey,
+				statusText: statusKey,
+			});
+		}
+		for (let index = 0; index < 6; index += 1) {
+			deliverCurrentExtension(runtime, {
+				type: "extension_ui_request",
+				id: `notify-${String(index)}`,
+				method: "notify",
+				message: "advance-sequence",
+				notifyType: "info",
+			});
+		}
+		expect(supervisor.getRuntime(target.sessionHandle)?.lastSeq).toBe(8);
+		const projection = runtimeProjection(runtime);
+		const limits: unknown = Reflect.get(projection, "limits");
+		if (typeof limits !== "object" || limits === null) throw new Error("Projection limits unavailable");
+		const originalMaxSnapshotBytes: unknown = Reflect.get(limits, "maxSnapshotBytes");
+		if (typeof originalMaxSnapshotBytes !== "number") throw new Error("Snapshot limit unavailable");
+		Reflect.set(limits, "maxSnapshotBytes", Buffer.byteLength(JSON.stringify(projection.snapshot())));
+		messages.length = 0;
+
+		expect(() =>
+			deliverCurrentExtension(runtime, {
+				type: "extension_ui_request",
+				id: "status-next",
+				method: "setStatus",
+				statusKey: "next",
+				statusText: "next",
+			}),
+		).toThrow("session_snapshot_overflow");
+		Reflect.set(limits, "maxSnapshotBytes", originalMaxSnapshotBytes);
+		expect(messages.filter((message) => message.type === "extension_ui_request")).toEqual([]);
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({
+			state: "crashed",
+			error: "session_snapshot_overflow",
+			lastSeq: 8,
+		});
+		expect([...runtimeMap(runtime, "stickyExtension").keys()]).toEqual([]);
+	});
+
+	it("commits a successful sticky clear-and-set pair consecutively", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "sticky-batch-success");
+		const { supervisor, messages } = createHarness({
+			targets: [target],
+			extensionStateMaxItems: 2,
+			maxAutoRestarts: 0,
+		});
+
+		await supervisor.activate(target.sessionHandle);
+		const runtime = exactRuntimeObject(supervisor, target.sessionHandle);
+		for (const statusKey of ["oldest", "newer"]) {
+			deliverCurrentExtension(runtime, {
+				type: "extension_ui_request",
+				id: `status-${statusKey}`,
+				method: "setStatus",
+				statusKey,
+				statusText: statusKey,
+			});
+		}
+		messages.length = 0;
+
+		deliverCurrentExtension(runtime, {
+			type: "extension_ui_request",
+			id: "status-next",
+			method: "setStatus",
+			statusKey: "next",
+			statusText: "next",
+		});
+		const frames = messages.filter(
+			(message) =>
+				message.type === "extension_ui_request" &&
+				message.request.method === "setStatus" &&
+				(message.request.statusKey === "oldest" || message.request.statusKey === "next"),
+		);
+		expect(frames).toHaveLength(2);
+		expect(frames.map((frame) => ("seq" in frame ? frame.seq : -1))).toEqual([3, 4]);
+		expect(frames[0]).toMatchObject({ request: { statusKey: "oldest", statusText: undefined } });
+		expect(frames[1]).toMatchObject({ request: { statusKey: "next", statusText: "next" } });
+		expect([...runtimeMap(runtime, "stickyExtension").keys()]).toEqual(["setStatus:newer", "setStatus:next"]);
+	});
+
+	it("publishes committed Extension callbacks only after projection, replay, and runtime waterlines agree", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "extension-commit-waterline");
+		const { supervisor } = createHarness({ targets: [target], maxAutoRestarts: 0 });
+
+		await supervisor.activate(target.sessionHandle);
+		const runtime = exactRuntimeObject(supervisor, target.sessionHandle);
+		const options: unknown = Reflect.get(runtime, "opts");
+		if (typeof options !== "object" || options === null) throw new Error("Runtime options unavailable");
+		const originalHotSetChanged: unknown = Reflect.get(options, "onHotSetChanged");
+		const originalEmit: unknown = Reflect.get(options, "emit");
+		if (typeof originalHotSetChanged !== "function" || typeof originalEmit !== "function") {
+			throw new Error("Runtime callbacks unavailable");
+		}
+		const observations: Array<{
+			source: "hot_set" | "message";
+			projectionAsOfSeq: number;
+			runtimeLastSeq: number;
+			replayLastSeq: number;
+		}> = [];
+		Reflect.set(options, "onHotSetChanged", () => {
+			observations.push({ source: "hot_set", ...runtimeSemanticWaterline(runtime) });
+			Reflect.apply(originalHotSetChanged, undefined, []);
+		});
+		Reflect.set(options, "emit", (message: unknown) => {
+			if (
+				typeof message === "object" &&
+				message !== null &&
+				Reflect.get(message, "type") === "runtime_state"
+			) {
+				observations.push({ source: "message", ...runtimeSemanticWaterline(runtime) });
+			}
+			Reflect.apply(originalEmit, undefined, [message]);
+		});
+
+		deliverCurrentExtension(runtime, {
+			type: "extension_ui_request",
+			id: "waterline-dialog",
+			method: "confirm",
+			title: "Waterline",
+			message: "Observe the committed state",
+		});
+
+		expect(observations).toEqual([
+			{ source: "hot_set", projectionAsOfSeq: 1, runtimeLastSeq: 1, replayLastSeq: 1 },
+			{ source: "message", projectionAsOfSeq: 1, runtimeLastSeq: 1, replayLastSeq: 1 },
+		]);
+	});
+
+	it("keeps committed Extension state coherent when the first publish and its logger throw", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "extension-post-commit-effect-failure");
+		const { supervisor, messages } = createHarness({ targets: [target], maxAutoRestarts: 0 });
+
+		await supervisor.activate(target.sessionHandle);
+		const runtime = exactRuntimeObject(supervisor, target.sessionHandle);
+		deliverCurrentExtension(runtime, {
+			type: "extension_ui_request",
+			id: "same-dialog",
+			method: "confirm",
+			title: "Original",
+			message: "Original",
+		});
+		messages.length = 0;
+
+		const options: unknown = Reflect.get(runtime, "opts");
+		if (typeof options !== "object" || options === null) throw new Error("Runtime options unavailable");
+		const originalEmit: unknown = Reflect.get(options, "emit");
+		const originalLog: unknown = Reflect.get(options, "log");
+		if (typeof originalEmit !== "function") throw new Error("Runtime message callback unavailable");
+		const attemptedTypes: string[] = [];
+		let rejectFirstCommittedFrame = true;
+		Reflect.set(options, "emit", (message: unknown) => {
+			const type = typeof message === "object" && message !== null ? Reflect.get(message, "type") : undefined;
+			if (type === "extension_ui_closed" || type === "extension_ui_request") {
+				attemptedTypes.push(type);
+				if (rejectFirstCommittedFrame) {
+					rejectFirstCommittedFrame = false;
+					throw new Error("fixture first committed publish failed");
+				}
+			}
+			Reflect.apply(originalEmit, undefined, [message]);
+		});
+		Reflect.set(options, "log", () => {
+			throw new Error("fixture committed-effect logger failed");
+		});
+
+		try {
+			expect(() =>
+				deliverCurrentExtension(runtime, {
+					type: "extension_ui_request",
+					id: "same-dialog",
+					method: "confirm",
+					title: "Replacement",
+					message: "Replacement",
+				}),
+			).not.toThrow();
+			expect(attemptedTypes).toEqual(["extension_ui_closed", "extension_ui_request"]);
+			expect(runtimeSemanticWaterline(runtime)).toEqual({
+				projectionAsOfSeq: 3,
+				runtimeLastSeq: 3,
+				replayLastSeq: 3,
+			});
+			expect(supervisor.getPendingExtensionRequests(target.sessionHandle)).toEqual([
+				expect.objectContaining({ id: "same-dialog", title: "Replacement" }),
+			]);
+			const replay = await supervisor.subscribe(target.sessionHandle, {
+				serverEpoch: supervisor.serverEpoch,
+				generation: supervisor.getRuntime(target.sessionHandle)!.generation,
+				seq: 1,
+			});
+			if (replay.type !== "replay") throw new Error("Committed Extension suffix was not replayable");
+			expect(replay.frames.map((frame) => frame.seq)).toEqual([2, 3]);
+			expect(
+				messages.filter(
+					(message) => message.type === "extension_ui_closed" || message.type === "extension_ui_request",
+				),
+			).toEqual([expect.objectContaining({ type: "extension_ui_request", seq: 3 })]);
+		} finally {
+			Reflect.set(options, "emit", originalEmit);
+			Reflect.set(options, "log", originalLog);
+		}
+	});
+
+	it("commits same-id close and replacement consecutively and fences the old timer entry", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "dialog-timer-entry-fence");
+		const { supervisor, messages } = createHarness({ targets: [target], maxAutoRestarts: 0 });
+
+		await supervisor.activate(target.sessionHandle);
+		const runtime = exactRuntimeObject(supervisor, target.sessionHandle);
+		deliverCurrentExtension(runtime, {
+			type: "extension_ui_request",
+			id: "same-dialog",
+			method: "confirm",
+			title: "Original",
+			message: "Original",
+			timeout: 1_000,
+		});
+		const initial = await supervisor.subscribe(target.sessionHandle);
+		expect(initial).toMatchObject({
+			type: "resync_required",
+			snapshot: { runtime: { state: "waiting_ui" } },
+		});
+		const oldEntry = runtimeMap(runtime, "pendingDialogs").get("same-dialog");
+		if (!oldEntry) throw new Error("Original dialog entry unavailable");
+		messages.length = 0;
+
+		deliverCurrentExtension(runtime, {
+			type: "extension_ui_request",
+			id: "same-dialog",
+			method: "confirm",
+			title: "Replacement",
+			message: "Replacement",
+			timeout: 1_000,
+		});
+		const semanticFrames = messages.filter(
+			(message) => message.type === "extension_ui_closed" || message.type === "extension_ui_request",
+		);
+		expect(semanticFrames.map((frame) => ("seq" in frame ? frame.seq : -1))).toEqual([2, 3]);
+		expect(semanticFrames.map((frame) => frame.type)).toEqual([
+			"extension_ui_closed",
+			"extension_ui_request",
+		]);
+		messages.length = 0;
+		expireDialogEntry(runtime, "same-dialog", oldEntry);
+		expect(messages).toEqual([]);
+		expect(supervisor.getPendingExtensionRequests(target.sessionHandle)).toEqual([
+			expect.objectContaining({ id: "same-dialog", title: "Replacement" }),
+		]);
 	});
 
 	it("uses one 256-item sticky authority and publishes explicit clears for live eviction", async () => {
