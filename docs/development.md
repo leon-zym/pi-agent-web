@@ -69,7 +69,7 @@ Focused 绿灯不是 release gate；修改完成后仍按风险运行上层组�
 | L1 单元 | guards、LF reader、identity、layout、reducer、scheduler、formatter | package Vitest |
 | L2 模块集成 | 文件、process group、runtime pool、rekey、trash、shutdown | server fixtures + Vitest |
 | L3 Gateway 黑盒 | Cookie/Origin/Host、REST+real WS、lease/fencing/replay/dialog/backpressure | gateway/security/bridge tests + smoke |
-| L4 Packaged browser | 用户操作、同 Workspace 多 Session、后台运行、image-only、typed content refs、responsive、console errors | Playwright `test:browser` |
+| L4 Packaged browser | 用户操作、同 Workspace 多 Session、后台运行、image-only、responsive、console errors | Playwright `test:browser` |
 | L5 Real Pi | fake 无法证明的 upstream/provider/multimodal/queue/fork 兼容性 | opt-in `test:e2e:real` |
 | L6 视觉/性能 | light/dark/mobile/zoom/states、长流公平性、Markdown/DOM profile | screenshots + benchmark |
 | L7 分发 | tarball contents、依赖可发布性、bin/npx、single port、clean dist | `verify` + smoke + pack |
@@ -78,14 +78,13 @@ Focused 绿灯不是 release gate；修改完成后仍按风险运行上层组�
 reducer 单测代替 browser bounding-box/console 断言。删除、process 或 shutdown 改动必须覆盖 race 和
 失败恢复；不能只检查 happy path。
 
-Protocol 1.3、shared content store 与 REST 变更至少覆盖以下边界：
+Attachment store 与 REST 变更至少覆盖以下边界：
 
-- Store 测试验证 raster 与 `utf8` namespace 的 exact epoch/digest/length identity、pre-read reservation、
-  48 MiB content 与 8 MiB raster blob ceiling、共享 64 MiB/256 item cache、streaming digest/length、同
-  bytes dedupe、hold/publish/pin/release/GC、temp cleanup、path/symlink/manifest/inode 防护，以及 lifecycle
-  lock、tombstone 和 shutdown race。Route 测试还要证明 raster exact-metadata PUT 快路径先 pin，使用固定
-  内存重验完整 gross contract/length/SHA-256，content route 则只允许 authenticated GET。测试不能把整段
-  request body 读入内存来替代 streaming seam。
+- Store 测试验证新 digest 的 pre-read reservation、blob/cache byte 与 item ceiling、streaming
+  digest/length、同 digest 并发、hold/publish/pin/release/GC、temp cleanup、path/symlink/manifest/inode
+  防护，以及 lifecycle lock、tombstone 和 shutdown race。Route 测试还要证明 exact-metadata digest 快路径
+  先 pin，使用固定内存重验完整 raster gross contract/length/SHA-256，且不创建新 reservation 或 temp
+  file。测试不能把整段 request body 读入内存来替代 streaming seam。
 - Route 测试验证 auth、旧 epoch 和非法 digest 在触碰 store 前失败，required `Content-Length`、identity
   encoding、allowlisted raster MIME、magic/gross container/truncation、canonical admission evidence、
   201/200 并发语义、GET safety headers、明确拒绝 Range/HEAD，以及真实 HTTP client abort 后 pin release。
@@ -96,15 +95,13 @@ Protocol 1.3、shared content store 与 REST 变更至少覆盖以下边界：
 Raster fixtures 只证明 Gateway admission 的 MIME、magic、gross container 与 truncation 边界，不宣称图片
 通过真实 decoder。Browser preprocessing 已用原生 decode seam 覆盖；server-private adapter externalizer
 复用同一 raster admission，并验证 canonical base64、decoded/blob ceiling、同帧去重、单 Buffer streaming
-与整帧 rollback。Typed externalizer 另验证 text/JSON bounded encoding、256 KiB threshold、48 MiB root、
-inline_json/external_json、root-only provenance 和 opaque nested lookalike。PiProcess 与 Runtime 测试覆盖
-late/deadline/stale/orphan disposal，startup、普通 response/event、idle compaction、generation cleanup、
-fork/clone/rekey ownership，以及 cleanup rejection 的永久 fence。Production Main 通过一个 activation root
-把相同 store、epoch、两套 budget context 与 Pi payload services 接到 REST、Supervisor 和 WebSocket hello。
-L3 real HTTP/WS integration 已验证大 tool result 在 live/replay/snapshot/history response 中只以 typed
-reference 出现，认证 content GET 返回原 UTF-8 bytes，stop 后 hold/GC 清理完成。L4 packaged Browser coverage
-验证 trusted-context projection/render、collapsed Tool 不 GET、expand/Inspector lazy materialization、
-Extension eager roots、精确失败 recovery 和 inline-only command ingress。
+与整帧 rollback。PiProcess 与 Runtime 测试覆盖 late/deadline/stale/orphan disposal，startup、普通
+response/event、idle compaction、generation cleanup、fork/clone/rekey ownership，以及 cleanup rejection 的
+永久 fence。Production Main 通过一个 activation root 把相同 store、epoch、budget context 与 Pi payload
+services 接到 REST、Supervisor 和 WebSocket hello。L3 real HTTP/WS integration 已验证大 Pi image 在 live、
+replay、snapshot 中只以 reference 出现，认证 GET 返回原 bytes，stop 后 hold/GC 清理完成。L4 packaged
+Browser coverage 与该 activation diff 一起验证 trusted-context projection/render、attachment load resync 和
+结构化 admission recovery；Browser command ingress 继续覆盖 inline-only image preparation。
 
 ## 确定性 browser E2E
 
@@ -116,11 +113,7 @@ case 建立隔离的 agent/session/web/workspace/control 目录，并从 child e
 - cold bootstrap，无 console/page error；
 - 同一 Workspace 的两个独立 Pi PID/Session 并发；A 后台流式时选择并完成 B，再切回 A；
 - image-only prompt 后同一 multiplexed socket 仍能发下一条 command；
-- Pi output attachment/content reference 通过同源认证 URL 渲染；失效 reference 触发精确、单次 resync；
-- collapsed Tool 不发 content GET，展开或打开 Inspector 后才 GET；replay、snapshot、history response 仍保留 lazy reference；
-- Extension editor、set_editor_text 与 widget root 在 semantic state/seq commit 前 eager materialize；
-- 404/410、错误 metadata、malformed UTF-8、JSON parse 与 slot guard failure 不产生空值或 inline fallback；
-- stale Session/generation/epoch、Abort、disconnect、rekey、unmount 与 late completion 不触发 recovery，也不污染当前选中 Session；
+- Pi output attachment reference 通过同源认证 URL 渲染；失效 reference 触发精确、单次 resync；
 - 结构化 payload admission failure 显示本地化文案并保留 draft/images，重试成功后才清空；
 - ordinary first prompt 不被标成 steer，真实 event order 不留下空 Working step；
 - 375×812 没有页面水平 overflow，composer 主控件 bounding box 都在 viewport。
@@ -155,9 +148,9 @@ pnpm test:e2e:real
   不得空洞 0-exit 假装通过。
 - Release 记录通过的 provider/model 与场景，不记录 credential。
 
-当前 suite 验证一条 socket 上两个 Session 并发、image-only、typed content 内容隔离、streaming `follow_up`、
-abort、clone rekey/generation、父子 history isolation，以及 stats/tree/commands；release gate 还覆盖
-Extension editor、set_editor_text 与 widget 的 eager materialization、content GET 认证与失败 recovery。
+当前 suite 验证一条 socket 上两个 Session 并发、image-only、内容隔离、streaming `follow_up`、abort、
+clone rekey/generation、父子 history isolation，以及 stats/tree/commands。Extension editor/widget 等尚未
+自动化的 upstream surface 必须在 release checklist 明示通过或跳过理由。
 
 ## Conversation 性能
 
@@ -230,12 +223,6 @@ PI_WEB_RUN_E2E=1 pnpm test:e2e:real  # 有 credential 的显式 compatibility ga
 
 同时完成最终截图、安全内容扫描、文档 consistency grep、版本/tag/change record；任何跳过的 L5/L6
 场景必须写原因。
-
-Activation commit 的文档门禁还要确认：active 文档与 ADR 0011 都写 minor 3、双 capability、两套完整
-budget、shared `EpochContentStore`、root-only materialization、exact identity/Abort/barrier/recovery 和
-Extension eager roots；不能把 1.2 写成当前 production，也不能留下未完成占位或 per-connection inline
-fallback。本仓库没有独立 Markdown linter，因此至少运行 `pnpm check:style`、`pnpm lint`、Markdown 结构
-检查（如环境提供）与 `git diff --check`。
 
 ## 代码与提交约定
 

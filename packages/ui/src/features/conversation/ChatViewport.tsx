@@ -1,5 +1,5 @@
 import { ArrowDown } from "lucide-react";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Skeleton } from "../../components/ui/skeleton";
 import { tt } from "../../lib/i18n";
 import { reportAuthoritativeAttachmentFailure } from "../../lib/session-attachment";
@@ -12,7 +12,6 @@ import { EmptyHero } from "./EmptyHero";
 import { SessionRecoveryNotice } from "./SessionRecoveryNotice";
 import { StatusRowView } from "./StatusRowView";
 import { TurnView } from "./TurnView";
-import { createSessionRuntimeIdentity } from "./use-lazy-tool-content";
 
 const PIN_THRESHOLD = 24;
 const SAVED_SESSION_SCROLL_LIMIT = 32;
@@ -116,14 +115,6 @@ export function ChatViewport() {
 	const [pinned, setPinned] = useState(true);
 
 	const currentSessionId = useProjectionStore((s) => s.currentSessionId);
-	const sessionHandle = currentSessionId;
-	const runtime = useSessionTransportStore((state) =>
-		sessionHandle ? state.sessions[sessionHandle]?.runtime : null,
-	);
-	const sessionIdentity = useMemo(
-		() => createSessionRuntimeIdentity(runtime, sessionHandle),
-		[runtime?.generation, runtime?.serverEpoch, runtime?.sessionHandle, runtime?.workspaceId, sessionHandle],
-	);
 	const projection = useProjectionStore((s) =>
 		currentSessionId ? s.projections[currentSessionId] : undefined,
 	);
@@ -239,13 +230,7 @@ export function ChatViewport() {
 				) : (
 					<div className="flex min-w-0 max-w-full flex-col gap-6">
 						{projection.turns.map((turn) => (
-							<TurnView
-								key={turn.id}
-								turn={turn}
-								sessionHandle={sessionHandle}
-								sessionIdentity={sessionIdentity}
-								onAttachmentLoadError={reportAttachmentLoadError}
-							/>
+							<TurnView key={turn.id} turn={turn} onAttachmentLoadError={reportAttachmentLoadError} />
 						))}
 						{projection.statusRows.map((row) => (
 							<StatusRowView key={row.key} row={row} />

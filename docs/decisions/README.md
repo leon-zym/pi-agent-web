@@ -16,7 +16,6 @@ an ADR explains why the contract exists and which alternatives were rejected.
 | [0008](0008-authoritative-epoch-aware-live-session-resync.md) | Authoritative epoch-aware live Session resync and snapshot waterlines |
 | [0009](0009-authoritative-hot-runtime-inventory-and-browser-reconciliation.md) | Authoritative hot Runtime inventory and Browser reconciliation |
 | [0010](0010-epoch-scoped-attachment-references-and-payload-budgets.md) | Epoch-scoped attachment references and payload budgets |
-| [0011](0011-epoch-scoped-typed-content-references.md) | Epoch-scoped typed content references for UTF-8 text and JSON |
 
 New ADRs use: Status, Date, Context, Decision, Consequences, Rejected alternatives, Verification.
 Accepted ADRs are amended or superseded by a later ADR; do not silently reverse them in a handoff or

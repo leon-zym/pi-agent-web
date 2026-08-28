@@ -1,9 +1,3 @@
-import {
-	isSessionAttachmentRefDto,
-	isSessionContentRefDto,
-	type SessionAttachmentRefDto,
-} from "@pi-agent-web/protocol";
-import type { EpochStoredContentRef } from "./epoch-content-store.js";
 import { GenerationContentOwner } from "./generation-content-owner.js";
 import type { PiPayloadLeaseTransfer } from "./pi-payload-externalizer.js";
 
@@ -17,24 +11,21 @@ export type TransitionPayloadLedgerState =
 	| "release_failed";
 
 export interface TransitionPayloadLedgerOptions {
-	readonly serverEpoch: string;
-	readonly maxPhysicalBytes: number;
-	readonly maxPhysicalItems: number;
-	readonly maxHeldItems: number;
-	readonly maxLogicalBytes: number;
+	maxBytes: number;
+	maxHoldItems: number;
 }
 
-export interface TransitionPayloadLedgerAdmission<
-	TRef extends EpochStoredContentRef = SessionAttachmentRefDto,
-> {
-	readonly transfer: PiPayloadLeaseTransfer<TRef> | null;
-	readonly logicalBytes: number;
+export interface TransitionPayloadLedgerAppend {
+	transfer: PiPayloadLeaseTransfer;
+	bytes: number;
 }
 
 type EntryState = "pending" | "adopted" | "released";
 
-interface LedgerEntry<TRef extends EpochStoredContentRef> {
-	readonly transfer: PiPayloadLeaseTransfer<TRef>;
+interface LedgerEntry {
+	readonly transfer: PiPayloadLeaseTransfer;
+	readonly bytes: number;
+	readonly holdItems: number;
 	state: EntryState;
 }
 
@@ -48,63 +39,36 @@ export class TransitionPayloadLedgerError extends Error {
 /**
  * Owns undecided Pi payload transfers until one transition outcome routes them
  * into an exact generation owner or releases every still-unassigned transfer.
- * Physical refs deduplicate for cache accounting, while every admitted transfer
- * remains under exact cleanup custody and every logical occurrence is charged.
  */
-export class TransitionPayloadLedger<TRef extends EpochStoredContentRef = SessionAttachmentRefDto> {
-	private readonly serverEpoch: string;
-	private readonly maxPhysicalBytes: number;
-	private readonly maxPhysicalItems: number;
-	private readonly maxHeldItems: number;
-	private readonly maxLogicalBytes: number;
-	private readonly entries: LedgerEntry<TRef>[] = [];
-	private readonly seenTransfers = new Set<PiPayloadLeaseTransfer<TRef>>();
-	private readonly physicalRefs = new Map<string, EpochStoredContentRef>();
+export class TransitionPayloadLedger {
+	private readonly maxBytes: number;
+	private readonly maxHoldItems: number;
+	private readonly entries: LedgerEntry[] = [];
+	private readonly seenTransfers = new Set<PiPayloadLeaseTransfer>();
 	private currentState: TransitionPayloadLedgerState = "open";
-	private currentPhysicalBytes = 0;
-	private currentPhysicalItems = 0;
-	private currentHeldItems = 0;
-	private currentLogicalBytes = 0;
+	private currentBytes = 0;
+	private currentHoldItems = 0;
 	private adoptedCount = 0;
 	private releasePromise: Promise<void> | null = null;
 
 	constructor(options: TransitionPayloadLedgerOptions) {
-		if (
-			!options ||
-			typeof options.serverEpoch !== "string" ||
-			options.serverEpoch.length === 0 ||
-			!isLimit(options.maxPhysicalBytes) ||
-			!isLimit(options.maxPhysicalItems) ||
-			!isLimit(options.maxHeldItems) ||
-			!isLimit(options.maxLogicalBytes)
-		) {
+		if (!options || !isLimit(options.maxBytes) || !isLimit(options.maxHoldItems)) {
 			throw new TransitionPayloadLedgerError("transition payload ledger options are invalid");
 		}
-		this.serverEpoch = options.serverEpoch;
-		this.maxPhysicalBytes = options.maxPhysicalBytes;
-		this.maxPhysicalItems = options.maxPhysicalItems;
-		this.maxHeldItems = options.maxHeldItems;
-		this.maxLogicalBytes = options.maxLogicalBytes;
+		this.maxBytes = options.maxBytes;
+		this.maxHoldItems = options.maxHoldItems;
 	}
 
 	get state(): TransitionPayloadLedgerState {
 		return this.currentState;
 	}
 
-	get physicalBytes(): number {
-		return this.currentPhysicalBytes;
+	get bytes(): number {
+		return this.currentBytes;
 	}
 
-	get physicalItems(): number {
-		return this.currentPhysicalItems;
-	}
-
-	get heldItems(): number {
-		return this.currentHeldItems;
-	}
-
-	get logicalBytes(): number {
-		return this.currentLogicalBytes;
+	get holdItems(): number {
+		return this.currentHoldItems;
 	}
 
 	get pendingTransfers(): number {
@@ -119,74 +83,36 @@ export class TransitionPayloadLedger<TRef extends EpochStoredContentRef = Sessio
 		return this.adoptedCount;
 	}
 
-	/** Takes exclusive cleanup responsibility only after every independent preflight passes. */
-	admit(input: TransitionPayloadLedgerAdmission<TRef>): void {
+	/** Takes exclusive cleanup responsibility only after all accounting preflights pass. */
+	append(input: TransitionPayloadLedgerAppend): void {
 		if (this.currentState !== "open") {
 			throw new TransitionPayloadLedgerError("transition payload ledger is already consumed");
 		}
-		if (!input || !isLimit(input.logicalBytes) || (input.transfer !== null && !isTransfer(input.transfer))) {
-			throw new TransitionPayloadLedgerError("transition payload ledger admission is invalid");
+		const { transfer, bytes } = input ?? {};
+		if (!isTransfer(transfer) || !isLimit(bytes)) {
+			throw new TransitionPayloadLedgerError("transition payload ledger append is invalid");
 		}
-		const { transfer, logicalBytes } = input;
-		if (transfer && this.seenTransfers.has(transfer)) {
-			throw new TransitionPayloadLedgerError("transition payload transfer was already admitted");
+		if (this.seenTransfers.has(transfer)) {
+			throw new TransitionPayloadLedgerError("transition payload transfer was already appended");
 		}
-		const nextLogicalBytes = safeAdd(this.currentLogicalBytes, logicalBytes);
-		if (nextLogicalBytes > this.maxLogicalBytes) {
-			throw new TransitionPayloadLedgerError("transition payload ledger logical byte limit exceeded");
+		const holdItems = transfer.refs.length;
+		const nextBytes = this.currentBytes + bytes;
+		const nextHoldItems = this.currentHoldItems + holdItems;
+		if (!Number.isSafeInteger(nextBytes) || nextBytes > this.maxBytes) {
+			throw new TransitionPayloadLedgerError("transition payload ledger byte limit exceeded");
 		}
-		if (!transfer) {
-			this.currentLogicalBytes = nextLogicalBytes;
-			return;
-		}
-
-		const stagedPhysicalRefs = new Map<string, EpochStoredContentRef>();
-		let addedPhysicalBytes = 0;
-		let addedPhysicalItems = 0;
-		for (const candidate of transfer.refs) {
-			if (!isStoredContentRef(candidate)) {
-				throw new TransitionPayloadLedgerError("transition payload reference is invalid");
-			}
-			if (candidate.serverEpoch !== this.serverEpoch) {
-				throw new TransitionPayloadLedgerError("transition payload reference epoch is invalid");
-			}
-			const key = contentKey(candidate);
-			const existing = this.physicalRefs.get(key) ?? stagedPhysicalRefs.get(key);
-			if (existing) {
-				if (!refsEqual(existing, candidate)) {
-					throw new TransitionPayloadLedgerError("transition payload digest metadata collision");
-				}
-				continue;
-			}
-			stagedPhysicalRefs.set(key, candidate);
-			addedPhysicalBytes = safeAdd(addedPhysicalBytes, candidate.byteLength);
-			addedPhysicalItems = safeAdd(addedPhysicalItems, 1);
+		if (!Number.isSafeInteger(nextHoldItems) || nextHoldItems > this.maxHoldItems) {
+			throw new TransitionPayloadLedgerError("transition payload ledger hold item limit exceeded");
 		}
 
-		const nextPhysicalBytes = safeAdd(this.currentPhysicalBytes, addedPhysicalBytes);
-		const nextPhysicalItems = safeAdd(this.currentPhysicalItems, addedPhysicalItems);
-		const nextHeldItems = safeAdd(this.currentHeldItems, transfer.refs.length);
-		if (nextPhysicalBytes > this.maxPhysicalBytes) {
-			throw new TransitionPayloadLedgerError("transition payload ledger physical byte limit exceeded");
-		}
-		if (nextPhysicalItems > this.maxPhysicalItems) {
-			throw new TransitionPayloadLedgerError("transition payload ledger physical item limit exceeded");
-		}
-		if (nextHeldItems > this.maxHeldItems) {
-			throw new TransitionPayloadLedgerError("transition payload ledger held item limit exceeded");
-		}
-
-		this.entries.push({ transfer, state: "pending" });
+		this.entries.push({ transfer, bytes, holdItems, state: "pending" });
 		this.seenTransfers.add(transfer);
-		for (const [key, ref] of stagedPhysicalRefs) this.physicalRefs.set(key, ref);
-		this.currentPhysicalBytes = nextPhysicalBytes;
-		this.currentPhysicalItems = nextPhysicalItems;
-		this.currentHeldItems = nextHeldItems;
-		this.currentLogicalBytes = nextLogicalBytes;
+		this.currentBytes = nextBytes;
+		this.currentHoldItems = nextHoldItems;
 	}
 
 	/** One-shot synchronous routing. A failed suffix remains owned only for releaseRemaining(). */
-	drainTo(owner: GenerationContentOwner<TRef>): void {
+	drainTo(owner: GenerationContentOwner): void {
 		if (this.currentState !== "open") {
 			throw new TransitionPayloadLedgerError("transition payload ledger is already consumed");
 		}
@@ -254,15 +180,7 @@ function isLimit(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
-function safeAdd(left: number, right: number): number {
-	const value = left + right;
-	if (!Number.isSafeInteger(value)) {
-		throw new TransitionPayloadLedgerError("transition payload ledger accounting overflowed");
-	}
-	return value;
-}
-
-function isTransfer(value: unknown): value is PiPayloadLeaseTransfer<EpochStoredContentRef> {
+function isTransfer(value: unknown): value is PiPayloadLeaseTransfer {
 	return (
 		typeof value === "object" &&
 		value !== null &&
@@ -273,28 +191,4 @@ function isTransfer(value: unknown): value is PiPayloadLeaseTransfer<EpochStored
 		"release" in value &&
 		typeof value.release === "function"
 	);
-}
-
-function isStoredContentRef(value: unknown): value is EpochStoredContentRef {
-	return isSessionAttachmentRefDto(value) || isSessionContentRefDto(value);
-}
-
-function contentKey(ref: EpochStoredContentRef): string {
-	const namespace = ref.type === "attachment_ref" ? "attachment" : "utf8";
-	return `${namespace}:${ref.sha256}`;
-}
-
-function refsEqual(left: EpochStoredContentRef, right: EpochStoredContentRef): boolean {
-	if (
-		left.type !== right.type ||
-		left.serverEpoch !== right.serverEpoch ||
-		left.sha256 !== right.sha256 ||
-		left.byteLength !== right.byteLength
-	) {
-		return false;
-	}
-	if (left.type === "attachment_ref" && right.type === "attachment_ref") {
-		return left.mediaType === right.mediaType;
-	}
-	return left.type === "content_ref" && right.type === "content_ref" && left.encoding === right.encoding;
 }

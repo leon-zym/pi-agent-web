@@ -4,7 +4,6 @@ import type { GatewayAccessControl } from "./access-control.js";
 import { type AttachmentContentStore, createAttachmentRoutes } from "./attachment-routes.js";
 import { readAuthStatus, saveApiKey } from "./auth-storage.js";
 import type { ServerConfig } from "./config.js";
-import { createContentRoutes, type Utf8ContentReadStore } from "./content-routes.js";
 import { pickWorkspaceDirectory } from "./directory-picker.js";
 import { createNativeRoutes } from "./native-routes.js";
 import type { NativeSessionCatalog } from "./native-session-catalog.js";
@@ -26,7 +25,7 @@ import type { WorkspacePreferences } from "./workspace-preferences.js";
  */
 export interface AppContext {
 	accessControl: GatewayAccessControl;
-	contentStore: AttachmentContentStore & Utf8ContentReadStore;
+	contentStore: AttachmentContentStore;
 	serverEpoch: string;
 	config: ServerConfig;
 	catalog: NativeSessionCatalog;
@@ -63,10 +62,6 @@ export function createApp(ctx: AppContext): Hono {
 	});
 
 	app.use("/api/v1/attachments/*", async (c, next) => {
-		await next();
-		c.header("Cache-Control", "no-store");
-	});
-	app.use("/api/v1/content/*", async (c, next) => {
 		await next();
 		c.header("Cache-Control", "no-store");
 	});
@@ -121,7 +116,6 @@ export function createApp(ctx: AppContext): Hono {
 		"/api/v1",
 		createAttachmentRoutes({ contentStore: ctx.contentStore, serverEpoch: ctx.serverEpoch }),
 	);
-	app.route("/api/v1", createContentRoutes({ contentStore: ctx.contentStore, serverEpoch: ctx.serverEpoch }));
 
 	app.route(
 		"/api/v1",

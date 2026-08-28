@@ -34,7 +34,6 @@ let failNextState = false;
 let delayNextTransitionState = false;
 let pendingBash;
 let pendingBashTimer;
-let pendingInlineTransition;
 let startupFloodSent = false;
 let initialStateRequest = true;
 let getMessagesRequestCount = 0;
@@ -162,11 +161,6 @@ function configuredBytes(name) {
 	return Number.isFinite(value) && value > 0 ? Math.min(value, 2 * 1024 * 1024) : 0;
 }
 
-function configuredLogicalBytes(name) {
-	const value = Number(process.env[name]);
-	return Number.isFinite(value) && value > 0 ? Math.min(value, 48 * 1024 * 1024) : 0;
-}
-
 function crc32(input) {
 	let crc = 0xffff_ffff;
 	for (const byte of input) {
@@ -211,53 +205,6 @@ function configuredCount(name) {
 }
 
 function sendStartupExtensionState() {
-	if (process.env.PI_WEB_FIXTURE_STARTUP_FUTURE_EDITOR === "1") {
-		send({
-			type: "extension_ui_request",
-			id: `startup-future-editor-${sessionId}`,
-			method: "editor",
-			title: "Startup future editor",
-			prefill: "s".repeat(320 * 1024),
-		});
-	}
-	if (process.env.PI_WEB_FIXTURE_STARTUP_TIMEOUT_INPUT === "1") {
-		send({
-			type: "extension_ui_request",
-			id: `startup-timeout-input-${sessionId}`,
-			method: "input",
-			title: "Startup expiring input",
-			placeholder: "expires before ready",
-			timeout: configuredBytes("PI_WEB_FIXTURE_STARTUP_TIMEOUT_INPUT_MS") || 20,
-		});
-	}
-	if (process.env.PI_WEB_FIXTURE_STARTUP_FUTURE_EDITOR_LOGICAL_PAIR === "1") {
-		for (let index = 0; index < 2; index += 1) {
-			send({
-				type: "extension_ui_request",
-				id: `startup-future-editor-logical-${String(index)}-${sessionId}`,
-				method: "editor",
-				title: `Startup future logical editor ${String(index)}`,
-				prefill: String(index).repeat(320 * 1024),
-			});
-		}
-	}
-	if (process.env.PI_WEB_FIXTURE_STARTUP_FUTURE_EDITOR_REPLACEMENT === "1") {
-		const id = `startup-future-editor-replacement-${sessionId}`;
-		send({
-			type: "extension_ui_request",
-			id,
-			method: "editor",
-			title: "Unpublished old startup editor",
-			prefill: "o".repeat(320 * 1024),
-		});
-		send({
-			type: "extension_ui_request",
-			id,
-			method: "editor",
-			title: "Authoritative startup editor",
-			prefill: "n".repeat(320 * 1024),
-		});
-	}
 	const stickyCount = configuredCount("PI_WEB_FIXTURE_STICKY_COUNT");
 	for (let index = 0; index < stickyCount; index += 1) {
 		send({
@@ -521,20 +468,6 @@ function streamPrompt(command) {
 		send({ type: "agent_settled" });
 		return;
 	}
-	if (text === "future-extension-large-editor") {
-		response(command);
-		send({
-			type: "extension_ui_request",
-			id: `future-editor-${sessionId}`,
-			method: "editor",
-			title: "Future editor",
-			prefill: "e".repeat(320 * 1024),
-		});
-		if (process.env.PI_WEB_FIXTURE_FUTURE_EDITOR_SETTLES === "1") {
-			send({ type: "agent_settled" });
-		}
-		return;
-	}
 	if (text === "notify-then-event") {
 		send({
 			type: "extension_ui_request",
@@ -552,24 +485,6 @@ function streamPrompt(command) {
 	if (text === "small-structural-turn") {
 		send({ type: "turn_start" });
 		messages.push(assistantMessage("small-structural-turn"));
-		send({ type: "agent_end", messages: [], willRetry: false });
-		send({ type: "agent_settled" });
-		return;
-	}
-	if (text === "logical-settle-boundary") {
-		send({ type: "turn_start" });
-		send({ type: "agent_end", messages: [], willRetry: false });
-		setTimeout(() => {
-			send({ type: "agent_settled" });
-			send({ type: "queue_update", steering: ["post-settle-marker"], followUp: [] });
-		}, 75);
-		return;
-	}
-	if (text === "logical-cleanup-boundary") {
-		send({ type: "turn_start" });
-		return;
-	}
-	if (text === "compaction-three-frame") {
 		send({ type: "agent_end", messages: [], willRetry: false });
 		send({ type: "agent_settled" });
 		return;
@@ -688,66 +603,6 @@ function streamPrompt(command) {
 }
 
 function transition(command) {
-	const sendInlineStatus = () => {
-		if (process.env.PI_WEB_FIXTURE_TRANSITION_INLINE_STATUS !== "1") return;
-		send({
-			type: "extension_ui_request",
-			id: `transition-inline-status-${sessionId}`,
-			method: "setStatus",
-			statusKey: "inline-transition",
-			statusText: sessionId,
-		});
-	};
-	if (process.env.PI_WEB_FIXTURE_TRANSITION_INLINE_DIALOG === "1") {
-		pendingInlineTransition = command;
-		send({
-			type: "extension_ui_request",
-			id: `transition-inline-dialog-${sessionId}`,
-			method: "confirm",
-			title: "Transition inline dialog",
-			message: "confirm transition veto",
-		});
-		return;
-	}
-	if (process.env.PI_WEB_FIXTURE_TRANSITION_FUTURE_EDITOR === "1") {
-		send({
-			type: "extension_ui_request",
-			id: `transition-future-editor-${sessionId}`,
-			method: "editor",
-			title: "Transition future editor",
-			prefill: "t".repeat(320 * 1024),
-		});
-	}
-	if (
-		process.env.PI_WEB_FIXTURE_TRANSITION_FUTURE_EDITOR_TEXT === "1" ||
-		process.env.PI_WEB_FIXTURE_TRANSITION_FUTURE_EDITOR_TEXT_LOGICAL_BYTES
-	) {
-		const logicalBytes = configuredLogicalBytes("PI_WEB_FIXTURE_TRANSITION_FUTURE_EDITOR_TEXT_LOGICAL_BYTES");
-		send({
-			type: "extension_ui_request",
-			id: `transition-future-editor-text-${sessionId}`,
-			method: "set_editor_text",
-			text: logicalBytes > 0 ? `tracked-logical:${String(logicalBytes)}` : "e".repeat(320 * 1024),
-		});
-	}
-	const stagedLogicalBytes = configuredLogicalBytes("PI_WEB_FIXTURE_TRANSITION_STAGED_LOGICAL_BYTES");
-	const stagedLogicalCount = Math.max(
-		0,
-		Number.parseInt(process.env.PI_WEB_FIXTURE_TRANSITION_STAGED_LOGICAL_COUNT ?? "0", 10) || 0,
-	);
-	for (let index = 0; index < stagedLogicalCount; index += 1) {
-		send({
-			type: "message_end",
-			message: {
-				role: "toolResult",
-				toolCallId: `transition-logical-${String(index)}`,
-				toolName: "fixture",
-				content: [{ type: "text", text: `tracked-logical:${String(stagedLogicalBytes)}` }],
-				isError: false,
-				timestamp: Date.now(),
-			},
-		});
-	}
 	if (process.env.PI_WEB_FIXTURE_TRANSITION_PAYLOAD_EVENTS === "1") {
 		send({
 			type: "message_end",
@@ -769,7 +624,6 @@ function transition(command) {
 		}
 	}
 	if (process.env.PI_WEB_FIXTURE_CANCEL_TRANSITION === "1") {
-		sendInlineStatus();
 		if (process.env.PI_WEB_FIXTURE_TRANSITION_STICKY === "1") {
 			send({
 				type: "extension_ui_request",
@@ -783,24 +637,12 @@ function transition(command) {
 		return;
 	}
 	if (process.env.PI_WEB_FIXTURE_TRANSITION_SAME_IDENTITY === "1") {
-		sendInlineStatus();
 		response(command, command.type === "fork" ? { text: "forked", cancelled: false } : { cancelled: false });
 		return;
 	}
 	const previousFile = sessionFile;
 	sessionId = `${sessionId}-${command.type}`;
 	sessionFile = path.join(path.dirname(previousFile), `2026-08-20T00-00-01-000Z_${sessionId}.jsonl`);
-	const childLogicalBytes = configuredLogicalBytes("PI_WEB_FIXTURE_TRANSITION_CHILD_LOGICAL_BYTES");
-	if (childLogicalBytes > 0) {
-		messages.splice(0, messages.length, {
-			role: "toolResult",
-			toolCallId: "transition-child-logical",
-			toolName: "fixture",
-			content: [{ type: "text", text: `tracked-logical:${String(childLogicalBytes)}` }],
-			isError: false,
-			timestamp: Date.now(),
-		});
-	}
 	if (process.env.PI_WEB_FIXTURE_UNPERSISTED_TRANSITION !== "1") ensurePersisted();
 	sendLargeExtensionRequest(
 		`transition-flood-${sessionId}`,
@@ -819,7 +661,6 @@ function transition(command) {
 			statusText: sessionId,
 		});
 	}
-	sendInlineStatus();
 	if (process.env.PI_WEB_FIXTURE_FAIL_TRANSITION_STATE === "1") {
 		failNextState = true;
 		send({
@@ -904,18 +745,6 @@ function handleLine(line) {
 						: {}),
 				});
 			}
-			if (
-				process.env.PI_WEB_FIXTURE_TRANSITION_VERIFYING_FUTURE_EDITOR === "1" &&
-				getMessagesRequestCount === 2
-			) {
-				send({
-					type: "extension_ui_request",
-					id: `transition-verifying-future-editor-${sessionId}`,
-					method: "editor",
-					title: "Transition verifying future editor",
-					prefill: "v".repeat(320 * 1024),
-				});
-			}
 			response(command, { messages });
 			if (
 				process.env.PI_WEB_FIXTURE_TRANSITION_DIALOG_DURING_PARENT_CLEANUP === "1" &&
@@ -928,26 +757,6 @@ function handleLine(line) {
 						method: "confirm",
 						title: "Transition applying dialog",
 						message: "transition-applying-dialog",
-					});
-				}, 20);
-			}
-			if (
-				process.env.PI_WEB_FIXTURE_TRANSITION_APPLYING_FUTURE_EXTENSIONS === "1" &&
-				getMessagesRequestCount === 2
-			) {
-				setTimeout(() => {
-					send({
-						type: "extension_ui_request",
-						id: `transition-applying-editor-text-${sessionId}`,
-						method: "set_editor_text",
-						text: "a".repeat(320 * 1024),
-					});
-					send({
-						type: "extension_ui_request",
-						id: `transition-applying-editor-${sessionId}`,
-						method: "editor",
-						title: "Transition applying editor",
-						prefill: "b".repeat(320 * 1024),
 					});
 				}, 20);
 			}
@@ -1077,10 +886,6 @@ function handleLine(line) {
 			transition(command);
 			return;
 		case "extension_ui_response":
-			if (pendingInlineTransition) {
-				response(pendingInlineTransition, { cancelled: true });
-				pendingInlineTransition = undefined;
-			}
 			return;
 		default:
 			response(command);

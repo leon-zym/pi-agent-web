@@ -1,10 +1,7 @@
 import {
 	isSessionAttachmentRefForNegotiatedBudget,
-	isSessionContentRefBudgetDto,
-	isSessionContentRefForNegotiatedBudget,
 	isSessionPayloadAdmissionErrorDto,
 	isSessionPayloadBudgetDto,
-	type SessionContentRefBudgetDto,
 	type SessionPayloadBudgetDto,
 } from "./payload-budget.js";
 import type {
@@ -23,13 +20,9 @@ import type {
 	SessionCommandResponseDto,
 	SessionCommandTypeDto,
 	SessionEntryDto,
-	SessionExternalTextDto,
-	SessionJsonRootDto,
-	SessionJsonValueDto,
 	SessionMessageDto,
 	SessionStateDto,
 	SessionStatsDto,
-	SessionTextPayloadDto,
 	SessionTreeNodeDto,
 	SlashCommandDto,
 	ThinkingLevelDto,
@@ -56,13 +49,6 @@ export interface SessionAttachmentGuardContext {
 	/** Trusted current epoch from the negotiated hello or Gateway runtime, never from the candidate payload. */
 	serverEpoch: string;
 	payloadBudget: SessionPayloadBudgetDto;
-}
-
-/** Trusted future protocol 1.3 context; never derive either field from a candidate payload. */
-export interface FutureSessionContentRefGuardContext {
-	serverEpoch: string;
-	payloadBudget: SessionPayloadBudgetDto;
-	contentRefBudget: SessionContentRefBudgetDto;
 }
 
 const ATTACHMENT_IMAGE_MEDIA_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
@@ -111,137 +97,7 @@ function isOneOf<T extends string>(value: unknown, variants: readonly T[]): valu
 	return typeof value === "string" && variants.includes(value as T);
 }
 
-function addEncodedUtf8CodeUnitBytes(
-	value: string,
-	index: number,
-	bytes: number,
-): { bytes: number; nextIndex: number } {
-	const codeUnit = value.charCodeAt(index);
-	if (codeUnit <= 0x7f) return { bytes: bytes + 1, nextIndex: index };
-	if (codeUnit <= 0x7ff) return { bytes: bytes + 2, nextIndex: index };
-	if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
-		const next = value.charCodeAt(index + 1);
-		if (next >= 0xdc00 && next <= 0xdfff) return { bytes: bytes + 4, nextIndex: index + 1 };
-	}
-	return { bytes: bytes + 3, nextIndex: index };
-}
-
-function isUtf8BytesBelow(value: string, exclusiveLimit: number): boolean {
-	let bytes = 0;
-	for (let index = 0; index < value.length; index++) {
-		const encoded = addEncodedUtf8CodeUnitBytes(value, index, bytes);
-		bytes = encoded.bytes;
-		index = encoded.nextIndex;
-		if (bytes >= exclusiveLimit) return false;
-	}
-	return true;
-}
-
-type JsonValidationCounter = {
-	encodedBytes: number;
-	stringBytes: number;
-	items: number;
-	exclusiveLimit: number;
-	seen: Set<object>;
-};
-
-function addJsonBytes(counter: JsonValidationCounter, bytes: number): boolean {
-	counter.encodedBytes += bytes;
-	return counter.encodedBytes < counter.exclusiveLimit;
-}
-
-function addJsonStringValueBytes(counter: JsonValidationCounter, bytes: number): boolean {
-	counter.stringBytes += bytes;
-	return counter.stringBytes <= MAX_JSON_STRING_BYTES;
-}
-
-function addJsonStringBytes(value: string, counter: JsonValidationCounter, countAsValue: boolean): boolean {
-	if (!addJsonBytes(counter, 2)) return false;
-	for (let index = 0; index < value.length; index++) {
-		const codeUnit = value.charCodeAt(index);
-		if (codeUnit === 0x22 || codeUnit === 0x5c) {
-			if (countAsValue && !addJsonStringValueBytes(counter, 1)) return false;
-			if (!addJsonBytes(counter, 2)) return false;
-			continue;
-		}
-		if (codeUnit <= 0x1f) {
-			if (countAsValue && !addJsonStringValueBytes(counter, 1)) return false;
-			const shortEscape =
-				codeUnit === 0x08 || codeUnit === 0x09 || codeUnit === 0x0a || codeUnit === 0x0c || codeUnit === 0x0d;
-			if (!addJsonBytes(counter, shortEscape ? 2 : 6)) return false;
-			continue;
-		}
-		if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
-			const next = value.charCodeAt(index + 1);
-			if (next >= 0xdc00 && next <= 0xdfff) {
-				index++;
-				if (countAsValue && !addJsonStringValueBytes(counter, 4)) return false;
-				if (!addJsonBytes(counter, 4)) return false;
-				continue;
-			}
-			if (countAsValue && !addJsonStringValueBytes(counter, 3)) return false;
-			if (!addJsonBytes(counter, 6)) return false;
-			continue;
-		}
-		if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
-			if (countAsValue && !addJsonStringValueBytes(counter, 3)) return false;
-			if (!addJsonBytes(counter, 6)) return false;
-			continue;
-		}
-		const encoded = addEncodedUtf8CodeUnitBytes(value, index, counter.encodedBytes);
-		const encodedCodeUnitBytes = encoded.bytes - counter.encodedBytes;
-		if (countAsValue && !addJsonStringValueBytes(counter, encodedCodeUnitBytes)) return false;
-		counter.encodedBytes = encoded.bytes;
-		if (counter.encodedBytes >= counter.exclusiveLimit) return false;
-	}
-	return true;
-}
-
-function addJsonValueBytes(value: unknown, counter: JsonValidationCounter, depth: number): boolean {
-	if (depth > MAX_JSON_DEPTH || ++counter.items > MAX_JSON_ITEMS) return false;
-	if (value === null) return addJsonBytes(counter, 4);
-	if (typeof value === "boolean") return addJsonBytes(counter, value ? 4 : 5);
-	if (typeof value === "number") {
-		return isFiniteNumber(value) && addJsonBytes(counter, Object.is(value, -0) ? 1 : String(value).length);
-	}
-	if (typeof value === "string") return addJsonStringBytes(value, counter, true);
-	if (typeof value !== "object" || counter.seen.has(value)) return false;
-	counter.seen.add(value);
-	if (Array.isArray(value)) {
-		if (value.length > MAX_ARRAY_ITEMS) return false;
-		if (!addJsonBytes(counter, 2 + Math.max(0, value.length - 1))) return false;
-		for (let index = 0; index < value.length; index++) {
-			if (!addJsonValueBytes(value[index], counter, depth + 1)) return false;
-		}
-		return true;
-	}
-	if (Object.getPrototypeOf(value) !== Object.prototype) return false;
-	const keys = Object.keys(value);
-	if (keys.length > MAX_ARRAY_ITEMS) return false;
-	if (!addJsonBytes(counter, 2 + Math.max(0, keys.length - 1) + keys.length)) return false;
-	for (const key of keys) {
-		if (
-			!addJsonStringBytes(key, counter, false) ||
-			!addJsonValueBytes((value as UnknownRecord)[key], counter, depth + 1)
-		) {
-			return false;
-		}
-	}
-	return true;
-}
-
-function isBoundedJsonEncodedBytesBelow(
-	value: unknown,
-	exclusiveLimit: number,
-): value is SessionJsonValueDto {
-	return addJsonValueBytes(
-		value,
-		{ encodedBytes: 0, stringBytes: 0, items: 0, exclusiveLimit, seen: new Set<object>() },
-		0,
-	);
-}
-
-export function isBoundedJsonValue(value: unknown): value is SessionJsonValueDto {
+export function isBoundedJsonValue(value: unknown): boolean {
 	const stack: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
 	let items = 0;
 	let stringBytes = 0;
@@ -279,72 +135,6 @@ export function isSessionAttachmentGuardContext(value: unknown): value is Sessio
 		hasOnlyKeys(value, ["serverEpoch", "payloadBudget"]) &&
 		isString(value.serverEpoch, 128) &&
 		isSessionPayloadBudgetDto(value.payloadBudget)
-	);
-}
-
-export function isFutureSessionContentRefGuardContext(
-	value: unknown,
-): value is FutureSessionContentRefGuardContext {
-	return (
-		isRecord(value) &&
-		hasOnlyKeys(value, ["serverEpoch", "payloadBudget", "contentRefBudget"]) &&
-		isString(value.serverEpoch, 128) &&
-		isSessionPayloadBudgetDto(value.payloadBudget) &&
-		isSessionContentRefBudgetDto(value.contentRefBudget) &&
-		value.contentRefBudget.maxContentBlobBytes <= value.payloadBudget.maxAttachmentCacheBytes
-	);
-}
-
-function isExternalContentRef(value: unknown, context: FutureSessionContentRefGuardContext): boolean {
-	return (
-		isSessionContentRefForNegotiatedBudget(value, context.serverEpoch, context.contentRefBudget) &&
-		value.byteLength >= context.contentRefBudget.inlineContentThresholdBytes
-	);
-}
-
-export function isSessionExternalTextDto(
-	value: unknown,
-	context?: FutureSessionContentRefGuardContext,
-): value is SessionExternalTextDto {
-	return (
-		isRecord(value) &&
-		hasOnlyKeys(value, ["type", "ref"]) &&
-		Object.keys(value).length === 2 &&
-		value.type === "external_text" &&
-		context !== undefined &&
-		isFutureSessionContentRefGuardContext(context) &&
-		isExternalContentRef(value.ref, context)
-	);
-}
-
-export function isSessionTextPayloadDto(
-	value: unknown,
-	context?: FutureSessionContentRefGuardContext,
-): value is SessionTextPayloadDto {
-	if (!context || !isFutureSessionContentRefGuardContext(context)) return false;
-	return typeof value === "string"
-		? isUtf8BytesBelow(value, context.contentRefBudget.inlineContentThresholdBytes)
-		: isSessionExternalTextDto(value, context);
-}
-
-export function isSessionJsonRootDto(
-	value: unknown,
-	context?: FutureSessionContentRefGuardContext,
-): value is SessionJsonRootDto {
-	if (!isRecord(value) || !hasOnlyKeys(value, ["type", "value", "ref"])) return false;
-	if (!context || !isFutureSessionContentRefGuardContext(context)) return false;
-	if (value.type === "inline_json") {
-		return (
-			Object.keys(value).length === 2 &&
-			Object.hasOwn(value, "value") &&
-			isBoundedJsonEncodedBytesBelow(value.value, context.contentRefBudget.inlineContentThresholdBytes)
-		);
-	}
-	return (
-		value.type === "external_json" &&
-		Object.keys(value).length === 2 &&
-		Object.hasOwn(value, "ref") &&
-		isExternalContentRef(value.ref, context)
 	);
 }
 

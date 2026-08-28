@@ -1,4 +1,3 @@
-import type { SessionRuntimeIdentityDto } from "@pi-agent-web/protocol";
 import { ChevronRight, Zap } from "lucide-react";
 import { useState } from "react";
 import { formatDuration } from "../../lib/format";
@@ -14,8 +13,6 @@ export interface ToolGroupViewProps {
 	resultsByToolCallId: Map<string, UiToolResult[]>;
 	durationMs?: number;
 	defaultOpen?: boolean;
-	sessionHandle?: string | null;
-	sessionIdentity?: SessionRuntimeIdentityDto | null;
 }
 
 export function formatToolGroupSummary(
@@ -52,8 +49,6 @@ export function ToolGroupView({
 	resultsByToolCallId,
 	durationMs,
 	defaultOpen = false,
-	sessionHandle,
-	sessionIdentity,
 }: ToolGroupViewProps) {
 	const [expanded, setExpanded] = useState(defaultOpen);
 
@@ -101,15 +96,7 @@ export function ToolGroupView({
 						const results = resultsByToolCallId.get(tool.toolCallId) ?? [];
 
 						return (
-							<ToolCallRow
-								key={tool.key}
-								block={tool}
-								results={results}
-								stacked
-								className={roundingClass}
-								sessionHandle={sessionHandle}
-								sessionIdentity={sessionIdentity}
-							/>
+							<ToolCallRow key={tool.key} block={tool} results={results} stacked className={roundingClass} />
 						);
 					})}
 				</div>
