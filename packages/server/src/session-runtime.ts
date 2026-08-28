@@ -48,6 +48,7 @@ import {
 	type SessionLiveProjectionIdentity,
 	SessionLiveProjectionLimitError,
 	type SessionLiveProjectionLimits,
+	type SessionLiveProjectionPreparedBatch,
 	type SessionLiveProjectionPreparedCommit,
 	type SessionLiveProjectionSnapshot,
 } from "./session-live-projection.js";
@@ -131,6 +132,26 @@ interface PreparedActiveEventPublication<
 	replay: SessionReplayFrame<TEvent, TExtensionRequest>[];
 	replayFrameBytes: number[];
 	replayBytes: number;
+}
+
+interface PreparedExtensionSemanticOperation<
+	TMessage,
+	TEvent,
+	TExtensionRequest extends { readonly id: string; readonly method: string },
+> {
+	projection: SessionLiveProjection<TMessage, TEvent, TExtensionRequest>;
+	token: SessionLiveProjectionPreparedBatch;
+	semanticRevision: number;
+	envelopes: readonly SessionReplayFrame<TEvent, TExtensionRequest>[];
+	replay: SessionReplayFrame<TEvent, TExtensionRequest>[];
+	replayFrameBytes: number[];
+	replayBytes: number;
+	lastTransientSeq: number;
+	pendingDialogs: Map<string, PendingDialog<TExtensionRequest>>;
+	stickyExtension: Map<string, TExtensionRequest>;
+	timersToClear: readonly PendingDialog<TExtensionRequest>[];
+	timersToArm: readonly PendingDialog<TExtensionRequest>[];
+	processToken: number;
 }
 
 export interface SessionIdentityTransitionCommit<
@@ -419,6 +440,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	private replayBytes = 0;
 	private lastTransientSeq = 0;
 	private pendingDialogs = new Map<string, PendingDialog<RuntimeExtensionRequest<M>>>();
+	private extensionSemanticRevision = 0;
 	private pendingTurnReservations = new Map<symbol, PendingTurnReservation>();
 	private nextTurnReservationId = 0n;
 	private queueReservationReleaseCutoff = 0n;
@@ -711,6 +733,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		this.startupFrameBytes = 0;
 		this.activeTurnProjectionLogicalBytes = 0;
 		this.stickyExtension.clear();
+		this.extensionSemanticRevision = 0;
 		this.error = undefined;
 		this.setState("starting");
 
@@ -1514,6 +1537,10 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	private buildSessionSnapshotFromProjection(
 		projection: SessionLiveProjectionSnapshot<RuntimeMessage<M>, RuntimeEvent<M>, RuntimeExtensionRequest<M>>,
 		runtime: SessionRuntimeSnapshot = this.snapshot(),
+		extensionState: {
+			pendingDialogs: ReadonlyMap<string, PendingDialog<RuntimeExtensionRequest<M>>>;
+			stickyExtension: ReadonlyMap<string, RuntimeExtensionRequest<M>>;
+		} = { pendingDialogs: this.pendingDialogs, stickyExtension: this.stickyExtension },
 	): unknown {
 		return structuredClone({
 			type: "session_snapshot" as const,
@@ -1528,8 +1555,8 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			settledMessages: projection.settledMessages,
 			projectionEvents: projection.projectionEvents,
 			queue: projection.queue,
-			pendingExtensionRequests: [...this.pendingDialogs.values()].map((entry) => entry.request),
-			stickyExtensionState: [...this.stickyExtension.values()],
+			pendingExtensionRequests: [...extensionState.pendingDialogs.values()].map((entry) => entry.request),
+			stickyExtensionState: [...extensionState.stickyExtension.values()],
 		});
 	}
 
@@ -1917,6 +1944,12 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	private handleExtensionRequest(processToken: number, request: RuntimeExtensionRequest<M>): void {
 		if (processToken !== this.processToken) return;
 		this.verifyMaterializedSessionFile();
+		if (this.productAdapter.mode === "current" && this.startupReady && !this.transitionStage) {
+			this.commitExtensionSemanticOperation(
+				this.prepareExtensionRequestSemanticOperation(processToken, request),
+			);
+			return;
+		}
 		if (BLOCKING_DIALOG_METHODS.has(request.method)) {
 			const publishImmediately =
 				this.transitionStage?.phase === "awaiting_response" || this.transitionStage?.phase === "applying";
@@ -1948,6 +1981,270 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		return true;
 	}
 
+	private prepareExtensionRequestSemanticOperation(
+		processToken: number,
+		request: RuntimeExtensionRequest<M>,
+	): PreparedExtensionSemanticOperation<RuntimeMessage<M>, RuntimeEvent<M>, RuntimeExtensionRequest<M>> {
+		const pendingDialogs = new Map(this.pendingDialogs);
+		const stickyExtension = new Map(this.stickyExtension);
+		const frames: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[] = [];
+		const timersToClear: PendingDialog<RuntimeExtensionRequest<M>>[] = [];
+		const timersToArm: PendingDialog<RuntimeExtensionRequest<M>>[] = [];
+
+		if (BLOCKING_DIALOG_METHODS.has(request.method)) {
+			const replaced = pendingDialogs.get(request.id);
+			if (replaced) {
+				pendingDialogs.delete(request.id);
+				timersToClear.push(replaced);
+				frames.push({ type: "extension_ui_closed", requestId: request.id, reason: "replaced" });
+			}
+			const entry: PendingDialog<RuntimeExtensionRequest<M>> = { request, timer: null };
+			pendingDialogs.set(request.id, entry);
+			if (
+				pendingDialogs.size > this.opts.pendingDialogLimit ||
+				!this.extensionStateMapsFit(pendingDialogs, stickyExtension)
+			) {
+				throw new RpcError("extension_ui_request", "pending_dialog_state_limit_exceeded");
+			}
+			timersToArm.push(entry);
+			frames.push({ type: "extension_ui_request", request });
+		} else if (STICKY_EXTENSION_METHODS.has(request.method)) {
+			const key = stickyRequestKey(request);
+			if (stickyRequestClearsState(request)) {
+				stickyExtension.delete(key);
+				frames.push({ type: "extension_ui_request", request });
+			} else {
+				stickyExtension.delete(key);
+				while (stickyExtension.size > 0) {
+					stickyExtension.set(key, request);
+					if (this.extensionStateMapsFit(pendingDialogs, stickyExtension)) break;
+					stickyExtension.delete(key);
+					const oldestKey = stickyExtension.keys().next().value;
+					if (typeof oldestKey !== "string") break;
+					const oldest = stickyExtension.get(oldestKey);
+					if (!oldest) break;
+					stickyExtension.delete(oldestKey);
+					frames.push({ type: "extension_ui_request", request: this.stickyClearRequest(oldest) });
+				}
+				stickyExtension.set(key, request);
+				if (!this.extensionStateMapsFit(pendingDialogs, stickyExtension)) {
+					stickyExtension.delete(key);
+					frames.push({ type: "extension_ui_request", request: this.stickyClearRequest(request) });
+					this.log("warn", `Dropping oversized sticky extension state for ${this.sessionHandle}`);
+				} else {
+					frames.push({ type: "extension_ui_request", request });
+				}
+			}
+		} else {
+			frames.push({ type: "extension_ui_request", request });
+		}
+
+		return this.prepareExtensionSemanticOperation({
+			processToken,
+			frames,
+			pendingDialogs,
+			stickyExtension,
+			timersToClear,
+			timersToArm,
+		});
+	}
+
+	private prepareExtensionCloseSemanticOperation(
+		processToken: number,
+		requestId: string,
+		reason: Extract<
+			BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>,
+			{ type: "extension_ui_closed" }
+		>["reason"],
+		dialog: PendingDialog<RuntimeExtensionRequest<M>>,
+	): PreparedExtensionSemanticOperation<RuntimeMessage<M>, RuntimeEvent<M>, RuntimeExtensionRequest<M>> {
+		const pendingDialogs = new Map(this.pendingDialogs);
+		pendingDialogs.delete(requestId);
+		return this.prepareExtensionSemanticOperation({
+			processToken,
+			frames: [{ type: "extension_ui_closed", requestId, reason }],
+			pendingDialogs,
+			stickyExtension: new Map(this.stickyExtension),
+			timersToClear: [dialog],
+			timersToArm: [],
+		});
+	}
+
+	private prepareExtensionSemanticOperation(input: {
+		processToken: number;
+		frames: readonly BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[];
+		pendingDialogs: Map<string, PendingDialog<RuntimeExtensionRequest<M>>>;
+		stickyExtension: Map<string, RuntimeExtensionRequest<M>>;
+		timersToClear: readonly PendingDialog<RuntimeExtensionRequest<M>>[];
+		timersToArm: readonly PendingDialog<RuntimeExtensionRequest<M>>[];
+	}): PreparedExtensionSemanticOperation<RuntimeMessage<M>, RuntimeEvent<M>, RuntimeExtensionRequest<M>> {
+		const projection = this.liveProjection;
+		if (!projection) throw new RpcError("session_snapshot", "session_snapshot_unavailable");
+		try {
+			const token = projection.prepareBatch(this.projectionIdentity(), input.frames, this.state);
+			const candidateProjection = projection.previewPreparedBatch(token);
+			if (!candidateProjection) {
+				throw new RpcError("extension_ui_request", "extension_projection_prepare_stale");
+			}
+			const candidateRuntime: SessionRuntimeSnapshot = {
+				...this.snapshot(),
+				lastSeq: token.lastSeq,
+			};
+			this.assertProductSnapshotCandidateFits(
+				this.buildSessionSnapshotFromProjection(candidateProjection, candidateRuntime, {
+					pendingDialogs: input.pendingDialogs,
+					stickyExtension: input.stickyExtension,
+				}),
+			);
+			const envelopes: SessionReplayFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[] = [];
+			for (const [index, frame] of input.frames.entries()) {
+				envelopes.push({
+					...frame,
+					serverEpoch: this.opts.serverEpoch,
+					sessionHandle: this.sessionHandle,
+					workspaceId: this.workspaceId,
+					generation: this.generation,
+					seq: token.firstSeq + index,
+				});
+			}
+			const replay = [...this.replay];
+			const replayFrameBytes = [...this.replayFrameBytes];
+			let replayBytes = this.replayBytes;
+			let lastTransientSeq = this.lastTransientSeq;
+			for (const [index, frame] of input.frames.entries()) {
+				const envelope = envelopes[index];
+				if (!envelope) throw new RpcError("extension_ui_request", "extension_envelope_missing");
+				const bytes = Buffer.byteLength(JSON.stringify(envelope));
+				if (isReplayableFrame(frame)) {
+					replay.push(envelope);
+					replayFrameBytes.push(bytes);
+					replayBytes += bytes;
+				} else {
+					lastTransientSeq = envelope.seq;
+				}
+			}
+			let removeCount = 0;
+			while (replay.length - removeCount > this.opts.replayLimit || replayBytes > this.opts.replayMaxBytes) {
+				replayBytes -= replayFrameBytes[removeCount] ?? 0;
+				removeCount += 1;
+			}
+			if (removeCount > 0) {
+				replay.splice(0, removeCount);
+				replayFrameBytes.splice(0, removeCount);
+			}
+			return {
+				projection,
+				token,
+				semanticRevision: this.extensionSemanticRevision,
+				envelopes,
+				replay,
+				replayFrameBytes,
+				replayBytes,
+				lastTransientSeq,
+				pendingDialogs: input.pendingDialogs,
+				stickyExtension: input.stickyExtension,
+				timersToClear: input.timersToClear,
+				timersToArm: input.timersToArm,
+				processToken: input.processToken,
+			};
+		} catch (error) {
+			if (error instanceof SessionLiveProjectionLimitError) {
+				throw this.normalizeProjectionError(error);
+			}
+			throw error;
+		}
+	}
+
+	private commitExtensionSemanticOperation(
+		prepared: PreparedExtensionSemanticOperation<
+			RuntimeMessage<M>,
+			RuntimeEvent<M>,
+			RuntimeExtensionRequest<M>
+		>,
+	): void {
+		if (
+			prepared.processToken !== this.processToken ||
+			this.liveProjection !== prepared.projection ||
+			prepared.semanticRevision !== this.extensionSemanticRevision ||
+			prepared.projection.previewPreparedBatch(prepared.token) === null
+		) {
+			throw new RpcError("extension_ui_request", "extension_semantic_operation_stale");
+		}
+		const committed = prepared.projection.commitPreparedBatch(prepared.token);
+		if (committed === null || committed !== prepared.token.lastSeq) {
+			throw new RpcError("extension_ui_request", "extension_projection_commit_invariant_failed");
+		}
+		this.pendingDialogs = prepared.pendingDialogs;
+		this.stickyExtension = prepared.stickyExtension;
+		this.extensionSemanticRevision += 1;
+		this.replay = prepared.replay;
+		this.replayFrameBytes = prepared.replayFrameBytes;
+		this.replayBytes = prepared.replayBytes;
+		this.lastTransientSeq = prepared.lastTransientSeq;
+		this.lastSeq = prepared.token.lastSeq;
+		const stateChanged = prepared.pendingDialogs.size > 0 && this.state !== "waiting_ui";
+		if (stateChanged) this.state = "waiting_ui";
+		this.touch();
+
+		for (const entry of prepared.timersToClear) {
+			this.runCommittedExtensionEffect("clear dialog timer", () => {
+				if (entry.timer) clearTimeout(entry.timer);
+			});
+		}
+		for (const entry of prepared.timersToArm) {
+			this.runCommittedExtensionEffect("arm dialog timer", () =>
+				this.armDialogTimer(prepared.processToken, entry),
+			);
+		}
+		if (stateChanged) {
+			this.runCommittedExtensionEffect("refresh hot Runtime inventory", () =>
+				this.opts.onHotSetChanged?.(this),
+			);
+			this.runCommittedExtensionEffect("publish waiting Extension state", () =>
+				this.emitSupervisorMessage({ type: "runtime_state", runtime: this.snapshot() }),
+			);
+		}
+		for (const envelope of prepared.envelopes) {
+			this.runCommittedExtensionEffect("publish Extension frame", () => this.emitSupervisorMessage(envelope));
+		}
+	}
+
+	private runCommittedExtensionEffect(label: string, effect: () => void): void {
+		try {
+			effect();
+		} catch {
+			try {
+				this.log("error", `Committed Extension effect failed: ${label}`);
+			} catch {
+				// A committed projection cannot be rolled back because an observer failed.
+			}
+		}
+	}
+
+	private armDialogTimer(processToken: number, entry: PendingDialog<RuntimeExtensionRequest<M>>): void {
+		const request = entry.request;
+		const timeout =
+			"timeout" in request && typeof request.timeout === "number" && request.timeout > 0
+				? request.timeout
+				: undefined;
+		if (!timeout) return;
+		entry.timer = setTimeout(() => this.expireDialog(processToken, request.id, entry), timeout);
+		entry.timer.unref?.();
+	}
+
+	private extensionStateMapsFit(
+		pendingDialogs: ReadonlyMap<string, PendingDialog<RuntimeExtensionRequest<M>>>,
+		stickyExtension: ReadonlyMap<string, RuntimeExtensionRequest<M>>,
+	): boolean {
+		let bytes = 0;
+		for (const request of stickyExtension.values()) bytes += extensionRequestBytes(request);
+		for (const { request } of pendingDialogs.values()) bytes += extensionRequestBytes(request);
+		return (
+			bytes <= this.opts.extensionStateMaxBytes &&
+			pendingDialogs.size + stickyExtension.size <= this.opts.extensionStateMaxItems
+		);
+	}
+
 	private trackDialog(
 		request: RuntimeExtensionRequest<M>,
 		processToken: number,
@@ -1965,9 +2262,13 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			"timeout" in request && typeof request.timeout === "number" && request.timeout > 0
 				? request.timeout
 				: undefined;
-		const timer = timeout ? setTimeout(() => this.expireDialog(processToken, request.id), timeout) : null;
-		timer?.unref?.();
-		this.pendingDialogs.set(request.id, { request, timer });
+		const entry: PendingDialog<RuntimeExtensionRequest<M>> = { request, timer: null };
+		if (timeout) {
+			entry.timer = setTimeout(() => this.expireDialog(processToken, request.id, entry), timeout);
+			entry.timer.unref?.();
+		}
+		this.pendingDialogs.set(request.id, entry);
+		this.extensionSemanticRevision += 1;
 		if (publishState) this.setState("waiting_ui");
 	}
 
@@ -2042,6 +2343,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		if (stickyRequestClearsState(request)) {
 			this.emitFrame({ type: "extension_ui_request", request }, () => {
 				this.stickyExtension.delete(key);
+				this.extensionSemanticRevision += 1;
 			});
 			return;
 		}
@@ -2056,12 +2358,14 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			if (!oldest) break;
 			this.emitFrame({ type: "extension_ui_request", request: this.stickyClearRequest(oldest) }, () => {
 				this.stickyExtension.delete(oldestKey);
+				this.extensionSemanticRevision += 1;
 			});
 			candidate.delete(oldestKey);
 		}
 		if (!this.extensionStateCandidateFits(candidate, requestBytes, 1)) {
 			this.emitFrame({ type: "extension_ui_request", request: this.stickyClearRequest(request) }, () => {
 				this.stickyExtension.delete(key);
+				this.extensionSemanticRevision += 1;
 			});
 			this.log("warn", `Dropping oversized sticky extension state for ${this.sessionHandle}`);
 			return;
@@ -2069,6 +2373,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		this.emitFrame({ type: "extension_ui_request", request }, () => {
 			this.stickyExtension.delete(key);
 			this.stickyExtension.set(key, request);
+			this.extensionSemanticRevision += 1;
 		});
 	}
 
@@ -2384,9 +2689,18 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	): void {
 		const dialog = this.pendingDialogs.get(requestId);
 		if (!dialog) return;
+		if (emit && this.productAdapter.mode === "current" && this.startupReady && !this.transitionStage) {
+			this.commitExtensionSemanticOperation(
+				this.prepareExtensionCloseSemanticOperation(this.processToken, requestId, reason, dialog),
+			);
+			return;
+		}
 		const commitClose = () => {
 			if (dialog.timer) clearTimeout(dialog.timer);
-			this.pendingDialogs.delete(requestId);
+			if (this.pendingDialogs.get(requestId) === dialog) {
+				this.pendingDialogs.delete(requestId);
+				this.extensionSemanticRevision += 1;
+			}
 		};
 		if (emit && this.startupReady) {
 			this.emitFrame({ type: "extension_ui_closed", requestId, reason }, commitClose);
@@ -2405,8 +2719,17 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		for (const requestId of [...this.pendingDialogs.keys()]) this.closeDialog(requestId, reason, emit);
 	}
 
-	private expireDialog(processToken: number, requestId: string): void {
-		if (processToken !== this.processToken || !this.pendingDialogs.has(requestId)) return;
+	private expireDialog(
+		processToken: number,
+		requestId: string,
+		expectedEntry?: PendingDialog<RuntimeExtensionRequest<M>>,
+	): void {
+		if (
+			processToken !== this.processToken ||
+			!this.pendingDialogs.has(requestId) ||
+			(expectedEntry !== undefined && this.pendingDialogs.get(requestId) !== expectedEntry)
+		)
+			return;
 		this.closeDialog(requestId, "expired");
 		if (this.proc?.running) {
 			this.proc.sendNoResponse({ type: "extension_ui_response", id: requestId, cancelled: true });
@@ -2741,6 +3064,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		this.pendingDialogs.clear();
 		this.clearPendingTurnReservations();
 		this.stickyExtension.clear();
+		this.extensionSemanticRevision += 1;
 		this.clearReplay();
 		this.agentBusy = false;
 		this.compactionBusy = false;
