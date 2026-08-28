@@ -42,8 +42,8 @@ interface SessionEnvelopeBase {
 	seq: number;
 }
 
-export type SessionReplayFrame =
-	| (SessionEnvelopeBase & { type: "event"; event: ProductSessionEventDto })
+export type SessionReplayFrame<TEvent = ProductSessionEventDto> =
+	| (SessionEnvelopeBase & { type: "event"; event: TEvent })
 	| (SessionEnvelopeBase & {
 			type: "extension_ui_request";
 			request: ExtensionUiRequestDto;
@@ -54,8 +54,8 @@ export type SessionReplayFrame =
 			reason: "answered" | "cancelled" | "expired" | "process_lost" | "replaced";
 	  });
 
-export type SessionSupervisorMessage =
-	| SessionReplayFrame
+export type SessionSupervisorMessage<TEvent = ProductSessionEventDto> =
+	| SessionReplayFrame<TEvent>
 	| { type: "runtime_state"; runtime: SessionRuntimeSnapshot }
 	| {
 			type: "session_rekeyed";
@@ -72,26 +72,26 @@ export interface ReplayCursor {
 	seq: number;
 }
 
-export type ReplayResult =
+export type ReplayResult<TEvent = ProductSessionEventDto, TSnapshot = SessionSnapshotDto> =
 	| {
 			type: "replay";
 			runtime: SessionRuntimeSnapshot;
-			frames: SessionReplayFrame[];
+			frames: SessionReplayFrame<TEvent>[];
 	  }
 	| {
 			type: "resync_required";
 			runtime: SessionRuntimeSnapshot;
 			reason: "initial" | "server_epoch_changed" | "generation_changed" | "gap" | "invalid_cursor";
-			snapshot: SessionSnapshotDto;
+			snapshot: TSnapshot;
 	  };
 
-export interface SessionCommandResult {
+export interface SessionCommandResult<TResponse = SessionCommandResponseDto> {
 	serverEpoch: string;
 	sessionHandle: string;
 	generation: number;
 	/** Last event sequence observed when the Pi response was received. */
 	barrierSeq: number;
-	response: SessionCommandResponseDto;
+	response: TResponse;
 	previousSessionHandle?: string;
 }
 
