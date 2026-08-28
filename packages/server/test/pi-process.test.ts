@@ -26,6 +26,7 @@ import {
 } from "../src/pi-host-adapter.js";
 import {
 	PiPayloadExternalizationError,
+	type PiPayloadExternalizerInput,
 	type PiPayloadLease,
 	type PiPayloadLeaseTransfer,
 } from "../src/pi-payload-externalizer.js";
@@ -899,9 +900,62 @@ describe("PiProcess response correlation", () => {
 		expect(leased.release).toHaveBeenCalledOnce();
 	});
 
-	it("keeps Extension UI outside future externalization and terminally releases a forged lease", async () => {
+	it("keeps current Extension UI on the inline callback", async () => {
+		const delivered: string[] = [];
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			onExtensionUiRequest: (request) => delivered.push(request.id),
+		});
+		await proc.start();
+
+		await expect(proc.send({ type: "prompt", message: "open-dialog" })).resolves.toMatchObject({
+			success: true,
+		});
+		expect(delivered).toEqual(["fake-dialog"]);
+		expect(proc.running).toBe(true);
+	});
+
+	it("delivers future Extension UI through PreparedDecodedDelivery and transfers its lease", async () => {
 		const leased = fakeFutureLease();
 		const delivered: string[] = [];
+		let claimed: PiPayloadLeaseTransfer<EpochStoredContentRef> | null | undefined;
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeFutureUnsolicited(value, context) {
+				const outcome = await legacyRpcV1Adapter.decodeFutureUnsolicited(value, context);
+				return outcome.value.kind === "extension_ui_request"
+					? { value: outcome.value, lease: leased.lease }
+					: outcome;
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
+			onFutureDecodedExtensionUiRequest: (delivery) => {
+				delivered.push(delivery.value.id);
+				return delivery.prepare((transfer) => {
+					claimed = transfer;
+					return true;
+				});
+			},
+		});
+		await proc.start();
+
+		await expect(proc.send({ type: "prompt", message: "open-dialog" })).resolves.toMatchObject({
+			success: true,
+		});
+		expect(delivered).toEqual(["fake-dialog"]);
+		expect(claimed?.refs).toEqual(leased.lease.refs);
+		expect(leased.release).not.toHaveBeenCalled();
+		await claimed?.release();
+		expect(leased.release).toHaveBeenCalledOnce();
+	});
+
+	it("terminally releases a future Extension lease when its prepared consumer is missing", async () => {
+		const leased = fakeFutureLease();
 		const exits: Array<{ stderrTail: string }> = [];
 		const adapter: PiHostAdapter = {
 			...legacyRpcV1Adapter,
@@ -917,18 +971,63 @@ describe("PiProcess response correlation", () => {
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
 			payloadExternalizer: futurePayloadExternalizer,
-			onExtensionUiRequest: (request) => delivered.push(request.id),
 			onExit: (info) => exits.push(info),
 		});
 		await proc.start();
 
 		await expect(proc.send({ type: "prompt", message: "open-dialog" })).rejects.toThrow(
-			"inline-only Pi Extension UI delivery cannot carry content holds",
+			"future Pi Extension UI delivery requires a decoded consumer",
 		);
 		await waitFor(() => exits.length === 1);
-		expect(delivered).toEqual([]);
 		expect(leased.release).toHaveBeenCalledOnce();
 		expect(proc.running).toBe(false);
+	});
+
+	it("releases a stopped future Extension decode without delivering into the restarted spawn", async () => {
+		const extensionStarted = deferred();
+		const releaseExtension = deferred();
+		const leased = fakeFutureLease();
+		const delivered: string[] = [];
+		let extensionSignal: AbortSignal | undefined;
+		const adapter: PiHostAdapter = {
+			...legacyRpcV1Adapter,
+			async decodeFutureUnsolicited(value, context) {
+				const outcome = await legacyRpcV1Adapter.decodeFutureUnsolicited(value, context);
+				if (outcome.value.kind !== "extension_ui_request") return outcome;
+				extensionSignal = context.signal;
+				extensionStarted.resolve();
+				await releaseExtension.promise;
+				return { value: outcome.value, lease: leased.lease };
+			},
+		};
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
+			onFutureDecodedExtensionUiRequest: (delivery) => {
+				delivered.push(delivery.value.id);
+				return delivery.prepare(() => true);
+			},
+		});
+		await proc.start();
+
+		const oldCommand = proc.send({ type: "prompt", message: "open-dialog" });
+		const oldResult = oldCommand.then(
+			() => "resolved",
+			() => "rejected",
+		);
+		await extensionStarted.promise;
+		await proc.stop();
+		expect(await oldResult).toBe("rejected");
+		expect(extensionSignal?.aborted).toBe(true);
+		await proc.start();
+
+		releaseExtension.resolve();
+		await waitFor(() => leased.release.mock.calls.length === 1);
+		expect(leased.release).toHaveBeenCalledOnce();
+		expect(delivered).toEqual([]);
+		expect(proc.running).toBe(true);
 	});
 
 	it("keeps a future authoritative-event deadline terminal and releases its late union lease", async () => {
@@ -1960,6 +2059,79 @@ describe("PiProcess response correlation", () => {
 		expect(claimed?.refs).toEqual([ref]);
 		await claimed?.release();
 		expect(leased.release).toHaveBeenCalledOnce();
+	});
+
+	it("admits an exact future Extension root above 8 MiB and transfers its lease", async () => {
+		const leased = fakeFutureLease();
+		const ref = leased.lease.refs[0];
+		const externalize = vi.fn(async (input: PiPayloadExternalizerInput) => {
+			if (input.kind !== "extension_ui_request") return futurePayloadExternalizer.externalize(input);
+			return {
+				value: {
+					type: "extension_ui_request",
+					id: "extension-wide",
+					method: "set_editor_text",
+					text: { type: "external_text", ref },
+				},
+				lease: leased.lease,
+			};
+		});
+		let claimed: PiPayloadLeaseTransfer<EpochStoredContentRef> | null | undefined;
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			payloadExternalizer: { ...futurePayloadExternalizer, externalize },
+			onFutureDecodedExtensionUiRequest: (delivery) =>
+				delivery.prepare((transfer) => {
+					claimed = transfer;
+					return true;
+				}),
+		});
+		await proc.start();
+		externalize.mockClear();
+		const internals = proc as unknown as { handleLine(line: string): Promise<void> };
+
+		await internals.handleLine(
+			JSON.stringify({
+				type: "extension_ui_request",
+				id: "extension-wide",
+				method: "set_editor_text",
+				text: "x".repeat(MAX_JSONL_LINE_BYTES),
+			}),
+		);
+
+		expect(externalize).toHaveBeenCalledOnce();
+		expect(claimed?.refs).toEqual([ref]);
+		await claimed?.release();
+		expect(leased.release).toHaveBeenCalledOnce();
+	});
+
+	it("rejects an oversized excluded future Extension field before externalization", async () => {
+		const externalize = vi.fn(futurePayloadExternalizer.externalize);
+		proc = new PiProcess({
+			cwd: process.cwd(),
+			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
+			payloadExternalizer: { ...futurePayloadExternalizer, externalize },
+		});
+		await proc.start();
+		externalize.mockClear();
+		const internals = proc as unknown as { handleLine(line: string): Promise<void> };
+
+		await expect(
+			internals.handleLine(
+				JSON.stringify({
+					type: "extension_ui_request",
+					id: "status-wide",
+					method: "setStatus",
+					statusKey: "status",
+					statusText: "x".repeat(MAX_JSONL_LINE_BYTES),
+				}),
+			),
+		).rejects.toMatchObject({
+			name: "PiProtocolIncompatibleError",
+			diagnostic: { reason: "oversized_frame" },
+		});
+		expect(externalize).not.toHaveBeenCalled();
 	});
 
 	it.each([
