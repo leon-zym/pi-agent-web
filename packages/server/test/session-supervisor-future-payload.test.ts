@@ -956,7 +956,7 @@ describe("future Session Supervisor payload mode", () => {
 		});
 		const messages: FutureSupervisorMessage[] = [];
 		const supervisor = createFutureSupervisorFixture(target, services, messages, undefined, 0, {
-			PI_WEB_FIXTURE_READY_DELAY_MS: "100",
+			PI_WEB_FIXTURE_READY_DELAY_MS: "500",
 			PI_WEB_FIXTURE_STARTUP_FUTURE_EDITOR: "1",
 			PI_WEB_FIXTURE_STARTUP_TIMEOUT_INPUT: "1",
 			PI_WEB_FIXTURE_STARTUP_TIMEOUT_INPUT_MS: "20",
