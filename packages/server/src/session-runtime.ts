@@ -2084,24 +2084,67 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		}
 		if (this.transitionStage !== null) {
 			const transitionStage = this.transitionStage;
-			return delivery.prepare((transfer) => {
-				if (!this.isCurrentGenerationContentOwner(processToken, proc, owner)) {
+			if (transitionStage.phase !== "applying" && futureExtensionStagesDuringTransition(delivery.value)) {
+				if (
+					!transitionStage.payloadLedger ||
+					!this.isCurrentPayloadTransition(processToken, proc, transitionStage)
+				) {
 					throw new RpcError("extension_ui_request", "session_generation_stale");
 				}
-				if (
-					this.startupReady &&
-					this.transitionStage === transitionStage &&
-					transitionStage?.phase === "awaiting_response" &&
-					BLOCKING_DIALOG_METHODS.has(delivery.value.method) &&
-					futureExtensionRequestRefs(delivery.value).length === 0 &&
-					transfer === null
-				) {
-					this.handleExtensionRequest(processToken, delivery.value);
-					return true;
+				const frame: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>> = {
+					type: "extension_ui_request",
+					request: delivery.value,
+				};
+				const frameBytes = bufferedFrameBytes(frame);
+				const nextBytes = transitionStage.bytes + frameBytes;
+				if (nextBytes > this.opts.transientBufferMaxBytes) {
+					throw new RpcError("session_transition", "transition_frame_buffer_limit_exceeded");
 				}
-				this.manuallyStopped = true;
-				throw new RpcError("extension_ui_request", "future_extension_delivery_phase_unsupported");
-			});
+				const nextFrames = [...transitionStage.frames, frame];
+				const logicalBytes = this.productAdapter.productSchema.extensionRequestLogicalBytes(delivery.value);
+				return delivery.prepare((transfer) => {
+					if (
+						this.transitionStage !== transitionStage ||
+						transitionStage.phase === "applying" ||
+						!transitionStage.payloadLedger ||
+						!this.isCurrentPayloadTransition(processToken, proc, transitionStage)
+					) {
+						throw new RpcError("extension_ui_request", "session_generation_stale");
+					}
+					if (!futureExtensionTransferMatches(delivery.value, transfer)) {
+						this.manuallyStopped = true;
+						throw new RpcError("extension_ui_request", "future_extension_payload_ref_mismatch");
+					}
+					transitionStage.payloadLedger.admit({ transfer, logicalBytes });
+					transitionStage.frames = nextFrames;
+					transitionStage.bytes = nextBytes;
+					this.touch();
+					return true;
+				});
+			}
+			if (transitionStage.phase === "applying") {
+				// The verified child generation is already authoritative. Reuse the
+				// normal owner/admission path instead of creating a second transition store.
+			} else {
+				return delivery.prepare((transfer) => {
+					if (!this.isCurrentGenerationContentOwner(processToken, proc, owner)) {
+						throw new RpcError("extension_ui_request", "session_generation_stale");
+					}
+					if (
+						this.startupReady &&
+						this.transitionStage === transitionStage &&
+						transitionStage?.phase === "awaiting_response" &&
+						BLOCKING_DIALOG_METHODS.has(delivery.value.method) &&
+						futureExtensionRequestRefs(delivery.value).length === 0 &&
+						transfer === null
+					) {
+						this.handleExtensionRequest(processToken, delivery.value);
+						return true;
+					}
+					this.manuallyStopped = true;
+					throw new RpcError("extension_ui_request", "future_extension_delivery_phase_unsupported");
+				});
+			}
 		}
 		this.verifyMaterializedSessionFile();
 		const prepared = this.prepareExtensionRequestSemanticOperation(processToken, delivery.value);
@@ -2264,9 +2307,13 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	private planExtensionRequestSemanticMutation(
 		request: RuntimeExtensionRequest<M>,
 		publishReplacedClose = true,
+		extensionState: {
+			pendingDialogs: ReadonlyMap<string, PendingDialog<RuntimeExtensionRequest<M>>>;
+			stickyExtension: ReadonlyMap<string, RuntimeExtensionRequest<M>>;
+		} = { pendingDialogs: this.pendingDialogs, stickyExtension: this.stickyExtension },
 	): ExtensionSemanticPlan<RuntimeEvent<M>, RuntimeExtensionRequest<M>> {
-		const pendingDialogs = new Map(this.pendingDialogs);
-		const stickyExtension = new Map(this.stickyExtension);
+		const pendingDialogs = new Map(extensionState.pendingDialogs);
+		const stickyExtension = new Map(extensionState.stickyExtension);
 		const frames: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[] = [];
 		const timersToClear: PendingDialog<RuntimeExtensionRequest<M>>[] = [];
 		const timersToArm: PendingDialog<RuntimeExtensionRequest<M>>[] = [];
@@ -2757,7 +2804,11 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			}
 			stage.payloadLedger.drainTo(stage.parentOwner);
 		}
-		this.flushTransitionFrames();
+		if (this.productAdapter.mode === "future_content") {
+			for (const message of this.commitTransitionFrames()) this.emitSupervisorMessage(message);
+		} else {
+			this.flushTransitionFrames();
+		}
 	}
 
 	private releaseTransitionStagePayloads(
@@ -2799,65 +2850,121 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		try {
 			if (this.productAdapter.mode === "future_content") {
 				try {
-					const candidateProjection = this.previewTransitionFrames();
-					const candidateRuntime: SessionRuntimeSnapshot = {
-						...this.snapshot(),
-						lastSeq: candidateProjection.asOfSeq,
-					};
-					this.assertProductSnapshotCandidateFits(
-						this.buildSessionSnapshotFromProjection(candidateProjection, candidateRuntime),
-					);
+					const stage = this.transitionStage;
+					if (!stage) throw new RpcError("session_transition", "session_generation_stale");
+					if (stage.frames.length === 0) return this.deferredTransitionEmits;
+					const plan = this.expandFutureTransitionSemanticPlan(stage);
+					const turnBudget = this.prepareTransitionTurnBudget(plan.frames);
+					const prepared = this.prepareExtensionSemanticOperation({
+						processToken: stage.processToken,
+						...plan,
+					});
+					this.commitExtensionSemanticOperation(prepared);
+					for (const frame of plan.frames) {
+						if (frame.type === "event") this.applyFrameState(frame);
+					}
+					this.activeTurnProjectionItems = turnBudget.items;
+					this.activeTurnProjectionBytes = turnBudget.bytes;
+					this.activeTurnProjectionLogicalBytes = turnBudget.logicalBytes;
+					stage.frames = [];
+					stage.bytes = 0;
 				} catch (error) {
 					throw this.normalizeProjectionError(error);
 				}
+			} else {
+				this.flushTransitionFrames();
 			}
-			this.flushTransitionFrames();
 			return this.deferredTransitionEmits;
 		} finally {
 			this.deferredTransitionEmits = null;
 		}
 	}
 
-	private previewTransitionFrames(): SessionLiveProjectionSnapshot<
-		RuntimeMessage<M>,
-		RuntimeEvent<M>,
-		RuntimeExtensionRequest<M>
-	> {
-		const stage = this.transitionStage;
-		const projection = this.liveProjection;
-		if (!stage || !projection) {
-			throw new RpcError("session_transition", "session_snapshot_unavailable");
-		}
-		const source = projection.snapshot();
-		if (source.asOfSeq !== source.baseSeq || source.projectionEvents.length !== 0) {
-			throw new RpcError("session_transition", "transition_child_projection_not_pristine");
-		}
-		const candidate = new SessionLiveProjection<
-			RuntimeMessage<M>,
-			RuntimeEvent<M>,
-			RuntimeExtensionRequest<M>
-		>({
-			identity: {
-				serverEpoch: source.serverEpoch,
-				sessionHandle: source.sessionHandle,
-				workspaceId: source.workspaceId,
-				generation: source.generation,
-			},
-			settledMessages: source.settledMessages,
-			baseSeq: source.baseSeq,
-			runtimePhase: source.runtimePhase,
-			limits: this.opts.projectionLimits,
-			schema: this.productAdapter.productSchema,
-		});
+	private expandFutureTransitionSemanticPlan(
+		stage: TransitionStage<RuntimeEvent<M>, RuntimeExtensionRequest<M>, RuntimeRef<M>>,
+	): ExtensionSemanticPlan<RuntimeEvent<M>, RuntimeExtensionRequest<M>> {
+		let pendingDialogs = new Map(this.pendingDialogs);
+		let stickyExtension = new Map(this.stickyExtension);
+		const frames: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[] = [];
+		const timersToClear: PendingDialog<RuntimeExtensionRequest<M>>[] = [];
+		const timersToArm: PendingDialog<RuntimeExtensionRequest<M>>[] = [];
+		let warnOversizedSticky = false;
+		let bytes = 0;
 		for (const frame of stage.frames) {
-			const committed = candidate.commitPrepared(
-				candidate.prepareCommit(this.projectionIdentity(), frame, this.state),
-			);
-			if (committed === null) {
-				throw new RpcError("session_transition", "transition_preview_commit_invariant_failed");
+			if (frame.type === "extension_ui_request") {
+				const plan = this.planExtensionRequestSemanticMutation(frame.request, true, {
+					pendingDialogs,
+					stickyExtension,
+				});
+				pendingDialogs = plan.pendingDialogs;
+				stickyExtension = plan.stickyExtension;
+				timersToClear.push(...plan.timersToClear);
+				timersToArm.push(...plan.timersToArm);
+				warnOversizedSticky ||= plan.warnOversizedSticky;
+				for (const expanded of plan.frames) {
+					const frameBytes = bufferedFrameBytes(expanded);
+					if (frameBytes > this.opts.transientBufferMaxBytes - bytes) {
+						throw new RpcError("session_transition", "transition_frame_buffer_limit_exceeded");
+					}
+					bytes += frameBytes;
+					frames.push(expanded);
+				}
+				continue;
+			}
+			const frameBytes = bufferedFrameBytes(frame);
+			if (frameBytes > this.opts.transientBufferMaxBytes - bytes) {
+				throw new RpcError("session_transition", "transition_frame_buffer_limit_exceeded");
+			}
+			bytes += frameBytes;
+			frames.push(frame);
+		}
+		return {
+			frames,
+			pendingDialogs,
+			stickyExtension,
+			timersToClear,
+			timersToArm,
+			warnOversizedSticky,
+		};
+	}
+
+	private prepareTransitionTurnBudget(
+		frames: readonly BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[],
+	): { items: number; bytes: number; logicalBytes: number } {
+		const projection = this.liveProjection;
+		if (!projection) throw new RpcError("session_transition", "session_snapshot_unavailable");
+		let items = this.activeTurnProjectionItems;
+		let bytes = this.activeTurnProjectionBytes;
+		let logicalBytes = this.activeTurnProjectionLogicalBytes;
+		let agentBusy = this.agentBusy;
+		const limit = projection.activeTurnBudget();
+		const maxLogicalBytes = projection.maxActiveTurnLogicalBytes();
+		for (const frame of frames) {
+			if (frame.type !== "event") continue;
+			const reset = !agentBusy && eventStartsWork(frame.event);
+			items = (reset ? 0 : items) + 1;
+			bytes = (reset ? 0 : bytes) + projection.activeTurnEventBytes(frame.event);
+			const logicalContribution = projection.activeTurnEventLogicalBytes(frame.event);
+			const logicalBase = reset ? 0 : logicalBytes;
+			if (
+				items > limit.maxItems ||
+				bytes > limit.maxBytes ||
+				logicalContribution > maxLogicalBytes - logicalBase
+			) {
+				throw new SessionLiveProjectionLimitError("live_events");
+			}
+			logicalBytes = logicalBase + logicalContribution;
+			if (eventStartsWork(frame.event)) agentBusy = true;
+			if (eventSettlesWork(frame.event)) {
+				agentBusy = false;
+				items = 0;
+				bytes = 0;
+				logicalBytes = 0;
+			} else if (frame.event.type === "compaction_end" && frame.event.willRetry) {
+				agentBusy = true;
 			}
 		}
-		return candidate.snapshot();
+		return { items, bytes, logicalBytes };
 	}
 
 	private emitFrame(
@@ -3538,6 +3645,10 @@ function futureExtensionRequestRefs(request: FutureExtensionUiRequestDto): reado
 		return [request.widgetLines.ref];
 	}
 	return [];
+}
+
+function futureExtensionStagesDuringTransition(request: FutureExtensionUiRequestDto): boolean {
+	return !BLOCKING_DIALOG_METHODS.has(request.method);
 }
 
 function futureExtensionTransferMatches(

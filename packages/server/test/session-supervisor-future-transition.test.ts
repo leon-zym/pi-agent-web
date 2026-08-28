@@ -82,6 +82,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (predicate()) return;
+		await new Promise<void>((resolve) => setTimeout(resolve, 5));
+	}
+	throw new Error("condition did not settle before timeout");
+}
+
 function trackedContentRef(byteLength: number): SessionContentRefDto {
 	return Object.freeze({
 		type: "content_ref",
@@ -168,6 +177,19 @@ function withTrackedLogicalPayloads(
 			});
 			if (input.kind === "event") {
 				return Object.freeze({ value: stagedLogicalEvent(byteLength), lease });
+			}
+			if (
+				input.kind === "extension_ui_request" &&
+				isRecord(input.value) &&
+				input.value.method === "set_editor_text"
+			) {
+				return Object.freeze({
+					value: Object.freeze({
+						...input.value,
+						text: Object.freeze({ type: "external_text", ref }),
+					}),
+					lease,
+				});
 			}
 			if (
 				input.kind === "response" &&
@@ -424,6 +446,85 @@ describe("future Session Supervisor identity transitions", () => {
 		});
 	});
 
+	it("rekeys before atomically publishing a staged future editor-text request to the verified child", async () => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-future-transition-extension-"));
+		const target = createTarget(root);
+		store = new EpochContentStore({
+			webDataDir: path.join(root, "web-data"),
+			serverEpoch: "future-transition-epoch",
+		});
+		await store.initialize();
+		const activation = createGatewayFuturePayloadActivation(store, "future-transition-epoch");
+		const audit = auditPayloadCustody(activation.supervisorServices);
+		const messages: FutureSupervisorMessage[] = [];
+		const supervisor = createFixture(target, audit.services, messages, {
+			PI_WEB_FIXTURE_TRANSITION_FUTURE_EDITOR_TEXT: "1",
+			PI_WEB_FIXTURE_TRANSITION_INLINE_STATUS: "1",
+		});
+		stop = () => supervisor.stopAll();
+
+		const lease = await supervisor.claim(target.sessionHandle, "future-extension-controller");
+		const before = supervisor.getRuntime(target.sessionHandle);
+		if (!before) throw new Error("future parent runtime was not activated");
+		messages.length = 0;
+		const result = await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "clone" },
+			{
+				connectionId: "future-extension-controller",
+				expectedGeneration: before.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+
+		const rekeyIndex = messages.findIndex((message) => message.type === "session_rekeyed");
+		const extensionIndex = messages.findIndex(
+			(message) => message.type === "extension_ui_request" && message.request.method === "set_editor_text",
+		);
+		const statusIndex = messages.findIndex(
+			(message) =>
+				message.type === "extension_ui_request" &&
+				message.request.method === "setStatus" &&
+				message.request.statusKey === "inline-transition",
+		);
+		expect(rekeyIndex).toBeGreaterThanOrEqual(0);
+		expect(extensionIndex).toBeGreaterThan(rekeyIndex);
+		expect(statusIndex).toBeGreaterThan(rekeyIndex);
+		const extension = messages[extensionIndex];
+		if (extension?.type !== "extension_ui_request" || extension.request.method !== "set_editor_text") {
+			throw new Error("staged future editor text was not published");
+		}
+		expect(extension.request.text).toMatchObject({ type: "external_text" });
+		const status = messages[statusIndex];
+		if (status?.type !== "extension_ui_request" || status.request.method !== "setStatus") {
+			throw new Error("staged future status was not published");
+		}
+		expect(result).toMatchObject({
+			previousSessionHandle: target.sessionHandle,
+			generation: before.generation + 1,
+			barrierSeq: status.seq,
+		});
+		expect(audit.counters).toMatchObject({
+			transferAdopt: 1,
+			transferRelease: 0,
+			leaseRelease: 0,
+		});
+		const childRuntime = supervisor.getRuntime(result.sessionHandle);
+		expect(childRuntime).toMatchObject({ state: "idle" });
+		expect(childRuntime?.error).toBeUndefined();
+		const initial = await supervisor.subscribe(result.sessionHandle);
+		expect(initial).toMatchObject({
+			type: "resync_required",
+			snapshot: {
+				asOfSeq: status.seq,
+				stickyExtensionState: [
+					expect.objectContaining({ id: extension.request.id, method: "set_editor_text" }),
+					expect.objectContaining({ method: "setStatus", statusKey: "inline-transition" }),
+				],
+			},
+		});
+	});
+
 	it.each([
 		["same identity", { PI_WEB_FIXTURE_TRANSITION_SAME_IDENTITY: "1" }],
 		["veto", { PI_WEB_FIXTURE_CANCEL_TRANSITION: "1" }],
@@ -446,6 +547,8 @@ describe("future Session Supervisor identity transitions", () => {
 		const messages: FutureSupervisorMessage[] = [];
 		const supervisor = createFixture(target, audit.services, messages, {
 			...env,
+			PI_WEB_FIXTURE_TRANSITION_FUTURE_EDITOR_TEXT: "1",
+			PI_WEB_FIXTURE_TRANSITION_INLINE_STATUS: "1",
 			PI_WEB_FIXTURE_TRANSITION_STAGED_LOGICAL_BYTES: String(1024 * 1024),
 			PI_WEB_FIXTURE_TRANSITION_STAGED_LOGICAL_COUNT: "1",
 		});
@@ -480,7 +583,206 @@ describe("future Session Supervisor identity transitions", () => {
 		expect(
 			Reflect.get(exactRuntime(supervisor, target.sessionHandle), "activeTurnProjectionLogicalBytes"),
 		).toBe(expectedLogicalBytes);
-		expect(audit.counters).toMatchObject({ transferAdopt: 1, transferRelease: 0, leaseRelease: 0 });
+		expect(audit.counters).toMatchObject({ transferAdopt: 2, transferRelease: 0, leaseRelease: 0 });
+		const extension = messages.find(
+			(message) => message.type === "extension_ui_request" && message.request.method === "set_editor_text",
+		);
+		if (extension?.type !== "extension_ui_request" || extension.request.method !== "set_editor_text") {
+			throw new Error("parent future editor text was not published");
+		}
+		expect(extension.request.text).toMatchObject({ type: "external_text" });
+		const status = messages.find(
+			(message) =>
+				message.type === "extension_ui_request" &&
+				message.request.method === "setStatus" &&
+				message.request.statusKey === "inline-transition",
+		);
+		expect(status).toMatchObject({
+			type: "extension_ui_request",
+			sessionHandle: target.sessionHandle,
+			generation: before.generation,
+		});
+		const initial = await supervisor.subscribe(target.sessionHandle);
+		expect(initial).toMatchObject({
+			type: "resync_required",
+			snapshot: {
+				stickyExtensionState: [
+					expect.objectContaining({ id: extension.request.id, method: "set_editor_text" }),
+					expect.objectContaining({ method: "setStatus", statusKey: "inline-transition" }),
+				],
+			},
+		});
+	});
+
+	it("rekeys then terminalizes without an Extension frame when child base plus staged Extension exceed 64 MiB", async () => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-future-transition-extension-limit-"));
+		const target = createTarget(root);
+		store = new EpochContentStore({
+			webDataDir: path.join(root, "web-data"),
+			serverEpoch: "future-transition-epoch",
+		});
+		await store.initialize();
+		const activation = createGatewayFuturePayloadActivation(store, "future-transition-epoch");
+		const trackedServices = withTrackedLogicalPayloads(activation.supervisorServices);
+		const audit = auditPayloadCustody(trackedServices);
+		const messages: FutureSupervisorMessage[] = [];
+		const supervisor = createFixture(target, audit.services, messages, {
+			PI_WEB_FIXTURE_TRANSITION_CHILD_LOGICAL_BYTES: String(40 * 1024 * 1024),
+			PI_WEB_FIXTURE_TRANSITION_FUTURE_EDITOR_TEXT_LOGICAL_BYTES: String(40 * 1024 * 1024),
+		});
+		stop = () => supervisor.stopAll();
+		const lease = await supervisor.claim(target.sessionHandle, "future-extension-limit-controller");
+		const before = supervisor.getRuntime(target.sessionHandle);
+		if (!before) throw new Error("future parent runtime was not activated");
+		messages.length = 0;
+
+		await expect(
+			supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "clone" },
+				{
+					connectionId: "future-extension-limit-controller",
+					expectedGeneration: before.generation,
+					fencingToken: lease.fencingToken,
+				},
+			),
+		).rejects.toThrow("session_snapshot_overflow");
+		const childLifecycle = messages.filter(
+			(message) =>
+				message.type === "session_rekeyed" ||
+				(message.type === "runtime_state" && message.runtime.sessionHandle !== target.sessionHandle),
+		);
+		expect(childLifecycle).toEqual([
+			expect.objectContaining({ type: "session_rekeyed", previousSessionHandle: target.sessionHandle }),
+			expect.objectContaining({
+				type: "runtime_state",
+				runtime: expect.objectContaining({
+					error: "session_snapshot_overflow",
+					lastSeq: 0,
+					state: "crashed",
+				}),
+			}),
+		]);
+		expect(
+			messages.some(
+				(message) => message.type === "extension_ui_request" && message.request.method === "set_editor_text",
+			),
+		).toBe(false);
+		await waitFor(() => audit.counters.holdRelease === 2);
+		expect(audit.counters).toEqual({
+			transferAdopt: 2,
+			transferRelease: 0,
+			leaseRelease: 0,
+			holdRelease: 2,
+		});
+	}, 20_000);
+
+	it("routes applying-phase leased blocking and nonblocking requests to the exact child owner", async () => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-future-transition-applying-extension-"));
+		const target = createTarget(root);
+		store = new EpochContentStore({
+			webDataDir: path.join(root, "web-data"),
+			serverEpoch: "future-transition-epoch",
+		});
+		await store.initialize();
+		const activation = createGatewayFuturePayloadActivation(store, "future-transition-epoch");
+		const audit = auditPayloadCustody(activation.supervisorServices);
+		const delayedServices: FutureSessionRuntimePiPayloadServices = Object.freeze({
+			...audit.services,
+			async releaseHold(hold: EpochContentHold<EpochStoredContentRef>) {
+				await new Promise<void>((resolve) => setTimeout(resolve, 100));
+				await audit.services.releaseHold(hold);
+			},
+		});
+		const messages: FutureSupervisorMessage[] = [];
+		const supervisor = createFixture(target, delayedServices, messages, {
+			PI_WEB_FIXTURE_FUTURE_EDITOR_SETTLES: "1",
+			PI_WEB_FIXTURE_TRANSITION_APPLYING_FUTURE_EXTENSIONS: "1",
+		});
+		stop = () => supervisor.stopAll();
+		const lease = await supervisor.claim(target.sessionHandle, "future-applying-extension-controller");
+		const before = supervisor.getRuntime(target.sessionHandle);
+		if (!before) throw new Error("future parent runtime was not activated");
+		await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "prompt", message: "future-extension-large-editor" },
+			{
+				connectionId: "future-applying-extension-controller",
+				expectedGeneration: before.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		await waitFor(() => supervisor.getPendingExtensionRequests(target.sessionHandle)?.length === 1);
+		expect(
+			await supervisor.sendExtensionUiResponse(
+				target.sessionHandle,
+				{
+					type: "extension_ui_response",
+					id: `future-editor-${target.nativeSessionId}`,
+					cancelled: true,
+				},
+				{
+					connectionId: "future-applying-extension-controller",
+					expectedGeneration: before.generation,
+					fencingToken: lease.fencingToken,
+				},
+			),
+		).toBe("accepted");
+		messages.length = 0;
+
+		const result = await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "clone" },
+			{
+				connectionId: "future-applying-extension-controller",
+				expectedGeneration: before.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		await waitFor(
+			() =>
+				messages.filter(
+					(message) =>
+						message.type === "extension_ui_request" &&
+						(message.request.id.startsWith("transition-applying-editor-text-") ||
+							message.request.id.startsWith("transition-applying-editor-")),
+				).length === 2,
+		);
+		const rekeyIndex = messages.findIndex((message) => message.type === "session_rekeyed");
+		const applyingFrames = messages.filter(
+			(message): message is Extract<FutureSupervisorMessage, { type: "extension_ui_request" }> =>
+				message.type === "extension_ui_request" &&
+				(message.request.id.startsWith("transition-applying-editor-text-") ||
+					message.request.id.startsWith("transition-applying-editor-")),
+		);
+		expect(rekeyIndex).toBeGreaterThanOrEqual(0);
+		expect(applyingFrames).toHaveLength(2);
+		expect(
+			messages.findIndex(
+				(message) =>
+					message.type === "extension_ui_request" && message.request.id === applyingFrames[0]?.request.id,
+			),
+		).toBeGreaterThan(rekeyIndex);
+		expect(applyingFrames.map((frame) => frame.request.method)).toEqual(["set_editor_text", "editor"]);
+		expect(supervisor.getRuntime(result.sessionHandle)).toMatchObject({ state: "waiting_ui", lastSeq: 2 });
+		expect(
+			Reflect.get(
+				Reflect.get(exactRuntime(supervisor, result.sessionHandle), "generationContentOwner"),
+				"size",
+			),
+		).toBe(2);
+		expect(audit.counters).toEqual({
+			transferAdopt: 3,
+			transferRelease: 0,
+			leaseRelease: 0,
+			holdRelease: 1,
+		});
+
+		await supervisor.stop(result.sessionHandle);
+		await waitFor(() => audit.counters.holdRelease === 3);
+		expect(audit.counters.holdRelease).toBe(3);
+		await supervisor.stop(result.sessionHandle);
+		expect(audit.counters.holdRelease).toBe(3);
 	});
 
 	it("rejects two staged 40 MiB logical frames before identity verification", async () => {
@@ -593,6 +895,7 @@ describe("future Session Supervisor identity transitions", () => {
 		const messages: FutureSupervisorMessage[] = [];
 		const supervisor = createFixture(target, audit.services, messages, {
 			PI_WEB_FIXTURE_FAIL_TRANSITION_STATE: "1",
+			PI_WEB_FIXTURE_TRANSITION_FUTURE_EDITOR_TEXT: "1",
 			PI_WEB_FIXTURE_TRANSITION_STAGED_LOGICAL_BYTES: String(1024 * 1024),
 			PI_WEB_FIXTURE_TRANSITION_STAGED_LOGICAL_COUNT: "1",
 		});
@@ -620,7 +923,7 @@ describe("future Session Supervisor identity transitions", () => {
 		});
 		expect(audit.counters).toEqual({
 			transferAdopt: 0,
-			transferRelease: 1,
+			transferRelease: 2,
 			leaseRelease: 0,
 			holdRelease: 0,
 		});
@@ -644,6 +947,7 @@ describe("future Session Supervisor identity transitions", () => {
 			audit.services,
 			messages,
 			{
+				PI_WEB_FIXTURE_TRANSITION_FUTURE_EDITOR_TEXT: "1",
 				PI_WEB_FIXTURE_TRANSITION_STAGED_LOGICAL_BYTES: String(1024 * 1024),
 				PI_WEB_FIXTURE_TRANSITION_STAGED_LOGICAL_COUNT: "1",
 			},
@@ -672,7 +976,7 @@ describe("future Session Supervisor identity transitions", () => {
 		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({ state: "dormant" });
 		expect(audit.counters).toEqual({
 			transferAdopt: 0,
-			transferRelease: 1,
+			transferRelease: 2,
 			leaseRelease: 0,
 			holdRelease: 0,
 		});

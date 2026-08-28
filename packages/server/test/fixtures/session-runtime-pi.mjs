@@ -530,6 +530,9 @@ function streamPrompt(command) {
 			title: "Future editor",
 			prefill: "e".repeat(320 * 1024),
 		});
+		if (process.env.PI_WEB_FIXTURE_FUTURE_EDITOR_SETTLES === "1") {
+			send({ type: "agent_settled" });
+		}
 		return;
 	}
 	if (text === "notify-then-event") {
@@ -685,6 +688,16 @@ function streamPrompt(command) {
 }
 
 function transition(command) {
+	const sendInlineStatus = () => {
+		if (process.env.PI_WEB_FIXTURE_TRANSITION_INLINE_STATUS !== "1") return;
+		send({
+			type: "extension_ui_request",
+			id: `transition-inline-status-${sessionId}`,
+			method: "setStatus",
+			statusKey: "inline-transition",
+			statusText: sessionId,
+		});
+	};
 	if (process.env.PI_WEB_FIXTURE_TRANSITION_INLINE_DIALOG === "1") {
 		pendingInlineTransition = command;
 		send({
@@ -703,6 +716,18 @@ function transition(command) {
 			method: "editor",
 			title: "Transition future editor",
 			prefill: "t".repeat(320 * 1024),
+		});
+	}
+	if (
+		process.env.PI_WEB_FIXTURE_TRANSITION_FUTURE_EDITOR_TEXT === "1" ||
+		process.env.PI_WEB_FIXTURE_TRANSITION_FUTURE_EDITOR_TEXT_LOGICAL_BYTES
+	) {
+		const logicalBytes = configuredLogicalBytes("PI_WEB_FIXTURE_TRANSITION_FUTURE_EDITOR_TEXT_LOGICAL_BYTES");
+		send({
+			type: "extension_ui_request",
+			id: `transition-future-editor-text-${sessionId}`,
+			method: "set_editor_text",
+			text: logicalBytes > 0 ? `tracked-logical:${String(logicalBytes)}` : "e".repeat(320 * 1024),
 		});
 	}
 	const stagedLogicalBytes = configuredLogicalBytes("PI_WEB_FIXTURE_TRANSITION_STAGED_LOGICAL_BYTES");
@@ -744,6 +769,7 @@ function transition(command) {
 		}
 	}
 	if (process.env.PI_WEB_FIXTURE_CANCEL_TRANSITION === "1") {
+		sendInlineStatus();
 		if (process.env.PI_WEB_FIXTURE_TRANSITION_STICKY === "1") {
 			send({
 				type: "extension_ui_request",
@@ -757,6 +783,7 @@ function transition(command) {
 		return;
 	}
 	if (process.env.PI_WEB_FIXTURE_TRANSITION_SAME_IDENTITY === "1") {
+		sendInlineStatus();
 		response(command, command.type === "fork" ? { text: "forked", cancelled: false } : { cancelled: false });
 		return;
 	}
@@ -792,6 +819,7 @@ function transition(command) {
 			statusText: sessionId,
 		});
 	}
+	sendInlineStatus();
 	if (process.env.PI_WEB_FIXTURE_FAIL_TRANSITION_STATE === "1") {
 		failNextState = true;
 		send({
@@ -900,6 +928,26 @@ function handleLine(line) {
 						method: "confirm",
 						title: "Transition applying dialog",
 						message: "transition-applying-dialog",
+					});
+				}, 20);
+			}
+			if (
+				process.env.PI_WEB_FIXTURE_TRANSITION_APPLYING_FUTURE_EXTENSIONS === "1" &&
+				getMessagesRequestCount === 2
+			) {
+				setTimeout(() => {
+					send({
+						type: "extension_ui_request",
+						id: `transition-applying-editor-text-${sessionId}`,
+						method: "set_editor_text",
+						text: "a".repeat(320 * 1024),
+					});
+					send({
+						type: "extension_ui_request",
+						id: `transition-applying-editor-${sessionId}`,
+						method: "editor",
+						title: "Transition applying editor",
+						prefill: "b".repeat(320 * 1024),
 					});
 				}, 20);
 			}
