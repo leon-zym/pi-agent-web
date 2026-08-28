@@ -106,6 +106,12 @@ export interface SessionLiveProjectionPreparedCommit {
 	readonly nextSeq: number;
 }
 
+export interface SessionLiveProjectionPreparedBatch {
+	readonly firstSeq: number;
+	readonly lastSeq: number;
+	readonly count: number;
+}
+
 export interface SessionLiveProjectionPreparedCompaction {
 	readonly expectedAsOfSeq: number;
 }
@@ -114,15 +120,22 @@ interface InternalCompactionToken extends SessionLiveProjectionCompactionToken {
 	owner: symbol;
 }
 
-interface PreparedCommitState<TEvent> {
-	revision: number;
-	nextSeq: number;
+interface ProjectionCandidate<TEvent> {
+	asOfSeq: number;
 	projectionEvents: readonly SessionLiveProjectionEventFrame<TEvent>[];
 	projectionEventFrameBytes: readonly number[];
 	projectionEventBytes: number;
 	queue: { readonly steering: readonly string[]; readonly followUp: readonly string[] };
 	pendingExtensionRequests: Map<string, ExtensionUiRequestDto>;
 	runtimePhase: SessionLiveRuntimePhase;
+}
+
+interface PreparedBatchState<TEvent> {
+	revision: number;
+	firstSeq: number;
+	lastSeq: number;
+	count: number;
+	candidate: ProjectionCandidate<TEvent>;
 }
 
 interface PreparedCompactionState<TMessage> {
@@ -170,7 +183,7 @@ export class SessionLiveProjection<TMessage = SessionMessageDto, TEvent = Produc
 	private readonly schema: SessionProjectionProductSchema<TMessage, TEvent> | null;
 	private readonly compactionOwner = Symbol("session-live-projection");
 	private readonly compactionTokens = new WeakMap<object, { revision: number }>();
-	private readonly preparedCommits = new WeakMap<object, PreparedCommitState<TEvent>>();
+	private readonly preparedBatches = new WeakMap<object, PreparedBatchState<TEvent>>();
 	private readonly preparedCompactions = new WeakMap<object, PreparedCompactionState<TMessage>>();
 	private revision = 0;
 	private baseSeq: number;
@@ -231,125 +244,42 @@ export class SessionLiveProjection<TMessage = SessionMessageDto, TEvent = Produc
 		this.assertIdentity(identity);
 		const nextSeq = this.asOfSeq + 1;
 		if (!Number.isSafeInteger(nextSeq)) throw new SessionLiveProjectionLimitError("live_events");
-		let projectionEvents = this.projectionEvents;
-		let projectionEventFrameBytes = this.projectionEventFrameBytes;
-		let projectionEventBytes = this.projectionEventBytes;
-		let queue = this.queue;
-		let pendingExtensionRequests = this.pendingExtensionRequests;
-
-		if (input.type === "event") {
-			const eventValue = clone(input.event);
-			if (!this.guardEvent(eventValue)) {
-				throw new SessionLiveProjectionPayloadError();
-			}
-			const frame: SessionLiveProjectionEventFrame<TEvent> = {
-				type: "event",
-				...this.identity,
-				seq: nextSeq,
-				event: eventValue,
-			};
-			const previousFrame = this.projectionEvents.at(-1);
-			const mergedEvent =
-				previousFrame?.seq === this.asOfSeq
-					? this.schema
-						? this.schema.mergeCompatibleDelta(previousFrame.event, eventValue)
-						: mergeCompatibleDelta(previousFrame.event, eventValue, (candidate) => this.guardEvent(candidate))
-					: null;
-			const nextFrame = mergedEvent === null ? frame : { ...frame, event: mergedEvent };
-			try {
-				this.schema?.activeTurnEventLogicalBytes(nextFrame.event);
-			} catch (error) {
-				if (error instanceof SessionProductSchemaLogicalError) {
-					throw new SessionLiveProjectionLimitError("live_events");
-				}
-				throw error;
-			}
-			const frameBytes = jsonBytes(nextFrame, "live_events");
-			if (this.schema?.mode === "future_content" && frameBytes > this.schema.maxNormalizedEventWireBytes) {
-				throw new SessionLiveProjectionLimitError("live_events");
-			}
-			const merging = mergedEvent !== null;
-			const previousFrameBytes = merging ? (this.projectionEventFrameBytes.at(-1) ?? 0) : 0;
-			const nextEventCount = this.projectionEvents.length + (merging ? 0 : 1);
-			const nextEventBytes = this.projectionEventBytes - previousFrameBytes + frameBytes;
-			if (nextEventCount > this.limits.maxLiveEventItems || nextEventBytes > this.maxLiveEventWireBytes()) {
-				throw new SessionLiveProjectionLimitError("live_events");
-			}
-			const queueUpdate = this.schema ? this.schema.queueUpdate(eventValue) : currentQueueUpdate(eventValue);
-			queue = queueUpdate
-				? { steering: [...queueUpdate.steering], followUp: [...queueUpdate.followUp] }
-				: this.queue;
-			if (
-				queue.steering.length > this.limits.maxQueueItems ||
-				queue.followUp.length > this.limits.maxQueueItems
-			) {
-				throw new SessionLiveProjectionLimitError("queue");
-			}
-			this.assertSnapshotFits({
-				asOfSeq: nextSeq,
-				projectionEventBytes: nextEventBytes,
-				projectionEventCount: nextEventCount,
-				queue,
-				runtimePhase: runtimePhase ?? this.runtimePhase,
-			});
-			projectionEvents = merging
-				? [...this.projectionEvents.slice(0, -1), nextFrame]
-				: [...this.projectionEvents, nextFrame];
-			projectionEventFrameBytes = merging
-				? [...this.projectionEventFrameBytes.slice(0, -1), frameBytes]
-				: [...this.projectionEventFrameBytes, frameBytes];
-			projectionEventBytes = nextEventBytes;
-		} else if (input.type === "extension_ui_request") {
-			const requestValue = clone(input.request);
-			pendingExtensionRequests = new Map(this.pendingExtensionRequests);
-			if (BLOCKING_EXTENSION_METHODS.has(requestValue.method)) {
-				pendingExtensionRequests.delete(requestValue.id);
-				pendingExtensionRequests.set(requestValue.id, requestValue);
-			}
-			this.assertExtensionStateFits(pendingExtensionRequests);
-			this.assertSnapshotFits({
-				asOfSeq: nextSeq,
-				pendingExtensionRequests,
-				runtimePhase: pendingExtensionRequests.size > 0 ? "waiting_ui" : (runtimePhase ?? this.runtimePhase),
-			});
-		} else {
-			pendingExtensionRequests = new Map(this.pendingExtensionRequests);
-			pendingExtensionRequests.delete(input.requestId);
-			this.assertSnapshotFits({
-				asOfSeq: nextSeq,
-				pendingExtensionRequests,
-				runtimePhase: pendingExtensionRequests.size > 0 ? "waiting_ui" : (runtimePhase ?? this.runtimePhase),
-			});
-		}
 		const token = deepFreeze({ nextSeq });
-		this.preparedCommits.set(token, {
-			revision: this.revision,
-			nextSeq,
-			projectionEvents,
-			projectionEventFrameBytes,
-			projectionEventBytes,
-			queue,
-			pendingExtensionRequests,
-			runtimePhase: runtimePhase ?? this.runtimePhase,
-		});
+		this.prepareBatchCore([input], runtimePhase, token);
 		return token;
 	}
 
 	commitPrepared(token: SessionLiveProjectionPreparedCommit): number | null {
-		if (typeof token !== "object" || token === null) return null;
-		const prepared = this.preparedCommits.get(token);
+		return this.commitPreparedBatchCore(token);
+	}
+
+	prepareBatch(
+		identity: SessionLiveProjectionIdentity,
+		inputs: readonly SessionLiveProjectionInput<TEvent>[],
+		runtimePhase?: SessionLiveRuntimePhase,
+	): SessionLiveProjectionPreparedBatch {
+		this.assertIdentity(identity);
+		if (inputs.length === 0) throw new SessionLiveProjectionPayloadError();
+		const firstSeq = this.asOfSeq + 1;
+		const lastSeq = this.asOfSeq + inputs.length;
+		if (!Number.isSafeInteger(firstSeq) || !Number.isSafeInteger(lastSeq)) {
+			throw new SessionLiveProjectionLimitError("live_events");
+		}
+		const token = deepFreeze({ firstSeq, lastSeq, count: inputs.length });
+		this.prepareBatchCore(inputs, runtimePhase, token);
+		return token;
+	}
+
+	previewPreparedBatch(
+		token: SessionLiveProjectionPreparedBatch,
+	): SessionLiveProjectionSnapshot<TMessage, TEvent> | null {
+		const prepared = this.eligiblePreparedBatch(token);
 		if (!prepared) return null;
-		this.preparedCommits.delete(token);
-		if (prepared.revision !== this.revision || prepared.nextSeq !== this.asOfSeq + 1) return null;
-		this.projectionEvents = prepared.projectionEvents;
-		this.projectionEventFrameBytes = prepared.projectionEventFrameBytes;
-		this.projectionEventBytes = prepared.projectionEventBytes;
-		this.queue = prepared.queue;
-		this.pendingExtensionRequests = prepared.pendingExtensionRequests;
-		this.runtimePhase = prepared.runtimePhase;
-		this.asOfSeq = prepared.nextSeq;
-		this.revision += 1;
-		return prepared.nextSeq;
+		return this.snapshotCandidate(prepared.candidate);
+	}
+
+	commitPreparedBatch(token: SessionLiveProjectionPreparedBatch): number | null {
+		return this.commitPreparedBatchCore(token);
 	}
 
 	/** Temporary default-off seam. C2b must replace this with prepare/adopt/commit. */
@@ -560,6 +490,178 @@ export class SessionLiveProjection<TMessage = SessionMessageDto, TEvent = Produc
 			return null;
 		}
 		return prepared;
+	}
+
+	private prepareBatchCore(
+		inputs: readonly SessionLiveProjectionInput<TEvent>[],
+		runtimePhase: SessionLiveRuntimePhase | undefined,
+		token: object,
+	): void {
+		let candidate: ProjectionCandidate<TEvent> = {
+			asOfSeq: this.asOfSeq,
+			projectionEvents: this.projectionEvents,
+			projectionEventFrameBytes: this.projectionEventFrameBytes,
+			projectionEventBytes: this.projectionEventBytes,
+			queue: this.queue,
+			pendingExtensionRequests: this.pendingExtensionRequests,
+			runtimePhase: this.runtimePhase,
+		};
+		for (const input of inputs) candidate = this.reduceCandidate(candidate, input, runtimePhase);
+		this.preparedBatches.set(token, {
+			revision: this.revision,
+			firstSeq: this.asOfSeq + 1,
+			lastSeq: candidate.asOfSeq,
+			count: inputs.length,
+			candidate,
+		});
+	}
+
+	private reduceCandidate(
+		candidate: ProjectionCandidate<TEvent>,
+		input: SessionLiveProjectionInput<TEvent>,
+		runtimePhase: SessionLiveRuntimePhase | undefined,
+	): ProjectionCandidate<TEvent> {
+		const nextSeq = candidate.asOfSeq + 1;
+		if (!Number.isSafeInteger(nextSeq)) throw new SessionLiveProjectionLimitError("live_events");
+		const nextRuntimePhase = runtimePhase ?? candidate.runtimePhase;
+		let projectionEvents = candidate.projectionEvents;
+		let projectionEventFrameBytes = candidate.projectionEventFrameBytes;
+		let projectionEventBytes = candidate.projectionEventBytes;
+		let queue = candidate.queue;
+		let pendingExtensionRequests = candidate.pendingExtensionRequests;
+
+		if (input.type === "event") {
+			const eventValue = clone(input.event);
+			if (!this.guardEvent(eventValue)) throw new SessionLiveProjectionPayloadError();
+			const frame: SessionLiveProjectionEventFrame<TEvent> = {
+				type: "event",
+				...this.identity,
+				seq: nextSeq,
+				event: eventValue,
+			};
+			const previousFrame = candidate.projectionEvents.at(-1);
+			const mergedEvent =
+				previousFrame?.seq === candidate.asOfSeq
+					? this.schema
+						? this.schema.mergeCompatibleDelta(previousFrame.event, eventValue)
+						: mergeCompatibleDelta(previousFrame.event, eventValue, (value) => this.guardEvent(value))
+					: null;
+			const nextFrame = mergedEvent === null ? frame : { ...frame, event: mergedEvent };
+			try {
+				this.schema?.activeTurnEventLogicalBytes(nextFrame.event);
+			} catch (error) {
+				if (error instanceof SessionProductSchemaLogicalError) {
+					throw new SessionLiveProjectionLimitError("live_events");
+				}
+				throw error;
+			}
+			const frameBytes = jsonBytes(nextFrame, "live_events");
+			if (this.schema?.mode === "future_content" && frameBytes > this.schema.maxNormalizedEventWireBytes) {
+				throw new SessionLiveProjectionLimitError("live_events");
+			}
+			const merging = mergedEvent !== null;
+			const previousFrameBytes = merging ? (candidate.projectionEventFrameBytes.at(-1) ?? 0) : 0;
+			const nextEventCount = candidate.projectionEvents.length + (merging ? 0 : 1);
+			const nextEventBytes = candidate.projectionEventBytes - previousFrameBytes + frameBytes;
+			if (nextEventCount > this.limits.maxLiveEventItems || nextEventBytes > this.maxLiveEventWireBytes()) {
+				throw new SessionLiveProjectionLimitError("live_events");
+			}
+			const queueUpdate = this.schema ? this.schema.queueUpdate(eventValue) : currentQueueUpdate(eventValue);
+			queue = queueUpdate
+				? { steering: [...queueUpdate.steering], followUp: [...queueUpdate.followUp] }
+				: candidate.queue;
+			if (
+				queue.steering.length > this.limits.maxQueueItems ||
+				queue.followUp.length > this.limits.maxQueueItems
+			) {
+				throw new SessionLiveProjectionLimitError("queue");
+			}
+			projectionEvents = merging
+				? [...candidate.projectionEvents.slice(0, -1), nextFrame]
+				: [...candidate.projectionEvents, nextFrame];
+			projectionEventFrameBytes = merging
+				? [...candidate.projectionEventFrameBytes.slice(0, -1), frameBytes]
+				: [...candidate.projectionEventFrameBytes, frameBytes];
+			projectionEventBytes = nextEventBytes;
+		} else if (input.type === "extension_ui_request") {
+			const requestValue = clone(input.request);
+			pendingExtensionRequests = new Map(candidate.pendingExtensionRequests);
+			if (BLOCKING_EXTENSION_METHODS.has(requestValue.method)) {
+				pendingExtensionRequests.delete(requestValue.id);
+				pendingExtensionRequests.set(requestValue.id, requestValue);
+			}
+			this.assertExtensionStateFits(pendingExtensionRequests);
+		} else {
+			pendingExtensionRequests = new Map(candidate.pendingExtensionRequests);
+			pendingExtensionRequests.delete(input.requestId);
+		}
+
+		this.assertSnapshotFits({
+			asOfSeq: nextSeq,
+			projectionEventBytes,
+			projectionEventCount: projectionEvents.length,
+			queue,
+			pendingExtensionRequests,
+			runtimePhase: nextRuntimePhase,
+		});
+		return {
+			asOfSeq: nextSeq,
+			projectionEvents,
+			projectionEventFrameBytes,
+			projectionEventBytes,
+			queue,
+			pendingExtensionRequests,
+			runtimePhase: nextRuntimePhase,
+		};
+	}
+
+	private eligiblePreparedBatch(token: object): PreparedBatchState<TEvent> | null {
+		if (typeof token !== "object" || token === null) return null;
+		const prepared = this.preparedBatches.get(token);
+		if (!prepared) return null;
+		if (
+			prepared.revision !== this.revision ||
+			prepared.firstSeq !== this.asOfSeq + 1 ||
+			prepared.lastSeq !== prepared.candidate.asOfSeq ||
+			prepared.count !== prepared.lastSeq - prepared.firstSeq + 1
+		) {
+			this.preparedBatches.delete(token);
+			return null;
+		}
+		return prepared;
+	}
+
+	private commitPreparedBatchCore(token: object): number | null {
+		const prepared = this.eligiblePreparedBatch(token);
+		if (!prepared) return null;
+		this.preparedBatches.delete(token);
+		const candidate = prepared.candidate;
+		this.projectionEvents = candidate.projectionEvents;
+		this.projectionEventFrameBytes = candidate.projectionEventFrameBytes;
+		this.projectionEventBytes = candidate.projectionEventBytes;
+		this.queue = candidate.queue;
+		this.pendingExtensionRequests = candidate.pendingExtensionRequests;
+		this.runtimePhase = candidate.runtimePhase;
+		this.asOfSeq = candidate.asOfSeq;
+		this.revision += 1;
+		return candidate.asOfSeq;
+	}
+
+	private snapshotCandidate(
+		candidate: ProjectionCandidate<TEvent>,
+	): SessionLiveProjectionSnapshot<TMessage, TEvent> {
+		const value: SessionLiveProjectionSnapshot<TMessage, TEvent> = {
+			...this.identity,
+			baseSeq: this.baseSeq,
+			asOfSeq: candidate.asOfSeq,
+			runtimePhase: candidate.pendingExtensionRequests.size > 0 ? "waiting_ui" : candidate.runtimePhase,
+			settledMessages: this.settledMessages,
+			projectionEvents: candidate.projectionEvents,
+			queue: candidate.queue,
+			pendingExtensionRequests: [...candidate.pendingExtensionRequests.values()],
+			stickyExtensionState: [],
+		};
+		return deepFreeze(clone(value));
 	}
 
 	private snapshotRuntimePhase(): SessionLiveRuntimePhase {

@@ -851,6 +851,117 @@ describe("SessionLiveProjection", () => {
 		expect(projection.commitPrepared(prepared)).toBeNull();
 	});
 
+	it("prepares, previews, and atomically commits a continuous batch exactly once", () => {
+		const projection = new SessionLiveProjection({ identity, baseSeq: 4, runtimePhase: "idle" });
+		const other = new SessionLiveProjection({ identity, baseSeq: 4, runtimePhase: "idle" });
+		const dialog: ExtensionUiRequestDto = {
+			type: "extension_ui_request",
+			id: "dialog-batch",
+			method: "confirm",
+			title: "Continue?",
+			message: "Confirm",
+		};
+		const before = projection.snapshot();
+		const prepared = projection.prepareBatch(
+			identity,
+			[
+				event({ type: "agent_start" }),
+				{ type: "extension_ui_request", request: dialog },
+				event({ type: "agent_end", messages: [], willRetry: false }),
+			],
+			"running",
+		);
+
+		expect(projection.snapshot()).toEqual(before);
+		expect(prepared).toEqual({ firstSeq: 5, lastSeq: 7, count: 3 });
+		expect(Object.keys(prepared).sort()).toEqual(["count", "firstSeq", "lastSeq"]);
+		expect(Object.isFrozen(prepared)).toBe(true);
+		const preview = projection.previewPreparedBatch(prepared);
+		expect(preview).toMatchObject({
+			baseSeq: 4,
+			asOfSeq: 7,
+			runtimePhase: "waiting_ui",
+			pendingExtensionRequests: [dialog],
+		});
+		expect(preview?.projectionEvents.map((frame) => frame.seq)).toEqual([5, 7]);
+		expect(Object.isFrozen(preview)).toBe(true);
+		expect(Object.isFrozen(preview?.projectionEvents)).toBe(true);
+		expect(Object.isFrozen(preview?.pendingExtensionRequests[0])).toBe(true);
+		expect(other.previewPreparedBatch(prepared)).toBeNull();
+		expect(other.commitPreparedBatch(prepared)).toBeNull();
+		expect(projection.commitPreparedBatch(prepared)).toBe(7);
+		expect(projection.snapshot()).toEqual(preview);
+		const sequential = new SessionLiveProjection({ identity, baseSeq: 4, runtimePhase: "idle" });
+		sequential.commitInlineOnly(identity, event({ type: "agent_start" }), "running");
+		sequential.commitInlineOnly(identity, { type: "extension_ui_request", request: dialog }, "running");
+		sequential.commitInlineOnly(
+			identity,
+			event({ type: "agent_end", messages: [], willRetry: false }),
+			"running",
+		);
+		expect(projection.snapshot()).toEqual(sequential.snapshot());
+		expect(projection.previewPreparedBatch(prepared)).toBeNull();
+		expect(projection.commitPreparedBatch(prepared)).toBeNull();
+	});
+
+	it("rejects an invalid or over-limit second batch input with zero mutation", () => {
+		const currentSchema = createCurrentSessionProductSchema();
+		const rejectingSchema = {
+			...currentSchema,
+			guardEvent: (value: unknown): value is ProductSessionEventDto =>
+				currentSchema.guardEvent(value) && value.type !== "agent_end",
+		};
+		const invalid = new SessionLiveProjection({
+			identity,
+			baseSeq: 0,
+			runtimePhase: "idle",
+			schema: rejectingSchema,
+		});
+		const invalidBefore = invalid.snapshot();
+		expect(() =>
+			invalid.prepareBatch(identity, [
+				event({ type: "agent_start" }),
+				event({ type: "agent_end", messages: [], willRetry: false }),
+			]),
+		).toThrow(SessionLiveProjectionPayloadError);
+		expect(invalid.snapshot()).toEqual(invalidBefore);
+
+		const limited = new SessionLiveProjection({
+			identity,
+			baseSeq: 0,
+			runtimePhase: "idle",
+			limits: { maxExtensionItems: 0 },
+		});
+		const limitedBefore = limited.snapshot();
+		expect(() =>
+			limited.prepareBatch(identity, [
+				event({ type: "agent_start" }),
+				{
+					type: "extension_ui_request",
+					request: {
+						type: "extension_ui_request",
+						id: "dialog-over-limit",
+						method: "confirm",
+						title: "Continue?",
+						message: "Confirm",
+					},
+				},
+			]),
+		).toThrow(SessionLiveProjectionLimitError);
+		expect(limited.snapshot()).toEqual(limitedBefore);
+	});
+
+	it("destroys a stale prepared batch without preview or commit mutation", () => {
+		const projection = new SessionLiveProjection({ identity, baseSeq: 0, runtimePhase: "idle" });
+		const prepared = projection.prepareBatch(identity, [event({ type: "agent_start" })], "running");
+		projection.setRuntimePhase(identity, "running");
+		const before = projection.snapshot();
+
+		expect(projection.previewPreparedBatch(prepared)).toBeNull();
+		expect(projection.commitPreparedBatch(prepared)).toBeNull();
+		expect(projection.snapshot()).toEqual(before);
+	});
+
 	it("invalidates prepared commits after any intervening projection mutation", () => {
 		const projection = new SessionLiveProjection({ identity, baseSeq: 0, runtimePhase: "idle" });
 		const prepared = projection.prepareCommit(identity, event({ type: "agent_start" }), "running");
