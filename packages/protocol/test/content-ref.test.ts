@@ -19,7 +19,7 @@ import {
 	SESSION_PAYLOAD_BUDGET,
 } from "../src/index.js";
 
-describe("lazy protocol 1.3 content references", () => {
+describe("protocol 1.3 content references", () => {
 	const contentRef = {
 		type: "content_ref",
 		serverEpoch: "epoch-a",
@@ -33,12 +33,12 @@ describe("lazy protocol 1.3 content references", () => {
 		contentRefBudget: FUTURE_SESSION_CONTENT_REF_BUDGET,
 	};
 
-	it("publishes the future capability without advertising it from the current protocol", () => {
-		expect(GATEWAY_PROTOCOL_VERSION).toEqual({ major: 1, minor: 2 });
+	it("publishes the active capability in the production protocol", () => {
+		expect(GATEWAY_PROTOCOL_VERSION).toEqual({ major: 1, minor: 3 });
 		expect(GATEWAY_CONTENT_REF_PROTOCOL_MINOR).toBe(3);
 		expect(GATEWAY_CONTENT_REF_CAPABILITY).toBe("payload.epoch_content_refs");
-		expect(GATEWAY_CLIENT_REQUIRED_CAPABILITIES).not.toContain(GATEWAY_CONTENT_REF_CAPABILITY);
-		expect(GATEWAY_SERVER_REQUIRED_CAPABILITIES).not.toContain(GATEWAY_CONTENT_REF_CAPABILITY);
+		expect(GATEWAY_CLIENT_REQUIRED_CAPABILITIES).toContain(GATEWAY_CONTENT_REF_CAPABILITY);
+		expect(GATEWAY_SERVER_REQUIRED_CAPABILITIES).toContain(GATEWAY_CONTENT_REF_CAPABILITY);
 	});
 
 	it("keeps the current 1.2 budget exact while publishing a separate future 48 MiB budget", () => {

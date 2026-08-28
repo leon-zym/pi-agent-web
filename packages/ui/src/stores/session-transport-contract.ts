@@ -2,7 +2,9 @@ import type {
 	ExtensionUiRequestDto,
 	ExtensionUiResponseDto,
 	FutureExtensionUiSnapshotDto,
+	FutureSessionContentRefGuardContext,
 	FutureSessionReplayFrameDto,
+	FutureSessionResponseFrameDto,
 	FutureSessionSnapshotDto,
 	GatewayProtocolVersionDto,
 	HotRuntimeInventoryDto,
@@ -14,7 +16,12 @@ import type {
 	SessionWsServerMessage,
 } from "@pi-agent-web/protocol";
 import type { StoreApi } from "zustand/vanilla";
-import type { FutureSessionContentAdapter } from "../lib/future-session-content-adapter";
+import type {
+	FutureSessionContentAdapter,
+	FutureSessionJsonFieldGuard,
+	FutureSessionJsonRootProjection,
+	FutureSessionTextPayloadProjection,
+} from "../lib/future-session-content-adapter";
 import type { SessionResyncState as SessionRecoveryState, SessionResyncClock } from "../lib/session-resync";
 import type { OrderedSessionFrameBus, SessionTransportGlobalBus } from "./session-frame-bus";
 
@@ -48,9 +55,14 @@ export interface SessionRawEventRecord {
 }
 
 export type FutureSessionTransportFrameMessage =
+	| FutureSessionResponseFrameDto
 	| FutureSessionReplayFrameDto
 	| FutureSessionSnapshotDto
 	| FutureExtensionUiSnapshotDto;
+
+export type FutureSessionLazyIdentity = Readonly<
+	Pick<SessionRuntimeIdentityDto, "serverEpoch" | "workspaceId" | "sessionHandle" | "generation">
+>;
 
 export interface SessionChannelState {
 	sessionHandle: string;
@@ -135,9 +147,20 @@ export interface SessionTransportOptions {
 	onResyncRequired?: (message: Extract<SessionWsServerMessage, { type: "resync_required" }>) => void;
 	resyncClock?: SessionResyncClock;
 	resyncRandom?: () => number;
-	/** Private protocol 1.3 seam; production remains disabled until the atomic hello activation. */
+	/** Protocol 1.3 content adapter; production installs the default from the trusted hello context. */
 	futureContentAdapter?: FutureSessionContentAdapter;
+	/** Protocol 1.3 hello-scoped adapter install; custom factories are validated before activation. */
+	futureContentAdapterFactory?: FutureSessionContentAdapterFactory;
 }
+
+export interface FutureSessionContentAdapterInstallation {
+	adapter: FutureSessionContentAdapter;
+	dispose: () => void;
+}
+
+export type FutureSessionContentAdapterFactory = (
+	context: Readonly<FutureSessionContentRefGuardContext>,
+) => FutureSessionContentAdapterInstallation;
 
 export interface SessionTransportState {
 	connectionState: SessionTransportConnectionState;
@@ -170,6 +193,19 @@ export interface SessionTransportController {
 	store: StoreApi<SessionTransportState>;
 	frameBus: OrderedSessionFrameBus;
 	globalBus: SessionTransportGlobalBus;
+	/** Hello-scoped future content facade; its identity is not a React dependency. */
+	resolveFutureText: (
+		identity: FutureSessionLazyIdentity,
+		payload: FutureSessionTextPayloadProjection,
+		callerSignal?: AbortSignal,
+	) => Promise<string>;
+	/** Hello-scoped future content facade with a caller-owned typed JSON guard. */
+	resolveFutureJson: <T>(
+		identity: FutureSessionLazyIdentity,
+		payload: FutureSessionJsonRootProjection,
+		fieldGuard: FutureSessionJsonFieldGuard<T>,
+		callerSignal?: AbortSignal,
+	) => Promise<T>;
 	/** Public for deterministic protocol tests and non-WebSocket adapters. */
 	ingestServerMessage: (message: SessionWsServerMessage) => void;
 	/** Queue one already-guarded private protocol 1.3 frame for exact-identity materialization. */

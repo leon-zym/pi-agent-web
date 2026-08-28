@@ -69,11 +69,11 @@ export interface PiProcessOptions {
 	/** Bounded allowance for Pi's single-line get_messages response. */
 	snapshotLineMaxBytes?: number;
 	adapter?: PiHostAdapter;
-	/** Disabled until a downstream generation owner is installed. */
+	/** Legacy payload seam; future Runtime installs the generation-owned externalizer. */
 	payloadExternalizer?: PiHostPayloadExternalizer;
 	/** Future Runtime seam: synchronously prepare an exact event handoff without seeing its transfer early. */
 	onDecodedEvent?: PiDecodedDeliveryConsumer<ProductSessionEventDto>;
-	/** Default-off future-content seam. Current Runtime does not install this callback. */
+	/** Future-content seam; the legacy Runtime does not install this callback. */
 	onFutureDecodedEvent?: PiDecodedDeliveryConsumer<FutureProductSessionEventDto, EpochStoredContentRef>;
 	/** Future-only Extension seam. Current inline delivery remains on onExtensionUiRequest. */
 	onFutureDecodedExtensionUiRequest?: PiDecodedDeliveryConsumer<
@@ -423,7 +423,7 @@ export class PiProcess {
 		return this.sendRaw({ ...command, id }, timeoutMs, consume);
 	}
 
-	/** Default-off future Runtime seam for responses that may contain typed content refs. */
+	/** Future Runtime seam for responses that may contain typed content refs. */
 	sendFutureDecoded(
 		command: SessionCommandDto,
 		consume: PiDecodedDeliveryConsumer<FutureSessionCommandResponseDto, EpochStoredContentRef>,

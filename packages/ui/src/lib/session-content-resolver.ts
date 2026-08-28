@@ -180,7 +180,9 @@ class DefaultSessionContentResolver implements SessionContentResolver {
 			payloadBudget: Object.freeze({ ...context.payloadBudget }),
 			contentRefBudget: Object.freeze({ ...context.contentRefBudget }),
 		});
-		this.#fetcher = options.fetcher ?? fetch;
+		// Keep the native fetch receiver intact. Browsers reject an unbound fetch call
+		// even though injected test fetchers are ordinary functions.
+		this.#fetcher = options.fetcher ?? globalThis.fetch.bind(globalThis);
 		const maxCacheBytes =
 			options.cacheLimits?.maxBytes ?? this.#context.payloadBudget.maxAttachmentCacheBytes;
 		const maxCacheItems =

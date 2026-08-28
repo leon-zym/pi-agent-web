@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	GATEWAY_CLIENT_REQUIRED_CAPABILITIES,
+	GATEWAY_CONTENT_REF_CAPABILITY,
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 	GATEWAY_PROTOCOL_VERSION,
@@ -15,11 +16,13 @@ import {
 
 describe("Gateway hello DTOs", () => {
 	it("requires epoch attachment references in both directional capability sets", () => {
-		expect(GATEWAY_PROTOCOL_VERSION).toEqual({ major: 1, minor: 2 });
+		expect(GATEWAY_PROTOCOL_VERSION).toEqual({ major: 1, minor: 3 });
 		expect(GATEWAY_CLIENT_REQUIRED_CAPABILITIES).not.toContain(GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY);
 		expect(GATEWAY_SERVER_REQUIRED_CAPABILITIES).toContain(GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY);
 		expect(GATEWAY_CLIENT_REQUIRED_CAPABILITIES).toContain(GATEWAY_PAYLOAD_BUDGET_CAPABILITY);
 		expect(GATEWAY_SERVER_REQUIRED_CAPABILITIES).toContain(GATEWAY_PAYLOAD_BUDGET_CAPABILITY);
+		expect(GATEWAY_CLIENT_REQUIRED_CAPABILITIES).toContain(GATEWAY_CONTENT_REF_CAPABILITY);
+		expect(GATEWAY_SERVER_REQUIRED_CAPABILITIES).toContain(GATEWAY_CONTENT_REF_CAPABILITY);
 		expect(GATEWAY_REQUIRED_CAPABILITIES).toEqual(GATEWAY_CLIENT_REQUIRED_CAPABILITIES);
 	});
 
@@ -47,7 +50,7 @@ describe("Gateway hello DTOs", () => {
 	it("rejects malformed versions, duplicate capabilities, and unsafe limits", () => {
 		const base = {
 			type: "client_hello",
-			protocol: GATEWAY_PROTOCOL_VERSION,
+			protocol: { major: 1, minor: 2 },
 			clientBuild: "0.1.0",
 			capabilities: ["session-multiplex-v1"],
 			limits: { maxServerFrameBytes: 1024 },
@@ -63,7 +66,7 @@ describe("Gateway hello DTOs", () => {
 		expect(
 			isGatewayServerHello({
 				type: "server_hello",
-				protocol: GATEWAY_PROTOCOL_VERSION,
+				protocol: { major: 1, minor: 2 },
 				serverBuild: "0.1.0",
 				serverEpoch: "0198f1f1-epoch",
 				piVersion: "0.84.2",
@@ -133,13 +136,19 @@ describe("Gateway hello DTOs", () => {
 	});
 
 	it("requires the protocol 1.2 capability and complete budget as one negotiated shape", () => {
+		const legacyClientCapabilities = [
+			"rpc.commands",
+			"rpc.events",
+			"rpc.extension_ui",
+			"session.multiplex",
+			GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+		];
+		const legacyServerCapabilities = [...legacyClientCapabilities, GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY];
 		const client = {
 			type: "client_hello" as const,
 			protocol: { major: 1, minor: 2 },
 			clientBuild: "0.1.0",
-			capabilities: Array.from(
-				new Set([...GATEWAY_SERVER_REQUIRED_CAPABILITIES, GATEWAY_PAYLOAD_BUDGET_CAPABILITY]),
-			),
+			capabilities: legacyServerCapabilities,
 			limits: { maxServerFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes },
 		};
 		const server = {
@@ -149,9 +158,7 @@ describe("Gateway hello DTOs", () => {
 			serverEpoch: "epoch-a",
 			piVersion: "0.84.2",
 			adapterId: "legacy-rpc-v1",
-			capabilities: Array.from(
-				new Set([...GATEWAY_SERVER_REQUIRED_CAPABILITIES, GATEWAY_PAYLOAD_BUDGET_CAPABILITY]),
-			),
+			capabilities: legacyServerCapabilities,
 			limits: {
 				maxClientFrameBytes: SESSION_PAYLOAD_BUDGET.maxCommandFrameBytes,
 				maxSnapshotFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes,

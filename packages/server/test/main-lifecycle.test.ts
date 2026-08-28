@@ -6,7 +6,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { EpochContentStore } from "../src/epoch-content-store.js";
-import { startServer } from "../src/main.js";
+import { startServerWithCurrentMode } from "../src/main.js";
 import { WorkspacePreferences } from "../src/workspace-preferences.js";
 
 const temporaryRoots: string[] = [];
@@ -31,7 +31,7 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 	return { promise, resolve };
 }
 
-async function authenticatedOrigin(handle: Awaited<ReturnType<typeof startServer>>): Promise<{
+async function authenticatedOrigin(handle: Awaited<ReturnType<typeof startServerWithCurrentMode>>): Promise<{
 	origin: string;
 	headers: Record<string, string>;
 }> {
@@ -58,7 +58,7 @@ describe("production server lifecycle", () => {
 	it("resolves only after binding and cannot resurrect after an immediate close", async () => {
 		const root = temporaryRoot();
 		const webDataDir = path.join(root, "web-data");
-		const handle = await startServer({
+		const handle = await startServerWithCurrentMode({
 			config: {
 				port: 0,
 				host: "127.0.0.1",
@@ -98,7 +98,7 @@ describe("production server lifecycle", () => {
 		const webDataDir = path.join(root, "web-data");
 		try {
 			await expect(
-				startServer({
+				startServerWithCurrentMode({
 					config: {
 						port: address.port,
 						host: "127.0.0.1",
@@ -129,7 +129,7 @@ describe("production server lifecycle", () => {
 		fs.mkdirSync(webDataDir, { recursive: true });
 		fs.writeFileSync(path.join(webDataDir, "content"), "unsafe non-directory");
 		await expect(
-			startServer({
+			startServerWithCurrentMode({
 				config: {
 					port: 0,
 					host: "127.0.0.1",
@@ -146,7 +146,7 @@ describe("production server lifecycle", () => {
 
 		fs.rmSync(path.join(webDataDir, "content"), { force: true });
 		await expect(
-			startServer({
+			startServerWithCurrentMode({
 				config: {
 					port: -1,
 					host: "127.0.0.1",
@@ -168,7 +168,7 @@ describe("production server lifecycle", () => {
 	it("force-closes an active streaming attachment upload within the shutdown bound", async () => {
 		const root = temporaryRoot();
 		const webDataDir = path.join(root, "web-data");
-		const handle = await startServer({
+		const handle = await startServerWithCurrentMode({
 			config: {
 				port: 0,
 				host: "127.0.0.1",
@@ -240,7 +240,7 @@ describe("production server lifecycle", () => {
 		const privateFile = path.join(root, "private.txt");
 		fs.writeFileSync(privateFile, "must not leak");
 		fs.symlinkSync(privateFile, path.join(staticDir, "leak.txt"));
-		const handle = await startServer({
+		const handle = await startServerWithCurrentMode({
 			config: {
 				port: 0,
 				host: "127.0.0.1",
@@ -313,7 +313,7 @@ describe("production server lifecycle", () => {
 		const root = temporaryRoot();
 		const canonicalWebDataDir = path.join(root, "web-data");
 		const relativeWebDataDir = path.relative(process.cwd(), canonicalWebDataDir);
-		const handle = await startServer({
+		const handle = await startServerWithCurrentMode({
 			config: {
 				port: 0,
 				host: "127.0.0.1",
@@ -425,7 +425,7 @@ describe("production server lifecycle", () => {
 
 	it("serves directly seeded UTF-8 content from the production store without enabling uploads", async () => {
 		const root = temporaryRoot();
-		const handle = await startServer({
+		const handle = await startServerWithCurrentMode({
 			config: {
 				port: 0,
 				host: "127.0.0.1",
@@ -483,7 +483,7 @@ describe("production server lifecycle", () => {
 	it("continues shutdown through a content-store lock failure and releases preferences", async () => {
 		const root = temporaryRoot();
 		const webDataDir = path.join(root, "web-data");
-		const handle = await startServer({
+		const handle = await startServerWithCurrentMode({
 			config: {
 				port: 0,
 				host: "127.0.0.1",

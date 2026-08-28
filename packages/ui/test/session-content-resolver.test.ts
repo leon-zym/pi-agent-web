@@ -107,6 +107,24 @@ const invalidResponses: Array<[string, Response]> = [
 ];
 
 describe("Session content resolver", () => {
+	it("binds the native fetch receiver for browser content requests", async () => {
+		const text = paddedText("native-fetch");
+		const nativeFetch = vi.fn(async function (this: unknown, input: RequestInfo | URL) {
+			if (this !== globalThis) throw new TypeError("Illegal invocation");
+			expect(input).toBe(`/api/v1/content/${trustedContext.serverEpoch}/${"d".repeat(64)}`);
+			return contentResponse([textBytes(text)], text.length);
+		});
+		vi.stubGlobal("fetch", nativeFetch);
+		try {
+			const resolver = createSessionContentResolver({ trustedContext });
+			await expect(resolver.resolveText(externalText(ref("d")))).resolves.toBe(text);
+			expect(nativeFetch).toHaveBeenCalledTimes(1);
+			resolver.dispose();
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
+
 	it("uses the authenticated exact-digest route and streams an exact external text body", async () => {
 		const text = paddedText("resolved-text");
 		const bytes = textBytes(text);

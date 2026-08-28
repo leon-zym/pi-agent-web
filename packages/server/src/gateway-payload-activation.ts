@@ -29,7 +29,7 @@ export interface GatewayPayloadActivation {
 	readonly supervisorServices: SessionRuntimePiPayloadServices;
 }
 
-/** Default-off future activation root. Stage 4C1 does not connect this to Main or Runtime. */
+/** Protocol 1.3 activation root; Main installs it atomically for the production path. */
 export interface GatewayFuturePayloadActivation {
 	readonly context: FutureSessionContentRefGuardContext;
 	readonly contentStore: EpochContentStore;

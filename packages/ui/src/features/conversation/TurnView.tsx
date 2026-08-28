@@ -1,4 +1,4 @@
-import type { SessionImageContentDto } from "@pi-agent-web/protocol";
+import type { SessionImageContentDto, SessionRuntimeIdentityDto } from "@pi-agent-web/protocol";
 import { memo } from "react";
 import { tt } from "../../lib/i18n";
 import type { ProductTurn } from "../../types/view-models";
@@ -12,9 +12,13 @@ import { UserMessageBubble } from "./UserMessageBubble";
  */
 export const TurnView = memo(function TurnView({
 	turn,
+	sessionHandle,
+	sessionIdentity,
 	onAttachmentLoadError,
 }: {
 	turn: ProductTurn;
+	sessionHandle?: string | null;
+	sessionIdentity?: SessionRuntimeIdentityDto | null;
 	onAttachmentLoadError?: (image: SessionImageContentDto) => void;
 }) {
 	return (
@@ -31,9 +35,15 @@ export const TurnView = memo(function TurnView({
 				/>
 			))}
 			{turn.steps.map((step) => (
-				<AssistantStepView key={step.key} turnId={turn.id} step={step} />
+				<AssistantStepView
+					key={step.key}
+					turnId={turn.id}
+					step={step}
+					sessionHandle={sessionHandle}
+					sessionIdentity={sessionIdentity}
+				/>
 			))}
-			<TurnTail turn={turn} />
+			<TurnTail turn={turn} sessionHandle={sessionHandle ?? null} />
 		</section>
 	);
 });

@@ -1,3 +1,4 @@
+import type { SessionRuntimeIdentityDto } from "@pi-agent-web/protocol";
 import {
 	Check,
 	ChevronRight,
@@ -12,12 +13,12 @@ import { useMemo, useState } from "react";
 import { stripAnsi } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
-import { useProjectionStore } from "../../stores/projection";
 import { useViewStore } from "../../stores/view";
 import type { ContentBlock, UiToolResult } from "../../types/view-models";
 import { formatToolArguments } from "./code-display";
 import { HighlightedCode } from "./HighlightedCode";
 import { getToolPresenter, toolDiffStats, toolOutputText } from "./tool-presenters";
+import { useLazyToolContent } from "./use-lazy-tool-content";
 
 type ToolCallBlock = Extract<ContentBlock, { type: "tool_call" }>;
 
@@ -94,6 +95,23 @@ export interface ToolCallRowProps {
 	results: UiToolResult[];
 	stacked?: boolean;
 	className?: string;
+	sessionHandle?: string | null;
+	sessionIdentity?: SessionRuntimeIdentityDto | null;
+}
+
+function ToolContentNotice({ status }: { status: "loading" | "error" }) {
+	if (status === "loading") {
+		return (
+			<div role="status" className="ml-[22px] py-1 text-[12px] text-ink-3">
+				{tt("common.loading")}
+			</div>
+		);
+	}
+	return (
+		<p role="alert" className="ml-[22px] py-1 text-[12px] text-danger">
+			{tt("tool.executionError")}
+		</p>
+	);
 }
 
 /**
@@ -101,13 +119,30 @@ export interface ToolCallRowProps {
  * collapsed summary row, two-phase status, inline expansion capped at
  * terminal 224px / code 260px; the full log goes to the right inspector.
  */
-export function ToolCallRow({ block, results, stacked, className }: ToolCallRowProps) {
+export function ToolCallRow({
+	block,
+	results,
+	stacked,
+	className,
+	sessionHandle,
+	sessionIdentity,
+}: ToolCallRowProps) {
 	const [expanded, setExpanded] = useState(false);
-	const presenter = getToolPresenter(block.toolName);
-	const presenterContext = toolContext(block, results);
+	const lazyContent = useLazyToolContent({
+		enabled: expanded,
+		identity: sessionIdentity ?? null,
+		block,
+		results,
+	});
+	const materializedBlock = lazyContent.status === "ready" ? lazyContent.block : block;
+	const materializedResults = lazyContent.status === "ready" ? lazyContent.results : results;
+	const presenter = getToolPresenter(materializedBlock.toolName);
+	const presenterContext = toolContext(materializedBlock, materializedResults);
 	const summary = boundedToolSummary(presenter.summarize(presenterContext));
 	const diffStats = toolDiffStats(presenterContext);
-	const effectiveStatus = results.some((result) => result.isError) ? "error" : block.status;
+	const effectiveStatus = materializedResults.some((result) => result.isError)
+		? "error"
+		: materializedBlock.status;
 	const status = STATUS_ICON[effectiveStatus];
 	const StatusIcon = status.icon;
 
@@ -146,9 +181,9 @@ export function ToolCallRow({ block, results, stacked, className }: ToolCallRowP
 					aria-label={tt("tool.inspectAria")}
 					className="flex size-6 shrink-0 items-center justify-center rounded-sm text-ink-3 opacity-0 transition-opacity hover:bg-hover hover:text-ink group-hover:opacity-100 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-primary/40"
 					onClick={() => {
+						if (!sessionHandle) return;
 						const view = useViewStore.getState();
-						const sessionId = useProjectionStore.getState().currentSessionId;
-						view.selectTool(sessionId ?? "", block.key);
+						view.selectTool(sessionHandle, block.key);
 					}}
 				>
 					<ExternalLink className="size-3.5" />
@@ -161,7 +196,12 @@ export function ToolCallRow({ block, results, stacked, className }: ToolCallRowP
 				)}
 			</div>
 
-			{expanded && <ExpandedToolCallBody block={block} results={results} />}
+			{expanded &&
+				(lazyContent.status === "ready" ? (
+					<ExpandedToolCallBody block={lazyContent.block} results={lazyContent.results} />
+				) : (
+					<ToolContentNotice status={lazyContent.status === "error" ? "error" : "loading"} />
+				))}
 		</div>
 	);
 }

@@ -1,7 +1,11 @@
 # ADR 0011: Epoch-scoped typed content references
 
-- Status: Accepted
+- Status: Accepted and activated
 - Date: 2026-08-28
+
+Protocol 1.3 activation is part of the same release change as this document update. The accepted
+design below is unchanged; the activation state records the production contract after the atomic
+Main, Supervisor, Bridge, route, Browser, and documentation switch.
 
 ## Context
 
@@ -67,8 +71,9 @@ atomicity protocol to every hold, download, materialization, and recovery path.
    JSON or referenced UTF-8 JSON bytes, while the containing field still owns the product meaning
    and runs its field-specific guard after materialization. Media type is therefore a typed-slot
    concern, not blob identity or singleton manifest metadata.
-4. Protocol 1.2 DTOs and guards remain frozen. Protocol 1.3 defines parallel full-frame message,
-   entry, tree, event, response, replay, and snapshot DTOs. Their guards accept content wrappers
+4. Protocol 1.2 DTOs and guards remain frozen as a historical compatibility surface. Protocol 1.3
+   defines the active parallel full-frame message, entry, tree, event, response, replay, and snapshot
+   DTOs. Their guards accept content wrappers
    only with a complete trusted content-reference context containing the exact epoch, attachment
    budget, and generic-content budget. Server projection, replay, and Runtime code use
    current-defaulted generics with an injected schema that owns these guards and their accounting
@@ -118,12 +123,12 @@ atomicity protocol to every hold, download, materialization, and recovery path.
    logical content are each limited to 64 MiB, while physical cache accounting continues to dedupe
    exact UTF-8 bytes.
 
-   The Pi-side raw JSONL frame and each decoded root have independent limits. A future
-   externalizable JSONL frame is at most 64 MiB, and each allowlisted generic root is at most 48 MiB.
+   The Pi-side raw JSONL frame and each decoded root have independent limits. An externalizable
+   JSONL frame is at most 64 MiB, and each allowlisted generic root is at most 48 MiB.
    JSON escaping can make a valid decoded value exceed the frame limit, so a control-character-heavy
    root may be rejected by the 64 MiB frame boundary before root admission. The Gateway does not
    raise framing to the roughly 288 MiB worst case.
-9. A live event must pass every applicable boundary. Its raw future JSONL frame is at most 64 MiB;
+9. A live event must pass every applicable boundary. Its raw JSONL frame is at most 64 MiB;
    after externalization its normalized event is at most 8 MiB plus 4 KiB envelope headroom; its
    replay frame has the same 8 MiB plus 4 KiB ceiling; and the serialized active-turn projection
    suffix remains at most 8 MiB. The separate active-turn logical-content ceiling is 64 MiB, so one
@@ -166,34 +171,34 @@ atomicity protocol to every hold, download, materialization, and recovery path.
     and reruns the slot guard. A 404, 410, decode failure, or guard failure reports one failure for
     the exact Session and generation and requests a cursorless authoritative resync. Stale identity
     or uncommitted-baseline failures do not affect the current channel.
-14. Protocol version 1.3 adds `payload.epoch_content_refs`. The capability and its complete canonical
-    budget become required in both directions only when the full vertical path is activated. Version
-    1.3 peers then reject a missing capability or budget before Session subscription and do not
-    materialize inline output for an older peer. Until that activation, production continues to
-    advertise protocol version 1.2 and `payload.epoch_attachment_refs` only;
-    `payload.epoch_content_refs` remains unadvertised.
+14. Protocol version 1.3 is the active Gateway contract. Both directions require
+    `payload.epoch_attachment_refs` and `payload.epoch_content_refs`, and `server_hello` carries the
+    complete `payloadBudget` and `contentRefBudget`. A missing capability, incomplete budget,
+    incompatible frame ceiling, or non-1.3 peer terminates the connection before Session subscription.
+    The Gateway does not provide a per-connection inline fallback. Protocol 1.2 remains documented
+    as the previous compatibility surface and is tested explicitly, but is not a production Session
+    mode after this activation.
 
-## Activation boundary
+## Activation status
 
-The capability stays private through the first six stages. Each intermediate stage must preserve the
-current protocol version 1.2 production behavior.
+The activation is atomic. Main creates one payload activation containing the current `serverEpoch`,
+the canonical `payloadBudget`, the canonical `contentRefBudget`, and the shared `EpochContentStore`.
+That activation is passed to REST routes, Supervisor externalization and ownership, the WebSocket
+Bridge, and Browser hello/materialization. The production Browser selects protocol minor 3 and both
+payload capabilities from this activation; no component selects the content mode by inspecting a
+payload shape.
 
-1. Record this decision and freeze the wrapper, slot, budget, and failure contracts.
-2. Add strict version 1.3 DTO, budget, wrapper, context, and provenance guards without advertising the
-   new capability.
-3. Add the namespaced store identity, manifest, holds, and authenticated GET route under the existing
-   `EpochContentStore` lifecycle.
-4. Add streaming text and JSON encoding plus raw-slot JSON normalization and externalization, with
-   the externalizer still absent from production activation.
-5. Carry namespaced holds through PiProcess, Runtime ownership, projection, replay, snapshot,
-   compaction, rekey, transition, and teardown paths. This stage does not externalize Extension
-   requests.
-6. Add Browser trusted-context guards, bounded materialization, tool and Extension consumers, and
-   exact resync behavior while version 1.3 remains unavailable to production connections.
-7. Atomically switch Main, Supervisor, Bridge, routes, Browser hello, and the canonical production
-   budget to version 1.3. Advertise and require `payload.epoch_content_refs` only in the same change
-   that passes the full integration and Browser gates and updates the current architecture, protocol,
-   and development contracts.
+The switch includes the following already activated behavior:
+
+- the shared store has raster and `utf8` namespaces, one lifecycle lock, one reservation/cache
+  ledger, and one shutdown fence;
+- the server-private adapter externalizes only reviewed roots, publishes a reference only after the
+  bytes are readable, and carries the transfer through exact Runtime generation ownership;
+- live, replay, snapshot, and history response families use the 1.3 product DTOs and their own
+  complete guards;
+- the Browser retains references in projection, materializes tool and message roots on demand, and
+  materializes ordered Extension roots before semantic state and sequence commit;
+- the integration, packaged Browser, and release gates below are the evidence for this activation.
 
 ## Consequences
 
@@ -212,8 +217,8 @@ JSON consumers may temporarily hold encoded text and the parsed value within the
 Components that do not need the value can retain the small reference instead of parsing it.
 
 Protocol version 1.3 is an atomic compatibility boundary. Independently updated version 1.2 clients
-and servers cannot guess the wrapper, budget, or materialization rules and will fail hello rather
-than receive a mixed inline/reference stream.
+and servers cannot guess the wrapper, budget, or materialization rules and fail hello rather than
+receive a mixed inline/reference stream.
 
 ## Rejected alternatives
 
@@ -242,8 +247,8 @@ than receive a mixed inline/reference stream.
 
 ## Verification
 
-- Protocol tests cover version 1.2 compatibility, unadvertised version 1.3 definitions, final required
-  capability negotiation, parallel full-frame guards, exact canonical budgets, strict wrappers,
+- Protocol tests cover version 1.2 compatibility, active version 1.3 required capability negotiation,
+  parallel full-frame guards, exact canonical budgets, strict wrappers,
   epoch fences, root-only provenance, and closed-slot logical-byte accounting.
 - Store tests prove that text and JSON wrappers for the same UTF-8 bytes use one namespaced blob,
   raster and UTF-8 identities do not collide, byte and item accounting is shared, and GC, deletion,
@@ -262,4 +267,5 @@ than receive a mixed inline/reference stream.
   and recovery without an inline fallback.
 - The activation gate includes a faithful large tool result, replay and snapshot recovery, a large
   Extension editor or widget payload, cache exhaustion recovery, packaged Browser coverage, and the
-  complete release verification suite.
+  complete release verification suite. A credential-bearing real-Pi run remains an explicit release
+  check and is never an implicit CI dependency.

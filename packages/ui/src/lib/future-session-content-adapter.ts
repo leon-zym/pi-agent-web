@@ -6,6 +6,7 @@ import {
 	type FutureSessionContentRefGuardContext,
 	type FutureSessionReplayFrameDto,
 	type FutureSessionSnapshotDto,
+	isBoundedJsonValue,
 	isExtensionUiRequestDto,
 	isFutureSessionContentRefGuardContext,
 	isFutureSessionReplayFrameDto,
@@ -15,8 +16,10 @@ import {
 	isSessionTextPayloadDto,
 	type SessionExternalJsonDto,
 	type SessionExternalTextDto,
+	type SessionJsonRootDto,
 	type SessionJsonValueDto,
 	type SessionReplayFrameDto,
+	type SessionTextPayloadDto,
 	type StickyExtensionUiRequestDto,
 } from "@pi-agent-web/protocol";
 
@@ -27,6 +30,8 @@ export type FutureSessionTextPayloadProjection =
 export type FutureSessionJsonRootProjection =
 	| { kind: "inline"; value: SessionJsonValueDto }
 	| { kind: "external"; value: SessionExternalJsonDto };
+
+export type FutureSessionJsonFieldGuard<T> = (value: unknown) => value is T;
 
 export type ProjectedFutureSessionReplayFrame =
 	| Exclude<FutureSessionReplayFrameDto, { type: "extension_ui_request" }>
@@ -57,6 +62,18 @@ export class FutureSessionContentAdapterError extends Error {
 export interface FutureSessionContentAdapter {
 	projectTextPayload(value: unknown): FutureSessionTextPayloadProjection;
 	projectJsonRoot(value: unknown): FutureSessionJsonRootProjection;
+	materializeTextPayload(value: unknown, signal?: AbortSignal): Promise<string>;
+	materializeJsonRoot(value: unknown, signal?: AbortSignal): Promise<SessionJsonValueDto>;
+	materializeJsonRoot(
+		value: unknown,
+		fieldGuard: undefined,
+		signal?: AbortSignal,
+	): Promise<SessionJsonValueDto>;
+	materializeJsonRoot<T>(
+		value: unknown,
+		fieldGuard: FutureSessionJsonFieldGuard<T>,
+		signal?: AbortSignal,
+	): Promise<T>;
 	materializeReplayFrame(frame: unknown, signal?: AbortSignal): Promise<ProjectedFutureSessionReplayFrame>;
 	materializeReplayFrames(
 		frames: readonly unknown[],
@@ -76,6 +93,13 @@ export interface FutureSessionContentAdapterOptions {
 
 export interface FutureSessionExtensionMaterializer {
 	materializeExtensionRequest(request: FutureExtensionUiRequestDto, signal?: AbortSignal): Promise<unknown>;
+	/** Optional during the staged rollout; required only for external lazy roots. */
+	resolveText?(value: SessionTextPayloadDto, signal?: AbortSignal): Promise<string>;
+	resolveJson?<T>(
+		value: SessionJsonRootDto,
+		guard: FutureSessionJsonFieldGuard<T>,
+		signal?: AbortSignal,
+	): Promise<T>;
 }
 
 function adapterError(message: string): FutureSessionContentAdapterError {
@@ -84,6 +108,29 @@ function adapterError(message: string): FutureSessionContentAdapterError {
 
 function abortError(): DOMException {
 	return new DOMException("Future Session content adaptation was aborted", "AbortError");
+}
+
+function boundedJsonFieldGuard<T>(
+	fieldGuard: FutureSessionJsonFieldGuard<T>,
+): FutureSessionJsonFieldGuard<T> {
+	return (value): value is T => isBoundedJsonValue(value) && fieldGuard(value);
+}
+
+function textPayloadRoot(
+	value: unknown,
+	context: FutureSessionContentRefGuardContext,
+): SessionTextPayloadDto {
+	if (!isSessionTextPayloadDto(value, context)) {
+		throw adapterError("Future Session text payload failed its exact context guard");
+	}
+	return value;
+}
+
+function jsonRoot(value: unknown, context: FutureSessionContentRefGuardContext): SessionJsonRootDto {
+	if (!isSessionJsonRootDto(value, context)) {
+		throw adapterError("Future Session JSON root failed its exact context guard");
+	}
+	return value;
 }
 
 class DefaultFutureSessionContentAdapter implements FutureSessionContentAdapter {
@@ -116,6 +163,51 @@ class DefaultFutureSessionContentAdapter implements FutureSessionContentAdapter 
 		return value.type === "inline_json"
 			? { kind: "inline", value: value.value }
 			: { kind: "external", value };
+	}
+
+	public async materializeTextPayload(value: unknown, signal?: AbortSignal): Promise<string> {
+		this.#assertNotAborted(signal);
+		const root = textPayloadRoot(value, this.#context);
+		if (typeof root === "string") {
+			this.#assertNotAborted(signal);
+			return root;
+		}
+		const materialized = await this.#resolveText(root, signal);
+		this.#assertNotAborted(signal);
+		if (typeof materialized !== "string") {
+			throw adapterError("Materialized Future Session text is not a string");
+		}
+		return materialized;
+	}
+
+	public materializeJsonRoot(value: unknown, signal?: AbortSignal): Promise<SessionJsonValueDto>;
+	public materializeJsonRoot(
+		value: unknown,
+		fieldGuard: undefined,
+		signal?: AbortSignal,
+	): Promise<SessionJsonValueDto>;
+	public materializeJsonRoot<T>(
+		value: unknown,
+		fieldGuard: FutureSessionJsonFieldGuard<T>,
+		signal?: AbortSignal,
+	): Promise<T>;
+	public async materializeJsonRoot<T>(
+		value: unknown,
+		fieldGuardOrSignal?: FutureSessionJsonFieldGuard<T> | AbortSignal,
+		signal?: AbortSignal,
+	): Promise<SessionJsonValueDto | T> {
+		const resolvedSignal =
+			typeof fieldGuardOrSignal === "function"
+				? signal
+				: fieldGuardOrSignal === undefined
+					? signal
+					: fieldGuardOrSignal;
+		this.#assertNotAborted(resolvedSignal);
+		const root = jsonRoot(value, this.#context);
+		if (typeof fieldGuardOrSignal === "function") {
+			return this.#materializeJsonRoot(root, boundedJsonFieldGuard(fieldGuardOrSignal), resolvedSignal);
+		}
+		return this.#materializeJsonRoot(root, isBoundedJsonValue, resolvedSignal);
 	}
 
 	public async materializeReplayFrame(
@@ -211,6 +303,47 @@ class DefaultFutureSessionContentAdapter implements FutureSessionContentAdapter 
 		}
 		const candidate: ProjectedFutureExtensionUiSnapshot = { ...snapshot, requests };
 		return candidate;
+	}
+
+	async #materializeJsonRoot<T>(
+		root: SessionJsonRootDto,
+		fieldGuard: FutureSessionJsonFieldGuard<T>,
+		signal?: AbortSignal,
+	): Promise<T> {
+		if (root.type === "inline_json") {
+			if (!fieldGuard(root.value)) {
+				throw adapterError("Materialized Future Session JSON failed its field guard");
+			}
+			const materialized = structuredClone(root.value);
+			this.#assertNotAborted(signal);
+			return materialized;
+		}
+		const materialized = await this.#resolveJson(root, fieldGuard, signal);
+		this.#assertNotAborted(signal);
+		if (!fieldGuard(materialized)) {
+			throw adapterError("Materialized Future Session JSON failed its field guard");
+		}
+		return materialized;
+	}
+
+	async #resolveText(value: SessionTextPayloadDto, signal?: AbortSignal): Promise<string> {
+		const resolver = this.#resolver;
+		if (typeof resolver.resolveText !== "function") {
+			throw adapterError("Future Session content resolver cannot materialize external text");
+		}
+		return resolver.resolveText(value, signal);
+	}
+
+	async #resolveJson<T>(
+		value: SessionJsonRootDto,
+		fieldGuard: FutureSessionJsonFieldGuard<T>,
+		signal?: AbortSignal,
+	): Promise<T> {
+		const resolver = this.#resolver;
+		if (typeof resolver.resolveJson !== "function") {
+			throw adapterError("Future Session content resolver cannot materialize external JSON");
+		}
+		return resolver.resolveJson(value, fieldGuard, signal);
 	}
 
 	#assertNotAborted(signal?: AbortSignal): void {

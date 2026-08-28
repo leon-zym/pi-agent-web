@@ -297,7 +297,7 @@ export class SessionLiveProjection<
 		return this.commitPreparedBatchCore(token);
 	}
 
-	/** Temporary default-off seam. C2b must replace this with prepare/adopt/commit. */
+	/** Legacy inline-only compatibility seam; future mode uses prepare/adopt/commit. */
 	commitInlineOnly(
 		identity: SessionLiveProjectionIdentity,
 		input: SessionLiveProjectionInput<TEvent, TExtensionRequest>,
@@ -411,7 +411,7 @@ export class SessionLiveProjection<
 		);
 	}
 
-	/** Temporary default-off seam. C2b must replace this with prepare/adopt/commit. */
+	/** Legacy inline-only compatibility seam; future mode uses prepare/adopt/commit. */
 	commitIdleBaseCompactionInlineOnly(
 		token: SessionLiveProjectionCompactionToken,
 		settledMessages: readonly TMessage[],
