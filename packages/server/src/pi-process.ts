@@ -3,6 +3,7 @@ import { once } from "node:events";
 import {
 	type ExtensionUiRequestDto,
 	type ExtensionUiResponseDto,
+	type FutureExtensionUiRequestDto,
 	type FutureProductSessionEventDto,
 	type FutureSessionCommandResponseDto,
 	isSessionCommandResponseDto,
@@ -23,6 +24,7 @@ import {
 	MAX_JSONL_SNAPSHOT_LINE_BYTES,
 } from "./jsonl.js";
 import { legacyRpcV1Adapter } from "./legacy-rpc-v1.js";
+import { isLegacyRpcV1FutureContentRawExtensionUiRequest } from "./legacy-rpc-v1-content-wire.js";
 import {
 	type PiHostAdapter,
 	type PiHostDecodeOutcome,
@@ -73,6 +75,11 @@ export interface PiProcessOptions {
 	onDecodedEvent?: PiDecodedDeliveryConsumer<ProductSessionEventDto>;
 	/** Default-off future-content seam. Current Runtime does not install this callback. */
 	onFutureDecodedEvent?: PiDecodedDeliveryConsumer<FutureProductSessionEventDto, EpochStoredContentRef>;
+	/** Future-only Extension seam. Current inline delivery remains on onExtensionUiRequest. */
+	onFutureDecodedExtensionUiRequest?: PiDecodedDeliveryConsumer<
+		FutureExtensionUiRequestDto,
+		EpochStoredContentRef
+	>;
 	onEvent?: (event: ProductSessionEventDto) => void;
 	onExtensionUiRequest?: (request: ExtensionUiRequestDto) => void;
 	onExit?: (info: PiProcessExitInfo) => void;
@@ -959,18 +966,17 @@ export class PiProcess {
 			);
 			return;
 		}
-		if (!this.opts.onExtensionUiRequest) {
-			await this.releaseOutcome(outcome);
-			return;
-		}
-		if (outcome.lease) {
+		const consume = this.opts.onFutureDecodedExtensionUiRequest;
+		if (!consume) {
 			return this.releaseOutcomeAfterFailure(
 				outcome,
-				new Error("inline-only Pi Extension UI delivery cannot carry content holds"),
-				"Pi inline Extension UI cleanup failed",
+				new Error("future Pi Extension UI delivery requires a decoded consumer"),
+				"Pi future Extension UI cleanup failed",
 			);
 		}
-		this.opts.onExtensionUiRequest(outcome.value.request);
+		await this.consumeDecodedOutcome({ value: outcome.value.request, lease: outcome.lease }, consume, () =>
+			this.ownsSpawn(identity),
+		);
 	}
 
 	private async handleLine(line: string, identity: SpawnIdentity | null = this.spawnIdentity): Promise<void> {
@@ -1184,6 +1190,9 @@ export class PiProcess {
 			return this.isPendingSnapshotResponse(data);
 		}
 		if (!isRecord(data)) return false;
+		if (data.type === "extension_ui_request") {
+			return isLegacyRpcV1FutureContentRawExtensionUiRequest(data);
+		}
 		if (data.type === "response") {
 			if (data.success !== true || typeof data.id !== "string") return false;
 			return isFutureContentHistoryCommand(data.command);

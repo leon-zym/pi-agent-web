@@ -10,6 +10,7 @@ import {
 } from "@pi-agent-web/protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EpochContentStore, EpochContentStoreError } from "../src/epoch-content-store.js";
+import { isLegacyRpcV1FutureContentRawExtensionUiRequest } from "../src/legacy-rpc-v1-content-wire.js";
 import {
 	externalizePiPayload,
 	type PiGenericPayloadExternalizerContentStore,
@@ -106,6 +107,184 @@ describe("Pi payload generic content externalizer", () => {
 		expect(stageUtf8).not.toHaveBeenCalled();
 		expect(holdPublishedUtf8).not.toHaveBeenCalled();
 		await result.lease.release();
+	});
+
+	it("externalizes only the three future Extension roots and normalizes the whole widget array", async () => {
+		const wide = "x".repeat(SESSION_CONTENT_INLINE_THRESHOLD_BYTES);
+		const editor = await externalizePiPayload(
+			{
+				kind: "extension_ui_request",
+				value: {
+					type: "extension_ui_request",
+					id: "editor-a",
+					method: "editor",
+					title: "Edit",
+					prefill: wide,
+				},
+			},
+			options(store),
+		);
+		expect(editor.value).toEqual(
+			expect.objectContaining({
+				prefill: { type: "external_text", ref: expect.objectContaining({ type: "content_ref" }) },
+			}),
+		);
+		expect(editor.lease.refs).toHaveLength(1);
+
+		const setEditorText = await externalizePiPayload(
+			{
+				kind: "extension_ui_request",
+				value: {
+					type: "extension_ui_request",
+					id: "set-editor-a",
+					method: "set_editor_text",
+					text: wide,
+				},
+			},
+			options(store),
+		);
+		expect(setEditorText.value).toEqual(
+			expect.objectContaining({
+				text: { type: "external_text", ref: expect.objectContaining({ type: "content_ref" }) },
+			}),
+		);
+		expect(setEditorText.lease.refs).toHaveLength(1);
+
+		const widgetLines = ["one", wide];
+		const widget = await externalizePiPayload(
+			{
+				kind: "extension_ui_request",
+				value: {
+					type: "extension_ui_request",
+					id: "widget-a",
+					method: "setWidget",
+					widgetKey: "tests",
+					widgetLines,
+				},
+			},
+			options(store),
+		);
+		expect(widget.value).toEqual(
+			expect.objectContaining({
+				widgetLines: { type: "external_json", ref: expect.objectContaining({ type: "content_ref" }) },
+			}),
+		);
+		expect(widget.lease.refs).toHaveLength(1);
+
+		await Promise.all([editor.lease.release(), setEditorText.lease.release(), widget.lease.release()]);
+	});
+
+	it("externalizes a whole widget root whose single line exceeds the current text limit", async () => {
+		const wideLine = "x".repeat(1024 * 1024 + 1);
+		const request = {
+			type: "extension_ui_request",
+			id: "widget-wide-line",
+			method: "setWidget",
+			widgetKey: "tests",
+			widgetPlacement: "belowEditor",
+			widgetLines: [wideLine],
+		} as const;
+		expect(Buffer.byteLength(JSON.stringify(request.widgetLines))).toBeLessThan(
+			FUTURE_SESSION_CONTENT_REF_BUDGET.maxContentBlobBytes,
+		);
+		expect(Buffer.byteLength(JSON.stringify(request.widgetLines))).toBeGreaterThanOrEqual(
+			SESSION_CONTENT_INLINE_THRESHOLD_BYTES,
+		);
+		expect(isLegacyRpcV1FutureContentRawExtensionUiRequest(request)).toBe(true);
+
+		const result = await externalizePiPayload(
+			{ kind: "extension_ui_request", value: request },
+			options(store),
+		);
+		expect(result.value).toEqual({
+			...request,
+			widgetLines: { type: "external_json", ref: expect.objectContaining({ type: "content_ref" }) },
+		});
+		expect(result.lease.refs).toHaveLength(1);
+		await result.lease.release();
+
+		const stageUtf8 = vi.spyOn(store, "stageUtf8");
+		await expect(
+			externalizePiPayload(
+				{ kind: "extension_ui_request", value: { ...request, unexpected: true } },
+				options(store),
+			),
+		).rejects.toMatchObject({ code: "invalid_raw_payload" });
+		expect(stageUtf8).not.toHaveBeenCalled();
+	});
+
+	it("keeps small Extension text inline, wraps small widget JSON, and rejects excluded wide fields", async () => {
+		const editor = await externalizePiPayload(
+			{
+				kind: "extension_ui_request",
+				value: {
+					type: "extension_ui_request",
+					id: "editor-inline",
+					method: "editor",
+					title: "Edit",
+					prefill: "inline",
+				},
+			},
+			options(store),
+		);
+		expect(editor.value).toEqual(expect.objectContaining({ prefill: "inline" }));
+		expect(editor.lease.refs).toEqual([]);
+		await editor.lease.release();
+
+		const widget = await externalizePiPayload(
+			{
+				kind: "extension_ui_request",
+				value: {
+					type: "extension_ui_request",
+					id: "widget-inline",
+					method: "setWidget",
+					widgetKey: "tests",
+					widgetLines: ["one", "two"],
+				},
+			},
+			options(store),
+		);
+		expect(widget.value).toEqual(
+			expect.objectContaining({ widgetLines: { type: "inline_json", value: ["one", "two"] } }),
+		);
+		expect(widget.lease.refs).toEqual([]);
+		await widget.lease.release();
+
+		await expect(
+			externalizePiPayload(
+				{
+					kind: "extension_ui_request",
+					value: {
+						type: "extension_ui_request",
+						id: "status-wide",
+						method: "setStatus",
+						statusKey: "status",
+						statusText: "x".repeat(1024 * 1024 + 1),
+					},
+				},
+				options(store),
+			),
+		).rejects.toMatchObject({ code: "invalid_raw_payload" });
+	});
+
+	it("rolls back a whole-widget hold when the supplemental product guard rejects", async () => {
+		const widgetLines = ["y".repeat(1024 * 1024 + 1)];
+		await expect(
+			externalizePiPayload(
+				{
+					kind: "extension_ui_request",
+					value: {
+						type: "extension_ui_request",
+						id: "widget-rejected",
+						method: "setWidget",
+						widgetKey: "tests",
+						widgetLines,
+					},
+				},
+				{ ...options(store), productGuard: () => false },
+			),
+		).rejects.toMatchObject({ code: "invalid_product_payload" });
+		expect(await store.gc()).toEqual({ bytes: Buffer.byteLength(JSON.stringify(widgetLines)), items: 1 });
 	});
 
 	it("rejects an invalid generic budget before raw admission or store access", async () => {

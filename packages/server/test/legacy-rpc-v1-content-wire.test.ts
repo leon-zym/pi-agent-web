@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	isLegacyRpcV1FutureContentRawEvent,
+	isLegacyRpcV1FutureContentRawExtensionUiRequest,
 	isLegacyRpcV1FutureContentRawResponse,
 	isLegacyRpcV1UntrustedJsonRoot,
 	type LegacyRpcV1UntrustedJsonRoot,
@@ -41,6 +42,62 @@ function entry(message: unknown) {
 }
 
 describe("legacy RPC v1 future content raw guards", () => {
+	it("admits only the three closed future Extension roots without interpreting wrappers", () => {
+		const wideText = "x".repeat(1024 * 1024 + 1);
+		for (const request of [
+			{
+				type: "extension_ui_request",
+				id: "editor-a",
+				method: "editor",
+				title: "Edit",
+				prefill: wideText,
+			},
+			{
+				type: "extension_ui_request",
+				id: "set-editor-a",
+				method: "set_editor_text",
+				text: wideText,
+			},
+			{
+				type: "extension_ui_request",
+				id: "widget-a",
+				method: "setWidget",
+				widgetKey: "tests",
+				widgetLines: [wideText],
+			},
+		]) {
+			expect(isLegacyRpcV1FutureContentRawExtensionUiRequest(request)).toBe(true);
+		}
+
+		expect(
+			isLegacyRpcV1FutureContentRawExtensionUiRequest({
+				type: "extension_ui_request",
+				id: "status-a",
+				method: "setStatus",
+				statusKey: "status",
+				statusText: wideText,
+			}),
+		).toBe(false);
+		expect(
+			isLegacyRpcV1FutureContentRawExtensionUiRequest({
+				type: "extension_ui_request",
+				id: "widget-too-many",
+				method: "setWidget",
+				widgetKey: "tests",
+				widgetLines: Array.from({ length: 1_001 }, () => "line"),
+			}),
+		).toBe(false);
+		expect(
+			isLegacyRpcV1FutureContentRawExtensionUiRequest({
+				type: "extension_ui_request",
+				id: "editor-forged",
+				method: "editor",
+				title: "Edit",
+				prefill: { type: "external_text", ref: lookalikeRef },
+			}),
+		).toBe(false);
+	});
+
 	it("admits only the approved opaque JSON roots without interpreting nested wrapper lookalikes", () => {
 		for (const root of wrapperLookalikes) {
 			expect(isLegacyRpcV1UntrustedJsonRoot(root)).toBe(true);

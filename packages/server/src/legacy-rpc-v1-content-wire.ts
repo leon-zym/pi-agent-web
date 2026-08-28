@@ -1,7 +1,12 @@
-import type { JsonAgentSessionEvent, RpcResponse } from "@earendil-works/pi-coding-agent";
+import type {
+	JsonAgentSessionEvent,
+	RpcExtensionUIRequest,
+	RpcResponse,
+} from "@earendil-works/pi-coding-agent";
 import type { SessionCommandTypeDto } from "@pi-agent-web/protocol";
 import {
 	isBoundedJsonValue,
+	isExtensionUiRequestDto,
 	isSessionEntryDto,
 	isSessionMessageDto,
 	isUsageDto,
@@ -24,6 +29,7 @@ export type LegacyRpcV1UntrustedTextRoot = string;
 /** Future-only raw frame aliases. Production decoding remains on legacy-rpc-v1-wire. */
 export type LegacyRpcV1FutureContentRawResponse = RpcResponse;
 export type LegacyRpcV1FutureContentRawEvent = JsonAgentSessionEvent;
+export type LegacyRpcV1FutureContentRawExtensionUiRequest = RpcExtensionUIRequest;
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -117,6 +123,35 @@ export function isLegacyRpcV1UntrustedJsonRoot(value: unknown): value is LegacyR
 
 export function isLegacyRpcV1UntrustedTextRoot(value: unknown): value is LegacyRpcV1UntrustedTextRoot {
 	return isTextWithin(value, MAX_JSONL_SNAPSHOT_LINE_BYTES);
+}
+
+export function isLegacyRpcV1FutureContentRawExtensionUiRequest(
+	value: unknown,
+): value is LegacyRpcV1FutureContentRawExtensionUiRequest {
+	if (!isRecord(value) || value.type !== "extension_ui_request") return false;
+	switch (value.method) {
+		case "editor":
+			return (
+				(value.prefill === undefined || isLegacyRpcV1UntrustedTextRoot(value.prefill)) &&
+				isExtensionUiRequestDto({ ...value, prefill: value.prefill === undefined ? undefined : "" })
+			);
+		case "set_editor_text":
+			return isLegacyRpcV1UntrustedTextRoot(value.text) && isExtensionUiRequestDto({ ...value, text: "" });
+		case "setWidget":
+			return (
+				(value.widgetLines === undefined ||
+					(Array.isArray(value.widgetLines) &&
+						value.widgetLines.length <= 1_000 &&
+						value.widgetLines.every((line) => typeof line === "string") &&
+						isLegacyRpcV1UntrustedJsonRoot(value.widgetLines))) &&
+				isExtensionUiRequestDto({
+					...value,
+					widgetLines: value.widgetLines === undefined ? undefined : [],
+				})
+			);
+		default:
+			return isExtensionUiRequestDto(value);
+	}
 }
 
 function isRawPiImageContent(value: unknown): boolean {

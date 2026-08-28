@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import {
 	type FutureSessionContentRefGuardContext,
+	isExtensionUiRequestDto,
 	isFutureSessionContentRefGuardContext,
 	isProductSessionEventDto,
 	isSessionAttachmentGuardContext,
@@ -31,6 +32,7 @@ import {
 } from "./epoch-content-store.js";
 import {
 	isLegacyRpcV1FutureContentRawEvent,
+	isLegacyRpcV1FutureContentRawExtensionUiRequest,
 	isLegacyRpcV1FutureContentRawResponse,
 } from "./legacy-rpc-v1-content-wire.js";
 import { isLegacyRpcV1RawEvent, isLegacyRpcV1RawResponse } from "./legacy-rpc-v1-wire.js";
@@ -52,6 +54,7 @@ export interface PiGenericPayloadExternalizerContentStore extends PiPayloadExter
 
 export type PiPayloadExternalizerInput =
 	| { kind: "event"; value: unknown }
+	| { kind: "extension_ui_request"; value: unknown }
 	| { kind: "response"; expectedCommand: SessionCommandTypeDto; value: unknown };
 
 export type PiPayloadExternalizationErrorCode =
@@ -184,7 +187,9 @@ export async function externalizePiPayload<T = unknown>(
 		const productValid =
 			input.kind === "event"
 				? isProductSessionEventDto(guardCandidate, attachmentContext)
-				: isSessionCommandResponseDto(guardCandidate, attachmentContext);
+				: input.kind === "extension_ui_request"
+					? isExtensionUiRequestDto(guardCandidate)
+					: isSessionCommandResponseDto(guardCandidate, attachmentContext);
 		const supplementalGuard = options.productGuard as
 			| ((
 					candidate: unknown,
@@ -256,10 +261,12 @@ function assertRawInput(input: PiPayloadExternalizerInput, generic: boolean): vo
 	const valid = generic
 		? input.kind === "event"
 			? isLegacyRpcV1FutureContentRawEvent(input.value)
-			: isLegacyRpcV1FutureContentRawResponse(input.value, input.expectedCommand)
+			: input.kind === "extension_ui_request"
+				? isLegacyRpcV1FutureContentRawExtensionUiRequest(input.value)
+				: isLegacyRpcV1FutureContentRawResponse(input.value, input.expectedCommand)
 		: input.kind === "event"
 			? isLegacyRpcV1RawEvent(input.value)
-			: isLegacyRpcV1RawResponse(input.value, input.expectedCommand);
+			: input.kind === "response" && isLegacyRpcV1RawResponse(input.value, input.expectedCommand);
 	if (!valid) {
 		throw new PiPayloadExternalizationError("invalid_raw_payload", "Pi payload failed raw provenance guards");
 	}
@@ -268,6 +275,7 @@ function assertRawInput(input: PiPayloadExternalizerInput, generic: boolean): vo
 async function externalizeFrame(input: PiPayloadExternalizerInput, state: FrameState): Promise<unknown> {
 	const value = input.value as UnknownRecord;
 	if (input.kind === "response") return externalizeResponse(value, state);
+	if (input.kind === "extension_ui_request") return value;
 	return externalizeEvent(value, state);
 }
 
@@ -380,9 +388,35 @@ async function externalizeGenericFrame(
 	state: FrameState,
 ): Promise<GenericTraversalResult> {
 	const value = input.value as UnknownRecord;
-	return input.kind === "response"
-		? externalizeGenericResponse(value, state)
-		: externalizeGenericEvent(value, state);
+	if (input.kind === "response") return externalizeGenericResponse(value, state);
+	if (input.kind === "extension_ui_request") return externalizeGenericExtensionRequest(value, state);
+	return externalizeGenericEvent(value, state);
+}
+
+async function externalizeGenericExtensionRequest(
+	value: UnknownRecord,
+	state: FrameState,
+): Promise<GenericTraversalResult> {
+	switch (value.method) {
+		case "editor": {
+			if (typeof value.prefill !== "string") return unchangedGeneric(value);
+			return pairRecordField(value, "prefill", await externalizeTextRoot(value.prefill, state));
+		}
+		case "set_editor_text": {
+			if (typeof value.text !== "string") return unchangedGeneric(value);
+			return pairRecordField(value, "text", await externalizeTextRoot(value.text, state));
+		}
+		case "setWidget": {
+			if (value.widgetLines === undefined) return unchangedGeneric(value);
+			const widgetLines = await externalizeJsonRoot(value.widgetLines, state);
+			return {
+				value: { ...value, widgetLines: widgetLines.value },
+				currentGuardShadow: { ...value, widgetLines: [] },
+			};
+		}
+		default:
+			return unchangedGeneric(value);
+	}
 }
 
 async function externalizeGenericResponse(

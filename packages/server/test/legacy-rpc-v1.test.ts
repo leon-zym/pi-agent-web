@@ -198,25 +198,75 @@ describe("legacy-rpc-v1 adapter", () => {
 		expect(externalize).not.toHaveBeenCalled();
 	});
 
-	it("keeps Extension UI on the current inline guard with future externalization at zero calls", () => {
-		const externalize = vi.fn();
+	it("future-externalizes Extension UI only after raw admission and preserves the exact lease", async () => {
+		const ref = {
+			type: "content_ref",
+			serverEpoch: "epoch",
+			sha256: "d".repeat(64),
+			encoding: "utf-8",
+			byteLength: FUTURE_SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes,
+		} as const;
+		const release = vi.fn(async () => {});
+		const lease = { refs: [ref], transfer: vi.fn(), release };
 		const request = {
 			type: "extension_ui_request",
 			id: "extension-1",
 			method: "set_editor_text",
-			text: "inline only",
+			text: "x".repeat(1024 * 1024 + 1),
+		} as const;
+		const product = { ...request, text: { type: "external_text" as const, ref } };
+		const externalize = vi.fn(async () => ({ value: product, lease }));
+		const signal = new AbortController().signal;
+
+		const outcome = await outcomeLegacyRpcV1Adapter.decodeFutureUnsolicited(request, {
+			signal,
+			externalizer: { mode: "future_content", context: futureContext, externalize },
+		});
+
+		expect(externalize).toHaveBeenCalledWith({ kind: "extension_ui_request", value: request }, signal);
+		expect(outcome.value).toEqual({ kind: "extension_ui_request", request: product });
+		expect(outcome.lease).toBe(lease);
+		expect(release).not.toHaveBeenCalled();
+	});
+
+	it("releases future Extension leases when post-processing changes provenance or fails the exact guard", async () => {
+		const ref = {
+			type: "content_ref",
+			serverEpoch: "epoch",
+			sha256: "e".repeat(64),
+			encoding: "utf-8",
+			byteLength: FUTURE_SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes,
+		} as const;
+		const request = {
+			type: "extension_ui_request",
+			id: "extension-1",
+			method: "set_editor_text",
+			text: "x".repeat(1024 * 1024 + 1),
 		} as const;
 
-		const outcome = syncOutcome(
-			outcomeLegacyRpcV1Adapter.decodeFutureUnsolicited(request, {
-				signal: new AbortController().signal,
-				externalizer: { mode: "future_content", context: futureContext, externalize },
-			}),
-		);
-
-		expect(outcome.value).toEqual({ kind: "extension_ui_request", request });
-		expect(outcome.lease).toBeNull();
-		expect(externalize).not.toHaveBeenCalled();
+		for (const product of [
+			{ ...request, id: "changed", text: { type: "external_text", ref } },
+			{
+				...request,
+				text: { type: "external_text", ref: { ...ref, serverEpoch: "wrong" } },
+			},
+		]) {
+			const release = vi.fn(async () => {});
+			await expect(
+				outcomeLegacyRpcV1Adapter.decodeFutureUnsolicited(request, {
+					signal: new AbortController().signal,
+					externalizer: {
+						mode: "future_content",
+						context: futureContext,
+						externalize: async () => ({
+							value: product,
+							lease: { refs: [ref], transfer: vi.fn(), release },
+						}),
+					},
+				}),
+			).rejects.toBeInstanceOf(PiProtocolIncompatibleError);
+			expect(release).toHaveBeenCalledOnce();
+		}
 	});
 
 	it.each([

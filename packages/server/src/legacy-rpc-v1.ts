@@ -1,5 +1,6 @@
 import {
 	type AssistantMessageDto,
+	type FutureExtensionUiRequestDto,
 	type FutureProductSessionEventDto,
 	type FutureSessionCommandResponseDto,
 	type FutureSessionEntryDto,
@@ -8,6 +9,7 @@ import {
 	isBoundedJsonValue,
 	isExtensionUiRequestDto,
 	isExtensionUiResponseDto,
+	isFutureExtensionUiRequestDto,
 	isFutureProductSessionEventDto,
 	isFutureSessionCommandResponseDto,
 	isModelDto,
@@ -26,6 +28,7 @@ import {
 import { EpochContentStoreError, type EpochStoredContentRef } from "./epoch-content-store.js";
 import {
 	isLegacyRpcV1FutureContentRawEvent,
+	isLegacyRpcV1FutureContentRawExtensionUiRequest,
 	isLegacyRpcV1FutureContentRawResponse,
 } from "./legacy-rpc-v1-content-wire.js";
 import {
@@ -610,6 +613,31 @@ async function externalizeFutureEvent(
 	}
 }
 
+async function externalizeFutureExtensionRequest(
+	value: UnknownRecord,
+	context: PiHostFutureDecodeContext,
+): Promise<PiHostDecodeOutcome<PiHostFutureUnsolicitedFrame, EpochStoredContentRef>> {
+	const externalized = await context.externalizer.externalize(
+		{ kind: "extension_ui_request", value },
+		context.signal,
+	);
+	try {
+		if (
+			!isRecord(externalized.value) ||
+			externalized.value.type !== "extension_ui_request" ||
+			externalized.value.id !== value.id ||
+			externalized.value.method !== value.method ||
+			!isFutureExtensionUiRequestDto(externalized.value, context.externalizer.context)
+		) {
+			return incompatible("extension_ui_request", "malformed_extension_ui_request", "extension_ui_request");
+		}
+		const request: FutureExtensionUiRequestDto = externalized.value;
+		return keepExternalizedLease(externalized, { kind: "extension_ui_request", request });
+	} catch (error) {
+		return releaseAfterPostprocessFailure(externalized.lease, error);
+	}
+}
+
 export function createLegacyRpcV1Adapter(
 	version: string,
 	capabilities: readonly PiCapability[],
@@ -763,17 +791,14 @@ export function createLegacyRpcV1Adapter(
 				return incompatible("frame", "malformed_frame");
 			}
 			if (value.type === "extension_ui_request") {
-				if (!isLegacyRpcV1RawExtensionUiRequest(value) || !isExtensionUiRequestDto(value)) {
+				if (!isLegacyRpcV1FutureContentRawExtensionUiRequest(value)) {
 					return incompatible(
 						"extension_ui_request",
 						"malformed_extension_ui_request",
 						"extension_ui_request",
 					);
 				}
-				return decoded({
-					kind: "extension_ui_request",
-					request: value,
-				} satisfies PiHostFutureUnsolicitedFrame);
+				return externalizeFutureExtensionRequest(value, context);
 			}
 			if (isLegacyRpcV1FutureContentRawEvent(value)) {
 				return externalizeFutureEvent(value, context, requiresToolcallIdentity);

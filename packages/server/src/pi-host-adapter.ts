@@ -2,6 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import type {
 	ExtensionUiRequestDto,
 	ExtensionUiResponseDto,
+	FutureExtensionUiRequestDto,
 	FutureProductSessionEventDto,
 	FutureSessionCommandResponseDto,
 	FutureSessionContentRefGuardContext,
@@ -86,12 +87,18 @@ export class PiProtocolIncompatibleError extends Error {
 	}
 }
 
-export type PiHostUnsolicitedFrame<TEvent = ProductSessionEventDto> =
+export type PiHostUnsolicitedFrame<
+	TEvent = ProductSessionEventDto,
+	TExtensionRequest = ExtensionUiRequestDto,
+> =
 	| { kind: "event"; event: TEvent }
-	| { kind: "extension_ui_request"; request: ExtensionUiRequestDto }
+	| { kind: "extension_ui_request"; request: TExtensionRequest }
 	| { kind: "ignored"; frameType: string };
 
-export type PiHostFutureUnsolicitedFrame = PiHostUnsolicitedFrame<FutureProductSessionEventDto>;
+export type PiHostFutureUnsolicitedFrame = PiHostUnsolicitedFrame<
+	FutureProductSessionEventDto,
+	FutureExtensionUiRequestDto
+>;
 
 export type PiHostPayloadLease = PiPayloadLease<EpochStoredContentRef>;
 export type PiHostPayloadLeaseTransfer = PiPayloadLeaseTransfer<EpochStoredContentRef>;
