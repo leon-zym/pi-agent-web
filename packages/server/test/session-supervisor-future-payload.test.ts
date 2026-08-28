@@ -1,13 +1,20 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { FutureProductSessionEventDto, FutureSessionSnapshotDto } from "@pi-agent-web/protocol";
+import type { FutureProductSessionEventDto, SessionContentRefDto } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it } from "vitest";
-import { EpochContentStore, type EpochStoredContentRef } from "../src/epoch-content-store.js";
+import {
+	type EpochContentHold,
+	EpochContentStore,
+	type EpochStoredContentRef,
+} from "../src/epoch-content-store.js";
 import { createGatewayFuturePayloadActivation } from "../src/gateway-payload-activation.js";
 import { legacyRpcV1Adapter } from "../src/legacy-rpc-v1.js";
 import { canonicalizeSessionFile, sessionHandleForFile } from "../src/native-session-catalog.js";
+import type { PiHostFuturePayloadExternalizer } from "../src/pi-host-adapter.js";
+import type { PiPayloadExternalizerInput, PiPayloadLease } from "../src/pi-payload-externalizer.js";
 import type { SessionLiveProjectionLimits } from "../src/session-live-projection.js";
+import { SessionLiveProjection } from "../src/session-live-projection.js";
 import type { FutureSessionRuntimePiPayloadServices } from "../src/session-runtime.js";
 import type { ExistingSessionTarget, SessionSupervisorMessage } from "../src/session-runtime-types.js";
 import { createFutureSessionSupervisor } from "../src/session-supervisor.js";
@@ -54,6 +61,7 @@ function createFutureSupervisorFixture(
 	piPayloadServices: FutureSessionRuntimePiPayloadServices,
 	messages: SessionSupervisorMessage<FutureProductSessionEventDto>[],
 	projectionLimits?: Partial<SessionLiveProjectionLimits>,
+	maxAutoRestarts = 0,
 ) {
 	return createFutureSessionSupervisor({
 		serverEpoch: "future-epoch",
@@ -72,7 +80,7 @@ function createFutureSupervisorFixture(
 		broadcast: (message) => messages.push(message),
 		piPayloadServices,
 		projectionLimits,
-		maxAutoRestarts: 0,
+		maxAutoRestarts,
 		readyTimeoutMs: 2_000,
 	});
 }
@@ -95,6 +103,58 @@ function isEventMessage(
 	message: SessionSupervisorMessage<FutureProductSessionEventDto>,
 ): message is Extract<SessionSupervisorMessage<FutureProductSessionEventDto>, { type: "event" }> {
 	return message.type === "event";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function oversizedHistoryLease(): {
+	lease: PiPayloadLease<EpochStoredContentRef>;
+	refs: readonly SessionContentRefDto[];
+	counters: { adopt: number; transferRelease: number; leaseRelease: number };
+} {
+	const first: SessionContentRefDto = Object.freeze({
+		type: "content_ref",
+		serverEpoch: "future-epoch",
+		sha256: "a".repeat(64),
+		byteLength: 33 * 1024 * 1024,
+		encoding: "utf-8",
+	});
+	const second: SessionContentRefDto = Object.freeze({
+		type: "content_ref",
+		serverEpoch: "future-epoch",
+		sha256: "b".repeat(64),
+		byteLength: 33 * 1024 * 1024,
+		encoding: "utf-8",
+	});
+	const refs: readonly SessionContentRefDto[] = Object.freeze([first, second]);
+	const holds: readonly EpochContentHold<SessionContentRefDto>[] = Object.freeze(
+		refs.map((ref) => Object.freeze({ ref })),
+	);
+	const counters = { adopt: 0, transferRelease: 0, leaseRelease: 0 };
+	let state: "provisional" | "transferred" = "provisional";
+	const lease: PiPayloadLease<EpochStoredContentRef> = Object.freeze({
+		refs,
+		transfer() {
+			if (state !== "provisional") throw new Error("history lease was already transferred");
+			state = "transferred";
+			return Object.freeze({
+				refs,
+				adopt(accept: (entries: readonly EpochContentHold<EpochStoredContentRef>[]) => true) {
+					counters.adopt += 1;
+					if (accept(holds) !== true) throw new Error("history lease adoption was rejected");
+				},
+				async release() {
+					counters.transferRelease += 1;
+				},
+			});
+		},
+		async release() {
+			counters.leaseRelease += 1;
+		},
+	});
+	return { lease, refs, counters };
 }
 
 describe("future Session Supervisor payload mode", () => {
@@ -239,7 +299,7 @@ describe("future Session Supervisor payload mode", () => {
 		expect(activeLogicalBytes(runtime)).toBe(0);
 	});
 
-	it("terminalizes a future compaction overflow without advancing seq and releases its transfer", async () => {
+	it("preflights a two-ref future compaction before owner adoption and CAS commit", async () => {
 		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-future-runtime-"));
 		const target = createTarget(root);
 		const exactStore = new EpochContentStore({
@@ -249,37 +309,77 @@ describe("future Session Supervisor payload mode", () => {
 		store = exactStore;
 		await exactStore.initialize();
 		const activation = createGatewayFuturePayloadActivation(exactStore, "future-epoch");
-		const baseSchema = activation.supervisorServices.productSchema;
-		const overflowSchema = Object.freeze({
-			...baseSchema,
-			snapshotLogicalBytes(snapshot: FutureSessionSnapshotDto) {
-				if (snapshot.settledMessages.some((message) => message.role === "toolResult")) {
-					throw new Error("fixture future compaction logical overflow");
+		const oversized = oversizedHistoryLease();
+		expect(oversized.refs.every((ref) => ref.byteLength < 48 * 1024 * 1024)).toBe(true);
+		expect(oversized.refs.reduce((total, ref) => total + ref.byteLength, 0)).toBeGreaterThan(
+			64 * 1024 * 1024,
+		);
+		let historyResponses = 0;
+		const externalizer: PiHostFuturePayloadExternalizer = Object.freeze({
+			...activation.externalizer,
+			async externalize(input: PiPayloadExternalizerInput, signal: AbortSignal) {
+				if (input.kind === "response" && input.expectedCommand === "get_messages") {
+					historyResponses += 1;
+					if (historyResponses === 2) {
+						if (!isRecord(input.value) || typeof input.value.id !== "string") {
+							throw new Error("compaction response id is unavailable");
+						}
+						return Object.freeze({
+							value: {
+								type: "response",
+								id: input.value.id,
+								command: "get_messages",
+								success: true,
+								data: {
+									messages: oversized.refs.map((ref, index) => ({
+										role: "toolResult",
+										toolCallId: `logical-${String(index)}`,
+										toolName: "fixture",
+										content: [{ type: "text", text: { type: "external_text", ref } }],
+										isError: false,
+										timestamp: index + 1,
+									})),
+								},
+							},
+							lease: oversized.lease,
+						});
+					}
 				}
-				return baseSchema.snapshotLogicalBytes(snapshot);
+				return activation.externalizer.externalize(input, signal);
 			},
 		});
-		const releasedRefs: EpochStoredContentRef[] = [];
+		const releasedHolds: EpochStoredContentRef[] = [];
 		const piPayloadServices = Object.freeze({
 			...activation.supervisorServices,
-			productSchema: overflowSchema,
+			externalizer,
 			async releaseHold(hold: { readonly ref: EpochStoredContentRef }) {
-				releasedRefs.push(hold.ref);
-				await exactStore.release(hold);
+				releasedHolds.push(hold.ref);
 			},
 		});
 		const messages: SessionSupervisorMessage<FutureProductSessionEventDto>[] = [];
-		const supervisor = createFutureSupervisorFixture(target, piPayloadServices, messages, {
-			maxLiveEventItems: 6,
-		});
+		const supervisor = createFutureSupervisorFixture(
+			target,
+			piPayloadServices,
+			messages,
+			{
+				maxLiveEventItems: 6,
+			},
+			3,
+		);
 		stop = () => supervisor.stopAll();
 
 		const lease = await supervisor.claim(target.sessionHandle, "future-controller");
 		const before = supervisor.getRuntime(target.sessionHandle);
 		if (!before) throw new Error("future runtime was not activated");
+		const runtime = exactRuntime(supervisor, target.sessionHandle);
+		const projection = Reflect.get(runtime, "liveProjection");
+		if (!(projection instanceof SessionLiveProjection)) {
+			throw new Error("future live projection is unavailable");
+		}
+		const projectionBefore = projection.snapshot();
 		await supervisor.sendCommand(
 			target.sessionHandle,
-			{ type: "prompt", message: "future-compaction-overflow" },
+			{ type: "prompt", message: "compaction-three-frame" },
 			{
 				connectionId: "future-controller",
 				expectedGeneration: before.generation,
@@ -295,9 +395,19 @@ describe("future Session Supervisor payload mode", () => {
 		expect(crashed).toMatchObject({
 			state: "crashed",
 			lastSeq: settled.seq,
-			error: expect.stringContaining("session_snapshot_overflow"),
+			error: "session_snapshot_overflow",
 		});
-		await waitFor(() => releasedRefs.some((ref) => ref.type === "content_ref"));
-		expect(releasedRefs.some((ref) => ref.type === "content_ref")).toBe(true);
+		await waitFor(() => oversized.counters.transferRelease > 0 || releasedHolds.length > 0);
+		await new Promise<void>((resolve) => setTimeout(resolve, 750));
+		expect(supervisor.getRuntime(target.sessionHandle)?.generation).toBe(before.generation);
+		const projectionAfter = projection.snapshot();
+		expect(oversized.counters).toEqual({ adopt: 0, transferRelease: 1, leaseRelease: 0 });
+		expect(releasedHolds).toEqual([]);
+		expect(projectionAfter.baseSeq).toBe(projectionBefore.baseSeq);
+		expect(projectionAfter.asOfSeq).toBe(settled.seq);
+		expect(projectionAfter.projectionEvents.at(-1)).toMatchObject({
+			seq: settled.seq,
+			event: { type: "agent_settled" },
+		});
 	});
 });

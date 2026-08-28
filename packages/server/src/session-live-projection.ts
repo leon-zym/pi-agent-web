@@ -517,11 +517,9 @@ export class SessionLiveProjection<TMessage = SessionMessageDto, TEvent = Produc
 	}
 
 	commitPreparedIdleBaseCompaction(token: SessionLiveProjectionPreparedCompaction): boolean {
-		if (typeof token !== "object" || token === null) return false;
-		const prepared = this.preparedCompactions.get(token);
+		const prepared = this.eligiblePreparedIdleBaseCompaction(token);
 		if (!prepared) return false;
 		this.preparedCompactions.delete(token);
-		if (prepared.revision !== this.revision || prepared.baseSeq !== this.asOfSeq) return false;
 		this.settledMessages = prepared.settledMessages;
 		this.settledMessageBytes = prepared.settledMessageBytes;
 		this.baseSeq = prepared.baseSeq;
@@ -530,6 +528,38 @@ export class SessionLiveProjection<TMessage = SessionMessageDto, TEvent = Produc
 		this.projectionEventBytes = 0;
 		this.revision += 1;
 		return true;
+	}
+
+	previewPreparedIdleBaseCompaction(
+		token: SessionLiveProjectionPreparedCompaction,
+	): SessionLiveProjectionSnapshot<TMessage, TEvent> | null {
+		const prepared = this.eligiblePreparedIdleBaseCompaction(token);
+		if (!prepared) return null;
+		const candidate: SessionLiveProjectionSnapshot<TMessage, TEvent> = {
+			...this.identity,
+			baseSeq: prepared.baseSeq,
+			asOfSeq: this.asOfSeq,
+			runtimePhase: this.snapshotRuntimePhase(),
+			settledMessages: prepared.settledMessages,
+			projectionEvents: [],
+			queue: this.queue,
+			pendingExtensionRequests: [...this.pendingExtensionRequests.values()],
+			stickyExtensionState: [],
+		};
+		return deepFreeze(clone(candidate));
+	}
+
+	private eligiblePreparedIdleBaseCompaction(
+		token: SessionLiveProjectionPreparedCompaction,
+	): PreparedCompactionState<TMessage> | null {
+		if (typeof token !== "object" || token === null) return null;
+		const prepared = this.preparedCompactions.get(token);
+		if (!prepared) return null;
+		if (prepared.revision !== this.revision || prepared.baseSeq !== this.asOfSeq) {
+			this.preparedCompactions.delete(token);
+			return null;
+		}
+		return prepared;
 	}
 
 	private snapshotRuntimePhase(): SessionLiveRuntimePhase {

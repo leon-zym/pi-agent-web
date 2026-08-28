@@ -502,16 +502,7 @@ function streamPrompt(command) {
 		send({ type: "turn_start" });
 		return;
 	}
-	if (text === "future-compaction-overflow") {
-		messages.push({
-			role: "toolResult",
-			toolCallId: "future-compaction-tool",
-			toolName: "fixture",
-			content: [{ type: "text", text: "x".repeat(300 * 1024) }],
-			details: { source: "future-compaction-overflow" },
-			isError: false,
-			timestamp: Date.now(),
-		});
+	if (text === "compaction-three-frame") {
 		send({ type: "agent_end", messages: [], willRetry: false });
 		send({ type: "agent_settled" });
 		return;
