@@ -67,14 +67,20 @@ atomicity protocol to every hold, download, materialization, and recovery path.
    JSON or referenced UTF-8 JSON bytes, while the containing field still owns the product meaning
    and runs its field-specific guard after materialization. Media type is therefore a typed-slot
    concern, not blob identity or singleton manifest metadata.
-4. External JSON identity covers the exact UTF-8 bytes emitted for that slot. It does not use
+4. Protocol 1.2 DTOs and guards remain frozen. Protocol 1.3 defines parallel full-frame message,
+   entry, tree, event, response, replay, and snapshot DTOs. Their guards accept content wrappers
+   only with a complete trusted content-reference context containing the exact epoch, attachment
+   budget, and generic-content budget. Server projection, replay, and Runtime code use
+   current-defaulted generics with an injected schema that owns these guards and their accounting
+   rules. They do not carry casts, `any`, or an unguarded union of the 1.2 and 1.3 frame models.
+5. External JSON identity covers the exact UTF-8 bytes emitted for that slot. It does not use
    semantic JSON canonicalization. Both `inline_json.value` and the value encoded for
    `external_json` must pass the same bounded JSON guard. The encoder preserves the JSON data model,
    enforces depth, item, string, and encoded-byte ceilings, and streams bytes to the store without
    constructing a second complete binary copy. Materialization parses the bytes and reruns the guard
    for the original field. Two different serializations of equivalent JSON may have different
    digests without changing product semantics.
-5. The externalizer uses a closed root-slot allowlist:
+6. The externalizer uses a closed root-slot allowlist:
    - Text slots are `TextContentDto.text` in reviewed tool-result and custom message or entry paths,
      `BashExecutionMessage.output`, Extension `editor.prefill`, and Extension
      `set_editor_text.text`.
@@ -88,13 +94,13 @@ atomicity protocol to every hold, download, materialization, and recovery path.
    JSON root that resembles `inline_json`, `external_json`, or `content_ref` is still ordinary Pi
    data and is placed inside `SessionInlineJsonDto.value`; it does not gain reference semantics.
    Objects with the same shapes below that root also remain ordinary JSON and are not traversed.
-6. This decision does not externalize arbitrary nested JSON, assistant diagnostics, deferred data,
+7. This decision does not externalize arbitrary nested JSON, assistant diagnostics, deferred data,
    custom entry data, compaction details or results, streaming text, thinking, or tool-call deltas,
    queue content, user prompts, bare user or custom message strings, Extension titles, prompts,
    options, notifications, or status text. Browser-to-Gateway commands and Extension responses
    remain inline. It does not add a generic binary type, remote hosting, durable Session storage, or
    a per-connection inline fallback.
-7. Text whose encoded UTF-8 byte length is strictly less than 256 KiB remains a string. A JSON root
+8. Text whose encoded UTF-8 byte length is strictly less than 256 KiB remains a string. A JSON root
    below the same threshold uses `inline_json`. Any allowlisted text or JSON value whose encoded byte
    length is at least 256 KiB uses `external_text` or `external_json`, up to a 48 MiB generic-content
    blob ceiling. Raster images retain their 8 MiB blob ceiling. Both internal namespaces share one
@@ -102,7 +108,29 @@ atomicity protocol to every hold, download, materialization, and recovery path.
    for the same UTF-8 bytes share one item and one hold. The negotiated budget exposes the threshold
    and both blob ceilings. A value beyond its ceiling fails admission rather than being split into
    chunks.
-8. Generic retrieval is GET-only at `/api/v1/content/:serverEpoch/:sha256`. The route selects the
+
+   Resource accounting separates logical content bytes from serialized wire bytes. A closed-slot,
+   field-aware walker counts an inline text root by its UTF-8 byte length, an external text or JSON
+   root by `ref.byteLength`, and an inline JSON root by the exact encoded JSON byte length of its
+   value. Every occurrence counts, including repeated roots that share one physical hold. A nested
+   wrapper or reference lookalike remains ordinary JSON and contributes only through its containing
+   inline JSON root. The walker does not recurse into opaque fields. Transition and active-turn
+   logical content are each limited to 64 MiB, while physical cache accounting continues to dedupe
+   exact UTF-8 bytes.
+
+   The Pi-side raw JSONL frame and each decoded root have independent limits. A future
+   externalizable JSONL frame is at most 64 MiB, and each allowlisted generic root is at most 48 MiB.
+   JSON escaping can make a valid decoded value exceed the frame limit, so a control-character-heavy
+   root may be rejected by the 64 MiB frame boundary before root admission. The Gateway does not
+   raise framing to the roughly 288 MiB worst case.
+9. A live event must pass every applicable boundary. Its raw future JSONL frame is at most 64 MiB;
+   after externalization its normalized event is at most 8 MiB plus 4 KiB envelope headroom; its
+   replay frame has the same 8 MiB plus 4 KiB ceiling; and the serialized active-turn projection
+   suffix remains at most 8 MiB. The separate active-turn logical-content ceiling is 64 MiB, so one
+   valid 48 MiB external root remains admissible without allowing an unbounded sequence of small
+   references to hide large downstream work. A history or snapshot root remains limited to 48 MiB,
+   while its complete raw history frame and canonical snapshot are each limited to 64 MiB.
+10. Generic retrieval is GET-only at `/api/v1/content/:serverEpoch/:sha256`. The route selects the
    internal `utf8` namespace; `/api/v1/attachments/:serverEpoch/:sha256` continues to select the
    raster namespace. Text and JSON references with the same raw UTF-8 bytes therefore resolve to one
    generic store entry. The content route uses the same loopback, same-origin, bootstrap Cookie,
@@ -111,24 +139,34 @@ atomicity protocol to every hold, download, materialization, and recovery path.
    no-store`, `Cross-Origin-Resource-Policy: same-origin`, and `X-Content-Type-Options: nosniff`.
    `HEAD`, `Range`, uploads, redirects, and content sniffing are not supported. The typed wrapper,
    rather than an HTTP media type, controls Browser decoding.
-9. Externalization remains transactional per decoded frame. The existing provisional lease,
-   PiProcess two-phase delivery, generation owner, compaction transfer, and identity-transition
-   ledger adopt namespaced holds before a reference enters projection, replay, or a snapshot. One
-   frame holds each exact physical UTF-8 blob once even when several typed wrappers refer to it.
-   Timeout, abort, late, stale, orphaned, transition failure, stop, and shutdown paths release holds
-   through the same exact cleanup fences as raster attachments.
-10. Correlated response failures remain local only for evidenced content-blob or shared-cache
+11. Externalization remains transactional per decoded frame. The existing provisional lease and
+   PiProcess two-phase delivery route each transfer to one of two exclusive custody paths. The exact
+   generation owner may adopt it immediately, or an identity-transition ledger may take exclusive
+   cleanup custody while the target generation remains uncertain. The ledger does not adopt holds.
+   It must drain the transfer into the confirmed generation owner before the corresponding value can
+   enter projection, replay, a snapshot, or a response delivery. If drain or transition processing
+   fails, `releaseRemaining()` releases every transfer that the ledger still owns. A staged value may
+   remain only in the transition's private bounded buffer while its transfer is under ledger custody.
+
+   One frame holds each exact physical UTF-8 blob once even when several typed wrappers refer to it.
+   Active events prepare projection and replay changes without mutation, let the exact owner adopt
+   their transfer, then commit projection state, sequence, and publication in that order. A response
+   is adopted before it resolves and exposes its barrier. Compaction is adopted before its
+   compare-and-swap commit; a stale compaction releases its transfer through the bounded
+   discard-cleanup fence. Timeout, abort, late, stale, orphaned, transition failure, stop, and
+   shutdown paths release holds through the same exact cleanup fences as raster attachments.
+12. Correlated response failures remain local only for evidenced content-blob or shared-cache
     ceilings and PiProcess-owned caller abort or deadline. Malformed UTF-8 or JSON, forged wrappers,
     field-guard failure, unsafe manifest or path state, rollback failure, uncertain ownership, and
     every authoritative event or Extension externalization failure terminate the Runtime. A missing
     or stale content GET never materializes as an empty string, `null`, or empty object.
-11. Browser projection retains typed references. Tool and message content may materialize on demand;
+13. Browser projection retains typed references. Tool and message content may materialize on demand;
     an ordered Extension request materializes before its semantic state or sequence barrier is
     committed. The Browser uses bounded streaming UTF-8 decoding, parses JSON only for JSON wrappers,
     and reruns the slot guard. A 404, 410, decode failure, or guard failure reports one failure for
     the exact Session and generation and requests a cursorless authoritative resync. Stale identity
     or uncommitted-baseline failures do not affect the current channel.
-12. Protocol version 1.3 adds `payload.epoch_content_refs`. The capability and its complete canonical
+14. Protocol version 1.3 adds `payload.epoch_content_refs`. The capability and its complete canonical
     budget become required in both directions only when the full vertical path is activated. Version
     1.3 peers then reject a missing capability or budget before Session subscription and do not
     materialize inline output for an older peer. Until that activation, production continues to
@@ -148,7 +186,8 @@ current protocol version 1.2 production behavior.
 4. Add streaming text and JSON encoding plus raw-slot JSON normalization and externalization, with
    the externalizer still absent from production activation.
 5. Carry namespaced holds through PiProcess, Runtime ownership, projection, replay, snapshot,
-   compaction, rekey, transition, and teardown paths.
+   compaction, rekey, transition, and teardown paths. This stage does not externalize Extension
+   requests.
 6. Add Browser trusted-context guards, bounded materialization, tool and Extension consumers, and
    exact resync behavior while version 1.3 remains unavailable to production connections.
 7. Atomically switch Main, Supervisor, Bridge, routes, Browser hello, and the canonical production
@@ -187,6 +226,10 @@ than receive a mixed inline/reference stream.
 - Split generic content into 8 MiB chunks: every value would need a second ordered manifest, multiple
   holds and GETs, reassembly validation, and partial-failure rollback. The existing 48 MiB history
   ceiling already gives a bounded single-blob limit.
+- Raise raw JSONL framing to roughly 288 MiB so every possible 48 MiB decoded string survives
+  worst-case JSON escaping: this would multiply the parser and buffering boundary for an uncommon
+  representation. The independent 64 MiB frame ceiling keeps memory bounded; values whose escaped
+  representation exceeds it fail framing admission.
 - Hash canonicalized JSON values: canonicalization would add a semantic normalization contract,
   require another complete transformation of large values, and make the digest differ from the
   bytes served by the content route unless both forms were retained.
@@ -200,8 +243,8 @@ than receive a mixed inline/reference stream.
 ## Verification
 
 - Protocol tests cover version 1.2 compatibility, unadvertised version 1.3 definitions, final required
-  capability negotiation, exact canonical budgets, strict wrappers, epoch fences, and root-only
-  provenance.
+  capability negotiation, parallel full-frame guards, exact canonical budgets, strict wrappers,
+  epoch fences, root-only provenance, and closed-slot logical-byte accounting.
 - Store tests prove that text and JSON wrappers for the same UTF-8 bytes use one namespaced blob,
   raster and UTF-8 identities do not collide, byte and item accounting is shared, and GC, deletion,
   abort, restart, and shutdown cannot leak holds or file descriptors.
@@ -210,8 +253,10 @@ than receive a mixed inline/reference stream.
   JSON encoding; mandatory `inline_json` or `external_json` roots; every allowlisted slot; opaque
   nested lookalikes; same-frame deduplication; rollback; and bounded-copy streaming seams.
 - PiProcess and Runtime tests cover late and stale delivery, response-local evidence, authoritative
-  terminal failures, startup history, event ordering, compaction, replay, snapshots, fork, clone,
-  rekey, transition rollback, mixed crash retention, and cleanup-failure replacement fences.
+  terminal failures, the 48 MiB root and 64 MiB raw-frame boundaries, normalized and replay wire
+  ceilings, startup history, event ordering, active-turn logical and serialized projection budgets,
+  compaction, replay, snapshots, fork, clone, rekey, transition rollback, mixed crash retention, and
+  cleanup-failure replacement fences.
 - Browser tests cover trusted version 1.3 context, lazy tool materialization, ordered Extension editor
   and widget materialization, exact field guards, authenticated GET, one-shot resync, stale identity,
   and recovery without an inline fallback.
