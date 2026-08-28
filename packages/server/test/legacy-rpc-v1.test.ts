@@ -1,7 +1,7 @@
 import fs from "node:fs";
-import { SESSION_PAYLOAD_BUDGET } from "@pi-agent-web/protocol";
+import { FUTURE_SESSION_CONTENT_REF_BUDGET, SESSION_PAYLOAD_BUDGET } from "@pi-agent-web/protocol";
 import { describe, expect, it, vi } from "vitest";
-import { EpochContentStoreError } from "../src/epoch-content-store.js";
+import { EpochContentStoreError, type EpochStoredContentRef } from "../src/epoch-content-store.js";
 import {
 	createLegacyRpcV1Adapter,
 	legacyRpcV1Adapter as outcomeLegacyRpcV1Adapter,
@@ -14,7 +14,9 @@ import {
 } from "../src/pi-host-adapter.js";
 import { PiPayloadExternalizationError } from "../src/pi-payload-externalizer.js";
 
-function syncOutcome<T>(result: PiHostDecodeResult<T>): PiHostDecodeOutcome<T> {
+function syncOutcome<T, TRef extends EpochStoredContentRef>(
+	result: PiHostDecodeResult<T, TRef>,
+): PiHostDecodeOutcome<T, TRef> {
 	if ("then" in result) throw new Error("expected synchronous adapter outcome");
 	return result;
 }
@@ -71,6 +73,10 @@ const imageResponse = {
 } as const;
 
 const attachmentContext = { serverEpoch: "epoch", payloadBudget: SESSION_PAYLOAD_BUDGET } as const;
+const futureContext = {
+	...attachmentContext,
+	contentRefBudget: FUTURE_SESSION_CONTENT_REF_BUDGET,
+} as const;
 
 describe("legacy-rpc-v1 adapter", () => {
 	it("keeps externalization disabled by default and carries an explicit null lease", () => {
@@ -128,6 +134,91 @@ describe("legacy-rpc-v1 adapter", () => {
 		expect(release).not.toHaveBeenCalled();
 	});
 
+	it("uses the future raw guard, generic externalizer, and exact future product guard in order", async () => {
+		const ref = {
+			type: "content_ref",
+			serverEpoch: "epoch",
+			sha256: "b".repeat(64),
+			encoding: "utf-8",
+			byteLength: FUTURE_SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes,
+		} as const;
+		const release = vi.fn(async () => {});
+		const lease = { refs: [ref], transfer: vi.fn(), release };
+		const raw = {
+			type: "message_start",
+			message: {
+				role: "bashExecution",
+				command: "printf x",
+				output: "x",
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				timestamp: 1,
+			},
+		} as const;
+		const externalize = vi.fn(async () => ({
+			value: {
+				...raw,
+				message: { ...raw.message, output: { type: "external_text", ref } },
+			},
+			lease,
+		}));
+		const signal = new AbortController().signal;
+
+		const outcome = await outcomeLegacyRpcV1Adapter.decodeFutureUnsolicited(raw, {
+			signal,
+			externalizer: { mode: "future_content", context: futureContext, externalize },
+		});
+
+		expect(externalize).toHaveBeenCalledWith({ kind: "event", value: raw }, signal);
+		expect(outcome.value).toEqual({
+			kind: "event",
+			event: {
+				...raw,
+				message: { ...raw.message, output: { type: "external_text", ref } },
+			},
+		});
+		expect(outcome.lease?.refs).toEqual([ref]);
+		expect(release).not.toHaveBeenCalled();
+	});
+
+	it("rejects a future response command mismatch before generic externalization", () => {
+		const externalize = vi.fn();
+		expect(() =>
+			outcomeLegacyRpcV1Adapter.decodeFutureResponse(imageResponse, "prompt", {
+				signal: new AbortController().signal,
+				externalizer: { mode: "future_content", context: futureContext, externalize },
+			}),
+		).toThrowError(
+			expect.objectContaining({
+				name: "PiProtocolIncompatibleError",
+				diagnostic: expect.objectContaining({ reason: "response_command_mismatch" }),
+			}),
+		);
+		expect(externalize).not.toHaveBeenCalled();
+	});
+
+	it("keeps Extension UI on the current inline guard with future externalization at zero calls", () => {
+		const externalize = vi.fn();
+		const request = {
+			type: "extension_ui_request",
+			id: "extension-1",
+			method: "set_editor_text",
+			text: "inline only",
+		} as const;
+
+		const outcome = syncOutcome(
+			outcomeLegacyRpcV1Adapter.decodeFutureUnsolicited(request, {
+				signal: new AbortController().signal,
+				externalizer: { mode: "future_content", context: futureContext, externalize },
+			}),
+		);
+
+		expect(outcome.value).toEqual({ kind: "extension_ui_request", request });
+		expect(outcome.lease).toBeNull();
+		expect(externalize).not.toHaveBeenCalled();
+	});
+
 	it.each([
 		new EpochContentStoreError("cache_bytes_exhausted", "quota", { limit: 8, actual: 9 }),
 		new EpochContentStoreError("cache_items_exhausted", "quota", { limit: 8, actual: 9 }),
@@ -147,6 +238,65 @@ describe("legacy-rpc-v1 adapter", () => {
 			command: "get_messages",
 			message: "Gateway failed to deliver the Pi get_messages response",
 		});
+	});
+
+	it("applies the same evidence-only response-local policy in future content mode", async () => {
+		const evidenced = new EpochContentStoreError("blob_too_large", "generic blob", {
+			limit: 8,
+			actual: 9,
+		});
+		await expect(
+			outcomeLegacyRpcV1Adapter.decodeFutureResponse(imageResponse, "get_messages", {
+				signal: new AbortController().signal,
+				externalizer: {
+					mode: "future_content",
+					context: futureContext,
+					externalize: async () => Promise.reject(evidenced),
+				},
+			}),
+		).rejects.toMatchObject({
+			name: "PiHostResponseExternalizationError",
+			command: "get_messages",
+			failure: "blob_too_large",
+		});
+
+		const malformed = new PiPayloadExternalizationError("invalid_product_payload", "invalid future root");
+		await expect(
+			outcomeLegacyRpcV1Adapter.decodeFutureResponse(imageResponse, "get_messages", {
+				signal: new AbortController().signal,
+				externalizer: {
+					mode: "future_content",
+					context: futureContext,
+					externalize: async () => Promise.reject(malformed),
+				},
+			}),
+		).rejects.toBe(malformed);
+	});
+
+	it("releases a future union lease when trusted post-processing rejects the product", async () => {
+		const ref = {
+			type: "content_ref",
+			serverEpoch: "epoch",
+			sha256: "c".repeat(64),
+			encoding: "utf-8",
+			byteLength: FUTURE_SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes,
+		} as const;
+		const release = vi.fn(async () => {});
+
+		await expect(
+			outcomeLegacyRpcV1Adapter.decodeFutureResponse(imageResponse, "get_messages", {
+				signal: new AbortController().signal,
+				externalizer: {
+					mode: "future_content",
+					context: futureContext,
+					externalize: async () => ({
+						value: { ...imageResponse, data: { messages: "not-an-array" } },
+						lease: { refs: [ref], transfer: vi.fn(), release },
+					}),
+				},
+			}),
+		).rejects.toBeInstanceOf(PiProtocolIncompatibleError);
+		expect(release).toHaveBeenCalledOnce();
 	});
 
 	it.each([

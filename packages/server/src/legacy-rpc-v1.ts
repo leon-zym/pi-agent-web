@@ -1,13 +1,21 @@
 import {
 	type AssistantMessageDto,
+	type FutureProductSessionEventDto,
+	type FutureSessionCommandResponseDto,
+	type FutureSessionEntryDto,
+	type FutureSessionMessageDto,
+	type FutureSessionTreeNodeDto,
 	isBoundedJsonValue,
 	isExtensionUiRequestDto,
 	isExtensionUiResponseDto,
+	isFutureProductSessionEventDto,
+	isFutureSessionCommandResponseDto,
 	isModelDto,
 	isProductSessionEventDto,
 	isSessionCommandResponseDto,
 	isSessionCommandTypeDto,
 	type ProductSessionEventDto,
+	type SessionAttachmentRefDto,
 	type SessionCommandDto,
 	type SessionCommandResponseDto,
 	type SessionCommandTypeDto,
@@ -15,7 +23,11 @@ import {
 	type SessionMessageDto,
 	type SessionTreeNodeDto,
 } from "@pi-agent-web/protocol";
-import { EpochContentStoreError } from "./epoch-content-store.js";
+import { EpochContentStoreError, type EpochStoredContentRef } from "./epoch-content-store.js";
+import {
+	isLegacyRpcV1FutureContentRawEvent,
+	isLegacyRpcV1FutureContentRawResponse,
+} from "./legacy-rpc-v1-content-wire.js";
 import {
 	isLegacyRpcV1RawEvent,
 	isLegacyRpcV1RawExtensionUiRequest,
@@ -26,6 +38,8 @@ import {
 	type PiHostAdapter,
 	type PiHostDecodeContext,
 	type PiHostDecodeOutcome,
+	type PiHostFutureDecodeContext,
+	type PiHostFutureUnsolicitedFrame,
 	PiHostResponseExternalizationError,
 	type PiHostUnsolicitedFrame,
 	PiProtocolIncompatibleError,
@@ -74,22 +88,27 @@ const AUTHORITATIVE_EVENT_TYPES: ReadonlySet<string> = new Set([
 
 type UnknownRecord = Record<string, unknown>;
 
-function decoded<T>(value: T): PiHostDecodeOutcome<T> {
+function decoded<T, TRef extends EpochStoredContentRef = SessionAttachmentRefDto>(
+	value: T,
+): PiHostDecodeOutcome<T, TRef> {
 	return Object.freeze({ value, lease: null });
 }
 
-async function keepExternalizedLease<T>(
-	externalized: Externalized<unknown>,
+async function keepExternalizedLease<T, TRef extends EpochStoredContentRef>(
+	externalized: Externalized<unknown, TRef>,
 	value: T,
-): Promise<PiHostDecodeOutcome<T>> {
+): Promise<PiHostDecodeOutcome<T, TRef>> {
 	if (externalized.lease.refs.length > 0) {
 		return Object.freeze({ value, lease: externalized.lease });
 	}
 	await externalized.lease.release();
-	return decoded(value);
+	return decoded<T, TRef>(value);
 }
 
-async function releaseAfterPostprocessFailure(lease: PiPayloadLease, error: unknown): Promise<never> {
+async function releaseAfterPostprocessFailure<TRef extends EpochStoredContentRef>(
+	lease: PiPayloadLease<TRef>,
+	error: unknown,
+): Promise<never> {
 	try {
 		await lease.release();
 	} catch (releaseError) {
@@ -300,6 +319,53 @@ function redactTree(tree: SessionTreeNodeDto[]): SessionTreeNodeDto[] {
 	}));
 }
 
+function redactFutureAssistantMetadata(message: FutureSessionMessageDto): FutureSessionMessageDto {
+	if (message.role !== "assistant") return message;
+	const {
+		responseId: _responseId,
+		diagnostics: _diagnostics,
+		deferred: _deferred,
+		...productMessage
+	} = message;
+	return productMessage;
+}
+
+function redactFutureEntry(entry: FutureSessionEntryDto): FutureSessionEntryDto {
+	return entry.type === "message"
+		? { ...entry, message: redactFutureAssistantMetadata(entry.message) }
+		: entry;
+}
+
+function redactFutureTree(tree: FutureSessionTreeNodeDto[]): FutureSessionTreeNodeDto[] {
+	return tree.map((node) => ({
+		...node,
+		entry: redactFutureEntry(node.entry),
+		children: redactFutureTree(node.children),
+	}));
+}
+
+function redactFutureResponse(
+	response: FutureSessionCommandResponseDto & { id: string },
+): FutureSessionCommandResponseDto & { id: string } {
+	if (!response.success) return response;
+	switch (response.command) {
+		case "get_messages":
+			return {
+				...response,
+				data: { messages: response.data.messages.map(redactFutureAssistantMetadata) },
+			};
+		case "get_entries":
+			return {
+				...response,
+				data: { ...response.data, entries: response.data.entries.map(redactFutureEntry) },
+			};
+		case "get_tree":
+			return { ...response, data: { ...response.data, tree: redactFutureTree(response.data.tree) } };
+		default:
+			return response;
+	}
+}
+
 function redactResponse(
 	response: SessionCommandResponseDto & { id: string },
 ): SessionCommandResponseDto & { id: string } {
@@ -360,10 +426,50 @@ function redactEvent(event: ProductSessionEventDto): ProductSessionEventDto {
 	}
 }
 
+function redactFutureEvent(event: FutureProductSessionEventDto): FutureProductSessionEventDto {
+	switch (event.type) {
+		case "agent_end":
+			return { ...event, messages: event.messages.map(redactFutureAssistantMetadata) };
+		case "turn_end":
+			return { ...event, message: redactFutureAssistantMetadata(event.message) };
+		case "message_start":
+		case "message_end":
+			return { ...event, message: redactFutureAssistantMetadata(event.message) };
+		case "entry_appended":
+			return { ...event, entry: redactFutureEntry(event.entry) };
+		case "message_update": {
+			const streamEvent = event.assistantMessageEvent;
+			if (streamEvent.type === "done" && streamEvent.message) {
+				return {
+					...event,
+					assistantMessageEvent: {
+						...streamEvent,
+						message: redactAssistantMetadata(streamEvent.message),
+					},
+				};
+			}
+			if (streamEvent.type === "error" && streamEvent.error) {
+				return {
+					...event,
+					assistantMessageEvent: {
+						...streamEvent,
+						error: redactAssistantMetadata(streamEvent.error),
+					},
+				};
+			}
+			return event;
+		}
+		default:
+			return event;
+	}
+}
+
 async function externalizeResponse(
 	value: UnknownRecord,
 	expectedCommand: SessionCommandTypeDto,
-	context: PiHostDecodeContext & { externalizer: NonNullable<PiHostDecodeContext["externalizer"]> },
+	context: PiHostDecodeContext & {
+		externalizer: NonNullable<PiHostDecodeContext["externalizer"]>;
+	},
 	frameType?: string,
 ): Promise<PiHostDecodeOutcome<SessionCommandResponseDto & { id: string }>> {
 	let externalized: Externalized<unknown>;
@@ -398,9 +504,53 @@ async function externalizeResponse(
 	return keepExternalizedLease(externalized, response);
 }
 
+async function externalizeFutureResponse(
+	value: UnknownRecord,
+	expectedCommand: SessionCommandTypeDto,
+	context: PiHostFutureDecodeContext,
+	frameType?: string,
+): Promise<PiHostDecodeOutcome<FutureSessionCommandResponseDto & { id: string }, EpochStoredContentRef>> {
+	let externalized: Externalized<unknown, EpochStoredContentRef>;
+	try {
+		externalized = await context.externalizer.externalize(
+			{ kind: "response", expectedCommand, value },
+			context.signal,
+		);
+	} catch (error) {
+		const failure = responseLocalFailure(error);
+		if (failure) throw new PiHostResponseExternalizationError(expectedCommand, failure, { cause: error });
+		throw error;
+	}
+	try {
+		if (
+			!isFutureSessionCommandResponseDto(externalized.value, context.externalizer.context) ||
+			!isRecord(externalized.value) ||
+			externalized.value.type !== "response" ||
+			externalized.value.id !== value.id ||
+			externalized.value.command !== expectedCommand ||
+			hasGatewayOnlyResponseFields(externalized.value)
+		) {
+			return incompatible("response", "malformed_response", frameType);
+		}
+		if (typeof externalized.value.id !== "string") {
+			return incompatible("response", "malformed_response", frameType);
+		}
+		const futureResponse = { ...externalized.value, id: externalized.value.id };
+		const response = redactFutureResponse(futureResponse);
+		if (typeof response.id !== "string") {
+			return incompatible("response", "malformed_response", frameType);
+		}
+		return keepExternalizedLease(externalized, { ...response, id: response.id });
+	} catch (error) {
+		return releaseAfterPostprocessFailure(externalized.lease, error);
+	}
+}
+
 async function externalizeEvent(
 	value: UnknownRecord,
-	context: PiHostDecodeContext & { externalizer: NonNullable<PiHostDecodeContext["externalizer"]> },
+	context: PiHostDecodeContext & {
+		externalizer: NonNullable<PiHostDecodeContext["externalizer"]>;
+	},
 	requiresToolcallIdentity: boolean,
 ): Promise<PiHostDecodeOutcome<PiHostUnsolicitedFrame>> {
 	const externalized = await context.externalizer.externalize({ kind: "event", value }, context.signal);
@@ -427,6 +577,37 @@ async function externalizeEvent(
 		return releaseAfterPostprocessFailure(externalized.lease, error);
 	}
 	return keepExternalizedLease(externalized, { kind: "event", event });
+}
+
+async function externalizeFutureEvent(
+	value: UnknownRecord,
+	context: PiHostFutureDecodeContext,
+	requiresToolcallIdentity: boolean,
+): Promise<PiHostDecodeOutcome<PiHostFutureUnsolicitedFrame, EpochStoredContentRef>> {
+	const externalized = await context.externalizer.externalize({ kind: "event", value }, context.signal);
+	try {
+		if (
+			!isFutureProductSessionEventDto(externalized.value, context.externalizer.context) ||
+			!isRecord(externalized.value) ||
+			externalized.value.type !== value.type ||
+			!boundedFrameType(externalized.value.type)
+		) {
+			return incompatible("event", "malformed_event", boundedFrameType(value.type));
+		}
+		const event = redactFutureEvent(externalized.value);
+		if (
+			requiresToolcallIdentity &&
+			event.type === "message_update" &&
+			event.assistantMessageEvent.type === "toolcall_start" &&
+			(typeof event.assistantMessageEvent.id !== "string" ||
+				typeof event.assistantMessageEvent.toolName !== "string")
+		) {
+			return incompatible("event", "malformed_event", "toolcall_start");
+		}
+		return keepExternalizedLease(externalized, { kind: "event", event });
+	} catch (error) {
+		return releaseAfterPostprocessFailure(externalized.lease, error);
+	}
 }
 
 export function createLegacyRpcV1Adapter(
@@ -484,6 +665,24 @@ export function createLegacyRpcV1Adapter(
 			return externalizeResponse(normalized, expectedCommand, { ...context, externalizer }, frameType);
 		},
 
+		decodeFutureResponse(value, expectedCommand, context) {
+			const normalized = normalizeLegacyResponse(value);
+			const frameType = isRecord(normalized) ? boundedFrameType(normalized.command) : undefined;
+			if (!isRecord(normalized) || normalized.type !== "response" || typeof normalized.id !== "string") {
+				return incompatible("response", "malformed_response", frameType);
+			}
+			if (normalized.command !== expectedCommand) {
+				return incompatible("response", "response_command_mismatch", frameType);
+			}
+			if (
+				hasGatewayOnlyResponseFields(normalized) ||
+				!isLegacyRpcV1FutureContentRawResponse(normalized, expectedCommand)
+			) {
+				return incompatible("response", "malformed_response", frameType);
+			}
+			return externalizeFutureResponse(normalized, expectedCommand, context, frameType);
+		},
+
 		decodeOrphanedResponse(value) {
 			const normalized = normalizeLegacyResponse(value);
 			const frameType = isRecord(normalized) ? boundedFrameType(normalized.command) : undefined;
@@ -494,6 +693,22 @@ export function createLegacyRpcV1Adapter(
 				hasGatewayOnlyResponseFields(normalized) ||
 				!isSessionCommandTypeDto(normalized.command) ||
 				!isLegacyRpcV1RawResponse(normalized, normalized.command)
+			) {
+				return incompatible("response", "malformed_response", frameType);
+			}
+			return decoded(undefined);
+		},
+
+		decodeFutureOrphanedResponse(value) {
+			const normalized = normalizeLegacyResponse(value);
+			const frameType = isRecord(normalized) ? boundedFrameType(normalized.command) : undefined;
+			if (
+				!isRecord(normalized) ||
+				normalized.type !== "response" ||
+				typeof normalized.id !== "string" ||
+				hasGatewayOnlyResponseFields(normalized) ||
+				!isSessionCommandTypeDto(normalized.command) ||
+				!isLegacyRpcV1FutureContentRawResponse(normalized, normalized.command)
 			) {
 				return incompatible("response", "malformed_response", frameType);
 			}
@@ -539,6 +754,38 @@ export function createLegacyRpcV1Adapter(
 			}
 			if (LEGACY_RPC_V1_IGNORABLE_FRAME_TYPES.has(value.type)) {
 				return decoded({ kind: "ignored", frameType: value.type } satisfies PiHostUnsolicitedFrame);
+			}
+			return incompatible("event", "unknown_authoritative_event", boundedFrameType(value.type));
+		},
+
+		decodeFutureUnsolicited(value, context) {
+			if (!isRecord(value) || typeof value.type !== "string") {
+				return incompatible("frame", "malformed_frame");
+			}
+			if (value.type === "extension_ui_request") {
+				if (!isLegacyRpcV1RawExtensionUiRequest(value) || !isExtensionUiRequestDto(value)) {
+					return incompatible(
+						"extension_ui_request",
+						"malformed_extension_ui_request",
+						"extension_ui_request",
+					);
+				}
+				return decoded({
+					kind: "extension_ui_request",
+					request: value,
+				} satisfies PiHostFutureUnsolicitedFrame);
+			}
+			if (isLegacyRpcV1FutureContentRawEvent(value)) {
+				return externalizeFutureEvent(value, context, requiresToolcallIdentity);
+			}
+			if (AUTHORITATIVE_EVENT_TYPES.has(value.type)) {
+				return incompatible("event", "malformed_event", boundedFrameType(value.type));
+			}
+			if (LEGACY_RPC_V1_IGNORABLE_FRAME_TYPES.has(value.type)) {
+				return decoded({
+					kind: "ignored",
+					frameType: value.type,
+				} satisfies PiHostFutureUnsolicitedFrame);
 			}
 			return incompatible("event", "unknown_authoritative_event", boundedFrameType(value.type));
 		},

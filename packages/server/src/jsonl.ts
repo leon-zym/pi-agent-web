@@ -4,6 +4,8 @@ import { StringDecoder } from "node:string_decoder";
 export const MAX_JSONL_LINE_BYTES = 8 * 1024 * 1024;
 /** Pi emits get_messages as one JSONL response, so snapshots receive a larger but still finite budget. */
 export const MAX_JSONL_SNAPSHOT_LINE_BYTES = 64 * 1024 * 1024;
+/** Future typed-content mode admits selected externalizable raw frames up to this hard ceiling. */
+export const MAX_JSONL_FUTURE_CONTENT_LINE_BYTES = 64 * 1024 * 1024;
 
 export class JsonlLineTooLongError extends Error {
 	constructor(maxBytes: number) {
