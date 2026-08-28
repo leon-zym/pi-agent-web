@@ -274,12 +274,6 @@ export interface SessionRuntimeProductAdapter<M extends SessionRuntimeProductMod
 		consume: PiDecodedDeliveryConsumer<RuntimeResponse<M>, RuntimeRef<M>>,
 		timeoutMs: number,
 	): Promise<RuntimeResponse<M>>;
-	sendIdentityDecoded(
-		proc: PiProcess,
-		command: SessionCommandDto,
-		consume: PiDecodedDeliveryConsumer<SessionCommandResponseDto, RuntimeRef<M>>,
-		timeoutMs: number,
-	): Promise<SessionCommandResponseDto>;
 	messagesFrom(response: RuntimeResponse<M>): readonly RuntimeMessage<M>[];
 	transitionResponseLogicalBytes(response: RuntimeResponse<M>): number;
 }
@@ -304,7 +298,6 @@ function createCurrentProductAdapter(
 			return proc;
 		},
 		sendDecoded: (proc, command, consume, timeoutMs) => proc.sendDecoded(command, consume, timeoutMs),
-		sendIdentityDecoded: (proc, command, consume, timeoutMs) => proc.sendDecoded(command, consume, timeoutMs),
 		messagesFrom: (response) => expectCommandData(response, "get_messages").messages,
 		transitionResponseLogicalBytes: () => 0,
 	};
@@ -336,8 +329,6 @@ function createFutureProductAdapter(
 			return proc;
 		},
 		sendDecoded: (proc, command, consume, timeoutMs) => proc.sendFutureDecoded(command, consume, timeoutMs),
-		sendIdentityDecoded: (_proc, command) =>
-			Promise.reject(new RpcError(command.type, "future_content_identity_transition_deferred")),
 		messagesFrom: (response) => {
 			if (response.success !== true || response.command !== "get_messages") {
 				throw new RpcError("get_messages", "unexpected Pi response");
@@ -1101,11 +1092,8 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		command: SessionCommandDto,
 		expectedGeneration: number,
 		admit: () => void,
-	): Promise<{ response: SessionCommandResponseDto; previousSessionHandle?: string }> {
+	): Promise<{ response: RuntimeResponse<M>; previousSessionHandle?: string }> {
 		return this.withCommandAdmission(async () => {
-			if (this.productAdapter.mode === "future_content") {
-				throw new RpcError(command.type, "future_content_identity_transition_deferred");
-			}
 			this.assertGeneration(command.type, expectedGeneration);
 			admit();
 			const blocker = this.identityTransitionBlocker();
@@ -1147,7 +1135,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			let identityCommitted = false;
 			let retiredParentCleanup: Promise<void> | null = null;
 			try {
-				const response = await this.productAdapter.sendIdentityDecoded(
+				const response = await this.productAdapter.sendDecoded(
 					proc,
 					command,
 					(delivery) =>
@@ -1167,7 +1155,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 					return { response };
 				}
 				stage.phase = "verifying";
-				const stateResponse = await this.productAdapter.sendIdentityDecoded(
+				const stateResponse = await this.productAdapter.sendDecoded(
 					proc,
 					{ type: "get_state" },
 					(delivery) =>
@@ -1379,6 +1367,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		this.clearPendingTurnReservations();
 		this.activeTurnProjectionItems = 0;
 		this.activeTurnProjectionBytes = 0;
+		this.activeTurnProjectionLogicalBytes = 0;
 		this.activeTurnHeadroomReserved = false;
 		this.error = undefined;
 		this.state = this.pendingDialogs.size > 0 ? "waiting_ui" : "idle";
@@ -2099,11 +2088,59 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		}
 		this.deferredTransitionEmits = [];
 		try {
+			if (this.productAdapter.mode === "future_content") {
+				try {
+					const candidateProjection = this.previewTransitionFrames();
+					const candidateRuntime: SessionRuntimeSnapshot = {
+						...this.snapshot(),
+						lastSeq: candidateProjection.asOfSeq,
+					};
+					this.assertProductSnapshotCandidateFits(
+						this.buildSessionSnapshotFromProjection(candidateProjection, candidateRuntime),
+					);
+				} catch (error) {
+					throw this.normalizeProjectionError(error);
+				}
+			}
 			this.flushTransitionFrames();
 			return this.deferredTransitionEmits;
 		} finally {
 			this.deferredTransitionEmits = null;
 		}
+	}
+
+	private previewTransitionFrames(): SessionLiveProjectionSnapshot<RuntimeMessage<M>, RuntimeEvent<M>> {
+		const stage = this.transitionStage;
+		const projection = this.liveProjection;
+		if (!stage || !projection) {
+			throw new RpcError("session_transition", "session_snapshot_unavailable");
+		}
+		const source = projection.snapshot();
+		if (source.asOfSeq !== source.baseSeq || source.projectionEvents.length !== 0) {
+			throw new RpcError("session_transition", "transition_child_projection_not_pristine");
+		}
+		const candidate = new SessionLiveProjection<RuntimeMessage<M>, RuntimeEvent<M>>({
+			identity: {
+				serverEpoch: source.serverEpoch,
+				sessionHandle: source.sessionHandle,
+				workspaceId: source.workspaceId,
+				generation: source.generation,
+			},
+			settledMessages: source.settledMessages,
+			baseSeq: source.baseSeq,
+			runtimePhase: source.runtimePhase,
+			limits: this.opts.projectionLimits,
+			schema: this.productAdapter.productSchema,
+		});
+		for (const frame of stage.frames) {
+			const committed = candidate.commitPrepared(
+				candidate.prepareCommit(this.projectionIdentity(), frame, this.state),
+			);
+			if (committed === null) {
+				throw new RpcError("session_transition", "transition_preview_commit_invariant_failed");
+			}
+		}
+		return candidate.snapshot();
 	}
 
 	private emitFrame(frame: BufferedFrame<RuntimeEvent<M>>, afterProjectionCommit?: () => void): void {
@@ -2691,10 +2728,12 @@ function commandReleasesQueuedWork(commandType: string): boolean {
 	return commandType === "abort" || commandType === "abort_retry";
 }
 
-function transitionWasCancelled(response: SessionCommandResponseDto): boolean {
+function transitionWasCancelled(
+	response: SessionCommandResponseDto | FutureSessionCommandResponseDto,
+): boolean {
 	if (response.success !== true || !("data" in response)) return false;
 	const data = response.data;
-	return typeof data === "object" && data !== null && (data as { cancelled?: unknown }).cancelled === true;
+	return typeof data === "object" && data !== null && "cancelled" in data && data.cancelled === true;
 }
 
 function bufferedFrameBytes<TEvent>(frame: BufferedFrame<TEvent>): number {

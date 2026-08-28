@@ -161,6 +161,11 @@ function configuredBytes(name) {
 	return Number.isFinite(value) && value > 0 ? Math.min(value, 2 * 1024 * 1024) : 0;
 }
 
+function configuredLogicalBytes(name) {
+	const value = Number(process.env[name]);
+	return Number.isFinite(value) && value > 0 ? Math.min(value, 48 * 1024 * 1024) : 0;
+}
+
 function crc32(input) {
 	let crc = 0xffff_ffff;
 	for (const byte of input) {
@@ -621,6 +626,24 @@ function streamPrompt(command) {
 }
 
 function transition(command) {
+	const stagedLogicalBytes = configuredLogicalBytes("PI_WEB_FIXTURE_TRANSITION_STAGED_LOGICAL_BYTES");
+	const stagedLogicalCount = Math.max(
+		0,
+		Number.parseInt(process.env.PI_WEB_FIXTURE_TRANSITION_STAGED_LOGICAL_COUNT ?? "0", 10) || 0,
+	);
+	for (let index = 0; index < stagedLogicalCount; index += 1) {
+		send({
+			type: "message_end",
+			message: {
+				role: "toolResult",
+				toolCallId: `transition-logical-${String(index)}`,
+				toolName: "fixture",
+				content: [{ type: "text", text: `tracked-logical:${String(stagedLogicalBytes)}` }],
+				isError: false,
+				timestamp: Date.now(),
+			},
+		});
+	}
 	if (process.env.PI_WEB_FIXTURE_TRANSITION_PAYLOAD_EVENTS === "1") {
 		send({
 			type: "message_end",
@@ -661,6 +684,17 @@ function transition(command) {
 	const previousFile = sessionFile;
 	sessionId = `${sessionId}-${command.type}`;
 	sessionFile = path.join(path.dirname(previousFile), `2026-08-20T00-00-01-000Z_${sessionId}.jsonl`);
+	const childLogicalBytes = configuredLogicalBytes("PI_WEB_FIXTURE_TRANSITION_CHILD_LOGICAL_BYTES");
+	if (childLogicalBytes > 0) {
+		messages.splice(0, messages.length, {
+			role: "toolResult",
+			toolCallId: "transition-child-logical",
+			toolName: "fixture",
+			content: [{ type: "text", text: `tracked-logical:${String(childLogicalBytes)}` }],
+			isError: false,
+			timestamp: Date.now(),
+		});
+	}
 	if (process.env.PI_WEB_FIXTURE_UNPERSISTED_TRANSITION !== "1") ensurePersisted();
 	sendLargeExtensionRequest(
 		`transition-flood-${sessionId}`,
