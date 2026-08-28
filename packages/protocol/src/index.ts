@@ -48,6 +48,7 @@ import type {
 	SessionMessageDto,
 } from "./product-dto.js";
 
+export * from "./future-logical-bytes.js";
 export * from "./future-product-decoders.js";
 export * from "./future-product-dto.js";
 export * from "./gateway-handshake.js";
