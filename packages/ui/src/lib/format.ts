@@ -75,6 +75,37 @@ function consumeControlSequence(text: string, start: number): number {
 	return index;
 }
 
+export function hasAnsiControlCharacters(text: string): boolean {
+	for (let index = 0; index < text.length; index += 1) {
+		const code = text.charCodeAt(index);
+		if (
+			(code <= 0x1f && code !== 0x09 && code !== 0x0a) ||
+			(code >= 0x7f && code <= 0x9f) ||
+			code === 0x061c ||
+			code === 0x200e ||
+			code === 0x200f ||
+			(code >= 0x202a && code <= 0x202e) ||
+			(code >= 0x2066 && code <= 0x2069)
+		) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/** Return whether UTF-8 encoding would exceed a bounded text budget. */
+export function exceedsUtf8ByteLimit(text: string, maxBytes: number): boolean {
+	if (!Number.isFinite(maxBytes) || maxBytes < 0) return true;
+	let bytes = 0;
+	for (let index = 0; index < text.length; index += 1) {
+		const point = text.codePointAt(index) ?? 0;
+		if (point > 0xffff) index += 1;
+		bytes += point <= 0x7f ? 1 : point <= 0x7ff ? 2 : point <= 0xffff ? 3 : 4;
+		if (bytes > maxBytes) return true;
+	}
+	return false;
+}
+
 /**
  * Remove terminal control sequences from display text without mutating the
  * event or projection that supplied it. Handles CSI colors/cursor movement,
@@ -83,6 +114,7 @@ function consumeControlSequence(text: string, start: number): number {
  * surfaces; protocol values must retain their raw identity separately.
  */
 export function stripAnsi(text: string): string {
+	if (!hasAnsiControlCharacters(text)) return text;
 	let output = "";
 	let index = 0;
 	while (index < text.length) {

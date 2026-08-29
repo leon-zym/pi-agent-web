@@ -366,6 +366,9 @@ export const zhCN = {
 
 	// Chat viewport
 	"chatViewport.backToBottom": "回到最新消息",
+	"chatViewport.loadOlder": "加载更早消息",
+	"chatViewport.loadNewer": "加载更新消息",
+	"chatViewport.historyWindow": "已加载 {loaded} / {total} 轮对话",
 	"appShell.sidebarWidth": "调整侧栏宽度",
 	"appShell.detailsWidth": "调整详情面板宽度",
 	"appShell.collapseSidebar": "收起侧栏",

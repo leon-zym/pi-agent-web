@@ -171,9 +171,16 @@ Composer Visual Seat 固定于 Center 底部，同一 DOM 延续焦点，数据�
   - 新增行 `bg-success-soft/30 text-success`，删除行 `bg-danger-soft/30 text-danger`；
   - 提供 **Clean Copy** 按钮：自动剥离行首 `+`/`-` 符号，一键复制纯净代码。
 
-### 7.5 渐进式流式 Markdown 与 32KB/64KB 熔断降级
-- 流式生成期间渐进渲染标题、粗斜体、列表与代码块外框，消除从纯文本到富文本的跳闪；
-- 当代码块超过 32KB 字符（`MAX_SYNTAX_HIGHLIGHT_CHARACTERS`）或 64KB UTF-8 字节时，跳过高亮与 DiffBlock，降级为轻量原生 `<pre><code>` 文本容器；这只限制高亮开销，不等同于完整 Markdown 解析或浏览器主线程预算。
+### 7.5 有界流式 Markdown 与 32KB/64KB 熔断降级
+- 流式生成期间使用可选取的纯文本尾部，不进入 settled Markdown/GFM 解析器；文本以复制后的 16 KiB 分段追加，避免每次更新让小片段继续持有完整累计字符串，且不在 surrogate pair 中间断开；
+- 结算后，UTF-8 不超过 256 KiB 的内容才进入 lazy ReactMarkdown/GFM 路径，保留表格、链接、代码高亮、DiffBlock 与 Clean Copy；超过该阈值则保留完整可选取纯文本，明确不保证标题/列表/代码的富语义节点；
+- 当代码块超过 32KB 字符（`MAX_SYNTAX_HIGHLIGHT_CHARACTERS`）或 64KB UTF-8 字节时，跳过高亮与 DiffBlock，降级为轻量原生文本容器；这只限制代码高亮开销，长文档总预算由上述 256 KiB settled 门槛和生产 Chromium 门禁负责；
+- 流式和历史回放均不因 Markdown 链接触发远程图片请求；富 Markdown 只在结算后加载，远程图片仍显示为显式链接。
+
+### 7.5.1 长对话历史窗口
+- Product projection 保留完整 Session 真相，但首屏只挂载最新 64 个 User Turn；向上/向下分页每次加载 24 个 Turn；
+- 加载更早历史时按稳定 `turnId` 保留视口锚点，变量高度、选取文本和键盘焦点不因 prepend 丢失；TOC 仍为每个 User Turn 保留一个轻量刻度；
+- TOC 跳转未挂载 Turn 时先调整窗口再滚动到目标；切换 Session、回到最新消息和 resize 均必须按当前 Session fencing，不能让旧的异步滚动覆盖新 Session 的阅读位置。
 
 ### 7.6 大型 Tool 与 Extension 内容的按需加载
 

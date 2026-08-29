@@ -36,12 +36,15 @@ export interface PiFixtureEvent {
 	commandType?: string;
 	text?: string;
 	label?: string;
+	eventType?: string;
+	frameBytes?: number;
 	imageCount?: number;
 	imageMimeTypes?: string[];
 	imageChars?: number;
 	deltaIndex?: number;
 	toolCount?: number;
 	markdownChars?: number;
+	targetBytes?: number;
 	confirmed?: boolean;
 	cancelled?: boolean;
 }
@@ -65,6 +68,7 @@ export interface StartHarnessOptions {
 	seedHistoricalSession?: {
 		userText: string;
 		assistantText: string;
+		turnCount?: number;
 	};
 }
 
@@ -76,9 +80,8 @@ function seedHistoricalSession(
 	const nativeSessionId = "browser-e2e-history";
 	const timestamp = "2026-01-01T00:00:00.000Z";
 	const sessionFile = path.join(sessionDir, `2026-01-01T00-00-00-000Z_${nativeSessionId}.jsonl`);
-	const userId = `${nativeSessionId}-user`;
-	const assistantId = `${nativeSessionId}-assistant`;
-	const entries = [
+	const turnCount = Math.max(1, Math.floor(seed.turnCount ?? 1));
+	const entries: Array<Record<string, unknown>> = [
 		{
 			type: "session",
 			version: 3,
@@ -86,41 +89,53 @@ function seedHistoricalSession(
 			timestamp,
 			cwd: workspacePath,
 		},
-		{
-			type: "message",
-			id: userId,
-			parentId: null,
-			timestamp,
-			message: {
-				role: "user",
-				content: [{ type: "text", text: seed.userText }],
-				timestamp: Date.parse(timestamp),
-			},
-		},
-		{
-			type: "message",
-			id: assistantId,
-			parentId: userId,
-			timestamp: "2026-01-01T00:00:01.000Z",
-			message: {
-				role: "assistant",
-				content: [{ type: "text", text: seed.assistantText }],
-				api: "openai-completions",
-				provider: "e2e",
-				model: "deterministic",
-				usage: {
-					input: 1,
-					output: 1,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 2,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-				stopReason: "stop",
-				timestamp: Date.parse("2026-01-01T00:00:01.000Z"),
-			},
-		},
 	];
+	let parentId: string | null = null;
+	for (let index = 0; index < turnCount; index++) {
+		const userId = `${nativeSessionId}-user-${String(index + 1)}`;
+		const assistantId = `${nativeSessionId}-assistant-${String(index + 1)}`;
+		const userTimestamp = Date.parse(timestamp) + index * 2_000;
+		const assistantTimestamp = userTimestamp + 1_000;
+		const userText = turnCount === 1 ? seed.userText : `${seed.userText} [turn ${String(index + 1)}]`;
+		const assistantText = turnCount === 1 ? seed.assistantText : `${seed.assistantText} ${String(index + 1)}`;
+		entries.push(
+			{
+				type: "message",
+				id: userId,
+				parentId,
+				timestamp: new Date(userTimestamp).toISOString(),
+				message: {
+					role: "user",
+					content: [{ type: "text", text: userText }],
+					timestamp: userTimestamp,
+				},
+			},
+			{
+				type: "message",
+				id: assistantId,
+				parentId: userId,
+				timestamp: new Date(assistantTimestamp).toISOString(),
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: assistantText }],
+					api: "openai-completions",
+					provider: "e2e",
+					model: "deterministic",
+					usage: {
+						input: 1,
+						output: 1,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 2,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: assistantTimestamp,
+				},
+			},
+		);
+		parentId = assistantId;
+	}
 	fs.writeFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf8");
 	return { nativeSessionId, sessionFile: fs.realpathSync(sessionFile) };
 }

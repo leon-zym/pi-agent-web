@@ -1,6 +1,6 @@
 # ADR 0006: UI/UX design system, reading stream orchestration, and client lifecycle invariants
 
-- Status: Accepted (amended 2026-08-25)
+- Status: Accepted (amended 2026-08-29)
 - Date: 2026-08-22
 
 ## Context
@@ -34,6 +34,9 @@ As the workbench scales to handle complex agent interactions and multi-session c
 ### 4. Conversation TOC Outline Rail
 - A floating miniature outline rail docked to the right of the conversation column with tick marks per user turn, expanding a 220px preview bubble on hover/focus and highlighting the active turn in the viewport via `IntersectionObserver`.
 - Collision Guard: Automatically hidden (`visibility: hidden`) when right viewport margin $<240\text{px}$ or wide content blocks expand horizontally.
+- The rail keeps one lightweight tick per User Turn. Expensive conversation Turn DOM is independently
+  bounded by ADR 0005's newest-64/older-24 window, and a TOC selection reveals an unmounted Turn before
+  scrolling to it.
 
 ### 5. 70vh Immersive Composer & Keyboard Arbitration
 - Provide a smooth expansion to `70vh` viewport height for extended drafting.
@@ -89,4 +92,7 @@ As the workbench scales to handle complex agent interactions and multi-session c
 - `scripts/check-style.mjs` enforces zero design-system anti-patterns.
 - Reducer and projection tests verify `interrupted` tool convergence, `contentShape` reconciliation, and `soft idempotency`.
 - Performance benchmarks (`conversation-performance.bench.ts`) report reducer/scheduler path timing and
-  fairness only. They do not establish browser main-thread, retained-DOM, heap, or long-history budgets.
+  fairness. Production Chromium specs (`conversation-performance.spec.ts` and
+  `conversation-window.spec.ts`) establish the conversation-specific live/settlement, retained-Turn,
+  heap, selection, focus, resize, and scroll-anchor budgets; they do not turn the broader protected
+  multi-Session subscription policy into a total browser-memory guarantee.

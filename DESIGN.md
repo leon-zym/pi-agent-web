@@ -148,9 +148,10 @@ Pi Agent Web 是**安静、精确、高生产力**的本地 Agent 工作台：
   - 语义化背景：新增行使用 `bg-success-soft/30 text-success`，删除行使用 `bg-danger-soft/30 text-danger`；
   - 提供 **Clean Copy** 功能：一键复制时自动剥离行首 `+`/`-` 标记，还原纯净源码。
 
-### 5.5 渐进式流式 Markdown 与 32KB/64KB 熔断降级
-- 流式生成期间渐进渲染标题、粗斜体、列表与代码块外框，消除从纯文本到富文本的突兀跳闪。
-- **熔断降级规范**：严格复用 `code-display.ts` 规范，当代码块字符超过 32KB（`MAX_SYNTAX_HIGHLIGHT_CHARACTERS`）或 64KB UTF-8 字节时，跳过高亮与 DiffBlock，降级为轻量原生 `<pre><code>` 文本容器；这只限制高亮开销，不是完整 Markdown 解析或主线程预算证明。
+### 5.5 有界流式 Markdown 与 32KB/64KB 熔断降级
+- 流式生成期间使用可选取的纯文本尾部，按复制后的 16 KiB 分段追加；不进入 settled Markdown/GFM 解析器，也不在 surrogate pair 中间断开。
+- 结算后，UTF-8 不超过 256 KiB 的内容才使用 lazy ReactMarkdown/GFM；超过阈值则保留完整纯文本和选取能力，不承诺富 Markdown 标题、列表、代码节点。
+- **熔断降级规范**：严格复用 `code-display.ts` 规范，当代码块字符超过 32KB（`MAX_SYNTAX_HIGHLIGHT_CHARACTERS`）或 64KB UTF-8 字节时，跳过高亮与 DiffBlock，降级为轻量原生文本容器；这只限制代码高亮开销，长文档主线程/heap 预算由生产 Chromium 门禁定义。
 
 ### 5.6 对话微缩大纲轨 (Conversation TOC)
 - 主阅读列右侧悬浮纵向微缩进度条，每轮 User Turn 对应一个小刻度线。
