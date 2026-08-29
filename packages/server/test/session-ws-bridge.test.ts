@@ -15,6 +15,7 @@ import type {
 import {
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+	GATEWAY_SESSION_HISTORY_CAPABILITY,
 	RpcError,
 	SESSION_PAYLOAD_BUDGET,
 } from "@pi-agent-web/protocol";
@@ -126,8 +127,9 @@ class ClientProbe {
 	async waitForFrame<T extends SessionWsServerMessage>(
 		predicate: (frame: SessionWsServerMessage) => frame is T,
 		from = 0,
+		timeoutMs = 2_000,
 	): Promise<T> {
-		return eventually(() => this.frames.slice(from).find(predicate));
+		return eventually(() => this.frames.slice(from).find(predicate), timeoutMs);
 	}
 
 	async close(): Promise<void> {
@@ -183,6 +185,29 @@ function createNativeSession(root: string, cwd: string, nativeSessionId: string)
 		sessionFile: canonicalizeSessionFile(sessionFile),
 		nativeSessionId,
 	};
+}
+
+function appendLargeNativeHistory(target: ExistingSessionTarget, count: number, textBytes: number): void {
+	let parentId: string | null = null;
+	const text = "h".repeat(textBytes);
+	for (let index = 0; index < count; index += 1) {
+		const id = `history-entry-${String(index)}`;
+		fs.appendFileSync(
+			target.sessionFile,
+			`${JSON.stringify({
+				type: "message",
+				id,
+				parentId,
+				timestamp: "2026-08-20T00:00:00.000Z",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: `${String(index)}:${text}` }],
+					timestamp: index + 1,
+				},
+			})}\n`,
+		);
+		parentId = id;
+	}
 }
 
 function snapshotResponse(textBytes: number): SessionWsServerMessage {
@@ -319,6 +344,7 @@ async function createHarness(
 		replayLimit?: number;
 		serverEpoch?: string;
 		env?: Record<string, string>;
+		historyCapability?: boolean;
 		bridge?: BridgeTestLimits;
 	} = {},
 ): Promise<Harness> {
@@ -358,6 +384,7 @@ async function createHarness(
 				"rpc.extension_ui",
 				"session.multiplex",
 				GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+				...(options.historyCapability ? [GATEWAY_SESSION_HISTORY_CAPABILITY] : []),
 			],
 		},
 		payloadActivation: {
@@ -397,7 +424,10 @@ async function createHarness(
 	return harness;
 }
 
-async function openClient(harness: Harness): Promise<ClientProbe> {
+async function openClient(
+	harness: Harness,
+	options: { historyCapability?: boolean } = {},
+): Promise<ClientProbe> {
 	const ws = new WebSocket(harness.url);
 	await new Promise<void>((resolve, reject) => {
 		ws.once("open", resolve);
@@ -421,6 +451,7 @@ async function openClient(harness: Harness): Promise<ClientProbe> {
 				"rpc.extension_ui",
 				"session.multiplex",
 				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+				...(options.historyCapability ? [GATEWAY_SESSION_HISTORY_CAPABILITY] : []),
 			],
 			limits: { maxServerFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes },
 		}),
@@ -471,6 +502,7 @@ async function subscribe(
 	client: ClientProbe,
 	sessionHandle: string,
 	cursor?: { serverEpoch?: string; generation: number; seq: number },
+	timeoutMs = 2_000,
 ): Promise<{ runtime: SessionRuntimeDto; lease: LeaseFrame; frames: SessionWsServerMessage[] }> {
 	const mark = client.mark();
 	client.send({
@@ -481,6 +513,7 @@ async function subscribe(
 	const lease = await client.waitForFrame(
 		(frame): frame is LeaseFrame => frame.type === "lease_status" && frame.sessionHandle === sessionHandle,
 		mark,
+		timeoutMs,
 	);
 	const frames = client.frames.slice(mark);
 	const runtimeFrames = frames.filter(
@@ -557,6 +590,66 @@ describe("SessionWsBridge", () => {
 		});
 
 		expect(await closed).toEqual({ code: 1013, reason: "gateway capacity" });
+	});
+
+	it("streams a large native snapshot and serves an older history page atomically", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "chunked-history-ws");
+		appendLargeNativeHistory(target, 110, 600 * 1024);
+		const harness = await createHarness([target], { historyCapability: true });
+		const client = await openClient(harness, { historyCapability: true });
+		const subscription = await subscribe(client, target.sessionHandle, undefined, 15_000);
+		const begin = subscription.frames.find(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_snapshot_begin" }> =>
+				frame.type === "session_snapshot_begin",
+		);
+		const snapshotChunks = subscription.frames.filter(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_snapshot_chunk" }> =>
+				frame.type === "session_snapshot_chunk",
+		);
+		const end = subscription.frames.find(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_snapshot_end" }> =>
+				frame.type === "session_snapshot_end",
+		);
+		expect(begin?.history).toMatchObject({ totalMessages: 110, loadedMessages: 96 });
+		expect(snapshotChunks.length).toBeGreaterThan(1);
+		expect(snapshotChunks.reduce((total, chunk) => total + chunk.messages.length, 0)).toBe(96);
+		expect(end).toMatchObject({ chunkCount: snapshotChunks.length, itemCount: 96 });
+		if (!begin || !end) throw new Error("chunked snapshot markers were not delivered");
+
+		const mark = client.mark();
+		client.send({
+			type: "session_history_page",
+			id: "history-page-1",
+			sessionHandle: target.sessionHandle,
+			expectedGeneration: begin.generation,
+			snapshotId: begin.snapshotId,
+			asOfSeq: begin.asOfSeq,
+			cursor: begin.history.nextCursor!,
+			limit: 8,
+		});
+		const pageEnd = await client.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_history_page_end" }> =>
+				frame.type === "session_history_page_end" && frame.requestId === "history-page-1",
+			mark,
+		);
+		const pageBegin = client.frames
+			.slice(mark)
+			.find(
+				(frame): frame is Extract<SessionWsServerMessage, { type: "session_history_page_begin" }> =>
+					frame.type === "session_history_page_begin" && frame.requestId === "history-page-1",
+			);
+		const pageChunks = client.frames
+			.slice(mark)
+			.filter(
+				(frame): frame is Extract<SessionWsServerMessage, { type: "session_history_page_chunk" }> =>
+					frame.type === "session_history_page_chunk" && frame.requestId === "history-page-1",
+			);
+		expect(pageBegin?.history).toMatchObject({ loadedMessages: 8 });
+		expect(pageChunks.reduce((total, chunk) => total + chunk.messages.length, 0)).toBe(8);
+		expect(pageEnd).toMatchObject({ chunkCount: pageChunks.length, itemCount: 8 });
 	});
 
 	it("rejects a subscription above the shared channel budget without disturbing existing channels", async () => {
@@ -2555,6 +2648,40 @@ describe("SessionWsBridge", () => {
 		expect(socket.sentBytes[1]).toBeGreaterThan(MAX_JSONL_SNAPSHOT_LINE_BYTES - 4_096);
 		expect(socket.closeCalls).toEqual([]);
 		expect(socket.readyState).toBe(WebSocket.OPEN);
+	});
+
+	it("keeps the next in-flight history frame inside the stream byte budget", async () => {
+		const harness = await createHarness([]);
+		const socket = new ControlledSendSocket();
+		socket.deferNextSend();
+		harness.bridge.wss.emit("connection", socket as unknown as WebSocket, {} as http.IncomingMessage);
+		markBridgeConnectionHelloComplete(harness.bridge);
+		const { connection, send } = bridgeConnection(harness.bridge);
+		const frame: SessionWsServerMessage = {
+			type: "session_history_page_end",
+			serverEpoch: TEST_SERVER_EPOCH,
+			sessionHandle: "history-session",
+			workspaceId: "history-workspace",
+			generation: 1,
+			requestId: "history-request",
+			snapshotId: "history-snapshot",
+			chunkCount: 0,
+			itemCount: 0,
+			byteCount: 0,
+			checksum: "00000000",
+			nextCursor: null,
+		};
+		const bytes = Buffer.byteLength(JSON.stringify(frame));
+
+		send(connection, frame);
+		send(connection, frame);
+		expect((connection as { outboundHistoryQueuedBytes: number }).outboundHistoryQueuedBytes).toBe(bytes * 2);
+
+		socket.deferNextSend();
+		socket.releaseDeferredSend();
+		await eventually(() => socket.sentBytes.length === 2);
+		expect(socket.sentBytes).toHaveLength(2);
+		expect((connection as { outboundHistoryQueuedBytes: number }).outboundHistoryQueuedBytes).toBe(bytes);
 	});
 
 	it("keeps additional backlog bounded while one oversized Session snapshot is queued", async () => {

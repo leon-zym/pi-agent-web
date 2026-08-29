@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
+	analyzeFutureSessionMessageLogicalBytes,
 	analyzeFutureSessionResponseFrameLogicalBytes,
 	FUTURE_SESSION_CONTENT_REF_BUDGET,
 	type FutureSessionWsServerMessage,
@@ -10,6 +11,7 @@ import {
 	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 	GATEWAY_PROTOCOL_VERSION,
 	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
+	GATEWAY_SESSION_HISTORY_CAPABILITY,
 	type GatewayContentRefServerHelloDto,
 	type GatewayProtocolErrorDto,
 	type GatewayServerHelloDto,
@@ -24,6 +26,9 @@ import {
 	negotiateGatewayPayloadBudget,
 	negotiateHotRuntimeInventory,
 	RpcError,
+	SESSION_HISTORY_MAX_CHUNK_BYTES,
+	SESSION_HISTORY_MAX_CHUNK_MESSAGES,
+	SESSION_HISTORY_MAX_STREAM_BYTES,
 	SESSION_HOT_RUNTIME_INVENTORY_MAX_BYTES,
 	SESSION_PAYLOAD_BUDGET,
 	SESSION_SUBSCRIPTION_RETRYABLE_ERROR_CODES,
@@ -35,6 +40,8 @@ import {
 	type SessionRuntimeIdentityDto,
 	type SessionWsClientMessage,
 	type SessionWsServerMessage,
+	sessionHistoryChecksum,
+	sessionHistoryMessagesBytes,
 } from "@pi-agent-web/protocol";
 import type { WebSocket } from "ws";
 import { WebSocketServer } from "ws";
@@ -71,12 +78,16 @@ interface ConnectionState<M extends SessionRuntimeProductMode = "current"> {
 	outboundQueue: OutboundPayload[];
 	outboundSmallQueuedBytes: number;
 	outboundLargeItems: number;
+	outboundHistoryQueuedBytes: number;
 	outboundSending: boolean;
 	alive: boolean;
 	closed: boolean;
 	epoch: number;
 	helloComplete: boolean;
 	hotInventoryNegotiated: boolean;
+	historyNegotiated: boolean;
+	historySnapshots: Map<string, HistorySnapshot<M>>;
+	historyPages: Map<string, HistoryPageOperation>;
 	hotInventoryRevision: number;
 	deferredHotInventory?: HotRuntimeInventoryDto;
 	admittedExactOperations: number;
@@ -88,6 +99,7 @@ interface OutboundPayload {
 	payload: string;
 	bytes: number;
 	large: boolean;
+	history: boolean;
 }
 
 type BridgeEvent<M extends SessionRuntimeProductMode> = SessionRuntimeProductEvent<M>;
@@ -101,7 +113,8 @@ type BridgeSupervisorMessage<M extends SessionRuntimeProductMode> = SessionSuper
 type BridgeReplayResult<M extends SessionRuntimeProductMode> = ReplayResult<
 	BridgeEvent<M>,
 	BridgeSnapshot<M>,
-	BridgeExtensionRequest<M>
+	BridgeExtensionRequest<M>,
+	BridgeSnapshot<M>["settledMessages"][number]
 >;
 type BridgeServerMessage<M extends SessionRuntimeProductMode> = M extends "future_content"
 	? FutureSessionWsServerMessage
@@ -122,6 +135,24 @@ interface SessionCatchUp<M extends SessionRuntimeProductMode = "current"> {
 	order: number;
 	rekeyVersion: number;
 	exactTransactional: boolean;
+}
+
+type BridgeChunkedSnapshot<M extends SessionRuntimeProductMode> = NonNullable<
+	Extract<BridgeReplayResult<M>, { type: "resync_required" }>["chunkedSnapshot"]
+>;
+
+interface HistorySnapshot<M extends SessionRuntimeProductMode> {
+	snapshotId: string;
+	workspaceId: string;
+	generation: number;
+	asOfSeq: number;
+	chunked: BridgeChunkedSnapshot<M>;
+}
+
+interface HistoryPageOperation {
+	sessionHandle: string;
+	requestId: string;
+	controller: AbortController;
 }
 
 interface BashCommandIdMapping {
@@ -194,6 +225,7 @@ export const MAX_SESSION_WS_SUBSCRIPTION_ALIASES = 1024;
 export const MAX_SESSION_WS_PENDING_COMMAND_RESPONSE_BYTES = SESSION_WS_SERVER_MAX_BYTES;
 const MAX_SESSION_WS_FRAME_BYTES = SESSION_WS_SERVER_MAX_BYTES;
 const MAX_SESSION_WS_SMALL_COMMAND_RESPONSE_BYTES = 64 * 1024;
+const DEFAULT_SESSION_HISTORY_CHUNK_TARGET_BYTES = 4 * 1024 * 1024;
 const LEGACY_GATEWAY_PROTOCOL_MINOR = 2;
 const RETRYABLE_SESSION_ERROR_CODES = new Set<string>(SESSION_SUBSCRIPTION_RETRYABLE_ERROR_CODES);
 const LEGACY_GATEWAY_CLIENT_REQUIRED_CAPABILITIES = [
@@ -338,6 +370,12 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		const sharedPayload = this.serializeMessage(message);
 		for (const connection of this.connections) {
 			if (connection.closed || !connection.helloComplete) continue;
+			if (message.type === "runtime_state") {
+				const history = connection.historySnapshots.get(message.runtime.sessionHandle);
+				if (history && history.generation !== message.runtime.generation) {
+					this.clearHistorySnapshot(connection, message.runtime.sessionHandle);
+				}
+			}
 			const payload = this.payloadForConnection(connection, message, sharedPayload);
 			const sessionHandle = this.broadcastSessionHandle(message);
 			if (!sessionHandle) {
@@ -390,6 +428,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				catchUp.rekeyVersion += 1;
 				this.bufferCatchUpMessage(connection, catchUp, message, payload);
 			}
+			this.clearHistorySnapshot(connection, message.previousSessionHandle);
 			const wasSubscribed = this.migrateLiveSubscription(
 				connection,
 				message.previousSessionHandle,
@@ -431,12 +470,16 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			outboundQueue: [],
 			outboundSmallQueuedBytes: 0,
 			outboundLargeItems: 0,
+			outboundHistoryQueuedBytes: 0,
 			outboundSending: false,
 			alive: true,
 			closed: false,
 			epoch: 0,
 			helloComplete: false,
 			hotInventoryNegotiated: false,
+			historyNegotiated: false,
+			historySnapshots: new Map(),
+			historyPages: new Map(),
 			hotInventoryRevision: -1,
 			admittedExactOperations: 0,
 			negotiatedMaxServerFrameBytes: MAX_SESSION_WS_FRAME_BYTES,
@@ -512,6 +555,12 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			case "extension_ui_response":
 				await this.handleExtensionUiResponse(connection, message);
 				return;
+			case "session_history_page":
+				await this.handleHistoryPage(connection, message);
+				return;
+			case "session_history_cancel":
+				this.cancelHistoryPage(connection, message);
+				return;
 		}
 	}
 
@@ -586,6 +635,9 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		}
 		connection.helloComplete = true;
 		connection.hotInventoryNegotiated = inventoryNegotiation.negotiated;
+		connection.historyNegotiated =
+			value.capabilities.includes(GATEWAY_SESSION_HISTORY_CAPABILITY) &&
+			hello.capabilities.includes(GATEWAY_SESSION_HISTORY_CAPABILITY);
 		if (connection.helloTimer) clearTimeout(connection.helloTimer);
 		connection.helloTimer = undefined;
 		this.sendPayload(connection, JSON.stringify(hello));
@@ -680,6 +732,9 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 
 		connection.helloComplete = true;
 		connection.hotInventoryNegotiated = hasInventoryCapability;
+		connection.historyNegotiated =
+			value.capabilities.includes(GATEWAY_SESSION_HISTORY_CAPABILITY) &&
+			hello.capabilities.includes(GATEWAY_SESSION_HISTORY_CAPABILITY);
 		if (connection.helloTimer) clearTimeout(connection.helloTimer);
 		connection.helloTimer = undefined;
 		this.sendPayload(connection, JSON.stringify(hello));
@@ -755,6 +810,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		}
 		const catchUp = admission.catchUp;
 		try {
+			let historySnapshot: HistorySnapshot<M> | undefined;
 			let observedRekeyVersion = catchUp.rekeyVersion;
 			let exactObservationToken: HotRuntimeSubscriptionToken | undefined;
 			let result: BridgeReplayResult<M>;
@@ -816,6 +872,9 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			}
 			this.send(connection, { type: "runtime_state", runtime: result.runtime });
 			if (result.type === "resync_required") {
+				if (result.chunkedSnapshot && !connection.historyNegotiated) {
+					throw new RpcError("session_subscribe", "session_history_unsupported");
+				}
 				this.send(connection, {
 					type: "resync_required",
 					serverEpoch: this.serverEpoch,
@@ -823,7 +882,18 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 					runtime: result.runtime,
 					reason: result.reason === "server_epoch_changed" ? "epoch_changed" : result.reason,
 				});
-				this.send(connection, result.snapshot as BridgeServerMessage<M>);
+				if (result.chunkedSnapshot) {
+					historySnapshot = {
+						snapshotId: result.snapshot.snapshotId,
+						workspaceId: result.snapshot.workspaceId,
+						generation: result.snapshot.generation,
+						asOfSeq: result.snapshot.asOfSeq,
+						chunked: result.chunkedSnapshot,
+					};
+					this.sendChunkedSnapshot(connection, result.snapshot, result.chunkedSnapshot);
+				} else {
+					this.send(connection, result.snapshot as BridgeServerMessage<M>);
+				}
 			} else {
 				for (const frame of result.frames) this.send(connection, frame as BridgeServerMessage<M>);
 			}
@@ -833,6 +903,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			const buffered = [...catchUp.buffered];
 			const baselineMarker = this.findBaselineMarker(buffered, result.runtime);
 			this.establishLiveSubscription(connection, catchUp, resolvedHandle);
+			if (historySnapshot) connection.historySnapshots.set(resolvedHandle, historySnapshot);
 			for (const [index, entry] of buffered.entries()) {
 				if (
 					this.isNonReplayableCatchUpMessage(entry.message) ||
@@ -856,6 +927,222 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				connection.admittedExactOperations = Math.max(0, connection.admittedExactOperations - 1);
 			}
 		}
+	}
+
+	private sendChunkedSnapshot(
+		connection: ConnectionState<M>,
+		snapshot: BridgeSnapshot<M>,
+		chunked: BridgeChunkedSnapshot<M>,
+	): void {
+		const messages = snapshot.settledMessages;
+		const chunks = splitHistoryMessages<BridgeSnapshot<M>["settledMessages"][number]>(
+			messages,
+			this.maxHistoryChunkBytes(connection),
+			this.maxHistorySingleMessageBytes(connection),
+		);
+		const identity = historyIdentity(snapshot);
+		this.send(connection, {
+			type: "session_snapshot_begin",
+			...identity,
+			snapshotId: snapshot.snapshotId,
+			baseSeq: snapshot.baseSeq,
+			asOfSeq: snapshot.asOfSeq,
+			runtime: snapshot.runtime,
+			projectionEvents: snapshot.projectionEvents,
+			queue: snapshot.queue,
+			pendingExtensionRequests: snapshot.pendingExtensionRequests,
+			stickyExtensionState: snapshot.stickyExtensionState,
+			history: chunked.history,
+		} as BridgeServerMessage<M>);
+		const chunkChecksums: string[] = [];
+		for (const [chunkIndex, chunk] of chunks.entries()) {
+			const checksum = sessionHistoryChecksum(chunk);
+			chunkChecksums.push(checksum);
+			this.send(connection, {
+				type: "session_snapshot_chunk",
+				...identity,
+				snapshotId: snapshot.snapshotId,
+				chunkIndex,
+				messages: chunk,
+				itemCount: chunk.length,
+				byteCount: sessionHistoryMessagesBytes(chunk),
+				checksum,
+			} as BridgeServerMessage<M>);
+		}
+		this.send(connection, {
+			type: "session_snapshot_end",
+			...identity,
+			snapshotId: snapshot.snapshotId,
+			chunkCount: chunks.length,
+			itemCount: messages.length,
+			byteCount: sessionHistoryMessagesBytes(messages),
+			checksum: sessionHistoryChecksum(chunkChecksums),
+			nextCursor: chunked.history.nextCursor,
+		} as BridgeServerMessage<M>);
+	}
+
+	private async handleHistoryPage(
+		connection: ConnectionState<M>,
+		message: Extract<SessionWsClientMessage, { type: "session_history_page" }>,
+	): Promise<void> {
+		if (!connection.historyNegotiated) {
+			this.sendSessionError(connection, message.sessionHandle, "history_page", "session_history_unsupported");
+			return;
+		}
+		const sessionHandle = this.connectionSessionHandle(connection, message.sessionHandle);
+		if (!this.isSubscribed(connection, sessionHandle)) {
+			this.sendSessionError(connection, message.sessionHandle, "history_page", "session_not_subscribed");
+			return;
+		}
+		const history = connection.historySnapshots.get(sessionHandle);
+		if (
+			!history ||
+			history.snapshotId !== message.snapshotId ||
+			history.generation !== message.expectedGeneration ||
+			history.asOfSeq !== message.asOfSeq
+		) {
+			this.sendSessionError(
+				connection,
+				message.sessionHandle,
+				"history_page",
+				"session_history_snapshot_stale",
+			);
+			return;
+		}
+		const existing = connection.historyPages.get(message.id);
+		if (existing) {
+			existing.controller.abort();
+			connection.historyPages.delete(message.id);
+		}
+		const operation: HistoryPageOperation = {
+			sessionHandle,
+			requestId: message.id,
+			controller: new AbortController(),
+		};
+		connection.historyPages.set(message.id, operation);
+		try {
+			const page = await history.chunked.readPage(message.cursor, message.limit, operation.controller.signal);
+			if (!this.isCurrentHistoryPage(connection, operation, history)) return;
+			const chunks = splitHistoryMessages(
+				page.messages,
+				this.maxHistoryChunkBytes(connection),
+				this.maxHistorySingleMessageBytes(connection),
+			);
+			const identity = {
+				serverEpoch: this.serverEpoch,
+				sessionHandle,
+				workspaceId: history.workspaceId,
+				generation: history.generation,
+			};
+			const historyMetadata = {
+				totalMessages: page.totalMessages,
+				loadedMessages: page.messages.length,
+				loadedBytes: sessionHistoryMessagesBytes(page.messages),
+				totalBytes: Math.max(page.totalBytes, sessionHistoryMessagesBytes(page.messages)),
+				nextCursor: page.nextCursor,
+			};
+			this.send(connection, {
+				type: "session_history_page_begin",
+				...identity,
+				requestId: message.id,
+				snapshotId: history.snapshotId,
+				asOfSeq: history.asOfSeq,
+				cursor: message.cursor,
+				history: historyMetadata,
+			} as BridgeServerMessage<M>);
+			const chunkChecksums: string[] = [];
+			for (const [chunkIndex, chunk] of chunks.entries()) {
+				const checksum = sessionHistoryChecksum(chunk);
+				chunkChecksums.push(checksum);
+				this.send(connection, {
+					type: "session_history_page_chunk",
+					...identity,
+					requestId: message.id,
+					snapshotId: history.snapshotId,
+					chunkIndex,
+					messages: chunk,
+					itemCount: chunk.length,
+					byteCount: sessionHistoryMessagesBytes(chunk),
+					checksum,
+				} as BridgeServerMessage<M>);
+			}
+			this.send(connection, {
+				type: "session_history_page_end",
+				...identity,
+				requestId: message.id,
+				snapshotId: history.snapshotId,
+				chunkCount: chunks.length,
+				itemCount: page.messages.length,
+				byteCount: sessionHistoryMessagesBytes(page.messages),
+				checksum: sessionHistoryChecksum(chunkChecksums),
+				nextCursor: page.nextCursor,
+			} as BridgeServerMessage<M>);
+		} catch (error) {
+			if (this.isCurrentHistoryPage(connection, operation, history) && !operation.controller.signal.aborted) {
+				this.sendSessionError(connection, message.sessionHandle, "history_page", error);
+			}
+		} finally {
+			if (connection.historyPages.get(message.id) === operation) connection.historyPages.delete(message.id);
+		}
+	}
+
+	private cancelHistoryPage(
+		connection: ConnectionState<M>,
+		message: Extract<SessionWsClientMessage, { type: "session_history_cancel" }>,
+	): void {
+		const sessionHandle = this.connectionSessionHandle(connection, message.sessionHandle);
+		const operation = connection.historyPages.get(message.id);
+		const history = connection.historySnapshots.get(sessionHandle);
+		if (
+			operation &&
+			operation.sessionHandle === sessionHandle &&
+			history?.snapshotId === message.snapshotId &&
+			history.generation === message.expectedGeneration
+		) {
+			connection.historyPages.delete(message.id);
+			operation.controller.abort();
+		}
+	}
+
+	private isCurrentHistoryPage(
+		connection: ConnectionState<M>,
+		operation: HistoryPageOperation,
+		history: HistorySnapshot<M>,
+	): boolean {
+		return (
+			!connection.closed &&
+			this.connections.has(connection) &&
+			connection.historyPages.get(operation.requestId) === operation &&
+			connection.subscriptions.has(operation.sessionHandle) &&
+			connection.historySnapshots.get(operation.sessionHandle) === history
+		);
+	}
+
+	private clearHistorySnapshot(connection: ConnectionState<M>, sessionHandle: string): void {
+		connection.historySnapshots.delete(sessionHandle);
+		for (const [requestId, operation] of connection.historyPages) {
+			if (operation.sessionHandle !== sessionHandle) continue;
+			connection.historyPages.delete(requestId);
+			operation.controller.abort();
+		}
+	}
+
+	private maxHistoryChunkBytes(connection: ConnectionState<M>): number {
+		return Math.max(
+			1,
+			Math.min(
+				DEFAULT_SESSION_HISTORY_CHUNK_TARGET_BYTES,
+				SESSION_HISTORY_MAX_CHUNK_BYTES,
+				connection.negotiatedMaxServerFrameBytes - 256 * 1024,
+			),
+		);
+	}
+
+	private maxHistorySingleMessageBytes(connection: ConnectionState<M>): number {
+		return Math.max(
+			1,
+			Math.min(SESSION_HISTORY_MAX_CHUNK_BYTES, connection.negotiatedMaxServerFrameBytes - 256 * 1024),
+		);
 	}
 
 	private beginCatchUp(
@@ -1089,6 +1376,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 	}
 
 	private removeLiveSubscription(connection: ConnectionState<M>, sessionHandle: string): boolean {
+		this.clearHistorySnapshot(connection, sessionHandle);
 		const deleted = connection.subscriptions.delete(sessionHandle);
 		for (const [alias, current] of connection.subscriptionAliases) {
 			if (current === sessionHandle) connection.subscriptionAliases.delete(alias);
@@ -1363,10 +1651,14 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		if (connection.helloTimer) clearTimeout(connection.helloTimer);
 		connection.helloTimer = undefined;
 		connection.hotInventoryNegotiated = false;
+		connection.historyNegotiated = false;
 		connection.deferredHotInventory = undefined;
 		connection.epoch += 1;
 		this.connections.delete(connection);
 		for (const catchUp of [...connection.catchUps]) this.cancelCatchUp(connection, catchUp);
+		for (const operation of connection.historyPages.values()) operation.controller.abort();
+		connection.historyPages.clear();
+		connection.historySnapshots.clear();
 		this.supervisor.releaseConnection(connection.connectionId);
 		connection.subscriptions.clear();
 		connection.subscriptionAliases.clear();
@@ -1376,6 +1668,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		connection.outboundQueue = [];
 		connection.outboundSmallQueuedBytes = 0;
 		connection.outboundLargeItems = 0;
+		connection.outboundHistoryQueuedBytes = 0;
 		connection.outboundSending = false;
 		this.log("info", `ws disconnected (${this.connections.size} open)`);
 	}
@@ -1453,10 +1746,22 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 	}
 
 	private send(connection: ConnectionState<M>, message: BridgeServerMessage<M>): void {
+		const history =
+			message.type === "session_snapshot_begin" ||
+			message.type === "session_snapshot_chunk" ||
+			message.type === "session_snapshot_end" ||
+			message.type === "session_history_page_begin" ||
+			message.type === "session_history_page_chunk" ||
+			message.type === "session_history_page_end";
 		this.sendPayload(
 			connection,
 			this.payloadForConnection(connection, message),
-			message.type === "event" || message.type === "response" || message.type === "session_snapshot",
+			message.type === "event" ||
+				message.type === "response" ||
+				message.type === "session_snapshot" ||
+				message.type === "session_snapshot_chunk" ||
+				message.type === "session_history_page_chunk",
+			history,
 		);
 	}
 
@@ -1510,18 +1815,29 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		return large;
 	}
 
-	private sendPayload(connection: ConnectionState<M>, payload: string, allowLarge = false): void {
+	private sendPayload(
+		connection: ConnectionState<M>,
+		payload: string,
+		allowLarge = false,
+		history = false,
+	): void {
 		if (connection.closed) return;
 		if (connection.ws.readyState !== connection.ws.OPEN) return;
 		const bytes = Buffer.byteLength(payload);
 		const large = this.classifyPayload(connection, bytes, allowLarge);
 		if (large === undefined) return;
-		if (large && connection.outboundLargeItems >= 1) {
+		if (!history && large && connection.outboundLargeItems >= 1) {
 			this.closeForPolicyViolation(connection, "slow WebSocket client");
 			return;
 		}
+		if (history && connection.outboundHistoryQueuedBytes + bytes > SESSION_HISTORY_MAX_STREAM_BYTES) {
+			this.closeForPolicyViolation(connection, "history stream exceeded its outbound limit");
+			return;
+		}
 		if (connection.outboundSending) {
-			if (large) {
+			if (history) {
+				connection.outboundHistoryQueuedBytes += bytes;
+			} else if (large) {
 				connection.outboundLargeItems += 1;
 			} else if (connection.outboundSmallQueuedBytes + bytes > MAX_SESSION_WS_BUFFERED_BYTES) {
 				this.closeForPolicyViolation(connection, "slow WebSocket client");
@@ -1529,15 +1845,16 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			} else {
 				connection.outboundSmallQueuedBytes += bytes;
 			}
-			connection.outboundQueue.push({ payload, bytes, large });
+			connection.outboundQueue.push({ payload, bytes, large, history });
 			return;
 		}
 		if (connection.ws.bufferedAmount > MAX_SESSION_WS_BUFFERED_BYTES) {
 			this.closeForPolicyViolation(connection, "slow WebSocket client");
 			return;
 		}
-		if (large) connection.outboundLargeItems += 1;
-		this.startPayloadSend(connection, { payload, bytes, large });
+		if (history) connection.outboundHistoryQueuedBytes += bytes;
+		else if (large) connection.outboundLargeItems += 1;
+		this.startPayloadSend(connection, { payload, bytes, large, history });
 	}
 
 	private startPayloadSend(connection: ConnectionState<M>, item: OutboundPayload): void {
@@ -1546,7 +1863,12 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			connection.ws.send(item.payload, (error) => {
 				if (connection.closed) return;
 				connection.outboundSending = false;
-				if (item.large) {
+				if (item.history) {
+					connection.outboundHistoryQueuedBytes = Math.max(
+						0,
+						connection.outboundHistoryQueuedBytes - item.bytes,
+					);
+				} else if (item.large) {
 					connection.outboundLargeItems = Math.max(0, connection.outboundLargeItems - 1);
 				}
 				if (error) {
@@ -1556,7 +1878,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				}
 				const next = connection.outboundQueue.shift();
 				if (!next) return;
-				if (!next.large) {
+				if (!next.history && !next.large) {
 					connection.outboundSmallQueuedBytes = Math.max(0, connection.outboundSmallQueuedBytes - next.bytes);
 				}
 				if (connection.ws.bufferedAmount > MAX_SESSION_WS_BUFFERED_BYTES) {
@@ -1618,6 +1940,51 @@ function sessionErrorCode(errorText: string): string {
 	return match?.[1] ?? "session_error";
 }
 
+function historyIdentity<M extends SessionRuntimeProductMode>(snapshot: BridgeSnapshot<M>) {
+	return {
+		serverEpoch: snapshot.serverEpoch,
+		sessionHandle: snapshot.sessionHandle,
+		workspaceId: snapshot.workspaceId,
+		generation: snapshot.generation,
+	};
+}
+
+function splitHistoryMessages<T>(
+	messages: readonly T[],
+	maxBytes: number,
+	maxSingleMessageBytes = maxBytes,
+): T[][] {
+	const chunks: T[][] = [];
+	let current: T[] = [];
+	for (const message of messages) {
+		const single = [message];
+		const singleBytes = sessionHistoryMessagesBytes(single);
+		const candidate = [...current, message];
+		if (
+			current.length > 0 &&
+			(current.length >= SESSION_HISTORY_MAX_CHUNK_MESSAGES ||
+				sessionHistoryMessagesBytes(candidate) > maxBytes)
+		) {
+			chunks.push(current);
+			current = [];
+		}
+		if (current.length === 0 && singleBytes > maxBytes) {
+			if (singleBytes > maxSingleMessageBytes) {
+				throw new RpcError("session_history", "session_history_message_too_large");
+			}
+			current = single;
+			continue;
+		}
+		const next = [...current, message];
+		if (sessionHistoryMessagesBytes(next) > maxBytes) {
+			throw new RpcError("session_history", "session_history_message_too_large");
+		}
+		current = next;
+	}
+	if (current.length > 0) chunks.push(current);
+	return chunks;
+}
+
 function serializeFutureBridgeMessage(message: unknown, activation: FutureBridgeActivation): string {
 	if (!isFutureSessionWsServerMessage(message, activation.context)) {
 		throw new TypeError("Future Session WebSocket message failed its exact context guard");
@@ -1648,6 +2015,20 @@ function serializeFutureBridgeMessage(message: unknown, activation: FutureBridge
 			throw new TypeError("Future Session snapshot failed its product provenance guard");
 		}
 		assertLogicalBytes(() => schema.snapshotLogicalBytes(message), "snapshot");
+	}
+	if (message.type === "session_snapshot_chunk" || message.type === "session_history_page_chunk") {
+		for (const historyMessage of message.messages) {
+			if (!schema.guardMessage(historyMessage)) {
+				throw new TypeError("Future Session history message failed its product provenance guard");
+			}
+			assertLogicalBytes(
+				() =>
+					analyzeFutureSessionMessageLogicalBytes(historyMessage, {
+						maxBytes: schema.maxSnapshotLogicalBytes,
+					}).byteLength,
+				"history message",
+			);
+		}
 	}
 	if (message.type === "response") {
 		assertLogicalBytes(

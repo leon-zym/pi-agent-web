@@ -2,6 +2,7 @@ import type {
 	ExtensionUiRequestDto,
 	ProductSessionEventDto,
 	SessionCommandResponseDto,
+	SessionHistoryMetadataDto,
 	SessionRuntimeDto,
 	SessionSnapshotDto,
 } from "@pi-agent-web/protocol";
@@ -75,10 +76,27 @@ export interface ReplayCursor {
 	seq: number;
 }
 
+export interface SessionHistoryPageResult<TMessage> {
+	messages: TMessage[];
+	nextCursor: string | null;
+	totalMessages: number;
+	totalBytes: number;
+}
+
+export interface SessionChunkedSnapshot<TMessage> {
+	history: SessionHistoryMetadataDto;
+	readPage: (
+		cursor: string,
+		limit: number | undefined,
+		signal?: AbortSignal,
+	) => Promise<SessionHistoryPageResult<TMessage>>;
+}
+
 export type ReplayResult<
 	TEvent = ProductSessionEventDto,
 	TSnapshot = SessionSnapshotDto,
 	TExtensionRequest = ExtensionUiRequestDto,
+	TMessage = TSnapshot extends { settledMessages: (infer TSnapshotMessage)[] } ? TSnapshotMessage : never,
 > =
 	| {
 			type: "replay";
@@ -90,6 +108,7 @@ export type ReplayResult<
 			runtime: SessionRuntimeSnapshot;
 			reason: "initial" | "server_epoch_changed" | "generation_changed" | "gap" | "invalid_cursor";
 			snapshot: TSnapshot;
+			chunkedSnapshot?: SessionChunkedSnapshot<TMessage>;
 	  };
 
 export interface SessionCommandResult<TResponse = SessionCommandResponseDto> {
