@@ -182,6 +182,12 @@ Composer Visual Seat 固定于 Center 底部，同一 DOM 延续焦点，数据�
 - 加载更早历史时按稳定 `turnId` 保留视口锚点，变量高度、选取文本和键盘焦点不因 prepend 丢失；TOC 仍为每个 User Turn 保留一个轻量刻度；
 - TOC 跳转未挂载 Turn 时先调整窗口再滚动到目标；切换 Session、回到最新消息和 resize 均必须按当前 Session fencing，不能让旧的异步滚动覆盖新 Session 的阅读位置。
 
+当 native history 超过单个 snapshot frame 的预算时，首次打开仍只展示最新 bounded tail。Gateway 通过
+`session_snapshot_begin/chunk/end` 完成一次原子 baseline，用户点击“加载更早历史”后再按
+`session_history_page_begin/chunk/end` 追加完整 page；page 未收到 End 前不改变对话投影。加载期间按钮显示
+明确的 busy 状态，失败保留已显示内容并提供一次重试；切换 Session、rekey、断线或取消会停止旧请求，旧
+请求的 late completion 不能改变当前页面或滚动锚点。
+
 ### 7.6 大型 Tool 与 Extension 内容的按需加载
 
 Protocol minor 3 的 `content_ref` 只在 exact `serverEpoch` 内有效。Projection、replay 和 snapshot 保存

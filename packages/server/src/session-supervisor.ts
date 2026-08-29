@@ -74,7 +74,8 @@ export interface HotRuntimeSubscriptionToken {
 export type HotRuntimeSubscriptionResult<M extends SessionRuntimeProductMode = "current"> = ReplayResult<
 	SessionRuntimeProductEvent<M>,
 	SessionRuntimeProductSnapshot<M>,
-	SessionRuntimeProductExtensionRequest<M>
+	SessionRuntimeProductExtensionRequest<M>,
+	SessionRuntimeProductSnapshot<M>["settledMessages"][number]
 > & {
 	observationToken: HotRuntimeSubscriptionToken;
 };
@@ -339,7 +340,8 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "curren
 		ReplayResult<
 			SessionRuntimeProductEvent<M>,
 			SessionRuntimeProductSnapshot<M>,
-			SessionRuntimeProductExtensionRequest<M>
+			SessionRuntimeProductExtensionRequest<M>,
+			SessionRuntimeProductSnapshot<M>["settledMessages"][number]
 		>
 	> {
 		const runtime = await this.ensureRuntime(sessionHandle);

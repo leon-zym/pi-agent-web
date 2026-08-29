@@ -185,4 +185,25 @@ describe("projection cache", () => {
 			partialOutput: "still running",
 		});
 	});
+
+	it("prepends older pages without changing the live tail or reusing view keys", () => {
+		const store = useProjectionStore.getState();
+		store.rebuildFromMessages("paged", [{ role: "user", content: "newest" }]);
+		const newestBefore = useProjectionStore.getState().projections.paged?.turns[0];
+
+		store.prependHistoricalMessages("paged", [{ role: "user", content: "older one" }]);
+		store.prependHistoricalMessages("paged", [{ role: "user", content: "oldest" }]);
+
+		const projection = useProjectionStore.getState().projections.paged;
+		expect(projection?.turns.map((turn) => turn.userMessages[0]?.text)).toEqual([
+			"oldest",
+			"older one",
+			"newest",
+		]);
+		expect(projection?.turns[2]).toBe(newestBefore);
+		expect(new Set(projection?.turns.map((turn) => turn.id)).size).toBe(3);
+		expect(
+			new Set(projection?.turns.flatMap((turn) => turn.userMessages.map((message) => message.entryKey))).size,
+		).toBe(3);
+	});
 });

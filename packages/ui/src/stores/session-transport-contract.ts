@@ -3,16 +3,23 @@ import type {
 	ExtensionUiResponseDto,
 	FutureExtensionUiSnapshotDto,
 	FutureSessionContentRefGuardContext,
+	FutureSessionHistoryPageChunkDto,
 	FutureSessionReplayFrameDto,
 	FutureSessionResponseFrameDto,
+	FutureSessionSnapshotBeginDto,
+	FutureSessionSnapshotChunkDto,
 	FutureSessionSnapshotDto,
 	GatewayProtocolVersionDto,
 	HotRuntimeInventoryDto,
 	SessionCommandDto,
 	SessionCommandResponseDto,
+	SessionHistoryMetadataDto,
+	SessionHistoryPageBeginDto,
+	SessionHistoryPageEndDto,
 	SessionReplayFrameDto,
 	SessionRuntimeDto,
 	SessionRuntimeIdentityDto,
+	SessionSnapshotEndDto,
 	SessionWsServerMessage,
 } from "@pi-agent-web/protocol";
 import type { StoreApi } from "zustand/vanilla";
@@ -42,6 +49,27 @@ export interface SessionResyncState {
 	requiresFreshBaseline: boolean;
 }
 
+export interface SessionHistoryState extends SessionHistoryMetadataDto {
+	snapshotId: string | null;
+	asOfSeq: number | null;
+	loading: boolean;
+	error: string | null;
+}
+
+export function emptySessionHistoryState(): SessionHistoryState {
+	return {
+		snapshotId: null,
+		asOfSeq: null,
+		totalMessages: 0,
+		loadedMessages: 0,
+		loadedBytes: 0,
+		totalBytes: 0,
+		nextCursor: null,
+		loading: false,
+		error: null,
+	};
+}
+
 export interface SessionRawEventRecord {
 	receivedAt: number;
 	serverEpoch: string;
@@ -58,6 +86,12 @@ export type FutureSessionTransportFrameMessage =
 	| FutureSessionResponseFrameDto
 	| FutureSessionReplayFrameDto
 	| FutureSessionSnapshotDto
+	| FutureSessionSnapshotBeginDto
+	| FutureSessionSnapshotChunkDto
+	| SessionSnapshotEndDto
+	| SessionHistoryPageBeginDto
+	| FutureSessionHistoryPageChunkDto
+	| SessionHistoryPageEndDto
 	| FutureExtensionUiSnapshotDto;
 
 export type FutureSessionLazyIdentity = Readonly<
@@ -83,6 +117,7 @@ export interface SessionChannelState {
 	pendingExtensionRequests: ExtensionUiRequestDto[];
 	resync: SessionResyncState | null;
 	recovery: SessionRecoveryState | null;
+	history: SessionHistoryState;
 	/** Background monitoring admission; this is disposable UI state, never Session truth. */
 	subscriptionAdmission?: SessionSubscriptionAdmission | null;
 	rawEvents: SessionRawEventRecord[];
@@ -177,6 +212,8 @@ export interface SessionTransportState {
 	disconnect: () => void;
 	subscribeSession: (sessionHandle: string) => void;
 	unsubscribeSession: (sessionHandle: string) => void;
+	loadOlderSessionHistory: (sessionHandle: string) => boolean;
+	cancelSessionHistory: (sessionHandle: string) => boolean;
 	/** Drop a dormant local baseline so the next subscribe requests an initial snapshot. */
 	invalidateSessionSnapshot: (sessionHandle: string) => boolean;
 	claimSession: (sessionHandle: string) => boolean;
@@ -224,6 +261,10 @@ export interface SessionTransportController {
 	isSnapshotSuffixProjectionPending: (sessionHandle: string, generation: number) => boolean;
 	/** Fail closed and request a cursorless baseline after deferred projection work throws. */
 	reportProjectionFailure: (sessionHandle: string, generation: number, error?: unknown) => boolean;
+	/** Request the next older bounded history page for a subscribed Session. */
+	loadOlderSessionHistory: (sessionHandle: string) => boolean;
+	/** Cancel a pending bounded history page request. */
+	cancelSessionHistory: (sessionHandle: string) => boolean;
 	/** Resolve after the current connection has received its ordered initial hot inventory. */
 	waitForInitialHotInventory: () => Promise<HotRuntimeInventoryToken>;
 	dispose: () => void;

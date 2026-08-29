@@ -307,8 +307,9 @@ envelope、response、lease、rekey、resync、snapshot 与 replay cursor。每�
 `{serverEpoch, sessionHandle, generation, seq}`。Cursor 按 epoch、handle/rekey、generation、seq
 range 的顺序校验；任一不确定身份都进入显式 resync。
 
-Runtime generation 启动时先用内部 `get_messages` 建立 `baseSeq = 0` 的 settled-message base，期间
-到达的已验证事件有界缓冲，base 建立后再按到达顺序提交。Gateway 的临时 live projection 保存
+Runtime generation 启动时，对于能放入直接预算的路径使用内部 `get_messages`，对于已验证且超过直接
+snapshot 预算的 native JSONL 则使用有界 reader 建立 `baseSeq = 0` 的 settled-message base；期间到达的
+已验证事件有界缓冲，base 建立后再按到达顺序提交。两条路径都只产生同一个 projection base。Gateway 的临时 live projection 保存
 settled base、有序 product-domain event suffix、queue、runtime phase 与 pending blocking Extension
 请求。Sticky Extension state 只保留在一个有界 Runtime map 中；替换、clear 与容量淘汰都发布明确的
 semantic frame，使 live observer 与 snapshot 在同一 waterline 收敛。Pi JSONL 仍是唯一持久化事实，
@@ -336,6 +337,13 @@ epoch 或 generation 变化、cursor 无效、replay gap、rekey race 或 UI 缓
 `session_snapshot` 在一个 `asOfSeq` 原子包含 settled base、live product event suffix、queue、runtime
 phase、pending dialog 与 sticky Extension state；不包含瞬时 `notify`、Controller Lease 或 fencing token。
 UI 原子替换该 Session 的权威状态，然后只接受 `seq > asOfSeq` 的连续 suffix。
+
+大型 native history 的 resync 不把完整 settled base 强行塞回单个 frame。Runtime 保存带 canonical file
+realpath、Header identity、文件 size/mtime/inode 等 source fingerprint 的 reader plan，只保留有界的
+索引元数据；Gateway 以 `session_snapshot_begin/chunk/end` 发送最新 bounded tail，并以 snapshot id、
+`asOfSeq`、generation 和 epoch 封存后续 page。向上读取更早 history 时重新检查 fingerprint、当前进程
+token 与 generation；文件被替换、截断、追加到不一致 waterline，或 Session rekey/停止时，page 失败并由
+客户端重试新的 baseline。这个 plan 是 native JSONL 的读取缓存，不是第二套 Workspace/Session 数据库。
 
 Snapshot 有 item、byte 与 depth 上限。无法生成合法 snapshot 的 Runtime 进入稳定
 `session_snapshot_overflow` crashed 状态，停止 Pi 且不自动重启或形成订阅循环。Persisted Session 的
@@ -419,7 +427,8 @@ event 数量与完整 frame bytes 各自受 live suffix ceiling 的 50% 预算�
 并复核 idle CAS compaction。容量复核与 pending reservation 在同一串行 admission 边界原子完成，
 不足时在命令发送给 Pi 前拒绝；Agent 启动后 reservation 转为 active，失败、取消、结算、stop 或
 rekey 时释放。这个预算只覆盖符合 half-ceiling 的 Turn，不保证任意完整 Turn。单个 active Turn
-超过预算时稳定进入 `session_snapshot_overflow`；更大的 Turn 需要 chunking 或 rollover 协议。
+超过预算时稳定进入 `session_snapshot_overflow`；更大的 active Turn 仍需要独立的 chunking 或 rollover
+协议，历史分块不能掩盖 live projection/event 的预算失败。
 
 Pi response 可与事件交错，因此 Gateway 附加 `barrierSeq`。UI 只有在同 generation 的投影已
 应用至该序号后才 resolve 调用者。普通 `get_messages` response 也遵守该 barrier，但不再参与

@@ -1,4 +1,8 @@
-import type { SessionWsServerMessage } from "@pi-agent-web/protocol";
+import type {
+	SessionMessageDto,
+	SessionRuntimeIdentityDto,
+	SessionWsServerMessage,
+} from "@pi-agent-web/protocol";
 import type { ProjectedFutureSessionFrameMessage } from "../lib/future-session-content-adapter";
 
 export type SessionFrameProductMode = "current" | "future";
@@ -7,7 +11,20 @@ export type CurrentSessionFrameBusMessage = Exclude<
 	SessionWsServerMessage,
 	{ type: "response" } | { type: "session_directory_changed" } | { type: "auth_changed" }
 >;
-export type SessionFrameBusMessage = CurrentSessionFrameBusMessage | ProjectedFutureSessionFrameMessage;
+
+/** Product event emitted only after a complete older history page is assembled. */
+export interface SessionHistoryPageLoadedFrame extends SessionRuntimeIdentityDto {
+	type: "session_history_page_loaded";
+	requestId: string;
+	snapshotId: string;
+	asOfSeq: number;
+	messages: SessionMessageDto[];
+}
+
+export type SessionFrameBusMessage =
+	| CurrentSessionFrameBusMessage
+	| SessionHistoryPageLoadedFrame
+	| ProjectedFutureSessionFrameMessage;
 
 interface OrderedSessionFrameEnvelope {
 	order: number;
@@ -17,7 +34,7 @@ interface OrderedSessionFrameEnvelope {
 
 export type OrderedSessionFrame = OrderedSessionFrameEnvelope &
 	(
-		| { productMode: "current"; message: CurrentSessionFrameBusMessage }
+		| { productMode: "current"; message: CurrentSessionFrameBusMessage | SessionHistoryPageLoadedFrame }
 		| { productMode: "future"; message: ProjectedFutureSessionFrameMessage }
 	);
 
@@ -68,6 +85,11 @@ export class OrderedSessionFrameBus {
 	): SessionFrameDeliveryResult;
 	emit(
 		sessionHandle: string,
+		message: SessionHistoryPageLoadedFrame,
+		receivedAt: number,
+	): SessionFrameDeliveryResult;
+	emit(
+		sessionHandle: string,
 		message: ProjectedFutureSessionFrameMessage,
 		receivedAt: number,
 		productMode: "future",
@@ -76,6 +98,7 @@ export class OrderedSessionFrameBus {
 		sessionHandle: string,
 		...args:
 			| [message: CurrentSessionFrameBusMessage, receivedAt: number]
+			| [message: SessionHistoryPageLoadedFrame, receivedAt: number]
 			| [message: ProjectedFutureSessionFrameMessage, receivedAt: number, productMode: "future"]
 	): SessionFrameDeliveryResult {
 		const order = (this.orderBySession.get(sessionHandle) ?? 0) + 1;
@@ -87,14 +110,14 @@ export class OrderedSessionFrameBus {
 						receivedAt: args[1],
 						sessionHandle,
 						productMode: "current",
-						message: args[0],
+						message: args[0] as CurrentSessionFrameBusMessage | SessionHistoryPageLoadedFrame,
 					}
 				: {
 						order,
 						receivedAt: args[1],
 						sessionHandle,
 						productMode: "future",
-						message: args[0],
+						message: args[0] as ProjectedFutureSessionFrameMessage,
 					};
 		const result: SessionFrameDeliveryResult = { deferred: false, errors: [] };
 		for (const listener of this.listeners.get(sessionHandle) ?? []) this.deliver(listener, frame, result);

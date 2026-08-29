@@ -8,6 +8,10 @@
 `payloadBudget` 和 `contentRefBudget`。minor 1/2 的 DTO、hello 和 image-only attachment 路径是保留的
 历史兼容事实，不属于当前 production Session mode。
 
+`session.chunked_history` 是按需协商的可选能力。支持它的两端可以把超出单帧预算的 settled history
+拆成有界流；未协商该能力的旧客户端仍可使用普通 snapshot，但遇到只能用分块传输的历史时会收到
+`session_history_unsupported`，不会收到一个超限或不完整的 snapshot。
+
 ## 1. Pi RPC 传输
 
 - 子进程 stdin/stdout 使用 JSONL，只按 LF 分帧；U+2028/U+2029 是合法 JSON 字符，禁止用
@@ -377,6 +381,8 @@ Browser cancel 都幂等 release pin。content route 不解释 text/json，Brows
 | `lease_status` | epoch, handle, generation, `isController`, controller-only token | 当前连接在该 Session 的权限快照 |
 | `resync_required` | epoch, handle, runtime, reason | initial/epoch_changed/generation_changed/gap/invalid_cursor |
 | `session_snapshot` | snapshot identity, runtime, `baseSeq`, `asOfSeq`, projection state | 一个 waterline 上的原子 live baseline |
+| `session_snapshot_begin` / `chunk` / `end` | snapshot identity, `snapshotId`, history metadata, settled message chunks | 大型 settled history 的有界原子 baseline |
+| `session_history_page_begin` / `chunk` / `end` | request/snapshot identity, cursor, settled message chunks | 同一 snapshot 的更早 history page |
 | `extension_ui_request` | sequenced request | live blocking/semantic/notify 请求 |
 | `extension_ui_result` | epoch, handle, generation, request id, accepted/no_dialog/not_running | 只确认 response admission；closed 帧负责全体收敛 |
 | `extension_ui_closed` | sequenced request id + reason | 所有订阅者删除对话框或 semantic request |
@@ -405,6 +411,18 @@ Cursor 先校验 `serverEpoch`，再解析 handle/rekey，随后校验 generatio
 requests 与 sticky Extension state。UI 原子替换 Session-scoped projection 与 Extension state，再只应用
 `seq > asOfSeq` 的连续 suffix。`notify`、Controller Lease 与 fencing token 不属于 snapshot。Replay 若
 跳过 `notify` 以避免重复 Toast，产生的 seq 空洞必须转为 gap resync，不能把非连续帧当作 replay。
+
+当 settled messages 不能安全放入一个 server frame 时，baseline 改用
+`session_snapshot_begin → session_snapshot_chunk* → session_snapshot_end`。Begin 携带除 settled messages
+外的 snapshot state 以及 `totalMessages`、`loadedMessages`、`loadedBytes`、`totalBytes`、`nextCursor`；每个
+chunk 携带有序 `chunkIndex`、消息数组、item/byte count 与 checksum；End 再确认完整 item/byte count、按序
+checksum 和下一页 cursor。Begin、chunk、End 全部通过相同的 epoch、handle、workspace、generation 与
+`snapshotId` 校验，只有 End 完成后 UI 才替换 baseline，不能先显示半个 snapshot。
+
+UI 请求更早历史时发送带 `expectedGeneration`、`snapshotId`、`asOfSeq` 和 cursor 的
+`session_history_page`，Gateway 返回对应的 begin/chunk/end 流。Page 必须属于当前订阅的同一 snapshot，
+过期、重排、重复、checksum/count 不一致或 source fingerprint 变化都会 fail closed；取消、切换 Session、
+rekey、断线和 generation 变化会中止未完成 page，late frame 不得写入新的 Session。
 
 Pi response 到达时 Gateway 记录 `barrierSeq`。UI 必须先应用同 generation 中不大于该序号的事件，
 再 resolve command。这个规则适用于所有普通 response。`get_messages` 只是一条普通只读命令；它的
@@ -491,6 +509,10 @@ does not change the ordinary replay-gap rule above.
   条 projection event、每个 queue 分区 10,000 项、每个 Extension 分区 256 项，JSON depth 上限为 48，
   总结构项上限为 250,000。Guard 只接受 plain canonical JSON record、自有可枚举 data property 与普通
   Array；symbol、accessor、非枚举字段和 exotic container 都 fail closed。
+- 分块 history 的单 chunk 最多约 64.75 MiB、256 条消息，默认发送目标约 4 MiB；每条消息仍必须独立通过
+  product guard 与 server-frame ceiling。一次 snapshot/page stream 的排队权重最多 65 MiB，native reader
+  还受 16 GiB 总源文件预算、上下文消息数与索引条目数预算、cursor 大小及 source fingerprint 约束。Checksum 只用于检测
+  顺序与完整性，不替代 epoch、generation、Cookie 或权限校验。
 - Live product event suffix 默认上限为 4,096 项与 8 MiB。每个 active Turn 的 raw product-event
   count 与完整 frame bytes 分别限制为对应 ceiling 的 50%，默认即 2,048 项与 4 MiB。发送
   `prompt`、`steer` 或 `follow_up` 前，Runtime 必须等待并复核 idle base compaction 已恢复这份
@@ -498,9 +520,10 @@ does not change the ordinary replay-gap rule above.
   Pi 命令前拒绝。Reservation 在 Agent 启动时转为 active，并在失败、取消、结算、stop 或 rekey 时
   释放。单个 Turn 超过 half-ceiling 时稳定 overflow，协议不承诺容纳任意 Turn，也不在本层合成
   chunk 或 rollover。
-- Catch-up 与每连接应用层 outbound queue 分别限制积压。一个合法 `session_snapshot` 可以成为唯一
-  oversized send/queue item；其前后的普通 queued backlog 仍不得超过 1 MiB。已有 socket backlog
-  超过 1 MiB、出现第二个 oversized item 或追加 backlog 越界时才断开。Snapshot overflow 使用稳定
+- Catch-up 与每连接应用层 outbound queue 分别限制积压。非分块的合法 `session_snapshot` 可以成为唯一
+  oversized send/queue item；其前后的普通 queued backlog 仍不得超过 1 MiB。分块 history 则受独立的
+  stream queue ceiling 约束，不能借由拆 chunk 无限增加 backlog。已有 socket backlog 超过上限、出现
+  第二个 oversized item 或追加 backlog 越界时才断开。非 history 的 snapshot overflow 使用稳定
   `session_snapshot_overflow` 错误，Runtime 不自动重启，Browser 也不形成永久 retry 或 Toast 循环。
 - 浏览器断开时 pending command reject、catch-up 取消、controller lease 释放；不保留幽灵 token。
 

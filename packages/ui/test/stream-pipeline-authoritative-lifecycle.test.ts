@@ -6,7 +6,7 @@ import { useComposerStore } from "../src/stores/composer";
 import { useExtensionUiStore } from "../src/stores/extension-ui";
 import { useProjectionStore } from "../src/stores/projection";
 import { useSessionDirectoryStore } from "../src/stores/session-directory";
-import { sessionTransport } from "../src/stores/session-transport";
+import { emptySessionHistoryState, sessionTransport } from "../src/stores/session-transport";
 
 const SESSION_HANDLE = "session-hidden-transient";
 const TARGET_HANDLE = "session-visible-history";
@@ -115,6 +115,7 @@ function prepareHiddenRecovery() {
 					requiresFreshBaseline: false,
 				},
 				recovery: null,
+				history: emptySessionHistoryState(),
 				rawEvents: [],
 			},
 		},
@@ -318,5 +319,29 @@ describe("authoritative snapshot hidden lifecycle ordering", () => {
 		expect(abandon).not.toHaveBeenCalled();
 		expect(releaseSession).not.toHaveBeenCalled();
 		expect(unsubscribeSession).not.toHaveBeenCalled();
+	});
+
+	it("routes a completed history page into one atomic projection prepend", () => {
+		prepareHiddenRecovery();
+		useProjectionStore
+			.getState()
+			.rebuildFromMessages(SESSION_HANDLE, [{ role: "user", content: "latest", timestamp: 1 }]);
+		initPipeline();
+
+		sessionTransport.frameBus.emit(
+			SESSION_HANDLE,
+			{
+				...runtime(),
+				type: "session_history_page_loaded",
+				requestId: "history-page-1",
+				snapshotId: "snapshot-history",
+				asOfSeq: 0,
+				messages: [{ role: "user", content: "older", timestamp: 0 }],
+			},
+			2,
+		);
+
+		const turns = useProjectionStore.getState().projections[SESSION_HANDLE]?.turns ?? [];
+		expect(turns.map((turn) => turn.userMessages[0]?.text)).toEqual(["older", "latest"]);
 	});
 });

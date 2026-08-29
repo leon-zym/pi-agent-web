@@ -377,6 +377,9 @@ export const en: typeof zhCN = {
 	// Chat viewport
 	"chatViewport.backToBottom": "Back to latest",
 	"chatViewport.loadOlder": "Load older messages",
+	"chatViewport.loadingOlder": "Loading older messages…",
+	"chatViewport.retryOlder": "Try loading older messages again",
+	"chatViewport.historyLoadFailed": "Could not load older messages. Try again.",
 	"chatViewport.loadNewer": "Load newer messages",
 	"chatViewport.historyWindow": "Showing {loaded} of {total} turns",
 	"appShell.sidebarWidth": "Resize sidebar",

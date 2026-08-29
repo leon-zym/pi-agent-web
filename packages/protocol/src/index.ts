@@ -51,6 +51,18 @@ import type {
 	SessionCommandTypeDto,
 	SessionMessageDto,
 } from "./product-dto.js";
+import {
+	isSessionHistoryChecksum,
+	SESSION_HISTORY_MAX_CHUNK_BYTES,
+	SESSION_HISTORY_MAX_CHUNK_MESSAGES,
+	SESSION_HISTORY_MAX_CURSOR_BYTES,
+	SESSION_HISTORY_MAX_MESSAGES,
+	SESSION_HISTORY_MAX_SNAPSHOT_ID_BYTES,
+	SESSION_HISTORY_MAX_STREAM_BYTES,
+	SESSION_HISTORY_MAX_TOTAL_BYTES,
+	sessionHistoryChecksum,
+	sessionHistoryMessagesBytes,
+} from "./session-history.js";
 
 export * from "./future-logical-bytes.js";
 export * from "./future-product-decoders.js";
@@ -59,6 +71,7 @@ export * from "./gateway-handshake.js";
 export * from "./payload-budget.js";
 export * from "./product-decoders.js";
 export * from "./product-dto.js";
+export * from "./session-history.js";
 
 const MAX_IDENTIFIER_LENGTH = 256;
 const MAX_PATH_LENGTH = 8192;
@@ -297,6 +310,23 @@ export type SessionWsClientMessage =
 			cursor?: SessionReplayCursorDto;
 			expectedHotRuntime?: SessionRuntimeIdentityDto;
 	  }
+	| {
+			type: "session_history_page";
+			id: string;
+			sessionHandle: string;
+			expectedGeneration: number;
+			snapshotId: string;
+			asOfSeq: number;
+			cursor: string;
+			limit?: number;
+	  }
+	| {
+			type: "session_history_cancel";
+			id: string;
+			sessionHandle: string;
+			expectedGeneration: number;
+			snapshotId: string;
+	  }
 	| { type: "session_unsubscribe"; sessionHandle: string }
 	| { type: "session_claim"; sessionHandle: string }
 	| { type: "session_release"; sessionHandle: string };
@@ -340,6 +370,37 @@ export function isSessionWsClientMessage(value: unknown): value is SessionWsClie
 			if (!isSessionSubscribeMessage(value)) return false;
 			if (value.expectedHotRuntime === undefined) return true;
 			return isCanonicalSessionSubscribeMessage(value);
+		case "session_history_page":
+			return (
+				hasOnlyKeys(value, [
+					"type",
+					"id",
+					"sessionHandle",
+					"expectedGeneration",
+					"snapshotId",
+					"asOfSeq",
+					"cursor",
+					"limit",
+				]) &&
+				isString(value.id) &&
+				isGeneration(value.expectedGeneration) &&
+				isString(value.snapshotId, SESSION_HISTORY_MAX_SNAPSHOT_ID_BYTES) &&
+				isGeneration(value.asOfSeq) &&
+				isHistoryCursor(value.cursor) &&
+				value.cursor !== null &&
+				(value.limit === undefined ||
+					(typeof value.limit === "number" &&
+						Number.isSafeInteger(value.limit) &&
+						value.limit > 0 &&
+						value.limit <= SESSION_HISTORY_MAX_CHUNK_MESSAGES))
+			);
+		case "session_history_cancel":
+			return (
+				hasOnlyKeys(value, ["type", "id", "sessionHandle", "expectedGeneration", "snapshotId"]) &&
+				isString(value.id) &&
+				isGeneration(value.expectedGeneration) &&
+				isString(value.snapshotId, SESSION_HISTORY_MAX_SNAPSHOT_ID_BYTES)
+			);
 		case "session_unsubscribe":
 		case "session_claim":
 		case "session_release":
@@ -575,6 +636,71 @@ export interface SessionSnapshotDto extends SessionRuntimeIdentityDto {
 	stickyExtensionState: StickyExtensionUiRequestDto[];
 }
 
+export interface SessionHistoryMetadataDto {
+	totalMessages: number;
+	loadedMessages: number;
+	loadedBytes: number;
+	totalBytes: number;
+	nextCursor: string | null;
+}
+
+/** The non-payload portion of a chunked authoritative snapshot. */
+export interface SessionSnapshotBeginDto extends Omit<SessionSnapshotDto, "type" | "settledMessages"> {
+	type: "session_snapshot_begin";
+	history: SessionHistoryMetadataDto;
+}
+
+export interface SessionSnapshotChunkDto extends SessionRuntimeIdentityDto {
+	type: "session_snapshot_chunk";
+	snapshotId: string;
+	chunkIndex: number;
+	messages: SessionMessageDto[];
+	itemCount: number;
+	byteCount: number;
+	checksum: string;
+}
+
+export interface SessionSnapshotEndDto extends SessionRuntimeIdentityDto {
+	type: "session_snapshot_end";
+	snapshotId: string;
+	chunkCount: number;
+	itemCount: number;
+	byteCount: number;
+	checksum: string;
+	nextCursor: string | null;
+}
+
+export interface SessionHistoryPageBeginDto extends SessionRuntimeIdentityDto {
+	type: "session_history_page_begin";
+	requestId: string;
+	snapshotId: string;
+	asOfSeq: number;
+	cursor: string;
+	history: SessionHistoryMetadataDto;
+}
+
+export interface SessionHistoryPageChunkDto extends SessionRuntimeIdentityDto {
+	type: "session_history_page_chunk";
+	requestId: string;
+	snapshotId: string;
+	chunkIndex: number;
+	messages: SessionMessageDto[];
+	itemCount: number;
+	byteCount: number;
+	checksum: string;
+}
+
+export interface SessionHistoryPageEndDto extends SessionRuntimeIdentityDto {
+	type: "session_history_page_end";
+	requestId: string;
+	snapshotId: string;
+	chunkCount: number;
+	itemCount: number;
+	byteCount: number;
+	checksum: string;
+	nextCursor: string | null;
+}
+
 export interface SessionResponseFrameDto {
 	type: "response";
 	serverEpoch: string;
@@ -620,7 +746,7 @@ export interface SessionErrorDto {
 	type: "session_error";
 	serverEpoch: string;
 	sessionHandle: string;
-	operation: "subscribe" | "claim" | "release" | "extension_ui_response";
+	operation: "subscribe" | "claim" | "release" | "extension_ui_response" | "history_page";
 	error: string;
 	/** Stable machine-readable code; optional for backwards-compatible peers. */
 	code?: string;
@@ -635,6 +761,12 @@ export type SessionWsServerMessage =
 	| SessionLeaseStatusDto
 	| SessionResyncRequiredDto
 	| SessionSnapshotDto
+	| SessionSnapshotBeginDto
+	| SessionSnapshotChunkDto
+	| SessionSnapshotEndDto
+	| SessionHistoryPageBeginDto
+	| SessionHistoryPageChunkDto
+	| SessionHistoryPageEndDto
 	| {
 			type: "extension_ui_snapshot";
 			serverEpoch: string;
@@ -677,6 +809,24 @@ export interface FutureSessionSnapshotDto
 	stickyExtensionState: FutureStickyExtensionUiRequestDto[];
 }
 
+export interface FutureSessionSnapshotBeginDto
+	extends Omit<
+		SessionSnapshotBeginDto,
+		"projectionEvents" | "pendingExtensionRequests" | "stickyExtensionState"
+	> {
+	projectionEvents: FutureSessionProjectionEventDto[];
+	pendingExtensionRequests: FutureBlockingExtensionUiRequestDto[];
+	stickyExtensionState: FutureStickyExtensionUiRequestDto[];
+}
+
+export interface FutureSessionSnapshotChunkDto extends Omit<SessionSnapshotChunkDto, "messages"> {
+	messages: FutureSessionMessageDto[];
+}
+
+export interface FutureSessionHistoryPageChunkDto extends Omit<SessionHistoryPageChunkDto, "messages"> {
+	messages: FutureSessionMessageDto[];
+}
+
 export interface FutureSessionResponseFrameDto extends Omit<SessionResponseFrameDto, "response"> {
 	response: FutureSessionCommandResponseDto;
 }
@@ -693,10 +843,25 @@ export type FutureSessionWsServerMessage =
 	| FutureSessionResponseFrameDto
 	| FutureSessionReplayFrameDto
 	| FutureSessionSnapshotDto
+	| FutureSessionSnapshotBeginDto
+	| FutureSessionSnapshotChunkDto
+	| SessionSnapshotEndDto
+	| SessionHistoryPageBeginDto
+	| FutureSessionHistoryPageChunkDto
+	| SessionHistoryPageEndDto
 	| FutureExtensionUiSnapshotDto
 	| Exclude<
 			SessionWsServerMessage,
-			SessionResponseFrameDto | SessionReplayFrameDto | SessionSnapshotDto | { type: "extension_ui_snapshot" }
+			| SessionResponseFrameDto
+			| SessionReplayFrameDto
+			| SessionSnapshotDto
+			| SessionSnapshotBeginDto
+			| SessionSnapshotChunkDto
+			| SessionSnapshotEndDto
+			| SessionHistoryPageBeginDto
+			| SessionHistoryPageChunkDto
+			| SessionHistoryPageEndDto
+			| { type: "extension_ui_snapshot" }
 	  >;
 
 export function isSessionRuntimeIdentityDto(value: unknown): value is SessionRuntimeIdentityDto {
@@ -1118,6 +1283,284 @@ function isCanonicalSessionSnapshotDto(
 	return true;
 }
 
+function isHistoryCount(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isHistoryCursor(value: unknown): value is string | null {
+	return (
+		value === null ||
+		(typeof value === "string" &&
+			value.length > 0 &&
+			isBoundedString(value, SESSION_HISTORY_MAX_CURSOR_BYTES))
+	);
+}
+
+export function isSessionHistoryMetadataDto(value: unknown): value is SessionHistoryMetadataDto {
+	if (
+		!isRecord(value) ||
+		!hasOnlyKeys(value, ["totalMessages", "loadedMessages", "loadedBytes", "totalBytes", "nextCursor"]) ||
+		!isHistoryCount(value.totalMessages) ||
+		value.totalMessages > SESSION_HISTORY_MAX_MESSAGES ||
+		!isHistoryCount(value.loadedMessages) ||
+		value.loadedMessages > value.totalMessages ||
+		!isHistoryCount(value.loadedBytes) ||
+		value.loadedBytes > SESSION_HISTORY_MAX_STREAM_BYTES ||
+		!isHistoryCount(value.totalBytes) ||
+		value.totalBytes > SESSION_HISTORY_MAX_TOTAL_BYTES ||
+		value.loadedBytes > value.totalBytes ||
+		!isHistoryCursor(value.nextCursor)
+	) {
+		return false;
+	}
+	return true;
+}
+
+function isHistoryFrameIdentity(value: UnknownRecord, context?: SessionAttachmentGuardContext): boolean {
+	return (
+		isString(value.serverEpoch, 128) &&
+		(context === undefined || value.serverEpoch === context.serverEpoch) &&
+		isString(value.sessionHandle) &&
+		isString(value.workspaceId) &&
+		isGeneration(value.generation)
+	);
+}
+
+function isHistoryMessages(
+	value: unknown,
+	context: SessionAttachmentGuardContext | undefined,
+): value is SessionMessageDto[] {
+	return (
+		Array.isArray(value) &&
+		value.length <= SESSION_HISTORY_MAX_CHUNK_MESSAGES &&
+		isHistoryCount(sessionHistoryMessagesBytes(value)) &&
+		value.every((message) => isSessionMessageDto(message, context))
+	);
+}
+
+function isSessionSnapshotBeginDto(
+	value: unknown,
+	context?: SessionAttachmentGuardContext,
+): value is SessionSnapshotBeginDto {
+	if (
+		!isRecord(value) ||
+		!hasOnlyKeys(value, [
+			"type",
+			"snapshotId",
+			"serverEpoch",
+			"sessionHandle",
+			"workspaceId",
+			"generation",
+			"baseSeq",
+			"asOfSeq",
+			"runtime",
+			"projectionEvents",
+			"queue",
+			"pendingExtensionRequests",
+			"stickyExtensionState",
+			"history",
+		]) ||
+		value.type !== "session_snapshot_begin" ||
+		!isHistoryFrameIdentity(value, context) ||
+		!isString(value.snapshotId, SESSION_HISTORY_MAX_SNAPSHOT_ID_BYTES) ||
+		!isGeneration(value.baseSeq) ||
+		!isGeneration(value.asOfSeq) ||
+		value.baseSeq > value.asOfSeq ||
+		!isSessionRuntimeDto(value.runtime) ||
+		!isSameRuntimeIncarnation(value as unknown as SessionRuntimeIdentityDto, value.runtime) ||
+		value.runtime.lastSeq !== value.asOfSeq ||
+		!Array.isArray(value.projectionEvents) ||
+		value.projectionEvents.length > SESSION_SNAPSHOT_MAX_PROJECTION_EVENTS ||
+		!isRecord(value.queue) ||
+		!hasOnlyKeys(value.queue, ["steering", "followUp"]) ||
+		!Array.isArray(value.queue.steering) ||
+		value.queue.steering.length > SESSION_SNAPSHOT_MAX_QUEUE_ITEMS ||
+		!value.queue.steering.every((item) => isBoundedString(item, SESSION_TEXT_MAX_BYTES)) ||
+		!Array.isArray(value.queue.followUp) ||
+		value.queue.followUp.length > SESSION_SNAPSHOT_MAX_QUEUE_ITEMS ||
+		!value.queue.followUp.every((item) => isBoundedString(item, SESSION_TEXT_MAX_BYTES)) ||
+		!Array.isArray(value.pendingExtensionRequests) ||
+		value.pendingExtensionRequests.length > SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS ||
+		!value.pendingExtensionRequests.every(isBlockingExtensionRequest) ||
+		!Array.isArray(value.stickyExtensionState) ||
+		value.stickyExtensionState.length > SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS ||
+		!value.stickyExtensionState.every(isStickyExtensionRequest) ||
+		!isSessionHistoryMetadataDto(value.history)
+	) {
+		return false;
+	}
+
+	let previousSeq = value.baseSeq;
+	for (const event of value.projectionEvents) {
+		if (
+			!isProjectionEventDto(event, context) ||
+			!isSameRuntimeIncarnation(value as unknown as SessionRuntimeIdentityDto, event) ||
+			event.seq <= previousSeq ||
+			event.seq > value.asOfSeq
+		) {
+			return false;
+		}
+		previousSeq = event.seq;
+	}
+	return true;
+}
+
+function isSessionHistoryChunkDto(
+	value: unknown,
+	context: SessionAttachmentGuardContext | undefined,
+): value is SessionSnapshotChunkDto | SessionHistoryPageChunkDto {
+	if (!isRecord(value) || !isHistoryFrameIdentity(value, context)) return false;
+	const isSnapshotChunk = value.type === "session_snapshot_chunk";
+	const isPageChunk = value.type === "session_history_page_chunk";
+	if (!isSnapshotChunk && !isPageChunk) return false;
+	if (
+		(isSnapshotChunk &&
+			!hasOnlyKeys(value, [
+				"type",
+				"serverEpoch",
+				"sessionHandle",
+				"workspaceId",
+				"generation",
+				"snapshotId",
+				"chunkIndex",
+				"messages",
+				"itemCount",
+				"byteCount",
+				"checksum",
+			])) ||
+		(isPageChunk &&
+			!hasOnlyKeys(value, [
+				"type",
+				"serverEpoch",
+				"sessionHandle",
+				"workspaceId",
+				"generation",
+				"requestId",
+				"snapshotId",
+				"chunkIndex",
+				"messages",
+				"itemCount",
+				"byteCount",
+				"checksum",
+			]))
+	) {
+		return false;
+	}
+	if (
+		(isPageChunk && !isString(value.requestId)) ||
+		!isString(value.snapshotId, SESSION_HISTORY_MAX_SNAPSHOT_ID_BYTES) ||
+		!isHistoryCount(value.chunkIndex) ||
+		value.chunkIndex >= SESSION_HISTORY_MAX_MESSAGES ||
+		!isHistoryMessages(value.messages, context) ||
+		!isHistoryCount(value.itemCount) ||
+		value.itemCount !== value.messages.length ||
+		!isHistoryCount(value.byteCount) ||
+		value.byteCount !== sessionHistoryMessagesBytes(value.messages) ||
+		value.byteCount > SESSION_HISTORY_MAX_CHUNK_BYTES ||
+		!isSessionHistoryChecksum(value.checksum) ||
+		value.checksum !== sessionHistoryChecksum(value.messages)
+	) {
+		return false;
+	}
+	return true;
+}
+
+function isSessionSnapshotEndDto(
+	value: unknown,
+	context?: SessionAttachmentGuardContext,
+): value is SessionSnapshotEndDto {
+	return (
+		isRecord(value) &&
+		hasOnlyKeys(value, [
+			"type",
+			"serverEpoch",
+			"sessionHandle",
+			"workspaceId",
+			"generation",
+			"snapshotId",
+			"chunkCount",
+			"itemCount",
+			"byteCount",
+			"checksum",
+			"nextCursor",
+		]) &&
+		value.type === "session_snapshot_end" &&
+		isHistoryFrameIdentity(value, context) &&
+		isString(value.snapshotId, SESSION_HISTORY_MAX_SNAPSHOT_ID_BYTES) &&
+		isHistoryCount(value.chunkCount) &&
+		value.chunkCount <= SESSION_HISTORY_MAX_MESSAGES &&
+		isHistoryCount(value.itemCount) &&
+		value.itemCount <= SESSION_HISTORY_MAX_MESSAGES &&
+		isHistoryCount(value.byteCount) &&
+		value.byteCount <= SESSION_HISTORY_MAX_STREAM_BYTES &&
+		isSessionHistoryChecksum(value.checksum) &&
+		isHistoryCursor(value.nextCursor)
+	);
+}
+
+function isSessionHistoryPageBeginDto(
+	value: unknown,
+	context?: SessionAttachmentGuardContext,
+): value is SessionHistoryPageBeginDto {
+	return (
+		isRecord(value) &&
+		hasOnlyKeys(value, [
+			"type",
+			"serverEpoch",
+			"sessionHandle",
+			"workspaceId",
+			"generation",
+			"requestId",
+			"snapshotId",
+			"asOfSeq",
+			"cursor",
+			"history",
+		]) &&
+		value.type === "session_history_page_begin" &&
+		isHistoryFrameIdentity(value, context) &&
+		isString(value.requestId) &&
+		isString(value.snapshotId, SESSION_HISTORY_MAX_SNAPSHOT_ID_BYTES) &&
+		isGeneration(value.asOfSeq) &&
+		isBoundedString(value.cursor, SESSION_HISTORY_MAX_CURSOR_BYTES) &&
+		isSessionHistoryMetadataDto(value.history)
+	);
+}
+
+function isSessionHistoryPageEndDto(
+	value: unknown,
+	context?: SessionAttachmentGuardContext,
+): value is SessionHistoryPageEndDto {
+	return (
+		isRecord(value) &&
+		hasOnlyKeys(value, [
+			"type",
+			"serverEpoch",
+			"sessionHandle",
+			"workspaceId",
+			"generation",
+			"requestId",
+			"snapshotId",
+			"chunkCount",
+			"itemCount",
+			"byteCount",
+			"checksum",
+			"nextCursor",
+		]) &&
+		value.type === "session_history_page_end" &&
+		isHistoryFrameIdentity(value, context) &&
+		isString(value.requestId) &&
+		isString(value.snapshotId, SESSION_HISTORY_MAX_SNAPSHOT_ID_BYTES) &&
+		isHistoryCount(value.chunkCount) &&
+		value.chunkCount <= SESSION_HISTORY_MAX_MESSAGES &&
+		isHistoryCount(value.itemCount) &&
+		value.itemCount <= SESSION_HISTORY_MAX_MESSAGES &&
+		isHistoryCount(value.byteCount) &&
+		value.byteCount <= SESSION_HISTORY_MAX_STREAM_BYTES &&
+		isSessionHistoryChecksum(value.checksum) &&
+		isHistoryCursor(value.nextCursor)
+	);
+}
+
 export function isSessionSnapshotDto(
 	value: unknown,
 	context?: SessionAttachmentGuardContext,
@@ -1149,6 +1592,22 @@ export function isSessionWsServerMessage(
 		return false;
 	}
 	if (value.type === "session_snapshot") return isSessionSnapshotDto(value, context);
+	if (
+		value.type === "session_snapshot_begin" ||
+		value.type === "session_snapshot_chunk" ||
+		value.type === "session_snapshot_end" ||
+		value.type === "session_history_page_begin" ||
+		value.type === "session_history_page_chunk" ||
+		value.type === "session_history_page_end"
+	) {
+		if (sessionWsServerMessageBytes(value) > SESSION_WS_SERVER_MAX_BYTES) return false;
+		if (value.type === "session_snapshot_begin") return isSessionSnapshotBeginDto(value, context);
+		if (value.type === "session_snapshot_chunk") return isSessionHistoryChunkDto(value, context);
+		if (value.type === "session_snapshot_end") return isSessionSnapshotEndDto(value, context);
+		if (value.type === "session_history_page_begin") return isSessionHistoryPageBeginDto(value, context);
+		if (value.type === "session_history_page_chunk") return isSessionHistoryChunkDto(value, context);
+		return isSessionHistoryPageEndDto(value, context);
+	}
 	if (sessionWsServerMessageBytes(value) > SESSION_WS_SERVER_MAX_BYTES) return false;
 	switch (value.type) {
 		case "hot_runtime_inventory":
@@ -1279,7 +1738,9 @@ export function isSessionWsServerMessage(
 				]) ||
 				!isString(value.serverEpoch, 128) ||
 				!isString(value.sessionHandle) ||
-				!["subscribe", "claim", "release", "extension_ui_response"].includes(String(value.operation)) ||
+				!["subscribe", "claim", "release", "extension_ui_response", "history_page"].includes(
+					String(value.operation),
+				) ||
 				!isBoundedString(value.error, SESSION_TEXT_MAX_BYTES)
 			) {
 				return false;
@@ -1370,6 +1831,135 @@ function isFutureStickyExtensionRequest(
 		isFutureExtensionUiRequestDto(value, context) &&
 		["setStatus", "setWidget", "setTitle", "set_editor_text"].includes(value.method)
 	);
+}
+
+function isFutureSessionSnapshotBeginDto(
+	value: unknown,
+	context: FutureSessionContentRefGuardContext,
+): value is FutureSessionSnapshotBeginDto {
+	if (
+		!isRecord(value) ||
+		!hasOnlyKeys(value, [
+			"type",
+			"snapshotId",
+			"serverEpoch",
+			"sessionHandle",
+			"workspaceId",
+			"generation",
+			"baseSeq",
+			"asOfSeq",
+			"runtime",
+			"projectionEvents",
+			"queue",
+			"pendingExtensionRequests",
+			"stickyExtensionState",
+			"history",
+		]) ||
+		value.type !== "session_snapshot_begin" ||
+		!isHistoryFrameIdentity(value, futureAttachmentContext(context)) ||
+		!isString(value.snapshotId, SESSION_HISTORY_MAX_SNAPSHOT_ID_BYTES) ||
+		!isGeneration(value.baseSeq) ||
+		!isGeneration(value.asOfSeq) ||
+		value.baseSeq > value.asOfSeq ||
+		!isSessionRuntimeDto(value.runtime) ||
+		!isSameRuntimeIncarnation(value as unknown as SessionRuntimeIdentityDto, value.runtime) ||
+		value.runtime.lastSeq !== value.asOfSeq ||
+		!Array.isArray(value.projectionEvents) ||
+		value.projectionEvents.length > SESSION_SNAPSHOT_MAX_PROJECTION_EVENTS ||
+		!isRecord(value.queue) ||
+		!hasOnlyKeys(value.queue, ["steering", "followUp"]) ||
+		!Array.isArray(value.queue.steering) ||
+		value.queue.steering.length > SESSION_SNAPSHOT_MAX_QUEUE_ITEMS ||
+		!value.queue.steering.every((item) => isBoundedString(item, SESSION_TEXT_MAX_BYTES)) ||
+		!Array.isArray(value.queue.followUp) ||
+		value.queue.followUp.length > SESSION_SNAPSHOT_MAX_QUEUE_ITEMS ||
+		!value.queue.followUp.every((item) => isBoundedString(item, SESSION_TEXT_MAX_BYTES)) ||
+		!Array.isArray(value.pendingExtensionRequests) ||
+		value.pendingExtensionRequests.length > SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS ||
+		!value.pendingExtensionRequests.every((request) => isFutureBlockingExtensionRequest(request, context)) ||
+		!Array.isArray(value.stickyExtensionState) ||
+		value.stickyExtensionState.length > SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS ||
+		!value.stickyExtensionState.every((request) => isFutureStickyExtensionRequest(request, context)) ||
+		!isSessionHistoryMetadataDto(value.history)
+	) {
+		return false;
+	}
+
+	let previousSeq = value.baseSeq;
+	for (const event of value.projectionEvents) {
+		if (
+			!isFutureSessionProjectionEventDto(event, context) ||
+			!isSameRuntimeIncarnation(value as unknown as SessionRuntimeIdentityDto, event) ||
+			event.seq <= previousSeq ||
+			event.seq > value.asOfSeq
+		) {
+			return false;
+		}
+		previousSeq = event.seq;
+	}
+	return true;
+}
+
+function isFutureSessionHistoryChunkDto(
+	value: unknown,
+	context: FutureSessionContentRefGuardContext,
+): value is FutureSessionSnapshotChunkDto | FutureSessionHistoryPageChunkDto {
+	if (!isRecord(value) || !isHistoryFrameIdentity(value, futureAttachmentContext(context))) return false;
+	const isSnapshotChunk = value.type === "session_snapshot_chunk";
+	const isPageChunk = value.type === "session_history_page_chunk";
+	if (!isSnapshotChunk && !isPageChunk) return false;
+	if (
+		(isSnapshotChunk &&
+			!hasOnlyKeys(value, [
+				"type",
+				"serverEpoch",
+				"sessionHandle",
+				"workspaceId",
+				"generation",
+				"snapshotId",
+				"chunkIndex",
+				"messages",
+				"itemCount",
+				"byteCount",
+				"checksum",
+			])) ||
+		(isPageChunk &&
+			!hasOnlyKeys(value, [
+				"type",
+				"serverEpoch",
+				"sessionHandle",
+				"workspaceId",
+				"generation",
+				"requestId",
+				"snapshotId",
+				"chunkIndex",
+				"messages",
+				"itemCount",
+				"byteCount",
+				"checksum",
+			]))
+	) {
+		return false;
+	}
+	if (
+		(isPageChunk && !isString(value.requestId)) ||
+		!isString(value.snapshotId, SESSION_HISTORY_MAX_SNAPSHOT_ID_BYTES) ||
+		!isHistoryCount(value.chunkIndex) ||
+		value.chunkIndex >= SESSION_HISTORY_MAX_MESSAGES ||
+		!Array.isArray(value.messages) ||
+		value.messages.length > SESSION_HISTORY_MAX_CHUNK_MESSAGES ||
+		!value.messages.every((message) => isFutureSessionMessageDto(message, context)) ||
+		!isHistoryCount(value.itemCount) ||
+		value.itemCount !== value.messages.length ||
+		!isHistoryCount(value.byteCount) ||
+		value.byteCount !== sessionHistoryMessagesBytes(value.messages) ||
+		value.byteCount > SESSION_HISTORY_MAX_CHUNK_BYTES ||
+		!isSessionHistoryChecksum(value.checksum) ||
+		value.checksum !== sessionHistoryChecksum(value.messages)
+	) {
+		return false;
+	}
+	return true;
 }
 
 function isCanonicalFutureSessionSnapshotDto(
@@ -1465,6 +2055,26 @@ export function isFutureSessionWsServerMessage(
 ): value is FutureSessionWsServerMessage {
 	if (!context || !isFutureSessionContentRefGuardContext(context) || !isRecord(value)) return false;
 	if (value.type === "session_snapshot") return isFutureSessionSnapshotDto(value, context);
+	if (
+		value.type === "session_snapshot_begin" ||
+		value.type === "session_snapshot_chunk" ||
+		value.type === "session_snapshot_end" ||
+		value.type === "session_history_page_begin" ||
+		value.type === "session_history_page_chunk" ||
+		value.type === "session_history_page_end"
+	) {
+		if (sessionWsServerMessageBytes(value) > SESSION_WS_SERVER_MAX_BYTES) return false;
+		if (value.type === "session_snapshot_begin") return isFutureSessionSnapshotBeginDto(value, context);
+		if (value.type === "session_snapshot_chunk") return isFutureSessionHistoryChunkDto(value, context);
+		if (value.type === "session_snapshot_end") {
+			return isSessionSnapshotEndDto(value, futureAttachmentContext(context));
+		}
+		if (value.type === "session_history_page_begin") {
+			return isSessionHistoryPageBeginDto(value, futureAttachmentContext(context));
+		}
+		if (value.type === "session_history_page_chunk") return isFutureSessionHistoryChunkDto(value, context);
+		return isSessionHistoryPageEndDto(value, futureAttachmentContext(context));
+	}
 	if (sessionWsServerMessageBytes(value) > SESSION_WS_SERVER_MAX_BYTES) return false;
 	if (value.type === "event") return isFutureSessionProjectionEventDto(value, context);
 	if (value.type === "extension_ui_request" || value.type === "extension_ui_closed") {

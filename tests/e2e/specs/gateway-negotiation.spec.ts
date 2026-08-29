@@ -4,6 +4,7 @@ import { expect, test } from "../fixtures/test";
 const MIB = 1024 * 1024;
 const PAYLOAD_CAPABILITY = "payload.epoch_attachment_refs";
 const CONTENT_REF_CAPABILITY = "payload.epoch_content_refs";
+const SESSION_HISTORY_CAPABILITY = "session.chunked_history";
 const CONTENT_REF_PROTOCOL_MINOR = 3;
 const MAX_SERVER_FRAME_BYTES = 65 * MIB;
 const CONTENT_REF_BUDGET = {
@@ -116,6 +117,7 @@ test("a real browser negotiates an independently versioned client hello", async 
 				"rpc.extension_ui",
 				"session.multiplex",
 				"session.hot_runtime_inventory",
+				SESSION_HISTORY_CAPABILITY,
 				PAYLOAD_CAPABILITY,
 				CONTENT_REF_CAPABILITY,
 			],

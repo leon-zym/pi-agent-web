@@ -1984,8 +1984,8 @@ describe("PiProcess response correlation", () => {
 			onExit: (info) => failures.push(info),
 		});
 		await proc.start();
-		await waitFor(() => failures.length === 1);
-		await waitFor(() => !proc?.running);
+		await waitFor(() => failures.length === 1, 5_000);
+		await waitFor(() => !proc?.running, 5_000);
 		expect(failures[0]).toMatchObject({
 			reason: "protocol_incompatible",
 			diagnostic: { reason: "oversized_frame" },

@@ -9,6 +9,7 @@ import {
 	GATEWAY_CONTENT_REF_CAPABILITY,
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+	GATEWAY_SESSION_HISTORY_CAPABILITY,
 } from "@pi-agent-web/protocol";
 import {
 	createGatewayAccessControl,
@@ -136,7 +137,12 @@ const CURRENT_MAIN_MODE: MainModeFactory<"current"> = {
 	bridgeRuntime: (runtime) => ({
 		version: runtime.version,
 		adapterId: runtime.adapterId,
-		capabilities: [...runtime.capabilities, "session.multiplex", GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY],
+		capabilities: [
+			...runtime.capabilities,
+			"session.multiplex",
+			GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+			GATEWAY_SESSION_HISTORY_CAPABILITY,
+		],
 	}),
 };
 
@@ -166,6 +172,7 @@ const FUTURE_MAIN_MODE: MainModeFactory<"future_content"> = {
 			...runtime.capabilities,
 			"session.multiplex",
 			GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+			GATEWAY_SESSION_HISTORY_CAPABILITY,
 			GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 			GATEWAY_CONTENT_REF_CAPABILITY,
 		],

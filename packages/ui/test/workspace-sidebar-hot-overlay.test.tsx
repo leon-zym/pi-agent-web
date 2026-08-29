@@ -24,7 +24,7 @@ vi.mock("../src/stores/session-transport", async (importOriginal) => {
 
 import { WorkspaceSidebar } from "../src/features/sidebar/WorkspaceSidebar";
 import { useSessionDirectoryStore } from "../src/stores/session-directory";
-import { sessionTransport } from "../src/stores/session-transport";
+import { emptySessionHistoryState, sessionTransport } from "../src/stores/session-transport";
 
 const originalDirectory = useSessionDirectoryStore.getState();
 const originalTransport = sessionTransport.store.getState();
@@ -304,6 +304,7 @@ describe("WorkspaceSidebar hot runtime overlay", () => {
 					pendingExtensionRequests: [],
 					resync: null,
 					recovery: null,
+					history: emptySessionHistoryState(),
 					subscriptionAdmission: { kind: "protected_overage", retryable: false },
 					rawEvents: [],
 				},
@@ -321,6 +322,7 @@ describe("WorkspaceSidebar hot runtime overlay", () => {
 					pendingExtensionRequests: [],
 					resync: null,
 					recovery: null,
+					history: emptySessionHistoryState(),
 					subscriptionAdmission: {
 						kind: "rejected",
 						code: "session_subscription_capacity",

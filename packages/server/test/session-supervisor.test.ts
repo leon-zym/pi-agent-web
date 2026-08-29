@@ -65,6 +65,48 @@ function createNativeSession(root: string, cwd: string, nativeSessionId: string)
 	};
 }
 
+function appendLargeNativeHistory(target: ExistingSessionTarget, count: number, textBytes: number): void {
+	let parentId: string | null = null;
+	const text = "h".repeat(textBytes);
+	for (let index = 0; index < count; index += 1) {
+		const id = `history-entry-${String(index)}`;
+		fs.appendFileSync(
+			target.sessionFile,
+			`${JSON.stringify({
+				type: "message",
+				id,
+				parentId,
+				timestamp: "2026-08-20T00:00:00.000Z",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: `${String(index)}:${text}` }],
+					timestamp: index + 1,
+				},
+			})}\n`,
+		);
+		parentId = id;
+	}
+}
+
+function appendNativeHistoryEntry(target: ExistingSessionTarget, index: number, textBytes: number): void {
+	const id = `history-entry-${String(index)}`;
+	const parentId = index > 0 ? `history-entry-${String(index - 1)}` : null;
+	fs.appendFileSync(
+		target.sessionFile,
+		`${JSON.stringify({
+			type: "message",
+			id,
+			parentId,
+			timestamp: "2026-08-20T00:00:00.000Z",
+			message: {
+				role: "user",
+				content: [{ type: "text", text: `${String(index)}:${"h".repeat(textBytes)}` }],
+				timestamp: index + 1,
+			},
+		})}\n`,
+	);
+}
+
 function createHarness(options: {
 	targets: ExistingSessionTarget[];
 	onBroadcast?: (message: SessionSupervisorMessage) => void;
@@ -1733,6 +1775,121 @@ describe("SessionSupervisor", () => {
 		await new Promise<void>((resolve) => setTimeout(resolve, 25));
 		expect(supervisor.getRuntime(target.sessionHandle)?.generation).toBe(1);
 		await expect(supervisor.activate(target.sessionHandle)).rejects.toThrow("session_snapshot_overflow");
+	});
+
+	it("opens a native history larger than one snapshot frame through a bounded plan", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "chunked-history");
+		appendLargeNativeHistory(target, 110, 600 * 1024);
+		expect(fs.statSync(target.sessionFile).size).toBeGreaterThan(64 * 1024 * 1024);
+		const getMessagesMarker = path.join(root, "get-messages.log");
+		const { supervisor } = createHarness({
+			targets: [target],
+			env: { PI_WEB_FIXTURE_GET_MESSAGES_MARKER: getMessagesMarker },
+			maxAutoRestarts: 0,
+		});
+
+		await expect(supervisor.activate(target.sessionHandle)).resolves.toMatchObject({ state: "idle" });
+		const result = await supervisor.subscribe(target.sessionHandle);
+		if (result.type !== "resync_required" || !result.chunkedSnapshot) {
+			throw new Error("large native history did not produce a chunked snapshot");
+		}
+		expect(result.chunkedSnapshot.history).toMatchObject({
+			totalMessages: 110,
+			loadedMessages: 96,
+			nextCursor: expect.any(String),
+		});
+		expect(result.snapshot.settledMessages).toHaveLength(96);
+		expect(fs.existsSync(getMessagesMarker)).toBe(false);
+
+		const older = await result.chunkedSnapshot.readPage(result.chunkedSnapshot.history.nextCursor!, 8);
+		expect(older.messages).toHaveLength(8);
+		expect(older.messages[0]).toMatchObject({
+			role: "user",
+			content: [{ type: "text", text: expect.stringContaining("6:") }],
+		});
+		expect(older.nextCursor).toEqual(expect.any(String));
+	});
+
+	it("refreshes the native history cursor when the persisted source grows while idle", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "chunked-history-growth");
+		appendLargeNativeHistory(target, 110, 600 * 1024);
+		const getMessagesMarker = path.join(root, "get-messages.log");
+		const { supervisor } = createHarness({
+			targets: [target],
+			env: { PI_WEB_FIXTURE_GET_MESSAGES_MARKER: getMessagesMarker },
+			maxAutoRestarts: 0,
+		});
+
+		await supervisor.activate(target.sessionHandle);
+		appendNativeHistoryEntry(target, 110, 600 * 1024);
+		const runtime = exactRuntimeObject(supervisor, target.sessionHandle);
+		const maybeCompact = Reflect.get(runtime, "maybeCompactIdleProjectionBase");
+		if (typeof maybeCompact !== "function") throw new Error("Idle compaction seam is unavailable");
+		Reflect.apply(maybeCompact, runtime, []);
+		let compaction: Promise<void> | null = null;
+		await waitFor(() => {
+			const candidate = Reflect.get(runtime, "idleBaseCompactionPromise");
+			if (!(candidate instanceof Promise)) return false;
+			compaction = candidate;
+			return true;
+		}, 5_000);
+		await compaction;
+
+		const plan = Reflect.get(runtime, "nativeHistoryPlan") as { totalMessages?: number } | null;
+		expect(plan?.totalMessages).toBe(111);
+		expect(fs.existsSync(getMessagesMarker)).toBe(false);
+	});
+
+	it("refreshes a large native history during idle compaction without calling Pi get_messages", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "chunked-history-compaction");
+		appendLargeNativeHistory(target, 110, 600 * 1024);
+		const getMessagesMarker = path.join(root, "get-messages.log");
+		const { supervisor } = createHarness({
+			targets: [target],
+			env: { PI_WEB_FIXTURE_GET_MESSAGES_MARKER: getMessagesMarker },
+			projectionLimits: { maxLiveEventItems: 2_048 },
+			maxAutoRestarts: 0,
+		});
+		const lease = await supervisor.claim(target.sessionHandle, "controller");
+
+		for (let turn = 0; turn < 2; turn += 1) {
+			const runtime = supervisor.getRuntime(target.sessionHandle)!;
+			await supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "prompt", message: "structural-burst" },
+				{
+					connectionId: "controller",
+					expectedGeneration: runtime.generation,
+					fencingToken: lease.fencingToken,
+				},
+			);
+			await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "idle", 5_000);
+		}
+
+		let compaction: Promise<void> | null = null;
+		await waitFor(() => {
+			const candidate = Reflect.get(
+				exactRuntimeObject(supervisor, target.sessionHandle),
+				"idleBaseCompactionPromise",
+			);
+			if (!(candidate instanceof Promise)) return false;
+			compaction = candidate;
+			return true;
+		}, 5_000);
+		await compaction;
+		expect(fs.existsSync(getMessagesMarker)).toBe(false);
+		expect(
+			runtimeProjection(exactRuntimeObject(supervisor, target.sessionHandle)).snapshot().settledMessages,
+		).toHaveLength(96);
 	});
 
 	it("preflights aggregate wire bounds before ready and releases the hot slot on failure", async () => {
