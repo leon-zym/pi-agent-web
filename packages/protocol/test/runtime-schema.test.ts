@@ -97,6 +97,8 @@ describe("runtime schema boundary", () => {
 		expect(Object.isFrozen(registry)).toBe(true);
 		expect(registry.get("frame")).toBe(testFrameSchema);
 		expect(registry.get("missing")).toBeUndefined();
+		expect(registry.get("__proto__")).toBeUndefined();
+		expect(registry.get("constructor")).toBeUndefined();
 		expect(registry.names).toEqual(["frame"]);
 	});
 

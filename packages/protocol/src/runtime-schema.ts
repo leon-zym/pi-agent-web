@@ -89,7 +89,7 @@ export function createRuntimeSchemaRegistry(
 	return Object.freeze({
 		names,
 		get(name: string) {
-			return entries[name];
+			return Object.hasOwn(entries, name) ? entries[name] : undefined;
 		},
 	});
 }
