@@ -121,6 +121,30 @@ test("browser sends one cancellation for a repeated cancel gesture", async ({ pa
 	expect(errors.page).toEqual([]);
 });
 
+test("mobile keeps a blocking Extension UI dialog inside the viewport", async ({ page, harness }) => {
+	const errors = observePageErrors(page);
+	await page.setViewportSize({ width: 375, height: 844 });
+	await openWorkbench(page, harness);
+	await sendPrompt(page, CANCEL_PROMPT);
+
+	const dialog = page.getByRole("dialog", { name: "Synthetic approval" });
+	await expect(dialog).toBeVisible();
+	const box = await dialog.boundingBox();
+	if (!box || box.x < 0 || box.x + box.width > 375 || box.y < 0 || box.y + box.height > 844) {
+		throw new Error(`mobile Extension dialog escaped its viewport: ${JSON.stringify(box)}`);
+	}
+	await expect(dialog.getByRole("button", { name: /^(Cancel|取消)$/ })).toBeVisible();
+	await dialog.getByRole("button", { name: /^(Cancel|取消)$/ }).click();
+	await expect(dialog).toBeHidden();
+	await expect(page.locator("main").getByText("E2E_EXTENSION_CANCELLED", { exact: true })).toBeVisible();
+	const overflow = await pageOverflow(page);
+	expect(overflow.htmlScrollWidth, JSON.stringify(overflow, null, 2)).toBeLessThanOrEqual(
+		overflow.viewportWidth,
+	);
+	expect(errors.console).toEqual([]);
+	expect(errors.page).toEqual([]);
+});
+
 test("browser closes and cancels an Extension UI request after its timeout", async ({ page, harness }) => {
 	const errors = observePageErrors(page);
 	await openWorkbench(page, harness);
