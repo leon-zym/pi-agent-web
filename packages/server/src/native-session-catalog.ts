@@ -80,6 +80,7 @@ interface CachedDirectorySummary {
 	revision: string;
 	sessions: NativeSessionSummary[];
 	files: Map<string, CachedSessionFileSummary>;
+	retryable: boolean;
 }
 
 interface CachedSessionFileSummary {
@@ -113,6 +114,11 @@ interface NativeSessionScanState {
 	messageCount: number;
 	firstMessage?: string;
 	lastActivityTime?: number;
+}
+
+interface NativeSessionScanResult {
+	summary: NativeSessionSummary | null;
+	retryable: boolean;
 }
 
 export function canonicalizeSessionFile(sessionFile: string): string {
@@ -367,7 +373,7 @@ export class NativeSessionCatalog {
 			.run(async () => {
 				const beforeRevision = await directoryRevision(directory);
 				const cached = this.directoryCache.get(cacheKey);
-				if (cached?.revision === beforeRevision) return cached.sessions;
+				if (cached?.retryable !== true && cached?.revision === beforeRevision) return cached.sessions;
 
 				const scanned = await this.scanSessionDirectory(directory, cached?.files);
 				const afterRevision = await directoryRevision(directory);
@@ -376,6 +382,7 @@ export class NativeSessionCatalog {
 						revision: afterRevision,
 						sessions: scanned.sessions,
 						files: scanned.files,
+						retryable: scanned.retryable,
 					});
 				}
 				return scanned.sessions;
@@ -390,12 +397,16 @@ export class NativeSessionCatalog {
 	private async scanSessionDirectory(
 		directory: string,
 		cachedFiles?: ReadonlyMap<string, CachedSessionFileSummary>,
-	): Promise<{ sessions: NativeSessionSummary[]; files: Map<string, CachedSessionFileSummary> }> {
+	): Promise<{
+		sessions: NativeSessionSummary[];
+		files: Map<string, CachedSessionFileSummary>;
+		retryable: boolean;
+	}> {
 		let entries: fs.Dirent[];
 		try {
 			entries = await fs.promises.readdir(directory, { withFileTypes: true });
 		} catch (error) {
-			if (isMissing(error)) return { sessions: [], files: new Map() };
+			if (isMissing(error)) return { sessions: [], files: new Map(), retryable: true };
 			throw error;
 		}
 
@@ -410,23 +421,35 @@ export class NativeSessionCatalog {
 		const scannedFiles = await mapWithConcurrency(
 			[...files.entries()],
 			NATIVE_SESSION_FILE_SCAN_CONCURRENCY,
-			async ([canonicalFile, file]) => {
+			async ([canonicalFile, file]): Promise<{
+				canonicalFile: string;
+				cached?: CachedSessionFileSummary;
+				retryable: boolean;
+			}> => {
 				const revision = await sessionFileRevision(file);
 				const cached = cachedFiles?.get(canonicalFile);
-				if (cached?.revision === revision) return [canonicalFile, cached] as const;
-				const summary = await this.sessionFileScanLimiter.run(() => scanNativeSessionFile(file));
-				return [
+				if (cached?.revision === revision) return { canonicalFile, cached, retryable: false };
+				const result = await this.sessionFileScanLimiter.run(() => scanNativeSessionFile(file));
+				if (result.retryable) return { canonicalFile, retryable: true };
+				return {
 					canonicalFile,
-					{ revision, summary: summary ? { ...summary, path: canonicalFile } : null },
-				] as const;
+					cached: {
+						revision,
+						summary: result.summary ? { ...result.summary, path: canonicalFile } : null,
+					},
+					retryable: false,
+				};
 			},
 		);
-		const fileCache = new Map(scannedFiles);
+		const fileCache = new Map(
+			scannedFiles.flatMap((entry) => (entry.cached ? [[entry.canonicalFile, entry.cached] as const] : [])),
+		);
 		return {
 			sessions: scannedFiles
-				.map(([, cached]) => cached.summary)
+				.map((entry) => entry.cached?.summary ?? null)
 				.filter((summary): summary is NativeSessionSummary => summary !== null),
 			files: fileCache,
+			retryable: scannedFiles.some((entry) => entry.retryable),
 		};
 	}
 
@@ -461,10 +484,10 @@ function toNativeSessionRecord(sessionFile: string, info: NativeSessionSummary):
 	};
 }
 
-async function scanNativeSessionFile(filePath: string): Promise<NativeSessionSummary | null> {
+async function scanNativeSessionFile(filePath: string): Promise<NativeSessionScanResult> {
 	try {
 		const stat = await fs.promises.stat(filePath);
-		if (!stat.isFile() || stat.size === 0) return null;
+		if (!stat.isFile() || stat.size === 0) return { summary: null, retryable: false };
 
 		const state: NativeSessionScanState = { lineNumber: 0, messageCount: 0 };
 		const decoder = new StringDecoder("utf8");
@@ -495,7 +518,7 @@ async function scanNativeSessionFile(filePath: string): Promise<NativeSessionSum
 		}
 
 		const header = state.header;
-		if (!header) return null;
+		if (!header) return { summary: null, retryable: false };
 		const headerTime = parseDateMillis(header.timestamp);
 		const createdTime = headerTime ?? safeStatCreatedTime(stat);
 		const modifiedTime =
@@ -504,20 +527,23 @@ async function scanNativeSessionFile(filePath: string): Promise<NativeSessionSum
 				: (headerTime ?? stat.mtimeMs);
 
 		return {
-			path: filePath,
-			id: header.id,
-			cwd: header.cwd,
-			name: state.name,
-			parentSessionPath: header.parentSessionPath,
-			created: new Date(createdTime),
-			modified: new Date(modifiedTime),
-			messageCount: state.messageCount,
-			firstMessage: state.firstMessage ?? "",
+			summary: {
+				path: filePath,
+				id: header.id,
+				cwd: header.cwd,
+				name: state.name,
+				parentSessionPath: header.parentSessionPath,
+				created: new Date(createdTime),
+				modified: new Date(modifiedTime),
+				messageCount: state.messageCount,
+				firstMessage: state.firstMessage ?? "",
+			},
+			retryable: false,
 		};
-	} catch {
+	} catch (error) {
 		// Native history discovery is best-effort. One changing, corrupt, or
 		// unreadable JSONL file must not hide healthy sessions beside it.
-		return null;
+		return { summary: null, retryable: isRetryableNativeSessionScanError(error) };
 	}
 }
 
@@ -752,11 +778,23 @@ async function directoryRevision(directory: string): Promise<string> {
 
 async function sessionFileRevision(filePath: string): Promise<string> {
 	try {
+		const canonicalFile = canonicalizeSessionFile(filePath);
+		const linkStat = await fs.promises.lstat(filePath, { bigint: true });
 		const stat = await fs.promises.stat(filePath, { bigint: true });
-		return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+		return `${canonicalFile}\0${linkStat.isSymbolicLink() ? "symlink" : "file"}\0${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
 	} catch (error) {
 		return isMissing(error) ? "missing" : "unreadable";
 	}
+}
+
+function isRetryableNativeSessionScanError(error: unknown): boolean {
+	if (isMissing(error)) return true;
+	if (typeof error !== "object" || error === null || !("code" in error)) return false;
+	const code = (error as { code?: unknown }).code;
+	return (
+		typeof code === "string" &&
+		["EACCES", "EAGAIN", "EBUSY", "EIO", "EMFILE", "ENFILE", "ETIMEDOUT"].includes(code)
+	);
 }
 
 class AsyncLimiter {

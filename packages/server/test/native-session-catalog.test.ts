@@ -547,6 +547,61 @@ describe("NativeSessionCatalog", () => {
 		expect(createReadStream).toHaveBeenCalledTimes(3);
 	});
 
+	it("invalidates a directory cache when a symlink changes its canonical target", async () => {
+		const root = temporaryDirectory();
+		const resolver = createResolver(root);
+		const workspace = path.join(root, "workspace");
+		const sessionDirectory = resolver.defaultSessionDirForWorkspace(workspace);
+		const targets = path.join(root, "targets");
+		fs.mkdirSync(workspace);
+		fs.mkdirSync(targets);
+		const targetA = writeSession(targets, "a.jsonl", { id: "same", cwd: workspace });
+		const targetB = path.join(targets, "b.jsonl");
+		fs.linkSync(targetA, targetB);
+		const link = path.join(sessionDirectory, "linked.jsonl");
+		fs.mkdirSync(sessionDirectory, { recursive: true });
+		fs.symlinkSync(targetA, link);
+		const catalog = new NativeSessionCatalog({ layoutResolver: resolver, cacheTtlMs: 0 });
+
+		expect((await catalog.refresh({ force: true })).sessions[0]?.sessionFile).toBe(
+			canonicalizeSessionFile(targetA),
+		);
+		fs.unlinkSync(link);
+		fs.symlinkSync(targetB, link);
+
+		expect((await catalog.refresh({ force: true })).sessions[0]?.sessionFile).toBe(
+			canonicalizeSessionFile(targetB),
+		);
+	});
+
+	it("retries a file after a transient read error without retaining a negative cache", async () => {
+		const root = temporaryDirectory();
+		const resolver = createResolver(root);
+		const workspace = path.join(root, "workspace");
+		fs.mkdirSync(workspace);
+		writeSession(resolver.defaultSessionDirForWorkspace(workspace), "one.jsonl", {
+			id: "one",
+			cwd: workspace,
+		});
+		const originalCreateReadStream = fs.createReadStream.bind(fs);
+		const createReadStream = vi.spyOn(fs, "createReadStream");
+		createReadStream.mockImplementationOnce((filePath, options) => {
+			const stream = new PassThrough();
+			const error = Object.assign(new Error("temporary read failure"), { code: "EIO" });
+			process.nextTick(() => stream.destroy(error));
+			return stream as unknown as fs.ReadStream;
+		});
+		createReadStream.mockImplementation((filePath, options) => originalCreateReadStream(filePath, options));
+		const catalog = new NativeSessionCatalog({ layoutResolver: resolver, cacheTtlMs: 0 });
+
+		expect((await catalog.refresh({ force: true })).sessions).toEqual([]);
+		expect((await catalog.refresh({ force: true })).sessions[0]).toMatchObject({
+			nativeSessionId: "one",
+			messageCount: 2,
+		});
+		expect(createReadStream).toHaveBeenCalledTimes(2);
+	});
+
 	it("evicts cached directories that disappear from the current discovery plan", async () => {
 		const root = temporaryDirectory();
 		const workspace = path.join(root, "workspace");
