@@ -323,6 +323,18 @@ process.stdout.write("0.84.2\\n");
 		);
 	});
 
+	it("does not silently promote a bundled candidate", async () => {
+		const candidate = fakePiPackage("0.84.3");
+		await expectDiagnostic(
+			resolvePiRuntime({
+				env: { PATH: "" },
+				bundledEntryUrl: pathToFileURL(candidate.entry),
+				expectedBundledVersion: "0.84.3",
+			}),
+			"pi_version_not_promoted",
+		);
+	});
+
 	it("rejects versions absent from the compatibility matrix", async () => {
 		const entry = versionProbe(path.join(tempDir(), "unsupported.mjs"), "0.84.4");
 		await expectDiagnostic(resolvePiRuntime({ piPath: entry, env: { PATH: "" } }), "pi_version_unsupported");

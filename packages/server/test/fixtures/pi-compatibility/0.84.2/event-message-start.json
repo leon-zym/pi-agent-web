@@ -1,0 +1,8 @@
+{
+	"type": "message_start",
+	"message": {
+		"role": "user",
+		"content": "compatibility fixture",
+		"timestamp": 1
+	}
+}

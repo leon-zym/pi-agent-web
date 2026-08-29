@@ -1,0 +1,45 @@
+name: Pi compatibility
+
+on:
+	workflow_dispatch:
+	pull_request:
+		paths:
+			- "packages/protocol/**"
+			- "packages/server/package.json"
+			- "packages/server/src/legacy-rpc-v1*.ts"
+			- "packages/server/src/pi-host-adapter.ts"
+			- "packages/server/src/resolver.ts"
+			- "packages/server/test/fixtures/pi-compatibility/**"
+			- "packages/server/test/fixtures/pi-0.84.3-toolcall-start.json"
+			- "packages/server/test/pi-compatibility.test.ts"
+			- "packages/server/test/pi-host-conformance.test.ts"
+			- "packages/server/test/resolver.test.ts"
+			- "pnpm-lock.yaml"
+			- "scripts/pack-smoke.mjs"
+			- "package.json"
+
+concurrency:
+	group: pi-compatibility-${{ github.workflow }}-${{ github.ref }}
+	cancel-in-progress: true
+
+permissions:
+	contents: read
+
+jobs:
+	compatibility:
+		name: Exact-version compatibility lane
+		runs-on: ubuntu-latest
+		timeout-minutes: 20
+		steps:
+			- uses: actions/checkout@v4
+			- uses: pnpm/action-setup@v4
+				with:
+					version: 11.21.0
+			- uses: actions/setup-node@v4
+				with:
+					node-version: 22
+					cache: pnpm
+			- run: pnpm install --frozen-lockfile
+			- run: pnpm test:compat
+			- run: pnpm --filter @pi-agent-web/protocol bench:schema
+			- run: pnpm test:pack
