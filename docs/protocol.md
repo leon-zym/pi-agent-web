@@ -371,7 +371,7 @@ Browser cancel 都幂等 release pin。content route 不解释 text/json，Brows
 
 | `type` | 核心字段 | 语义 |
 |---|---|---|
-| `runtime_state` | `runtime` | Session 的 epoch/handle/workspace/id/file/generation/lastSeq/state/recoverable |
+| `runtime_state` | `runtime` | Session 的 epoch/handle/workspace/id/file/generation/lastSeq/state/phase/operationCount/busyReasons/recoverable |
 | `event` | epoch-aware Session envelope + `event` | 权威 Pi/extension error 事件 |
 | `response` | epoch, handle, generation, `barrierSeq`, Pi response, optional previous handle | 只发回命令发起连接 |
 | `lease_status` | epoch, handle, generation, `isController`, controller-only token | 当前连接在该 Session 的权限快照 |
@@ -382,7 +382,7 @@ Browser cancel 都幂等 release pin。content route 不解释 text/json，Brows
 | `extension_ui_closed` | sequenced request id + reason | 所有订阅者删除对话框或 semantic request |
 | `session_rekeyed` | epoch, previous handle + authoritative runtime | new/fork/clone 或 catch-up identity 迁移 |
 | `hot_runtime_inventory` | epoch, monotonic revision, exact Runtime entries | Bounded full replacement of current hot Pi process ownership |
-| `session_error` | epoch, handle, operation, error | subscribe/claim/release/extension response 错误 |
+| `session_error` | epoch, handle, operation, error, optional `code`/`retryable` | subscribe/claim/release/extension response 错误；结构化字段优先于文案判断 |
 | `session_directory_changed` | workspace id | 触发该 Workspace 的 forced native catalog refresh |
 | `auth_changed` | optional workspace id | 重新获取模型/认证状态 |
 
@@ -437,7 +437,8 @@ that cannot carry the inventory is terminal for this Browser connection.
 handles, has a canonical JSON ceiling of 1 MiB, and carries one `serverEpoch` plus a monotonically
 increasing safe-integer `revision`. Every entry repeats the same epoch and contains the exact
 `workspaceId`, `sessionHandle`, positive `generation`, and one of `starting`, `idle`, `running`, or
-`waiting_ui`. A new epoch resets revision comparison. Crashed and dormant Sessions are absent.
+`waiting_ui`, together with a coherent `phase`, `operationCount`, and `busyReasons` observation.
+A new epoch resets revision comparison. Crashed and dormant Sessions are absent.
 
 When `session_subscribe.expectedHotRuntime` is present, its complete identity must match the outer
 handle and a currently live Supervisor observation. This form is only-if-hot: it never starts a Pi
@@ -466,6 +467,24 @@ does not change the ordinary replay-gap rule above.
 
 ### 有界性与 backpressure
 
+- Session admission is bounded at the shared resource owners. The Supervisor defaults to 8 hot Pi
+  processes and reserves up to 512 MiB for retained projection state; each hot Runtime consumes a
+  conservative reservation derived from its snapshot ceiling. This is an admission budget, not an
+  exact Node/Browser heap measurement. `session_runtime_capacity` and `session_projection_capacity`
+  are explicit retryable-or-not decisions at the REST/WS boundary.
+- Across sockets, the Gateway defaults to 64 connections, 1,024 subscribed channels, 256 concurrent
+  catch-ups, 1,024 historical subscription aliases, and 65 MiB of weighted pending command-response
+  reservations per connection. Large history/tree responses reserve a full server-frame weight;
+  ordinary responses reserve a small bounded weight. A socket still has a 32 in-flight-command limit.
+- Native discovery is streamed and budgeted per refresh: default 128 MiB/4,096 pages/5 seconds,
+  clamped at 512 MiB/100,000 pages/60 seconds, with at most 8 files scanned concurrently. Per-file
+  identity/revision cache entries are disposable; safe append reads only the new suffix, while
+  truncate, replacement, symlink retarget, and transient I/O failure fall back to a bounded rescan.
+  A partial result can carry `partial`, `stale`, and `retryable` diagnostics so callers never mistake
+  an incomplete catalog for authoritative absence.
+- The Browser keeps six ordinary idle/persisted subscriptions as a soft target. Hot Runtime observers
+  are protected and may exceed it; the UI exposes `protected_overage` separately from a rejected
+  subscription and uses `session_error.code`/`retryable` for retry decisions.
 - Runtime replay 默认同时受 1024 frame 与 8 MiB 限制；startup/transition staging、Extension state、
   dialogs、UI raw events 和 resync buffers 都有独立 item/byte ceiling。
 - `session_snapshot` 的完整 canonical JSON 上限为 64 MiB，最多包含 10,000 条 settled message、4,096

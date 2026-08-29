@@ -9,7 +9,7 @@ import type {
 	SessionCommandResponseDto,
 	SessionRuntimeIdentityDto,
 } from "@pi-agent-web/protocol";
-import { SESSION_PAYLOAD_BUDGET } from "@pi-agent-web/protocol";
+import { SESSION_PAYLOAD_BUDGET, SESSION_SNAPSHOT_MAX_BYTES } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { EpochContentHold } from "../src/epoch-content-store.js";
 import { legacyRpcV1Adapter } from "../src/legacy-rpc-v1.js";
@@ -69,7 +69,9 @@ function createHarness(options: {
 	targets: ExistingSessionTarget[];
 	onBroadcast?: (message: SessionSupervisorMessage) => void;
 	onHotRuntimeInventory?: (inventory: HotRuntimeInventoryDto) => void;
+	maxHotProcesses?: number;
 	maxHotRuntimes?: number;
+	maxRetainedProjectionBytes?: number;
 	replayLimit?: number;
 	replayMaxBytes?: number;
 	transientBufferMaxBytes?: number;
@@ -111,7 +113,10 @@ function createHarness(options: {
 			options.onBroadcast?.(message);
 		},
 		onHotRuntimeInventory: options.onHotRuntimeInventory,
-		maxHotRuntimes: options.maxHotRuntimes ?? 8,
+		...(options.maxHotProcesses !== undefined
+			? { maxHotProcesses: options.maxHotProcesses }
+			: { maxHotRuntimes: options.maxHotRuntimes ?? 8 }),
+		maxRetainedProjectionBytes: options.maxRetainedProjectionBytes,
 		replayLimit: options.replayLimit ?? 32,
 		replayMaxBytes: options.replayMaxBytes,
 		transientBufferMaxBytes: options.transientBufferMaxBytes,
@@ -731,6 +736,52 @@ describe("SessionSupervisor", () => {
 		await expect(
 			supervisor.subscribeHotExact({ ...hot, sessionHandle: `pending_${hot.sessionHandle}` }),
 		).rejects.toThrow("hot_runtime_not_found");
+	});
+
+	it("coalesces duplicate snapshot builds within one runtime turn", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "snapshot-coalesce");
+		const { supervisor } = createHarness({ targets: [target] });
+		await supervisor.activate(target.sessionHandle);
+		const runtime = exactRuntimeObject(supervisor, target.sessionHandle) as SessionRuntime;
+		const internal = runtime as unknown as { buildSessionSnapshot: () => unknown };
+		const build = vi.spyOn(internal, "buildSessionSnapshot");
+
+		const first = runtime.sessionSnapshot();
+		const second = runtime.sessionSnapshot();
+
+		expect(build).toHaveBeenCalledTimes(1);
+		expect(second).toBe(first);
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+		expect(runtime.sessionSnapshot()).toBe(first);
+		expect(build).toHaveBeenCalledTimes(1);
+
+		const lease = await supervisor.claim(target.sessionHandle, "snapshot-controller");
+		const generation = runtime.generation;
+		await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "prompt", message: "open-dialog-no-agent" },
+			{
+				connectionId: "snapshot-controller",
+				expectedGeneration: generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		await waitFor(() =>
+			runtime.getPendingExtensionRequests().some((request) => request.method === "confirm"),
+		);
+		const beforeClose = runtime.sessionSnapshot();
+		const buildsBeforeClose = build.mock.calls.length;
+		const dialog = runtime.getPendingExtensionRequests().find((request) => request.method === "confirm");
+		if (!dialog || !("id" in dialog)) throw new Error("snapshot cache dialog unavailable");
+		expect(
+			runtime.sendExtensionUiResponse({ type: "extension_ui_response", id: dialog.id, cancelled: true }),
+		).toBe("accepted");
+		const afterClose = runtime.sessionSnapshot();
+		expect(afterClose).not.toBe(beforeClose);
+		expect(build).toHaveBeenCalledTimes(buildsBeforeClose + 1);
 	});
 
 	it("revalidates exact process ownership after capturing the replay baseline", async () => {
@@ -3379,6 +3430,33 @@ describe("SessionSupervisor", () => {
 		expect(supervisor.getRuntime(first.sessionHandle)?.state).toBe("running");
 	});
 
+	it("uses the explicit hot-process budget for runtime admission", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const first = createNativeSession(root, cwd, "process-budget-first");
+		const second = createNativeSession(root, cwd, "process-budget-second");
+		const { supervisor } = createHarness({ targets: [first, second], maxHotProcesses: 1 });
+
+		await supervisor.claim(first.sessionHandle, "process-budget-connection");
+		await expect(supervisor.activate(second.sessionHandle)).rejects.toThrow("session_runtime_capacity");
+	});
+
+	it("protects the aggregate retained projection budget from a second hot process", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const first = createNativeSession(root, cwd, "projection-budget-first");
+		const second = createNativeSession(root, cwd, "projection-budget-second");
+		const { supervisor } = createHarness({
+			targets: [first, second],
+			maxRetainedProjectionBytes: SESSION_SNAPSHOT_MAX_BYTES,
+		});
+
+		await supervisor.claim(first.sessionHandle, "projection-budget-connection");
+		await expect(supervisor.activate(second.sessionHandle)).rejects.toThrow("session_projection_capacity");
+	});
+
 	it("pins an idle controller lease against capacity eviction until release", async () => {
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace");
@@ -4655,7 +4733,10 @@ describe("SessionSupervisor", () => {
 		);
 		expect(rekeyIndex).toBeGreaterThanOrEqual(0);
 		expect(stickyIndex).toBeGreaterThan(rekeyIndex);
-		expect(order).toEqual(["rekey", "inventory", "staged"]);
+		// The identity fence and its post-rekey inventory must precede staged child
+		// frames. The final inventory reflects the transition command completing and
+		// its operation count dropping after the staged frames are published.
+		expect(order).toEqual(["rekey", "inventory", "staged", "inventory"]);
 		expect(messages[stickyIndex]).toMatchObject({
 			type: "extension_ui_request",
 			sessionHandle: result.sessionHandle,
@@ -5220,6 +5301,12 @@ describe("SessionSupervisor", () => {
 			},
 		);
 		await new Promise<void>((resolve) => setTimeout(resolve, 25));
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({
+			state: "idle",
+			phase: "busy",
+			operationCount: 1,
+			busyReasons: ["command"],
+		});
 		await expect(
 			supervisor.sendCommand(
 				target.sessionHandle,

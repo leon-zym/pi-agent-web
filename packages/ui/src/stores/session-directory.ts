@@ -9,6 +9,7 @@ import type {
 import { create } from "zustand";
 import { api } from "../lib/api";
 import { displayLabel } from "../lib/format";
+import { runtimeIsBusy, runtimeIsReady, runtimeStateForDisplay } from "../lib/runtime-state";
 import { useComposerStore } from "./composer";
 import { useExtensionUiStore } from "./extension-ui";
 import { useModelDirectoryStore } from "./model-directory";
@@ -137,13 +138,13 @@ function hotSessionPlaceholder(runtime: HotRuntimeInventoryEntryDto): NativeSess
 	};
 }
 
-function hotRuntimeState(runtime: SessionRuntimeDto): HotRuntimeStateDto | undefined {
-	return runtime.state === "starting" ||
-		runtime.state === "idle" ||
-		runtime.state === "running" ||
-		runtime.state === "waiting_ui"
-		? runtime.state
-		: undefined;
+function hotRuntimeState(runtime: {
+	state: SessionRuntimeDto["state"];
+	phase?: SessionRuntimeDto["phase"];
+}): HotRuntimeStateDto | undefined {
+	const state = runtimeStateForDisplay(runtime);
+	if (!state || state === "crashed" || state === "dormant") return undefined;
+	return state;
 }
 
 function runtimeMatchesHotIdentity(
@@ -253,8 +254,8 @@ function activateSessionView(session: NativeSessionDto | null): void {
 }
 
 function releasableSessionState(sessionHandle: string): boolean {
-	const state = sessionTransport.store.getState().sessions[sessionHandle]?.runtime?.state;
-	if (state === "running" || state === "waiting_ui" || state === "starting") return false;
+	const runtime = sessionTransport.store.getState().sessions[sessionHandle]?.runtime;
+	if (runtimeIsBusy(runtime)) return false;
 	const composerState = useComposerStore.getState();
 	const composer =
 		composerState.bySession[sessionHandle] ??
@@ -319,7 +320,7 @@ function transientManagement(sessionHandle: string): {
 		!channel.lease.fencingToken ||
 		channel.runtime?.recoverable !== false ||
 		!useSessionDirectoryStore.getState().locallyCreatedTransientSessions[sessionHandle] ||
-		channel.runtime.state !== "idle"
+		!runtimeIsReady(channel.runtime)
 	) {
 		return null;
 	}
@@ -932,7 +933,8 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 		const hotRuntimeStateBySession: Record<string, HotRuntimeStateDto> = {};
 		const hotRuntimeIdentityBySession: Record<string, HotRuntimeInventoryEntryDto> = {};
 		for (const runtime of inventory.runtimes) {
-			hotRuntimeStateBySession[runtime.sessionHandle] = runtime.state;
+			const displayState = hotRuntimeState(runtime);
+			if (displayState) hotRuntimeStateBySession[runtime.sessionHandle] = displayState;
 			hotRuntimeIdentityBySession[runtime.sessionHandle] = { ...runtime };
 			const durable = current.sessionsByWorkspace[runtime.workspaceId]?.find(
 				(session) => session.sessionHandle === runtime.sessionHandle,

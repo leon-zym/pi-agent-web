@@ -9,7 +9,11 @@ import type {
 	SessionCommandDto,
 	SessionRuntimeIdentityDto,
 } from "@pi-agent-web/protocol";
-import { RpcError, SESSION_HOT_RUNTIME_INVENTORY_MAX_ITEMS } from "@pi-agent-web/protocol";
+import {
+	RpcError,
+	SESSION_HOT_RUNTIME_INVENTORY_MAX_ITEMS,
+	SESSION_SNAPSHOT_MAX_BYTES,
+} from "@pi-agent-web/protocol";
 import type { ProbedPiRuntime } from "./resolver.js";
 import { canonicalizePathAllowMissing } from "./session-layout-resolver.js";
 import type { SessionLiveProjectionLimits } from "./session-live-projection.js";
@@ -43,6 +47,7 @@ import {
 
 const DEFAULT_TRANSIENT_IDLE_TTL_MS = 30_000;
 const MAX_TRANSIENT_IDLE_TTL_MS = 5 * 60_000;
+const DEFAULT_MAX_RETAINED_PROJECTION_BYTES = 512 * 1024 * 1024;
 
 export interface SessionCommandContext {
 	connectionId: string;
@@ -104,7 +109,12 @@ export interface SessionSupervisorBaseOptions<M extends SessionRuntimeProductMod
 	pendingDialogLimit?: number;
 	projectionLimits?: Partial<SessionLiveProjectionLimits>;
 	commandTimeoutFor?: (commandType: string) => number;
+	/** Hard cap for concurrently owned Pi processes. */
+	maxHotProcesses?: number;
+	/** @deprecated Use maxHotProcesses. Kept for current embedders during the contract transition. */
 	maxHotRuntimes?: number;
+	/** Aggregate upper bound reserved for retained per-runtime projection state. */
+	maxRetainedProjectionBytes?: number;
 	idleTtlMs?: number;
 	/** Untouched, unclaimed, unpersisted Sessions are forgotten after this bounded grace period. */
 	transientIdleTtlMs?: number;
@@ -155,7 +165,9 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "curren
 			SessionSupervisorBaseOptions<M>,
 			| "readyTimeoutMs"
 			| "replayLimit"
+			| "maxHotProcesses"
 			| "maxHotRuntimes"
+			| "maxRetainedProjectionBytes"
 			| "idleTtlMs"
 			| "transientIdleTtlMs"
 			| "restartWindowMs"
@@ -190,17 +202,32 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "curren
 	) {
 		this.runtimeFactory = runtimeFactory;
 		this.serverEpoch = opts.serverEpoch ?? randomUUID();
-		const configuredMaxHotRuntimes = Number.isFinite(opts.maxHotRuntimes)
-			? Math.floor(opts.maxHotRuntimes ?? 8)
-			: 8;
+		const configuredMaxHotProcesses = Number.isFinite(opts.maxHotProcesses)
+			? Math.floor(opts.maxHotProcesses ?? 8)
+			: Number.isFinite(opts.maxHotRuntimes)
+				? Math.floor(opts.maxHotRuntimes ?? 8)
+				: 8;
+		const maxHotProcesses = Math.min(
+			SESSION_HOT_RUNTIME_INVENTORY_MAX_ITEMS,
+			Math.max(1, configuredMaxHotProcesses),
+		);
+		const projectionReservationBytes = Math.max(
+			1,
+			Math.floor(opts.projectionLimits?.maxSnapshotBytes ?? SESSION_SNAPSHOT_MAX_BYTES),
+		);
+		const maxRetainedProjectionBytes = Math.max(
+			projectionReservationBytes,
+			Number.isFinite(opts.maxRetainedProjectionBytes)
+				? Math.floor(opts.maxRetainedProjectionBytes ?? DEFAULT_MAX_RETAINED_PROJECTION_BYTES)
+				: DEFAULT_MAX_RETAINED_PROJECTION_BYTES,
+		);
 		this.opts = {
 			...opts,
 			readyTimeoutMs: opts.readyTimeoutMs ?? 10_000,
 			replayLimit: opts.replayLimit ?? 1_024,
-			maxHotRuntimes: Math.min(
-				SESSION_HOT_RUNTIME_INVENTORY_MAX_ITEMS,
-				Math.max(1, configuredMaxHotRuntimes),
-			),
+			maxHotProcesses,
+			maxHotRuntimes: maxHotProcesses,
+			maxRetainedProjectionBytes,
 			idleTtlMs: opts.idleTtlMs ?? 10 * 60_000,
 			transientIdleTtlMs: Math.max(
 				0,
@@ -1186,14 +1213,32 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "curren
 			const hot = [...new Set(this.runtimes.values())].filter(
 				(runtime) => runtime.running || runtime.state === "starting",
 			);
-			if (hot.length < this.opts.maxHotRuntimes) return;
+			const processCapacityReached = hot.length >= this.opts.maxHotProcesses;
+			const projectionCapacityReached =
+				hot.length * this.projectionReservationBytes() + this.projectionReservationBytes() >
+				this.opts.maxRetainedProjectionBytes;
+			if (!processCapacityReached && !projectionCapacityReached) return;
 			const candidate = hot
 				.filter((runtime) => this.isEvictable(runtime))
 				.sort((a, b) => a.lastActivityAt - b.lastActivityAt)[0];
-			if (!candidate) throw new RpcError("activate", "session_runtime_capacity");
+			if (!candidate) {
+				throw new RpcError(
+					"activate",
+					projectionCapacityReached && !processCapacityReached
+						? "session_projection_capacity"
+						: "session_runtime_capacity",
+				);
+			}
 			await candidate.stop();
 			this.assertOpen();
 		}
+	}
+
+	private projectionReservationBytes(): number {
+		return Math.max(
+			1,
+			Math.floor(this.opts.projectionLimits?.maxSnapshotBytes ?? SESSION_SNAPSHOT_MAX_BYTES),
+		);
 	}
 
 	private async reapIdle(): Promise<void> {
@@ -1283,6 +1328,10 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "curren
 		this.hotInventoryRefreshScheduled = true;
 		void this.withPoolLock(async () => {
 			this.hotInventoryRefreshScheduled = false;
+			// Identity transitions publish their rekey fence synchronously from
+			// commitIdentityTransition. An operational update queued before that
+			// fence must not publish the old handle after the transition began.
+			if ([...new Set(this.runtimes.values())].some((runtime) => runtime.transitioning)) return;
 			this.commitHotRuntimeInventoryIfChanged();
 		}).catch((error) => {
 			this.hotInventoryRefreshScheduled = false;

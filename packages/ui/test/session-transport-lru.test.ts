@@ -127,6 +127,15 @@ function runningRuntime(sessionHandle: string): SessionRuntimeDto {
 	};
 }
 
+function commandBusyRuntime(sessionHandle: string): SessionRuntimeDto {
+	return {
+		...idlePersistedRuntime(sessionHandle),
+		phase: "busy",
+		operationCount: 1,
+		busyReasons: ["command"],
+	};
+}
+
 function unpersistedRuntime(sessionHandle: string): SessionRuntimeDto {
 	return {
 		serverEpoch: "test-epoch",
@@ -272,6 +281,32 @@ describe("Active WebSocket Subscription LRU admission target with liveness guard
 		expect(sessions["session-7"]?.subscribed).toBe(true);
 	});
 
+	it("does not evict a command-busy session whose legacy state is still idle", () => {
+		const { controller, sockets } = harness();
+		controller.store.getState().connect();
+		open(sockets[0]);
+
+		controller.store.getState().subscribeSession("session-1");
+		controller.ingestServerMessage({
+			type: "runtime_state",
+			runtime: commandBusyRuntime("session-1"),
+		});
+		for (let i = 2; i <= 6; i++) {
+			const handle = `session-${i}`;
+			controller.store.getState().subscribeSession(handle);
+			controller.ingestServerMessage({
+				type: "runtime_state",
+				runtime: idlePersistedRuntime(handle),
+			});
+		}
+
+		controller.store.getState().subscribeSession("session-7");
+
+		const sessions = controller.store.getState().sessions;
+		expect(sessions["session-1"]?.subscribed).toBe(true);
+		expect(sessions["session-2"]?.subscribed).toBe(false);
+	});
+
 	it("does not evict unpersisted sessions (transient sessions)", () => {
 		const { controller, sockets } = harness();
 		controller.store.getState().connect();
@@ -388,6 +423,138 @@ describe("Active WebSocket Subscription LRU admission target with liveness guard
 		for (let i = 1; i <= 7; i++) {
 			expect(sessions[`session-${i}`]?.subscribed).toBe(true);
 		}
+		expect(sessions["session-7"]?.subscriptionAdmission).toEqual({
+			kind: "protected_overage",
+			retryable: false,
+		});
+	});
+
+	it("records a retryable rejected subscription and exposes a manual retry", () => {
+		const { controller, sockets } = harness({ maxActiveSubscriptions: 1 });
+		controller.store.getState().connect();
+		open(sockets[0]);
+		const socket = sockets[0];
+		if (!socket) throw new Error("transport did not create a socket");
+
+		controller.store.getState().subscribeSession("rejected");
+		socket.onmessage?.({
+			data: JSON.stringify({
+				type: "session_error",
+				serverEpoch: "test-epoch",
+				sessionHandle: "rejected",
+				operation: "subscribe",
+				error: "session_subscription_capacity",
+			}),
+		});
+
+		expect(controller.store.getState().sessions.rejected).toMatchObject({
+			subscribed: false,
+			subscriptionAdmission: {
+				kind: "rejected",
+				code: "session_subscription_capacity",
+				retryable: true,
+			},
+		});
+		expect(controller.store.getState().retrySessionSubscription?.("rejected")).toBe(true);
+		expect(controller.store.getState().sessions.rejected?.subscriptionAdmission).toBeNull();
+		expect(socket.sent.at(-1)).toEqual({ type: "session_subscribe", sessionHandle: "rejected" });
+	});
+
+	it("uses structured server error metadata for snapshot retry admission", () => {
+		const { controller, sockets } = harness();
+		controller.store.getState().connect();
+		open(sockets[0]);
+		const socket = sockets[0];
+		if (!socket) throw new Error("transport did not create a socket");
+
+		controller.store.getState().subscribeSession("snapshot");
+		socket.onmessage?.({
+			data: JSON.stringify({
+				type: "session_error",
+				serverEpoch: "test-epoch",
+				sessionHandle: "snapshot",
+				operation: "subscribe",
+				error: "session_snapshot_unavailable",
+				code: "session_snapshot_unavailable",
+				retryable: true,
+			}),
+		});
+
+		expect(controller.store.getState().sessions.snapshot?.subscriptionAdmission).toEqual({
+			kind: "rejected",
+			code: "session_snapshot_unavailable",
+			retryable: true,
+		});
+		expect(controller.store.getState().retrySessionSubscription?.("snapshot")).toBe(true);
+		expect(socket.sent.at(-1)).toEqual({ type: "session_subscribe", sessionHandle: "snapshot" });
+	});
+
+	it("clears protected overage markers as rejected subscriptions leave the overage", () => {
+		const { controller, sockets } = harness({ maxActiveSubscriptions: 1 });
+		controller.store.getState().connect();
+		open(sockets[0]);
+		const socket = sockets[0];
+		if (!socket) throw new Error("transport did not create a socket");
+
+		for (const handle of ["first", "second"]) {
+			controller.store.getState().subscribeSession(handle);
+			controller.ingestServerMessage({
+				type: "runtime_state",
+				runtime: runningRuntime(handle),
+			});
+		}
+		expect(controller.store.getState().sessions.second?.subscriptionAdmission).toEqual({
+			kind: "protected_overage",
+			retryable: false,
+		});
+
+		socket.onmessage?.({
+			data: JSON.stringify({
+				type: "session_error",
+				serverEpoch: "test-epoch",
+				sessionHandle: "first",
+				operation: "subscribe",
+				error: "session_subscription_capacity",
+				code: "session_subscription_capacity",
+				retryable: true,
+			}),
+		});
+
+		expect(controller.store.getState().sessions.first?.subscriptionAdmission).toMatchObject({
+			kind: "rejected",
+		});
+		expect(controller.store.getState().sessions.second?.subscriptionAdmission).toBeNull();
+	});
+
+	it("keeps a retryable rejection visible while the transport is offline", () => {
+		const { controller, sockets } = harness();
+		controller.store.getState().connect();
+		open(sockets[0]);
+		const socket = sockets[0];
+		if (!socket) throw new Error("transport did not create a socket");
+
+		controller.store.getState().subscribeSession("offline-retry");
+		socket.onmessage?.({
+			data: JSON.stringify({
+				type: "session_error",
+				serverEpoch: "test-epoch",
+				sessionHandle: "offline-retry",
+				operation: "subscribe",
+				error: "session_subscription_capacity",
+				code: "session_subscription_capacity",
+				retryable: true,
+			}),
+		});
+		const sentBeforeDisconnect = socket.sent.length;
+		socket.close();
+
+		expect(controller.store.getState().retrySessionSubscription?.("offline-retry")).toBe(false);
+		expect(controller.store.getState().sessions["offline-retry"]?.subscriptionAdmission).toEqual({
+			kind: "rejected",
+			code: "session_subscription_capacity",
+			retryable: true,
+		});
+		expect(socket.sent).toHaveLength(sentBeforeDisconnect);
 	});
 
 	it("evicts dormant historical sessions when pool exceeds capacity", () => {

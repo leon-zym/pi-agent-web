@@ -17,6 +17,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/too
 import { stripAnsi } from "../../lib/format";
 import { tt, useT } from "../../lib/i18n";
 import { ImageAttachmentError, prepareImageAttachments } from "../../lib/image-attachments";
+import { runtimeIsBusy } from "../../lib/runtime-state";
 import { isSessionControlReady } from "../../lib/session-capabilities";
 import { abortCurrentRun, submitDraft } from "../../lib/session-controller";
 import { cn } from "../../lib/utils";
@@ -117,8 +118,8 @@ export function ComposerSeat() {
 		return isSessionControlReady(channel);
 	});
 	const runtimeBusy = useSessionTransportStore((state) => {
-		const runtimeState = sessionHandle ? state.sessions[sessionHandle]?.runtime?.state : undefined;
-		return runtimeState === "running" || runtimeState === "waiting_ui";
+		const runtime = sessionHandle ? state.sessions[sessionHandle]?.runtime : undefined;
+		return runtimeIsBusy(runtime);
 	});
 	const activeTurnId = useProjectionStore(selectActiveTurnId);
 	const running = runtimeBusy || activeTurnId !== null;

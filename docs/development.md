@@ -79,6 +79,11 @@ Focused 绿灯不是 release gate；修改完成后仍按风险运行上层组�
 reducer 单测代替 browser bounding-box/console 断言。删除、process 或 shutdown 改动必须覆盖 race 和
 失败恢复；不能只检查 happy path。
 
+资源治理改动还必须覆盖共享边界，而非只覆盖单连接 happy path：多连接 admission/snapshot
+coalescing、慢客户端与 catch-up storm、热 Runtime pressure、目录 unchanged-file cache、append/inode
+replacement、预算截断、partial/stale/retryable 诊断，以及 Browser 对 protected overage 与 retryable
+rejection 的区分。
+
 Protocol 1.3、shared content store 与 REST 变更至少覆盖以下边界：
 
 - Store 测试验证 raster 与 `utf8` namespace 的 exact epoch/digest/length identity、pre-read reservation、
@@ -120,6 +125,9 @@ case 建立隔离的 agent/session/web/workspace/control 目录，并从 child e
 - Pi output attachment/content reference 通过同源认证 URL 渲染；失效 reference 触发精确、单次 resync；
 - collapsed Tool 不发 content GET，展开或打开 Inspector 后才 GET；replay、snapshot、history response 仍保留 lazy reference；
 - Extension editor、set_editor_text 与 widget root 在 semantic state/seq commit 前 eager materialize；
+- hot Runtime inventory 在后台运行、waiting UI、idle 与多 Runtime pressure 下持续发布一致的
+  phase/operationCount/busyReasons；普通订阅超出 soft target 时显示 protected 或可重试拒绝，而不
+  静默取消后台 Session；
 - 404/410、错误 metadata、malformed UTF-8、JSON parse 与 slot guard failure 不产生空值或 inline fallback；
 - stale Session/generation/epoch、Abort、disconnect、rekey、unmount 与 late completion 不触发 recovery，也不污染当前选中 Session；
 - 结构化 payload admission failure 显示本地化文案并保留 draft/images，重试成功后才清空；

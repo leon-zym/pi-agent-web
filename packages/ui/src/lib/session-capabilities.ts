@@ -1,5 +1,6 @@
 import type { NativeSessionDto } from "@pi-agent-web/protocol";
 import { hasFreshLeaseBaseline, type SessionChannelState } from "../stores/session-transport-contract";
+import { runtimeIsSettled } from "./runtime-state";
 
 export type SessionDeleteBlockReason =
 	| "controller_required"
@@ -35,7 +36,7 @@ export function sessionDeleteCapability(
 	if (runtime?.recoverable !== true) {
 		return { allowed: false, reason: "runtime_unavailable" };
 	}
-	if (runtime.state !== "idle" && runtime.state !== "crashed" && runtime.state !== "dormant") {
+	if (!runtimeIsSettled(runtime)) {
 		return { allowed: false, reason: "runtime_active" };
 	}
 	return { allowed: true, reason: null };

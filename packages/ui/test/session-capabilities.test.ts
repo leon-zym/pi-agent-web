@@ -67,6 +67,12 @@ describe("session deletion capability", () => {
 		expect(sessionDeleteCapability(session(), undefined).reason).toBe("controller_required");
 		expect(sessionDeleteCapability(session(false), channel()).reason).toBe("session_unpersisted");
 		expect(sessionDeleteCapability(session(), channel(runtime("running"))).reason).toBe("runtime_active");
+		expect(
+			sessionDeleteCapability(
+				session(),
+				channel({ ...runtime(), phase: "busy", operationCount: 1, busyReasons: ["command"] }),
+			).reason,
+		).toBe("runtime_active");
 		expect(sessionDeleteCapability(session(), channel(runtime("idle", false))).reason).toBe(
 			"runtime_unavailable",
 		);

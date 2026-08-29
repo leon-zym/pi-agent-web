@@ -42,6 +42,7 @@ import {
 	stripAnsi,
 } from "../../lib/format";
 import { tt } from "../../lib/i18n";
+import { runtimeStateForDisplay } from "../../lib/runtime-state";
 import {
 	isSessionControlReady,
 	type SessionDeleteBlockReason,
@@ -107,6 +108,7 @@ export function SessionHeader() {
 	);
 	const canControl = isSessionControlReady(channel);
 	const processStatus = channel?.runtime;
+	const processDisplayState = runtimeStateForDisplay(processStatus);
 	const setRightPanelMode = useViewStore((s) => s.setRightPanelMode);
 	const setRightPanelOpen = useViewStore((s) => s.setRightPanelOpen);
 	const [editing, setEditing] = useState(false);
@@ -249,11 +251,11 @@ export function SessionHeader() {
 					)}
 					<Badge
 						variant={
-							processStatus?.state === "crashed"
+							processDisplayState === "crashed"
 								? "danger"
-								: processStatus?.state === "starting"
+								: processDisplayState === "starting"
 									? "warning"
-									: processStatus?.state === "running" || processStatus?.state === "waiting_ui"
+									: processDisplayState === "running" || processDisplayState === "waiting_ui"
 										? "success"
 										: "default"
 						}
@@ -263,18 +265,18 @@ export function SessionHeader() {
 							<span
 								className={
 									"size-1.5 rounded-full bg-current" +
-									(processStatus?.state === "starting" ? " pulse-dot" : "")
+									(processDisplayState === "starting" ? " pulse-dot" : "")
 								}
 							/>
-							{processStatus?.state === "crashed"
+							{processDisplayState === "crashed"
 								? tt("status.crashed")
-								: processStatus?.state === "starting"
+								: processDisplayState === "starting"
 									? tt("status.starting")
-									: processStatus?.state === "running"
+									: processDisplayState === "running"
 										? tt("status.running")
-										: processStatus?.state === "waiting_ui"
+										: processDisplayState === "waiting_ui"
 											? tt("status.waitingUi")
-											: processStatus?.state === "idle"
+											: processDisplayState === "idle"
 												? tt("status.idle")
 												: tt("status.dormant")}
 						</span>

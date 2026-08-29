@@ -14,6 +14,7 @@ import type { ImageContent } from "../types/pi-types";
 import { api } from "./api";
 import { displayCommandResponseError, displayError, stripAnsi } from "./format";
 import { tt } from "./i18n";
+import { runtimeIsBusy } from "./runtime-state";
 import { isSessionControlReady, sessionDeleteCapability } from "./session-capabilities";
 import { sendControlCommand } from "./session-command";
 
@@ -307,7 +308,7 @@ export type SubmitKind = "prompt" | "steer" | "follow_up";
 
 function isRunning(sessionHandle: string): boolean {
 	const runtime = sessionTransport.store.getState().sessions[sessionHandle]?.runtime;
-	if (runtime?.state === "running" || runtime?.state === "waiting_ui") return true;
+	if (runtimeIsBusy(runtime)) return true;
 	const projection = useProjectionStore.getState().projections[sessionHandle];
 	return projection?.activeTurnId !== null && projection?.activeTurnId !== undefined;
 }

@@ -18,6 +18,7 @@ import { useSlashCommandsStore } from "../stores/slash-commands";
 import { playAttentionChime, playCompletionChime } from "./audio-feedback";
 import { displayLabel, stripAnsi } from "./format";
 import { tt } from "./i18n";
+import { runtimeIsBusy, runtimeIsSettled, runtimePhase } from "./runtime-state";
 import { isSoftIdempotentError } from "./session-controller";
 import { type CoalescibleMessageUpdate, SessionEventScheduler } from "./session-event-scheduler";
 import { updateTabBadge } from "./tab-badge";
@@ -154,44 +155,37 @@ function routeSessionFrame(
 }
 
 function routeRuntime(runtime: SessionRuntimeDto, reconcileHidden = true): void {
+	const phase = runtimePhase(runtime);
+	const settled = runtimeIsSettled(runtime);
+	const busy = runtimeIsBusy(runtime);
 	const identity = activeMessageIdentities.get(runtime.sessionHandle);
-	if (
-		identity &&
-		(identity.generation !== runtime.generation ||
-			runtime.state === "idle" ||
-			runtime.state === "dormant" ||
-			runtime.state === "crashed")
-	) {
+	if (identity && (identity.generation !== runtime.generation || settled)) {
 		activeMessageIdentities.delete(runtime.sessionHandle);
 	}
 	useSessionDirectoryStore.getState().applyRuntime(runtime);
 	useExtensionUiStore.getState().resetSessionForGeneration(runtime.sessionHandle, runtime.generation);
-	if (runtime.state === "crashed") {
+	if (phase === "crashed") {
 		useProjectionStore.getState().markRuntimeFailure(runtime.sessionHandle, stripAnsi(runtime.error ?? ""));
 	}
-	if (
-		reconcileHidden &&
-		!isCurrentSession(runtime.sessionHandle) &&
-		(runtime.state === "idle" || runtime.state === "dormant" || runtime.state === "crashed")
-	) {
+	if (reconcileHidden && !isCurrentSession(runtime.sessionHandle) && settled) {
 		reconcileHiddenSessionLifecycle(runtime.sessionHandle);
 	}
-	if (runtime.state === "crashed" && isCurrentSession(runtime.sessionHandle)) {
+	if (phase === "crashed" && isCurrentSession(runtime.sessionHandle)) {
 		toast.error(tt("status.crashed"), { description: stripAnsi(runtime.error ?? "") });
 	}
 	if (isCurrentSession(runtime.sessionHandle)) {
-		if (runtime.state === "running") {
-			updateTabBadge("running", sessionLabel(runtime.sessionHandle));
-		} else if (runtime.state === "waiting_ui") {
+		if (phase === "waiting_ui") {
 			updateTabBadge("waiting_ui", sessionLabel(runtime.sessionHandle));
-		} else if (runtime.state === "idle" || runtime.state === "dormant") {
+		} else if (busy) {
+			updateTabBadge("running", sessionLabel(runtime.sessionHandle));
+		} else if (phase === "ready" || phase === "dormant") {
 			updateTabBadge("idle", sessionLabel(runtime.sessionHandle));
 		}
 	}
 }
 
 function scheduleHiddenLifecycleAfterSnapshot(runtime: SessionRuntimeDto): void {
-	if (runtime.state !== "idle" && runtime.state !== "dormant" && runtime.state !== "crashed") return;
+	if (!runtimeIsSettled(runtime)) return;
 	// The transport marks the baseline authoritative only after every synchronous
 	// snapshot listener commits. Reconcile on the next microtask and fence the
 	// captured incarnation so a visible switch or rekey cancels stale cleanup.

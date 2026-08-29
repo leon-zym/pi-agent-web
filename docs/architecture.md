@@ -120,6 +120,29 @@ Header、名称、计数、时间和截断首条消息，不复制完整对话�
 同一 Workspace 的多个 Session 可以并发。Workspace reservation 只覆盖文件身份敏感的 create、
 fork/clone commit 与 delete 窗口，避免两个进程同时拥有同一 JSONL；它不是运行时全局锁。
 
+## 跨层资源治理
+
+资源上限在 Gateway 的实际共享边界上执行，而不是只在单个请求或单个 Browser 连接上计数：
+
+- `SessionSupervisor` 默认最多保留 8 个热 Pi 进程，并以 `maxRetainedProjectionBytes` 默认 512 MiB
+  为热 Runtime 投影保留预算。每个热 Runtime 按其 snapshot 上限做保守 reservation；这是 admission
+  预算，不是对 Node 或 Browser 实际 heap 的精确测量。容量不足时只有可驱逐的 idle、已持久化、无
+  lease/命令/对话框/transition reservation 的 Runtime 可以让位，否则以
+  `session_runtime_capacity` 或 `session_projection_capacity` 明确拒绝。
+- Runtime 对外发布 `phase`、`operationCount` 和 `busyReasons`：`starting`、`ready`、`busy`、
+  `waiting_ui`、`crashed`、`dormant`。这些字段描述共享 admission 与可观察状态；`operationCount`
+  是加权占用估计，不是可供客户端操纵的任务序号。
+- `SessionWsBridge` 在所有连接共享的边界执行连接数（默认 64）、订阅 channel（1024）、并发
+  catch-up（256）、历史 alias（1024）、pending command response reservation（65 MiB）以及
+  outbound backlog/frame 上限；每连接的 in-flight command 仍受 32 项限制。超过预算会得到稳定、
+  可分类的错误，不通过扩大某一条连接的队列来掩盖全局压力。
+- `NativeSessionCatalog` 以文件 identity/revision 做可丢弃的逐文件 cache；同一文件追加时只读取
+  新增尾部，truncate、inode replacement、symlink retarget 或 transient I/O failure 会退回安全重扫。
+  单次发现默认受 128 MiB、4096 页、5 秒限制，硬上限为 512 MiB、100,000 页、60 秒，并保留
+  `partial`/`stale`/`retryable` 诊断，不把 cache 当成第二套 Session 事实。
+- Browser 的 6 个普通 idle/persisted subscription 仍是 soft target。受保护的 hot Runtime 可以使其
+  暂时超额；UI 必须区分 protected overage 与带 `code`/`retryable` 的拒绝，并只在连接已可用时重试。
+
 ## 订阅、控制与命令
 
 连接必须先用 `client_hello` / `server_hello` 协商协议 major/minor、能力与上限；major 不兼容是
@@ -133,6 +156,9 @@ Session；不同连接也能各自控制不同 Session。同一 Session 同时�
 - observer 继续接收权威 Session snapshot、事件、运行状态与 Extension state，但不能修改 Pi；
 - `new_session` 与 `switch_session` 是 Host 管理的生命周期命令，浏览器不能直接转发；新建走
   Native REST，页面导航只更改 selected pointer。
+
+`session_error` 的错误文案仅用于展示；Gateway 同时发送稳定 `code` 与 `retryable` 判定。Browser
+不得从人类可读文案猜测是否应重试；旧 peer 缺少结构化字段时只保留兼容性 fallback。
 
 桥接层为每条浏览器命令分配内部 Pi id，response 前恢复发起者 id。Bash 的流式 execution id
 也按连接映射，避免不同连接使用相同 client id 时串流。

@@ -15,6 +15,8 @@ import type {
 	SessionCommandDto,
 	SessionCommandResponseDto,
 	SessionMessageDto,
+	SessionRuntimeBusyReasonDto,
+	SessionRuntimePhaseDto,
 	SessionSnapshotDto,
 	SessionStateDto,
 } from "@pi-agent-web/protocol";
@@ -77,6 +79,13 @@ const DEFAULT_TRANSIENT_BUFFER_MAX_BYTES = 4 * 1024 * 1024;
 const DEFAULT_EXTENSION_STATE_MAX_BYTES = 512 * 1024;
 const DEFAULT_EXTENSION_STATE_MAX_ITEMS = SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS;
 const DEFAULT_PENDING_DIALOG_LIMIT = 32;
+
+function deepFreeze<T>(value: T): T {
+	if (value === null || typeof value !== "object" || Object.isFrozen(value)) return value;
+	Object.freeze(value);
+	for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);
+	return value;
+}
 
 type BufferedFrame<TEvent = ProductSessionEventDto, TExtensionRequest = ExtensionUiRequestDto> =
 	| { type: "event"; event: TEvent }
@@ -496,6 +505,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	private activeTurnHeadroomReserved = false;
 	private agentBusy = false;
 	private compactionBusy = false;
+	private idleBaseCompactionBusy = false;
 	private inFlight = 0;
 	private reservations = 0;
 	private commandTail: Promise<void> = Promise.resolve();
@@ -520,6 +530,11 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	private discardedCompactionTransferCleanup: Promise<void> | null = null;
 	private retiredGenerationContentCleanup: Promise<void> | null = null;
 	private generationContentCleanupFailure: Error | null = null;
+	private snapshotVersion = 0;
+	private snapshotCache: {
+		version: number;
+		snapshot: SessionRuntimeProductSnapshot<M>;
+	} | null = null;
 	private deferredStartupEmits:
 		| SessionSupervisorMessage<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[]
 		| null = null;
@@ -603,6 +618,8 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		) {
 			return null;
 		}
+		const phase = this.runtimePhase();
+		if (phase === "crashed" || phase === "dormant") return null;
 		return {
 			entry: {
 				serverEpoch: this.opts.serverEpoch,
@@ -610,6 +627,9 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 				workspaceId: this.workspaceId,
 				generation: this.generation,
 				state: this.state,
+				phase,
+				operationCount: this.operationCount(),
+				busyReasons: this.busyReasons(),
 			},
 			processToken: this.processToken,
 		};
@@ -711,10 +731,48 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			generation: this.generation,
 			lastSeq: this.lastSeq,
 			state: this.state,
+			phase: this.runtimePhase(),
+			operationCount: this.operationCount(),
+			busyReasons: this.busyReasons(),
 			lastActivityAt: this.lastActivityAt,
 			recoverable: this.recoverable,
 			...(this.error ? { error: this.error } : {}),
 		};
+	}
+
+	private runtimePhase(): SessionRuntimePhaseDto {
+		if (this.state === "starting") return "starting";
+		if (this.state === "crashed") return "crashed";
+		if (this.state === "dormant") return "dormant";
+		if (this.state === "waiting_ui" || this.pendingDialogs.size > 0) return "waiting_ui";
+		if (this.state === "running" || this.busyReasons().length > 0) return "busy";
+		return "ready";
+	}
+
+	private busyReasons(): SessionRuntimeBusyReasonDto[] {
+		const reasons: SessionRuntimeBusyReasonDto[] = [];
+		if (this.state === "starting") reasons.push("starting");
+		if (this.inFlight > 0) reasons.push("command");
+		if (this.agentBusy) reasons.push("agent");
+		if (this.compactionBusy || this.idleBaseCompactionBusy) reasons.push("compaction");
+		if (this.activeQueueDepth > 0) reasons.push("queue");
+		if (this.pendingDialogs.size > 0) reasons.push("dialog");
+		if (this.pendingTurnReservations.size > 0) reasons.push("turn_reservation");
+		if (this.transitioning) reasons.push("transition");
+		return reasons;
+	}
+
+	private operationCount(): number {
+		return (
+			this.inFlight +
+			this.activeQueueDepth +
+			this.pendingDialogs.size +
+			this.pendingTurnReservations.size +
+			(this.agentBusy ? 1 : 0) +
+			(this.compactionBusy || this.idleBaseCompactionBusy ? 1 : 0) +
+			(this.transitioning ? 1 : 0) +
+			(this.state === "starting" ? 1 : 0)
+		);
 	}
 
 	/** Start or reuse this exact Session target. */
@@ -1185,8 +1243,10 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			// response cannot prove that Pi rejected it. Retain the runtime unless
 			// the Session later materializes and becomes independently recoverable.
 			if (commandCarriesConversation(command.type)) this.hasConversationIntent = true;
-			if (expectsWork) this.setState("running");
 			this.touch();
+			const stateBeforeCommand = this.state;
+			if (expectsWork) this.setState("running");
+			if (!expectsWork || stateBeforeCommand === this.state) this.publishOperationalState();
 			let response: Promise<RuntimeResponse<M>>;
 			try {
 				const processToken = this.processToken;
@@ -1213,9 +1273,12 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 					timeoutMs ?? this.timeoutFor(command.type),
 				);
 			} catch (error) {
+				const previousOperationalState = this.operationalStateKey();
 				this.inFlight = Math.max(0, this.inFlight - 1);
 				if (turnReservation) this.releasePendingTurn(turnReservation);
-				if (expectsWork) this.refreshOperationalState();
+				this.touch();
+				if (expectsWork) this.refreshOperationalStateAndPublish(previousOperationalState);
+				else this.publishOperationalState();
 				throw error;
 			}
 			return {
@@ -1231,18 +1294,23 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 				this.finishWorkCommandResponse(response.success === true, admitted.turnReservation);
 			}
 			if (response.success === true && admitted.turnReleaseCutoff !== undefined) {
+				const previousOperationalState = this.operationalStateKey();
 				this.releasePendingTurnsThrough(admitted.turnReleaseCutoff);
-				this.refreshOperationalState();
+				this.refreshOperationalStateAndPublish(previousOperationalState);
 			}
 			return response;
 		} catch (error) {
-			if (admitted.turnReservation) this.releasePendingTurn(admitted.turnReservation);
-			if (admitted.expectsWork) this.refreshOperationalState();
+			if (admitted.turnReservation) {
+				const previousOperationalState = this.operationalStateKey();
+				this.releasePendingTurn(admitted.turnReservation);
+				this.refreshOperationalStateAndPublish(previousOperationalState);
+			}
 			throw error;
 		} finally {
+			const previousOperationalState = this.operationalStateKey();
 			this.inFlight = Math.max(0, this.inFlight - 1);
-			this.refreshOperationalState();
 			this.touch();
+			this.refreshOperationalStateAndPublish(previousOperationalState);
 		}
 	}
 
@@ -1293,6 +1361,8 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			};
 			this.transitionStage = stage;
 			this.inFlight += 1;
+			this.touch();
+			this.publishOperationalState();
 			const previousSessionHandle = this.sessionHandle;
 			let parentIdentityConfirmed = false;
 			let identityCommitted = false;
@@ -1470,10 +1540,11 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 				}
 				throw error;
 			} finally {
+				const previousOperationalState = this.operationalStateKey();
 				this.inFlight = Math.max(0, this.inFlight - 1);
 				this.transitionStage = null;
-				this.refreshOperationalState();
 				this.touch();
+				this.refreshOperationalStateAndPublish(previousOperationalState);
 			}
 		});
 	}
@@ -1590,6 +1661,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	}
 
 	sessionSnapshot(): SessionRuntimeProductSnapshot<M> {
+		if (this.snapshotCache?.version === this.snapshotVersion) return this.snapshotCache.snapshot;
 		const snapshot = this.buildSessionSnapshot();
 		if (!this.isProductSnapshot(snapshot)) {
 			this.terminalizeSnapshotOverflow();
@@ -1601,7 +1673,10 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			this.terminalizeSnapshotOverflow();
 			throw new RpcError("session_snapshot", "session_snapshot_overflow");
 		}
-		return snapshot;
+		const version = this.snapshotVersion;
+		const frozenSnapshot = deepFreeze(snapshot);
+		this.snapshotCache = { version, snapshot: frozenSnapshot };
+		return frozenSnapshot;
 	}
 
 	private buildSessionSnapshot(
@@ -1693,14 +1768,22 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			this.closeDialog(response.id, "process_lost");
 			return "not_running";
 		}
-		this.closeDialog(
+		const previousOperationalState = this.operationalStateKey();
+		const publishedOperationalState = this.closeDialog(
 			response.id,
 			"cancelled" in response && response.cancelled === true ? "cancelled" : "answered",
 		);
 		this.proc.sendNoResponse(response);
 		// A dialog can belong to an extension command that never starts the
 		// agent. Restore state from actual events instead of assuming work began.
-		this.refreshOperationalState();
+		const stateChanged = this.refreshOperationalState();
+		if (
+			!stateChanged &&
+			!publishedOperationalState &&
+			this.operationalStateKey() !== previousOperationalState
+		) {
+			this.publishOperationalState();
+		}
 		return "accepted";
 	}
 
@@ -1988,6 +2071,8 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	}
 
 	private applyEventState(event: RuntimeEvent<M>): void {
+		const previousState = this.state;
+		const previousOperationalState = this.operationalStateKey();
 		if (event.type === "queue_update") {
 			const previousQueueDepth = this.activeQueueDepth;
 			this.activeQueueDepth = event.steering.length + event.followUp.length;
@@ -2027,7 +2112,10 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			this.refreshOperationalState();
 		}
 		this.touch();
-		if (this.state === "idle") this.maybeCompactIdleProjectionBase();
+		if (this.state === "idle") this.maybeCompactIdleProjectionBase(false);
+		if (this.state === previousState && this.operationalStateKey() !== previousOperationalState) {
+			this.publishOperationalState();
+		}
 	}
 
 	private handleExtensionRequest(processToken: number, request: RuntimeExtensionRequest<M>): void {
@@ -2498,6 +2586,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		if (!this.extensionSemanticOperationEligible(prepared)) {
 			throw new RpcError("extension_ui_request", "extension_semantic_operation_stale");
 		}
+		const previousOperationalState = this.operationalStateKey();
 		const committed = prepared.projection.commitPreparedBatch(prepared.token);
 		if (committed === null || committed !== prepared.token.lastSeq) {
 			throw new RpcError("extension_ui_request", "extension_projection_commit_invariant_failed");
@@ -2513,6 +2602,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		const stateChanged = prepared.pendingDialogs.size > 0 && this.state !== "waiting_ui";
 		if (stateChanged) this.state = "waiting_ui";
 		this.touch();
+		const operationalStateChanged = this.operationalStateKey() !== previousOperationalState;
 
 		for (const entry of prepared.timersToClear) {
 			this.runCommittedExtensionEffect("clear dialog timer", () => {
@@ -2524,7 +2614,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 				this.armDialogTimer(prepared.processToken, entry),
 			);
 		}
-		if (stateChanged) {
+		if (stateChanged || operationalStateChanged) {
 			this.runCommittedExtensionEffect("refresh hot Runtime inventory", () =>
 				this.opts.onHotSetChanged?.(this),
 			);
@@ -2599,6 +2689,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		publishState: boolean,
 	): void {
 		this.closeDialog(request.id, "replaced");
+		const previousOperationalState = this.operationalStateKey();
 		const requestBytes = extensionRequestBytes(request);
 		if (
 			this.pendingDialogs.size >= this.opts.pendingDialogLimit ||
@@ -2617,7 +2708,14 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		}
 		this.pendingDialogs.set(request.id, entry);
 		this.extensionSemanticRevision += 1;
-		if (publishState) this.setState("waiting_ui");
+		this.touch();
+		if (publishState) {
+			const stateChanged = this.state !== "waiting_ui";
+			this.setState("waiting_ui");
+			if (!stateChanged && this.operationalStateKey() !== previousOperationalState) {
+				this.publishOperationalState();
+			}
+		}
 	}
 
 	private extensionStateFits(extraBytes: number, extraItems: number): boolean {
@@ -3000,6 +3098,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			this.activeTurnProjectionBytes = turnBudget.bytes;
 		}
 		afterProjectionCommit?.();
+		this.touch();
 		const envelope: SessionReplayFrame = {
 			...frame,
 			serverEpoch: this.opts.serverEpoch,
@@ -3117,14 +3216,14 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			{ type: "extension_ui_closed" }
 		>["reason"],
 		emit = true,
-	): void {
+	): boolean {
 		const dialog = this.pendingDialogs.get(requestId);
-		if (!dialog) return;
+		if (!dialog) return false;
 		if (emit && this.productAdapter.mode === "current" && this.startupReady && !this.transitionStage) {
 			this.commitExtensionSemanticOperation(
 				this.prepareExtensionCloseSemanticOperation(this.processToken, requestId, reason, dialog),
 			);
-			return;
+			return true;
 		}
 		const commitClose = () => {
 			if (dialog.timer) clearTimeout(dialog.timer);
@@ -3138,6 +3237,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		} else {
 			commitClose();
 		}
+		return false;
 	}
 
 	private closeAllDialogs(
@@ -3161,33 +3261,44 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			(expectedEntry !== undefined && this.pendingDialogs.get(requestId) !== expectedEntry)
 		)
 			return;
-		this.closeDialog(requestId, "expired");
+		const previousOperationalState = this.operationalStateKey();
+		const publishedOperationalState = this.closeDialog(requestId, "expired");
 		if (this.proc?.running) {
 			this.proc.sendNoResponse({ type: "extension_ui_response", id: requestId, cancelled: true });
 		}
-		this.refreshOperationalState();
+		const stateChanged = this.refreshOperationalState();
+		if (
+			!stateChanged &&
+			!publishedOperationalState &&
+			this.operationalStateKey() !== previousOperationalState
+		) {
+			this.publishOperationalState();
+		}
 		this.log("info", `Extension dialog ${requestId} expired for ${this.sessionHandle}`);
 	}
 
 	private setState(state: SessionRuntimeSnapshot["state"], projectionPhasePrepared = false): void {
 		if (this.state === state && state !== "starting") return;
 		this.state = state;
+		// Invalidate the cached snapshot before callbacks can observe the new state.
+		this.touch();
 		this.opts.onHotSetChanged?.(this);
 		if (!projectionPhasePrepared) this.liveProjection?.setRuntimePhase(this.projectionIdentity(), state);
-		this.touch();
 		if (!this.startupReady && state !== "starting" && state !== "crashed" && state !== "dormant") return;
 		this.emitSupervisorMessage({ type: "runtime_state", runtime: this.snapshot() });
 	}
 
 	private touch(): void {
 		this.lastActivityAt = Date.now();
+		this.snapshotVersion += 1;
+		this.snapshotCache = null;
 	}
 
 	private identityTransitionBlocker(): string | null {
 		if (!this.running) return "process";
 		if (this.state !== "idle") return this.state;
 		if (this.agentBusy) return "agent";
-		if (this.compactionBusy) return "compaction";
+		if (this.compactionBusy || this.idleBaseCompactionBusy) return "compaction";
 		if (this.activeQueueDepth > 0) return "queue";
 		if (this.inFlight > 0) return "command";
 		if (this.pendingDialogs.size > 0) return "dialog";
@@ -3196,18 +3307,42 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		return null;
 	}
 
-	private refreshOperationalState(): void {
-		if (!this.startupReady || !this.running) return;
+	private refreshOperationalState(): boolean {
+		if (!this.startupReady || !this.running) return false;
+		const previousState = this.state;
 		if (this.pendingDialogs.size > 0) this.setState("waiting_ui");
-		else if (this.agentBusy || this.compactionBusy || this.pendingTurnReservations.size > 0)
+		else if (
+			this.agentBusy ||
+			this.compactionBusy ||
+			this.idleBaseCompactionBusy ||
+			this.pendingTurnReservations.size > 0
+		)
 			this.setState("running");
 		else {
 			this.setState("idle");
 			this.maybeCompactIdleProjectionBase();
 		}
+		return previousState !== this.state;
 	}
 
-	private maybeCompactIdleProjectionBase(): void {
+	private refreshOperationalStateAndPublish(previousOperationalState: string): void {
+		const stateChanged = this.refreshOperationalState();
+		if (!stateChanged && this.operationalStateKey() !== previousOperationalState) {
+			this.publishOperationalState();
+		}
+	}
+
+	private operationalStateKey(): string {
+		return `${this.runtimePhase()}\0${this.operationCount()}\0${this.busyReasons().join(",")}`;
+	}
+
+	private publishOperationalState(): void {
+		if (!this.startupReady || !this.running) return;
+		this.opts.onHotSetChanged?.(this);
+		this.emitSupervisorMessage({ type: "runtime_state", runtime: this.snapshot() });
+	}
+
+	private maybeCompactIdleProjectionBase(publishOperationalState = true): void {
 		if (
 			this.idleBaseCompactionPromise ||
 			this.discardedCompactionTransferCleanup ||
@@ -3219,6 +3354,12 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		if (!projection || !proc?.running || !projection.shouldCompactIdleBase()) return;
 		const token = projection.beginIdleBaseCompaction();
 		if (!token || token.expectedAsOfSeq === projection.snapshot().baseSeq) return;
+		const previousOperationalState = this.operationalStateKey();
+		this.idleBaseCompactionBusy = true;
+		this.touch();
+		if (publishOperationalState && this.operationalStateKey() !== previousOperationalState) {
+			this.publishOperationalState();
+		}
 		const processToken = this.processToken;
 		const contentOwner = this.generationContentOwner;
 		let compaction!: Promise<void>;
@@ -3290,6 +3431,9 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			})
 			.finally(() => {
 				if (this.idleBaseCompactionPromise === compaction) this.idleBaseCompactionPromise = null;
+				this.idleBaseCompactionBusy = false;
+				this.touch();
+				this.publishOperationalState();
 			});
 		this.idleBaseCompactionPromise = compaction;
 	}
@@ -3341,8 +3485,9 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 
 	private finishWorkCommandResponse(success: boolean, reservation: symbol): void {
 		if (!success) {
+			const previousOperationalState = this.operationalStateKey();
 			this.releasePendingTurn(reservation);
-			this.refreshOperationalState();
+			this.refreshOperationalStateAndPublish(previousOperationalState);
 			return;
 		}
 		const pending = this.pendingTurnReservations.get(reservation);
@@ -3358,6 +3503,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			processToken: this.processToken,
 			timer: null,
 		});
+		this.touch();
 		return token;
 	}
 
@@ -3371,6 +3517,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		if (!reservation) return;
 		if (reservation.timer) clearTimeout(reservation.timer);
 		this.pendingTurnReservations.delete(token);
+		this.touch();
 	}
 
 	private schedulePendingTurnExpiry(token: symbol): void {
@@ -3387,8 +3534,9 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			}
 			reservation.timer = null;
 			if (!this.agentBusy && this.activeQueueDepth === 0) {
+				const previousOperationalState = this.operationalStateKey();
 				this.releasePendingTurn(token);
-				this.refreshOperationalState();
+				this.refreshOperationalStateAndPublish(previousOperationalState);
 				return;
 			}
 			this.schedulePendingTurnExpiry(token);
@@ -3499,12 +3647,14 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		this.clearReplay();
 		this.agentBusy = false;
 		this.compactionBusy = false;
+		this.idleBaseCompactionBusy = false;
 		this.activeQueueDepth = 0;
 		this.activeTurnProjectionItems = 0;
 		this.activeTurnProjectionBytes = 0;
 		this.activeTurnProjectionLogicalBytes = 0;
 		this.activeTurnHeadroomReserved = false;
 		this.inFlight = 0;
+		this.touch();
 	}
 
 	private emitSupervisorMessage(

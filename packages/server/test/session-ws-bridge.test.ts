@@ -29,6 +29,7 @@ import {
 	MAX_SESSION_WS_BUFFERED_BYTES,
 	MAX_SESSION_WS_IN_FLIGHT_EXACT_SUBSCRIPTIONS,
 	SessionWsBridge,
+	type SessionWsBridgeOptions,
 } from "../src/session-ws-bridge.js";
 
 const fixturePath = path.join(import.meta.dirname, "fixtures", "session-runtime-pi.mjs");
@@ -144,6 +145,14 @@ interface Harness {
 	url: string;
 	clients: ClientProbe[];
 	connectionEvents: string[];
+}
+
+interface BridgeTestLimits {
+	maxConnections?: number;
+	maxSubscribedChannels?: number;
+	maxConcurrentCatchUps?: number;
+	maxSubscriptionAliases?: number;
+	maxPendingCommandResponseBytes?: number;
 }
 
 function temporaryRoot(): string {
@@ -306,7 +315,12 @@ function markBridgeConnectionInventoryNegotiated(bridge: SessionWsBridge): void 
 
 async function createHarness(
 	targets: ExistingSessionTarget[],
-	options: { replayLimit?: number; serverEpoch?: string; env?: Record<string, string> } = {},
+	options: {
+		replayLimit?: number;
+		serverEpoch?: string;
+		env?: Record<string, string>;
+		bridge?: BridgeTestLimits;
+	} = {},
 ): Promise<Harness> {
 	const connectionEvents: string[] = [];
 	const targetMap = new Map(targets.map((target) => [target.sessionHandle, target]));
@@ -354,7 +368,8 @@ async function createHarness(
 		},
 		heartbeatIntervalMs: 60_000,
 		log: (_level, message) => connectionEvents.push(message),
-	});
+		...(options.bridge ?? {}),
+	} satisfies SessionWsBridgeOptions);
 
 	const server = http.createServer();
 	server.on("upgrade", (request, socket, head) => {
@@ -531,6 +546,190 @@ afterEach(async () => {
 });
 
 describe("SessionWsBridge", () => {
+	it("rejects a connection above the Gateway socket budget with a retryable close", async () => {
+		const harness = await createHarness([], { bridge: { maxConnections: 1 } });
+		await openClient(harness);
+
+		const rejected = new WebSocket(harness.url);
+		const closed = new Promise<{ code: number; reason: string }>((resolve, reject) => {
+			rejected.once("error", reject);
+			rejected.once("close", (code, reason) => resolve({ code, reason: reason.toString() }));
+		});
+
+		expect(await closed).toEqual({ code: 1013, reason: "gateway capacity" });
+	});
+
+	it("rejects a subscription above the shared channel budget without disturbing existing channels", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const first = createNativeSession(root, cwd, "subscription-capacity-first");
+		const second = createNativeSession(root, cwd, "subscription-capacity-second");
+		const harness = await createHarness([first, second], { bridge: { maxSubscribedChannels: 1 } });
+		const client = await openClient(harness);
+		await subscribe(client, first.sessionHandle);
+
+		const mark = client.mark();
+		client.send({ type: "session_subscribe", sessionHandle: second.sessionHandle });
+		const error = await client.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+				frame.type === "session_error" &&
+				frame.sessionHandle === second.sessionHandle &&
+				frame.operation === "subscribe",
+			mark,
+		);
+
+		expect(error.error).toBe("session_subscription_capacity");
+		expect(error.code).toBe("session_subscription_capacity");
+		expect(error.retryable).toBe(true);
+		const { connection } = bridgeConnection(harness.bridge);
+		expect((connection as { subscriptions: Set<string> }).subscriptions).toEqual(
+			new Set([first.sessionHandle]),
+		);
+	});
+
+	it("rejects a catch-up storm at the shared budget and accepts a retry after release", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const first = createNativeSession(root, cwd, "catchup-capacity-first");
+		const second = createNativeSession(root, cwd, "catchup-capacity-second");
+		const harness = await createHarness([first, second], { bridge: { maxConcurrentCatchUps: 1 } });
+		const client = await openClient(harness);
+		const originalSubscribe = harness.supervisor.subscribe.bind(harness.supervisor);
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let entered: (() => void) | undefined;
+		const enteredPromise = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		harness.supervisor.subscribe = async (...args) => {
+			entered?.();
+			await gate;
+			return originalSubscribe(...args);
+		};
+
+		client.send({ type: "session_subscribe", sessionHandle: first.sessionHandle });
+		await enteredPromise;
+		const rejectedMark = client.mark();
+		client.send({ type: "session_subscribe", sessionHandle: second.sessionHandle });
+		const rejected = await client.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+				frame.type === "session_error" &&
+				frame.sessionHandle === second.sessionHandle &&
+				frame.operation === "subscribe",
+			rejectedMark,
+		);
+		expect(rejected.error).toBe("session_catchup_capacity");
+		expect(rejected.code).toBe("session_catchup_capacity");
+		expect(rejected.retryable).toBe(true);
+
+		release?.();
+		await client.waitForFrame(
+			(frame): frame is LeaseFrame =>
+				frame.type === "lease_status" && frame.sessionHandle === first.sessionHandle,
+		);
+		await subscribe(client, second.sessionHandle);
+	});
+
+	it("bounds historical subscription aliases while retaining the current canonical handle", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "alias-capacity");
+		const harness = await createHarness([target], { bridge: { maxSubscriptionAliases: 2 } });
+		const client = await openClient(harness);
+		const initial = await subscribe(client, target.sessionHandle);
+		const firstChild = `${target.sessionHandle}-child-1`;
+		const secondChild = `${target.sessionHandle}-child-2`;
+		const rekey = (previousSessionHandle: string, sessionHandle: string): void => {
+			harness.bridge.broadcast({
+				type: "session_rekeyed",
+				previousSessionHandle,
+				runtime: { ...initial.runtime, sessionHandle },
+			} as Parameters<SessionWsBridge["broadcast"]>[0]);
+		};
+
+		rekey(target.sessionHandle, firstChild);
+		rekey(firstChild, secondChild);
+
+		const { connection } = bridgeConnection(harness.bridge);
+		const state = connection as {
+			subscriptions: Set<string>;
+			subscriptionAliases: Map<string, string>;
+		};
+		expect(state.subscriptions).toEqual(new Set([secondChild]));
+		expect(state.subscriptionAliases.size).toBeLessThanOrEqual(2);
+		expect(state.subscriptionAliases.get(secondChild)).toBe(secondChild);
+	});
+
+	it("rejects commands whose weighted pending responses exceed the connection budget", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "pending-response-capacity");
+		const harness = await createHarness([target], {
+			bridge: { maxPendingCommandResponseBytes: 128 * 1024 },
+		});
+		const client = await openClient(harness);
+		const subscription = await subscribe(client, target.sessionHandle);
+		const originalSendCommand = harness.supervisor.sendCommand.bind(harness.supervisor);
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		harness.supervisor.sendCommand = async (...args) => {
+			await gate;
+			return originalSendCommand(...args);
+		};
+
+		for (const id of ["pending-1", "pending-2"]) {
+			client.send({
+				type: "command",
+				sessionHandle: target.sessionHandle,
+				expectedGeneration: subscription.runtime.generation,
+				command: { type: "get_state", id },
+			});
+		}
+		const mark = client.mark();
+		client.send({
+			type: "command",
+			sessionHandle: target.sessionHandle,
+			expectedGeneration: subscription.runtime.generation,
+			command: { type: "get_state", id: "pending-3" },
+		});
+		const rejected = await client.waitForFrame(
+			(frame): frame is ResponseFrame => frame.type === "response" && frame.response.id === "pending-3",
+			mark,
+		);
+		expect(rejected.response).toMatchObject({
+			success: false,
+			error: "pending_command_response_capacity",
+		});
+
+		release?.();
+		await client.waitForFrame(
+			(frame): frame is ResponseFrame => frame.type === "response" && frame.response.id === "pending-2",
+		);
+		const largeMark = client.mark();
+		client.send({
+			type: "command",
+			sessionHandle: target.sessionHandle,
+			expectedGeneration: subscription.runtime.generation,
+			command: { type: "get_tree", id: "pending-large" },
+		});
+		const largeRejected = await client.waitForFrame(
+			(frame): frame is ResponseFrame => frame.type === "response" && frame.response.id === "pending-large",
+			largeMark,
+		);
+		expect(largeRejected.response).toMatchObject({
+			success: false,
+			error: "pending_command_response_capacity",
+		});
+	});
+
 	it("sends hello then the initial full hot inventory only after capability negotiation", async () => {
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace");
@@ -1235,6 +1434,13 @@ describe("SessionWsBridge", () => {
 		const lease = await observer.waitForFrame(
 			(frame): frame is LeaseFrame =>
 				frame.type === "lease_status" && frame.sessionHandle === target.sessionHandle,
+			ordinaryMark,
+		);
+		await observer.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "event" }> =>
+				frame.type === "event" &&
+				frame.sessionHandle === target.sessionHandle &&
+				frame.seq === current.lastSeq,
 			ordinaryMark,
 		);
 		expect(lease.isController).toBe(false);

@@ -14,10 +14,20 @@ vi.mock("../src/stores/session-directory", async (importOriginal) => {
 	return { ...actual, useSessionDirectoryStore: liveStore };
 });
 
+vi.mock("../src/stores/session-transport", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../src/stores/session-transport")>();
+	const liveSelector = <T,>(
+		selector: (state: ReturnType<typeof actual.sessionTransport.store.getState>) => T,
+	): T => selector(actual.sessionTransport.store.getState());
+	return { ...actual, useSessionTransportStore: liveSelector };
+});
+
 import { WorkspaceSidebar } from "../src/features/sidebar/WorkspaceSidebar";
 import { useSessionDirectoryStore } from "../src/stores/session-directory";
+import { sessionTransport } from "../src/stores/session-transport";
 
 const originalDirectory = useSessionDirectoryStore.getState();
+const originalTransport = sessionTransport.store.getState();
 
 function runtime(
 	sessionHandle: string,
@@ -61,6 +71,7 @@ function session(
 
 afterEach(() => {
 	useSessionDirectoryStore.setState(originalDirectory, true);
+	sessionTransport.store.setState(originalTransport, true);
 });
 
 describe("WorkspaceSidebar hot runtime overlay", () => {
@@ -175,6 +186,161 @@ describe("WorkspaceSidebar hot runtime overlay", () => {
 		const html = renderToStaticMarkup(createElement(WorkspaceSidebar, { rail: false }));
 
 		expect(html).toMatch(/Unloaded inventory workspace<\/span><span[^>]*>10<\/span>/);
+	});
+
+	it("uses the hot runtime phase for the session status overlay", () => {
+		const workspace: NativeWorkspaceDto = {
+			workspaceHandle: "workspace-phase",
+			path: "/tmp/workspace-phase",
+			available: true,
+			pinned: false,
+			displayName: "Phase workspace",
+			lastOpenedAt: null,
+			sessionCount: 1,
+			hasNativeHistory: true,
+		};
+		const sessionWithBusyPhase = {
+			...session("phase-session", "Phase-aware session", true, workspace.workspaceHandle),
+			runtime: {
+				...runtime("phase-session", workspace.workspaceHandle, true),
+				state: "idle" as const,
+				phase: "busy" as const,
+			},
+		};
+		useSessionDirectoryStore.setState({
+			workspaces: [workspace],
+			currentWorkspaceHandle: workspace.workspaceHandle,
+			currentSession: sessionWithBusyPhase,
+			sessionsByWorkspace: { [workspace.workspaceHandle]: [sessionWithBusyPhase] },
+			hotSessionsByWorkspace: {},
+			hotRuntimeStateBySession: {},
+			searchQuery: "",
+		});
+
+		const html = renderToStaticMarkup(createElement(WorkspaceSidebar, { rail: false }));
+
+		expect(html).toContain('data-runtime-state="running"');
+	});
+
+	it("normalizes an inventory phase before storing the sidebar overlay state", () => {
+		const workspace: NativeWorkspaceDto = {
+			workspaceHandle: "workspace-inventory-phase",
+			path: "/tmp/workspace-inventory-phase",
+			available: true,
+			pinned: false,
+			displayName: "Inventory phase workspace",
+			lastOpenedAt: null,
+			sessionCount: 0,
+			hasNativeHistory: false,
+		};
+		useSessionDirectoryStore.setState({
+			workspaces: [workspace],
+			currentWorkspaceHandle: workspace.workspaceHandle,
+			currentSession: null,
+			sessionsByWorkspace: {},
+			hotSessionsByWorkspace: {},
+			hotRuntimeStateBySession: {},
+			searchQuery: "",
+		});
+		useSessionDirectoryStore.getState().applyHotRuntimeInventory({
+			type: "hot_runtime_inventory",
+			serverEpoch: "epoch-sidebar",
+			revision: 1,
+			runtimes: [
+				{
+					serverEpoch: "epoch-sidebar",
+					sessionHandle: "inventory-phase-session",
+					workspaceId: workspace.workspaceHandle,
+					generation: 1,
+					state: "idle",
+					phase: "busy",
+				},
+			],
+		});
+
+		expect(useSessionDirectoryStore.getState().hotRuntimeStateBySession).toEqual({
+			"inventory-phase-session": "running",
+		});
+		const html = renderToStaticMarkup(createElement(WorkspaceSidebar, { rail: false }));
+
+		expect(html).toContain('data-runtime-state="running"');
+	});
+
+	it("distinguishes protected soft overage from a rejected subscription", () => {
+		const workspace: NativeWorkspaceDto = {
+			workspaceHandle: "workspace-admission",
+			path: "/tmp/workspace-admission",
+			available: true,
+			pinned: false,
+			displayName: "Admission workspace",
+			lastOpenedAt: null,
+			sessionCount: 2,
+			hasNativeHistory: true,
+		};
+		const protectedSession = session("protected", "Protected session", true, workspace.workspaceHandle);
+		const rejectedSession = session("rejected", "Rejected session", true, workspace.workspaceHandle);
+		useSessionDirectoryStore.setState({
+			workspaces: [workspace],
+			currentWorkspaceHandle: workspace.workspaceHandle,
+			currentSession: protectedSession,
+			sessionsByWorkspace: { [workspace.workspaceHandle]: [protectedSession, rejectedSession] },
+			hotSessionsByWorkspace: {},
+			hotRuntimeStateBySession: {},
+			searchQuery: "",
+		});
+		sessionTransport.store.setState({
+			sessions: {
+				protected: {
+					sessionHandle: "protected",
+					subscribed: true,
+					controllerIntent: false,
+					runtime: protectedSession.runtime,
+					generation: 1,
+					baselineAuthoritative: true,
+					freshLeaseBaseline: protectedSession.runtime,
+					lastSeq: 0,
+					projectedSeq: 0,
+					lease: { isController: false },
+					pendingExtensionRequests: [],
+					resync: null,
+					recovery: null,
+					subscriptionAdmission: { kind: "protected_overage", retryable: false },
+					rawEvents: [],
+				},
+				rejected: {
+					sessionHandle: "rejected",
+					subscribed: false,
+					controllerIntent: false,
+					runtime: rejectedSession.runtime,
+					generation: 1,
+					baselineAuthoritative: false,
+					freshLeaseBaseline: null,
+					lastSeq: 0,
+					projectedSeq: 0,
+					lease: { isController: false },
+					pendingExtensionRequests: [],
+					resync: null,
+					recovery: null,
+					subscriptionAdmission: {
+						kind: "rejected",
+						code: "session_subscription_capacity",
+						retryable: true,
+					},
+					rawEvents: [],
+				},
+			},
+		});
+		expect(sessionTransport.store.getState().sessions.protected?.subscriptionAdmission).toEqual({
+			kind: "protected_overage",
+			retryable: false,
+		});
+
+		const html = renderToStaticMarkup(createElement(WorkspaceSidebar, { rail: false }));
+
+		expect(html).toContain('data-subscription-admission="protected_overage"');
+		expect(html).toContain('data-subscription-admission="rejected"');
+		expect(html).toContain('data-subscription-retry="true"');
+		expect(html).toContain("重试后台监控订阅");
 	});
 
 	it("drops stale unpersisted knowledge when the same handle advances generation", () => {

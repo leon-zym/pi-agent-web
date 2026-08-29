@@ -3,6 +3,7 @@ import { useMemo } from "react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
 import { formatCost, formatTokens } from "../../lib/format";
 import { tt } from "../../lib/i18n";
+import { runtimeIsBusy } from "../../lib/runtime-state";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { useSessionStatsStore } from "../../stores/session-stats";
 import { useSessionTransportStore } from "../../stores/session-transport";
@@ -16,14 +17,13 @@ export function ContextMeter() {
 	const stats = useSessionStatsStore((s) => s.stats);
 	const liveUsage = useSessionStatsStore((s) => s.liveUsage);
 	const sessionHandle = useSessionDirectoryStore((s) => s.currentSession?.sessionHandle ?? null);
-	const runtimeState = useSessionTransportStore((state) =>
-		sessionHandle ? state.sessions[sessionHandle]?.runtime?.state : undefined,
+	const runtimeBusy = useSessionTransportStore((state) =>
+		runtimeIsBusy(sessionHandle ? state.sessions[sessionHandle]?.runtime : undefined),
 	);
-	const pending = runtimeState === "starting" || runtimeState === "running" || runtimeState === "waiting_ui";
 
 	const display = useMemo(() => {
-		return resolveContextDisplay(stats, pending);
-	}, [stats, pending]);
+		return resolveContextDisplay(stats, runtimeBusy);
+	}, [stats, runtimeBusy]);
 
 	const liveTokens = liveUsage?.totalTokens ?? null;
 	const totalCost = stats?.cost ?? 0;
