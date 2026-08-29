@@ -33,8 +33,11 @@ export {
 } from "./session-supervisor.js";
 export {
 	MAX_SESSION_WS_BUFFERED_BYTES,
+	MAX_SESSION_WS_CONCURRENT_CATCHUPS,
+	MAX_SESSION_WS_CONNECTIONS,
 	MAX_SESSION_WS_IN_FLIGHT_COMMANDS,
 	MAX_SESSION_WS_IN_FLIGHT_EXACT_SUBSCRIPTIONS,
+	MAX_SESSION_WS_SUBSCRIBED_CHANNELS,
 	SessionWsBridge,
 	type SessionWsBridgeOptions,
 } from "./session-ws-bridge.js";

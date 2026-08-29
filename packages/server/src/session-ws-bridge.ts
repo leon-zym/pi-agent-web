@@ -153,6 +153,12 @@ interface SessionWsBridgeOptionsBase<M extends SessionRuntimeProductMode> {
 	};
 	heartbeatIntervalMs?: number;
 	helloTimeoutMs?: number;
+	/** Hard cap for sockets admitted by this Gateway instance. */
+	maxConnections?: number;
+	/** Hard cap for live and in-progress Session channels across all sockets. */
+	maxSubscribedChannels?: number;
+	/** Hard cap for in-progress replay/snapshot catch-ups across all sockets. */
+	maxConcurrentCatchUps?: number;
 	log?: (level: "info" | "warn" | "error", message: string) => void;
 }
 
@@ -175,6 +181,9 @@ type SessionWsBridgeCoreOptions<M extends SessionRuntimeProductMode> = SessionWs
 export const MAX_SESSION_WS_IN_FLIGHT_COMMANDS = 32;
 export const MAX_SESSION_WS_IN_FLIGHT_EXACT_SUBSCRIPTIONS = 256;
 export const MAX_SESSION_WS_BUFFERED_BYTES = 1024 * 1024;
+export const MAX_SESSION_WS_CONNECTIONS = 64;
+export const MAX_SESSION_WS_SUBSCRIBED_CHANNELS = 1024;
+export const MAX_SESSION_WS_CONCURRENT_CATCHUPS = 256;
 const MAX_SESSION_WS_FRAME_BYTES = SESSION_WS_SERVER_MAX_BYTES;
 const LEGACY_GATEWAY_PROTOCOL_MINOR = 2;
 const LEGACY_GATEWAY_CLIENT_REQUIRED_CAPABILITIES = [
@@ -198,6 +207,9 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 	private readonly payloadActivation: SessionWsBridgeOptions["payloadActivation"];
 	private readonly futureActivation: FutureBridgeActivation | undefined;
 	private readonly helloTimeoutMs: number;
+	private readonly maxConnections: number;
+	private readonly maxSubscribedChannels: number;
+	private readonly maxConcurrentCatchUps: number;
 	private requestCounter = 0;
 	private closePromise: Promise<void> | null = null;
 	private readonly bashCommandIds = new Map<string, BashCommandIdMapping>();
@@ -240,6 +252,15 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			capabilities,
 		};
 		this.helloTimeoutMs = Math.max(1, opts.helloTimeoutMs ?? 5_000);
+		this.maxConnections = positiveLimit(opts.maxConnections, MAX_SESSION_WS_CONNECTIONS);
+		this.maxSubscribedChannels = positiveLimit(
+			opts.maxSubscribedChannels,
+			MAX_SESSION_WS_SUBSCRIBED_CHANNELS,
+		);
+		this.maxConcurrentCatchUps = positiveLimit(
+			opts.maxConcurrentCatchUps,
+			MAX_SESSION_WS_CONCURRENT_CATCHUPS,
+		);
 		this.wss = new WebSocketServer({ noServer: true, maxPayload: SESSION_WS_CLIENT_MAX_BYTES });
 		this.wss.on("connection", (ws) => this.handleConnection(ws));
 		this.wss.on("error", (error) => this.log("error", `ws server error: ${String(error)}`));
@@ -362,6 +383,19 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 	}
 
 	private handleConnection(ws: WebSocket): void {
+		if (this.connections.size >= this.maxConnections) {
+			this.log("warn", `rejecting WebSocket connection: gateway capacity (${this.maxConnections})`);
+			try {
+				ws.close(1013, "gateway capacity");
+			} catch {
+				try {
+					ws.terminate();
+				} catch {
+					// The peer is already gone.
+				}
+			}
+			return;
+		}
 		const connection: ConnectionState<M> = {
 			connectionId: randomUUID(),
 			ws,
@@ -690,11 +724,15 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			connection.admittedExactOperations += 1;
 		}
 		const lifecycleEpoch = connection.epoch;
-		const catchUp = this.beginCatchUp(connection, sessionHandle, expectedHotRuntime !== undefined);
-		if (!catchUp) {
+		const admission = this.beginCatchUp(connection, sessionHandle, expectedHotRuntime !== undefined);
+		if (!admission.catchUp) {
 			if (expectedHotRuntime) connection.admittedExactOperations -= 1;
+			if (!connection.closed && admission.reason) {
+				this.sendSessionError(connection, sessionHandle, "subscribe", admission.reason);
+			}
 			return;
 		}
+		const catchUp = admission.catchUp;
 		try {
 			let observedRekeyVersion = catchUp.rekeyVersion;
 			let exactObservationToken: HotRuntimeSubscriptionToken | undefined;
@@ -803,8 +841,31 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		connection: ConnectionState<M>,
 		requestedHandle: string,
 		exactHotRuntime = false,
-	): SessionCatchUp<M> | null {
-		if (connection.closed) return null;
+	): {
+		catchUp: SessionCatchUp<M> | null;
+		reason?: "session_subscription_capacity" | "session_catchup_capacity";
+	} {
+		if (connection.closed) return { catchUp: null };
+		const activeHandle = exactHotRuntime
+			? requestedHandle
+			: (this.supervisor.getRuntime(requestedHandle)?.sessionHandle ?? requestedHandle);
+		const handles = new Set([requestedHandle, activeHandle]);
+		const replacedCatchUps = exactHotRuntime
+			? []
+			: [...connection.catchUps].filter((existing) =>
+					[...handles].some((handle) => existing.handles.has(handle)),
+				);
+		if (this.totalCatchUps() - replacedCatchUps.length + 1 > this.maxConcurrentCatchUps) {
+			return { catchUp: null, reason: "session_catchup_capacity" };
+		}
+		const replacedLiveSubscription =
+			!exactHotRuntime && [...handles].some((handle) => connection.subscriptions.has(handle)) ? 1 : 0;
+		if (
+			this.totalSubscriptionChannels() - replacedCatchUps.length - replacedLiveSubscription + 1 >
+			this.maxSubscribedChannels
+		) {
+			return { catchUp: null, reason: "session_subscription_capacity" };
+		}
 		if (exactHotRuntime) {
 			const catchUp: SessionCatchUp<M> = {
 				requestedHandle,
@@ -818,14 +879,12 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				exactTransactional: true,
 			};
 			connection.catchUps.add(catchUp);
-			return catchUp;
+			return { catchUp };
 		}
 		// An explicit subscribe to a fork parent is not a stale reference to the
 		// child. Clear only that stale-unsubscribe alias and preserve the child as
 		// an independent live subscription.
 		connection.subscriptionAliases.delete(requestedHandle);
-		const activeHandle = this.supervisor.getRuntime(requestedHandle)?.sessionHandle ?? requestedHandle;
-		const handles = new Set([requestedHandle, activeHandle]);
 		const catchUp: SessionCatchUp<M> = {
 			requestedHandle,
 			currentHandle: activeHandle,
@@ -845,7 +904,20 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			}
 		}
 		this.removeLiveSubscription(connection, activeHandle);
-		return catchUp;
+		return { catchUp };
+	}
+
+	private totalSubscriptionChannels(): number {
+		let total = 0;
+		for (const connection of this.connections)
+			total += connection.subscriptions.size + connection.catchUps.size;
+		return total;
+	}
+
+	private totalCatchUps(): number {
+		let total = 0;
+		for (const connection of this.connections) total += connection.catchUps.size;
+		return total;
 	}
 
 	private unsubscribe(connection: ConnectionState<M>, sessionHandle: string): void {
@@ -1476,6 +1548,10 @@ function assertFutureBridgeActivation(value: FutureBridgeActivation, serverEpoch
 	) {
 		throw new TypeError("Future Session WebSocket payload activation is invalid");
 	}
+}
+
+function positiveLimit(value: number | undefined, fallback: number): number {
+	return Number.isFinite(value) ? Math.max(1, Math.floor(value as number)) : fallback;
 }
 
 function serializeFutureBridgeMessage(message: unknown, activation: FutureBridgeActivation): string {
