@@ -1,3 +1,4 @@
+import { PRODUCT_RUNTIME_SCHEMAS } from "./boundary-schemas.js";
 import {
 	FUTURE_SESSION_CONTENT_REF_BUDGET,
 	isSessionContentRefBudgetDto,
@@ -393,6 +394,7 @@ export function negotiateGatewayContentRef(
 
 export function isGatewayClientHello(value: unknown): value is GatewayClientHelloDto {
 	if (
+		!PRODUCT_RUNTIME_SCHEMAS.clientHello.check(value) ||
 		!isRecord(value) ||
 		!hasOnlyKeys(value, ["type", "protocol", "clientBuild", "capabilities", "limits"])
 	) {
@@ -418,6 +420,7 @@ export function isGatewayClientHello(value: unknown): value is GatewayClientHell
 
 export function isGatewayServerHello(value: unknown): value is GatewayServerHelloDto {
 	if (
+		!PRODUCT_RUNTIME_SCHEMAS.serverHello.check(value) ||
 		!isRecord(value) ||
 		!hasOnlyKeys(value, [
 			"type",

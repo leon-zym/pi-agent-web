@@ -10,6 +10,7 @@ import {
 	isSessionEntryDto,
 	isSessionMessageDto,
 	isUsageDto,
+	PI_WIRE_RUNTIME_SCHEMAS,
 } from "@pi-agent-web/protocol";
 import { MAX_JSONL_SNAPSHOT_LINE_BYTES } from "./jsonl.js";
 import { isLegacyRpcV1RawEvent, isLegacyRpcV1RawResponse } from "./legacy-rpc-v1-wire.js";
@@ -128,7 +129,7 @@ export function isLegacyRpcV1UntrustedTextRoot(value: unknown): value is LegacyR
 export function isLegacyRpcV1FutureContentRawExtensionUiRequest(
 	value: unknown,
 ): value is LegacyRpcV1FutureContentRawExtensionUiRequest {
-	if (!isRecord(value) || value.type !== "extension_ui_request") return false;
+	if (!PI_WIRE_RUNTIME_SCHEMAS.extensionUiRequest.check(value) || !isRecord(value)) return false;
 	switch (value.method) {
 		case "editor":
 			return (
@@ -461,6 +462,7 @@ export function isLegacyRpcV1FutureContentRawResponse(
 	value: unknown,
 	expectedCommand: SessionCommandTypeDto,
 ): value is LegacyRpcV1FutureContentRawResponse {
+	if (!PI_WIRE_RUNTIME_SCHEMAS.response.check(value)) return false;
 	if (
 		isRecord(value) &&
 		value.success === true &&
@@ -544,7 +546,7 @@ function isFutureRawToolExecutionEvent(value: UnknownRecord): boolean {
 export function isLegacyRpcV1FutureContentRawEvent(
 	value: unknown,
 ): value is LegacyRpcV1FutureContentRawEvent {
-	if (!isRecord(value)) return false;
+	if (!PI_WIRE_RUNTIME_SCHEMAS.event.check(value) || !isRecord(value)) return false;
 	if (
 		value.type === "agent_end" ||
 		value.type === "turn_end" ||
