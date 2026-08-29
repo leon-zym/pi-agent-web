@@ -160,6 +160,68 @@ describe("epoch-aware Session resync protocol", () => {
 		).toBe(false);
 	});
 
+	it("validates optional runtime admission facts when they are present", () => {
+		const operational = {
+			...runtime(),
+			phase: "busy",
+			operationCount: 1,
+			busyReasons: ["command"],
+		};
+		expect(isSessionWsServerMessage({ type: "runtime_state", runtime: operational })).toBe(true);
+		expect(
+			isSessionWsServerMessage({
+				type: "runtime_state",
+				runtime: { ...operational, operationCount: -1 },
+			}),
+		).toBe(false);
+		expect(
+			isSessionWsServerMessage({
+				type: "runtime_state",
+				runtime: { ...operational, busyReasons: ["command", "command"] },
+			}),
+		).toBe(false);
+	});
+
+	it("rejects contradictory runtime admission facts", () => {
+		const operational = {
+			...runtime(),
+			phase: "busy",
+			operationCount: 1,
+			busyReasons: ["command"],
+		};
+		const invalid = [
+			{ ...operational, phase: "ready", operationCount: 1, busyReasons: ["command"] },
+			{ ...operational, phase: "busy", operationCount: 0, busyReasons: [] },
+			{ ...operational, phase: "waiting_ui", operationCount: 1, busyReasons: ["command"] },
+			{ ...operational, phase: "starting", operationCount: 1, busyReasons: ["command"] },
+			{ ...operational, phase: "crashed", operationCount: 1, busyReasons: ["command"] },
+			{ ...operational, phase: "dormant", operationCount: 0, busyReasons: ["command"] },
+		];
+
+		for (const runtimeValue of invalid) {
+			expect(
+				isSessionWsServerMessage({ type: "runtime_state", runtime: runtimeValue }),
+				JSON.stringify(runtimeValue),
+			).toBe(false);
+		}
+	});
+
+	it("validates structured Session error metadata without making legacy frames valid by accident", () => {
+		const error = {
+			type: "session_error",
+			serverEpoch,
+			sessionHandle: "session-a",
+			operation: "subscribe",
+			error: "session_snapshot_unavailable",
+			code: "session_snapshot_unavailable",
+			retryable: true,
+		};
+		expect(isSessionWsServerMessage(error)).toBe(true);
+		expect(isSessionWsServerMessage({ ...error, code: undefined })).toBe(false);
+		expect(isSessionWsServerMessage({ ...error, retryable: "yes" })).toBe(false);
+		expect(isSessionWsServerMessage({ ...error, code: "" })).toBe(false);
+	});
+
 	it("strictly rejects unknown runtime and envelope fields", () => {
 		expect(
 			isSessionWsServerMessage({

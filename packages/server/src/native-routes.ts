@@ -725,6 +725,7 @@ function supervisorError(error: unknown, fallbackCode: string): NativeRouteError
 
 const SUPERVISOR_CONFLICT_CODES = new Set([
 	"canonical_session_already_active",
+	"session_projection_capacity",
 	"session_runtime_capacity",
 	"unpersisted_session_cannot_be_recovered",
 	"workspace_creation_in_progress",

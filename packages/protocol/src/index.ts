@@ -69,8 +69,31 @@ export const SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS = 256;
 export const SESSION_SNAPSHOT_MAX_DEPTH = 48;
 export const SESSION_SNAPSHOT_MAX_ITEMS = 250_000;
 export const SESSION_HOT_RUNTIME_INVENTORY_MAX_ITEMS = 256;
+export const SESSION_RUNTIME_BUSY_REASON_MAX_ITEMS = 8;
 /** Covers the worst canonical JSON envelope for 256 maximum escaped identities. */
 export const SESSION_HOT_RUNTIME_INVENTORY_MAX_BYTES = 1024 * 1024;
+
+/**
+ * Subscribe failures that may succeed after pressure, identity, or workspace
+ * state changes. The Gateway publishes this decision with each Session error
+ * so clients do not have to infer it from human-readable text.
+ */
+export const SESSION_SUBSCRIPTION_RETRYABLE_ERROR_CODES = [
+	"session_subscription_capacity",
+	"session_catchup_capacity",
+	"too_many_in_flight_exact_subscriptions",
+	"session_runtime_capacity",
+	"session_projection_capacity",
+	"session_snapshot_unavailable",
+	"session_snapshot_headroom_unavailable",
+	"hot_runtime_identity_changed",
+	"expected_hot_runtime_rekeyed",
+	"generation_changed",
+	"server_epoch_changed",
+	"workspace_identity_transitioning",
+] as const;
+export type SessionSubscriptionRetryableErrorCodeDto =
+	(typeof SESSION_SUBSCRIPTION_RETRYABLE_ERROR_CODES)[number];
 
 const UTF8_ENCODER = new TextEncoder();
 
@@ -396,6 +419,24 @@ export function isReadOnlyRpcCommand(command: Pick<SessionCommandDto, "type"> | 
 
 export type SessionRuntimeStateDto = "starting" | "idle" | "running" | "waiting_ui" | "crashed" | "dormant";
 
+/** Operational phase used for resource admission; unlike state, it cannot hide in-flight work. */
+export type SessionRuntimePhaseDto = "starting" | "ready" | "busy" | "waiting_ui" | "crashed" | "dormant";
+
+export type SessionRuntimeBusyReasonDto =
+	| "starting"
+	| "command"
+	| "agent"
+	| "compaction"
+	| "queue"
+	| "dialog"
+	| "turn_reservation"
+	| "transition";
+
+export type HotRuntimePhaseDto = Extract<
+	SessionRuntimePhaseDto,
+	"starting" | "ready" | "busy" | "waiting_ui"
+>;
+
 export interface SessionRuntimeIdentityDto {
 	serverEpoch: string;
 	sessionHandle: string;
@@ -410,6 +451,9 @@ export type HotRuntimeStateDto = Extract<
 
 export interface HotRuntimeInventoryEntryDto extends SessionRuntimeIdentityDto {
 	state: HotRuntimeStateDto;
+	phase?: HotRuntimePhaseDto;
+	operationCount?: number;
+	busyReasons?: SessionRuntimeBusyReasonDto[];
 }
 
 export interface HotRuntimeInventoryDto {
@@ -473,6 +517,9 @@ export interface SessionRuntimeDto extends SessionRuntimeIdentityDto {
 	cwd: string;
 	lastSeq: number;
 	state: SessionRuntimeStateDto;
+	phase?: SessionRuntimePhaseDto;
+	operationCount?: number;
+	busyReasons?: SessionRuntimeBusyReasonDto[];
 	lastActivityAt: number;
 	recoverable: boolean;
 	error?: string;
@@ -569,6 +616,18 @@ export interface SessionRekeyedDto {
 	runtime: SessionRuntimeDto;
 }
 
+export interface SessionErrorDto {
+	type: "session_error";
+	serverEpoch: string;
+	sessionHandle: string;
+	operation: "subscribe" | "claim" | "release" | "extension_ui_response";
+	error: string;
+	/** Stable machine-readable code; optional for backwards-compatible peers. */
+	code?: string;
+	/** Whether the operation may be retried after the current resource/state changes. */
+	retryable?: boolean;
+}
+
 export type SessionWsServerMessage =
 	| SessionResponseFrameDto
 	| SessionReplayFrameDto
@@ -593,13 +652,7 @@ export type SessionWsServerMessage =
 	  }
 	| SessionRekeyedDto
 	| HotRuntimeInventoryDto
-	| {
-			type: "session_error";
-			serverEpoch: string;
-			sessionHandle: string;
-			operation: "subscribe" | "claim" | "release" | "extension_ui_response";
-			error: string;
-	  }
+	| SessionErrorDto
 	| { type: "session_directory_changed"; workspaceId: string }
 	| { type: "auth_changed"; workspaceId?: string };
 
@@ -715,6 +768,9 @@ export function isSessionRuntimeDto(value: unknown): value is SessionRuntimeDto 
 			"generation",
 			"lastSeq",
 			"state",
+			"phase",
+			"operationCount",
+			"busyReasons",
 			"lastActivityAt",
 			"recoverable",
 			"error",
@@ -728,6 +784,7 @@ export function isSessionRuntimeDto(value: unknown): value is SessionRuntimeDto 
 		isGeneration(value.generation) &&
 		isGeneration(value.lastSeq) &&
 		["starting", "idle", "running", "waiting_ui", "crashed", "dormant"].includes(String(value.state)) &&
+		isRuntimeOperationalFacts(value, ["starting", "ready", "busy", "waiting_ui", "crashed", "dormant"]) &&
 		isGeneration(value.lastActivityAt) &&
 		typeof value.recoverable === "boolean" &&
 		(value.error === undefined || isBoundedString(value.error, SESSION_TEXT_MAX_BYTES))
@@ -867,7 +924,16 @@ function isCanonicalHotRuntimeInventoryDto(value: unknown): value is HotRuntimeI
 		if (
 			!isRecord(runtime) ||
 			!hasOwnProperties(runtime, ["serverEpoch", "sessionHandle", "workspaceId", "generation", "state"]) ||
-			!hasOnlyKeys(runtime, ["serverEpoch", "sessionHandle", "workspaceId", "generation", "state"]) ||
+			!hasOnlyKeys(runtime, [
+				"serverEpoch",
+				"sessionHandle",
+				"workspaceId",
+				"generation",
+				"state",
+				"phase",
+				"operationCount",
+				"busyReasons",
+			]) ||
 			!isString(runtime.serverEpoch, 128) ||
 			runtime.serverEpoch !== value.serverEpoch ||
 			!isString(runtime.sessionHandle) ||
@@ -875,6 +941,7 @@ function isCanonicalHotRuntimeInventoryDto(value: unknown): value is HotRuntimeI
 			!isGeneration(runtime.generation) ||
 			runtime.generation === 0 ||
 			!["starting", "idle", "running", "waiting_ui"].includes(String(runtime.state)) ||
+			!isRuntimeOperationalFacts(runtime, ["starting", "ready", "busy", "waiting_ui"]) ||
 			handles.has(runtime.sessionHandle)
 		) {
 			return false;
@@ -882,6 +949,54 @@ function isCanonicalHotRuntimeInventoryDto(value: unknown): value is HotRuntimeI
 		handles.add(runtime.sessionHandle);
 	}
 	return true;
+}
+
+function isRuntimeOperationalFacts(value: UnknownRecord, allowedPhases: readonly string[]): boolean {
+	const keys = ["phase", "operationCount", "busyReasons"] as const;
+	const hasAny = keys.some((key) => Object.hasOwn(value, key));
+	if (!hasAny) return true;
+	if (!keys.every((key) => Object.hasOwn(value, key))) return false;
+	if (typeof value.phase !== "string" || !allowedPhases.includes(value.phase)) return false;
+	if (!isGeneration(value.operationCount)) return false;
+	if (!Array.isArray(value.busyReasons) || value.busyReasons.length > SESSION_RUNTIME_BUSY_REASON_MAX_ITEMS) {
+		return false;
+	}
+	const seen = new Set<string>();
+	for (const reason of value.busyReasons) {
+		if (
+			typeof reason !== "string" ||
+			![
+				"starting",
+				"command",
+				"agent",
+				"compaction",
+				"queue",
+				"dialog",
+				"turn_reservation",
+				"transition",
+			].includes(reason) ||
+			seen.has(reason)
+		) {
+			return false;
+		}
+		seen.add(reason);
+	}
+	const phase = value.phase;
+	const operationCount = value.operationCount;
+	const busyReasons = value.busyReasons;
+	if (phase === "starting") {
+		return operationCount > 0 && busyReasons.includes("starting");
+	}
+	if (phase === "ready") {
+		return operationCount === 0 && busyReasons.length === 0;
+	}
+	if (phase === "busy") {
+		return operationCount > 0 && busyReasons.length > 0;
+	}
+	if (phase === "waiting_ui") {
+		return operationCount > 0 && busyReasons.includes("dialog");
+	}
+	return operationCount === 0 && busyReasons.length === 0;
 }
 
 export function isHotRuntimeInventoryDto(value: unknown): value is HotRuntimeInventoryDto {
@@ -1151,14 +1266,31 @@ export function isSessionWsServerMessage(
 				isString(value.requestId) &&
 				["accepted", "no_dialog", "not_running"].includes(String(value.outcome))
 			);
-		case "session_error":
+		case "session_error": {
+			if (
+				!hasOnlyKeys(value, [
+					"type",
+					"serverEpoch",
+					"sessionHandle",
+					"operation",
+					"error",
+					"code",
+					"retryable",
+				]) ||
+				!isString(value.serverEpoch, 128) ||
+				!isString(value.sessionHandle) ||
+				!["subscribe", "claim", "release", "extension_ui_response"].includes(String(value.operation)) ||
+				!isBoundedString(value.error, SESSION_TEXT_MAX_BYTES)
+			) {
+				return false;
+			}
+			const hasCode = Object.hasOwn(value, "code");
+			const hasRetryable = Object.hasOwn(value, "retryable");
 			return (
-				hasOnlyKeys(value, ["type", "serverEpoch", "sessionHandle", "operation", "error"]) &&
-				isString(value.serverEpoch, 128) &&
-				isString(value.sessionHandle) &&
-				["subscribe", "claim", "release", "extension_ui_response"].includes(String(value.operation)) &&
-				isBoundedString(value.error, SESSION_TEXT_MAX_BYTES)
+				(!hasCode && !hasRetryable) ||
+				(hasCode && hasRetryable && isString(value.code, 128) && typeof value.retryable === "boolean")
 			);
+		}
 		default:
 			return false;
 	}
