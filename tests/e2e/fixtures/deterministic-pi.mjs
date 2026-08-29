@@ -949,52 +949,62 @@ function streamBudgetPrompt(command, text, user, userEntryId, targetBytes) {
 	const chunkSize = 4 * 1024;
 	const finishRun = () => {
 		if (activeRun !== run) return;
-		record("stream_end", { commandId: command.id, text, targetBytes });
-		const final = assistantMessageWithContent([{ type: "text", text: markdown }], "stop");
-		const textEndFrame = {
-			type: "message_update",
-			usage: final.usage,
-			assistantMessageEvent: { type: "text_end", contentIndex: 0, content: markdown },
-		};
-		record("large_frame", {
-			commandId: command.id,
-			text,
-			targetBytes,
-			eventType: "text_end",
-			frameBytes: Buffer.byteLength(JSON.stringify(textEndFrame), "utf8"),
-		});
-		send(textEndFrame);
-		// The wire budget permits one large frame at a time. Leave the text_end
-		// frame a turn to drain before the authoritative message_end repeats it.
-		schedule(run, 100, () => {
+		record("stream_end", { commandId: command.id, text, targetBytes, markdownChars: markdown.length });
+		// Let the browser acknowledge the final delta before the structural text_end
+		// commit is released, keeping the performance fixture's phases deterministic.
+		const finishAfterStreamEnd = () => {
 			if (activeRun !== run) return;
-			const messageEndFrame = { type: "message_end", message: final };
+			const final = assistantMessageWithContent([{ type: "text", text: markdown }], "stop");
+			const textEndFrame = {
+				type: "message_update",
+				usage: final.usage,
+				assistantMessageEvent: { type: "text_end", contentIndex: 0, content: markdown },
+			};
 			record("large_frame", {
 				commandId: command.id,
 				text,
 				targetBytes,
-				eventType: "message_end",
-				frameBytes: Buffer.byteLength(JSON.stringify(messageEndFrame), "utf8"),
+				eventType: "text_end",
+				frameBytes: Buffer.byteLength(JSON.stringify(textEndFrame), "utf8"),
 			});
-			send(messageEndFrame);
-			// Keep the fixture below the current active-turn snapshot budget. The
-			// authoritative message_end above carries the full response; these
-			// lifecycle envelopes do not need to repeat the same 1 MiB text.
-			const compactFinal = assistantMessageWithContent([], "stop");
-			send({ type: "turn_end", message: compactFinal, toolResults: [] });
-			messages.push(final);
-			persistMessage(final, userEntryId);
-			send({ type: "agent_end", messages: [user, compactFinal], willRetry: false });
-			send({ type: "agent_settled" });
-			record("settled", {
-				commandId: command.id,
-				text,
-				label: run.label,
-				targetBytes,
-				markdownChars: markdown.length,
+			send(textEndFrame);
+			// The wire budget permits one large frame at a time. Leave the text_end
+			// frame a turn to drain before the authoritative message_end repeats it.
+			schedule(run, 100, () => {
+				if (activeRun !== run) return;
+				const messageEndFrame = { type: "message_end", message: final };
+				record("large_frame", {
+					commandId: command.id,
+					text,
+					targetBytes,
+					eventType: "message_end",
+					frameBytes: Buffer.byteLength(JSON.stringify(messageEndFrame), "utf8"),
+				});
+				send(messageEndFrame);
+				// Keep the fixture below the current active-turn snapshot budget. The
+				// authoritative message_end above carries the full response; these
+				// lifecycle envelopes do not need to repeat the same 1 MiB text.
+				const compactFinal = assistantMessageWithContent([], "stop");
+				send({ type: "turn_end", message: compactFinal, toolResults: [] });
+				messages.push(final);
+				persistMessage(final, userEntryId);
+				send({ type: "agent_end", messages: [user, compactFinal], willRetry: false });
+				send({ type: "agent_settled" });
+				record("settled", {
+					commandId: command.id,
+					text,
+					label: run.label,
+					targetBytes,
+					markdownChars: markdown.length,
+				});
+				activeRun = null;
 			});
-			activeRun = null;
-		});
+		};
+		if (controlDir) {
+			scheduleConsumedRelease(run, text, "stream_end_released", finishAfterStreamEnd);
+		} else {
+			finishAfterStreamEnd();
+		}
 	};
 	const emitChunk = () => {
 		if (activeRun !== run) return;

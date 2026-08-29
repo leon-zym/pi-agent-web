@@ -173,6 +173,16 @@ test("production Chromium keeps live Markdown and settled rendering within docum
 				},
 			)
 			.toBe(true);
+		// The fixture pauses before text_end. Wait until the final delta is mounted
+		// so the live budget excludes only the authoritative structural commit.
+		const streamEndEvent = harness
+			.piEvents()
+			.find((event) => event.type === "stream_end" && event.text === fixture.prompt);
+		const streamedTextLength = streamEndEvent?.markdownChars;
+		if (streamedTextLength === undefined) throw new Error(`${fixture.label} stream length marker is missing`);
+		await expect
+			.poll(() => streamingMarkdown.evaluate((element) => element.textContent?.length ?? 0))
+			.toBe(streamedTextLength);
 		await page.evaluate(() => {
 			(
 				window as typeof window & {
@@ -180,6 +190,7 @@ test("production Chromium keeps live Markdown and settled rendering within docum
 				}
 			).__piwebConversationPerformance.markStreamingEnd();
 		});
+		harness.releasePrompt(fixture.prompt);
 		await expect
 			.poll(
 				() => harness.piEvents().some((event) => event.type === "settled" && event.text === fixture.prompt),
