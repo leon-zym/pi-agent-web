@@ -342,6 +342,16 @@ async function waitForInitialFullInventory(
 	return inventory;
 }
 
+function inventoryRuntime(inventory: WireFrame, sessionHandle: string): WireFrame {
+	const runtimes = Array.isArray(inventory.runtimes) ? inventory.runtimes : [];
+	const runtime = runtimes.find(
+		(candidate): candidate is WireFrame =>
+			typeof candidate === "object" && candidate !== null && candidate.sessionHandle === sessionHandle,
+	);
+	if (!runtime) throw new Error(`hot Runtime ${sessionHandle} was not present in the inventory`);
+	return runtime;
+}
+
 async function expectObservationBaseline(
 	observation: SocketWireObservation,
 	expectedHandles: Set<string>,
@@ -379,7 +389,12 @@ async function expectObservationBaseline(
 		const inventoryRuntime = inventoryRuntimes.find((runtime) => runtime.sessionHandle === sessionHandle);
 		expect(inventoryRuntime).toBeDefined();
 		if (!inventoryRuntime || !exact) continue;
-		const { state: _state, ...expectedIdentity } = inventoryRuntime;
+		const expectedIdentity = {
+			serverEpoch: inventoryRuntime.serverEpoch,
+			sessionHandle: inventoryRuntime.sessionHandle,
+			workspaceId: inventoryRuntime.workspaceId,
+			generation: inventoryRuntime.generation,
+		};
 		expect(exact.expectedHotRuntime).toEqual(expectedIdentity);
 		if (exact.cursor !== undefined) {
 			expect(Object.keys(exact.cursor as WireFrame).sort()).toEqual(["generation", "seq", "serverEpoch"]);
@@ -495,6 +510,31 @@ test("hard reload observes every hot Runtime exactly once without activating dor
 	const reloadSocket = await waitForSocket(wire, reloadSocketIndex);
 	await expect(page.locator("main")).toBeVisible();
 	const initialInventory = await expectObservationBaseline(reloadSocket, expectedHandles);
+	const backgroundRuntime = inventoryRuntime(initialInventory, scenario.background.sessionHandle);
+	expect(backgroundRuntime.state).toBe("running");
+	expect(backgroundRuntime.phase).toBe("busy");
+	expect(backgroundRuntime.operationCount).toEqual(expect.any(Number));
+	expect(Number(backgroundRuntime.operationCount)).toBeGreaterThan(0);
+	expect(backgroundRuntime.busyReasons).toEqual(expect.arrayContaining(["agent"]));
+
+	const dialogRuntime = inventoryRuntime(initialInventory, scenario.dialog.sessionHandle);
+	expect(dialogRuntime.phase).toBe("waiting_ui");
+	expect(dialogRuntime.operationCount).toEqual(expect.any(Number));
+	expect(Number(dialogRuntime.operationCount)).toBeGreaterThan(0);
+	expect(dialogRuntime.busyReasons).toEqual(expect.arrayContaining(["dialog"]));
+
+	for (const session of [scenario.idle, scenario.visible]) {
+		const readyRuntime = inventoryRuntime(initialInventory, session.sessionHandle);
+		expect(readyRuntime.phase).toBe("ready");
+		expect(readyRuntime.operationCount).toBe(0);
+		expect(readyRuntime.busyReasons).toEqual([]);
+	}
+	for (const session of scenario.transients) {
+		const transientRuntime = inventoryRuntime(initialInventory, session.sessionHandle);
+		expect(transientRuntime.phase).toBe("busy");
+		expect(Number(transientRuntime.operationCount)).toBeGreaterThan(0);
+		expect(transientRuntime.busyReasons).toEqual(expect.arrayContaining(["agent"]));
+	}
 	await expect(page.locator("textarea")).toBeVisible();
 	const inventoryIndex = reloadSocket.received.indexOf(initialInventory);
 	expect(inventoryIndex).toBeGreaterThanOrEqual(0);
@@ -605,12 +645,20 @@ test("hard reload observes every hot Runtime exactly once without activating dor
 		.poll(() =>
 			hotInventoryFrames(reloadSocket).some((frame) => {
 				if (Number(frame.revision) <= initialRevision || !Array.isArray(frame.runtimes)) return false;
-				return frame.runtimes.some(
+				const background = frame.runtimes.find(
 					(runtime) =>
 						typeof runtime === "object" &&
 						runtime !== null &&
-						(runtime as WireFrame).sessionHandle === scenario.background.sessionHandle &&
-						(runtime as WireFrame).state === "idle",
+						(runtime as WireFrame).sessionHandle === scenario.background.sessionHandle,
+				);
+				return (
+					typeof background === "object" &&
+					background !== null &&
+					(background as WireFrame).state === "idle" &&
+					(background as WireFrame).phase === "ready" &&
+					(background as WireFrame).operationCount === 0 &&
+					Array.isArray((background as WireFrame).busyReasons) &&
+					(background as WireFrame).busyReasons.length === 0
 				);
 			}),
 		)
