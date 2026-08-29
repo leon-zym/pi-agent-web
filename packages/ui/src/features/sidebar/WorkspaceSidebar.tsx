@@ -9,11 +9,14 @@ import {
 	PanelLeftOpen,
 	Pencil,
 	Plus,
+	RefreshCw,
 	Search,
 	Settings,
+	ShieldCheck,
 	Sun,
 	SunMoon,
 	Trash2,
+	TriangleAlert,
 } from "lucide-react";
 import { type Ref, useMemo, useState } from "react";
 import { toast } from "sonner";
@@ -48,6 +51,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/too
 import { api } from "../../lib/api";
 import { displayError, displayLabel, formatRelativeTime } from "../../lib/format";
 import { tt } from "../../lib/i18n";
+import { runtimeStateForDisplay } from "../../lib/runtime-state";
 import {
 	isSessionControlReady,
 	type SessionDeleteBlockReason,
@@ -134,10 +138,14 @@ function SessionRow({ session, current, comfortable = false, onSelect }: Session
 		const queue = state.bySession[session.sessionHandle]?.queue;
 		return (queue?.steering.length ?? 0) + (queue?.followUp.length ?? 0);
 	});
+	const retrySessionSubscription = useSessionTransportStore((state) => state.retrySessionSubscription);
 	const runtime = channel?.runtime ?? session.runtime;
+	const subscriptionAdmission = channel?.subscriptionAdmission;
 	const exactLease = isSessionControlReady(channel);
 	const status: SessionStatus =
-		projection?.turns.at(-1)?.status === "error" ? "error" : (runtime?.state ?? inventoryState ?? "dormant");
+		projection?.turns.at(-1)?.status === "error"
+			? "error"
+			: (runtimeStateForDisplay(runtime) ?? inventoryState ?? "dormant");
 	const canRename = current && exactLease;
 	const deleteCapability = sessionDeleteCapability(session, channel);
 	const empty = session.messageCount === 0 && !session.name && !session.firstMessage;
@@ -160,6 +168,7 @@ function SessionRow({ session, current, comfortable = false, onSelect }: Session
 			data-session-row=""
 			data-current={current ? "true" : "false"}
 			data-runtime-state={status}
+			data-subscription-admission={subscriptionAdmission?.kind}
 			data-unread={unread ? "true" : "false"}
 			data-queued-count={queuedCount}
 			className={cn(
@@ -196,6 +205,53 @@ function SessionRow({ session, current, comfortable = false, onSelect }: Session
 					</span>
 				)}
 			</button>
+			{subscriptionAdmission && (
+				<Tooltip>
+					<TooltipTrigger asChild>
+						{subscriptionAdmission.kind === "rejected" &&
+						subscriptionAdmission.retryable &&
+						retrySessionSubscription ? (
+							<button
+								type="button"
+								aria-label={tt("sidebar.retrySubscription")}
+								data-subscription-retry="true"
+								className="flex size-5 shrink-0 items-center justify-center rounded-sm text-warning hover:bg-warning/10 focus-visible:ring-2 focus-visible:ring-warning/40 focus-visible:outline-none"
+								onClick={(event) => {
+									event.preventDefault();
+									event.stopPropagation();
+									retrySessionSubscription(session.sessionHandle);
+								}}
+							>
+								<RefreshCw className="size-3.5" aria-hidden="true" />
+							</button>
+						) : (
+							<span
+								role="status"
+								aria-label={
+									subscriptionAdmission.kind === "protected_overage"
+										? tt("sidebar.subscriptionProtected")
+										: tt("sidebar.subscriptionRejected")
+								}
+								data-subscription-status="true"
+								className="flex size-5 shrink-0 items-center justify-center text-warning"
+							>
+								{subscriptionAdmission.kind === "protected_overage" ? (
+									<ShieldCheck className="size-3.5" aria-hidden="true" />
+								) : (
+									<TriangleAlert className="size-3.5" aria-hidden="true" />
+								)}
+							</span>
+						)}
+					</TooltipTrigger>
+					<TooltipContent>
+						{subscriptionAdmission.kind === "protected_overage"
+							? tt("sidebar.subscriptionProtected")
+							: subscriptionAdmission.retryable
+								? tt("sidebar.subscriptionRejectedRetryable")
+								: tt("sidebar.subscriptionRejected")}
+					</TooltipContent>
+				</Tooltip>
+			)}
 			{!empty && (
 				<div
 					className={cn(

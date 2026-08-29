@@ -6,6 +6,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "../../components/ui/pop
 import { SegmentedControl } from "../../components/ui/segmented-control";
 import { displayError, displayLabel } from "../../lib/format";
 import { tt } from "../../lib/i18n";
+import { runtimeIsBusy } from "../../lib/runtime-state";
 import { isSessionControlReady } from "../../lib/session-capabilities";
 import { cn } from "../../lib/utils";
 import { useModelDirectoryStore } from "../../stores/model-directory";
@@ -42,10 +43,9 @@ export function ModelSelector() {
 		const channel = sessionHandle ? state.sessions[sessionHandle] : undefined;
 		return isSessionControlReady(channel);
 	});
-	const runtimeState = useSessionTransportStore((state) =>
-		sessionHandle ? state.sessions[sessionHandle]?.runtime?.state : undefined,
+	const runtimeBusy = useSessionTransportStore((state) =>
+		runtimeIsBusy(sessionHandle ? state.sessions[sessionHandle]?.runtime : undefined),
 	);
-	const runtimeBusy = runtimeState === "running" || runtimeState === "waiting_ui";
 	const hasModels = models.length > 0;
 
 	const currentModelObject = useMemo(

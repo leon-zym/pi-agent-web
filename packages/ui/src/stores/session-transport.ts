@@ -32,6 +32,7 @@ import {
 	negotiateGatewayContentRef,
 	negotiateGatewayPayloadBudget,
 	negotiateHotRuntimeInventory,
+	SESSION_SUBSCRIPTION_RETRYABLE_ERROR_CODES,
 	SESSION_WS_CLIENT_MAX_BYTES,
 	SESSION_WS_SERVER_MAX_BYTES,
 	type SessionAttachmentGuardContext,
@@ -41,6 +42,7 @@ import {
 	type SessionMessageDto,
 	type SessionReplayCursorDto,
 	type SessionReplayFrameDto,
+	type SessionRuntimeDto,
 	type SessionRuntimeIdentityDto,
 	type SessionSnapshotDto,
 	type SessionTreeNodeDto,
@@ -60,6 +62,7 @@ import {
 	type ProjectedFutureSessionReplayFrame,
 	type ProjectedFutureSessionSnapshot,
 } from "../lib/future-session-content-adapter";
+import { runtimeIsReady, runtimePhase } from "../lib/runtime-state";
 import { createSessionContentResolver } from "../lib/session-content-resolver";
 import {
 	createSessionResyncCoordinator,
@@ -75,6 +78,7 @@ import {
 	type HotRuntimeInventoryToken,
 	hasFreshLeaseBaseline,
 	type SessionChannelState,
+	type SessionSubscriptionAdmission,
 	type SessionTransportController,
 	SessionTransportError,
 	type SessionTransportOptions,
@@ -102,6 +106,7 @@ export {
 	type SessionLeaseState,
 	type SessionRawEventRecord,
 	type SessionResyncState,
+	type SessionSubscriptionAdmission,
 	type SessionTransportConnectionState,
 	type SessionTransportController,
 	SessionTransportError,
@@ -122,6 +127,7 @@ const DEFAULT_HELLO_TIMEOUT_MS = 5_000;
 const MAX_RESYNC_BUFFERED_FRAMES = 1_024;
 const MAX_RESYNC_BUFFERED_BYTES = 1024 * 1024;
 export const MAX_ACTIVE_SUBSCRIPTIONS = 6;
+const LEGACY_RETRYABLE_SUBSCRIPTION_ERROR_CODES = ["snapshot_unavailable"] as const;
 const MAX_PENDING_EXTENSION_REQUESTS = 256;
 const MAX_DELIVERED_NOTIFY_KEYS = 256;
 const MAX_DELIVERED_NOTIFY_IDENTITIES = 64;
@@ -276,6 +282,7 @@ function emptyChannel(sessionHandle: string): SessionChannelState {
 		pendingExtensionRequests: [],
 		resync: null,
 		recovery: null,
+		subscriptionAdmission: null,
 		rawEvents: [],
 	};
 }
@@ -409,6 +416,24 @@ function validCursor(channel: SessionChannelState): SessionReplayCursorDto | und
 				generation: channel.generation,
 				seq: channel.lastSeq,
 			};
+}
+
+function subscriptionAdmissionCode(error: string, code?: string): string {
+	if (code) return code.slice(0, 128);
+	const known = [
+		...SESSION_SUBSCRIPTION_RETRYABLE_ERROR_CODES,
+		...LEGACY_RETRYABLE_SUBSCRIPTION_ERROR_CODES,
+	].find((errorCode) => error.includes(errorCode));
+	if (known) return known;
+	const token = error.match(/[A-Za-z][A-Za-z0-9_-]*/)?.[0];
+	return (token ?? "subscription_rejected").slice(0, 128);
+}
+
+function isRetryableSubscriptionError(error: string, retryable?: boolean): boolean {
+	if (retryable !== undefined) return retryable;
+	return [...SESSION_SUBSCRIPTION_RETRYABLE_ERROR_CODES, ...LEGACY_RETRYABLE_SUBSCRIPTION_ERROR_CODES].some(
+		(code) => error.includes(code),
+	);
 }
 
 function identityKey(identity: SessionRuntimeIdentityDto): string {
@@ -567,6 +592,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		sendCommand,
 		sendExtensionUiResponse,
 		manualRetryResync: (sessionHandle) => resyncCoordinator.manualRetry(sessionHandle),
+		retrySessionSubscription,
 	}));
 
 	function waitForInitialHotInventory(): Promise<HotRuntimeInventoryToken> {
@@ -1124,10 +1150,53 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		subscribedLruOrder.push(sessionHandle);
 	}
 
-	function evictSubscriptionLruIfNeeded(incomingSessionHandle: string): void {
+	function markProtectedSubscriptionOverage(sessionHandle: string): void {
+		const subscribedCount = Object.values(store.getState().sessions).filter(
+			(channel) => channel.subscribed,
+		).length;
+		if (subscribedCount <= maxActiveSubscriptions) return;
+		setChannel(sessionHandle, (channel) => {
+			if (channel.subscriptionAdmission) return channel;
+			const admission: SessionSubscriptionAdmission = {
+				kind: "protected_overage",
+				retryable: false,
+			};
+			return { ...channel, subscriptionAdmission: admission };
+		});
+	}
+
+	function clearProtectedSubscriptionOverage(): void {
+		const subscribedCount = Object.values(store.getState().sessions).filter(
+			(channel) => channel.subscribed,
+		).length;
+		if (subscribedCount > maxActiveSubscriptions) return;
+		for (const sessionHandle of Object.keys(store.getState().sessions)) {
+			setChannel(sessionHandle, (channel) =>
+				channel.subscriptionAdmission?.kind === "protected_overage"
+					? { ...channel, subscriptionAdmission: null }
+					: channel,
+			);
+		}
+	}
+
+	function recordSubscriptionRejection(
+		sessionHandle: string,
+		error: string,
+		code?: string,
+		retryable?: boolean,
+	): void {
+		const admission: SessionSubscriptionAdmission = {
+			kind: "rejected",
+			code: subscriptionAdmissionCode(error, code),
+			retryable: isRetryableSubscriptionError(error, retryable),
+		};
+		setChannel(sessionHandle, (channel) => ({ ...channel, subscriptionAdmission: admission }));
+	}
+
+	function evictSubscriptionLruIfNeeded(incomingSessionHandle: string): boolean {
 		const state = store.getState();
 		const subscribedSessions = Object.values(state.sessions).filter((s) => s.subscribed);
-		if (subscribedSessions.length < maxActiveSubscriptions) return;
+		if (subscribedSessions.length < maxActiveSubscriptions) return false;
 
 		for (const candidateHandle of [...subscribedLruOrder]) {
 			if (candidateHandle === incomingSessionHandle) continue;
@@ -1135,16 +1204,22 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			const candidate = state.sessions[candidateHandle];
 			if (!candidate?.subscribed) continue;
 
-			const isIdle = candidate.runtime?.state === "idle" || candidate.runtime?.state === "dormant";
+			const isIdle = canEvictRuntime(candidate.runtime);
 			const isPersisted =
 				candidate.runtime?.sessionFile !== null && candidate.runtime?.sessionFile !== undefined;
 			const hasNoPendingExt = candidate.pendingExtensionRequests.length === 0;
 
 			if (isIdle && isPersisted && hasNoPendingExt) {
 				unsubscribeSession(candidateHandle);
-				break;
+				return false;
 			}
 		}
+		return true;
+	}
+
+	function canEvictRuntime(runtime: SessionRuntimeDto | null | undefined): boolean {
+		if (!runtime) return false;
+		return runtimeIsReady(runtime) || runtimePhase(runtime) === "dormant";
 	}
 
 	function subscribeSession(sessionHandle: string): void {
@@ -1153,14 +1228,37 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			touchSubscriptionLru(sessionHandle);
 			return;
 		}
-		evictSubscriptionLruIfNeeded(sessionHandle);
+		const protectedOverage = evictSubscriptionLruIfNeeded(sessionHandle);
 		touchSubscriptionLru(sessionHandle);
 		const channel = setChannel(sessionHandle, (current) =>
-			current.subscribed ? current : { ...current, subscribed: true, freshLeaseBaseline: null },
+			current.subscribed
+				? current
+				: { ...current, subscribed: true, freshLeaseBaseline: null, subscriptionAdmission: null },
 		);
+		if (protectedOverage) markProtectedSubscriptionOverage(sessionHandle);
 		if (store.getState().connectionState !== "online" || negotiatedProductMode === null) return;
 		const cursor = validCursor(channel);
 		sendSubscription(sessionHandle, cursor);
+	}
+
+	function retrySessionSubscription(sessionHandle: string): boolean {
+		const channel = store.getState().sessions[sessionHandle];
+		if (channel?.subscriptionAdmission?.kind !== "rejected") return false;
+		if (!channel.subscriptionAdmission.retryable) return false;
+		if (store.getState().connectionState !== "online" || negotiatedProductMode === null) return false;
+		setChannel(sessionHandle, (current) => ({ ...current, subscriptionAdmission: null }));
+		if (!channel.subscribed) {
+			subscribeSession(sessionHandle);
+			return Boolean(store.getState().sessions[sessionHandle]?.subscribed);
+		}
+		connectionObservations.delete(sessionHandle);
+		const desiredHotRuntime = hotRuntimeByHandle.get(sessionHandle);
+		if (desiredHotRuntime) {
+			queueHotRuntimeRecovery(desiredHotRuntime);
+		} else {
+			sendSubscription(sessionHandle, validCursor(channel));
+		}
+		return true;
 	}
 
 	function unsubscribeSession(sessionHandle: string): void {
@@ -1177,6 +1275,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			controllerIntent: false,
 			freshLeaseBaseline: null,
 			lease: { isController: false },
+			subscriptionAdmission: null,
 		}));
 		claimAttempts.delete(sessionHandle);
 		baselineRefreshes.delete(sessionHandle);
@@ -1189,6 +1288,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		if (store.getState().connectionState === "online") {
 			sendWire({ type: "session_unsubscribe", sessionHandle });
 		}
+		clearProtectedSubscriptionOverage();
 	}
 
 	function invalidateSessionSnapshot(sessionHandle: string): boolean {
@@ -1436,8 +1536,10 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				...channel,
 				subscribed: true,
 				freshLeaseBaseline: null,
+				subscriptionAdmission: null,
 			}));
 		}
+		markProtectedSubscriptionOverage(runtime.sessionHandle);
 		if (
 			hasAuthoritativeHotBaseline(runtime) ||
 			hasConnectionObservation(runtime) ||
@@ -2363,6 +2465,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			activeExact.identity.serverEpoch === message.serverEpoch &&
 			!activeExact.recoveryStarted;
 		if (exactErrorMatches) {
+			recordSubscriptionRejection(message.sessionHandle, message.error, message.code, message.retryable);
 			settleExactHotRecoveryError(message.sessionHandle);
 			frameBus.emit(message.sessionHandle, message, now());
 			return;
@@ -2375,6 +2478,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			return;
 		}
 		if (message.operation === "subscribe") {
+			recordSubscriptionRejection(message.sessionHandle, message.error, message.code, message.retryable);
 			abortFutureProjection(message.sessionHandle);
 			abortFutureLazyOperationsForSession(message.sessionHandle);
 			rejectFutureHistoryForSession(
@@ -2400,6 +2504,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				freshLeaseBaseline: null,
 				lease: { isController: false },
 			}));
+			clearProtectedSubscriptionOverage();
 			if (current.lease.isController || current.lease.fencingToken) {
 				sendWire({ type: "session_release", sessionHandle: message.sessionHandle });
 			}
@@ -2872,6 +2977,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		setChannel(message.sessionHandle, (channel) => ({
 			...channel,
 			freshLeaseBaseline: channel.runtime,
+			subscriptionAdmission:
+				channel.subscriptionAdmission?.kind === "rejected" ? null : channel.subscriptionAdmission,
 			lease: message.isController
 				? {
 						isController: true,
@@ -3070,6 +3177,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			lastSeq: endpointSeq,
 			projectedSeq: endpointSeq,
 			resync: null,
+			subscriptionAdmission:
+				current.subscriptionAdmission?.kind === "rejected" ? null : current.subscriptionAdmission,
 		}));
 		subscriptionBaselines.delete(identity.sessionHandle);
 		baselineRefreshes.delete(identity.sessionHandle);
@@ -3332,6 +3441,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			pendingExtensionRequests: [],
 			resync: previous.resync ? { ...previous.resync, bufferedFrameCount: 0 } : null,
 			recovery: null,
+			subscriptionAdmission: null,
 		};
 		const migrated: SessionChannelState = {
 			...previous,
@@ -3347,6 +3457,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			pendingExtensionRequests: [],
 			resync: null,
 			recovery: null,
+			subscriptionAdmission: null,
 			rawEvents: [],
 		};
 		const sessions = {

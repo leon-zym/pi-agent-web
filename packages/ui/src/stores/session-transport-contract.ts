@@ -83,8 +83,14 @@ export interface SessionChannelState {
 	pendingExtensionRequests: ExtensionUiRequestDto[];
 	resync: SessionResyncState | null;
 	recovery: SessionRecoveryState | null;
+	/** Background monitoring admission; this is disposable UI state, never Session truth. */
+	subscriptionAdmission?: SessionSubscriptionAdmission | null;
 	rawEvents: SessionRawEventRecord[];
 }
+
+export type SessionSubscriptionAdmission =
+	| { kind: "protected_overage"; retryable: false }
+	| { kind: "rejected"; code: string; retryable: boolean };
 
 export function hasFreshLeaseBaseline(channel: SessionChannelState | undefined): boolean {
 	const runtime = channel?.runtime;
@@ -182,6 +188,8 @@ export interface SessionTransportState {
 	) => Promise<SessionCommandResponseDto>;
 	sendExtensionUiResponse: (sessionHandle: string, response: ExtensionUiResponseDto) => boolean;
 	manualRetryResync: (sessionHandle: string) => boolean;
+	/** Retry a rejected background subscription without changing the visible Session. */
+	retrySessionSubscription?: (sessionHandle: string) => boolean;
 }
 
 export interface HotRuntimeInventoryToken {

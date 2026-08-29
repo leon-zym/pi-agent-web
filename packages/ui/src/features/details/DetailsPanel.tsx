@@ -24,6 +24,7 @@ import { Skeleton } from "../../components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
 import { displayError, displayLabel } from "../../lib/format";
 import { tt } from "../../lib/i18n";
+import { runtimeIsReady } from "../../lib/runtime-state";
 import { isSessionControlReady } from "../../lib/session-capabilities";
 import { presentUserMessage, serializePresentedUserMessage } from "../../lib/user-message-presentation";
 import { cn } from "../../lib/utils";
@@ -385,7 +386,7 @@ function TreeView() {
 	const channelReady = Boolean(
 		sessionHandle && connectionState === "online" && channel?.subscribed && channel.generation !== null,
 	);
-	const canFork = isSessionControlReady(channel) && channel?.runtime?.state === "idle";
+	const canFork = isSessionControlReady(channel) && runtimeIsReady(channel?.runtime);
 	const [snapshot, setSnapshot] = useState(() => pendingConversationTreeSnapshot(sessionHandle));
 	const [collapsedIds, setCollapsedIds] = useState<Set<string>>(() => new Set());
 	const requestRef = useRef(0);
