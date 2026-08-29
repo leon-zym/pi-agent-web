@@ -3,7 +3,12 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { PI_COMPATIBILITY_MATRIX, type PiRuntimeDiagnosticError, resolvePiRuntime } from "../src/resolver.js";
+import {
+	compatibilityForPiVersion,
+	PI_COMPATIBILITY_MATRIX,
+	type PiRuntimeDiagnosticError,
+	resolvePiRuntime,
+} from "../src/resolver.js";
 
 const tempRoots: string[] = [];
 
@@ -364,5 +369,10 @@ describe("Pi compatibility matrix", () => {
 			adapterId: "legacy-rpc-v1",
 			capabilities: expect.arrayContaining(["rpc.toolcall_identity"]),
 		});
+	});
+
+	it("does not treat inherited property names as compatible versions", () => {
+		expect(compatibilityForPiVersion("__proto__")).toBeUndefined();
+		expect(compatibilityForPiVersion("constructor")).toBeUndefined();
 	});
 });

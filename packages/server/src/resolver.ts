@@ -344,7 +344,7 @@ function mapProbeError(error: unknown): never {
 }
 
 export function compatibilityForPiVersion(version: string): PiCompatibility | undefined {
-	return PI_COMPATIBILITY_MATRIX[version];
+	return Object.hasOwn(PI_COMPATIBILITY_MATRIX, version) ? PI_COMPATIBILITY_MATRIX[version] : undefined;
 }
 
 export function assertRequiredPiCapabilities(
