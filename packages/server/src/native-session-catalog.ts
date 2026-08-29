@@ -79,6 +79,12 @@ export interface WorkspacePreferenceHints {
 interface CachedDirectorySummary {
 	revision: string;
 	sessions: NativeSessionSummary[];
+	files: Map<string, CachedSessionFileSummary>;
+}
+
+interface CachedSessionFileSummary {
+	revision: string;
+	summary: NativeSessionSummary | null;
 }
 
 interface NativeSessionSummary {
@@ -363,12 +369,16 @@ export class NativeSessionCatalog {
 				const cached = this.directoryCache.get(cacheKey);
 				if (cached?.revision === beforeRevision) return cached.sessions;
 
-				const sessions = await this.scanSessionDirectory(directory);
+				const scanned = await this.scanSessionDirectory(directory, cached?.files);
 				const afterRevision = await directoryRevision(directory);
 				if (beforeRevision === afterRevision) {
-					this.directoryCache.set(cacheKey, { revision: afterRevision, sessions });
+					this.directoryCache.set(cacheKey, {
+						revision: afterRevision,
+						sessions: scanned.sessions,
+						files: scanned.files,
+					});
 				}
-				return sessions;
+				return scanned.sessions;
 			})
 			.finally(() => {
 				if (this.directoryScans.get(cacheKey) === scan) this.directoryScans.delete(cacheKey);
@@ -377,22 +387,47 @@ export class NativeSessionCatalog {
 		return scan;
 	}
 
-	private async scanSessionDirectory(directory: string): Promise<NativeSessionSummary[]> {
+	private async scanSessionDirectory(
+		directory: string,
+		cachedFiles?: ReadonlyMap<string, CachedSessionFileSummary>,
+	): Promise<{ sessions: NativeSessionSummary[]; files: Map<string, CachedSessionFileSummary> }> {
 		let entries: fs.Dirent[];
 		try {
 			entries = await fs.promises.readdir(directory, { withFileTypes: true });
 		} catch (error) {
-			if (isMissing(error)) return [];
+			if (isMissing(error)) return { sessions: [], files: new Map() };
 			throw error;
 		}
 
-		const files = entries
-			.filter((entry) => entry.name.endsWith(".jsonl") && (entry.isFile() || entry.isSymbolicLink()))
-			.map((entry) => path.join(directory, entry.name));
-		const summaries = await mapWithConcurrency(files, NATIVE_SESSION_FILE_SCAN_CONCURRENCY, (file) =>
-			this.sessionFileScanLimiter.run(() => scanNativeSessionFile(file)),
+		const files = new Map(
+			entries
+				.filter((entry) => entry.name.endsWith(".jsonl") && (entry.isFile() || entry.isSymbolicLink()))
+				.map((entry) => {
+					const file = path.join(directory, entry.name);
+					return [canonicalizeSessionFile(file), file] as const;
+				}),
 		);
-		return summaries.filter((summary): summary is NativeSessionSummary => summary !== null);
+		const scannedFiles = await mapWithConcurrency(
+			[...files.entries()],
+			NATIVE_SESSION_FILE_SCAN_CONCURRENCY,
+			async ([canonicalFile, file]) => {
+				const revision = await sessionFileRevision(file);
+				const cached = cachedFiles?.get(canonicalFile);
+				if (cached?.revision === revision) return [canonicalFile, cached] as const;
+				const summary = await this.sessionFileScanLimiter.run(() => scanNativeSessionFile(file));
+				return [
+					canonicalFile,
+					{ revision, summary: summary ? { ...summary, path: canonicalFile } : null },
+				] as const;
+			},
+		);
+		const fileCache = new Map(scannedFiles);
+		return {
+			sessions: scannedFiles
+				.map(([, cached]) => cached.summary)
+				.filter((summary): summary is NativeSessionSummary => summary !== null),
+			files: fileCache,
+		};
 	}
 
 	private pruneDirectoryCache(currentDirectoryCacheKeys: ReadonlySet<string>): void {
@@ -709,15 +744,19 @@ async function directoryRevision(directory: string): Promise<string> {
 		entries,
 		DIRECTORY_REVISION_CONCURRENCY,
 		async (entry): Promise<string> => {
-			try {
-				const stat = await fs.promises.stat(path.join(directory, entry), { bigint: true });
-				return `${entry}\0${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
-			} catch (error) {
-				return `${entry}\0${isMissing(error) ? "missing" : "unreadable"}`;
-			}
+			return `${entry}\0${await sessionFileRevision(path.join(directory, entry))}`;
 		},
 	);
 	return createHash("sha256").update(revisions.join("\n")).digest("base64url");
+}
+
+async function sessionFileRevision(filePath: string): Promise<string> {
+	try {
+		const stat = await fs.promises.stat(filePath, { bigint: true });
+		return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+	} catch (error) {
+		return isMissing(error) ? "missing" : "unreadable";
+	}
 }
 
 class AsyncLimiter {

@@ -477,21 +477,23 @@ describe("NativeSessionCatalog", () => {
 		expect(createReadStream).toHaveBeenCalledTimes(3);
 	});
 
-	it("reuses exact directory summaries until a JSONL file revision changes", async () => {
+	it("reuses unchanged file summaries when one JSONL file revision changes", async () => {
 		const root = temporaryDirectory();
 		const resolver = createResolver(root);
 		const workspace = path.join(root, "workspace");
 		fs.mkdirSync(workspace);
-		const file = writeSession(resolver.defaultSessionDirForWorkspace(workspace), "one.jsonl", {
+		const sessionDirectory = resolver.defaultSessionDirForWorkspace(workspace);
+		const file = writeSession(sessionDirectory, "one.jsonl", {
 			id: "one",
 			cwd: workspace,
 		});
+		writeSession(sessionDirectory, "two.jsonl", { id: "two", cwd: workspace });
 		const createReadStream = vi.spyOn(fs, "createReadStream");
 		const catalog = new NativeSessionCatalog({ layoutResolver: resolver, cacheTtlMs: 0 });
 
-		expect((await catalog.refresh({ force: true })).sessions[0]?.messageCount).toBe(2);
-		expect((await catalog.refresh({ force: true })).sessions[0]?.messageCount).toBe(2);
-		expect(createReadStream).toHaveBeenCalledTimes(1);
+		expect((await catalog.refresh({ force: true })).sessions).toHaveLength(2);
+		expect((await catalog.refresh({ force: true })).sessions).toHaveLength(2);
+		expect(createReadStream).toHaveBeenCalledTimes(2);
 
 		fs.appendFileSync(
 			file,
@@ -504,7 +506,45 @@ describe("NativeSessionCatalog", () => {
 			})}\n`,
 		);
 		expect((await catalog.refresh({ force: true })).sessions[0]?.messageCount).toBe(3);
+		expect(createReadStream).toHaveBeenCalledTimes(3);
+	});
+
+	it("rebuilds a cached file after truncation or inode replacement", async () => {
+		const root = temporaryDirectory();
+		const resolver = createResolver(root);
+		const workspace = path.join(root, "workspace");
+		fs.mkdirSync(workspace);
+		const sessionDirectory = resolver.defaultSessionDirForWorkspace(workspace);
+		const file = writeSession(sessionDirectory, "one.jsonl", { id: "one", cwd: workspace });
+		const createReadStream = vi.spyOn(fs, "createReadStream");
+		const catalog = new NativeSessionCatalog({ layoutResolver: resolver, cacheTtlMs: 0 });
+
+		expect((await catalog.refresh({ force: true })).sessions[0]).toMatchObject({
+			nativeSessionId: "one",
+			messageCount: 2,
+		});
+		expect(createReadStream).toHaveBeenCalledTimes(1);
+
+		fs.writeFileSync(
+			file,
+			`${JSON.stringify({ type: "session", version: 3, id: "one", timestamp: "2026-01-01T00:00:00.000Z", cwd: workspace })}\n`,
+		);
+		expect((await catalog.refresh({ force: true })).sessions[0]).toMatchObject({
+			nativeSessionId: "one",
+			messageCount: 0,
+		});
 		expect(createReadStream).toHaveBeenCalledTimes(2);
+
+		const replacement = writeSession(sessionDirectory, "replacement.jsonl", {
+			id: "replacement",
+			cwd: workspace,
+		});
+		fs.renameSync(replacement, file);
+		expect((await catalog.refresh({ force: true })).sessions[0]).toMatchObject({
+			nativeSessionId: "replacement",
+			messageCount: 2,
+		});
+		expect(createReadStream).toHaveBeenCalledTimes(3);
 	});
 
 	it("evicts cached directories that disappear from the current discovery plan", async () => {
