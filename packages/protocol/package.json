@@ -26,6 +26,7 @@
 		"prepack": "pnpm build",
 		"build": "node ../../scripts/clean-dist.mjs && tsc -p tsconfig.build.json",
 		"typecheck": "tsc -p tsconfig.json --noEmit",
+		"bench:schema": "vitest bench test/runtime-schema.bench.ts --run",
 		"test": "vitest run",
 		"lint": "biome check ."
 	},
