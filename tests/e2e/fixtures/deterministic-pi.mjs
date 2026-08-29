@@ -1097,7 +1097,283 @@ function streamExtensionPrompt(command, text, user, userEntryId) {
 	});
 }
 
+function emitExtensionUiCompatDialog(run, method) {
+	const requestId = `${sessionId}-compat-${method}`;
+	run.requestId = requestId;
+	run.stage = method;
+	if (method === "select") {
+		send({
+			type: "extension_ui_request",
+			id: requestId,
+			method,
+			title: "Extension select",
+			options: ["safe (Recommended)", "fast", "custom"],
+		});
+	} else if (method === "input") {
+		send({
+			type: "extension_ui_request",
+			id: requestId,
+			method,
+			title: "Extension input",
+			placeholder: "Type a compatibility value",
+		});
+	} else {
+		send({
+			type: "extension_ui_request",
+			id: requestId,
+			method: "editor",
+			title: "Extension editor",
+			prefill: "E2E_EDITOR_PREFILL",
+		});
+	}
+	record("extension_request", { commandId: run.command.id, text: run.text, requestId, method });
+}
+
+function streamExtensionUiCompatPrompt(command, text, user, userEntryId) {
+	const run = {
+		kind: "extension-ui-compat",
+		command,
+		label: "extension-ui-compat",
+		timers: [],
+		user,
+		userEntryId,
+		text,
+		requestId: null,
+		stage: null,
+	};
+	activeRun = run;
+	record("prompt", {
+		commandId: command.id,
+		text,
+		imageCount: 0,
+		imageMimeTypes: [],
+		imageChars: 0,
+		slow: false,
+		extension: true,
+		compatibility: true,
+	});
+	send({ type: "agent_start" });
+	send({ type: "turn_start" });
+	send({ type: "message_start", message: user });
+	send({ type: "message_end", message: user });
+	send({ type: "session_info_changed" });
+	respond(command);
+	schedule(run, 25, () => {
+		send({
+			type: "extension_ui_request",
+			id: `${sessionId}-compat-status`,
+			method: "setStatus",
+			statusKey: "compat-status",
+			statusText: "E2E_STATUS_READY",
+		});
+		send({
+			type: "extension_ui_request",
+			id: `${sessionId}-compat-widget`,
+			method: "setWidget",
+			widgetKey: "compat-widget",
+			widgetLines: ["E2E_WIDGET_LINE_1", "E2E_WIDGET_LINE_2"],
+			widgetPlacement: "belowEditor",
+		});
+		send({
+			type: "extension_ui_request",
+			id: `${sessionId}-compat-title`,
+			method: "setTitle",
+			title: "E2E_EXTENSION_TAB",
+		});
+		send({
+			type: "extension_ui_request",
+			id: `${sessionId}-compat-editor-text`,
+			method: "set_editor_text",
+			text: "E2E_SET_EDITOR_TEXT",
+		});
+		send({
+			type: "extension_ui_request",
+			id: `${sessionId}-compat-notify`,
+			method: "notify",
+			message: "\u001b[32mE2E_NOTIFY_MESSAGE\u001b[0m",
+			notifyType: "info",
+		});
+		emitExtensionUiCompatDialog(run, "select");
+	});
+}
+
+function finishExtensionUiCompatPrompt(response) {
+	const run = activeRun;
+	if (run?.kind !== "extension-ui-compat" || response.id !== run.requestId) return false;
+	record("extension_response", {
+		commandId: run.command.id,
+		text: run.text,
+		requestId: response.id,
+		method: run.stage,
+		value: response.value,
+		cancelled: response.cancelled === true,
+	});
+	if (run.stage === "select") {
+		emitExtensionUiCompatDialog(run, "input");
+		return true;
+	}
+	if (run.stage === "input") {
+		emitExtensionUiCompatDialog(run, "editor");
+		return true;
+	}
+	const final = assistantMessage("E2E_EXTENSION_UI_COMPAT_COMPLETE");
+	send({ type: "message_start", message: final });
+	send({ type: "message_end", message: final });
+	send({ type: "turn_end", message: final, toolResults: [] });
+	messages.push(final);
+	persistMessage(final, run.userEntryId);
+	send({ type: "agent_end", messages: [run.user, final], willRetry: false });
+	send({ type: "agent_settled" });
+	record("settled", {
+		commandId: run.command.id,
+		text: run.text,
+		label: "E2E_EXTENSION_UI_COMPAT_COMPLETE",
+	});
+	activeRun = null;
+	return true;
+}
+
+function streamExtensionUiScopedPrompt(command, text, user, userEntryId) {
+	const isReload = text === "E2E_EXTENSION_UI_RELOAD";
+	const isTimeout = text === "E2E_EXTENSION_UI_TIMEOUT";
+	const title = isReload
+		? "Extension reload checkpoint"
+		: isTimeout
+			? "Extension timeout checkpoint"
+			: "Extension background checkpoint";
+	const run = {
+		kind: "extension-ui-scoped",
+		command,
+		label: isReload ? "extension-ui-reload" : "extension-ui-background",
+		timers: [],
+		user,
+		userEntryId,
+		text,
+		requestId: `${sessionId}-scoped-confirm`,
+	};
+	activeRun = run;
+	record("prompt", {
+		commandId: command.id,
+		text,
+		imageCount: 0,
+		imageMimeTypes: [],
+		imageChars: 0,
+		slow: false,
+		extension: true,
+		scoped: true,
+	});
+	send({ type: "agent_start" });
+	send({ type: "turn_start" });
+	send({ type: "message_start", message: user });
+	send({ type: "message_end", message: user });
+	send({ type: "session_info_changed" });
+	respond(command);
+	schedule(run, 25, () => {
+		send({
+			type: "extension_ui_request",
+			id: `${sessionId}-scoped-status`,
+			method: "setStatus",
+			statusKey: "scoped-status",
+			statusText: "E2E_SCOPED_STATUS",
+		});
+		send({
+			type: "extension_ui_request",
+			id: `${sessionId}-scoped-widget`,
+			method: "setWidget",
+			widgetKey: "scoped-widget",
+			widgetLines: ["E2E_SCOPED_WIDGET_LINE_1", "E2E_SCOPED_WIDGET_LINE_2"],
+			widgetPlacement: "belowEditor",
+		});
+		send({
+			type: "extension_ui_request",
+			id: `${sessionId}-scoped-title`,
+			method: "setTitle",
+			title: "E2E_SCOPED_TAB",
+		});
+		send({
+			type: "extension_ui_request",
+			id: `${sessionId}-scoped-editor-text`,
+			method: "set_editor_text",
+			text: "E2E_SCOPED_EDITOR_TEXT",
+		});
+		if (isReload) {
+			send({
+				type: "extension_ui_request",
+				id: `${sessionId}-scoped-warning`,
+				method: "notify",
+				message: "\u001b[33mE2E_NOTIFY_WARNING\u001b[0m",
+				notifyType: "warning",
+			});
+			send({
+				type: "extension_ui_request",
+				id: `${sessionId}-scoped-error`,
+				method: "notify",
+				message: "\u001b[31mE2E_NOTIFY_ERROR\u001b[0m",
+				notifyType: "error",
+			});
+		}
+		send({
+			type: "extension_ui_request",
+			id: run.requestId,
+			method: "confirm",
+			title,
+			message: "Resume the scoped synthetic run?",
+			...(isTimeout ? { timeout: 1_000 } : {}),
+		});
+		record("extension_request", {
+			commandId: command.id,
+			text,
+			requestId: run.requestId,
+			method: "confirm",
+		});
+	});
+}
+
+function finishExtensionUiScopedPrompt(response) {
+	const run = activeRun;
+	if (run?.kind !== "extension-ui-scoped" || response.id !== run.requestId) return false;
+	const cancelled = response.cancelled === true;
+	record("extension_response", {
+		commandId: run.command.id,
+		text: run.text,
+		requestId: response.id,
+		method: "confirm",
+		confirmed: response.confirmed === true,
+		cancelled,
+	});
+	for (const request of [
+		{
+			id: `${sessionId}-scoped-status-clear`,
+			method: "setStatus",
+			statusKey: "scoped-status",
+		},
+		{
+			id: `${sessionId}-scoped-widget-clear`,
+			method: "setWidget",
+			widgetKey: "scoped-widget",
+		},
+		{ id: `${sessionId}-scoped-title-clear`, method: "setTitle", title: "" },
+		{ id: `${sessionId}-scoped-editor-text-clear`, method: "set_editor_text", text: "" },
+	]) {
+		send({ type: "extension_ui_request", ...request });
+	}
+	const label = cancelled ? "E2E_EXTENSION_UI_SCOPED_CANCELLED" : "E2E_EXTENSION_UI_SCOPED_COMPLETE";
+	const final = assistantMessage(label);
+	send({ type: "message_start", message: final });
+	send({ type: "message_end", message: final });
+	send({ type: "turn_end", message: final, toolResults: [] });
+	messages.push(final);
+	persistMessage(final, run.userEntryId);
+	send({ type: "agent_end", messages: [run.user, final], willRetry: false });
+	send({ type: "agent_settled" });
+	record("settled", { commandId: run.command.id, text: run.text, label });
+	activeRun = null;
+	return true;
+}
+
 function finishExtensionPrompt(response) {
+	if (finishExtensionUiCompatPrompt(response)) return;
+	if (finishExtensionUiScopedPrompt(response)) return;
 	const run = activeRun;
 	if (run?.kind === "future-content" && response.id === run.requestId) {
 		run.extensionResponse = response;
@@ -1538,6 +1814,19 @@ function streamPrompt(command) {
 	}
 	if (text === "E2E_EXTENSION_CONFIRM" && images.length === 0) {
 		streamExtensionPrompt(command, text, user, userEntryId);
+		return;
+	}
+	if (text === "E2E_EXTENSION_UI_COMPAT" && images.length === 0) {
+		streamExtensionUiCompatPrompt(command, text, user, userEntryId);
+		return;
+	}
+	if (
+		(text === "E2E_EXTENSION_UI_RELOAD" ||
+			text === "E2E_EXTENSION_UI_BACKGROUND" ||
+			text === "E2E_EXTENSION_UI_TIMEOUT") &&
+		images.length === 0
+	) {
+		streamExtensionUiScopedPrompt(command, text, user, userEntryId);
 		return;
 	}
 	if (text === "E2E_RELOAD_ACTIVE_STATE" && images.length === 0) {

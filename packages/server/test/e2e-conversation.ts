@@ -11,6 +11,76 @@ const COMMAND_TIMEOUT_MS = 30_000;
 const TURN_TIMEOUT_MS = 180_000;
 const MAX_COPIED_CONFIG_BYTES = 16 * 1024 * 1024;
 const PRIVATE_CONFIG_FILES = ["auth.json", "models.json"] as const;
+const REAL_EXTENSION_COMPLETE = "PI_WEB_REAL_EXTENSION_COMPLETE";
+const REAL_EXTENSION_CANCEL = "PI_WEB_REAL_EXTENSION_CANCEL";
+const REAL_EXTENSION_TIMEOUT = "PI_WEB_REAL_EXTENSION_TIMEOUT";
+const REAL_EXTENSION_PROCESS_LOSS = "PI_WEB_REAL_EXTENSION_PROCESS_LOSS";
+const REAL_EXTENSION_SOURCE = String.raw`
+import * as fs from "node:fs";
+import path from "node:path";
+
+const COMPLETE = "PI_WEB_REAL_EXTENSION_COMPLETE";
+const CANCEL = "PI_WEB_REAL_EXTENSION_CANCEL";
+const TIMEOUT = "PI_WEB_REAL_EXTENSION_TIMEOUT";
+const PROCESS_LOSS = "PI_WEB_REAL_EXTENSION_PROCESS_LOSS";
+const tracePath = path.join(process.cwd(), ".pi-web-real-extension-trace.jsonl");
+const pidPath = path.join(process.cwd(), ".pi-web-real-extension.pid");
+const providerPath = path.join(process.cwd(), ".pi-web-real-extension-provider");
+
+function record(value) {
+	fs.appendFileSync(tracePath, JSON.stringify(value) + "\n", "utf8");
+}
+
+export default function (pi) {
+	pi.on("before_provider_request", () => {
+		fs.writeFileSync(providerPath, "provider-called\n", "utf8");
+		record({ kind: "provider" });
+	});
+
+	pi.on("input", async (event, ctx) => {
+		if (event.text === COMPLETE) {
+			ctx.ui.setStatus("real-status", "E2E_REAL_STATUS");
+			ctx.ui.setWidget("real-widget", ["E2E_REAL_WIDGET_LINE_1", "E2E_REAL_WIDGET_LINE_2"], {
+				placement: "belowEditor",
+			});
+			ctx.ui.setTitle("E2E_REAL_EXTENSION_TITLE");
+			ctx.ui.setEditorText("E2E_REAL_EDITOR_TEXT");
+			ctx.ui.notify("E2E_REAL_NOTIFY", "info");
+			const selected = await ctx.ui.select("E2E real select", ["safe", "fast"]);
+			const confirmed = await ctx.ui.confirm("E2E real confirm", "Continue the real Extension flow?");
+			const input = await ctx.ui.input("E2E real input", "real value");
+			const edited = await ctx.ui.editor("E2E real editor", "E2E_REAL_EDITOR_PREFILL");
+			ctx.ui.setStatus("real-status", undefined);
+			ctx.ui.setWidget("real-widget", undefined);
+			ctx.ui.setTitle("");
+			ctx.ui.setEditorText("");
+			record({ kind: "complete", selected, confirmed, input, edited });
+			return { action: "handled" };
+		}
+
+		if (event.text === CANCEL) {
+			const confirmed = await ctx.ui.confirm("E2E real cancellation", "Cancel this real Extension flow?");
+			record({ kind: "cancel", confirmed });
+			return { action: "handled" };
+		}
+
+		if (event.text === TIMEOUT) {
+			const confirmed = await ctx.ui.confirm("E2E real timeout", "This dialog expires.", { timeout: 250 });
+			record({ kind: "timeout", confirmed });
+			return { action: "handled" };
+		}
+
+		if (event.text === PROCESS_LOSS) {
+			fs.writeFileSync(pidPath, String(process.pid) + "\n", "utf8");
+			const confirmed = await ctx.ui.confirm("E2E real process loss", "The process will be terminated.");
+			record({ kind: "process_loss", confirmed });
+			return { action: "handled" };
+		}
+
+		return { action: "continue" };
+	});
+}
+`;
 
 interface RuntimeSnapshot {
 	sessionHandle: string;
@@ -50,6 +120,11 @@ interface SessionRef {
 	runtime?: RuntimeSnapshot;
 	error?: string;
 	events: Array<Record<string, unknown>>;
+	extensionRequests: Array<Record<string, unknown>>;
+	extensionClosed: Array<Record<string, unknown>>;
+	extensionResults: Array<Record<string, unknown>>;
+	sessionSnapshots: Array<Record<string, unknown>>;
+	sessionErrors: Array<Record<string, unknown>>;
 }
 
 function sha256(value: string | Buffer): string {
@@ -122,6 +197,15 @@ function timeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Prom
 			},
 		);
 	});
+}
+
+function capturePromise<T>(
+	promise: Promise<T>,
+): Promise<{ status: "fulfilled"; value: T } | { status: "rejected"; error: unknown }> {
+	return promise.then(
+		(value) => ({ status: "fulfilled" as const, value }),
+		(error: unknown) => ({ status: "rejected" as const, error }),
+	);
 }
 
 async function waitUntil(predicate: () => boolean, timeoutMs: number, label: string): Promise<void> {
@@ -224,8 +308,36 @@ class MultiplexClient {
 			const handle = frame.sessionHandle;
 			if (typeof handle === "string") {
 				const ref = this.refs.get(handle);
-				if (ref) ref.error = String(frame.error ?? "unknown Session error");
+				if (ref) {
+					ref.sessionErrors.push(frame);
+					if (frame.operation === "subscribe" || frame.operation === "claim") {
+						ref.error = String(frame.error ?? "unknown Session error");
+					}
+				}
 			}
+			return;
+		}
+		if (frame.type === "extension_ui_request") {
+			const handle = frame.sessionHandle;
+			const request = frame.request;
+			if (typeof handle === "string" && request && typeof request === "object") {
+				this.refs.get(handle)?.extensionRequests.push(request as Record<string, unknown>);
+			}
+			return;
+		}
+		if (frame.type === "extension_ui_closed") {
+			const handle = frame.sessionHandle;
+			if (typeof handle === "string") this.refs.get(handle)?.extensionClosed.push(frame);
+			return;
+		}
+		if (frame.type === "extension_ui_result") {
+			const handle = frame.sessionHandle;
+			if (typeof handle === "string") this.refs.get(handle)?.extensionResults.push(frame);
+			return;
+		}
+		if (frame.type === "session_snapshot") {
+			const handle = frame.sessionHandle;
+			if (typeof handle === "string") this.refs.get(handle)?.sessionSnapshots.push(frame);
 			return;
 		}
 		if (frame.type === "response") {
@@ -256,6 +368,11 @@ class MultiplexClient {
 			handle: runtime.sessionHandle,
 			generation: runtime.generation,
 			events: [],
+			extensionRequests: [],
+			extensionClosed: [],
+			extensionResults: [],
+			sessionSnapshots: [],
+			sessionErrors: [],
 		};
 		this.refs.set(ref.handle, ref);
 		this.ws.send(JSON.stringify({ type: "session_subscribe", sessionHandle: ref.handle }));
@@ -276,7 +393,16 @@ class MultiplexClient {
 	}
 
 	async attachExisting(handle: string): Promise<SessionRef> {
-		const ref: SessionRef = { handle, generation: 0, events: [] };
+		const ref: SessionRef = {
+			handle,
+			generation: 0,
+			events: [],
+			extensionRequests: [],
+			extensionClosed: [],
+			extensionResults: [],
+			sessionSnapshots: [],
+			sessionErrors: [],
+		};
 		this.refs.set(handle, ref);
 		this.ws.send(JSON.stringify({ type: "session_subscribe", sessionHandle: handle }));
 		await waitUntil(
@@ -293,6 +419,67 @@ class MultiplexClient {
 		);
 		if (ref.error) throw new Error(`parent session claim failed: ${ref.error}`);
 		return ref;
+	}
+
+	async observe(runtime: RuntimeSnapshot): Promise<SessionRef> {
+		const ref: SessionRef = {
+			handle: runtime.sessionHandle,
+			generation: runtime.generation,
+			events: [],
+			extensionRequests: [],
+			extensionClosed: [],
+			extensionResults: [],
+			sessionSnapshots: [],
+			sessionErrors: [],
+		};
+		this.refs.set(ref.handle, ref);
+		this.ws.send(JSON.stringify({ type: "session_subscribe", sessionHandle: ref.handle }));
+		await waitUntil(
+			() => Boolean(ref.runtime) || Boolean(ref.error),
+			COMMAND_TIMEOUT_MS,
+			"observer session subscribe",
+		);
+		if (ref.error) throw new Error(`observer session subscribe failed: ${ref.error}`);
+		return ref;
+	}
+
+	async sendExtensionUiResponse(
+		ref: SessionRef,
+		response: Record<string, unknown>,
+		label: string,
+		expectation: "result" | "error" = "result",
+	): Promise<Record<string, unknown>> {
+		if (typeof response.id !== "string") throw new Error(`${label} has no Extension UI request id`);
+		if (!ref.fencingToken && expectation === "result") {
+			throw new Error(`${label} has no controller fencing token`);
+		}
+		const resultCount = ref.extensionResults.length;
+		const errorCount = ref.sessionErrors.length;
+		this.ws.send(
+			JSON.stringify({
+				type: "extension_ui_response",
+				sessionHandle: ref.handle,
+				expectedGeneration: ref.generation,
+				fencingToken: ref.fencingToken ?? "observer-no-lease",
+				response: { ...response, type: "extension_ui_response" },
+			}),
+		);
+		await waitUntil(
+			() => ref.extensionResults.length > resultCount || ref.sessionErrors.length > errorCount,
+			COMMAND_TIMEOUT_MS,
+			label,
+		);
+		const error = ref.sessionErrors
+			.slice(errorCount)
+			.find((frame) => frame.operation === "extension_ui_response");
+		const result = ref.extensionResults.slice(resultCount).find((frame) => frame.requestId === response.id);
+		if (expectation === "error") {
+			if (!error) throw new Error(`${label} did not produce the expected Session error`);
+			return error;
+		}
+		if (error) throw new Error(`${label} failed: ${String(error.error ?? "unknown Session error")}`);
+		if (!result) throw new Error(`${label} did not produce an Extension UI result`);
+		return result;
 	}
 
 	async command(
@@ -336,6 +523,135 @@ class MultiplexClient {
 	}
 }
 
+async function connectMultiplexClient(
+	port: number,
+	authHeaders: Record<string, string>,
+): Promise<{ ws: import("ws").default; client: MultiplexClient }> {
+	const WebSocketCtor = (await import("ws")).default;
+	const ws = new WebSocketCtor(`ws://127.0.0.1:${String(port)}/api/v1/ws`, {
+		headers: authHeaders,
+	});
+	try {
+		await timeout(
+			new Promise<void>((resolve, reject) => {
+				ws.once("open", resolve);
+				ws.once("error", reject);
+			}),
+			COMMAND_TIMEOUT_MS,
+			"WebSocket open",
+		);
+		await timeout(
+			new Promise<void>((resolve, reject) => {
+				ws.once("message", (raw) => {
+					try {
+						const frame = JSON.parse(raw.toString()) as { type?: string };
+						if (frame.type === "server_hello") resolve();
+						else reject(new Error("Gateway rejected real-E2E client hello"));
+					} catch (error) {
+						reject(error);
+					}
+				});
+				ws.once("error", reject);
+				ws.send(
+					JSON.stringify({
+						type: "client_hello",
+						protocol: { major: 1, minor: 2 },
+						clientBuild: "real-e2e",
+						capabilities: [
+							"rpc.commands",
+							"rpc.events",
+							"rpc.extension_ui",
+							"session.multiplex",
+							GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+						],
+						limits: { maxServerFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes },
+					}),
+				);
+			}),
+			COMMAND_TIMEOUT_MS,
+			"WebSocket hello",
+		);
+		return { ws, client: new MultiplexClient(ws) };
+	} catch (error) {
+		await closeWebSocket(ws);
+		throw error;
+	}
+}
+
+async function closeWebSocket(ws: import("ws").default): Promise<void> {
+	if (ws.readyState === 3) return;
+	await new Promise<void>((resolve) => {
+		let finished = false;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const finish = () => {
+			if (finished) return;
+			finished = true;
+			if (timer) clearTimeout(timer);
+			resolve();
+		};
+		ws.once("close", finish);
+		ws.once("error", finish);
+		ws.close();
+		timer = setTimeout(finish, 1_000);
+	});
+}
+
+async function waitForExtensionRequest(
+	ref: SessionRef,
+	predicate: (request: Record<string, unknown>) => boolean,
+	label: string,
+): Promise<Record<string, unknown>> {
+	await waitUntil(() => ref.extensionRequests.some(predicate), COMMAND_TIMEOUT_MS, label);
+	const request = [...ref.extensionRequests].reverse().find(predicate);
+	if (!request) throw new Error(`${label} did not expose a matching request`);
+	return request;
+}
+
+function extensionRequestId(request: Record<string, unknown>, label: string): string {
+	if (typeof request.id !== "string") throw new Error(`${label} request has no id`);
+	return request.id;
+}
+
+function readSafeProcessId(filePath: string): number | null {
+	try {
+		const text = fs.readFileSync(filePath, "utf8").trim();
+		if (!/^[1-9][0-9]*$/.test(text)) return null;
+		const pid = Number(text);
+		if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid) return null;
+		process.kill(pid, 0);
+		return pid;
+	} catch {
+		return null;
+	}
+}
+
+async function waitForExtensionClose(
+	ref: SessionRef,
+	requestId: string,
+	reason: string,
+	label: string,
+): Promise<Record<string, unknown>> {
+	await waitUntil(
+		() => ref.extensionClosed.some((frame) => frame.requestId === requestId && frame.reason === reason),
+		COMMAND_TIMEOUT_MS,
+		label,
+	);
+	const frame = [...ref.extensionClosed]
+		.reverse()
+		.find((candidate) => candidate.requestId === requestId && candidate.reason === reason);
+	if (!frame) throw new Error(`${label} did not expose the expected close frame`);
+	return frame;
+}
+
+function readJsonLines(filePath: string): Array<Record<string, unknown>> {
+	if (!fs.existsSync(filePath)) return [];
+	return fs
+		.readFileSync(filePath, "utf8")
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
 if (!RUN_REAL_E2E) {
 	console.log(
 		"REAL PI E2E SKIPPED (expected): set PI_WEB_RUN_E2E=1 to use configured provider credentials in isolated temporary Sessions.",
@@ -349,15 +665,22 @@ if (!RUN_REAL_E2E) {
 	const realAgentDir = getAgentDir(process.env);
 	const realSettingsPath = path.join(realAgentDir, "settings.json");
 	const realSettingsBefore = fileFingerprint(realSettingsPath);
+	const extensionDir = path.join(isolatedAgentDir, "extensions");
+	const extensionPath = path.join(extensionDir, "real-e2e-extension.ts");
 	fs.mkdirSync(workspacePath, { recursive: true, mode: 0o700 });
 	fs.mkdirSync(isolatedAgentDir, { recursive: true, mode: 0o700 });
+	fs.mkdirSync(extensionDir, { recursive: true, mode: 0o700 });
 	fs.chmodSync(workspacePath, 0o700);
 	fs.chmodSync(isolatedAgentDir, 0o700);
+	fs.chmodSync(extensionDir, 0o700);
+	fs.writeFileSync(extensionPath, REAL_EXTENSION_SOURCE, { encoding: "utf8", mode: 0o600 });
+	fs.chmodSync(extensionPath, 0o600);
 	for (const fileName of PRIVATE_CONFIG_FILES) {
 		copyOptionalPrivateConfig(realAgentDir, isolatedAgentDir, fileName);
 	}
 	let handle: Awaited<ReturnType<typeof startServerWithCurrentMode>> | undefined;
 	let ws: import("ws").default | undefined;
+	const extraSockets: Array<import("ws").default> = [];
 
 	try {
 		const started = await startServerWithCurrentMode({
@@ -409,45 +732,9 @@ if (!RUN_REAL_E2E) {
 			throw new Error("two Session creations returned the same handle");
 		}
 
-		const WebSocketCtor = (await import("ws")).default;
-		ws = new WebSocketCtor(`ws://127.0.0.1:${String(address.port)}/api/v1/ws`, {
-			headers: authHeaders,
-		});
-		await timeout(
-			new Promise<void>((resolve, reject) => {
-				ws?.once("open", resolve);
-				ws?.once("error", reject);
-			}),
-			COMMAND_TIMEOUT_MS,
-			"WebSocket open",
-		);
-		await timeout(
-			new Promise<void>((resolve, reject) => {
-				ws?.once("message", (raw) => {
-					const frame = JSON.parse(raw.toString()) as { type?: string };
-					if (frame.type === "server_hello") resolve();
-					else reject(new Error("Gateway rejected real-E2E client hello"));
-				});
-				ws?.send(
-					JSON.stringify({
-						type: "client_hello",
-						protocol: { major: 1, minor: 2 },
-						clientBuild: "real-e2e",
-						capabilities: [
-							"rpc.commands",
-							"rpc.events",
-							"rpc.extension_ui",
-							"session.multiplex",
-							GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
-						],
-						limits: { maxServerFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes },
-					}),
-				);
-			}),
-			COMMAND_TIMEOUT_MS,
-			"WebSocket hello",
-		);
-		const client = new MultiplexClient(ws);
+		const connected = await connectMultiplexClient(address.port, authHeaders);
+		ws = connected.ws;
+		const client = connected.client;
 		const [sessionA, sessionB] = await Promise.all([client.attach(runtimeA), client.attach(runtimeB)]);
 
 		const available = await client.command(
@@ -748,12 +1035,450 @@ if (!RUN_REAL_E2E) {
 			client.command(parent, { type: "get_tree" }, "get_tree parent"),
 			client.command(rootForkParent, { type: "get_commands" }, "get_commands Session B root child"),
 		]);
+
+		const extensionTracePath = path.join(workspacePath, ".pi-web-real-extension-trace.jsonl");
+		const extensionProviderPath = path.join(workspacePath, ".pi-web-real-extension-provider");
+		const extensionPidPath = path.join(workspacePath, ".pi-web-real-extension.pid");
+		// The same temporary Extension is loaded by every real Pi Session. Clear
+		// evidence from the provider-backed checks before starting the local-only
+		// Extension UI checks below.
+		fs.rmSync(extensionProviderPath, { force: true });
+		fs.rmSync(extensionPidPath, { force: true });
+		const traceBeforeExtension = readJsonLines(extensionTracePath);
+		const providerRecordsBeforeExtension = traceBeforeExtension.filter(
+			(entry) => entry.kind === "provider",
+		).length;
+		// attachExisting replaces the client's reference for a rekeyed handle;
+		// rootForkParent is the final live reference for Session B's child.
+		const sessionBIsolationRef = rootForkParent;
+		const sessionBExtensionRequestCount = sessionBIsolationRef.extensionRequests.length;
+		const extensionRuntime = await createSession();
+		const extensionSession = await client.attach(extensionRuntime);
+
+		const observerOneConnection = await connectMultiplexClient(address.port, authHeaders);
+		extraSockets.push(observerOneConnection.ws);
+		const observerOne = await observerOneConnection.client.observe(extensionRuntime);
+		const observerTwoConnection = await connectMultiplexClient(address.port, authHeaders);
+		extraSockets.push(observerTwoConnection.ws);
+		const observerTwo = await observerTwoConnection.client.observe(extensionRuntime);
+
+		const completeCommand = capturePromise(
+			client.command(
+				extensionSession,
+				{ type: "prompt", message: REAL_EXTENSION_COMPLETE, streamingBehavior: "steer" },
+				"real Extension complete flow",
+				TURN_TIMEOUT_MS,
+			),
+		);
+		const selectRequest = await waitForExtensionRequest(
+			extensionSession,
+			(request) => request.method === "select" && request.title === "E2E real select",
+			"real Extension select request",
+		);
+		const selectId = selectRequest.id;
+		if (typeof selectId !== "string") throw new Error("real Extension select request has no id");
+		if (
+			!Array.isArray(selectRequest.options) ||
+			selectRequest.options.length !== 2 ||
+			selectRequest.options[0] !== "safe" ||
+			selectRequest.options[1] !== "fast"
+		) {
+			throw new Error("real Extension select request exposed the wrong options");
+		}
+		const selectObserverOne = await waitForExtensionRequest(
+			observerOne,
+			(request) => request.method === "select" && request.id === selectId,
+			"first real Extension observer select",
+		);
+		const selectObserverTwo = await waitForExtensionRequest(
+			observerTwo,
+			(request) => request.method === "select" && request.id === selectId,
+			"second real Extension observer select",
+		);
+		if (selectObserverOne.id !== selectObserverTwo.id) {
+			throw new Error("real Extension observers did not receive the same select request");
+		}
+
+		await Promise.all([
+			waitForExtensionRequest(
+				extensionSession,
+				(request) => request.method === "setStatus" && request.statusKey === "real-status",
+				"real Extension setStatus request",
+			),
+			waitForExtensionRequest(
+				extensionSession,
+				(request) => request.method === "setWidget" && request.widgetKey === "real-widget",
+				"real Extension setWidget request",
+			),
+			waitForExtensionRequest(
+				extensionSession,
+				(request) => request.method === "setTitle" && request.title === "E2E_REAL_EXTENSION_TITLE",
+				"real Extension setTitle request",
+			),
+			waitForExtensionRequest(
+				extensionSession,
+				(request) => request.method === "set_editor_text" && request.text === "E2E_REAL_EDITOR_TEXT",
+				"real Extension set_editor_text request",
+			),
+			waitForExtensionRequest(
+				extensionSession,
+				(request) => request.method === "notify" && request.message === "E2E_REAL_NOTIFY",
+				"real Extension notify request",
+			),
+			waitForExtensionRequest(
+				observerOne,
+				(request) => request.method === "notify" && request.message === "E2E_REAL_NOTIFY",
+				"first real Extension observer notify",
+			),
+			waitForExtensionRequest(
+				observerTwo,
+				(request) => request.method === "notify" && request.message === "E2E_REAL_NOTIFY",
+				"second real Extension observer notify",
+			),
+		]);
+		const stickyStatus = extensionSession.extensionRequests.find(
+			(request) => request.method === "setStatus" && request.statusKey === "real-status",
+		);
+		const stickyWidget = extensionSession.extensionRequests.find(
+			(request) => request.method === "setWidget" && request.widgetKey === "real-widget",
+		);
+		if (
+			stickyStatus?.statusText !== "E2E_REAL_STATUS" ||
+			!Array.isArray(stickyWidget?.widgetLines) ||
+			stickyWidget.widgetLines.length !== 2 ||
+			stickyWidget.widgetLines[0] !== "E2E_REAL_WIDGET_LINE_1" ||
+			stickyWidget.widgetLines[1] !== "E2E_REAL_WIDGET_LINE_2" ||
+			stickyWidget.widgetPlacement !== "belowEditor"
+		) {
+			throw new Error("real Extension sticky UI state was not exposed exactly");
+		}
+
+		// A reconnecting observer must receive the pending dialog and sticky UI
+		// from the authoritative Session snapshot, not from local client memory.
+		await closeWebSocket(observerOneConnection.ws);
+		const reconnectConnection = await connectMultiplexClient(address.port, authHeaders);
+		extraSockets.push(reconnectConnection.ws);
+		const reconnectObserver = await reconnectConnection.client.observe(extensionRuntime);
+		await waitUntil(
+			() => reconnectObserver.sessionSnapshots.length > 0,
+			COMMAND_TIMEOUT_MS,
+			"real Extension reconnect snapshot",
+		);
+		const reconnectSnapshot = reconnectObserver.sessionSnapshots.at(-1);
+		if (!reconnectSnapshot) throw new Error("real Extension reconnect returned no Session snapshot");
+		const pendingFromSnapshot = reconnectSnapshot.pendingExtensionRequests;
+		const stickyFromSnapshot = reconnectSnapshot.stickyExtensionState;
+		const hasSnapshotRequest = (value: unknown, method: string): boolean =>
+			Boolean(value && typeof value === "object" && (value as { method?: unknown }).method === method);
+		if (
+			!Array.isArray(pendingFromSnapshot) ||
+			!pendingFromSnapshot.some(
+				(value) =>
+					value &&
+					typeof value === "object" &&
+					(value as { id?: unknown }).id === selectId &&
+					(value as { method?: unknown }).method === "select",
+			) ||
+			!Array.isArray(stickyFromSnapshot) ||
+			!["setStatus", "setWidget", "setTitle", "set_editor_text"].every((method) =>
+				stickyFromSnapshot.some((value) => hasSnapshotRequest(value, method)),
+			) ||
+			JSON.stringify(reconnectSnapshot).includes("E2E_REAL_NOTIFY") ||
+			(reconnectSnapshot as { runtime?: { state?: unknown } }).runtime?.state !== "waiting_ui"
+		) {
+			throw new Error("real Extension reconnect snapshot lost pending or sticky UI state");
+		}
+
+		const unauthorizedResponse = await reconnectConnection.client.sendExtensionUiResponse(
+			reconnectObserver,
+			{ id: selectId, value: "safe" },
+			"non-controller real Extension response",
+			"error",
+		);
+		if (unauthorizedResponse.operation !== "extension_ui_response") {
+			throw new Error("non-controller real Extension response returned the wrong error operation");
+		}
+		if (reconnectObserver.extensionResults.some((frame) => frame.requestId === selectId)) {
+			throw new Error("non-controller real Extension response was incorrectly accepted");
+		}
+
+		const answerDialog = async (
+			request: Record<string, unknown>,
+			response: Record<string, unknown>,
+			label: string,
+			reason: "answered" | "cancelled" = "answered",
+		): Promise<void> => {
+			const id = extensionRequestId(request, label);
+			const result = await client.sendExtensionUiResponse(extensionSession, { ...response, id }, label);
+			if (result.outcome !== "accepted") throw new Error(`${label} was not accepted`);
+			await Promise.all([
+				waitForExtensionClose(extensionSession, id, reason, `${label} controller close`),
+				waitForExtensionClose(observerTwo, id, reason, `${label} observer close`),
+				waitForExtensionClose(reconnectObserver, id, reason, `${label} reconnect close`),
+			]);
+		};
+
+		await answerDialog(selectRequest, { id: selectId, value: "safe" }, "real Extension select response");
+		const confirmRequest = await waitForExtensionRequest(
+			extensionSession,
+			(request) => request.method === "confirm" && request.title === "E2E real confirm",
+			"real Extension confirm request",
+		);
+		const confirmObserver = await waitForExtensionRequest(
+			observerTwo,
+			(request) => request.method === "confirm" && request.id === confirmRequest.id,
+			"real Extension observer confirm",
+		);
+		if (
+			confirmObserver.id !== confirmRequest.id ||
+			confirmRequest.message !== "Continue the real Extension flow?"
+		) {
+			throw new Error("real Extension confirm request was not shared exactly");
+		}
+		await answerDialog(
+			confirmRequest,
+			{ id: confirmRequest.id, confirmed: true },
+			"real Extension confirm response",
+		);
+
+		const inputRequest = await waitForExtensionRequest(
+			extensionSession,
+			(request) => request.method === "input" && request.title === "E2E real input",
+			"real Extension input request",
+		);
+		if (inputRequest.placeholder !== "real value")
+			throw new Error("real Extension input placeholder changed");
+		await waitForExtensionRequest(
+			observerTwo,
+			(request) => request.method === "input" && request.id === inputRequest.id,
+			"real Extension observer input",
+		);
+		await answerDialog(
+			inputRequest,
+			{ id: inputRequest.id, value: "E2E_REAL_INPUT" },
+			"real Extension input response",
+		);
+
+		const editorRequest = await waitForExtensionRequest(
+			extensionSession,
+			(request) => request.method === "editor" && request.title === "E2E real editor",
+			"real Extension editor request",
+		);
+		if (editorRequest.prefill !== "E2E_REAL_EDITOR_PREFILL") {
+			throw new Error("real Extension editor prefill changed");
+		}
+		await waitForExtensionRequest(
+			observerTwo,
+			(request) => request.method === "editor" && request.id === editorRequest.id,
+			"real Extension observer editor",
+		);
+		await answerDialog(
+			editorRequest,
+			{ id: editorRequest.id, value: "E2E_REAL_EDITOR" },
+			"real Extension editor response",
+		);
+		const completeOutcome = await completeCommand;
+		if (completeOutcome.status === "rejected") throw completeOutcome.error;
+
+		if (
+			!extensionSession.extensionRequests.some(
+				(request) =>
+					request.method === "setStatus" &&
+					request.statusKey === "real-status" &&
+					request.statusText === undefined,
+			) ||
+			!extensionSession.extensionRequests.some(
+				(request) =>
+					request.method === "setWidget" &&
+					request.widgetKey === "real-widget" &&
+					request.widgetLines === undefined,
+			) ||
+			!extensionSession.extensionRequests.some(
+				(request) => request.method === "setTitle" && request.title === "",
+			) ||
+			!extensionSession.extensionRequests.some(
+				(request) => request.method === "set_editor_text" && request.text === "",
+			)
+		) {
+			throw new Error("real Extension did not clear sticky UI state after the completed flow");
+		}
+		const completeRecord = await (async () => {
+			await waitUntil(
+				() => readJsonLines(extensionTracePath).some((entry) => entry.kind === "complete"),
+				COMMAND_TIMEOUT_MS,
+				"real Extension completion trace",
+			);
+			return readJsonLines(extensionTracePath).find((entry) => entry.kind === "complete");
+		})();
+		if (
+			completeRecord?.selected !== "safe" ||
+			completeRecord.confirmed !== true ||
+			completeRecord.input !== "E2E_REAL_INPUT" ||
+			completeRecord.edited !== "E2E_REAL_EDITOR"
+		) {
+			throw new Error("real Extension did not receive the controller responses exactly");
+		}
+
+		const cancelCommand = capturePromise(
+			client.command(
+				extensionSession,
+				{ type: "prompt", message: REAL_EXTENSION_CANCEL, streamingBehavior: "steer" },
+				"real Extension cancellation flow",
+				TURN_TIMEOUT_MS,
+			),
+		);
+		const cancelRequest = await waitForExtensionRequest(
+			extensionSession,
+			(request) => request.method === "confirm" && request.title === "E2E real cancellation",
+			"real Extension cancellation request",
+		);
+		await waitForExtensionRequest(
+			observerTwo,
+			(request) => request.method === "confirm" && request.id === cancelRequest.id,
+			"real Extension cancellation observer",
+		);
+		await answerDialog(
+			cancelRequest,
+			{ id: cancelRequest.id, cancelled: true },
+			"real Extension cancellation response",
+			"cancelled",
+		);
+		const cancelOutcome = await cancelCommand;
+		if (cancelOutcome.status === "rejected") throw cancelOutcome.error;
+
+		const timeoutCommand = capturePromise(
+			client.command(
+				extensionSession,
+				{ type: "prompt", message: REAL_EXTENSION_TIMEOUT, streamingBehavior: "steer" },
+				"real Extension timeout flow",
+				TURN_TIMEOUT_MS,
+			),
+		);
+		const timeoutRequest = await waitForExtensionRequest(
+			extensionSession,
+			(request) => request.method === "confirm" && request.title === "E2E real timeout",
+			"real Extension timeout request",
+		);
+		const timeoutId = extensionRequestId(timeoutRequest, "real Extension timeout");
+		if (timeoutRequest.timeout !== 250) throw new Error("real Extension timeout was not forwarded exactly");
+		await waitForExtensionRequest(
+			observerTwo,
+			(request) => request.method === "confirm" && request.id === timeoutRequest.id,
+			"real Extension timeout observer",
+		);
+		await Promise.all([
+			waitForExtensionClose(extensionSession, timeoutId, "expired", "real Extension timeout close"),
+			waitForExtensionClose(observerTwo, timeoutId, "expired", "real Extension timeout observer close"),
+			waitForExtensionClose(
+				reconnectObserver,
+				timeoutId,
+				"expired",
+				"real Extension timeout reconnect close",
+			),
+		]);
+		const timeoutOutcome = await timeoutCommand;
+		if (timeoutOutcome.status === "rejected") throw timeoutOutcome.error;
+
+		fs.rmSync(extensionPidPath, { force: true });
+		const processLossCommand = client
+			.command(
+				extensionSession,
+				{ type: "prompt", message: REAL_EXTENSION_PROCESS_LOSS, streamingBehavior: "steer" },
+				"real Extension process-loss flow",
+				TURN_TIMEOUT_MS,
+			)
+			.then(
+				() => "resolved" as const,
+				() => "rejected" as const,
+			);
+		const processLossRequest = await waitForExtensionRequest(
+			extensionSession,
+			(request) => request.method === "confirm" && request.title === "E2E real process loss",
+			"real Extension process-loss request",
+		);
+		const processLossId = extensionRequestId(processLossRequest, "real Extension process-loss");
+		await waitUntil(
+			() => fs.existsSync(extensionPidPath),
+			COMMAND_TIMEOUT_MS,
+			"real Extension process pid marker",
+		);
+		let processPid: number | null = null;
+		await waitUntil(
+			() => {
+				processPid = readSafeProcessId(extensionPidPath);
+				return processPid !== null;
+			},
+			COMMAND_TIMEOUT_MS,
+			"real Extension process pid readiness",
+		);
+		if (processPid === null) throw new Error("real Extension exposed an unsafe process pid");
+		try {
+			process.kill(processPid, "SIGKILL");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+		}
+		await Promise.all([
+			waitForExtensionClose(
+				extensionSession,
+				processLossId,
+				"process_lost",
+				"real Extension process-loss close",
+			),
+			waitForExtensionClose(
+				observerTwo,
+				processLossId,
+				"process_lost",
+				"real Extension process-loss observer close",
+			),
+			waitForExtensionClose(
+				reconnectObserver,
+				processLossId,
+				"process_lost",
+				"real Extension process-loss reconnect close",
+			),
+		]);
+		await waitUntil(
+			() => extensionSession.runtime?.state === "crashed",
+			COMMAND_TIMEOUT_MS,
+			"real Extension process-loss runtime state",
+		);
+		await processLossCommand;
+
+		const traceAfterExtension = readJsonLines(extensionTracePath);
+		const providerRecordsAfterExtension = traceAfterExtension.filter(
+			(entry) => entry.kind === "provider",
+		).length;
+		if (
+			providerRecordsAfterExtension !== providerRecordsBeforeExtension ||
+			fs.existsSync(extensionProviderPath)
+		) {
+			throw new Error("real Extension UI flow unexpectedly invoked a provider");
+		}
+		if (
+			!traceAfterExtension.some((entry) => entry.kind === "cancel" && entry.confirmed === false) ||
+			!traceAfterExtension.some((entry) => entry.kind === "timeout" && entry.confirmed === false)
+		) {
+			throw new Error("real Extension cancellation or timeout did not complete in Pi");
+		}
+		const sessionBExtensionRequests = sessionBIsolationRef.extensionRequests.slice(
+			sessionBExtensionRequestCount,
+		);
+		if (sessionBExtensionRequests.length > 0) {
+			throw new Error("Extension UI requests leaked from the real Extension Session into Session B");
+		}
+		const traceText = fs.existsSync(extensionTracePath) ? fs.readFileSync(extensionTracePath, "utf8") : "";
+		for (const forbidden of [realAgentDir, realSettingsPath, "auth.json", "models.json"]) {
+			if (traceText.includes(forbidden))
+				throw new Error("real Extension trace leaked private configuration details");
+		}
+		console.log("real Pi Extension UI compatibility, observers, recovery, isolation, and provider guard ok");
 		console.log("REAL PI E2E OK");
 	} catch (error) {
 		process.exitCode = 1;
 		console.error("REAL PI E2E ERROR:", error instanceof Error ? error.message : String(error));
 	} finally {
-		ws?.close();
+		for (const socket of extraSockets) await closeWebSocket(socket);
+		if (ws) await closeWebSocket(ws);
 		try {
 			await handle?.close();
 		} catch {
