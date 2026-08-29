@@ -8,6 +8,7 @@ const AFTER_ATTACHMENT_PROMPT = "E2E_AFTER_PAYLOAD_ATTACHMENT";
 const PNG_BASE64_PREFIX = "iVBORw0KGgo";
 const MIB = 1024 * 1024;
 const CONTENT_REF_PROTOCOL_MINOR = 3;
+const SESSION_HISTORY_CAPABILITY = "session.chunked_history";
 const CONTENT_REF_BUDGET = {
 	maxContentBlobBytes: 48 * MIB,
 	inlineContentThresholdBytes: 256 * 1024,
@@ -18,6 +19,7 @@ const EXPECTED_SERVER_CAPABILITIES = [
 	"rpc.extension_ui",
 	"session.multiplex",
 	"session.hot_runtime_inventory",
+	SESSION_HISTORY_CAPABILITY,
 	"payload.epoch_attachment_refs",
 	"payload.epoch_content_refs",
 ];
