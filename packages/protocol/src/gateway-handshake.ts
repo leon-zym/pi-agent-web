@@ -239,7 +239,12 @@ function isGatewayContentRefClientHelloCore(value: unknown): value is GatewayCon
 
 function isGatewayContentRefServerHelloCore(value: unknown): value is GatewayContentRefServerHelloDto {
 	try {
-		if (!isCanonicalRecord(value, GATEWAY_FUTURE_SERVER_HELLO_KEYS)) return false;
+		if (
+			!PRODUCT_RUNTIME_SCHEMAS.serverHello.check(value) ||
+			!isCanonicalRecord(value, GATEWAY_FUTURE_SERVER_HELLO_KEYS)
+		) {
+			return false;
+		}
 		const protocol = value.protocol;
 		const limits = value.limits;
 		const capabilities = value.capabilities;
