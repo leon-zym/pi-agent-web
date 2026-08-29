@@ -69,6 +69,7 @@ function createHarness(options: {
 	targets: ExistingSessionTarget[];
 	onBroadcast?: (message: SessionSupervisorMessage) => void;
 	onHotRuntimeInventory?: (inventory: HotRuntimeInventoryDto) => void;
+	maxHotProcesses?: number;
 	maxHotRuntimes?: number;
 	replayLimit?: number;
 	replayMaxBytes?: number;
@@ -111,7 +112,9 @@ function createHarness(options: {
 			options.onBroadcast?.(message);
 		},
 		onHotRuntimeInventory: options.onHotRuntimeInventory,
-		maxHotRuntimes: options.maxHotRuntimes ?? 8,
+		...(options.maxHotProcesses !== undefined
+			? { maxHotProcesses: options.maxHotProcesses }
+			: { maxHotRuntimes: options.maxHotRuntimes ?? 8 }),
 		replayLimit: options.replayLimit ?? 32,
 		replayMaxBytes: options.replayMaxBytes,
 		transientBufferMaxBytes: options.transientBufferMaxBytes,
@@ -731,6 +734,27 @@ describe("SessionSupervisor", () => {
 		await expect(
 			supervisor.subscribeHotExact({ ...hot, sessionHandle: `pending_${hot.sessionHandle}` }),
 		).rejects.toThrow("hot_runtime_not_found");
+	});
+
+	it("coalesces duplicate snapshot builds within one runtime turn", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "snapshot-coalesce");
+		const { supervisor } = createHarness({ targets: [target] });
+		await supervisor.activate(target.sessionHandle);
+		const runtime = exactRuntimeObject(supervisor, target.sessionHandle) as SessionRuntime;
+		const internal = runtime as unknown as { buildSessionSnapshot: () => unknown };
+		const build = vi.spyOn(internal, "buildSessionSnapshot");
+
+		const first = runtime.sessionSnapshot();
+		const second = runtime.sessionSnapshot();
+
+		expect(build).toHaveBeenCalledTimes(1);
+		expect(second).toBe(first);
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+		runtime.sessionSnapshot();
+		expect(build).toHaveBeenCalledTimes(2);
 	});
 
 	it("revalidates exact process ownership after capturing the replay baseline", async () => {
@@ -3379,6 +3403,18 @@ describe("SessionSupervisor", () => {
 		expect(supervisor.getRuntime(first.sessionHandle)?.state).toBe("running");
 	});
 
+	it("uses the explicit hot-process budget for runtime admission", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const first = createNativeSession(root, cwd, "process-budget-first");
+		const second = createNativeSession(root, cwd, "process-budget-second");
+		const { supervisor } = createHarness({ targets: [first, second], maxHotProcesses: 1 });
+
+		await supervisor.claim(first.sessionHandle, "process-budget-connection");
+		await expect(supervisor.activate(second.sessionHandle)).rejects.toThrow("session_runtime_capacity");
+	});
+
 	it("pins an idle controller lease against capacity eviction until release", async () => {
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace");
@@ -5220,6 +5256,12 @@ describe("SessionSupervisor", () => {
 			},
 		);
 		await new Promise<void>((resolve) => setTimeout(resolve, 25));
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({
+			state: "idle",
+			phase: "busy",
+			operationCount: 1,
+			busyReasons: ["command"],
+		});
 		await expect(
 			supervisor.sendCommand(
 				target.sessionHandle,

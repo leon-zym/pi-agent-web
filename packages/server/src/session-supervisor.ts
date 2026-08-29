@@ -104,6 +104,9 @@ export interface SessionSupervisorBaseOptions<M extends SessionRuntimeProductMod
 	pendingDialogLimit?: number;
 	projectionLimits?: Partial<SessionLiveProjectionLimits>;
 	commandTimeoutFor?: (commandType: string) => number;
+	/** Hard cap for concurrently owned Pi processes. */
+	maxHotProcesses?: number;
+	/** @deprecated Use maxHotProcesses. Kept for current embedders during the contract transition. */
 	maxHotRuntimes?: number;
 	idleTtlMs?: number;
 	/** Untouched, unclaimed, unpersisted Sessions are forgotten after this bounded grace period. */
@@ -155,6 +158,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "curren
 			SessionSupervisorBaseOptions<M>,
 			| "readyTimeoutMs"
 			| "replayLimit"
+			| "maxHotProcesses"
 			| "maxHotRuntimes"
 			| "idleTtlMs"
 			| "transientIdleTtlMs"
@@ -190,17 +194,21 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "curren
 	) {
 		this.runtimeFactory = runtimeFactory;
 		this.serverEpoch = opts.serverEpoch ?? randomUUID();
-		const configuredMaxHotRuntimes = Number.isFinite(opts.maxHotRuntimes)
-			? Math.floor(opts.maxHotRuntimes ?? 8)
-			: 8;
+		const configuredMaxHotProcesses = Number.isFinite(opts.maxHotProcesses)
+			? Math.floor(opts.maxHotProcesses ?? 8)
+			: Number.isFinite(opts.maxHotRuntimes)
+				? Math.floor(opts.maxHotRuntimes ?? 8)
+				: 8;
+		const maxHotProcesses = Math.min(
+			SESSION_HOT_RUNTIME_INVENTORY_MAX_ITEMS,
+			Math.max(1, configuredMaxHotProcesses),
+		);
 		this.opts = {
 			...opts,
 			readyTimeoutMs: opts.readyTimeoutMs ?? 10_000,
 			replayLimit: opts.replayLimit ?? 1_024,
-			maxHotRuntimes: Math.min(
-				SESSION_HOT_RUNTIME_INVENTORY_MAX_ITEMS,
-				Math.max(1, configuredMaxHotRuntimes),
-			),
+			maxHotProcesses,
+			maxHotRuntimes: maxHotProcesses,
 			idleTtlMs: opts.idleTtlMs ?? 10 * 60_000,
 			transientIdleTtlMs: Math.max(
 				0,
@@ -1186,7 +1194,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "curren
 			const hot = [...new Set(this.runtimes.values())].filter(
 				(runtime) => runtime.running || runtime.state === "starting",
 			);
-			if (hot.length < this.opts.maxHotRuntimes) return;
+			if (hot.length < this.opts.maxHotProcesses) return;
 			const candidate = hot
 				.filter((runtime) => this.isEvictable(runtime))
 				.sort((a, b) => a.lastActivityAt - b.lastActivityAt)[0];
