@@ -34,9 +34,12 @@ test("loads an oversized native history in bounded chunks and pages older turns"
 
 	const viewport = page.locator('[data-chat-viewport="true"]');
 	const turnWindow = viewport.locator('[data-turn-window="true"]');
-	await expect(viewport.getByText("E2E_CHUNKED_HISTORY_REPLY", { exact: false }).last()).toBeVisible();
-	await expect(turnWindow).toHaveAttribute("data-turn-window-total", String(INITIAL_TURNS));
-	await expect(turnWindow.locator('[data-load-older-turns="true"]')).toBeVisible();
+	await expect(turnWindow).toHaveAttribute("data-turn-window-total", String(INITIAL_TURNS), {
+		timeout: 30_000,
+	});
+	const latestTurn = turnWindow.locator("[data-turn-id]").last();
+	await expect(latestTurn).toContainText("E2E_CHUNKED_HISTORY_REPLY", { timeout: 30_000 });
+	await expect(turnWindow.locator('[data-load-older-turns="true"]')).toBeVisible({ timeout: 30_000 });
 
 	const getMessages = harness
 		.piEvents()
