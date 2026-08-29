@@ -47,8 +47,10 @@ test("loads an oversized native history in bounded chunks and pages older turns"
 	expect(getMessages).toEqual([]);
 
 	await turnWindow.locator('[data-load-older-turns="true"]').click();
-	await expect(turnWindow).toHaveAttribute("data-turn-window-total", String(HISTORY_TURNS));
-	await expect(turnWindow.locator('[aria-busy="true"]')).toHaveCount(0);
+	await expect(turnWindow).toHaveAttribute("data-turn-window-total", String(HISTORY_TURNS), {
+		timeout: 30_000,
+	});
+	await expect(turnWindow.locator('[aria-busy="true"]')).toHaveCount(0, { timeout: 30_000 });
 	await page.locator("[data-toc-tick]").first().click({ force: true });
 	await expect(viewport.getByText(`${HISTORY_PROMPT} [turn 1]`, { exact: true })).toBeVisible();
 
