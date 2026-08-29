@@ -557,11 +557,20 @@ Workspace cwd 解析；Gateway 必须让 Catalog 与 child 看到相同结果。
 probe，再以 exact version compatibility matrix 校验 adapter 与必需 capabilities。发行依赖版本、Pi
 package manifest 与 probe 输出必须一致；失败使用稳定且不含路径/凭据的诊断码。
 
-Pi stdout 先由 `legacy-rpc-v1` adapter 的 raw wire guard 按 command/event 验证，再转换为产品 DTO。
-响应按 command 校验 nested data，事件与 Extension UI 按 discriminant、UTF-8 bytes、item count、safe
-number 与 JSON depth 校验。显式列入 non-authoritative allowlist 的 frame 可忽略；其他未知或畸形权威
-frame 进入单一 `protocol_incompatible` 终态。Production Main 注入的 image externalizer 按上面的
-attachment 顺序与 generation ownership 处理 image payload。
+Pi stdout 先由独立的 `PI_WIRE_RUNTIME_SCHEMA_REGISTRY` 做有界 envelope 形状筛选，再由
+`legacy-rpc-v1` adapter 的 raw wire guard 按 command/event 验证并转换为产品 DTO。Browser/Gateway 方向
+使用独立的 `PRODUCT_RUNTIME_SCHEMA_REGISTRY`；它同样只声明浅层 envelope，产品 guard 继续负责 nested
+data、UTF-8 bytes、item count、safe number、JSON depth、epoch/generation identity 与 resource budget。
+这样 schema 不会把 Pi-owned opaque JSON 误认成 Gateway-owned DTO，也不会在通用 validator 中重复实现
+脱敏或 ownership 检查。显式列入 non-authoritative allowlist 的 frame 可忽略；其他未知或畸形权威 frame
+进入单一 `protocol_incompatible` 终态。Production Main 注入的 image externalizer 按上面的 attachment
+顺序与 generation ownership 处理 image payload。
+
+Registry 的稳定 schema id 只用于内部诊断、fixture 与 benchmark，不是对外的协议版本号。TypeScript
+upstream 类型只能在 Server 中以 type-only import 参与 adapter conformance；运行时仍必须通过 raw
+registry、边界 guard 与显式 redaction。升级 Pi 时先加入 exact candidate 和 current/candidate fixture，
+在 `pnpm test:compat` 及 schema benchmark 通过后，人工把 candidate promotion 到 matrix current；bundled
+resolver 会拒绝尚未晋级的 candidate，显式 `PI_PATH` 仍可用于专家验证。
 
 The first WebSocket frame must be `client_hello`. A successful `server_hello` carries the Gateway
 protocol major and minor, server build and epoch, Pi version, adapter id, capability intersection,
