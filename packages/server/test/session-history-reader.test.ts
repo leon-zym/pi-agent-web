@@ -134,4 +134,17 @@ describe("Native Session history reader", () => {
 			code: "session_history_cancelled",
 		});
 	});
+
+	it("bounds the retained record index independently of the source byte budget", async () => {
+		const file = await sessionFile([
+			header(),
+			message("a", null, "user", "one"),
+			message("b", "a", "assistant", "two"),
+			message("c", "b", "user", "three"),
+		]);
+
+		await expect(scanNativeSessionHistory(file, { maxIndexedRecords: 2 })).rejects.toMatchObject({
+			code: "session_history_too_large",
+		});
+	});
 });

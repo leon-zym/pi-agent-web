@@ -1759,6 +1759,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			message.type === "event" ||
 				message.type === "response" ||
 				message.type === "session_snapshot" ||
+				message.type === "session_snapshot_begin" ||
 				message.type === "session_snapshot_chunk" ||
 				message.type === "session_history_page_chunk",
 			history,

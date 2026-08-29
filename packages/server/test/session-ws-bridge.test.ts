@@ -2710,6 +2710,56 @@ describe("SessionWsBridge", () => {
 		expect(harness.connectionEvents).toContainEqual(expect.stringContaining("slow WebSocket client"));
 	});
 
+	it("allows a large chunked snapshot begin frame within the server frame ceiling", async () => {
+		const harness = await createHarness([]);
+		const socket = new NonClosingSocket();
+		harness.bridge.wss.emit("connection", socket as unknown as WebSocket, {} as http.IncomingMessage);
+		markBridgeConnectionHelloComplete(harness.bridge);
+		const { connection, send } = bridgeConnection(harness.bridge);
+		const sessionHandle = "large-snapshot-begin-session";
+		const workspaceId = "large-snapshot-begin-workspace";
+		const baseline = snapshotResponse(0);
+		if (baseline.type !== "session_snapshot") throw new Error("snapshot fixture is not a snapshot");
+		const projectionEvents = Array.from({ length: 2_048 }, (_, index) => ({
+			...ordinaryLargeEvent(600, index + 1),
+			sessionHandle,
+			workspaceId,
+		}));
+		const begin = {
+			type: "session_snapshot_begin",
+			serverEpoch: TEST_SERVER_EPOCH,
+			sessionHandle,
+			workspaceId,
+			generation: 1,
+			snapshotId: "large-snapshot-begin",
+			baseSeq: 0,
+			asOfSeq: projectionEvents.length,
+			runtime: {
+				...baseline.runtime,
+				sessionHandle,
+				workspaceId,
+				lastSeq: projectionEvents.length,
+			},
+			projectionEvents,
+			queue: { steering: [], followUp: [] },
+			pendingExtensionRequests: [],
+			stickyExtensionState: [],
+			history: {
+				totalMessages: 0,
+				loadedMessages: 0,
+				loadedBytes: 0,
+				totalBytes: 0,
+				nextCursor: null,
+			},
+		} as SessionWsServerMessage;
+
+		expect(Buffer.byteLength(JSON.stringify(begin))).toBeGreaterThan(MAX_SESSION_WS_BUFFERED_BYTES);
+		send(connection, begin);
+
+		expect(socket.closeCalls).toEqual([]);
+		expect(socket.sent).toHaveLength(1);
+	});
+
 	it("rejects a second large ordinary event while the first is still in flight", async () => {
 		const harness = await createHarness([]);
 		const socket = new ControlledSendSocket();

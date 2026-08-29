@@ -15,6 +15,7 @@ import { canonicalizePathAllowMissing } from "./session-layout-resolver.js";
 const SCAN_BUFFER_BYTES = 64 * 1024;
 const DEFAULT_INITIAL_MESSAGE_LIMIT = 96;
 const DEFAULT_INITIAL_SOURCE_BYTE_LIMIT = SESSION_SNAPSHOT_MAX_BYTES - 4 * 1024 * 1024;
+const DEFAULT_MAX_INDEXED_RECORDS = SESSION_HISTORY_MAX_MESSAGES;
 
 export type SessionHistoryErrorCode =
 	| "session_history_cancelled"
@@ -67,6 +68,7 @@ export interface NativeSessionHistoryScanOptions {
 	initialSourceByteLimit?: number;
 	maxSourceBytes?: number;
 	maxLineBytes?: number;
+	maxIndexedRecords?: number;
 }
 
 export class NativeSessionHistoryPlan {
@@ -224,6 +226,7 @@ export async function scanNativeSessionHistory(
 	const maxLineBytes = options.maxLineBytes ?? SESSION_PI_SNAPSHOT_JSONL_MAX_BYTES;
 	const initialMessageLimit = options.initialMessageLimit ?? DEFAULT_INITIAL_MESSAGE_LIMIT;
 	const initialSourceByteLimit = options.initialSourceByteLimit ?? DEFAULT_INITIAL_SOURCE_BYTE_LIMIT;
+	const maxIndexedRecords = options.maxIndexedRecords ?? DEFAULT_MAX_INDEXED_RECORDS;
 	if (
 		!Number.isSafeInteger(maxSourceBytes) ||
 		maxSourceBytes <= 0 ||
@@ -236,7 +239,10 @@ export async function scanNativeSessionHistory(
 		initialMessageLimit > SESSION_HISTORY_MAX_CHUNK_MESSAGES ||
 		!Number.isSafeInteger(initialSourceByteLimit) ||
 		initialSourceByteLimit <= 0 ||
-		initialSourceByteLimit > SESSION_HISTORY_MAX_CHUNK_BYTES
+		initialSourceByteLimit > SESSION_HISTORY_MAX_CHUNK_BYTES ||
+		!Number.isSafeInteger(maxIndexedRecords) ||
+		maxIndexedRecords <= 0 ||
+		maxIndexedRecords > DEFAULT_MAX_INDEXED_RECORDS
 	) {
 		throw new SessionHistoryError("session_history_too_large", "history reader limits are invalid");
 	}
@@ -304,6 +310,12 @@ export async function scanNativeSessionHistory(
 				throw new SessionHistoryError(
 					"session_history_invalid_entry",
 					"native Session history contains duplicate entry ids",
+				);
+			}
+			if (records.length >= maxIndexedRecords) {
+				throw new SessionHistoryError(
+					"session_history_too_large",
+					"native Session history contains too many indexed records",
 				);
 			}
 			const record: SessionHistoryRecord = {
