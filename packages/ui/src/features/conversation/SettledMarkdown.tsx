@@ -64,10 +64,9 @@ function extractNodeText(node: ReactNode): string {
 	return "";
 }
 
-/** Markdown renderer with progressive streaming support and syntax highlight circuit breaker. */
-export default function SettledMarkdown({ text, streaming = false }: { text: string; streaming?: boolean }) {
+/** Rich settled Markdown renderer. Streaming callers stay on MarkdownBlock's plain-text path. */
+export default function SettledMarkdown({ text }: { text: string }) {
 	const { t } = useT();
-	void streaming;
 
 	return (
 		<ReactMarkdown

@@ -8,10 +8,9 @@ import { useProjectionStore } from "../../stores/projection";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { sessionTransport, useSessionTransportStore } from "../../stores/session-transport";
 import { ConversationToc } from "./ConversationToc";
+import { ConversationTurnWindow, type ConversationTurnWindowHandle } from "./ConversationTurnWindow";
 import { EmptyHero } from "./EmptyHero";
 import { SessionRecoveryNotice } from "./SessionRecoveryNotice";
-import { StatusRowView } from "./StatusRowView";
-import { TurnView } from "./TurnView";
 import { createSessionRuntimeIdentity } from "./use-lazy-tool-content";
 
 const PIN_THRESHOLD = 24;
@@ -112,11 +111,14 @@ function restoreSessionScroll(element: HTMLDivElement, saved: SavedSessionScroll
 export function ChatViewport() {
 	const scrollRef = useRef<HTMLDivElement>(null);
 	const contentRef = useRef<HTMLDivElement>(null);
+	const turnWindowRef = useRef<ConversationTurnWindowHandle | null>(null);
+	const sessionHandleRef = useRef<string | null>(null);
 	const pinnedRef = useRef(true);
 	const [pinned, setPinned] = useState(true);
 
 	const currentSessionId = useProjectionStore((s) => s.currentSessionId);
 	const sessionHandle = currentSessionId;
+	sessionHandleRef.current = sessionHandle;
 	const runtime = useSessionTransportStore((state) =>
 		sessionHandle ? state.sessions[sessionHandle]?.runtime : null,
 	);
@@ -145,15 +147,26 @@ export function ChatViewport() {
 		(smooth = false) => {
 			const el = scrollRef.current;
 			if (!el) return;
+			const expectedSessionHandle = sessionHandle;
+			turnWindowRef.current?.scrollToLatest();
 			const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ?? false;
-			el.scrollTo({ top: el.scrollHeight, behavior: smooth && !reduceMotion ? "smooth" : "auto" });
+			const scroll = () => {
+				const top = el.scrollHeight;
+				el.scrollTop = top;
+				if (smooth && !reduceMotion) el.scrollTo({ top, behavior: "smooth" });
+			};
+			scroll();
+			window.requestAnimationFrame(() => {
+				if (sessionHandleRef.current !== expectedSessionHandle) return;
+				scroll();
+			});
 			pinnedRef.current = true;
 			setPinned(true);
 			if (currentSessionId) {
 				rememberSessionScroll(currentSessionId, { scrollTop: el.scrollTop, pinned: true });
 			}
 		},
-		[currentSessionId],
+		[sessionHandle],
 	);
 
 	// Preserve each Session's reading position. Appended background content does
@@ -237,24 +250,23 @@ export function ChatViewport() {
 				) : isEmpty ? (
 					<EmptyHero />
 				) : (
-					<div className="flex min-w-0 max-w-full flex-col gap-6">
-						{projection.turns.map((turn) => (
-							<TurnView
-								key={turn.id}
-								turn={turn}
-								sessionHandle={sessionHandle}
-								sessionIdentity={sessionIdentity}
-								onAttachmentLoadError={reportAttachmentLoadError}
-							/>
-						))}
-						{projection.statusRows.map((row) => (
-							<StatusRowView key={row.key} row={row} />
-						))}
-					</div>
+					<ConversationTurnWindow
+						key={sessionHandle ?? "no-session"}
+						ref={turnWindowRef}
+						turns={projection.turns}
+						statusRows={projection.statusRows}
+						sessionHandle={sessionHandle}
+						sessionIdentity={sessionIdentity}
+						onAttachmentLoadError={reportAttachmentLoadError}
+						scrollContainerRef={scrollRef}
+					/>
 				)}
 			</div>
 
-			<ConversationToc turns={projection?.turns ?? []} />
+			<ConversationToc
+				turns={projection?.turns ?? []}
+				onTurnSelect={(turnId) => turnWindowRef.current?.revealTurn(turnId)}
+			/>
 
 			{/* Bottom fade into the composer area. */}
 			<div className="pointer-events-none sticky bottom-0 -mt-10 h-10 bg-gradient-to-t from-base to-transparent" />

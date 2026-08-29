@@ -858,6 +858,167 @@ function streamStressPrompt(command, text, user, userEntryId) {
 	});
 }
 
+function budgetMarkdown(targetBytes) {
+	const header = [
+		`## Streaming budget fixture ${String(targetBytes)} bytes`,
+		"",
+		"中文 Unicode 🧪 **bold** and `inline code` stay selectable while this response is live.",
+		"",
+		"| Check | Result |",
+		"| --- | --- |",
+		"| Renderer | plain streaming tail |",
+		"| Fixture | deterministic Chromium budget |",
+		"",
+	].join("\n");
+	const fenceCount = targetBytes >= 64 * 1024 ? 16 : 8;
+	const fencedBlocks = Array.from({ length: fenceCount }, (_, index) =>
+		["```ts", `export const fenceValue${String(index)} = "deterministic";`, "```", ""].join("\n"),
+	).join("");
+	const longCodeBytes = Math.min(64 * 1024, Math.max(2 * 1024, Math.floor(targetBytes / 4)));
+	const longCodeLine = 'const longStreamingCodeLine = "bounded syntax highlighting";\n';
+	const longCode = [
+		"```ts",
+		longCodeLine.repeat(Math.ceil(longCodeBytes / longCodeLine.length)),
+		"```",
+		"",
+	].join("\n");
+	const diff = "```diff\n@@ -1,1 +1,1 @@\n-old\n+new\n```\n\n";
+	const unfinishedCode = "```text\nunfinished fence remains literal until the response settles\n";
+	const prefix = [
+		header,
+		"A paragraph with a [safe link](https://example.com), punctuation, and repeated live text.\n\n",
+		fencedBlocks,
+		longCode,
+		diff,
+		"- list item with **formatting markers** preserved\n- another item with 中文字符\n\n",
+		unfinishedCode,
+	].join("");
+	const suffix = "\n\nSTREAM_BUDGET_END";
+	const prefixBudget = Math.max(0, targetBytes - Buffer.byteLength(suffix, "utf8"));
+	const fillerLine = "plain streaming budget filler keeps the settled text selectable\n";
+	const availableFillerBytes = Math.max(0, prefixBudget - Buffer.byteLength(prefix, "utf8"));
+	const filler = fillerLine.repeat(Math.ceil(availableFillerBytes / Buffer.byteLength(fillerLine, "utf8")));
+	const body = `${prefix}${filler}`;
+	let low = 0;
+	let high = body.length;
+	while (low < high) {
+		const middle = Math.ceil((low + high) / 2);
+		if (Buffer.byteLength(body.slice(0, middle), "utf8") <= prefixBudget) low = middle;
+		else high = middle - 1;
+	}
+	return `${body.slice(0, low)}${suffix}`;
+}
+
+function streamBudgetPrompt(command, text, user, userEntryId, targetBytes) {
+	const markdown = budgetMarkdown(targetBytes);
+	const run = {
+		kind: "stream-budget",
+		command,
+		label: `stream-budget-${String(targetBytes)}`,
+		timers: [],
+		assembled: "",
+		userEntryId,
+		deltaIndex: 0,
+	};
+	activeRun = run;
+	record("prompt", {
+		commandId: command.id,
+		text,
+		imageCount: 0,
+		imageMimeTypes: [],
+		imageChars: 0,
+		slow: false,
+		streamBudget: true,
+		targetBytes,
+	});
+
+	send({ type: "agent_start" });
+	send({ type: "turn_start" });
+	send({ type: "message_start", message: user });
+	send({ type: "message_end", message: user });
+	send({ type: "session_info_changed" });
+	const pending = assistantMessageWithContent([], "pending");
+	send({ type: "message_start", message: pending });
+	respond(command);
+	send({
+		type: "message_update",
+		usage: pending.usage,
+		assistantMessageEvent: { type: "text_start", contentIndex: 0 },
+	});
+
+	const chunkSize = 4 * 1024;
+	const finishRun = () => {
+		if (activeRun !== run) return;
+		record("stream_end", { commandId: command.id, text, targetBytes });
+		const final = assistantMessageWithContent([{ type: "text", text: markdown }], "stop");
+		const textEndFrame = {
+			type: "message_update",
+			usage: final.usage,
+			assistantMessageEvent: { type: "text_end", contentIndex: 0, content: markdown },
+		};
+		record("large_frame", {
+			commandId: command.id,
+			text,
+			targetBytes,
+			eventType: "text_end",
+			frameBytes: Buffer.byteLength(JSON.stringify(textEndFrame), "utf8"),
+		});
+		send(textEndFrame);
+		// The wire budget permits one large frame at a time. Leave the text_end
+		// frame a turn to drain before the authoritative message_end repeats it.
+		schedule(run, 100, () => {
+			if (activeRun !== run) return;
+			const messageEndFrame = { type: "message_end", message: final };
+			record("large_frame", {
+				commandId: command.id,
+				text,
+				targetBytes,
+				eventType: "message_end",
+				frameBytes: Buffer.byteLength(JSON.stringify(messageEndFrame), "utf8"),
+			});
+			send(messageEndFrame);
+			// Keep the fixture below the current active-turn snapshot budget. The
+			// authoritative message_end above carries the full response; these
+			// lifecycle envelopes do not need to repeat the same 1 MiB text.
+			const compactFinal = assistantMessageWithContent([], "stop");
+			send({ type: "turn_end", message: compactFinal, toolResults: [] });
+			messages.push(final);
+			persistMessage(final, userEntryId);
+			send({ type: "agent_end", messages: [user, compactFinal], willRetry: false });
+			send({ type: "agent_settled" });
+			record("settled", {
+				commandId: command.id,
+				text,
+				label: run.label,
+				targetBytes,
+				markdownChars: markdown.length,
+			});
+			activeRun = null;
+		});
+	};
+	const emitChunk = () => {
+		if (activeRun !== run) return;
+		if (run.assembled.length < markdown.length) {
+			const delta = markdown.slice(run.assembled.length, run.assembled.length + chunkSize);
+			run.assembled += delta;
+			run.deltaIndex += 1;
+			send({
+				type: "message_update",
+				usage: pending.usage,
+				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta },
+			});
+			if (run.deltaIndex === 1 || run.deltaIndex % 16 === 0) {
+				record("delta", { commandId: command.id, text, deltaIndex: run.deltaIndex, targetBytes });
+			}
+			schedule(run, run.deltaIndex === 1 ? 500 : 10, emitChunk);
+			return;
+		}
+		finishRun();
+	};
+
+	schedule(run, 250, emitChunk);
+}
+
 function startUnpersistedHotRuntime() {
 	if (activeRun) return;
 	const run = {
@@ -1352,6 +1513,18 @@ function streamPrompt(command) {
 	if (text === "E2E_STRESS_TRAJECTORY" && images.length === 0) {
 		streamStressPrompt(command, text, user, userEntryId);
 		return;
+	}
+	if (text.startsWith("E2E_STREAM_BUDGET_") && images.length === 0) {
+		const targetBytes = {
+			E2E_STREAM_BUDGET_10K: 10 * 1024,
+			E2E_STREAM_BUDGET_64K: 64 * 1024,
+			E2E_STREAM_BUDGET_120K: 120 * 1024,
+			E2E_STREAM_BUDGET_1M: 1024 * 1024,
+		}[text];
+		if (targetBytes) {
+			streamBudgetPrompt(command, text, user, userEntryId, targetBytes);
+			return;
+		}
 	}
 	if (text === "E2E_EXTENSION_CONFIRM" && images.length === 0) {
 		streamExtensionPrompt(command, text, user, userEntryId);

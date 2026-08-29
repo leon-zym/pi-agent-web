@@ -9,6 +9,7 @@ export interface ConversationTocProps {
 	hoveredTurnId?: string | null;
 	rightMargin?: number;
 	className?: string;
+	onTurnSelect?: (turnId: string) => void;
 }
 
 const MIN_RIGHT_MARGIN = 240;
@@ -45,6 +46,7 @@ export const ConversationToc = memo(function ConversationToc({
 	hoveredTurnId: controlledHoveredTurnId,
 	rightMargin: controlledRightMargin,
 	className,
+	onTurnSelect,
 }: ConversationTocProps) {
 	const { t } = useT();
 	void t;
@@ -106,23 +108,63 @@ export const ConversationToc = memo(function ConversationToc({
 			},
 		);
 
-		for (const el of elements) {
-			observer.observe(el);
+		const observeMountedTurns = () => {
+			observer.disconnect();
+			for (const element of document.querySelectorAll<HTMLElement>("[data-turn-id]")) {
+				observer.observe(element);
+			}
+		};
+		observeMountedTurns();
+
+		const viewport = document.querySelector("[data-chat-viewport]");
+		const mutationObserver =
+			viewport && "MutationObserver" in window
+				? new MutationObserver((records) => {
+						const turnWindowChanged = records.some((record) =>
+							[...record.addedNodes, ...record.removedNodes].some(
+								(node) =>
+									node instanceof Element &&
+									(node.matches("[data-turn-id]") || node.querySelector("[data-turn-id]")),
+							),
+						);
+						if (turnWindowChanged) observeMountedTurns();
+					})
+				: null;
+		if (viewport && mutationObserver) {
+			mutationObserver.observe(viewport, { childList: true, subtree: true });
 		}
 
-		return () => observer.disconnect();
-	}, [controlledActiveTurnId, turns]);
+		return () => {
+			observer.disconnect();
+			mutationObserver?.disconnect();
+		};
+	}, [controlledActiveTurnId, turns.length]);
 
-	const scrollToTurn = useCallback((turnId: string) => {
-		const el = document.querySelector<HTMLElement>(`[data-turn-id="${turnId}"]`);
-		if (el) {
-			const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ?? false;
-			el.scrollIntoView({
-				behavior: reduceMotion ? "auto" : "smooth",
-				block: "start",
-			});
-		}
-	}, []);
+	const scrollToTurn = useCallback(
+		(turnId: string) => {
+			if (onTurnSelect) {
+				onTurnSelect(turnId);
+				return;
+			}
+			const scroll = () => {
+				const el = Array.from(document.querySelectorAll<HTMLElement>("[data-turn-id]")).find(
+					(candidate) => candidate.dataset.turnId === turnId,
+				);
+				if (!el) return;
+				const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ?? false;
+				el.scrollIntoView({
+					behavior: reduceMotion ? "auto" : "smooth",
+					block: "start",
+				});
+			};
+			const isMounted = Array.from(document.querySelectorAll<HTMLElement>("[data-turn-id]")).some(
+				(candidate) => candidate.dataset.turnId === turnId,
+			);
+			if (isMounted) scroll();
+			else window.requestAnimationFrame(scroll);
+		},
+		[onTurnSelect],
+	);
 
 	if (turns.length === 0) return null;
 
@@ -136,7 +178,7 @@ export const ConversationToc = memo(function ConversationToc({
 				className,
 			)}
 		>
-			<div className="flex flex-col items-center gap-2 rounded-full border border-border/60 bg-surface/80 px-1.5 py-3 shadow-lv1">
+			<div className="flex max-h-[min(70vh,640px)] flex-col items-center gap-2 overflow-y-auto rounded-full border border-border/60 bg-surface/80 px-1.5 py-3 shadow-lv1">
 				{turns.map((turn, index) => {
 					const prompt = getTurnPrompt(turn);
 					const isActive = turn.id === activeTurnId || (!activeTurnId && index === 0);

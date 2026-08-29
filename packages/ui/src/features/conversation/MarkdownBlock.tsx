@@ -1,18 +1,14 @@
 import { lazy, memo, Suspense } from "react";
-import { stripAnsi } from "../../lib/format";
+import { exceedsUtf8ByteLimit } from "../../lib/format";
 import { cn } from "../../lib/utils";
+import { StreamingText, useStreamingDisplayText } from "./streaming-text";
 
 const SettledMarkdown = lazy(() => import("./SettledMarkdown"));
 
-function PlainMarkdownFallback({ text }: { text: string }) {
-	return <div className="whitespace-pre-wrap">{text}</div>;
-}
+/** Keep synchronous rich Markdown parsing below the browser render budget. */
+export const MAX_RICH_MARKDOWN_UTF8_BYTES = 256 * 1024;
 
-/**
- * Assistant prose renderer with progressive streaming Markdown support:
- * Headings, lists, bold/italic, inline code, and code blocks render progressively
- * during streaming while enforcing syntax-highlighting circuit breakers.
- */
+/** Assistant prose renderer with a cheap, selectable streaming tail and rich settled Markdown. */
 export const MarkdownBlock = memo(function MarkdownBlock({
 	text,
 	streaming = false,
@@ -20,11 +16,13 @@ export const MarkdownBlock = memo(function MarkdownBlock({
 	text: string;
 	streaming?: boolean;
 }) {
-	const displayText = stripAnsi(text);
+	const displayText = useStreamingDisplayText(text, streaming);
+	const useLargeTextFallback = !streaming && exceedsUtf8ByteLimit(displayText, MAX_RICH_MARKDOWN_UTF8_BYTES);
 
 	return (
 		<div
 			data-markdown-streaming={streaming ? "true" : undefined}
+			data-markdown-settled={!streaming ? "true" : undefined}
 			className={cn(
 				"min-w-0 max-w-full text-[15px] leading-[26px] break-words [overflow-wrap:anywhere] text-ink",
 				"[&_p]:my-2 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0",
@@ -46,9 +44,15 @@ export const MarkdownBlock = memo(function MarkdownBlock({
 				"[&_img]:my-2 [&_img]:max-w-full [&_img]:rounded-md",
 			)}
 		>
-			<Suspense fallback={<PlainMarkdownFallback text={displayText} />}>
-				<SettledMarkdown text={displayText} streaming={streaming} />
-			</Suspense>
+			{streaming || useLargeTextFallback ? (
+				<div data-markdown-large={useLargeTextFallback ? "true" : undefined}>
+					<StreamingText text={displayText} />
+				</div>
+			) : (
+				<Suspense fallback={<StreamingText text={displayText} />}>
+					<SettledMarkdown text={displayText} />
+				</Suspense>
+			)}
 		</div>
 	);
 });

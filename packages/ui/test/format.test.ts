@@ -1,6 +1,13 @@
 import { RpcError, type SessionPayloadAdmissionErrorDto } from "@pi-agent-web/protocol";
 import { describe, expect, it } from "vitest";
-import { displayError, displayLabel, formatExactDateTime, stripAnsi, tailTeaser } from "../src/lib/format";
+import {
+	displayError,
+	displayLabel,
+	exceedsUtf8ByteLimit,
+	formatExactDateTime,
+	stripAnsi,
+	tailTeaser,
+} from "../src/lib/format";
 import { useI18n } from "../src/lib/i18n";
 import { en } from "../src/lib/i18n/en";
 
@@ -42,6 +49,15 @@ describe("stripAnsi", () => {
 		expect(tailTeaser("First thought.\nSecond thought.\nFinal conclusion.")).toBe("Final conclusion.");
 		expect(tailTeaser("  \n  Single line  \n  ")).toBe("Single line");
 		expect(tailTeaser("")).toBe("");
+	});
+});
+
+describe("UTF-8 text budgets", () => {
+	it("counts Unicode code points at the exact boundary", () => {
+		expect(exceedsUtf8ByteLimit("中文", 6)).toBe(false);
+		expect(exceedsUtf8ByteLimit("中文", 5)).toBe(true);
+		expect(exceedsUtf8ByteLimit("🧪", 4)).toBe(false);
+		expect(exceedsUtf8ByteLimit("🧪", 3)).toBe(true);
 	});
 });
 
