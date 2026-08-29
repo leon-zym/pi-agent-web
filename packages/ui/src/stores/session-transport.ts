@@ -218,6 +218,14 @@ type TransportSessionSnapshotFrame =
 type HistorySnapshotBegin = SessionSnapshotBeginDto | FutureSessionSnapshotBeginDto;
 type HistorySnapshotChunk = SessionSnapshotChunkDto | FutureSessionSnapshotChunkDto;
 type HistoryPageChunk = SessionHistoryPageChunkDto | FutureSessionHistoryPageChunkDto;
+type CompletedHistorySnapshot = ReturnType<
+	SessionHistoryStreamAssembler<
+		unknown,
+		HistorySnapshotBegin,
+		HistorySnapshotChunk,
+		SessionSnapshotEndDto
+	>["end"]
+>;
 
 interface SnapshotHistoryAssembly {
 	identity: SessionRuntimeIdentityDto;
@@ -232,6 +240,10 @@ interface SnapshotHistoryAssembly {
 	>;
 	waiterToken: number;
 	finishing: boolean;
+	completed: CompletedHistorySnapshot | null;
+	completion?: Promise<CompletedHistorySnapshot>;
+	resolveCompletion?: (completed: CompletedHistorySnapshot) => void;
+	rejectCompletion?: (error: Error) => void;
 }
 
 interface PageHistoryAssembly {
@@ -809,7 +821,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		const snapshotAssembly = snapshotHistoryAssemblies.get(key);
 		if (snapshotAssembly) {
 			snapshotHistoryAssemblies.delete(key);
-			snapshotAssembly.controller.abort();
+			abortSnapshotHistoryAssembly(snapshotAssembly);
 		}
 		const waiter = snapshotWaiters.get(key);
 		if (waiter) {
@@ -827,7 +839,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		for (const [key, assembly] of snapshotHistoryAssemblies) {
 			if (assembly.identity.sessionHandle !== sessionHandle) continue;
 			snapshotHistoryAssemblies.delete(key);
-			assembly.controller.abort();
+			abortSnapshotHistoryAssembly(assembly);
 		}
 		for (const [key, waiter] of snapshotWaiters) {
 			if (waiter.identity.sessionHandle !== sessionHandle) continue;
@@ -848,7 +860,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		for (const [key, assembly] of snapshotHistoryAssemblies) {
 			if (assembly.identity.sessionHandle !== sessionHandle) continue;
 			snapshotHistoryAssemblies.delete(key);
-			assembly.controller.abort();
+			abortSnapshotHistoryAssembly(assembly);
 		}
 		for (const [candidateId, assembly] of pageHistoryAssemblies) {
 			if (assembly.identity.sessionHandle !== sessionHandle) continue;
@@ -2387,7 +2399,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				});
 			}
 			case "session_snapshot_begin":
-				handleSessionSnapshotBegin(message, "future");
+				handleSessionSnapshotBegin(message, "future", rawWireBytes);
 				return true;
 			case "session_snapshot_chunk":
 				handleSessionSnapshotChunk(message, "future");
@@ -2415,6 +2427,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	function handleSessionSnapshotBegin(
 		message: HistorySnapshotBegin,
 		productMode: "current" | "future",
+		rawWireBytes = 0,
 	): void {
 		const channel = store.getState().sessions[message.sessionHandle];
 		if (!channel?.subscribed || !channel.resync || !identitiesMatch(channel.runtime, message)) return;
@@ -2424,7 +2437,13 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		const previous = snapshotHistoryAssemblies.get(key);
 		if (previous) {
 			snapshotHistoryAssemblies.delete(key);
-			previous.controller.abort();
+			abortSnapshotHistoryAssembly(previous);
+		}
+		if (productMode === "future") {
+			const pendingTail = futureProjectionTails.get(message.sessionHandle);
+			if (pendingTail?.snapshotPending) {
+				discardFutureProjectionTail(message.sessionHandle, pendingTail);
+			}
 		}
 		const assembler = new SessionHistoryStreamAssembler<
 			unknown,
@@ -2446,7 +2465,16 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			assembler,
 			waiterToken: waiter.token,
 			finishing: false,
+			completed: null,
 		};
+		if (productMode === "future") {
+			const completion = new Promise<CompletedHistorySnapshot>((resolve, reject) => {
+				assembly.resolveCompletion = resolve;
+				assembly.rejectCompletion = (error) => reject(error);
+			});
+			assembly.completion = completion;
+			completion.catch(() => undefined);
+		}
 		snapshotHistoryAssemblies.set(key, assembly);
 		setChannel(message.sessionHandle, (current) => ({
 			...current,
@@ -2458,6 +2486,35 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				error: null,
 			},
 		}));
+		if (productMode === "future") {
+			const accepted = enqueueFutureProjection(message, rawWireBytes, waiter, async (signal) => {
+				const completed = await assembly.completion;
+				if (!completed || signal.aborted || assembly.controller.signal.aborted) {
+					throw new DOMException("Future Session snapshot was aborted", "AbortError");
+				}
+				const adapter = activeFutureContentAdapter;
+				if (!adapter || completed.begin.type !== "session_snapshot_begin") {
+					throw new Error("Future history snapshot materialization is unavailable");
+				}
+				const { type: _type, history: _history, ...header } = completed.begin;
+				const projected = await adapter.materializeSnapshot(
+					{
+						...header,
+						type: "session_snapshot",
+						settledMessages: completed.messages as FutureSessionMessageDto[],
+					} as FutureSessionSnapshotDto,
+					AbortSignal.any([signal, assembly.controller.signal]),
+				);
+				return () => {
+					if (!isCurrentSnapshotAssembly(assembly)) return;
+					snapshotHistoryAssemblies.delete(key);
+					commitSessionSnapshot(projected, "future");
+				};
+			});
+			if (!accepted) {
+				failChunkedSnapshot(message, new Error("Future history snapshot could not be queued"), waiter);
+			}
+		}
 	}
 
 	function handleSessionSnapshotChunk(
@@ -2500,7 +2557,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			);
 			return;
 		}
-		void finishFutureChunkedSnapshot(assembly, completed);
+		assembly.completed = completed;
+		assembly.resolveCompletion?.(completed);
 	}
 
 	function currentSnapshotWaiter(assembly: SnapshotHistoryAssembly): SnapshotWaiter | undefined {
@@ -2518,38 +2576,6 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			type: "session_snapshot",
 			settledMessages: messages as SessionMessageDto[],
 		};
-	}
-
-	async function finishFutureChunkedSnapshot(
-		assembly: SnapshotHistoryAssembly,
-		completed: ReturnType<typeof assembly.assembler.end>,
-	): Promise<void> {
-		const adapter = activeFutureContentAdapter;
-		const begin = completed.begin;
-		try {
-			if (!adapter || begin.type !== "session_snapshot_begin") {
-				throw new Error("Future history snapshot materialization is unavailable");
-			}
-			const { type: _type, history: _history, ...header } = begin;
-			const projected = await adapter.materializeSnapshot(
-				{
-					...header,
-					type: "session_snapshot",
-					settledMessages: completed.messages as FutureSessionMessageDto[],
-				} as FutureSessionSnapshotDto,
-				assembly.controller.signal,
-			);
-			if (!isCurrentSnapshotAssembly(assembly)) return;
-			snapshotHistoryAssemblies.delete(identityKey(assembly.identity));
-			commitSessionSnapshot(projected, "future");
-		} catch (error) {
-			if (assembly.controller.signal.aborted) return;
-			failChunkedSnapshot(
-				assembly.identity,
-				error instanceof Error ? error : new Error(String(error)),
-				currentSnapshotWaiter(assembly),
-			);
-		}
 	}
 
 	function isCurrentSnapshotAssembly(assembly: SnapshotHistoryAssembly): boolean {
@@ -2572,7 +2598,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		const assembly = snapshotHistoryAssemblies.get(key);
 		if (assembly) {
 			snapshotHistoryAssemblies.delete(key);
-			assembly.controller.abort();
+			assembly.rejectCompletion?.(error);
+			abortSnapshotHistoryAssembly(assembly);
 		}
 		if (waiter && snapshotWaiters.get(key)?.token === waiter.token) {
 			snapshotWaiters.delete(key);
@@ -2584,6 +2611,21 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				: channel,
 		);
 		reportProjectionFailure(identity.sessionHandle, identity.generation, error);
+	}
+
+	function abortSnapshotHistoryAssembly(assembly: SnapshotHistoryAssembly): void {
+		if (!assembly.completed) {
+			assembly.rejectCompletion?.(
+				new SessionTransportError("stale_resync", "Session history stream was aborted"),
+			);
+		}
+		assembly.controller.abort();
+		if (assembly.productMode === "future") {
+			const tail = futureProjectionTails.get(assembly.identity.sessionHandle);
+			if (tail?.snapshotPending && tail.snapshotWaiter?.token === assembly.waiterToken) {
+				discardFutureProjectionTail(assembly.identity.sessionHandle, tail);
+			}
+		}
 	}
 
 	function handleSessionHistoryPageBegin(

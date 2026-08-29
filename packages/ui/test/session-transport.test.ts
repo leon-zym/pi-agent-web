@@ -3,7 +3,10 @@ import {
 	FUTURE_SESSION_CONTENT_REF_BUDGET,
 	type FutureExtensionUiRequestDto,
 	type FutureSessionContentRefGuardContext,
+	type FutureSessionMessageDto,
 	type FutureSessionReplayFrameDto,
+	type FutureSessionSnapshotBeginDto,
+	type FutureSessionSnapshotChunkDto,
 	type FutureSessionSnapshotDto,
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
@@ -288,6 +291,55 @@ function futureSnapshot(sessionHandle: string, generation: number, id: string): 
 		pendingExtensionRequests: [],
 		stickyExtensionState: [request],
 	};
+}
+
+function futureChunkedSnapshotFrames(
+	sessionHandle: string,
+	id: string,
+): [FutureSessionSnapshotBeginDto, FutureSessionSnapshotChunkDto, SessionSnapshotEndDto] {
+	const snapshot = futureSnapshot(sessionHandle, 1, id);
+	const { type: _type, settledMessages: _settledMessages, ...snapshotHeader } = snapshot;
+	const runtimeValue = snapshot.runtime;
+	const message: FutureSessionMessageDto = { role: "user", content: "snapshot", timestamp: 1 };
+	const loadedBytes = sessionHistoryMessagesBytes([message]);
+	const begin: FutureSessionSnapshotBeginDto = {
+		...snapshotHeader,
+		type: "session_snapshot_begin",
+		history: {
+			totalMessages: 1,
+			loadedMessages: 1,
+			loadedBytes,
+			totalBytes: loadedBytes,
+			nextCursor: null,
+		},
+	};
+	const chunk: FutureSessionSnapshotChunkDto = {
+		serverEpoch: runtimeValue.serverEpoch,
+		sessionHandle,
+		workspaceId: runtimeValue.workspaceId,
+		generation: 1,
+		type: "session_snapshot_chunk",
+		snapshotId: snapshot.snapshotId,
+		chunkIndex: 0,
+		messages: [message],
+		itemCount: 1,
+		byteCount: loadedBytes,
+		checksum: sessionHistoryChecksum([message]),
+	};
+	const end: SessionSnapshotEndDto = {
+		serverEpoch: runtimeValue.serverEpoch,
+		sessionHandle,
+		workspaceId: runtimeValue.workspaceId,
+		generation: 1,
+		type: "session_snapshot_end",
+		snapshotId: snapshot.snapshotId,
+		chunkCount: 1,
+		itemCount: 1,
+		byteCount: loadedBytes,
+		checksum: sessionHistoryChecksum([chunk.checksum]),
+		nextCursor: null,
+	};
+	return [begin, chunk, end];
 }
 
 function futureWireBytes(message: Parameters<SessionTransportController["ingestFutureFrameMessage"]>[0]) {
@@ -3716,6 +3768,97 @@ describe("future Session content transport", () => {
 			projectedSeq: 0,
 			pendingExtensionRequests: [],
 		});
+	});
+
+	it("serializes future live materialization behind a chunked snapshot", async () => {
+		let releaseSnapshot!: () => void;
+		const snapshotGate = new Promise<void>((resolve) => {
+			releaseSnapshot = resolve;
+		});
+		let liveMaterializationStarted = false;
+		const adapter = futureAdapter(async (request: FutureExtensionUiRequestDto) => {
+			if (request.id === "future-chunked-snapshot") await snapshotGate;
+			if (request.id === "future-chunked-live") liveMaterializationStarted = true;
+			if (request.method !== "set_editor_text") throw new Error("unexpected fixture request");
+			return { ...request, text: `resolved:${request.id}` };
+		});
+		const h = harness({ futureContentAdapter: adapter });
+		connect(h);
+		const sessionHandle = "future-chunked-session";
+		const state = h.controller.store.getState();
+		state.subscribeSession(sessionHandle);
+		const runtimeValue = runtime(sessionHandle, 1, 0);
+		h.controller.ingestServerMessage({ type: "runtime_state", runtime: runtimeValue });
+		h.controller.ingestServerMessage({
+			type: "resync_required",
+			serverEpoch: runtimeValue.serverEpoch,
+			sessionHandle,
+			runtime: runtimeValue,
+			reason: "initial",
+		});
+
+		const [begin, chunk, end] = futureChunkedSnapshotFrames(sessionHandle, "future-chunked-snapshot");
+		const delivered: string[] = [];
+		h.controller.frameBus.subscribe(sessionHandle, ({ message: frame }) => {
+			if (frame.type === "session_snapshot") delivered.push("snapshot");
+			if (frame.type === "extension_ui_request") delivered.push(frame.request.id);
+		});
+
+		expect(ingestFuture(h.controller, begin)).toBe(true);
+		expect(ingestFuture(h.controller, chunk)).toBe(true);
+		expect(ingestFuture(h.controller, end)).toBe(true);
+		expect(ingestFuture(h.controller, futureSetEditorFrame(sessionHandle, 1, 1, "future-chunked-live"))).toBe(
+			true,
+		);
+		await flushPromises();
+
+		expect(liveMaterializationStarted).toBe(false);
+		expect(delivered).toEqual([]);
+		releaseSnapshot();
+		await vi.waitFor(() => expect(delivered).toEqual(["snapshot", "future-chunked-live"]));
+	});
+
+	it("replaces a pending future snapshot before starting a chunked snapshot", async () => {
+		let releasePrevious!: () => void;
+		let previousSignal: AbortSignal | undefined;
+		const previousGate = new Promise<void>((resolve) => {
+			releasePrevious = resolve;
+		});
+		const adapter = futureAdapter(async (request, signal) => {
+			if (request.id === "future-ordinary-snapshot") {
+				previousSignal = signal;
+				await previousGate;
+			}
+			if (request.method !== "set_editor_text") throw new Error("unexpected fixture request");
+			return { ...request, text: `resolved:${request.id}` };
+		});
+		const h = harness({ futureContentAdapter: adapter });
+		connect(h);
+		subscribeAndPrime(h, "session-a");
+		h.controller.ingestServerMessage({
+			type: "resync_required",
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "session-a",
+			runtime: runtime("session-a", 1, 0),
+			reason: "initial",
+		});
+		expect(ingestFuture(h.controller, futureSnapshot("session-a", 1, "future-ordinary-snapshot"))).toBe(true);
+		await vi.waitFor(() => expect(previousSignal).toBeDefined());
+
+		const [begin, chunk, end] = futureChunkedSnapshotFrames("session-a", "future-replacement");
+		expect(ingestFuture(h.controller, begin)).toBe(true);
+		expect(ingestFuture(h.controller, chunk)).toBe(true);
+		expect(ingestFuture(h.controller, end)).toBe(true);
+		await vi.waitFor(() =>
+			expect(h.controller.store.getState().sessions["session-a"]?.baselineAuthoritative).toBe(true),
+		);
+
+		expect(previousSignal?.aborted).toBe(true);
+		expect(h.controller.store.getState().sessions["session-a"]?.pendingExtensionRequests).toEqual([
+			expect.objectContaining({ id: "future-replacement" }),
+		]);
+		releasePrevious();
+		await flushPromises();
 	});
 
 	it("serializes future Extension materialization per Session without blocking another Session", async () => {
