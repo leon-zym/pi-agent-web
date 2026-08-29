@@ -40,6 +40,10 @@ interface ConversationTurnWindowProps {
 	statusRows: readonly StatusRow[];
 	sessionHandle?: string | null;
 	sessionIdentity?: SessionRuntimeIdentityDto | null;
+	remoteHistoryHasOlder?: boolean;
+	remoteHistoryLoading?: boolean;
+	remoteHistoryError?: string | null;
+	onLoadRemoteOlder?: () => void;
 	onAttachmentLoadError?: (image: SessionImageContentDto) => void;
 	scrollContainerRef: RefObject<HTMLDivElement | null>;
 }
@@ -74,7 +78,18 @@ function scrollToTurnElement(container: HTMLDivElement | null, turnId: string): 
 
 export const ConversationTurnWindow = memo(
 	forwardRef<ConversationTurnWindowHandle, ConversationTurnWindowProps>(function ConversationTurnWindow(
-		{ turns, statusRows, sessionHandle, sessionIdentity, onAttachmentLoadError, scrollContainerRef },
+		{
+			turns,
+			statusRows,
+			sessionHandle,
+			sessionIdentity,
+			remoteHistoryHasOlder = false,
+			remoteHistoryLoading = false,
+			remoteHistoryError = null,
+			onLoadRemoteOlder,
+			onAttachmentLoadError,
+			scrollContainerRef,
+		},
 		ref,
 	) {
 		const [start, setStart] = useState(() => getSavedStart(sessionHandle, turns.length));
@@ -171,7 +186,10 @@ export const ConversationTurnWindow = memo(
 		const loadOlder = useCallback(() => {
 			const currentStart = startRef.current;
 			const currentRange = getTurnWindowRange(turnsRef.current.length, currentStart);
-			if (!currentRange.hasOlder) return;
+			if (!currentRange.hasOlder) {
+				if (remoteHistoryHasOlder && !remoteHistoryLoading) onLoadRemoteOlder?.();
+				return;
+			}
 			const nextStart = getPreviousTurnWindowStart(currentStart, CONVERSATION_TURN_PAGE_SIZE);
 			const container = scrollContainerRef.current;
 			const viewportTop = container?.getBoundingClientRect().top ?? 0;
@@ -191,7 +209,7 @@ export const ConversationTurnWindow = memo(
 					: {}),
 			};
 			setStart(nextStart);
-		}, [scrollContainerRef]);
+		}, [onLoadRemoteOlder, remoteHistoryHasOlder, remoteHistoryLoading, scrollContainerRef]);
 
 		const scrollToLatest = useCallback(() => {
 			const nextStart = getInitialTurnWindowStart(turnsRef.current.length);
@@ -254,16 +272,29 @@ export const ConversationTurnWindow = memo(
 				data-turn-window-total={turns.length}
 				className="flex min-w-0 max-w-full flex-col gap-6"
 			>
-				{range.hasOlder && (
+				{(range.hasOlder || remoteHistoryHasOlder) && (
 					<div className="flex flex-col items-center gap-1">
 						<button
 							type="button"
 							data-load-older-turns="true"
 							onClick={loadOlder}
+							disabled={remoteHistoryLoading && !range.hasOlder}
+							aria-busy={remoteHistoryLoading && !range.hasOlder}
 							className="rounded-md border border-border bg-surface px-3 py-1.5 text-xs text-ink-2 shadow-lv1 hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
 						>
-							{tt("chatViewport.loadOlder")}
+							{range.hasOlder
+								? tt("chatViewport.loadOlder")
+								: remoteHistoryLoading
+									? tt("chatViewport.loadingOlder")
+									: remoteHistoryError
+										? tt("chatViewport.retryOlder")
+										: tt("chatViewport.loadOlder")}
 						</button>
+						{!range.hasOlder && remoteHistoryError && (
+							<span role="status" className="text-[11px] text-danger">
+								{remoteHistoryError}
+							</span>
+						)}
 						<span className="text-[11px] text-ink-3">
 							{tt("chatViewport.historyWindow", { loaded: range.end - range.start, total: turns.length })}
 						</span>

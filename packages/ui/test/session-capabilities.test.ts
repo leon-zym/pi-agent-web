@@ -1,7 +1,7 @@
 import type { NativeSessionDto, SessionRuntimeDto } from "@pi-agent-web/protocol";
 import { describe, expect, it } from "vitest";
 import { sessionDeleteCapability } from "../src/lib/session-capabilities";
-import type { SessionChannelState } from "../src/stores/session-transport";
+import { emptySessionHistoryState, type SessionChannelState } from "../src/stores/session-transport";
 
 function runtime(state: SessionRuntimeDto["state"] = "idle", recoverable = true): SessionRuntimeDto {
 	return {
@@ -49,6 +49,7 @@ function channel(value = runtime()): SessionChannelState {
 		pendingExtensionRequests: [],
 		resync: null,
 		recovery: null,
+		history: emptySessionHistoryState(),
 		rawEvents: [],
 	};
 }

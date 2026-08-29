@@ -14,6 +14,7 @@ import type { SessionFrameProductMode } from "./session-frame-bus";
 import { sessionTransport } from "./session-transport";
 
 const MAX_CACHED_SESSIONS = 3;
+const historicalBatchBySession = new Map<string, number>();
 
 interface ProjectionState {
 	projections: Record<string, ConversationProjection>;
@@ -33,6 +34,12 @@ interface ProjectionState {
 	) => void;
 	/** Rebuild the projection from a get_messages snapshot (reconnect/first load). */
 	rebuildFromMessages: (
+		sessionId: string,
+		messages: unknown[],
+		productMode?: SessionFrameProductMode,
+	) => void;
+	/** Prepend one complete, older history page without disturbing the live tail. */
+	prependHistoricalMessages: (
 		sessionId: string,
 		messages: unknown[],
 		productMode?: SessionFrameProductMode,
@@ -96,6 +103,7 @@ export const useProjectionStore = create<ProjectionState>()((set, get) => ({
 
 	rebuildFromMessages: (sessionId, messages, productMode) => {
 		const state = get();
+		historicalBatchBySession.delete(sessionId);
 		// A snapshot is applied only while the Session transport holds later
 		// frames behind a resync barrier, so it is authoritative even if the
 		// previous local projection appeared to be streaming.
@@ -104,8 +112,26 @@ export const useProjectionStore = create<ProjectionState>()((set, get) => ({
 		set(prune({ ...state, projections: { ...state.projections, [sessionId]: next }, order }));
 	},
 
+	prependHistoricalMessages: (sessionId, messages, productMode) => {
+		if (messages.length === 0) return;
+		const state = get();
+		const current = state.projections[sessionId] ?? createEmptyProjection(sessionId);
+		const older = rebuildProjectionFromMessages(sessionId, messages, productMode);
+		if (older.turns.length === 0) return;
+		const batch = (historicalBatchBySession.get(sessionId) ?? 0) + 1;
+		historicalBatchBySession.set(sessionId, batch);
+		const olderTurns = older.turns.map((turn) => remapHistoricalTurn(turn, sessionId, batch));
+		const next = {
+			...current,
+			turns: [...olderTurns, ...current.turns],
+		};
+		const order = touch(state.order, sessionId);
+		set(prune({ ...state, projections: { ...state.projections, [sessionId]: next }, order }));
+	},
+
 	applyAuthoritativeSnapshot: (sessionId, settledMessages, projectionEvents, productMode) => {
 		const state = get();
+		historicalBatchBySession.delete(sessionId);
 		let next = rebuildProjectionFromMessages(sessionId, settledMessages, productMode);
 		for (const event of projectionEvents) {
 			if (event.type === "extension_error") continue;
@@ -160,6 +186,7 @@ export const useProjectionStore = create<ProjectionState>()((set, get) => ({
 		const state = get();
 		const projections = { ...state.projections };
 		delete projections[sessionId];
+		historicalBatchBySession.delete(sessionId);
 		set({ ...state, projections, order: state.order.filter((id) => id !== sessionId) });
 	},
 
@@ -180,6 +207,33 @@ export function selectActiveTurnId(state: ProjectionState): string | null {
 	if (!state.currentSessionId) return null;
 	const projection = state.projections[state.currentSessionId];
 	return projection?.activeTurnId ?? null;
+}
+
+function remapHistoricalTurn(
+	turn: ConversationProjection["turns"][number],
+	sessionId: string,
+	batch: number,
+): ConversationProjection["turns"][number] {
+	const id = `history:${sessionId}:${String(batch)}:${turn.id}`;
+	return {
+		...turn,
+		id,
+		userMessages: turn.userMessages.map((message, index) => ({
+			...message,
+			entryKey: `${id}:u${String(index)}`,
+		})),
+		steps: turn.steps.map((step, stepIndex) => {
+			const key = `${id}:${String(stepIndex)}`;
+			return {
+				...step,
+				key,
+				blocks: step.blocks.map((block, blockIndex) => ({
+					...block,
+					key: `${key}:${String(blockIndex)}`,
+				})),
+			};
+		}),
+	};
 }
 
 /**

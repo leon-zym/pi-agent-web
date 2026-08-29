@@ -15,7 +15,11 @@ import {
 	renameSession,
 } from "../src/lib/session-controller";
 import { selectCurrentWorkspaceSessions, useSessionDirectoryStore } from "../src/stores/session-directory";
-import { type SessionChannelState, sessionTransport } from "../src/stores/session-transport";
+import {
+	emptySessionHistoryState,
+	type SessionChannelState,
+	sessionTransport,
+} from "../src/stores/session-transport";
 
 const originalTransport = sessionTransport.store.getState();
 const originalDirectory = useSessionDirectoryStore.getState();
@@ -67,6 +71,7 @@ function manualOnlyChannel(
 		lease: { isController: false },
 		pendingExtensionRequests: [],
 		resync: null,
+		history: emptySessionHistoryState(),
 		recovery: {
 			identity: {
 				serverEpoch: "test-server-epoch",
@@ -1046,6 +1051,7 @@ describe("Session-scoped controls", () => {
 					lease: { isController: true, fencingToken: "fence-a" },
 					pendingExtensionRequests: [],
 					resync: null,
+					history: emptySessionHistoryState(),
 					rawEvents: [],
 				},
 			},
@@ -1085,6 +1091,7 @@ describe("Session-scoped controls", () => {
 					lease: { isController: true, fencingToken: "fence-crashed" },
 					pendingExtensionRequests: [],
 					resync: null,
+					history: emptySessionHistoryState(),
 					rawEvents: [],
 				},
 			},

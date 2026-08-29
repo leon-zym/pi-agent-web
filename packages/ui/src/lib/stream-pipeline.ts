@@ -140,6 +140,20 @@ function routeSessionFrame(
 			void refreshSessionMetadata(message.sessionHandle);
 			scheduleHiddenLifecycleAfterSnapshot(message.runtime);
 			return;
+		case "session_snapshot_begin":
+		case "session_snapshot_chunk":
+		case "session_snapshot_end":
+		case "session_history_page_begin":
+		case "session_history_page_chunk":
+		case "session_history_page_end":
+			// The transport assembles these frames and emits one atomic product snapshot/page.
+			return;
+		case "session_history_page_loaded":
+			projectionEventScheduler.flushSession(message.sessionHandle, message.generation);
+			useProjectionStore
+				.getState()
+				.prependHistoricalMessages(message.sessionHandle, message.messages, productMode);
+			return;
 		case "session_rekeyed":
 			projectionEventScheduler.discardSession(message.previousSessionHandle);
 			projectionEventScheduler.discardSession(message.runtime.sessionHandle);

@@ -6,7 +6,7 @@ import { useComposerStore } from "../src/stores/composer";
 import { useExtensionUiStore } from "../src/stores/extension-ui";
 import { useProjectionStore } from "../src/stores/projection";
 import { reconcileHiddenSessionLifecycle, useSessionDirectoryStore } from "../src/stores/session-directory";
-import { sessionTransport } from "../src/stores/session-transport";
+import { emptySessionHistoryState, sessionTransport } from "../src/stores/session-transport";
 
 const originalComposer = useComposerStore.getState();
 const originalDirectory = useSessionDirectoryStore.getState();
@@ -61,6 +61,7 @@ function controlledTransient(sessionHandle: string) {
 		lease: { isController: true, fencingToken: "fence-transient" },
 		pendingExtensionRequests: [],
 		resync: null,
+		history: emptySessionHistoryState(),
 		rawEvents: [],
 	};
 }

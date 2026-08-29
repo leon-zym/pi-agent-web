@@ -7,6 +7,7 @@ import {
 	type FutureSessionSnapshotDto,
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+	GATEWAY_SESSION_HISTORY_CAPABILITY,
 	type GatewayClientHelloDto,
 	type GatewayProtocolErrorDto,
 	type GatewayServerHelloDto,
@@ -16,11 +17,20 @@ import {
 	SESSION_WS_CLIENT_MAX_BYTES,
 	SESSION_WS_SERVER_MAX_BYTES,
 	type SessionCommandResponseDto,
+	type SessionHistoryPageBeginDto,
+	type SessionHistoryPageChunkDto,
+	type SessionHistoryPageEndDto,
+	type SessionMessageDto,
 	type SessionReplayFrameDto,
 	type SessionRuntimeDto,
+	type SessionSnapshotBeginDto,
+	type SessionSnapshotChunkDto,
 	type SessionSnapshotDto,
+	type SessionSnapshotEndDto,
 	type SessionWsClientMessage,
 	type SessionWsServerMessage,
+	sessionHistoryChecksum,
+	sessionHistoryMessagesBytes,
 } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -494,6 +504,140 @@ function completeWithSnapshot(
 	} satisfies SessionSnapshotDto);
 }
 
+function historySnapshotFrames(
+	sessionHandle: string,
+	generation = 1,
+): [SessionSnapshotBeginDto, SessionSnapshotChunkDto, SessionSnapshotEndDto] {
+	const runtimeValue = runtime(sessionHandle, generation, 0);
+	const messages: SessionMessageDto[] = [{ role: "user", content: "newest", timestamp: 1 }];
+	const chunkChecksum = sessionHistoryChecksum(messages);
+	const loadedBytes = sessionHistoryMessagesBytes(messages);
+	const nextCursor = "cursor-older";
+	return [
+		{
+			type: "session_snapshot_begin",
+			snapshotId: "history-snapshot",
+			serverEpoch: runtimeValue.serverEpoch,
+			workspaceId: runtimeValue.workspaceId,
+			sessionHandle,
+			generation,
+			baseSeq: 0,
+			asOfSeq: 0,
+			runtime: runtimeValue,
+			projectionEvents: [],
+			queue: { steering: [], followUp: [] },
+			pendingExtensionRequests: [],
+			stickyExtensionState: [],
+			history: {
+				totalMessages: 2,
+				loadedMessages: messages.length,
+				loadedBytes,
+				totalBytes: loadedBytes + 32,
+				nextCursor,
+			},
+		},
+		{
+			type: "session_snapshot_chunk",
+			serverEpoch: runtimeValue.serverEpoch,
+			workspaceId: runtimeValue.workspaceId,
+			sessionHandle,
+			generation,
+			snapshotId: "history-snapshot",
+			chunkIndex: 0,
+			messages,
+			itemCount: messages.length,
+			byteCount: loadedBytes,
+			checksum: chunkChecksum,
+		},
+		{
+			type: "session_snapshot_end",
+			serverEpoch: runtimeValue.serverEpoch,
+			workspaceId: runtimeValue.workspaceId,
+			sessionHandle,
+			generation,
+			snapshotId: "history-snapshot",
+			chunkCount: 1,
+			itemCount: messages.length,
+			byteCount: loadedBytes,
+			checksum: sessionHistoryChecksum([chunkChecksum]),
+			nextCursor,
+		},
+	];
+}
+
+function historyPageFrames(
+	sessionHandle: string,
+	requestId: string,
+	generation = 1,
+): [SessionHistoryPageBeginDto, SessionHistoryPageChunkDto, SessionHistoryPageEndDto] {
+	const runtimeValue = runtime(sessionHandle, generation, 0);
+	const messages: SessionMessageDto[] = [{ role: "user", content: "older", timestamp: 0 }];
+	const chunkChecksum = sessionHistoryChecksum(messages);
+	const loadedBytes = sessionHistoryMessagesBytes(messages);
+	return [
+		{
+			type: "session_history_page_begin",
+			serverEpoch: runtimeValue.serverEpoch,
+			workspaceId: runtimeValue.workspaceId,
+			sessionHandle,
+			generation,
+			requestId,
+			snapshotId: "history-snapshot",
+			asOfSeq: 0,
+			cursor: "cursor-older",
+			history: {
+				totalMessages: 2,
+				loadedMessages: messages.length,
+				loadedBytes,
+				totalBytes: loadedBytes + 32,
+				nextCursor: null,
+			},
+		},
+		{
+			type: "session_history_page_chunk",
+			serverEpoch: runtimeValue.serverEpoch,
+			workspaceId: runtimeValue.workspaceId,
+			sessionHandle,
+			generation,
+			requestId,
+			snapshotId: "history-snapshot",
+			chunkIndex: 0,
+			messages,
+			itemCount: messages.length,
+			byteCount: loadedBytes,
+			checksum: chunkChecksum,
+		},
+		{
+			type: "session_history_page_end",
+			serverEpoch: runtimeValue.serverEpoch,
+			workspaceId: runtimeValue.workspaceId,
+			sessionHandle,
+			generation,
+			requestId,
+			snapshotId: "history-snapshot",
+			chunkCount: 1,
+			itemCount: messages.length,
+			byteCount: loadedBytes,
+			checksum: sessionHistoryChecksum([chunkChecksum]),
+			nextCursor: null,
+		},
+	];
+}
+
+function connectWithHistory(h: Harness): FakeSocket {
+	h.controller.store.getState().connect();
+	const socket = h.sockets[0];
+	if (!socket) throw new Error("transport did not create a socket");
+	socket.open(false);
+	socket.serverMessage(
+		serverHello({
+			capabilities: [...serverHello().capabilities, GATEWAY_SESSION_HISTORY_CAPABILITY],
+		}),
+	);
+	socket.serverMessage(hotInventory());
+	return socket;
+}
+
 function sentCommand(socket: FakeSocket, id: string) {
 	return socket.sent.find(
 		(message): message is Extract<SessionWsClientMessage, { type: "command" }> =>
@@ -526,6 +670,7 @@ describe("session transport Gateway negotiation", () => {
 				"session.multiplex",
 				GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+				GATEWAY_SESSION_HISTORY_CAPABILITY,
 			],
 			limits: { maxServerFrameBytes: SESSION_WS_SERVER_MAX_BYTES },
 		});
@@ -4204,6 +4349,157 @@ describe("future Session content transport", () => {
 		release();
 		await flushPromises();
 		expect(delivered).toEqual([]);
+	});
+});
+
+describe("chunked Session history transport", () => {
+	it("commits a chunked snapshot atomically and loads an older page through the same fence", () => {
+		const h = harness();
+		const socket = connectWithHistory(h);
+		const sessionHandle = "history-a";
+		h.controller.store.getState().subscribeSession(sessionHandle);
+		const runtimeValue = runtime(sessionHandle, 1, 0);
+		socket.serverMessage({ type: "runtime_state", runtime: runtimeValue });
+		socket.serverMessage({
+			type: "resync_required",
+			serverEpoch: runtimeValue.serverEpoch,
+			sessionHandle,
+			runtime: runtimeValue,
+			reason: "initial",
+		});
+		const [begin, chunk, end] = historySnapshotFrames(sessionHandle);
+		socket.serverMessage(begin);
+		socket.serverMessage(chunk);
+		socket.serverMessage(end);
+
+		expect(h.controller.store.getState().sessions[sessionHandle]).toMatchObject({
+			baselineAuthoritative: true,
+			history: {
+				snapshotId: "history-snapshot",
+				asOfSeq: 0,
+				loadedMessages: 1,
+				totalMessages: 2,
+				nextCursor: "cursor-older",
+				loading: false,
+			},
+		});
+
+		const loadedPages: SessionMessageDto[][] = [];
+		const unsubscribe = h.controller.frameBus.subscribe(sessionHandle, ({ message }) => {
+			if (message.type === "session_history_page_loaded") loadedPages.push(message.messages);
+		});
+		expect(h.controller.store.getState().loadOlderSessionHistory(sessionHandle)).toBe(true);
+		const request = socket.sent.find(
+			(message): message is Extract<SessionWsClientMessage, { type: "session_history_page" }> =>
+				message.type === "session_history_page",
+		);
+		expect(request).toBeDefined();
+		const page = historyPageFrames(sessionHandle, request?.id ?? "missing");
+		for (const frame of page) socket.serverMessage(frame);
+		unsubscribe();
+
+		expect(loadedPages).toEqual([[{ role: "user", content: "older", timestamp: 0 }]]);
+		expect(h.controller.store.getState().sessions[sessionHandle]?.history).toMatchObject({
+			loadedMessages: 2,
+			nextCursor: null,
+			loading: false,
+			error: null,
+		});
+	});
+
+	it("fails closed when a snapshot chunk is reordered without publishing a partial baseline", () => {
+		const h = harness();
+		const socket = connectWithHistory(h);
+		const sessionHandle = "history-reordered";
+		h.controller.store.getState().subscribeSession(sessionHandle);
+		const runtimeValue = runtime(sessionHandle, 1, 0);
+		socket.serverMessage({ type: "runtime_state", runtime: runtimeValue });
+		socket.serverMessage({
+			type: "resync_required",
+			serverEpoch: runtimeValue.serverEpoch,
+			sessionHandle,
+			runtime: runtimeValue,
+			reason: "initial",
+		});
+		const [begin, chunk] = historySnapshotFrames(sessionHandle);
+		socket.serverMessage(begin);
+		socket.serverMessage({ ...chunk, chunkIndex: 1 });
+
+		expect(h.controller.store.getState().sessions[sessionHandle]).toMatchObject({
+			baselineAuthoritative: false,
+			history: { snapshotId: "history-snapshot", loading: false, error: expect.any(String) },
+		});
+		expect(h.controller.store.getState().sessions[sessionHandle]?.resync).not.toBeNull();
+	});
+
+	it("cancels an in-flight older page and ignores its late frames", () => {
+		const h = harness();
+		const socket = connectWithHistory(h);
+		const sessionHandle = "history-cancel";
+		h.controller.store.getState().subscribeSession(sessionHandle);
+		const runtimeValue = runtime(sessionHandle, 1, 0);
+		socket.serverMessage({ type: "runtime_state", runtime: runtimeValue });
+		socket.serverMessage({
+			type: "resync_required",
+			serverEpoch: runtimeValue.serverEpoch,
+			sessionHandle,
+			runtime: runtimeValue,
+			reason: "initial",
+		});
+		for (const frame of historySnapshotFrames(sessionHandle)) socket.serverMessage(frame);
+		expect(h.controller.store.getState().loadOlderSessionHistory(sessionHandle)).toBe(true);
+		const request = socket.sent.find(
+			(message): message is Extract<SessionWsClientMessage, { type: "session_history_page" }> =>
+				message.type === "session_history_page",
+		);
+		expect(request).toBeDefined();
+		expect(h.controller.store.getState().cancelSessionHistory(sessionHandle)).toBe(true);
+		expect(socket.sent).toContainEqual({
+			type: "session_history_cancel",
+			id: request?.id,
+			sessionHandle,
+			expectedGeneration: 1,
+			snapshotId: "history-snapshot",
+		});
+
+		for (const frame of historyPageFrames(sessionHandle, request?.id ?? "missing"))
+			socket.serverMessage(frame);
+		expect(h.controller.store.getState().sessions[sessionHandle]?.history).toMatchObject({
+			loadedMessages: 1,
+			nextCursor: "cursor-older",
+			loading: false,
+		});
+	});
+
+	it("fails a page whose begin frame crosses the snapshot identity fence", () => {
+		const h = harness();
+		const socket = connectWithHistory(h);
+		const sessionHandle = "history-page-fence";
+		h.controller.store.getState().subscribeSession(sessionHandle);
+		const runtimeValue = runtime(sessionHandle, 1, 0);
+		socket.serverMessage({ type: "runtime_state", runtime: runtimeValue });
+		socket.serverMessage({
+			type: "resync_required",
+			serverEpoch: runtimeValue.serverEpoch,
+			sessionHandle,
+			runtime: runtimeValue,
+			reason: "initial",
+		});
+		for (const frame of historySnapshotFrames(sessionHandle)) socket.serverMessage(frame);
+		expect(h.controller.store.getState().loadOlderSessionHistory(sessionHandle)).toBe(true);
+		const request = socket.sent.find(
+			(message): message is Extract<SessionWsClientMessage, { type: "session_history_page" }> =>
+				message.type === "session_history_page",
+		);
+		if (!request) throw new Error("history page request was not sent");
+
+		const [begin] = historyPageFrames(sessionHandle, request.id);
+		socket.serverMessage({ ...begin, snapshotId: "foreign-snapshot" });
+
+		expect(h.controller.store.getState().sessions[sessionHandle]?.history).toMatchObject({
+			loading: false,
+			error: expect.any(String),
+		});
 	});
 });
 
