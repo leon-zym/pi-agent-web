@@ -142,6 +142,18 @@ describe("runtime schema boundary", () => {
 				unexpected: true,
 			}),
 		).toBe(false);
+		expect(
+			PI_WIRE_RUNTIME_SCHEMA_REGISTRY.get("response")?.check({
+				type: "response",
+				command: "get_state",
+				success: false,
+				error: "failed",
+				admissionError: { code: "gateway_only" },
+			}),
+		).toBe(false);
+		expect(PI_WIRE_RUNTIME_SCHEMA_REGISTRY.get("response")?.shape).not.toBe(
+			PRODUCT_RUNTIME_SCHEMAS.response.shape,
+		);
 		expect(PRODUCT_BOUNDARY_SHAPES.event).toMatchObject({ type: "object" });
 	});
 });

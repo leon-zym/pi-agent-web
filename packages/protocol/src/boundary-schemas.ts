@@ -107,6 +107,35 @@ export const PRODUCT_BOUNDARY_SHAPES = Object.freeze({
 	),
 });
 
+/** Pi-owned envelopes intentionally exclude Gateway-only admission metadata. */
+const PI_WIRE_BOUNDARY_SHAPES = Object.freeze({
+	response: TypeObject(
+		{
+			type: Literal("response"),
+			id: Optional(IDENTIFIER),
+			command: TypeString({ minLength: 1, maxLength: 64 }),
+			success: TypeBoolean(),
+			data: Optional(Unknown()),
+			error: Optional(TypeString({ maxLength: 1_048_576 })),
+		},
+		{ additionalProperties: false },
+	),
+	event: TypeObject(
+		{
+			type: FRAME_TYPE,
+		},
+		{ additionalProperties: true },
+	),
+	extensionUiRequest: TypeObject(
+		{
+			type: Literal("extension_ui_request"),
+			id: IDENTIFIER,
+			method: FRAME_TYPE,
+		},
+		{ additionalProperties: true },
+	),
+});
+
 /** Static types are intentionally limited to envelope shape, not product DTO semantics. */
 export type ProductBoundaryShapeMap = {
 	[K in keyof typeof PRODUCT_BOUNDARY_SHAPES]: Static<(typeof PRODUCT_BOUNDARY_SHAPES)[K]>;
@@ -133,11 +162,11 @@ export const PRODUCT_RUNTIME_SCHEMA_REGISTRY = createRuntimeSchemaRegistry(PRODU
 
 /** Generic upstream-frame envelopes. Their nested data remains owned by each adapter. */
 export const PI_WIRE_RUNTIME_SCHEMAS = Object.freeze({
-	response: recordSchema("pi-wire.response-envelope", PRODUCT_BOUNDARY_SHAPES.response),
-	event: recordSchema("pi-wire.event-envelope", PRODUCT_BOUNDARY_SHAPES.event),
+	response: recordSchema("pi-wire.response-envelope", PI_WIRE_BOUNDARY_SHAPES.response),
+	event: recordSchema("pi-wire.event-envelope", PI_WIRE_BOUNDARY_SHAPES.event),
 	extensionUiRequest: recordSchema(
 		"pi-wire.extension-ui-request-envelope",
-		PRODUCT_BOUNDARY_SHAPES.extensionUiRequest,
+		PI_WIRE_BOUNDARY_SHAPES.extensionUiRequest,
 	),
 });
 
