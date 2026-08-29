@@ -151,6 +151,8 @@ interface BridgeTestLimits {
 	maxConnections?: number;
 	maxSubscribedChannels?: number;
 	maxConcurrentCatchUps?: number;
+	maxSubscriptionAliases?: number;
+	maxPendingCommandResponseBytes?: number;
 }
 
 function temporaryRoot(): string {
@@ -578,6 +580,8 @@ describe("SessionWsBridge", () => {
 		);
 
 		expect(error.error).toBe("session_subscription_capacity");
+		expect(error.code).toBe("session_subscription_capacity");
+		expect(error.retryable).toBe(true);
 		const { connection } = bridgeConnection(harness.bridge);
 		expect((connection as { subscriptions: Set<string> }).subscriptions).toEqual(
 			new Set([first.sessionHandle]),
@@ -619,6 +623,8 @@ describe("SessionWsBridge", () => {
 			rejectedMark,
 		);
 		expect(rejected.error).toBe("session_catchup_capacity");
+		expect(rejected.code).toBe("session_catchup_capacity");
+		expect(rejected.retryable).toBe(true);
 
 		release?.();
 		await client.waitForFrame(
@@ -626,6 +632,102 @@ describe("SessionWsBridge", () => {
 				frame.type === "lease_status" && frame.sessionHandle === first.sessionHandle,
 		);
 		await subscribe(client, second.sessionHandle);
+	});
+
+	it("bounds historical subscription aliases while retaining the current canonical handle", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "alias-capacity");
+		const harness = await createHarness([target], { bridge: { maxSubscriptionAliases: 2 } });
+		const client = await openClient(harness);
+		const initial = await subscribe(client, target.sessionHandle);
+		const firstChild = `${target.sessionHandle}-child-1`;
+		const secondChild = `${target.sessionHandle}-child-2`;
+		const rekey = (previousSessionHandle: string, sessionHandle: string): void => {
+			harness.bridge.broadcast({
+				type: "session_rekeyed",
+				previousSessionHandle,
+				runtime: { ...initial.runtime, sessionHandle },
+			} as Parameters<SessionWsBridge["broadcast"]>[0]);
+		};
+
+		rekey(target.sessionHandle, firstChild);
+		rekey(firstChild, secondChild);
+
+		const { connection } = bridgeConnection(harness.bridge);
+		const state = connection as {
+			subscriptions: Set<string>;
+			subscriptionAliases: Map<string, string>;
+		};
+		expect(state.subscriptions).toEqual(new Set([secondChild]));
+		expect(state.subscriptionAliases.size).toBeLessThanOrEqual(2);
+		expect(state.subscriptionAliases.get(secondChild)).toBe(secondChild);
+	});
+
+	it("rejects commands whose weighted pending responses exceed the connection budget", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "pending-response-capacity");
+		const harness = await createHarness([target], {
+			bridge: { maxPendingCommandResponseBytes: 128 * 1024 },
+		});
+		const client = await openClient(harness);
+		const subscription = await subscribe(client, target.sessionHandle);
+		const originalSendCommand = harness.supervisor.sendCommand.bind(harness.supervisor);
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		harness.supervisor.sendCommand = async (...args) => {
+			await gate;
+			return originalSendCommand(...args);
+		};
+
+		for (const id of ["pending-1", "pending-2"]) {
+			client.send({
+				type: "command",
+				sessionHandle: target.sessionHandle,
+				expectedGeneration: subscription.runtime.generation,
+				command: { type: "get_state", id },
+			});
+		}
+		const mark = client.mark();
+		client.send({
+			type: "command",
+			sessionHandle: target.sessionHandle,
+			expectedGeneration: subscription.runtime.generation,
+			command: { type: "get_state", id: "pending-3" },
+		});
+		const rejected = await client.waitForFrame(
+			(frame): frame is ResponseFrame => frame.type === "response" && frame.response.id === "pending-3",
+			mark,
+		);
+		expect(rejected.response).toMatchObject({
+			success: false,
+			error: "pending_command_response_capacity",
+		});
+
+		release?.();
+		await client.waitForFrame(
+			(frame): frame is ResponseFrame => frame.type === "response" && frame.response.id === "pending-2",
+		);
+		const largeMark = client.mark();
+		client.send({
+			type: "command",
+			sessionHandle: target.sessionHandle,
+			expectedGeneration: subscription.runtime.generation,
+			command: { type: "get_tree", id: "pending-large" },
+		});
+		const largeRejected = await client.waitForFrame(
+			(frame): frame is ResponseFrame => frame.type === "response" && frame.response.id === "pending-large",
+			largeMark,
+		);
+		expect(largeRejected.response).toMatchObject({
+			success: false,
+			error: "pending_command_response_capacity",
+		});
 	});
 
 	it("sends hello then the initial full hot inventory only after capability negotiation", async () => {
