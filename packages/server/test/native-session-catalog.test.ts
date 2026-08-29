@@ -507,6 +507,9 @@ describe("NativeSessionCatalog", () => {
 		);
 		expect((await catalog.refresh({ force: true })).sessions[0]?.messageCount).toBe(3);
 		expect(createReadStream).toHaveBeenCalledTimes(3);
+		const appendOptions = createReadStream.mock.calls[2]?.[1] as { start?: number } | undefined;
+		if (!appendOptions) throw new Error("incremental scan did not open a stream");
+		expect(appendOptions.start).toBeGreaterThan(0);
 	});
 
 	it("rebuilds a cached file after truncation or inode replacement", async () => {
@@ -547,6 +550,78 @@ describe("NativeSessionCatalog", () => {
 		expect(createReadStream).toHaveBeenCalledTimes(3);
 	});
 
+	it("rebuilds after same-inode truncation and regrowth despite an unchanged Header", async () => {
+		const root = temporaryDirectory();
+		const resolver = createResolver(root);
+		const workspace = path.join(root, "workspace");
+		fs.mkdirSync(workspace);
+		const sessionDirectory = resolver.defaultSessionDirForWorkspace(workspace);
+		const file = writeSession(sessionDirectory, "one.jsonl", { id: "one", cwd: workspace });
+		const catalog = new NativeSessionCatalog({ layoutResolver: resolver, cacheTtlMs: 0 });
+
+		expect((await catalog.refresh({ force: true })).sessions[0]).toMatchObject({
+			nativeSessionId: "one",
+			messageCount: 2,
+		});
+		const replacement = [
+			JSON.stringify({
+				type: "session",
+				version: 3,
+				id: "one",
+				timestamp: "2026-01-01T00:00:00.000Z",
+				cwd: workspace,
+			}),
+			JSON.stringify({
+				type: "message",
+				timestamp: "2026-01-03T00:00:00.000Z",
+				message: {
+					role: "user",
+					content: "replacement ".repeat(20_000),
+					timestamp: Date.parse("2026-01-03T00:00:00.000Z"),
+				},
+			}),
+		].join("\n");
+		expect(Buffer.byteLength(replacement)).toBeGreaterThan(fs.statSync(file).size);
+		fs.writeFileSync(file, `${replacement}\n`);
+
+		expect((await catalog.refresh({ force: true })).sessions[0]).toMatchObject({
+			nativeSessionId: "one",
+			messageCount: 1,
+			firstMessage: expect.stringContaining("replacement"),
+		});
+	});
+
+	it("retries a scan against a fixed descriptor when a symlink target changes mid-read", async () => {
+		const root = temporaryDirectory();
+		const workspace = path.join(root, "workspace");
+		const targets = path.join(root, "targets");
+		const sessionDirectory = path.join(root, "sessions");
+		fs.mkdirSync(workspace);
+		const targetA = writeSession(targets, "a.jsonl", { id: "a", cwd: workspace });
+		const targetB = writeSession(targets, "b.jsonl", { id: "b", cwd: workspace });
+		fs.mkdirSync(sessionDirectory);
+		const link = path.join(sessionDirectory, "linked.jsonl");
+		fs.symlinkSync(targetA, link);
+		const originalCreateReadStream = fs.createReadStream.bind(fs);
+		let replaced = false;
+		const createReadStream = vi.spyOn(fs, "createReadStream");
+		createReadStream.mockImplementation(((filePath, options) => {
+			if (!replaced && filePath === link) {
+				replaced = true;
+				fs.unlinkSync(link);
+				fs.symlinkSync(targetB, link);
+			}
+			return originalCreateReadStream(filePath, options);
+		}) as typeof fs.createReadStream);
+		const catalog = new NativeSessionCatalog({
+			layoutResolver: createResolver(root, { PI_CODING_AGENT_SESSION_DIR: sessionDirectory }),
+			cacheTtlMs: 0,
+		});
+
+		expect((await catalog.refresh({ force: true })).sessions[0]).toMatchObject({ nativeSessionId: "b" });
+		expect(createReadStream.mock.calls.length).toBeGreaterThanOrEqual(2);
+	});
+
 	it("invalidates a directory cache when a symlink changes its canonical target", async () => {
 		const root = temporaryDirectory();
 		const resolver = createResolver(root);
@@ -585,7 +660,7 @@ describe("NativeSessionCatalog", () => {
 		});
 		const originalCreateReadStream = fs.createReadStream.bind(fs);
 		const createReadStream = vi.spyOn(fs, "createReadStream");
-		createReadStream.mockImplementationOnce((filePath, options) => {
+		createReadStream.mockImplementationOnce((_filePath, _options) => {
 			const stream = new PassThrough();
 			const error = Object.assign(new Error("temporary read failure"), { code: "EIO" });
 			process.nextTick(() => stream.destroy(error));
@@ -594,12 +669,67 @@ describe("NativeSessionCatalog", () => {
 		createReadStream.mockImplementation((filePath, options) => originalCreateReadStream(filePath, options));
 		const catalog = new NativeSessionCatalog({ layoutResolver: resolver, cacheTtlMs: 0 });
 
-		expect((await catalog.refresh({ force: true })).sessions).toEqual([]);
+		const first = await catalog.refresh({ force: true });
+		expect(first.sessions).toEqual([]);
+		expect(first.diagnostics).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					code: "discovery_retryable",
+					path: expect.stringContaining("one.jsonl"),
+					retryable: true,
+					partial: true,
+					stale: false,
+				}),
+			]),
+		);
 		expect((await catalog.refresh({ force: true })).sessions[0]).toMatchObject({
 			nativeSessionId: "one",
 			messageCount: 2,
 		});
 		expect(createReadStream).toHaveBeenCalledTimes(2);
+	});
+
+	it("keeps a stale file summary visible and retries it after a transient refresh failure", async () => {
+		const root = temporaryDirectory();
+		const resolver = createResolver(root);
+		const workspace = path.join(root, "workspace");
+		fs.mkdirSync(workspace);
+		const sessionDirectory = resolver.defaultSessionDirForWorkspace(workspace);
+		const file = writeSession(sessionDirectory, "one.jsonl", { id: "one", cwd: workspace });
+		const createReadStream = vi.spyOn(fs, "createReadStream");
+		const catalog = new NativeSessionCatalog({ layoutResolver: resolver, cacheTtlMs: 0 });
+
+		expect((await catalog.refresh({ force: true })).sessions[0]?.messageCount).toBe(2);
+		fs.appendFileSync(
+			file,
+			`${JSON.stringify({
+				type: "message",
+				timestamp: "2026-01-03T00:00:00.000Z",
+				message: { role: "user", content: "follow up", timestamp: Date.parse("2026-01-03T00:00:00.000Z") },
+			})}\n`,
+		);
+		createReadStream.mockImplementationOnce((_filePath, _options) => {
+			const stream = new PassThrough();
+			const error = Object.assign(new Error("temporary read failure"), { code: "EIO" });
+			process.nextTick(() => stream.destroy(error));
+			return stream as unknown as fs.ReadStream;
+		});
+
+		const stale = await catalog.refresh({ force: true });
+		expect(stale.sessions[0]?.messageCount).toBe(2);
+		expect(stale.diagnostics).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					code: "discovery_retryable",
+					path: expect.stringContaining("one.jsonl"),
+					retryable: true,
+					partial: true,
+					stale: true,
+				}),
+			]),
+		);
+
+		expect((await catalog.refresh({ force: true })).sessions[0]?.messageCount).toBe(3);
 	});
 
 	it("evicts cached directories that disappear from the current discovery plan", async () => {
@@ -677,6 +807,93 @@ describe("NativeSessionCatalog", () => {
 		releaseWorkers?.();
 		expect((await refresh).sessions).toHaveLength(fileCount);
 		expect(maximumActive).toBeLessThanOrEqual(NATIVE_SESSION_FILE_SCAN_CONCURRENCY);
+	});
+
+	it("retains the last complete directory view when the discovery page budget is exhausted", async () => {
+		const root = temporaryDirectory();
+		const workspace = path.join(root, "workspace");
+		const sessionDir = path.join(root, "sessions");
+		fs.mkdirSync(workspace);
+		writeSession(sessionDir, "one.jsonl", { id: "one", cwd: workspace });
+		const catalog = new NativeSessionCatalog({
+			layoutResolver: createResolver(root, { PI_CODING_AGENT_SESSION_DIR: sessionDir }),
+			cacheTtlMs: 0,
+			maxDiscoveryPages: 3,
+		});
+
+		expect(
+			(await catalog.refresh({ force: true })).sessions.map((session) => session.nativeSessionId),
+		).toEqual(["one"]);
+		writeSession(sessionDir, "two.jsonl", { id: "two", cwd: workspace });
+
+		const partial = await catalog.refresh({ force: true });
+		expect(partial.sessions.map((session) => session.nativeSessionId)).toContain("one");
+		expect(partial.diagnostics).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					code: "discovery_pages_exhausted",
+					partial: true,
+					stale: true,
+				}),
+			]),
+		);
+	});
+
+	it("bounds total discovery bytes and reports a partial result", async () => {
+		const root = temporaryDirectory();
+		const workspace = path.join(root, "workspace");
+		const sessionDir = path.join(root, "sessions");
+		fs.mkdirSync(workspace);
+		writeSession(sessionDir, "large.jsonl", { id: "large", cwd: workspace });
+
+		const snapshot = await new NativeSessionCatalog({
+			layoutResolver: createResolver(root, { PI_CODING_AGENT_SESSION_DIR: sessionDir }),
+			maxDiscoveryBytes: 1,
+		}).refresh({ force: true });
+
+		expect(snapshot.sessions).toEqual([]);
+		expect(snapshot.diagnostics).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ code: "discovery_bytes_exhausted", partial: true, stale: false }),
+			]),
+		);
+	});
+
+	it("returns stale history for timeout and cancellation instead of failing the catalog refresh", async () => {
+		const root = temporaryDirectory();
+		const workspace = path.join(root, "workspace");
+		const sessionDir = path.join(root, "sessions");
+		fs.mkdirSync(workspace);
+		writeSession(sessionDir, "one.jsonl", { id: "one", cwd: workspace });
+		const catalog = new NativeSessionCatalog({
+			layoutResolver: createResolver(root, { PI_CODING_AGENT_SESSION_DIR: sessionDir }),
+			cacheTtlMs: 0,
+		});
+		const initial = await catalog.refresh({ force: true });
+
+		const timeoutCatalog = new NativeSessionCatalog({
+			layoutResolver: createResolver(root, { PI_CODING_AGENT_SESSION_DIR: sessionDir }),
+			maxDiscoveryTimeMs: 0,
+		});
+		const timedOut = await timeoutCatalog.refresh({ force: true });
+		expect(timedOut.sessions).toEqual([]);
+		expect(timedOut.diagnostics).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ code: "discovery_time_exhausted", partial: true, stale: false }),
+			]),
+		);
+
+		const controller = new AbortController();
+		controller.abort();
+		const cancelled = await catalog.refresh({ force: true, signal: controller.signal });
+		expect(cancelled.sessions.map((session) => session.nativeSessionId)).toEqual(
+			initial.sessions.map((session) => session.nativeSessionId),
+		);
+		expect(cancelled.diagnostics).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ code: "discovery_cancelled", partial: true, stale: true }),
+			]),
+		);
 	});
 });
 

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import {
@@ -14,11 +15,31 @@ const DIRECTORY_SUMMARY_CONCURRENCY = 2;
 const DIRECTORY_REVISION_CONCURRENCY = 16;
 const SESSION_SCAN_HIGH_WATER_MARK_BYTES = 64 * 1024;
 const SESSION_SCAN_MAX_LINE_BYTES = 16 * 1024 * 1024;
+const SESSION_SCAN_CHECKPOINT_BYTES = 64 * 1024;
+const DEFAULT_DISCOVERY_MAX_BYTES = 128 * 1024 * 1024;
+const DEFAULT_DISCOVERY_MAX_PAGES = 4_096;
+const DEFAULT_DISCOVERY_MAX_TIME_MS = 5_000;
+const MAX_DISCOVERY_BYTES = 512 * 1024 * 1024;
+const MAX_DISCOVERY_PAGES = 100_000;
+const MAX_DISCOVERY_TIME_MS = 60_000;
 
 /** The sidebar preview is deliberately independent of the size of the first user message. */
 export const NATIVE_SESSION_FIRST_MESSAGE_MAX_CHARS = 160;
 /** A single catalog instance never parses more than this many session files at once. */
 export const NATIVE_SESSION_FILE_SCAN_CONCURRENCY = 8;
+
+export type NativeSessionCatalogDiagnosticCode =
+	| "discovery_bytes_exhausted"
+	| "discovery_pages_exhausted"
+	| "discovery_time_exhausted"
+	| "discovery_cancelled"
+	| "discovery_retryable";
+
+export interface NativeSessionDiscoveryLimits {
+	maxBytes: number;
+	maxPages: number;
+	maxTimeMs: number;
+}
 
 export type WorkspaceUnavailableReason = "cwd-empty" | "missing" | "not-directory" | "unreadable";
 
@@ -52,6 +73,10 @@ export interface NativeSessionCatalogDiagnostic {
 	source: "layout" | "preferences" | "filesystem";
 	message: string;
 	path?: string;
+	code?: NativeSessionCatalogDiagnosticCode;
+	partial?: boolean;
+	stale?: boolean;
+	retryable?: boolean;
 }
 
 export interface NativeSessionCatalogSnapshot {
@@ -61,6 +86,8 @@ export interface NativeSessionCatalogSnapshot {
 	workspaces: NativeWorkspaceRecord[];
 	diagnostics: NativeSessionCatalogDiagnostic[];
 	scannedSources: SessionDiscoverySource[];
+	partial?: boolean;
+	stale?: boolean;
 }
 
 export interface NativeSessionCatalogOptions {
@@ -69,6 +96,11 @@ export interface NativeSessionCatalogOptions {
 	knownWorkspacePaths?: Iterable<string> | (() => Iterable<string>);
 	cacheTtlMs?: number;
 	now?: () => number;
+	discoveryLimits?: Partial<NativeSessionDiscoveryLimits>;
+	/** Direct aliases are kept convenient for embedders and test fixtures. */
+	maxDiscoveryBytes?: number;
+	maxDiscoveryPages?: number;
+	maxDiscoveryTimeMs?: number;
 }
 
 export interface WorkspacePreferenceHints {
@@ -85,6 +117,12 @@ interface CachedDirectorySummary {
 
 interface CachedSessionFileSummary {
 	revision: string;
+	identity: string;
+	size: bigint;
+	scanOffset: bigint;
+	appendSafe: boolean;
+	appendCheckpoint?: NativeSessionAppendCheckpoint;
+	scanState?: NativeSessionScanState;
 	summary: NativeSessionSummary | null;
 }
 
@@ -119,7 +157,47 @@ interface NativeSessionScanState {
 interface NativeSessionScanResult {
 	summary: NativeSessionSummary | null;
 	retryable: boolean;
+	scanState?: NativeSessionScanState;
+	scanOffset?: bigint;
+	appendSafe?: boolean;
+	appendCheckpoint?: NativeSessionAppendCheckpoint;
+	budgetCode?: NativeSessionCatalogDiagnosticCode;
 }
+
+interface NativeSessionAppendCheckpoint {
+	prefix: string;
+	suffix: string;
+}
+
+interface NativeSessionAppendCheckpointParts {
+	prefix: Buffer;
+	suffix: Buffer;
+	checkpoint: NativeSessionAppendCheckpoint;
+}
+
+interface NativeSessionScanRetry {
+	retry: true;
+}
+
+interface NativeSessionFileMetadata {
+	revision: string;
+	identity: string;
+	size: bigint;
+	dev: bigint;
+	ino: bigint;
+	mtimeNs: bigint;
+	ctimeNs: bigint;
+}
+
+interface NativeSessionDiscoveryScan {
+	sessions: NativeSessionSummary[];
+	diagnostics: NativeSessionCatalogDiagnostic[];
+	coveredDirectories: Set<string>;
+	partial: boolean;
+	stale: boolean;
+}
+
+type DiscoveryBudgetCode = NativeSessionCatalogDiagnosticCode;
 
 export function canonicalizeSessionFile(sessionFile: string): string {
 	return canonicalizePathAllowMissing(sessionFile);
@@ -140,6 +218,7 @@ export class NativeSessionCatalog {
 	private readonly knownWorkspacePaths?: Iterable<string> | (() => Iterable<string>);
 	private readonly cacheTtlMs: number;
 	private readonly now: () => number;
+	private readonly discoveryLimits: NativeSessionDiscoveryLimits;
 	private snapshot: NativeSessionCatalogSnapshot | undefined;
 	private refreshPromise: Promise<NativeSessionCatalogSnapshot> | undefined;
 	private forcedRefreshPromise: Promise<NativeSessionCatalogSnapshot> | undefined;
@@ -149,7 +228,7 @@ export class NativeSessionCatalog {
 	private readonly directoryCache = new Map<string, CachedDirectorySummary>();
 	private readonly directoryScanLimiter = new AsyncLimiter(DIRECTORY_SUMMARY_CONCURRENCY);
 	private readonly sessionFileScanLimiter = new AsyncLimiter(NATIVE_SESSION_FILE_SCAN_CONCURRENCY);
-	private readonly directoryScans = new Map<string, Promise<NativeSessionSummary[]>>();
+	private readonly directoryScans = new Map<string, Promise<NativeSessionDiscoveryScan>>();
 
 	constructor(options: NativeSessionCatalogOptions) {
 		this.layoutResolver = options.layoutResolver;
@@ -157,13 +236,14 @@ export class NativeSessionCatalog {
 		this.knownWorkspacePaths = options.knownWorkspacePaths;
 		this.cacheTtlMs = Math.max(0, options.cacheTtlMs ?? 1_000);
 		this.now = options.now ?? Date.now;
+		this.discoveryLimits = normalizeDiscoveryLimits(options);
 	}
 
 	getSnapshot(): NativeSessionCatalogSnapshot | undefined {
 		return this.snapshot;
 	}
 
-	refresh(options: { force?: boolean } = {}): Promise<NativeSessionCatalogSnapshot> {
+	refresh(options: { force?: boolean; signal?: AbortSignal } = {}): Promise<NativeSessionCatalogSnapshot> {
 		const now = this.now();
 		if (!options.force && this.snapshot && now - this.snapshot.generatedAt < this.cacheTtlMs) {
 			return Promise.resolve(this.snapshot);
@@ -171,7 +251,7 @@ export class NativeSessionCatalog {
 		if (options.force) {
 			this.forcedRefreshRequested += 1;
 			if (!this.forcedRefreshPromise) {
-				const draining = this.drainForcedRefreshes();
+				const draining = this.drainForcedRefreshes(options.signal);
 				const forced = draining.finally(() => {
 					if (this.forcedRefreshPromise === forced) this.forcedRefreshPromise = undefined;
 				});
@@ -180,11 +260,11 @@ export class NativeSessionCatalog {
 			return this.forcedRefreshPromise;
 		}
 		if (this.forcedRefreshPromise) return this.forcedRefreshPromise;
-		return this.refreshPromise ?? this.startRefresh();
+		return this.refreshPromise ?? this.startRefresh(options.signal);
 	}
 
-	private startRefresh(): Promise<NativeSessionCatalogSnapshot> {
-		const refresh = this.discover()
+	private startRefresh(signal?: AbortSignal): Promise<NativeSessionCatalogSnapshot> {
+		const refresh = this.discover(signal)
 			.then((snapshot) => {
 				this.snapshot = snapshot;
 				return snapshot;
@@ -196,7 +276,7 @@ export class NativeSessionCatalog {
 		return refresh;
 	}
 
-	private async drainForcedRefreshes(): Promise<NativeSessionCatalogSnapshot> {
+	private async drainForcedRefreshes(signal?: AbortSignal): Promise<NativeSessionCatalogSnapshot> {
 		let latest = this.snapshot;
 		for (;;) {
 			const active = this.refreshPromise;
@@ -211,7 +291,7 @@ export class NativeSessionCatalog {
 			const coveredRequest = this.forcedRefreshRequested;
 			if (this.forcedRefreshCompleted >= coveredRequest && latest) return latest;
 			try {
-				latest = await this.startRefresh();
+				latest = await this.startRefresh(signal);
 				this.forcedRefreshCompleted = coveredRequest;
 			} catch (error) {
 				if (this.forcedRefreshRequested > coveredRequest) continue;
@@ -221,68 +301,110 @@ export class NativeSessionCatalog {
 		}
 	}
 
-	private async discover(): Promise<NativeSessionCatalogSnapshot> {
+	private async discover(signal?: AbortSignal): Promise<NativeSessionCatalogSnapshot> {
 		const diagnostics: NativeSessionCatalogDiagnostic[] = [];
+		const budget = new DiscoveryBudget(this.discoveryLimits, this.now, signal);
+		const previous = this.snapshot;
 		const knownWorkspaces = new Set(this.readKnownWorkspacePaths(diagnostics));
 		const infoByFile = new Map<string, NativeSessionSummary>();
 		const scannedSourceKeys = new Set<string>();
 		const scannedSources: SessionDiscoverySource[] = [];
 		const currentDirectoryCacheKeys = new Set<string>();
+		const coveredDirectories = new Set<string>();
+		let partial = false;
+		let stale = false;
 
-		for (;;) {
-			const plan = this.layoutResolver.discoveryPlan(knownWorkspaces);
-			for (const diagnostic of plan.diagnostics) {
-				diagnostics.push({
-					source: "layout",
-					message: `${diagnostic.scope} settings: ${diagnostic.message}`,
-					path: diagnostic.workspacePath,
+		try {
+			budget.check();
+			for (;;) {
+				budget.check();
+				const plan = this.layoutResolver.discoveryPlan(knownWorkspaces);
+				for (const diagnostic of plan.diagnostics) {
+					diagnostics.push({
+						source: "layout",
+						message: `${diagnostic.scope} settings: ${diagnostic.message}`,
+						path: diagnostic.workspacePath,
+					});
+				}
+
+				const pendingSources = plan.sources.filter((source) => {
+					const key = sourceKey(source);
+					if (scannedSourceKeys.has(key)) return false;
+					scannedSourceKeys.add(key);
+					return true;
 				});
-			}
+				if (pendingSources.length === 0) break;
 
-			const pendingSources = plan.sources.filter((source) => {
-				const key = sourceKey(source);
-				if (scannedSourceKeys.has(key)) return false;
-				scannedSourceKeys.add(key);
-				return true;
-			});
-			if (pendingSources.length === 0) break;
+				const batches = await mapWithConcurrency(
+					pendingSources,
+					DISCOVERY_SOURCE_CONCURRENCY,
+					async (source): Promise<NativeSessionDiscoveryScan> => {
+						try {
+							return await this.scanSource(source, currentDirectoryCacheKeys, budget);
+						} catch (error) {
+							if (isDiscoveryBudgetError(error)) {
+								return discoveryBudgetScan(error, source.path, Boolean(previous));
+							}
+							if (isMissing(error)) return emptyDiscoveryScan();
+							if (isRetryableNativeSessionScanError(error)) {
+								return retryableDiscoveryScan(source.path, Boolean(previous));
+							}
+							diagnostics.push({
+								source: "filesystem",
+								message: error instanceof Error ? error.message : String(error),
+								path: source.path,
+							});
+							return emptyDiscoveryScan();
+						}
+					},
+				);
+				scannedSources.push(...pendingSources);
 
-			const batches = await mapWithConcurrency(
-				pendingSources,
-				DISCOVERY_SOURCE_CONCURRENCY,
-				async (source) => {
-					try {
-						return await this.scanSource(source, currentDirectoryCacheKeys);
-					} catch (error) {
-						diagnostics.push({
-							source: "filesystem",
-							message: error instanceof Error ? error.message : String(error),
-							path: source.path,
-						});
-						return [];
-					}
-				},
-			);
-			scannedSources.push(...pendingSources);
-
-			let discoveredWorkspace = false;
-			for (const info of batches.flat()) {
-				const sessionFile = canonicalizeSessionFile(info.path);
-				if (!infoByFile.has(sessionFile)) infoByFile.set(sessionFile, info);
-				if (info.cwd) {
-					const workspacePath = canonicalizePathAllowMissing(info.cwd);
-					if (!knownWorkspaces.has(workspacePath)) {
-						knownWorkspaces.add(workspacePath);
-						discoveredWorkspace = true;
+				let discoveredWorkspace = false;
+				for (const batch of batches) {
+					diagnostics.push(...batch.diagnostics);
+					partial ||= batch.partial;
+					stale ||= batch.stale;
+					for (const directory of batch.coveredDirectories) coveredDirectories.add(directory);
+					for (const info of batch.sessions) {
+						const sessionFile = canonicalizeSessionFile(info.path);
+						if (!infoByFile.has(sessionFile)) infoByFile.set(sessionFile, info);
+						if (info.cwd) {
+							const workspacePath = canonicalizePathAllowMissing(info.cwd);
+							if (!knownWorkspaces.has(workspacePath)) {
+								knownWorkspaces.add(workspacePath);
+								discoveredWorkspace = true;
+							}
+						}
 					}
 				}
-			}
 
-			// All new source paths have been scanned and no new Header.cwd can reveal
-			// an additional project sessionDir.
-			if (!discoveredWorkspace) {
-				const followUpPlan = this.layoutResolver.discoveryPlan(knownWorkspaces);
-				if (followUpPlan.sources.every((source) => scannedSourceKeys.has(sourceKey(source)))) break;
+				if (budget.interrupted) {
+					partial = true;
+					break;
+				}
+
+				// All new source paths have been scanned and no new Header.cwd can reveal
+				// an additional project sessionDir.
+				if (!discoveredWorkspace) {
+					const followUpPlan = this.layoutResolver.discoveryPlan(knownWorkspaces);
+					if (followUpPlan.sources.every((source) => scannedSourceKeys.has(sourceKey(source)))) break;
+				}
+			}
+		} catch (error) {
+			if (!isDiscoveryBudgetError(error)) throw error;
+			partial = true;
+			stale ||= Boolean(previous);
+			diagnostics.push(discoveryBudgetDiagnostic(error, undefined, Boolean(previous)));
+		}
+
+		if (partial && previous) {
+			for (const previousSession of previous.sessions) {
+				const sessionFile = canonicalizeSessionFile(previousSession.sessionFile);
+				const directory = canonicalizePathAllowMissing(path.dirname(sessionFile));
+				if (coveredDirectories.has(directory) || infoByFile.has(sessionFile)) continue;
+				infoByFile.set(sessionFile, nativeSummaryFromRecord(previousSession));
+				stale = true;
 			}
 		}
 
@@ -301,6 +423,8 @@ export class NativeSessionCatalog {
 			workspaces,
 			diagnostics: dedupeDiagnostics(diagnostics),
 			scannedSources,
+			...(partial ? { partial: true } : {}),
+			...(stale ? { stale: true } : {}),
 		};
 	}
 
@@ -339,31 +463,27 @@ export class NativeSessionCatalog {
 	private async scanSource(
 		source: SessionDiscoverySource,
 		currentDirectoryCacheKeys: Set<string>,
-	): Promise<NativeSessionSummary[]> {
+		budget: DiscoveryBudget,
+	): Promise<NativeSessionDiscoveryScan> {
 		if (source.mode === "direct") {
-			return this.scanDirectDirectory(source.path, currentDirectoryCacheKeys);
+			return this.scanDirectDirectory(source.path, currentDirectoryCacheKeys, budget);
 		}
 
-		let entries: fs.Dirent[];
-		try {
-			entries = await fs.promises.readdir(source.path, { withFileTypes: true });
-		} catch (error) {
-			if (isMissing(error)) return [];
-			throw error;
-		}
+		const entries = await readDirectoryEntries(source.path, budget);
 		const directories = entries
 			.filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
 			.map((entry) => path.join(source.path, entry.name));
-		const sessions = await Promise.all(
-			directories.map((directory) => this.scanDirectDirectory(directory, currentDirectoryCacheKeys)),
+		const scans = await Promise.all(
+			directories.map((directory) => this.scanDirectDirectory(directory, currentDirectoryCacheKeys, budget)),
 		);
-		return sessions.flat();
+		return mergeDiscoveryScans(scans);
 	}
 
 	private scanDirectDirectory(
 		directory: string,
 		currentDirectoryCacheKeys: Set<string>,
-	): Promise<NativeSessionSummary[]> {
+		budget: DiscoveryBudget,
+	): Promise<NativeSessionDiscoveryScan> {
 		const cacheKey = canonicalizePathAllowMissing(directory);
 		currentDirectoryCacheKeys.add(cacheKey);
 		const activeScan = this.directoryScans.get(cacheKey);
@@ -371,21 +491,81 @@ export class NativeSessionCatalog {
 
 		const scan = this.directoryScanLimiter
 			.run(async () => {
-				const beforeRevision = await directoryRevision(directory);
 				const cached = this.directoryCache.get(cacheKey);
-				if (cached?.retryable !== true && cached?.revision === beforeRevision) return cached.sessions;
+				let beforeRevision: string;
+				try {
+					beforeRevision = await directoryRevision(directory, budget);
+				} catch (error) {
+					if (isDiscoveryBudgetError(error)) {
+						return discoveryBudgetScan(error, directory, Boolean(cached));
+					}
+					if (isMissing(error)) {
+						return {
+							sessions: [],
+							diagnostics: [],
+							coveredDirectories: new Set([cacheKey]),
+							partial: false,
+							stale: false,
+						};
+					}
+					if (isRetryableNativeSessionScanError(error)) {
+						return retryableDiscoveryScan(directory, Boolean(cached), cached?.sessions);
+					}
+					throw error;
+				}
+				if (cached?.retryable !== true && cached?.revision === beforeRevision) {
+					return {
+						sessions: cached.sessions,
+						diagnostics: [],
+						coveredDirectories: new Set([cacheKey]),
+						partial: false,
+						stale: false,
+					};
+				}
 
-				const scanned = await this.scanSessionDirectory(directory, cached?.files);
-				const afterRevision = await directoryRevision(directory);
+				const scanned = await this.scanSessionDirectory(directory, cached?.files, budget);
+				let afterRevision: string;
+				try {
+					afterRevision = await directoryRevision(directory, budget);
+				} catch (error) {
+					if (isDiscoveryBudgetError(error)) {
+						return {
+							...scanned,
+							diagnostics: [
+								...scanned.diagnostics,
+								discoveryBudgetDiagnostic(error, directory, Boolean(cached)),
+							],
+							partial: true,
+							stale: scanned.stale || Boolean(cached),
+							coveredDirectories: new Set<string>(),
+						};
+					}
+					if (isRetryableNativeSessionScanError(error)) {
+						return {
+							...scanned,
+							retryable: true,
+							diagnostics: [...scanned.diagnostics, retryableDiscoveryDiagnostic(directory, Boolean(cached))],
+							partial: true,
+							stale: scanned.stale || Boolean(cached),
+							coveredDirectories: new Set<string>(),
+						};
+					}
+					throw error;
+				}
 				if (beforeRevision === afterRevision) {
 					this.directoryCache.set(cacheKey, {
 						revision: afterRevision,
 						sessions: scanned.sessions,
 						files: scanned.files,
-						retryable: scanned.retryable,
+						// Partial/budgeted views are useful stale data, but must never
+						// become a cache hit that suppresses the next retry.
+						retryable: scanned.partial || scanned.retryable,
 					});
 				}
-				return scanned.sessions;
+				return {
+					...scanned,
+					coveredDirectories: scanned.partial ? new Set<string>() : new Set([cacheKey]),
+				};
 			})
 			.finally(() => {
 				if (this.directoryScans.get(cacheKey) === scan) this.directoryScans.delete(cacheKey);
@@ -396,17 +576,38 @@ export class NativeSessionCatalog {
 
 	private async scanSessionDirectory(
 		directory: string,
-		cachedFiles?: ReadonlyMap<string, CachedSessionFileSummary>,
+		cachedFiles: ReadonlyMap<string, CachedSessionFileSummary> | undefined,
+		budget: DiscoveryBudget,
 	): Promise<{
 		sessions: NativeSessionSummary[];
 		files: Map<string, CachedSessionFileSummary>;
 		retryable: boolean;
+		diagnostics: NativeSessionCatalogDiagnostic[];
+		coveredDirectories: Set<string>;
+		partial: boolean;
+		stale: boolean;
 	}> {
 		let entries: fs.Dirent[];
 		try {
-			entries = await fs.promises.readdir(directory, { withFileTypes: true });
+			entries = await readDirectoryEntries(directory, budget);
 		} catch (error) {
-			if (isMissing(error)) return { sessions: [], files: new Map(), retryable: true };
+			if (isMissing(error)) {
+				return {
+					sessions: [],
+					files: new Map(),
+					retryable: true,
+					diagnostics: [],
+					coveredDirectories: new Set<string>(),
+					partial: false,
+					stale: false,
+				};
+			}
+			if (isDiscoveryBudgetError(error)) {
+				return discoveryBudgetDirectoryScan(error, directory, cachedFiles);
+			}
+			if (isRetryableNativeSessionScanError(error)) {
+				return retryableDiscoveryDirectoryScan(directory, cachedFiles);
+			}
 			throw error;
 		}
 
@@ -425,31 +626,111 @@ export class NativeSessionCatalog {
 				canonicalFile: string;
 				cached?: CachedSessionFileSummary;
 				retryable: boolean;
+				budgetCode?: NativeSessionCatalogDiagnosticCode;
+				diagnostic?: NativeSessionCatalogDiagnostic;
 			}> => {
-				const revision = await sessionFileRevision(file);
-				const cached = cachedFiles?.get(canonicalFile);
-				if (cached?.revision === revision) return { canonicalFile, cached, retryable: false };
-				const result = await this.sessionFileScanLimiter.run(() => scanNativeSessionFile(file));
-				if (result.retryable) return { canonicalFile, retryable: true };
-				return {
-					canonicalFile,
-					cached: {
-						revision,
-						summary: result.summary ? { ...result.summary, path: canonicalFile } : null,
-					},
-					retryable: false,
-				};
+				try {
+					budget.check();
+					const cached = cachedFiles?.get(canonicalFile);
+					let metadata: NativeSessionFileMetadata;
+					try {
+						metadata = await sessionFileMetadata(file);
+					} catch (error) {
+						const retryable = isRetryableNativeSessionScanError(error);
+						return {
+							canonicalFile,
+							...(retryable && cached ? { cached } : {}),
+							retryable,
+							...(retryable ? { diagnostic: retryableDiscoveryDiagnostic(file, cached !== undefined) } : {}),
+						};
+					}
+					if (cached?.revision === metadata.revision) return { canonicalFile, cached, retryable: false };
+					const result = await this.sessionFileScanLimiter.run(() =>
+						scanNativeSessionFile(file, metadata, cached, budget),
+					);
+					if (result.budgetCode) {
+						return {
+							canonicalFile,
+							cached,
+							retryable: false,
+							budgetCode: result.budgetCode,
+						};
+					}
+					if (result.retryable) {
+						return {
+							canonicalFile,
+							...(cached ? { cached } : {}),
+							retryable: true,
+							diagnostic: retryableDiscoveryDiagnostic(file, cached !== undefined),
+						};
+					}
+					return {
+						canonicalFile,
+						cached: {
+							revision: metadata.revision,
+							identity: metadata.identity,
+							size: metadata.size,
+							scanOffset: result.scanOffset ?? metadata.size,
+							appendSafe: result.appendSafe ?? false,
+							appendCheckpoint: result.appendCheckpoint,
+							scanState: result.scanState,
+							summary: result.summary ? { ...result.summary, path: canonicalFile } : null,
+						},
+						retryable: false,
+					};
+				} catch (error) {
+					if (isDiscoveryBudgetError(error)) {
+						return {
+							canonicalFile,
+							cached: cachedFiles?.get(canonicalFile),
+							retryable: false,
+							budgetCode: error.code,
+						};
+					}
+					if (budget?.interrupted) {
+						return {
+							canonicalFile,
+							cached: cachedFiles?.get(canonicalFile),
+							retryable: false,
+							budgetCode: budget.interrupted,
+						};
+					}
+					if (isRetryableNativeSessionScanError(error)) {
+						return {
+							canonicalFile,
+							cached: cachedFiles?.get(canonicalFile),
+							retryable: true,
+							diagnostic: retryableDiscoveryDiagnostic(file, Boolean(cachedFiles?.get(canonicalFile))),
+						};
+					}
+					throw error;
+				}
 			},
 		);
 		const fileCache = new Map(
 			scannedFiles.flatMap((entry) => (entry.cached ? [[entry.canonicalFile, entry.cached] as const] : [])),
 		);
+		const budgetCodes = new Set(
+			scannedFiles.flatMap((entry) => (entry.budgetCode ? [entry.budgetCode] : [])),
+		);
+		const retryable = scannedFiles.some((entry) => entry.retryable);
+		const partial = budgetCodes.size > 0 || retryable;
+		const stale =
+			(budgetCodes.size > 0 && Boolean(cachedFiles)) ||
+			scannedFiles.some((entry) => entry.retryable && entry.cached !== undefined);
 		return {
 			sessions: scannedFiles
 				.map((entry) => entry.cached?.summary ?? null)
 				.filter((summary): summary is NativeSessionSummary => summary !== null),
 			files: fileCache,
-			retryable: scannedFiles.some((entry) => entry.retryable),
+			retryable,
+			diagnostics: [
+				...[...budgetCodes].map((code) => discoveryBudgetDiagnosticForCode(code, directory, stale)),
+				...scannedFiles.flatMap((entry) => (entry.diagnostic ? [entry.diagnostic] : [])),
+			],
+			coveredDirectories: new Set(),
+			partial,
+			stale,
 		};
 	}
 
@@ -484,47 +765,106 @@ function toNativeSessionRecord(sessionFile: string, info: NativeSessionSummary):
 	};
 }
 
-async function scanNativeSessionFile(filePath: string): Promise<NativeSessionScanResult> {
-	try {
-		const stat = await fs.promises.stat(filePath);
-		if (!stat.isFile() || stat.size === 0) return { summary: null, retryable: false };
+async function scanNativeSessionFile(
+	filePath: string,
+	metadata: NativeSessionFileMetadata,
+	cached?: CachedSessionFileSummary,
+	budget?: DiscoveryBudget,
+): Promise<NativeSessionScanResult> {
+	let currentMetadata = metadata;
+	for (let attempt = 0; attempt < 2; attempt += 1) {
+		const result = await scanNativeSessionFileAttempt(filePath, currentMetadata, cached, budget);
+		if (!("retry" in result)) return result;
+		if (attempt === 1) return { summary: null, retryable: true };
+		try {
+			currentMetadata = await sessionFileMetadata(filePath);
+		} catch (error) {
+			return { summary: null, retryable: isRetryableNativeSessionScanError(error) };
+		}
+	}
+	return { summary: null, retryable: true };
+}
 
-		const state: NativeSessionScanState = { lineNumber: 0, messageCount: 0 };
+async function scanNativeSessionFileAttempt(
+	filePath: string,
+	metadata: NativeSessionFileMetadata,
+	cached: CachedSessionFileSummary | undefined,
+	budget: DiscoveryBudget | undefined,
+): Promise<NativeSessionScanResult | NativeSessionScanRetry> {
+	let handle: FileHandle | undefined;
+	try {
+		budget?.check();
+		handle = await fs.promises.open(filePath, "r");
+		const stat = await handle.stat({ bigint: true });
+		if (!stat.isFile()) return { summary: null, retryable: false };
+		if (!sameSessionFileMetadata(stat, metadata)) return { retry: true };
+		if (stat.size === 0n) return { summary: null, retryable: false };
+
+		const incrementalParts = await canIncrementallyScan(handle, metadata, cached, budget);
+		const incremental = incrementalParts !== null;
+		const state = incremental ? cloneScanState(cached?.scanState) : { lineNumber: 0, messageCount: 0 };
+		const checkpoint = new AppendCheckpointAccumulator(incrementalParts ?? undefined);
 		const decoder = new StringDecoder("utf8");
 		let buffered = "";
 		const stream = fs.createReadStream(filePath, {
+			fd: handle.fd,
+			autoClose: false,
 			highWaterMark: SESSION_SCAN_HIGH_WATER_MARK_BYTES,
+			...(budget?.signal ? { signal: budget.signal } : {}),
+			...(incremental ? { start: Number(cached?.scanOffset) } : {}),
 		});
 
-		for await (const chunk of stream) {
-			buffered += decoder.write(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
-			for (;;) {
-				const newlineIndex = buffered.indexOf("\n");
-				if (newlineIndex === -1) break;
-				parseNativeSessionLine(state, buffered.slice(0, newlineIndex));
-				buffered = buffered.slice(newlineIndex + 1);
+		try {
+			for await (const chunk of stream) {
+				const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+				budget?.consumeBytes(bytes.byteLength);
+				checkpoint.consume(bytes);
+				buffered += decoder.write(bytes);
+				for (;;) {
+					const newlineIndex = buffered.indexOf("\n");
+					if (newlineIndex === -1) break;
+					parseNativeSessionLine(state, buffered.slice(0, newlineIndex));
+					buffered = buffered.slice(newlineIndex + 1);
+				}
+				if (Buffer.byteLength(buffered) > SESSION_SCAN_MAX_LINE_BYTES) {
+					throw new Error(`Session JSONL line exceeds ${String(SESSION_SCAN_MAX_LINE_BYTES)} bytes`);
+				}
 			}
-			if (Buffer.byteLength(buffered) > SESSION_SCAN_MAX_LINE_BYTES) {
-				throw new Error(`Session JSONL line exceeds ${String(SESSION_SCAN_MAX_LINE_BYTES)} bytes`);
-			}
+		} finally {
+			if (!stream.readableEnded) stream.destroy();
 		}
 
 		buffered += decoder.end();
+		const appendSafe = buffered.length === 0;
 		if (buffered.length > 0) {
 			if (Buffer.byteLength(buffered) > SESSION_SCAN_MAX_LINE_BYTES) {
 				throw new Error(`Session JSONL line exceeds ${String(SESSION_SCAN_MAX_LINE_BYTES)} bytes`);
 			}
 			parseNativeSessionLine(state, buffered);
 		}
+		const finalStat = await handle.stat({ bigint: true });
+		if (!sameSessionFileMetadata(finalStat, metadata)) return { retry: true };
+		const pathMetadata = await sessionFileMetadata(filePath);
+		if (pathMetadata.identity !== metadata.identity || pathMetadata.revision !== metadata.revision) {
+			return { retry: true };
+		}
 
 		const header = state.header;
-		if (!header) return { summary: null, retryable: false };
+		if (!header) {
+			return {
+				summary: null,
+				retryable: false,
+				scanState: state,
+				scanOffset: metadata.size,
+				appendSafe,
+			};
+		}
 		const headerTime = parseDateMillis(header.timestamp);
 		const createdTime = headerTime ?? safeStatCreatedTime(stat);
 		const modifiedTime =
 			state.lastActivityTime !== undefined && state.lastActivityTime > 0
 				? state.lastActivityTime
-				: (headerTime ?? stat.mtimeMs);
+				: (headerTime ?? Number(stat.mtimeMs));
 
 		return {
 			summary: {
@@ -539,12 +879,178 @@ async function scanNativeSessionFile(filePath: string): Promise<NativeSessionSca
 				firstMessage: state.firstMessage ?? "",
 			},
 			retryable: false,
+			scanState: state,
+			scanOffset: metadata.size,
+			appendSafe,
+			appendCheckpoint: checkpoint.checkpoint(),
 		};
 	} catch (error) {
+		if (isDiscoveryBudgetError(error)) return { summary: null, retryable: false, budgetCode: error.code };
+		if (budget?.interrupted) {
+			return { summary: null, retryable: false, budgetCode: budget.interrupted };
+		}
 		// Native history discovery is best-effort. One changing, corrupt, or
 		// unreadable JSONL file must not hide healthy sessions beside it.
 		return { summary: null, retryable: isRetryableNativeSessionScanError(error) };
+	} finally {
+		await handle?.close().catch(() => {});
 	}
+}
+
+async function canIncrementallyScan(
+	handle: FileHandle,
+	metadata: NativeSessionFileMetadata,
+	cached: CachedSessionFileSummary | undefined,
+	budget?: DiscoveryBudget,
+): Promise<NativeSessionAppendCheckpointParts | null> {
+	if (
+		!cached?.appendSafe ||
+		!cached.scanState?.header ||
+		!cached.appendCheckpoint ||
+		cached.identity !== metadata.identity ||
+		cached.scanOffset !== cached.size ||
+		metadata.size <= cached.scanOffset ||
+		cached.scanOffset > BigInt(Number.MAX_SAFE_INTEGER)
+	) {
+		return null;
+	}
+	const checkpoint = await readAppendCheckpoint(handle, cached.size, budget);
+	if (!checkpoint || !sameAppendCheckpoint(checkpoint.checkpoint, cached.appendCheckpoint)) return null;
+	const header = await readSessionHeader(handle, budget);
+	return header !== null && sameSessionHeader(header, cached.scanState.header) ? checkpoint : null;
+}
+
+async function readSessionHeader(
+	handle: FileHandle,
+	budget?: DiscoveryBudget,
+): Promise<NativeSessionHeader | null> {
+	budget?.check();
+	const chunks: Buffer[] = [];
+	let totalBytes = 0;
+	let position = 0;
+	while (totalBytes <= SESSION_SCAN_MAX_LINE_BYTES) {
+		const buffer = Buffer.allocUnsafe(
+			Math.min(SESSION_SCAN_HIGH_WATER_MARK_BYTES, SESSION_SCAN_MAX_LINE_BYTES + 1 - totalBytes),
+		);
+		const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+		if (bytesRead === 0) return null;
+		budget?.consumeBytes(bytesRead);
+		const chunk = buffer.subarray(0, bytesRead);
+		const newlineIndex = chunk.indexOf(0x0a);
+		if (newlineIndex !== -1) {
+			const line = Buffer.concat([...chunks, chunk.subarray(0, newlineIndex)]).toString("utf8");
+			try {
+				return parseNativeSessionHeader(JSON.parse(line));
+			} catch {
+				return null;
+			}
+		}
+		chunks.push(chunk);
+		totalBytes += bytesRead;
+		position += bytesRead;
+	}
+	return null;
+}
+
+async function readAppendCheckpoint(
+	handle: FileHandle,
+	size: bigint,
+	budget?: DiscoveryBudget,
+): Promise<NativeSessionAppendCheckpointParts | null> {
+	if (size > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+	const numericSize = Number(size);
+	const prefixLength = Math.min(SESSION_SCAN_CHECKPOINT_BYTES, numericSize);
+	const suffixStart = Math.max(0, numericSize - SESSION_SCAN_CHECKPOINT_BYTES);
+	const suffixLength = numericSize - suffixStart;
+	const prefix = await readFileRange(handle, 0, prefixLength, budget);
+	const suffix = await readFileRange(handle, suffixStart, suffixLength, budget);
+	if (prefix.length !== prefixLength || suffix.length !== suffixLength) return null;
+	return { prefix, suffix, checkpoint: appendCheckpoint(prefix, suffix) };
+}
+
+async function readFileRange(
+	handle: FileHandle,
+	position: number,
+	length: number,
+	budget?: DiscoveryBudget,
+): Promise<Buffer> {
+	const chunks: Buffer[] = [];
+	let offset = 0;
+	while (offset < length) {
+		const buffer = Buffer.allocUnsafe(Math.min(SESSION_SCAN_HIGH_WATER_MARK_BYTES, length - offset));
+		const { bytesRead } = await handle.read(buffer, 0, buffer.length, position + offset);
+		if (bytesRead === 0) break;
+		budget?.consumeBytes(bytesRead);
+		chunks.push(buffer.subarray(0, bytesRead));
+		offset += bytesRead;
+	}
+	return Buffer.concat(chunks);
+}
+
+function appendCheckpoint(prefix: Buffer, suffix: Buffer): NativeSessionAppendCheckpoint {
+	return {
+		prefix: createHash("sha256").update(prefix).digest("hex"),
+		suffix: createHash("sha256").update(suffix).digest("hex"),
+	};
+}
+
+function sameSessionFileMetadata(stat: fs.BigIntStats, metadata: NativeSessionFileMetadata): boolean {
+	return (
+		stat.isFile() &&
+		stat.dev === metadata.dev &&
+		stat.ino === metadata.ino &&
+		stat.size === metadata.size &&
+		stat.mtimeNs === metadata.mtimeNs &&
+		stat.ctimeNs === metadata.ctimeNs
+	);
+}
+
+function sameAppendCheckpoint(
+	left: NativeSessionAppendCheckpoint,
+	right: NativeSessionAppendCheckpoint,
+): boolean {
+	return left.prefix === right.prefix && left.suffix === right.suffix;
+}
+
+class AppendCheckpointAccumulator {
+	private prefix: Buffer;
+	private suffix: Buffer;
+
+	constructor(seed?: NativeSessionAppendCheckpointParts) {
+		this.prefix = seed?.prefix ?? Buffer.alloc(0);
+		this.suffix = seed?.suffix ?? Buffer.alloc(0);
+	}
+
+	consume(bytes: Buffer): void {
+		if (this.prefix.length < SESSION_SCAN_CHECKPOINT_BYTES) {
+			this.prefix = Buffer.concat([
+				this.prefix,
+				bytes.subarray(0, SESSION_SCAN_CHECKPOINT_BYTES - this.prefix.length),
+			]);
+		}
+		this.suffix = Buffer.concat([this.suffix, bytes]).subarray(-SESSION_SCAN_CHECKPOINT_BYTES);
+	}
+
+	checkpoint(): NativeSessionAppendCheckpoint {
+		return appendCheckpoint(this.prefix, this.suffix);
+	}
+}
+
+function cloneScanState(state: NativeSessionScanState | undefined): NativeSessionScanState {
+	if (!state) return { lineNumber: 0, messageCount: 0 };
+	return {
+		...state,
+		...(state.header ? { header: { ...state.header } } : {}),
+	};
+}
+
+function sameSessionHeader(left: NativeSessionHeader, right: NativeSessionHeader): boolean {
+	return (
+		left.id === right.id &&
+		left.cwd === right.cwd &&
+		left.timestamp === right.timestamp &&
+		left.parentSessionPath === right.parentSessionPath
+	);
 }
 
 function parseNativeSessionLine(state: NativeSessionScanState, rawLine: string): void {
@@ -670,8 +1176,9 @@ function parseDateMillis(value: string | undefined): number | undefined {
 	return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-function safeStatCreatedTime(stat: fs.Stats): number {
-	return stat.birthtimeMs > 0 ? stat.birthtimeMs : stat.mtimeMs;
+function safeStatCreatedTime(stat: fs.Stats | fs.BigIntStats): number {
+	const birthtimeMs = Number(stat.birthtimeMs);
+	return birthtimeMs > 0 ? birthtimeMs : Number(stat.mtimeMs);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -740,6 +1247,275 @@ function buildWorkspaceRecords(sessions: NativeSessionRecord[]): NativeWorkspace
 	return [...records.values()];
 }
 
+function emptyDiscoveryScan(): NativeSessionDiscoveryScan {
+	return {
+		sessions: [],
+		diagnostics: [],
+		coveredDirectories: new Set(),
+		partial: false,
+		stale: false,
+	};
+}
+
+function mergeDiscoveryScans(scans: NativeSessionDiscoveryScan[]): NativeSessionDiscoveryScan {
+	const coveredDirectories = new Set<string>();
+	for (const scan of scans) {
+		for (const directory of scan.coveredDirectories) coveredDirectories.add(directory);
+	}
+	return {
+		sessions: scans.flatMap((scan) => scan.sessions),
+		diagnostics: scans.flatMap((scan) => scan.diagnostics),
+		coveredDirectories,
+		partial: scans.some((scan) => scan.partial),
+		stale: scans.some((scan) => scan.stale),
+	};
+}
+
+function discoveryBudgetScan(
+	error: DiscoveryBudgetExceeded,
+	pathValue: string | undefined,
+	stale: boolean,
+): NativeSessionDiscoveryScan {
+	return {
+		sessions: [],
+		diagnostics: [discoveryBudgetDiagnostic(error, pathValue, stale)],
+		coveredDirectories: new Set(),
+		partial: true,
+		stale,
+	};
+}
+
+function retryableDiscoveryScan(
+	pathValue: string,
+	stale: boolean,
+	sessions: NativeSessionSummary[] = [],
+): NativeSessionDiscoveryScan {
+	return {
+		sessions,
+		diagnostics: [retryableDiscoveryDiagnostic(pathValue, stale)],
+		coveredDirectories: new Set(),
+		partial: true,
+		stale,
+	};
+}
+
+function retryableDiscoveryDirectoryScan(
+	directory: string,
+	cachedFiles: ReadonlyMap<string, CachedSessionFileSummary> | undefined,
+): {
+	sessions: NativeSessionSummary[];
+	files: Map<string, CachedSessionFileSummary>;
+	retryable: boolean;
+	diagnostics: NativeSessionCatalogDiagnostic[];
+	coveredDirectories: Set<string>;
+	partial: boolean;
+	stale: boolean;
+} {
+	const files = new Map(cachedFiles ?? []);
+	return {
+		sessions: [...files.values()]
+			.map((entry) => entry.summary)
+			.filter((summary): summary is NativeSessionSummary => summary !== null),
+		files,
+		retryable: true,
+		diagnostics: [retryableDiscoveryDiagnostic(directory, Boolean(cachedFiles))],
+		coveredDirectories: new Set(),
+		partial: true,
+		stale: Boolean(cachedFiles),
+	};
+}
+
+function discoveryBudgetDirectoryScan(
+	error: DiscoveryBudgetExceeded,
+	directory: string,
+	cachedFiles: ReadonlyMap<string, CachedSessionFileSummary> | undefined,
+): {
+	sessions: NativeSessionSummary[];
+	files: Map<string, CachedSessionFileSummary>;
+	retryable: boolean;
+	diagnostics: NativeSessionCatalogDiagnostic[];
+	coveredDirectories: Set<string>;
+	partial: boolean;
+	stale: boolean;
+} {
+	const files = new Map(cachedFiles ?? []);
+	return {
+		sessions: [...files.values()]
+			.map((entry) => entry.summary)
+			.filter((summary): summary is NativeSessionSummary => summary !== null),
+		files,
+		retryable: false,
+		diagnostics: [discoveryBudgetDiagnostic(error, directory, Boolean(cachedFiles))],
+		coveredDirectories: new Set(),
+		partial: true,
+		stale: Boolean(cachedFiles),
+	};
+}
+
+function discoveryBudgetDiagnostic(
+	error: DiscoveryBudgetExceeded,
+	pathValue: string | undefined,
+	stale: boolean,
+): NativeSessionCatalogDiagnostic {
+	return discoveryBudgetDiagnosticForCode(error.code, pathValue, stale);
+}
+
+function discoveryBudgetDiagnosticForCode(
+	code: NativeSessionCatalogDiagnosticCode,
+	pathValue: string | undefined,
+	stale: boolean,
+): NativeSessionCatalogDiagnostic {
+	return {
+		source: "filesystem",
+		code,
+		message: discoveryBudgetMessage(code),
+		...(pathValue ? { path: pathValue } : {}),
+		partial: true,
+		stale,
+	};
+}
+
+function retryableDiscoveryDiagnostic(pathValue: string, stale: boolean): NativeSessionCatalogDiagnostic {
+	return {
+		source: "filesystem",
+		code: "discovery_retryable",
+		message: discoveryBudgetMessage("discovery_retryable"),
+		path: pathValue,
+		partial: true,
+		stale,
+		retryable: true,
+	};
+}
+
+function discoveryBudgetMessage(code: NativeSessionCatalogDiagnosticCode): string {
+	switch (code) {
+		case "discovery_bytes_exhausted":
+			return "Native Session discovery stopped after reaching its byte budget";
+		case "discovery_pages_exhausted":
+			return "Native Session discovery stopped after reaching its page budget";
+		case "discovery_time_exhausted":
+			return "Native Session discovery stopped after reaching its time budget";
+		case "discovery_cancelled":
+			return "Native Session discovery was cancelled";
+		case "discovery_retryable":
+			return "Native Session discovery encountered a transient filesystem state and will be retried";
+	}
+}
+
+function nativeSummaryFromRecord(session: NativeSessionRecord): NativeSessionSummary {
+	return {
+		path: session.sessionFile,
+		id: session.nativeSessionId,
+		cwd: session.cwd,
+		name: session.name,
+		parentSessionPath: session.parentSessionFile,
+		created: new Date(session.created),
+		modified: new Date(session.modified),
+		messageCount: session.messageCount,
+		firstMessage: session.firstMessage,
+	};
+}
+
+async function readDirectoryEntries(directory: string, budget: DiscoveryBudget): Promise<fs.Dirent[]> {
+	budget.check();
+	const handle = await fs.promises.opendir(directory);
+	const entries: fs.Dirent[] = [];
+	try {
+		for await (const entry of handle) {
+			budget.consumePage();
+			entries.push(entry);
+		}
+		return entries;
+	} finally {
+		await handle.close().catch(() => {});
+	}
+}
+
+class DiscoveryBudgetExceeded extends Error {
+	readonly code: DiscoveryBudgetCode;
+
+	constructor(code: DiscoveryBudgetCode) {
+		super(discoveryBudgetMessage(code));
+		this.name = "DiscoveryBudgetExceeded";
+		this.code = code;
+	}
+}
+
+class DiscoveryBudget {
+	private readonly startedAt: number;
+	private bytes = 0;
+	private pages = 0;
+	private reason: DiscoveryBudgetCode | undefined;
+
+	constructor(
+		private readonly limits: NativeSessionDiscoveryLimits,
+		private readonly now: () => number,
+		readonly signal?: AbortSignal,
+	) {
+		this.startedAt = now();
+	}
+
+	get interrupted(): DiscoveryBudgetCode | undefined {
+		return this.reason ?? (this.signal?.aborted ? "discovery_cancelled" : undefined);
+	}
+
+	check(): void {
+		if (this.signal?.aborted) throw this.exhaust("discovery_cancelled");
+		if (this.now() - this.startedAt >= this.limits.maxTimeMs) {
+			throw this.exhaust("discovery_time_exhausted");
+		}
+	}
+
+	consumePage(): void {
+		this.check();
+		if (this.pages >= this.limits.maxPages) throw this.exhaust("discovery_pages_exhausted");
+		this.pages += 1;
+	}
+
+	consumeBytes(bytes: number): void {
+		this.check();
+		if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > this.limits.maxBytes - this.bytes) {
+			throw this.exhaust("discovery_bytes_exhausted");
+		}
+		this.bytes += bytes;
+	}
+
+	private exhaust(code: DiscoveryBudgetCode): DiscoveryBudgetExceeded {
+		this.reason ??= code;
+		return new DiscoveryBudgetExceeded(this.reason);
+	}
+}
+
+function isDiscoveryBudgetError(error: unknown): error is DiscoveryBudgetExceeded {
+	return error instanceof DiscoveryBudgetExceeded;
+}
+
+function normalizeDiscoveryLimits(options: NativeSessionCatalogOptions): NativeSessionDiscoveryLimits {
+	const configured = options.discoveryLimits;
+	return {
+		maxBytes: normalizeDiscoveryLimit(
+			options.maxDiscoveryBytes ?? configured?.maxBytes,
+			DEFAULT_DISCOVERY_MAX_BYTES,
+			MAX_DISCOVERY_BYTES,
+		),
+		maxPages: normalizeDiscoveryLimit(
+			options.maxDiscoveryPages ?? configured?.maxPages,
+			DEFAULT_DISCOVERY_MAX_PAGES,
+			MAX_DISCOVERY_PAGES,
+		),
+		maxTimeMs: normalizeDiscoveryLimit(
+			options.maxDiscoveryTimeMs ?? configured?.maxTimeMs,
+			DEFAULT_DISCOVERY_MAX_TIME_MS,
+			MAX_DISCOVERY_TIME_MS,
+		),
+	};
+}
+
+function normalizeDiscoveryLimit(value: number | undefined, fallback: number, maximum: number): number {
+	if (!Number.isFinite(value)) return fallback;
+	return Math.min(maximum, Math.max(0, Math.floor(value ?? fallback)));
+}
+
 async function mapWithConcurrency<T, R>(
 	items: readonly T[],
 	concurrency: number,
@@ -758,10 +1534,16 @@ async function mapWithConcurrency<T, R>(
 	return results;
 }
 
-async function directoryRevision(directory: string): Promise<string> {
+async function directoryRevision(directory: string, budget?: DiscoveryBudget): Promise<string> {
 	let entries: string[];
 	try {
-		entries = (await fs.promises.readdir(directory)).filter((entry) => entry.endsWith(".jsonl")).sort();
+		entries = (
+			budget
+				? (await readDirectoryEntries(directory, budget)).map((entry) => entry.name)
+				: await fs.promises.readdir(directory)
+		)
+			.filter((entry) => entry.endsWith(".jsonl"))
+			.sort();
 	} catch (error) {
 		if (isMissing(error)) return "missing";
 		throw error;
@@ -770,7 +1552,10 @@ async function directoryRevision(directory: string): Promise<string> {
 		entries,
 		DIRECTORY_REVISION_CONCURRENCY,
 		async (entry): Promise<string> => {
-			return `${entry}\0${await sessionFileRevision(path.join(directory, entry))}`;
+			budget?.check();
+			const revision = await sessionFileRevision(path.join(directory, entry));
+			budget?.check();
+			return `${entry}\0${revision}`;
 		},
 	);
 	return createHash("sha256").update(revisions.join("\n")).digest("base64url");
@@ -778,13 +1563,26 @@ async function directoryRevision(directory: string): Promise<string> {
 
 async function sessionFileRevision(filePath: string): Promise<string> {
 	try {
-		const canonicalFile = canonicalizeSessionFile(filePath);
-		const linkStat = await fs.promises.lstat(filePath, { bigint: true });
-		const stat = await fs.promises.stat(filePath, { bigint: true });
-		return `${canonicalFile}\0${linkStat.isSymbolicLink() ? "symlink" : "file"}\0${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+		return (await sessionFileMetadata(filePath)).revision;
 	} catch (error) {
 		return isMissing(error) ? "missing" : "unreadable";
 	}
+}
+
+async function sessionFileMetadata(filePath: string): Promise<NativeSessionFileMetadata> {
+	const canonicalFile = canonicalizeSessionFile(filePath);
+	const linkStat = await fs.promises.lstat(filePath, { bigint: true });
+	const stat = await fs.promises.stat(filePath, { bigint: true });
+	const identity = `${canonicalFile}\0${linkStat.isSymbolicLink() ? "symlink" : "file"}\0${stat.dev}:${stat.ino}`;
+	return {
+		identity,
+		revision: `${identity}\0${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`,
+		size: stat.size,
+		dev: stat.dev,
+		ino: stat.ino,
+		mtimeNs: stat.mtimeNs,
+		ctimeNs: stat.ctimeNs,
+	};
 }
 
 function isRetryableNativeSessionScanError(error: unknown): boolean {
