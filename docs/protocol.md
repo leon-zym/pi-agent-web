@@ -509,9 +509,9 @@ does not change the ordinary replay-gap rule above.
   条 projection event、每个 queue 分区 10,000 项、每个 Extension 分区 256 项，JSON depth 上限为 48，
   总结构项上限为 250,000。Guard 只接受 plain canonical JSON record、自有可枚举 data property 与普通
   Array；symbol、accessor、非枚举字段和 exotic container 都 fail closed。
-- 分块 history 的单 chunk 最多约 63.75 MiB、256 条消息，默认发送目标约 4 MiB；每条消息仍必须独立通过
-  product guard 与 server-frame ceiling。一次 snapshot/page stream 的排队权重最多 64 MiB，native reader
-  还受 16 GiB 总源文件预算、消息数预算、cursor 大小与 source fingerprint 约束。Checksum 只用于检测
+- 分块 history 的单 chunk 最多约 64.75 MiB、256 条消息，默认发送目标约 4 MiB；每条消息仍必须独立通过
+  product guard 与 server-frame ceiling。一次 snapshot/page stream 的排队权重最多 65 MiB，native reader
+  还受 16 GiB 总源文件预算、上下文消息数与索引条目数预算、cursor 大小及 source fingerprint 约束。Checksum 只用于检测
   顺序与完整性，不替代 epoch、generation、Cookie 或权限校验。
 - Live product event suffix 默认上限为 4,096 项与 8 MiB。每个 active Turn 的 raw product-event
   count 与完整 frame bytes 分别限制为对应 ceiling 的 50%，默认即 2,048 项与 4 MiB。发送
