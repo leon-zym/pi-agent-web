@@ -32,7 +32,8 @@ CLI 只接受 `127.0.0.1`、`localhost` 或 `::1`。
 | `pnpm lint` | 全 package Biome + root scripts/e2e files | 无 |
 | `pnpm typecheck` | 先 build protocol/server，再检查四包与 E2E TS | 无 |
 | `pnpm test` | protocol/server/UI/CLI 确定性测试 | 无 |
-| `pnpm build` | 清理并生成发行 dist | 无 |
+| `pnpm build` | 清理并生成发行 dist，并检查 UI gzip bundle 预算 | 无 |
+| `pnpm check:bundle` | 单独检查已生成 UI 产物的 gzip bundle 预算 | 无 |
 | `pnpm verify` | lint → typecheck → test → build | 无 |
 | `pnpm test:smoke` | fake Pi 的 authenticated REST/WS gateway smoke | 无 |
 | `pnpm test:browser` | production build + packaged Chromium black-box | 无 |
@@ -176,9 +177,29 @@ settlement。它是诊断数据，不是跨机器的绝对通过阈值。原始 
 - structural/error/settled/rekey/dialog boundary 不延迟；
 - 一个高频 Session 不饿死其他 Session；
 - 用户上翻不被吸底，settled Markdown 仍有完整 GFM/code 语义。
+- 流式 Markdown 不进入 settled 全文解析器；超过 256 KiB UTF-8 的 settled 文本走完整可选取纯文本降级；
+- 长历史首屏最多挂载 64 个 Turn，旧/新历史按 24 个分页，prepend、resize、selection 和 focus 保持稳定；
+- TOC 每个 User Turn 保留一个轻量刻度，未挂载 Turn 由窗口 reveal 后再滚动。
 
-只有 profile 证明 DOM/layout 是剩余主瓶颈后才引入 turn virtualization；只有候选 renderer 在真实长
-Markdown、Unicode、unfinished fence、GFM、highlight、DOM stability 上有证据时才替换当前 renderer。
+当前选择的是 bounded older-history window，而非固定高度的 full virtualization；这是针对生产
+Chromium 中 DOM/layout 压力的最小实现。只有候选 renderer 在真实长 Markdown、Unicode、unfinished
+fence、GFM、highlight、DOM stability 上有证据时才替换当前 renderer。
+
+生产 Chromium 性能门禁：
+
+```bash
+pnpm build
+pnpm exec playwright test --config tests/e2e/playwright.config.ts conversation-performance.spec.ts
+pnpm exec playwright test --config tests/e2e/playwright.config.ts conversation-window.spec.ts
+```
+
+性能 fixture 固定覆盖 10 KiB、64 KiB、120 KiB、1 MiB；live long task 上限为 200ms，cold/warm
+settlement 上限为 2,000/1,500ms，mounted Turn 上限为 64，强制 GC 后 heap delta 上限为 64MiB。
+性能测试中的大文本只在页面内读取长度/形状，不能把完整文本通过测试协议反复搬运，否则会污染
+heap 测量。
+
+`pnpm build` 同时执行 gzip bundle 门禁：entry JavaScript ≤240 KiB、lazy settled-Markdown
+JavaScript ≤110 KiB、全部 UI CSS ≤12 KiB。需要单独复核已生成产物时可运行 `pnpm check:bundle`。
 
 ## 视觉验收
 

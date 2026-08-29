@@ -1,6 +1,6 @@
 # ADR 0005: Coalesce Session streams and defer renderer replacement
 
-- Status: Accepted (amended 2026-08-25)
+- Status: Accepted (amended 2026-08-29)
 - Date: 2026-08-21
 
 ## Context
@@ -24,17 +24,25 @@ selection, scrolling, accessibility, and bundle cost.
   budgets bound the queue, and every ready Session receives work in the same flush cycle.
 - Preserve references for unchanged turns/steps/blocks; memoize turn, step, and user-message
   surfaces. Index tool results by call id instead of filtering the full result list per block.
-- Keep the full Markdown adapter behind a lazy boundary. The current implementation also uses the
-  ReactMarkdown/GFM path while a text block is streaming, with a selectable plain-text fallback
-  until that lazy chunk is ready. Syntax highlighting and custom diff rendering remain behind the
-  explicit character/UTF-8 byte circuit breakers. This preserves semantic Markdown during a live
-  reply, but reparses the current buffer on each published update; it is not evidence of bounded
-  browser parse or layout cost.
+- Keep the full Markdown adapter behind a lazy boundary. While a text block is streaming,
+  `StreamingText` renders selectable plain text in copied, fixed-size 16 KiB segments; it does not
+  enter the settled Markdown parser. Append-only updates extend only the changing suffix, and
+  segment boundaries never split a UTF-16 surrogate pair. ANSI/control characters are removed from
+  the display projection without mutating the raw event or projection truth.
+- After settlement, blocks at or below 256 KiB UTF-8 use the lazy ReactMarkdown/GFM path, retaining
+  safe links, tables, code highlighting, DiffBlock, and clean copy behavior. A larger settled block
+  uses the same bounded selectable plain-text surface instead of synchronously parsing an
+  unbounded document. This fallback intentionally preserves complete text and selection, but does
+  not promise heading/list/code semantic elements for that oversized block. Syntax highlighting and
+  custom diff rendering remain behind their explicit character/UTF-8 byte circuit breakers.
 - Markstream React 2.0.0 is not part of the current renderer. A renderer replacement must enter
   behind an adapter and pass the same security, semantics, style, accessibility, scroll, selection,
   and browser tests before replacing the settled renderer.
-- Do not add turn virtualization until profiles after these changes show retained DOM/layout, not
-  parsing or publication, is the remaining primary bottleneck.
+- Use an older-history window after the production profile showed that mounting every historical
+  `TurnView` would defeat the DOM/layout bound: the newest 64 turns mount initially, and older/newer
+  pages add 24 turns at a time. The full Product projection remains authoritative, every User Turn
+  keeps a lightweight TOC tick, and prepend/reveal preserve a stable scroll anchor. This is a
+  bounded turn window, not a second history database or a fixed-height virtualization spacer.
 
 ## Measurements
 
@@ -42,12 +50,23 @@ On the same local benchmark fixture:
 
 - 10,000 sequential reducer updates took about 1.35 ms; scheduler plus batch took about 0.71 ms.
 - Eight Sessions × 2,000 compatible updates took about 1.88 ms in the scheduler path.
-- Moving settled Markdown behind a lazy boundary reduced entry JavaScript from about
-  888/271 kB gzip to 562/172 kB, with a separate 336/102 kB Markdown chunk.
+- Moving settled Markdown behind a lazy boundary keeps the initial route independent from the
+  syntax-highlighting/Markdown chunk; the current production sizes and working budgets are listed
+  below.
 - A 64 KiB GFM/code fixture costs roughly 130–180 ms in the current Node SSR
   parse/highlight/render proxy. This flags a browser long-task risk; it is not itself a Chromium
   mount/layout/paint measurement and is not claimed as solved by lazy loading or the streaming
   circuit breakers.
+- Production Chromium fixtures cover 10 KiB, 64 KiB, 120 KiB, and 1 MiB streamed responses with
+  a 200 ms maximum live long task, 2,000 ms cold / 1,500 ms warm settlement budget, at most 64
+  mounted turns, and a 64 MiB post-GC heap-delta ceiling. The latest full production Chromium run
+  passed these gates. Settlement timing starts at the final stream-delta boundary and ends only
+  after the settled DOM is present; the measurement reads numeric DOM/heap values in the page and
+  does not pull the full text across the Playwright boundary.
+- The current production build is about 226 kB gzip for the entry JavaScript, 102 kB gzip for the
+  lazy settled-Markdown chunk, and 10 kB gzip for the UI CSS. These are enforced bundle budgets
+  (entry ≤240 kB, Markdown chunk ≤110 kB, CSS ≤12 kB gzip); root `pnpm build` runs
+  `scripts/check-ui-bundle-budget.mjs` and fails when one is exceeded.
 - Markstream parsed/mounted the same shape substantially faster in an isolated `<pre>` setup, but
   its lazy JavaScript and CSS were about twice the current Markdown chunk footprint. Equivalent
   syntax highlighting was absent, stable-prefix reuse required explicit options and was disabled by
@@ -56,26 +75,34 @@ On the same local benchmark fixture:
 ## Consequences
 
 Streaming and multi-Session background work become bounded and responsive without changing the
-event model. Initial application load no longer pays for Markdown parsing. The current streaming
-adapter keeps rich Markdown semantics, but every published text buffer remains a potential parse
-cost; the SSR proxy shows that a very large block may produce a browser main-thread long task.
-The current measurements do not establish production Chromium mount/layout/paint budgets, and the
-risk remains visible in benchmarks rather than being hidden by a typewriter effect.
+event model. Initial application load no longer pays for Markdown parsing, and a live response does
+not repeatedly parse its accumulated buffer. Oversized settled blocks remain complete and
+selectable while avoiding synchronous rich parsing. The older-history window bounds mounted turn
+DOM/layout cost without discarding Product projection truth; the TOC remains semantically complete
+with one lightweight tick per User Turn.
 
 ## Rejected alternatives
 
 - rAF-only batching: hidden Session updates can stall indefinitely.
 - Keeping only the latest `message_update`: Pi sends deltas, so text would be lost.
 - Typewriter throttling: changes truth and only hides upstream update pressure.
+- Progressive rich Markdown during streaming: reparsing the accumulated document made live cost
+  scale with the complete response and was not needed for the accepted settled semantics.
 - Immediate Markstream replacement: not functionally or visually equivalent and increases payload.
-- Immediate turn virtualization: variable height, prepend anchors, expansion, selection, and tool
-  inspection are unresolved without evidence that DOM count is now dominant.
+- Sampled TOC ticks: omitted User Turns lose direct navigation and conflict with the accepted
+  outline-rail contract; the bounded conversation window limits expensive turn DOM instead.
+- Fixed-height full-history virtualization: variable-height turns, prepend anchors, expansion,
+  selection, and tool inspection need a more complex spacer/measurement system than the current
+  evidence justifies.
 
 ## Verification
 
 `session-event-scheduler.test.ts`, `projection-reducer.test.ts`, `projection.test.ts`,
-`markdown-block.test.tsx`, `settled-markdown.test.tsx`, `conversation-performance.bench.ts`, and
-packaged multi-Session browser tests cover ordering, boundaries, hidden-tab publication, fairness,
-projection stability, background completion, renderer circuit breakers, and the measured hot paths.
-Renderer replacement or a claim of performance completeness requires additional long-Markdown
-browser and a11y gates.
+`markdown-block.test.tsx`, `streaming-text.test.ts`, `turn-window.test.ts`,
+`settled-markdown.test.tsx`, `conversation-performance.bench.ts`,
+`tests/e2e/specs/conversation-performance.spec.ts`,
+`tests/e2e/specs/conversation-window.spec.ts`, and packaged multi-Session browser tests cover
+ordering, boundaries, hidden-tab publication, fairness, projection stability, background
+completion, renderer circuit breakers, Unicode-safe segments, bounded turn mounting, selection,
+focus, resize anchoring, and the measured hot paths. Renderer replacement still requires the same
+security, semantics, style, accessibility, scroll, selection, and browser gates.
