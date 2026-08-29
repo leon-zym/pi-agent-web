@@ -651,14 +651,17 @@ test("hard reload observes every hot Runtime exactly once without activating dor
 						runtime !== null &&
 						(runtime as WireFrame).sessionHandle === scenario.background.sessionHandle,
 				);
+				const backgroundRecord =
+					typeof background === "object" && background !== null
+						? (background as Record<string, unknown>)
+						: null;
 				return (
-					typeof background === "object" &&
-					background !== null &&
-					(background as WireFrame).state === "idle" &&
-					(background as WireFrame).phase === "ready" &&
-					(background as WireFrame).operationCount === 0 &&
-					Array.isArray((background as WireFrame).busyReasons) &&
-					(background as WireFrame).busyReasons.length === 0
+					backgroundRecord !== null &&
+					backgroundRecord.state === "idle" &&
+					backgroundRecord.phase === "ready" &&
+					backgroundRecord.operationCount === 0 &&
+					Array.isArray(backgroundRecord.busyReasons) &&
+					backgroundRecord.busyReasons.length === 0
 				);
 			}),
 		)
