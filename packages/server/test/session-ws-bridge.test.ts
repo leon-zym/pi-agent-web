@@ -1436,6 +1436,13 @@ describe("SessionWsBridge", () => {
 				frame.type === "lease_status" && frame.sessionHandle === target.sessionHandle,
 			ordinaryMark,
 		);
+		await observer.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "event" }> =>
+				frame.type === "event" &&
+				frame.sessionHandle === target.sessionHandle &&
+				frame.seq === current.lastSeq,
+			ordinaryMark,
+		);
 		expect(lease.isController).toBe(false);
 		expect(observer.frames.slice(ordinaryMark).some((frame) => frame.type === "session_error")).toBe(false);
 		const sequences = observer.frames
