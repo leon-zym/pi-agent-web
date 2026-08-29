@@ -60,9 +60,14 @@ As the workbench scales to handle complex agent interactions and multi-session c
 - When the target is reached, eviction is restricted to persisted `idle`/`dormant` sessions with no
   pending Extension request. Sessions in `running`, `waiting_ui`, `starting`, or `unpersisted`
   states are protected and may temporarily take the connection above the target.
-- This UI policy does not provide a total memory budget or an admission response when every candidate
-  is protected. Cross-layer resource ceilings and an observable degraded state are not part of the
-  current client policy.
+- Cross-layer resource governance is owned by the shared Gateway boundaries: hot process and retained
+  projection reservations, WebSocket connection/channel/catch-up/alias/pending-response ceilings, and
+  bounded native discovery. The Browser receives explicit Runtime phase facts and structured
+  `session_error.code`/`retryable` metadata.
+- The UI distinguishes a protected overage from a rejected subscription and offers retry only for a
+  retryable rejection after the transport is usable. The projection reservation is conservative
+  admission accounting, not a claim about exact Browser heap usage; there is still no total Browser
+  memory guarantee.
 
 ### 9. Hanging Tool Convergence to `interrupted`
 - Any incomplete tool call discovered upon session load, step settlement, or abort converges to an explicit `interrupted` status (muted gray badge), preventing infinite loading spinners without faking success.
