@@ -3,6 +3,10 @@
 - Status: Accepted; Browser/Gateway compatibility policy amended by ADR 0013
 - Date: 2026-08-25
 
+The Pi host and runtime-resolution decisions remain active. The Browser/Gateway minor-negotiation
+details below are historical pre-activation rationale; ADR 0013 and `docs/protocol.md` define the
+current single-version 1.3 contract and the terminal mismatch behavior.
+
 ## Context
 
 The distribution pins a Pi package version, but the Gateway previously preferred any `pi` found on
@@ -39,7 +43,8 @@ the application package version.
    negotiated Gateway protocol major/minor, server build and epoch, selected Pi version and adapter,
    capability
    intersection, and limits. Major mismatch and protocol errors are terminal and do not reconnect.
-   The same server epoch will later be carried by replay cursors under issue #17.
+   The current implementation carries the same server epoch in replay cursors and validates it
+   before replay or resync.
 7. `/api/v1/health/live` reports only Gateway process liveness. `/api/v1/health/ready` and the legacy
    `/health` alias report whether a validated Pi runtime is available; startup fails fast when the
    runtime cannot be validated.

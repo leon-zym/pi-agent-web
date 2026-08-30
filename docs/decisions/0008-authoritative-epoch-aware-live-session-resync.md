@@ -3,6 +3,10 @@
 - Status: Accepted
 - Date: 2026-08-26
 
+This ADR records the epoch and waterline design before chunked history was activated. Issue #8
+completed the bounded history implementation; `docs/protocol.md` and `docs/architecture.md` are
+the current contract for that behavior.
+
 ## Context
 
 Pi RPC `get_messages` returns the current branch's in-memory message list. While Pi is producing an
@@ -86,8 +90,9 @@ The Gateway owns more bounded memory while a Runtime is hot. Snapshot overflow l
 generation terminal and the Browser degraded instead of guessing at an incomplete baseline. A new
 admissible generation or a future chunked snapshot protocol is required before mutation can resume.
 The half-ceiling active-Turn budget does not guarantee an arbitrary complete Turn. A Turn that
-exceeds either its raw event or frame-byte budget fails with the same stable overflow. Chunking or
-rolling over a larger Turn belongs to [Issue #8](https://github.com/leon-zym/pi-agent-web/issues/8).
+exceeds either its raw event or frame-byte budget fails with the same stable overflow. Rolling over
+a larger Turn remains a separate design question; the current bounded history implementation is
+documented in `docs/protocol.md`.
 
 ## Rejected alternatives
 

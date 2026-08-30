@@ -4,6 +4,11 @@
 - Date: 2026-08-27
 - Amended: 2026-08-28
 
+The payload budgets, epoch-scoped store, and ownership decisions remain active. The numbered
+Browser/Gateway rollout below records the staged pre-activation design; ADR 0013 and
+`docs/protocol.md` supersede its minor-1/minor-2 compatibility wording with the current single
+Gateway protocol 1.3 contract.
+
 ## Context
 
 Browser commands, Pi JSONL, normalized events, replay, snapshots, catch-up buffers, and outbound
