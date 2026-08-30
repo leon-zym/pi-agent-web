@@ -1,0 +1,16 @@
+{
+	"versions": [
+		{
+			"version": "0.84.2",
+			"status": "current",
+			"response": "0.84.2/response-get-state.json",
+			"event": "0.84.2/event-message-start.json",
+			"extension": "0.84.2/extension-confirm.json"
+		},
+		{
+			"version": "0.84.3",
+			"status": "candidate",
+			"event": "0.84.3/event-toolcall-start.json"
+		}
+	]
+}

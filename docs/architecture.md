@@ -47,7 +47,7 @@ Node Gateway · Hono + ws
   ├─ Native REST routes
   ├─ SessionWsBridge (multiplexing, catch-up, id mapping, backpressure)
   └─ SessionSupervisor (bounded hot-runtime pool)
-         ├─ PiHostAdapter (probe, capabilities, strict normalization)
+         ├─ PiHostAdapter (probe, schema-backed raw wire, capabilities, strict normalization)
          ├─ SessionRuntime A ─ PiProcess A ─ Pi RPC ─ session A.jsonl
          ├─ SessionRuntime B ─ PiProcess B ─ Pi RPC ─ session B.jsonl
          └─ dormant Session C ─ no process
@@ -114,7 +114,9 @@ Header、名称、计数、时间和截断首条消息，不复制完整对话�
   controller 主动离开时可用 exact generation/fencing 的 transient abandon 提前完成同一收敛；
 - generation 在进程生命周期或身份迁移时递增，所有旧 mutation 都被拒绝；
 - crash 在滚动窗口内有限重试，超预算保留 crashed 状态供显式恢复；
-- adapter 发现未知权威字段或畸形嵌套数据时进入 `protocol_incompatible` 终态，不自动重启；
+- Pi wire 与 product envelope 先分别经过 schema registry，再由 adapter/产品 guard 处理拥有上下文的
+  nested、resource、identity 与 redaction 规则；发现未知权威字段或畸形嵌套数据时进入
+  `protocol_incompatible` 终态，不自动重启；
 - POSIX 子进程使用独立进程组，显式停止与异常退出都会清理残留后代，再允许新进程启动。
 
 同一 Workspace 的多个 Session 可以并发。Workspace reservation 只覆盖文件身份敏感的 create、

@@ -1,0 +1,18 @@
+{
+	"type": "response",
+	"id": "fixture-state",
+	"command": "get_state",
+	"success": true,
+	"data": {
+		"thinkingLevel": "off",
+		"isStreaming": false,
+		"isCompacting": false,
+		"steeringMode": "all",
+		"followUpMode": "all",
+		"sessionFile": "/tmp/pi-web-fixture.jsonl",
+		"sessionId": "fixture-session",
+		"autoCompactionEnabled": true,
+		"messageCount": 0,
+		"pendingMessageCount": 0
+	}
+}

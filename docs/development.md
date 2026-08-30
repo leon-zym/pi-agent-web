@@ -39,8 +39,10 @@ CLI 只接受 `127.0.0.1`、`localhost` 或 `::1`。
 | `pnpm test:browser` | production build + packaged Chromium black-box | 无 |
 | `pnpm test:e2e` | `test:browser` 的用户友好别名 | 无 |
 | `pnpm test:pack` | 四 tarball → install → bin/npx help + bin 启动工作台 | 无 |
+| `pnpm test:compat` | 锁定 Pi 版本的 current/candidate fixture、resolver、adapter 与 upstream conformance | 无 |
 | `pnpm test:e2e:real` | 默认明确 skip；显式运行真实 Pi/provider compatibility | 有，release only |
 | `pnpm --filter @pi-agent-web/ui bench:conversation` | scheduler 与 Markdown benchmark | 无 |
+| `pnpm --filter @pi-agent-web/protocol bench:schema` | 产品/Pi wire 边界 schema 与 decoder benchmark | 无 |
 
 Focused Vitest 可以在 package 内传文件：
 
@@ -208,6 +210,12 @@ heap 测量。
 
 `pnpm build` 同时执行 gzip bundle 门禁：entry JavaScript ≤240 KiB、lazy settled-Markdown
 JavaScript ≤110 KiB、全部 UI CSS ≤12 KiB。需要单独复核已生成产物时可运行 `pnpm check:bundle`。
+
+Protocol schema benchmark 是兼容性升级 lane 的性能证据，不把跨机器的绝对延迟伪装成稳定门禁。
+在同一环境比较同名 fixture 时，升级候选的中位吞吐预算为不得比记录基线下降超过 20%；若超过预算，
+先检查 schema 是否重复遍历或把资源/语义校验错误地移入通用 validator，再决定是否晋级。当前 registry
+只做浅层 envelope 形状检查，UTF-8、item、depth、identity、resource budget 与脱敏仍由边界 guard 和
+PiHostAdapter 负责。
 
 ## 视觉验收
 

@@ -3,7 +3,12 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { PI_COMPATIBILITY_MATRIX, type PiRuntimeDiagnosticError, resolvePiRuntime } from "../src/resolver.js";
+import {
+	compatibilityForPiVersion,
+	PI_COMPATIBILITY_MATRIX,
+	type PiRuntimeDiagnosticError,
+	resolvePiRuntime,
+} from "../src/resolver.js";
 
 const tempRoots: string[] = [];
 
@@ -323,6 +328,18 @@ process.stdout.write("0.84.2\\n");
 		);
 	});
 
+	it("does not silently promote a bundled candidate", async () => {
+		const candidate = fakePiPackage("0.84.3");
+		await expectDiagnostic(
+			resolvePiRuntime({
+				env: { PATH: "" },
+				bundledEntryUrl: pathToFileURL(candidate.entry),
+				expectedBundledVersion: "0.84.3",
+			}),
+			"pi_version_not_promoted",
+		);
+	});
+
 	it("rejects versions absent from the compatibility matrix", async () => {
 		const entry = versionProbe(path.join(tempDir(), "unsupported.mjs"), "0.84.4");
 		await expectDiagnostic(resolvePiRuntime({ piPath: entry, env: { PATH: "" } }), "pi_version_unsupported");
@@ -352,5 +369,10 @@ describe("Pi compatibility matrix", () => {
 			adapterId: "legacy-rpc-v1",
 			capabilities: expect.arrayContaining(["rpc.toolcall_identity"]),
 		});
+	});
+
+	it("does not treat inherited property names as compatible versions", () => {
+		expect(compatibilityForPiVersion("__proto__")).toBeUndefined();
+		expect(compatibilityForPiVersion("constructor")).toBeUndefined();
 	});
 });

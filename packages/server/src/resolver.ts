@@ -22,6 +22,7 @@ export type PiRuntimeDiagnosticCode =
 	| "pi_probe_output_oversized"
 	| "pi_version_mismatch"
 	| "pi_version_unsupported"
+	| "pi_version_not_promoted"
 	| "pi_capability_missing"
 	| "protocol_incompatible";
 
@@ -343,7 +344,7 @@ function mapProbeError(error: unknown): never {
 }
 
 export function compatibilityForPiVersion(version: string): PiCompatibility | undefined {
-	return PI_COMPATIBILITY_MATRIX[version];
+	return Object.hasOwn(PI_COMPATIBILITY_MATRIX, version) ? PI_COMPATIBILITY_MATRIX[version] : undefined;
 }
 
 export function assertRequiredPiCapabilities(
@@ -387,6 +388,12 @@ export async function probePiRuntime(
 		throw diagnostic(
 			"pi_version_unsupported",
 			`Pi runtime ${version} is not supported by this Gateway build.`,
+		);
+	}
+	if (candidate.source === "bundled" && compatibility.status !== "current") {
+		throw diagnostic(
+			"pi_version_not_promoted",
+			"The bundled Pi runtime is reviewed only as a candidate and has not been promoted.",
 		);
 	}
 	assertRequiredPiCapabilities(compatibility, options.requiredCapabilities);

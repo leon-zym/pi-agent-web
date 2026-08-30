@@ -1,0 +1,7 @@
+{
+	"type": "extension_ui_request",
+	"id": "fixture-confirm",
+	"method": "confirm",
+	"title": "Continue?",
+	"message": "Compatibility fixture"
+}

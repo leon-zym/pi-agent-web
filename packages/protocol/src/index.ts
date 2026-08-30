@@ -1,5 +1,6 @@
 /** Browser-safe, product-owned WebSocket and REST DTOs shared by the gateway and UI. */
 
+import { PRODUCT_RUNTIME_SCHEMAS } from "./boundary-schemas.js";
 import {
 	isFutureExtensionUiRequestDto,
 	isFutureProductSessionEventDto,
@@ -64,6 +65,7 @@ import {
 	sessionHistoryMessagesBytes,
 } from "./session-history.js";
 
+export * from "./boundary-schemas.js";
 export * from "./future-logical-bytes.js";
 export * from "./future-product-decoders.js";
 export * from "./future-product-dto.js";
@@ -202,6 +204,7 @@ function isPromptLikeCommand(value: UnknownRecord, allowStreamingBehavior: boole
 }
 
 function isRpcCommand(value: unknown): value is SessionCommandDto {
+	if (!PRODUCT_RUNTIME_SCHEMAS.command.check(value)) return false;
 	if (!isRecord(value) || !isString(value.type, 64)) return false;
 
 	switch (value.type) {
@@ -348,6 +351,7 @@ export function isSessionReplayCursorDto(value: unknown): value is SessionReplay
 
 /** Strictly validate every Session browser frame before it reaches a runtime. */
 export function isSessionWsClientMessage(value: unknown): value is SessionWsClientMessage {
+	if (!PRODUCT_RUNTIME_SCHEMAS.wsClient.check(value)) return false;
 	if (!isRecord(value) || !isString(value.type, 64) || !isString(value.sessionHandle)) return false;
 	if (sessionWsClientMessageBytes(value) > SESSION_WS_CLIENT_MAX_BYTES) return false;
 
@@ -1214,6 +1218,7 @@ function isCanonicalSessionSnapshotDto(
 	value: unknown,
 	context?: SessionAttachmentGuardContext,
 ): value is SessionSnapshotDto {
+	if (!PRODUCT_RUNTIME_SCHEMAS.snapshot.check(value)) return false;
 	if (
 		!isRecord(value) ||
 		!hasOnlyKeys(value, [
@@ -1580,6 +1585,7 @@ export function isSessionWsServerMessage(
 	value: unknown,
 	context?: SessionAttachmentGuardContext,
 ): value is SessionWsServerMessage {
+	if (!PRODUCT_RUNTIME_SCHEMAS.wsServer.check(value)) return false;
 	if (!isRecord(value) || !isString(value.type, 64)) return false;
 	if (context !== undefined && !isSessionAttachmentGuardContext(context)) return false;
 	if (
@@ -1966,6 +1972,7 @@ function isCanonicalFutureSessionSnapshotDto(
 	value: unknown,
 	context: FutureSessionContentRefGuardContext,
 ): value is FutureSessionSnapshotDto {
+	if (!PRODUCT_RUNTIME_SCHEMAS.snapshot.check(value)) return false;
 	if (
 		!isRecord(value) ||
 		!hasOnlyKeys(value, [
@@ -2053,6 +2060,7 @@ export function isFutureSessionWsServerMessage(
 	value: unknown,
 	context?: FutureSessionContentRefGuardContext,
 ): value is FutureSessionWsServerMessage {
+	if (!PRODUCT_RUNTIME_SCHEMAS.wsServer.check(value)) return false;
 	if (!context || !isFutureSessionContentRefGuardContext(context) || !isRecord(value)) return false;
 	if (value.type === "session_snapshot") return isFutureSessionSnapshotDto(value, context);
 	if (

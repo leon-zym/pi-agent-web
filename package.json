@@ -14,6 +14,7 @@
 		"build": "pnpm -r build && pnpm check:bundle",
 		"test": "pnpm --filter @pi-agent-web/protocol build && pnpm --filter @pi-agent-web/server build && pnpm -r test",
 		"test:smoke": "pnpm --filter @pi-agent-web/server test:smoke",
+		"test:compat": "pnpm --filter @pi-agent-web/protocol build && pnpm --filter @pi-agent-web/server test:compat",
 		"test:e2e": "pnpm test:browser",
 		"test:e2e:real": "pnpm --filter @pi-agent-web/server test:e2e",
 		"test:browser": "pnpm build && playwright test --config tests/e2e/playwright.config.ts",

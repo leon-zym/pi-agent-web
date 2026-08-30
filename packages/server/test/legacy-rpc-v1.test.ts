@@ -698,7 +698,10 @@ describe("legacy-rpc-v1 adapter", () => {
 			"rpc.toolcall_identity",
 		]);
 		const capturedCandidateFrame = JSON.parse(
-			fs.readFileSync(new URL("./fixtures/pi-0.84.3-toolcall-start.json", import.meta.url), "utf8"),
+			fs.readFileSync(
+				new URL("./fixtures/pi-compatibility/0.84.3/event-toolcall-start.json", import.meta.url),
+				"utf8",
+			),
 		) as {
 			type: "message_update";
 			usage: typeof usage;
