@@ -4,11 +4,11 @@ import type {
 	SessionRuntimeIdentityDto,
 } from "@pi-agent-web/protocol";
 import { useEffect, useState } from "react";
-import type {
-	FutureSessionJsonRootProjection,
-	FutureSessionTextPayloadProjection,
-} from "../../lib/future-session-content-adapter";
 import { tt } from "../../lib/i18n";
+import type {
+	SessionJsonRootProjection,
+	SessionTextPayloadProjection,
+} from "../../lib/session-content-adapter";
 import { sessionTransport } from "../../stores/session-transport";
 import type { SessionTransportController } from "../../stores/session-transport-contract";
 import type { ContentBlock, UiToolResult } from "../../types/view-models";
@@ -16,16 +16,13 @@ import type { ContentBlock, UiToolResult } from "../../types/view-models";
 export type ToolCallBlock = Extract<ContentBlock, { type: "tool_call" }>;
 
 /** Transport-owned lazy content methods, kept narrow for injected test facades. */
-export type FutureContentTransportFacade = Pick<
-	SessionTransportController,
-	"resolveFutureText" | "resolveFutureJson"
->;
+export type ContentTransportFacade = Pick<SessionTransportController, "resolveText" | "resolveJson">;
 
 export interface LazyToolContentMaterializationInput {
 	identity: SessionRuntimeIdentityDto | null;
 	block: ToolCallBlock;
 	results: readonly UiToolResult[];
-	transport?: FutureContentTransportFacade;
+	transport?: ContentTransportFacade;
 	signal: AbortSignal;
 	/** Abort all sibling roots when one root fails. */
 	abortSiblings?: () => void;
@@ -116,39 +113,39 @@ function assertNotAborted(signal: AbortSignal): void {
 	if (signal.aborted) throw abortError();
 }
 
-function defaultFutureContentTransport(): FutureContentTransportFacade {
+function defaultContentTransport(): ContentTransportFacade {
 	return sessionTransport;
 }
 
-function resolveTransport(transport: FutureContentTransportFacade | undefined): FutureContentTransportFacade {
-	return transport ?? defaultFutureContentTransport();
+function resolveTransport(transport: ContentTransportFacade | undefined): ContentTransportFacade {
+	return transport ?? defaultContentTransport();
 }
 
 async function materializeTextProjection(
-	projection: FutureSessionTextPayloadProjection,
+	projection: SessionTextPayloadProjection,
 	identity: SessionRuntimeIdentityDto | null,
-	transport: FutureContentTransportFacade | undefined,
+	transport: ContentTransportFacade | undefined,
 	signal: AbortSignal,
 ): Promise<string> {
 	assertNotAborted(signal);
 	if (projection.kind === "inline") return projection.value;
 	if (!identity) throw new Error(tt("tool.executionError"));
-	const materialized = await resolveTransport(transport).resolveFutureText(identity, projection, signal);
+	const materialized = await resolveTransport(transport).resolveText(identity, projection, signal);
 	assertNotAborted(signal);
 	if (typeof materialized !== "string") throw new Error(tt("tool.executionError"));
 	return materialized;
 }
 
 async function materializeJsonProjection(
-	projection: FutureSessionJsonRootProjection,
+	projection: SessionJsonRootProjection,
 	identity: SessionRuntimeIdentityDto | null,
-	transport: FutureContentTransportFacade | undefined,
+	transport: ContentTransportFacade | undefined,
 	signal: AbortSignal,
 ): Promise<SessionJsonValueDto> {
 	assertNotAborted(signal);
 	if (projection.kind === "inline") return cloneJsonValue(projection.value);
 	if (!identity) throw new Error(tt("tool.executionError"));
-	const materialized = await resolveTransport(transport).resolveFutureJson(
+	const materialized = await resolveTransport(transport).resolveJson(
 		identity,
 		projection,
 		isJsonValue,
@@ -160,9 +157,9 @@ async function materializeJsonProjection(
 }
 
 async function materializeTextSequence(
-	payloads: readonly FutureSessionTextPayloadProjection[],
+	payloads: readonly SessionTextPayloadProjection[],
 	identity: SessionRuntimeIdentityDto | null,
-	transport: FutureContentTransportFacade | undefined,
+	transport: ContentTransportFacade | undefined,
 	signal: AbortSignal,
 ): Promise<string> {
 	const text: string[] = [];
@@ -182,7 +179,7 @@ function abortOnFailure<T>(promise: Promise<T>, abortSiblings: () => void): Prom
 async function materializeToolResult(
 	result: UiToolResult,
 	identity: SessionRuntimeIdentityDto | null,
-	transport: FutureContentTransportFacade | undefined,
+	transport: ContentTransportFacade | undefined,
 	signal: AbortSignal,
 	abortSiblings: () => void,
 ): Promise<UiToolResult> {
@@ -257,7 +254,7 @@ export function useLazyToolContent({
 	identity: SessionRuntimeIdentityDto | null;
 	block: ToolCallBlock;
 	results: readonly UiToolResult[];
-	transport?: FutureContentTransportFacade;
+	transport?: ContentTransportFacade;
 }): LazyToolContentState {
 	const [state, setState] = useState<LazyToolContentState>({ status: "idle" });
 

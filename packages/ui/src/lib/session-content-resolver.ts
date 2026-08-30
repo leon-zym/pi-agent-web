@@ -1,13 +1,13 @@
 import {
 	type ExtensionUiRequestDto,
-	type FutureExtensionUiRequestDto,
-	type FutureSessionContentRefGuardContext,
 	isExtensionUiRequestDto,
-	isFutureExtensionUiRequestDto,
-	isFutureSessionContentRefGuardContext,
+	isPiExtensionUiRequestDto,
+	isSessionContentRefGuardContext,
 	isSessionJsonRootDto,
 	isSessionTextPayloadDto,
+	type PiExtensionUiRequestDto,
 	type SessionContentRefDto,
+	type SessionContentRefGuardContext,
 	type SessionJsonRootDto,
 	type SessionTextPayloadDto,
 } from "@pi-agent-web/protocol";
@@ -22,7 +22,7 @@ export class SessionContentResolutionError extends Error {
 }
 
 export interface SessionContentResolverOptions {
-	trustedContext: FutureSessionContentRefGuardContext;
+	trustedContext: SessionContentRefGuardContext;
 	fetcher?: typeof fetch;
 	cacheLimits?: {
 		maxBytes: number;
@@ -38,9 +38,9 @@ export interface SessionContentResolver {
 		signal?: AbortSignal,
 	): Promise<T>;
 	materializeExtensionRequest(
-		request: FutureExtensionUiRequestDto,
+		request: ExtensionUiRequestDto,
 		signal?: AbortSignal,
-	): Promise<ExtensionUiRequestDto>;
+	): Promise<PiExtensionUiRequestDto>;
 	dispose(): void;
 }
 
@@ -159,7 +159,7 @@ async function decodeExactUtf8(response: Response, ref: SessionContentRefDto): P
 }
 
 class DefaultSessionContentResolver implements SessionContentResolver {
-	readonly #context: FutureSessionContentRefGuardContext;
+	readonly #context: SessionContentRefGuardContext;
 	readonly #fetcher: typeof fetch;
 	readonly #maxCacheBytes: number;
 	readonly #maxCacheItems: number;
@@ -171,7 +171,7 @@ class DefaultSessionContentResolver implements SessionContentResolver {
 	#disposed = false;
 
 	public constructor(options: SessionContentResolverOptions) {
-		if (!isFutureSessionContentRefGuardContext(options.trustedContext)) {
+		if (!isSessionContentRefGuardContext(options.trustedContext)) {
 			throw resolutionError("Session content resolver received an invalid trusted context");
 		}
 		const context = options.trustedContext;
@@ -234,12 +234,12 @@ class DefaultSessionContentResolver implements SessionContentResolver {
 	}
 
 	public async materializeExtensionRequest(
-		request: FutureExtensionUiRequestDto,
+		request: ExtensionUiRequestDto,
 		signal?: AbortSignal,
-	): Promise<ExtensionUiRequestDto> {
+	): Promise<PiExtensionUiRequestDto> {
 		this.#assertUsable(signal);
-		if (!isFutureExtensionUiRequestDto(request, this.#context)) {
-			throw resolutionError("Future Extension request failed its trusted context guard");
+		if (!isExtensionUiRequestDto(request, this.#context)) {
+			throw resolutionError(" Extension request failed its trusted context guard");
 		}
 		let candidate: unknown = request;
 		switch (request.method) {
@@ -263,7 +263,7 @@ class DefaultSessionContentResolver implements SessionContentResolver {
 				}
 				break;
 		}
-		if (!isExtensionUiRequestDto(candidate)) {
+		if (!isPiExtensionUiRequestDto(candidate)) {
 			throw resolutionError("Materialized Extension request failed its current field guard");
 		}
 		return candidate;

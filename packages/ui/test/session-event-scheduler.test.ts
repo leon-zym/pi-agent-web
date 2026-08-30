@@ -1,4 +1,4 @@
-import type { SessionEventDto } from "@pi-agent-web/protocol";
+import type { PiSessionEventDto } from "@pi-agent-web/protocol";
 import { describe, expect, it } from "vitest";
 import {
 	type CoalescibleMessageUpdate,
@@ -158,7 +158,7 @@ describe("SessionEventScheduler", () => {
 			{ type: "tool_execution_start", toolCallId: "tool-1", toolName: "bash", args: {} },
 			{ type: "turn_end", message: {}, toolResults: [] },
 			{ type: "agent_settled" },
-		] as SessionEventDto[];
+		] as PiSessionEventDto[];
 
 		expect(isCoalescibleMessageUpdate(delta("text_delta", 0, "x"))).toBe(true);
 		expect(isCoalescibleMessageUpdate(delta("thinking_delta", 0, "x"))).toBe(true);
@@ -301,7 +301,7 @@ describe("SessionEventScheduler", () => {
 			delta("toolcall_delta", 2, '{"path"'),
 			delta("toolcall_delta", 2, ':"x"}'),
 		];
-		const prefix = [{ type: "agent_start" }, { type: "turn_start" }] as SessionEventDto[];
+		const prefix = [{ type: "agent_start" }, { type: "turn_start" }] as PiSessionEventDto[];
 		const context = { now: 1_000 };
 		let sequential = createEmptyProjection("session-a");
 		for (const event of [...prefix, ...events]) sequential = reduceProjection(sequential, event, context);

@@ -1,4 +1,4 @@
-import type { SessionCommandDto, SessionCommandResponseDto, SessionStatsDto } from "@pi-agent-web/protocol";
+import type { PiSessionCommandResponseDto, SessionCommandDto, SessionStatsDto } from "@pi-agent-web/protocol";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { useComposerStore } from "../src/stores/composer";
 import { useModelDirectoryStore } from "../src/stores/model-directory";
@@ -8,8 +8,8 @@ import { useSlashCommandsStore } from "../src/stores/slash-commands";
 
 const originalTransport = sessionTransport.store.getState();
 
-function response(command: string, data: unknown): SessionCommandResponseDto {
-	return { type: "response", command, success: true, data } as SessionCommandResponseDto;
+function response(command: string, data: unknown): PiSessionCommandResponseDto {
+	return { type: "response", command, success: true, data } as PiSessionCommandResponseDto;
 }
 
 function model(sessionHandle: string) {

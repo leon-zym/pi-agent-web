@@ -1,4 +1,4 @@
-import type { SessionTreeNodeDto } from "@pi-agent-web/protocol";
+import type { PiSessionTreeNodeDto } from "@pi-agent-web/protocol";
 import { describe, expect, it } from "vitest";
 import {
 	activeTreeEntryIds,
@@ -11,9 +11,9 @@ import {
 function messageNode(
 	id: string,
 	parentId: string | null,
-	children: SessionTreeNodeDto[] = [],
+	children: PiSessionTreeNodeDto[] = [],
 	label?: string,
-): SessionTreeNodeDto {
+): PiSessionTreeNodeDto {
 	return {
 		entry: {
 			type: "message",
@@ -76,7 +76,7 @@ describe("conversation tree model", () => {
 	});
 
 	it("prioritizes the active root and caps the visual prefix in a deeply branched tree", () => {
-		const buildBranch = (level: number, parentId: string | null): SessionTreeNodeDto => {
+		const buildBranch = (level: number, parentId: string | null): PiSessionTreeNodeDto => {
 			const id = `active-${level}`;
 			if (level === 8) return messageNode(id, parentId);
 			return messageNode(id, parentId, [messageNode(`alternate-${level}`, id), buildBranch(level + 1, id)]);

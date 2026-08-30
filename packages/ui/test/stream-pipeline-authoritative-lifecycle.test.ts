@@ -1,4 +1,4 @@
-import type { NativeSessionDto, SessionRuntimeDto, SessionSnapshotDto } from "@pi-agent-web/protocol";
+import type { InlineSessionSnapshotDto, NativeSessionDto, SessionRuntimeDto } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api } from "../src/lib/api";
 import { initPipeline } from "../src/lib/stream-pipeline";
@@ -48,7 +48,7 @@ function nativeSession(sessionHandle: string, persisted: boolean): NativeSession
 	};
 }
 
-function snapshot(overrides: Partial<SessionSnapshotDto> = {}): SessionSnapshotDto {
+function snapshot(overrides: Partial<InlineSessionSnapshotDto> = {}): InlineSessionSnapshotDto {
 	const snapshotRuntime = runtime();
 	return {
 		type: "session_snapshot",

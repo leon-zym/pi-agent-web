@@ -1,4 +1,4 @@
-import type { SessionCommandResponseDto } from "@pi-agent-web/protocol";
+import type { PiSessionCommandResponseDto } from "@pi-agent-web/protocol";
 import { expectCommandData, type NativeSessionDto } from "@pi-agent-web/protocol";
 import { toast } from "sonner";
 import { serializeComposerMessage, useComposerStore } from "../stores/composer";
@@ -338,7 +338,7 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 
 	const images = submitted.images.length > 0 ? submitted.images : undefined;
 	try {
-		let response: SessionCommandResponseDto;
+		let response: PiSessionCommandResponseDto;
 		if (resolvedKind === "steer" || resolvedKind === "follow_up") {
 			composer.recordQueuedForSession(sessionHandle, text, resolvedKind);
 			response = await sendControlCommand(sessionHandle, {

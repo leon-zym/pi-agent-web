@@ -1,8 +1,8 @@
 import {
 	commandTimeoutMs,
 	type ExtensionUiResponseDto,
+	type PiSessionCommandResponseDto,
 	type SessionCommandDto,
-	type SessionCommandResponseDto,
 } from "@pi-agent-web/protocol";
 import { sessionTransport } from "../stores/session-transport";
 
@@ -11,7 +11,7 @@ export async function sendReadCommand(
 	sessionHandle: string,
 	command: SessionCommandDto,
 	timeoutMs = commandTimeoutMs(command.type),
-): Promise<SessionCommandResponseDto> {
+): Promise<PiSessionCommandResponseDto> {
 	return sessionTransport.store.getState().sendCommand(sessionHandle, command, timeoutMs);
 }
 
@@ -20,7 +20,7 @@ export async function sendControlCommand(
 	sessionHandle: string,
 	command: SessionCommandDto,
 	timeoutMs = commandTimeoutMs(command.type),
-): Promise<SessionCommandResponseDto> {
+): Promise<PiSessionCommandResponseDto> {
 	return sessionTransport.store.getState().sendCommand(sessionHandle, command, timeoutMs);
 }
 

@@ -1,9 +1,9 @@
 import {
-	FUTURE_SESSION_CONTENT_REF_BUDGET,
-	type FutureSessionContentRefGuardContext,
-	isExtensionUiRequestDto,
+	isPiExtensionUiRequestDto,
+	SESSION_CONTENT_REF_BUDGET,
 	SESSION_PAYLOAD_BUDGET,
 	type SessionContentRefDto,
+	type SessionContentRefGuardContext,
 	type SessionExternalJsonDto,
 	type SessionExternalTextDto,
 	type SessionInlineJsonDto,
@@ -11,35 +11,35 @@ import {
 } from "@pi-agent-web/protocol";
 import { describe, expect, it, vi } from "vitest";
 import {
-	createFutureSessionContentAdapter,
-	type FutureSessionContentAdapter,
-	type FutureSessionExtensionMaterializer,
-} from "../src/lib/future-session-content-adapter";
+	createSessionContentAdapter,
+	type SessionContentAdapter,
+	type SessionExtensionMaterializer,
+} from "../src/lib/session-content-adapter";
 import {
 	createSessionContentResolver,
 	SessionContentResolutionError,
 } from "../src/lib/session-content-resolver";
 
-const CONTENT_BYTES = FUTURE_SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes;
-const trustedContext: FutureSessionContentRefGuardContext = Object.freeze({
+const CONTENT_BYTES = SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes;
+const trustedContext: SessionContentRefGuardContext = Object.freeze({
 	serverEpoch: "stage6b3-content-epoch",
 	payloadBudget: SESSION_PAYLOAD_BUDGET,
-	contentRefBudget: FUTURE_SESSION_CONTENT_REF_BUDGET,
+	contentRefBudget: SESSION_CONTENT_REF_BUDGET,
 });
 
-type Stage6b3ContentAdapter = FutureSessionContentAdapter;
+type Stage6b3ContentAdapter = SessionContentAdapter;
 
-function isStage6b3ContentAdapter(value: FutureSessionContentAdapter): value is Stage6b3ContentAdapter {
+function isStage6b3ContentAdapter(value: SessionContentAdapter): value is Stage6b3ContentAdapter {
 	return (
 		typeof Reflect.get(value, "materializeTextPayload") === "function" &&
 		typeof Reflect.get(value, "materializeJsonRoot") === "function"
 	);
 }
 
-function stage6b3Adapter(resolver: FutureSessionExtensionMaterializer): Stage6b3ContentAdapter {
-	const adapter = createFutureSessionContentAdapter({ trustedContext, resolver });
+function stage6b3Adapter(resolver: SessionExtensionMaterializer): Stage6b3ContentAdapter {
+	const adapter = createSessionContentAdapter({ trustedContext, resolver });
 	if (!isStage6b3ContentAdapter(adapter)) {
-		throw new Error("Stage6b3 RED: future-session-content-adapter must expose text and JSON materializers");
+		throw new Error("Stage6b3 RED: session-content-adapter must expose text and JSON materializers");
 	}
 	return adapter;
 }
@@ -122,7 +122,7 @@ function isCurrentWidgetLines(value: unknown): value is string[] {
 		widgetKey: "stage6b3",
 		widgetLines: value,
 	};
-	if (!isExtensionUiRequestDto(candidate)) return false;
+	if (!isPiExtensionUiRequestDto(candidate)) return false;
 	return candidate.method === "setWidget" && candidate.widgetLines !== undefined;
 }
 

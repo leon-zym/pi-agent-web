@@ -1,67 +1,67 @@
 import {
-	type BlockingExtensionUiRequestDto,
 	type ExtensionUiRequestDto,
-	type FutureExtensionUiRequestDto,
-	type FutureExtensionUiSnapshotDto,
-	type FutureSessionContentRefGuardContext,
-	type FutureSessionReplayFrameDto,
-	type FutureSessionSnapshotDto,
+	type ExtensionUiSnapshotDto,
+	type InlineSessionReplayFrameDto,
 	isBoundedJsonValue,
-	isExtensionUiRequestDto,
-	isFutureSessionContentRefGuardContext,
-	isFutureSessionReplayFrameDto,
-	isFutureSessionSnapshotDto,
-	isFutureSessionWsServerMessage,
+	isPiExtensionUiRequestDto,
+	isSessionContentRefGuardContext,
 	isSessionJsonRootDto,
+	isSessionReplayFrameDto,
+	isSessionSnapshotDto,
 	isSessionTextPayloadDto,
+	isSessionWsServerMessage,
+	type PiBlockingExtensionUiRequestDto,
+	type PiExtensionUiRequestDto,
+	type PiStickyExtensionUiRequestDto,
+	type SessionContentRefGuardContext,
 	type SessionExternalJsonDto,
 	type SessionExternalTextDto,
 	type SessionJsonRootDto,
 	type SessionJsonValueDto,
 	type SessionReplayFrameDto,
+	type SessionSnapshotDto,
 	type SessionTextPayloadDto,
-	type StickyExtensionUiRequestDto,
 } from "@pi-agent-web/protocol";
 
-export type FutureSessionTextPayloadProjection =
+export type SessionTextPayloadProjection =
 	| { kind: "inline"; value: string }
 	| { kind: "external"; value: SessionExternalTextDto };
 
-export type FutureSessionJsonRootProjection =
+export type SessionJsonRootProjection =
 	| { kind: "inline"; value: SessionJsonValueDto }
 	| { kind: "external"; value: SessionExternalJsonDto };
 
-export type FutureSessionJsonFieldGuard<T> = (value: unknown) => value is T;
+export type SessionJsonFieldGuard<T> = (value: unknown) => value is T;
 
-export type ProjectedFutureSessionReplayFrame =
-	| Exclude<FutureSessionReplayFrameDto, { type: "extension_ui_request" }>
-	| Extract<SessionReplayFrameDto, { type: "extension_ui_request" }>;
+export type ProjectedSessionReplayFrame =
+	| Exclude<SessionReplayFrameDto, { type: "extension_ui_request" }>
+	| Extract<InlineSessionReplayFrameDto, { type: "extension_ui_request" }>;
 
-export interface ProjectedFutureSessionSnapshot
-	extends Omit<FutureSessionSnapshotDto, "pendingExtensionRequests" | "stickyExtensionState"> {
-	pendingExtensionRequests: BlockingExtensionUiRequestDto[];
-	stickyExtensionState: StickyExtensionUiRequestDto[];
+export interface ProjectedSessionSnapshot
+	extends Omit<SessionSnapshotDto, "pendingExtensionRequests" | "stickyExtensionState"> {
+	pendingExtensionRequests: PiBlockingExtensionUiRequestDto[];
+	stickyExtensionState: PiStickyExtensionUiRequestDto[];
 }
 
-export interface ProjectedFutureExtensionUiSnapshot extends Omit<FutureExtensionUiSnapshotDto, "requests"> {
-	requests: ExtensionUiRequestDto[];
+export interface ProjectedExtensionUiSnapshot extends Omit<ExtensionUiSnapshotDto, "requests"> {
+	requests: PiExtensionUiRequestDto[];
 }
 
-export type ProjectedFutureSessionFrameMessage =
-	| ProjectedFutureSessionReplayFrame
-	| ProjectedFutureSessionSnapshot
-	| ProjectedFutureExtensionUiSnapshot;
+export type ProjectedSessionFrameMessage =
+	| ProjectedSessionReplayFrame
+	| ProjectedSessionSnapshot
+	| ProjectedExtensionUiSnapshot;
 
-export class FutureSessionContentAdapterError extends Error {
+export class SessionContentAdapterError extends Error {
 	public constructor(message: string, options?: ErrorOptions) {
 		super(message, options);
-		this.name = "FutureSessionContentAdapterError";
+		this.name = "SessionContentAdapterError";
 	}
 }
 
-export interface FutureSessionContentAdapter {
-	projectTextPayload(value: unknown): FutureSessionTextPayloadProjection;
-	projectJsonRoot(value: unknown): FutureSessionJsonRootProjection;
+export interface SessionContentAdapter {
+	projectTextPayload(value: unknown): SessionTextPayloadProjection;
+	projectJsonRoot(value: unknown): SessionJsonRootProjection;
 	materializeTextPayload(value: unknown, signal?: AbortSignal): Promise<string>;
 	materializeJsonRoot(value: unknown, signal?: AbortSignal): Promise<SessionJsonValueDto>;
 	materializeJsonRoot(
@@ -71,75 +71,70 @@ export interface FutureSessionContentAdapter {
 	): Promise<SessionJsonValueDto>;
 	materializeJsonRoot<T>(
 		value: unknown,
-		fieldGuard: FutureSessionJsonFieldGuard<T>,
+		fieldGuard: SessionJsonFieldGuard<T>,
 		signal?: AbortSignal,
 	): Promise<T>;
-	materializeReplayFrame(frame: unknown, signal?: AbortSignal): Promise<ProjectedFutureSessionReplayFrame>;
+	materializeReplayFrame(frame: unknown, signal?: AbortSignal): Promise<ProjectedSessionReplayFrame>;
 	materializeReplayFrames(
 		frames: readonly unknown[],
 		signal?: AbortSignal,
-	): Promise<ProjectedFutureSessionReplayFrame[]>;
-	materializeSnapshot(snapshot: unknown, signal?: AbortSignal): Promise<ProjectedFutureSessionSnapshot>;
+	): Promise<ProjectedSessionReplayFrame[]>;
+	materializeSnapshot(snapshot: unknown, signal?: AbortSignal): Promise<ProjectedSessionSnapshot>;
 	materializeExtensionSnapshot(
 		snapshot: unknown,
 		signal?: AbortSignal,
-	): Promise<ProjectedFutureExtensionUiSnapshot>;
+	): Promise<ProjectedExtensionUiSnapshot>;
 }
 
-export interface FutureSessionContentAdapterOptions {
-	trustedContext: FutureSessionContentRefGuardContext;
-	resolver: FutureSessionExtensionMaterializer;
+export interface SessionContentAdapterOptions {
+	trustedContext: SessionContentRefGuardContext;
+	resolver: SessionExtensionMaterializer;
 }
 
-export interface FutureSessionExtensionMaterializer {
-	materializeExtensionRequest(request: FutureExtensionUiRequestDto, signal?: AbortSignal): Promise<unknown>;
+export interface SessionExtensionMaterializer {
+	materializeExtensionRequest(request: ExtensionUiRequestDto, signal?: AbortSignal): Promise<unknown>;
 	/** Optional during the staged rollout; required only for external lazy roots. */
 	resolveText?(value: SessionTextPayloadDto, signal?: AbortSignal): Promise<string>;
 	resolveJson?<T>(
 		value: SessionJsonRootDto,
-		guard: FutureSessionJsonFieldGuard<T>,
+		guard: SessionJsonFieldGuard<T>,
 		signal?: AbortSignal,
 	): Promise<T>;
 }
 
-function adapterError(message: string): FutureSessionContentAdapterError {
-	return new FutureSessionContentAdapterError(message);
+function adapterError(message: string): SessionContentAdapterError {
+	return new SessionContentAdapterError(message);
 }
 
 function abortError(): DOMException {
-	return new DOMException("Future Session content adaptation was aborted", "AbortError");
+	return new DOMException("Session content adaptation was aborted", "AbortError");
 }
 
-function boundedJsonFieldGuard<T>(
-	fieldGuard: FutureSessionJsonFieldGuard<T>,
-): FutureSessionJsonFieldGuard<T> {
+function boundedJsonFieldGuard<T>(fieldGuard: SessionJsonFieldGuard<T>): SessionJsonFieldGuard<T> {
 	return (value): value is T => isBoundedJsonValue(value) && fieldGuard(value);
 }
 
-function textPayloadRoot(
-	value: unknown,
-	context: FutureSessionContentRefGuardContext,
-): SessionTextPayloadDto {
+function textPayloadRoot(value: unknown, context: SessionContentRefGuardContext): SessionTextPayloadDto {
 	if (!isSessionTextPayloadDto(value, context)) {
-		throw adapterError("Future Session text payload failed its exact context guard");
+		throw adapterError("Session text payload failed its exact context guard");
 	}
 	return value;
 }
 
-function jsonRoot(value: unknown, context: FutureSessionContentRefGuardContext): SessionJsonRootDto {
+function jsonRoot(value: unknown, context: SessionContentRefGuardContext): SessionJsonRootDto {
 	if (!isSessionJsonRootDto(value, context)) {
-		throw adapterError("Future Session JSON root failed its exact context guard");
+		throw adapterError("Session JSON root failed its exact context guard");
 	}
 	return value;
 }
 
-class DefaultFutureSessionContentAdapter implements FutureSessionContentAdapter {
-	readonly #context: FutureSessionContentRefGuardContext;
-	readonly #resolver: FutureSessionExtensionMaterializer;
+class DefaultSessionContentAdapter implements SessionContentAdapter {
+	readonly #context: SessionContentRefGuardContext;
+	readonly #resolver: SessionExtensionMaterializer;
 
-	public constructor(options: FutureSessionContentAdapterOptions) {
-		if (!isFutureSessionContentRefGuardContext(options.trustedContext)) {
-			throw adapterError("Future Session content adapter received an invalid trusted context");
+	public constructor(options: SessionContentAdapterOptions) {
+		if (!isSessionContentRefGuardContext(options.trustedContext)) {
+			throw adapterError("Session content adapter received an invalid trusted context");
 		}
 		this.#context = Object.freeze({
 			serverEpoch: options.trustedContext.serverEpoch,
@@ -149,16 +144,16 @@ class DefaultFutureSessionContentAdapter implements FutureSessionContentAdapter 
 		this.#resolver = options.resolver;
 	}
 
-	public projectTextPayload(value: unknown): FutureSessionTextPayloadProjection {
+	public projectTextPayload(value: unknown): SessionTextPayloadProjection {
 		if (!isSessionTextPayloadDto(value, this.#context)) {
-			throw adapterError("Future Session text payload failed its exact context guard");
+			throw adapterError("Session text payload failed its exact context guard");
 		}
 		return typeof value === "string" ? { kind: "inline", value } : { kind: "external", value };
 	}
 
-	public projectJsonRoot(value: unknown): FutureSessionJsonRootProjection {
+	public projectJsonRoot(value: unknown): SessionJsonRootProjection {
 		if (!isSessionJsonRootDto(value, this.#context)) {
-			throw adapterError("Future Session JSON root failed its exact context guard");
+			throw adapterError("Session JSON root failed its exact context guard");
 		}
 		return value.type === "inline_json"
 			? { kind: "inline", value: value.value }
@@ -175,7 +170,7 @@ class DefaultFutureSessionContentAdapter implements FutureSessionContentAdapter 
 		const materialized = await this.#resolveText(root, signal);
 		this.#assertNotAborted(signal);
 		if (typeof materialized !== "string") {
-			throw adapterError("Materialized Future Session text is not a string");
+			throw adapterError("Materialized Session text is not a string");
 		}
 		return materialized;
 	}
@@ -188,12 +183,12 @@ class DefaultFutureSessionContentAdapter implements FutureSessionContentAdapter 
 	): Promise<SessionJsonValueDto>;
 	public materializeJsonRoot<T>(
 		value: unknown,
-		fieldGuard: FutureSessionJsonFieldGuard<T>,
+		fieldGuard: SessionJsonFieldGuard<T>,
 		signal?: AbortSignal,
 	): Promise<T>;
 	public async materializeJsonRoot<T>(
 		value: unknown,
-		fieldGuardOrSignal?: FutureSessionJsonFieldGuard<T> | AbortSignal,
+		fieldGuardOrSignal?: SessionJsonFieldGuard<T> | AbortSignal,
 		signal?: AbortSignal,
 	): Promise<SessionJsonValueDto | T> {
 		const resolvedSignal =
@@ -213,25 +208,25 @@ class DefaultFutureSessionContentAdapter implements FutureSessionContentAdapter 
 	public async materializeReplayFrame(
 		frame: unknown,
 		signal?: AbortSignal,
-	): Promise<ProjectedFutureSessionReplayFrame> {
+	): Promise<ProjectedSessionReplayFrame> {
 		this.#assertNotAborted(signal);
-		if (!isFutureSessionReplayFrameDto(frame, this.#context)) {
-			throw adapterError("Future Session replay frame failed its exact context guard");
+		if (!isSessionReplayFrameDto(frame, this.#context)) {
+			throw adapterError("Session replay frame failed its exact context guard");
 		}
 		if (frame.type !== "extension_ui_request") return frame;
 		const request = this.#assertMaterializedCurrentRequest(
 			await this.#resolver.materializeExtensionRequest(frame.request, signal),
 		);
-		const candidate: ProjectedFutureSessionReplayFrame = { ...frame, request };
+		const candidate: ProjectedSessionReplayFrame = { ...frame, request };
 		return candidate;
 	}
 
 	public async materializeReplayFrames(
 		frames: readonly unknown[],
 		signal?: AbortSignal,
-	): Promise<ProjectedFutureSessionReplayFrame[]> {
+	): Promise<ProjectedSessionReplayFrame[]> {
 		this.#assertNotAborted(signal);
-		const projected: ProjectedFutureSessionReplayFrame[] = [];
+		const projected: ProjectedSessionReplayFrame[] = [];
 		for (const frame of frames) projected.push(await this.materializeReplayFrame(frame, signal));
 		return projected;
 	}
@@ -239,12 +234,12 @@ class DefaultFutureSessionContentAdapter implements FutureSessionContentAdapter 
 	public async materializeSnapshot(
 		snapshot: unknown,
 		signal?: AbortSignal,
-	): Promise<ProjectedFutureSessionSnapshot> {
+	): Promise<ProjectedSessionSnapshot> {
 		this.#assertNotAborted(signal);
-		if (!isFutureSessionSnapshotDto(snapshot, this.#context)) {
-			throw adapterError("Future Session snapshot failed its exact context guard");
+		if (!isSessionSnapshotDto(snapshot, this.#context)) {
+			throw adapterError("Session snapshot failed its exact context guard");
 		}
-		const pendingExtensionRequests: BlockingExtensionUiRequestDto[] = [];
+		const pendingExtensionRequests: PiBlockingExtensionUiRequestDto[] = [];
 		for (const request of snapshot.pendingExtensionRequests) {
 			const materialized = this.#assertMaterializedCurrentRequest(
 				await this.#resolver.materializeExtensionRequest(request, signal),
@@ -259,7 +254,7 @@ class DefaultFutureSessionContentAdapter implements FutureSessionContentAdapter 
 			}
 			pendingExtensionRequests.push(materialized);
 		}
-		const stickyExtensionState: StickyExtensionUiRequestDto[] = [];
+		const stickyExtensionState: PiStickyExtensionUiRequestDto[] = [];
 		for (const request of snapshot.stickyExtensionState) {
 			const materialized = this.#assertMaterializedCurrentRequest(
 				await this.#resolver.materializeExtensionRequest(request, signal),
@@ -274,7 +269,7 @@ class DefaultFutureSessionContentAdapter implements FutureSessionContentAdapter 
 			}
 			stickyExtensionState.push(materialized);
 		}
-		const candidate: ProjectedFutureSessionSnapshot = {
+		const candidate: ProjectedSessionSnapshot = {
 			...snapshot,
 			pendingExtensionRequests,
 			stickyExtensionState,
@@ -285,15 +280,12 @@ class DefaultFutureSessionContentAdapter implements FutureSessionContentAdapter 
 	public async materializeExtensionSnapshot(
 		snapshot: unknown,
 		signal?: AbortSignal,
-	): Promise<ProjectedFutureExtensionUiSnapshot> {
+	): Promise<ProjectedExtensionUiSnapshot> {
 		this.#assertNotAborted(signal);
-		if (
-			!isFutureSessionWsServerMessage(snapshot, this.#context) ||
-			snapshot.type !== "extension_ui_snapshot"
-		) {
-			throw adapterError("Future Extension snapshot failed its exact context guard");
+		if (!isSessionWsServerMessage(snapshot, this.#context) || snapshot.type !== "extension_ui_snapshot") {
+			throw adapterError(" Extension snapshot failed its exact context guard");
 		}
-		const requests: ExtensionUiRequestDto[] = [];
+		const requests: PiExtensionUiRequestDto[] = [];
 		for (const request of snapshot.requests) {
 			requests.push(
 				this.#assertMaterializedCurrentRequest(
@@ -301,18 +293,18 @@ class DefaultFutureSessionContentAdapter implements FutureSessionContentAdapter 
 				),
 			);
 		}
-		const candidate: ProjectedFutureExtensionUiSnapshot = { ...snapshot, requests };
+		const candidate: ProjectedExtensionUiSnapshot = { ...snapshot, requests };
 		return candidate;
 	}
 
 	async #materializeJsonRoot<T>(
 		root: SessionJsonRootDto,
-		fieldGuard: FutureSessionJsonFieldGuard<T>,
+		fieldGuard: SessionJsonFieldGuard<T>,
 		signal?: AbortSignal,
 	): Promise<T> {
 		if (root.type === "inline_json") {
 			if (!fieldGuard(root.value)) {
-				throw adapterError("Materialized Future Session JSON failed its field guard");
+				throw adapterError("Materialized Session JSON failed its field guard");
 			}
 			const materialized = structuredClone(root.value);
 			this.#assertNotAborted(signal);
@@ -321,7 +313,7 @@ class DefaultFutureSessionContentAdapter implements FutureSessionContentAdapter 
 		const materialized = await this.#resolveJson(root, fieldGuard, signal);
 		this.#assertNotAborted(signal);
 		if (!fieldGuard(materialized)) {
-			throw adapterError("Materialized Future Session JSON failed its field guard");
+			throw adapterError("Materialized Session JSON failed its field guard");
 		}
 		return materialized;
 	}
@@ -329,19 +321,19 @@ class DefaultFutureSessionContentAdapter implements FutureSessionContentAdapter 
 	async #resolveText(value: SessionTextPayloadDto, signal?: AbortSignal): Promise<string> {
 		const resolver = this.#resolver;
 		if (typeof resolver.resolveText !== "function") {
-			throw adapterError("Future Session content resolver cannot materialize external text");
+			throw adapterError("Session content resolver cannot materialize external text");
 		}
 		return resolver.resolveText(value, signal);
 	}
 
 	async #resolveJson<T>(
 		value: SessionJsonRootDto,
-		fieldGuard: FutureSessionJsonFieldGuard<T>,
+		fieldGuard: SessionJsonFieldGuard<T>,
 		signal?: AbortSignal,
 	): Promise<T> {
 		const resolver = this.#resolver;
 		if (typeof resolver.resolveJson !== "function") {
-			throw adapterError("Future Session content resolver cannot materialize external JSON");
+			throw adapterError("Session content resolver cannot materialize external JSON");
 		}
 		return resolver.resolveJson(value, fieldGuard, signal);
 	}
@@ -350,16 +342,14 @@ class DefaultFutureSessionContentAdapter implements FutureSessionContentAdapter 
 		if (signal?.aborted) throw abortError();
 	}
 
-	#assertMaterializedCurrentRequest(value: unknown): ExtensionUiRequestDto {
-		if (!isExtensionUiRequestDto(value)) {
+	#assertMaterializedCurrentRequest(value: unknown): PiExtensionUiRequestDto {
+		if (!isPiExtensionUiRequestDto(value)) {
 			throw adapterError("Materialized Extension request failed its current guard");
 		}
 		return value;
 	}
 }
 
-export function createFutureSessionContentAdapter(
-	options: FutureSessionContentAdapterOptions,
-): FutureSessionContentAdapter {
-	return new DefaultFutureSessionContentAdapter(options);
+export function createSessionContentAdapter(options: SessionContentAdapterOptions): SessionContentAdapter {
+	return new DefaultSessionContentAdapter(options);
 }

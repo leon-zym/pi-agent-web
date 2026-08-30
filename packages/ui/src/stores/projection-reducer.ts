@@ -1,19 +1,16 @@
 import {
-	type FutureProductSessionEventDto,
-	type FutureSessionMessageDto,
 	isSessionContentRefDto,
-	type SessionEventDto,
+	type PiSessionEventDto,
+	type PiSessionMessageDto,
+	type ProductSessionEventDto,
 	type SessionExternalJsonDto,
 	type SessionExternalTextDto,
 	type SessionImageContentDto,
 	type SessionJsonValueDto,
 	type SessionMessageDto,
 } from "@pi-agent-web/protocol";
-import type {
-	FutureSessionJsonRootProjection,
-	FutureSessionTextPayloadProjection,
-} from "../lib/future-session-content-adapter";
 import { tt } from "../lib/i18n";
+import type { SessionJsonRootProjection, SessionTextPayloadProjection } from "../lib/session-content-adapter";
 import { presentUserMessage, serializePresentedUserMessage } from "../lib/user-message-presentation";
 import type {
 	AssistantStep,
@@ -62,14 +59,14 @@ type ContentBlockLite = {
 	redacted?: boolean;
 };
 
-export type ProjectionSessionEvent = SessionEventDto | FutureProductSessionEventDto;
+export type ProjectionSessionEvent = PiSessionEventDto | ProductSessionEventDto;
 type ProjectionMessageStartEvent = {
 	type: "message_start";
-	message: SessionMessageDto | FutureSessionMessageDto;
+	message: PiSessionMessageDto | SessionMessageDto;
 };
 type ProjectionMessageEndEvent = {
 	type: "message_end";
-	message: SessionMessageDto | FutureSessionMessageDto;
+	message: PiSessionMessageDto | SessionMessageDto;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -107,13 +104,13 @@ function isExternalJson(value: unknown): value is SessionExternalJsonDto {
 	);
 }
 
-function projectFutureTextPayload(value: unknown): FutureSessionTextPayloadProjection {
+function projectTextPayload(value: unknown): SessionTextPayloadProjection {
 	if (typeof value === "string") return { kind: "inline", value };
 	if (isExternalText(value)) return { kind: "external", value };
-	throw new Error("Future Session text payload lost its trusted root shape");
+	throw new Error("Session text payload lost its trusted root shape");
 }
 
-function projectFutureJsonRoot(value: unknown): FutureSessionJsonRootProjection {
+function projectJsonRoot(value: unknown): SessionJsonRootProjection {
 	if (
 		isRecord(value) &&
 		value.type === "inline_json" &&
@@ -123,35 +120,35 @@ function projectFutureJsonRoot(value: unknown): FutureSessionJsonRootProjection 
 		return { kind: "inline", value: value.value };
 	}
 	if (isExternalJson(value)) return { kind: "external", value };
-	throw new Error("Future Session JSON payload lost its trusted root shape");
+	throw new Error("Session JSON payload lost its trusted root shape");
 }
 
 export function projectProjectionJsonValue(
 	value: unknown,
 	productMode: SessionFrameProductMode | undefined,
-): { value: unknown; payload?: FutureSessionJsonRootProjection } {
+): { value: unknown; payload?: SessionJsonRootProjection } {
 	if (productMode !== "future") return { value };
-	const payload = projectFutureJsonRoot(value);
+	const payload = projectJsonRoot(value);
 	return { value: payload.kind === "inline" ? payload.value : undefined, payload };
 }
 
 export function projectProjectionTextValue(
 	value: unknown,
 	productMode: SessionFrameProductMode | undefined,
-): { text: string; payload?: FutureSessionTextPayloadProjection } {
+): { text: string; payload?: SessionTextPayloadProjection } {
 	if (productMode !== "future") return { text: typeof value === "string" ? value : "" };
-	const payload = projectFutureTextPayload(value);
+	const payload = projectTextPayload(value);
 	return { text: payload.kind === "inline" ? payload.value : "", payload };
 }
 
 export function projectProjectionTextSequence(
 	content: unknown,
 	productMode: SessionFrameProductMode | undefined,
-): { text: string; payloads?: FutureSessionTextPayloadProjection[] } {
+): { text: string; payloads?: SessionTextPayloadProjection[] } {
 	if (typeof content === "string") return { text: content };
 	if (!Array.isArray(content)) return { text: "" };
 	const text: string[] = [];
-	const payloads: FutureSessionTextPayloadProjection[] = [];
+	const payloads: SessionTextPayloadProjection[] = [];
 	for (const block of content) {
 		if (!isRecord(block) || block.type !== "text") continue;
 		const projected = projectProjectionTextValue(block.text, productMode);

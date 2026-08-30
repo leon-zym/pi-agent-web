@@ -1,40 +1,39 @@
 import {
-	FUTURE_SESSION_CONTENT_REF_BUDGET,
-	type FutureSessionCommandResponseDto,
-	type FutureSessionContentRefGuardContext,
-	type FutureSessionEntryDto,
-	type FutureSessionMessageDto,
-	type FutureSessionReplayFrameDto,
-	type FutureSessionResponseFrameDto,
-	type FutureSessionSnapshotDto,
-	GATEWAY_CONTENT_REF_PROTOCOL_MINOR,
 	GATEWAY_PROTOCOL_VERSION,
 	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
-	type GatewayContentRefServerHelloDto,
+	type GatewayServerHelloDto,
+	type InlineSessionSnapshotDto,
+	type InlineSessionWsServerMessage,
+	SESSION_CONTENT_REF_BUDGET,
 	SESSION_PAYLOAD_BUDGET,
 	SESSION_WS_CLIENT_MAX_BYTES,
+	type SessionCommandResponseDto,
+	type SessionContentRefGuardContext,
+	type SessionEntryDto,
 	type SessionExternalTextDto,
+	type SessionMessageDto,
+	type SessionReplayFrameDto,
+	type SessionResponseFrameDto,
 	type SessionRuntimeDto,
 	type SessionSnapshotDto,
 	type SessionTextPayloadDto,
-	type SessionWsServerMessage,
 } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-	createFutureSessionContentAdapter,
-	type FutureSessionContentAdapter,
-	type FutureSessionExtensionMaterializer,
-} from "../src/lib/future-session-content-adapter";
+	createSessionContentAdapter,
+	type SessionContentAdapter,
+	type SessionExtensionMaterializer,
+} from "../src/lib/session-content-adapter";
 import {
 	createSessionTransport,
-	type FutureSessionContentAdapterFactory,
+	type SessionContentAdapterFactory,
 	type SessionTransportController,
 	type SessionWebSocket,
 } from "../src/stores/session-transport";
 
 const FUTURE_EPOCH = "future-server-epoch";
 
-class FutureSocket implements SessionWebSocket {
+class Socket implements SessionWebSocket {
 	readyState = 0;
 	onopen: (() => void) | null = null;
 	onclose: (() => void) | null = null;
@@ -62,17 +61,17 @@ class FutureSocket implements SessionWebSocket {
 	}
 }
 
-interface FutureHarness {
+interface Harness {
 	controller: SessionTransportController;
-	socket: FutureSocket;
+	socket: Socket;
 }
 
 const controllers: SessionTransportController[] = [];
 
-function futureServerHello(): GatewayContentRefServerHelloDto {
+function futureServerHello(): GatewayServerHelloDto {
 	return {
 		type: "server_hello",
-		protocol: { major: GATEWAY_PROTOCOL_VERSION.major, minor: GATEWAY_CONTENT_REF_PROTOCOL_MINOR },
+		protocol: { major: GATEWAY_PROTOCOL_VERSION.major, minor: GATEWAY_PROTOCOL_VERSION.minor },
 		serverBuild: "future-test-server",
 		serverEpoch: FUTURE_EPOCH,
 		piVersion: "0.84.2",
@@ -84,11 +83,11 @@ function futureServerHello(): GatewayContentRefServerHelloDto {
 			maxExtensionRequests: 256,
 		},
 		payloadBudget: SESSION_PAYLOAD_BUDGET,
-		contentRefBudget: FUTURE_SESSION_CONTENT_REF_BUDGET,
+		contentRefBudget: SESSION_CONTENT_REF_BUDGET,
 	};
 }
 
-function futureInventory(): Extract<SessionWsServerMessage, { type: "hot_runtime_inventory" }> {
+function futureInventory(): Extract<InlineSessionWsServerMessage, { type: "hot_runtime_inventory" }> {
 	return { type: "hot_runtime_inventory", serverEpoch: FUTURE_EPOCH, revision: 0, runtimes: [] };
 }
 
@@ -108,7 +107,7 @@ function futureRuntime(sessionHandle: string, generation = 1, lastSeq = 0): Sess
 	};
 }
 
-function futureBaselineSnapshot(sessionHandle: string, generation: number): FutureSessionSnapshotDto {
+function futureBaselineSnapshot(sessionHandle: string, generation: number): SessionSnapshotDto {
 	const runtimeValue = futureRuntime(sessionHandle, generation, 0);
 	return {
 		type: "session_snapshot",
@@ -135,13 +134,13 @@ function futureTextRef(sha256: string): SessionExternalTextDto {
 			type: "content_ref",
 			serverEpoch: FUTURE_EPOCH,
 			sha256,
-			byteLength: FUTURE_SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes,
+			byteLength: SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes,
 			encoding: "utf-8",
 		},
 	};
 }
 
-function futureToolResult(): Extract<FutureSessionMessageDto, { role: "toolResult" }> {
+function futureToolResult(): Extract<SessionMessageDto, { role: "toolResult" }> {
 	return {
 		role: "toolResult",
 		toolCallId: "future-call",
@@ -152,7 +151,7 @@ function futureToolResult(): Extract<FutureSessionMessageDto, { role: "toolResul
 	};
 }
 
-function futureCustomEntry(): Extract<FutureSessionEntryDto, { type: "custom_message" }> {
+function futureCustomEntry(): Extract<SessionEntryDto, { type: "custom_message" }> {
 	return {
 		type: "custom_message",
 		id: "future-entry",
@@ -164,12 +163,8 @@ function futureCustomEntry(): Extract<FutureSessionEntryDto, { type: "custom_mes
 	};
 }
 
-function messagesResponse(
-	id: string,
-	barrierSeq: number,
-	sessionHandle: string,
-): FutureSessionResponseFrameDto {
-	const response: FutureSessionCommandResponseDto = {
+function messagesResponse(id: string, barrierSeq: number, sessionHandle: string): SessionResponseFrameDto {
+	const response: SessionCommandResponseDto = {
 		id,
 		type: "response",
 		command: "get_messages",
@@ -186,12 +181,8 @@ function messagesResponse(
 	};
 }
 
-function entriesResponse(
-	id: string,
-	barrierSeq: number,
-	sessionHandle: string,
-): FutureSessionResponseFrameDto {
-	const response: FutureSessionCommandResponseDto = {
+function entriesResponse(id: string, barrierSeq: number, sessionHandle: string): SessionResponseFrameDto {
+	const response: SessionCommandResponseDto = {
 		id,
 		type: "response",
 		command: "get_entries",
@@ -208,8 +199,8 @@ function entriesResponse(
 	};
 }
 
-function treeResponse(id: string, barrierSeq: number, sessionHandle: string): FutureSessionResponseFrameDto {
-	const response: FutureSessionCommandResponseDto = {
+function treeResponse(id: string, barrierSeq: number, sessionHandle: string): SessionResponseFrameDto {
+	const response: SessionCommandResponseDto = {
 		id,
 		type: "response",
 		command: "get_tree",
@@ -234,7 +225,7 @@ function forkResponse(
 	barrierSeq: number,
 	sessionHandle: string,
 	previousSessionHandle: string,
-): FutureSessionResponseFrameDto {
+): SessionResponseFrameDto {
 	return {
 		type: "response",
 		serverEpoch: FUTURE_EPOCH,
@@ -252,7 +243,7 @@ function forkResponse(
 	};
 }
 
-function futureEvent(sessionHandle: string, seq: number): FutureSessionReplayFrameDto {
+function futureEvent(sessionHandle: string, seq: number): SessionReplayFrameDto {
 	return {
 		type: "event",
 		serverEpoch: FUTURE_EPOCH,
@@ -264,20 +255,20 @@ function futureEvent(sessionHandle: string, seq: number): FutureSessionReplayFra
 	};
 }
 
-function makeFactory(resolveText: NonNullable<FutureSessionExtensionMaterializer["resolveText"]>): {
-	factory: FutureSessionContentAdapterFactory;
-	contexts: Readonly<FutureSessionContentRefGuardContext>[];
+function makeFactory(resolveText: NonNullable<SessionExtensionMaterializer["resolveText"]>): {
+	factory: SessionContentAdapterFactory;
+	contexts: Readonly<SessionContentRefGuardContext>[];
 	dispose: ReturnType<typeof vi.fn>;
 } {
-	const contexts: Readonly<FutureSessionContentRefGuardContext>[] = [];
+	const contexts: Readonly<SessionContentRefGuardContext>[] = [];
 	const dispose = vi.fn();
-	const factory: FutureSessionContentAdapterFactory = (context) => {
+	const factory: SessionContentAdapterFactory = (context) => {
 		contexts.push(context);
-		const resolver: FutureSessionExtensionMaterializer = {
+		const resolver: SessionExtensionMaterializer = {
 			materializeExtensionRequest: async (request) => request,
 			resolveText,
 		};
-		const adapter: FutureSessionContentAdapter = createFutureSessionContentAdapter({
+		const adapter: SessionContentAdapter = createSessionContentAdapter({
 			trustedContext: context,
 			resolver,
 		});
@@ -286,8 +277,8 @@ function makeFactory(resolveText: NonNullable<FutureSessionExtensionMaterializer
 	return { factory, contexts, dispose };
 }
 
-function makeFutureHarness(factory: FutureSessionContentAdapterFactory): FutureHarness {
-	const socket = new FutureSocket();
+function makeHarness(factory: SessionContentAdapterFactory): Harness {
+	const socket = new Socket();
 	const controller = createSessionTransport({
 		createSocket: () => socket,
 		url: () => "ws://stage7.test/api/v1/ws",
@@ -302,15 +293,15 @@ function makeFutureHarness(factory: FutureSessionContentAdapterFactory): FutureH
 	return { controller, socket };
 }
 
-function ingestFuture(
+function ingest(
 	controller: SessionTransportController,
-	message: Parameters<SessionTransportController["ingestFutureFrameMessage"]>[0],
+	message: Parameters<SessionTransportController["ingestFrameMessage"]>[0],
 ): boolean {
 	const rawWireBytes = new TextEncoder().encode(JSON.stringify(message)).byteLength;
-	return controller.ingestFutureFrameMessage(message, rawWireBytes);
+	return controller.ingestFrameMessage(message, rawWireBytes);
 }
 
-function prime(harness: FutureHarness, sessionHandle: string): void {
+function prime(harness: Harness, sessionHandle: string): void {
 	const { controller } = harness;
 	controller.store.getState().subscribeSession(sessionHandle);
 	const currentRuntime = futureRuntime(sessionHandle);
@@ -329,7 +320,7 @@ function prime(harness: FutureHarness, sessionHandle: string): void {
 		generation: 1,
 		requests: [],
 	});
-	const snapshot: SessionSnapshotDto = {
+	const snapshot: InlineSessionSnapshotDto = {
 		type: "session_snapshot",
 		snapshotId: `snapshot-${sessionHandle}`,
 		serverEpoch: FUTURE_EPOCH,
@@ -365,7 +356,7 @@ describe("Stage 7B future history materialization", () => {
 				return "materialized-history";
 			});
 			const probe = makeFactory(resolveText);
-			const harness = makeFutureHarness(probe.factory);
+			const harness = makeHarness(probe.factory);
 			prime(harness, "session-history");
 			const pending = harness.controller.store
 				.getState()
@@ -416,7 +407,7 @@ describe("Stage 7B future history materialization", () => {
 			await gate;
 			return "deduplicated";
 		});
-		const harness = makeFutureHarness(makeFactory(resolveText).factory);
+		const harness = makeHarness(makeFactory(resolveText).factory);
 		prime(harness, "session-dedupe");
 		const pending = harness.controller.store
 			.getState()
@@ -436,7 +427,7 @@ describe("Stage 7B future history materialization", () => {
 	});
 
 	it("accepts a future fork response after the command rekeys to its child Session", async () => {
-		const harness = makeFutureHarness(makeFactory(async () => "child editor").factory);
+		const harness = makeHarness(makeFactory(async () => "child editor").factory);
 		prime(harness, "session-parent");
 		harness.socket.receive({
 			type: "lease_status",
@@ -465,7 +456,7 @@ describe("Stage 7B future history materialization", () => {
 			reason: "generation_changed",
 		});
 		expect(
-			ingestFuture(harness.controller, forkResponse("future-fork", 0, "session-child", "session-parent")),
+			ingest(harness.controller, forkResponse("future-fork", 0, "session-child", "session-parent")),
 		).toBe(true);
 		await flushPromises();
 		let settled = false;
@@ -480,7 +471,7 @@ describe("Stage 7B future history materialization", () => {
 		await flushPromises();
 		expect(settled).toBe(false);
 
-		expect(ingestFuture(harness.controller, futureBaselineSnapshot("session-child", 2))).toBe(true);
+		expect(ingest(harness.controller, futureBaselineSnapshot("session-child", 2))).toBe(true);
 		await expect(pending).resolves.toMatchObject({ id: "future-fork", success: true });
 	});
 
@@ -490,7 +481,7 @@ describe("Stage 7B future history materialization", () => {
 			throw new Error("content 410");
 		});
 		const probe = makeFactory(resolveText);
-		const harness = makeFutureHarness(probe.factory);
+		const harness = makeHarness(probe.factory);
 		prime(harness, "session-failure");
 		let recoveryObserved = false;
 		harness.controller.store.subscribe((state) => {
@@ -525,7 +516,7 @@ describe("Stage 7B future history materialization", () => {
 				if (materializerSignal?.aborted) throw new DOMException("aborted", "AbortError");
 				return "late-history";
 			});
-			const harness = makeFutureHarness(makeFactory(resolveText).factory);
+			const harness = makeHarness(makeFactory(resolveText).factory);
 			prime(harness, `session-${commandType}`);
 			const sessionHandle = `session-${commandType}`;
 			const id = `identity-${commandType}`;
@@ -555,8 +546,8 @@ describe("Stage 7B future history materialization", () => {
 
 describe("Stage 7D future hello-scoped install", () => {
 	it("fails closed when a custom factory returns a malformed installation", () => {
-		const socket = new FutureSocket();
-		const malformedFactory = (() => undefined) as unknown as FutureSessionContentAdapterFactory;
+		const socket = new Socket();
+		const malformedFactory = (() => undefined) as unknown as SessionContentAdapterFactory;
 		const controller = createSessionTransport({
 			createSocket: () => socket,
 			url: () => "ws://stage7.test/api/v1/ws",
@@ -574,7 +565,7 @@ describe("Stage 7D future hello-scoped install", () => {
 	it("freezes the negotiated context, installs once, and disposes on disconnect", () => {
 		const resolveText = vi.fn(async () => "installed");
 		const probe = makeFactory(resolveText);
-		const harness = makeFutureHarness(probe.factory);
+		const harness = makeHarness(probe.factory);
 
 		expect(probe.contexts).toHaveLength(1);
 		const context = probe.contexts[0];

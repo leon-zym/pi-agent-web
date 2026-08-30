@@ -1,35 +1,35 @@
 import {
-	FUTURE_SESSION_CONTENT_REF_BUDGET,
-	type FutureExtensionUiSnapshotDto,
-	type FutureSessionContentRefGuardContext,
-	type FutureSessionMessageDto,
-	type FutureSessionReplayFrameDto,
-	type FutureSessionSnapshotDto,
+	type ExtensionUiSnapshotDto,
 	isExtensionUiRequestDto,
-	isFutureExtensionUiRequestDto,
-	isFutureSessionMessageDto,
-	isFutureSessionProjectionEventDto,
-	isFutureSessionReplayFrameDto,
-	isFutureSessionSnapshotDto,
+	isPiExtensionUiRequestDto,
+	isSessionMessageDto,
+	isSessionProjectionEventDto,
+	isSessionReplayFrameDto,
 	isSessionRuntimeDto,
+	isSessionSnapshotDto,
+	SESSION_CONTENT_REF_BUDGET,
 	SESSION_PAYLOAD_BUDGET,
 	type SessionContentRefDto,
+	type SessionContentRefGuardContext,
 	type SessionExternalJsonDto,
 	type SessionExternalTextDto,
+	type SessionMessageDto,
+	type SessionReplayFrameDto,
+	type SessionSnapshotDto,
 } from "@pi-agent-web/protocol";
 import { describe, expect, it, vi } from "vitest";
 import {
-	createFutureSessionContentAdapter,
-	FutureSessionContentAdapterError,
-	type FutureSessionExtensionMaterializer,
-} from "../src/lib/future-session-content-adapter";
+	createSessionContentAdapter,
+	SessionContentAdapterError,
+	type SessionExtensionMaterializer,
+} from "../src/lib/session-content-adapter";
 import { createSessionContentResolver } from "../src/lib/session-content-resolver";
 
-const CONTENT_BYTES = FUTURE_SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes;
-const trustedContext: FutureSessionContentRefGuardContext = Object.freeze({
+const CONTENT_BYTES = SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes;
+const trustedContext: SessionContentRefGuardContext = Object.freeze({
 	serverEpoch: "future-content-epoch",
 	payloadBudget: SESSION_PAYLOAD_BUDGET,
-	contentRefBudget: FUTURE_SESSION_CONTENT_REF_BUDGET,
+	contentRefBudget: SESSION_CONTENT_REF_BUDGET,
 });
 const identity = Object.freeze({
 	serverEpoch: trustedContext.serverEpoch,
@@ -78,7 +78,7 @@ function response(text: string): Response {
 	});
 }
 
-function futureToolResult(id: string, details: SessionExternalJsonDto): FutureSessionMessageDto {
+function futureToolResult(id: string, details: SessionExternalJsonDto): SessionMessageDto {
 	return {
 		role: "toolResult",
 		toolCallId: id,
@@ -90,11 +90,11 @@ function futureToolResult(id: string, details: SessionExternalJsonDto): FutureSe
 	};
 }
 
-function extensionFrame(request: FutureSessionReplayFrameDto & { type: "extension_ui_request" }) {
+function extensionFrame(request: SessionReplayFrameDto & { type: "extension_ui_request" }) {
 	return request;
 }
 
-function fakeMaterializer(value: unknown): FutureSessionExtensionMaterializer {
+function fakeMaterializer(value: unknown): SessionExtensionMaterializer {
 	return {
 		async materializeExtensionRequest() {
 			return value;
@@ -102,7 +102,7 @@ function fakeMaterializer(value: unknown): FutureSessionExtensionMaterializer {
 	};
 }
 
-function minimalSnapshot(): FutureSessionSnapshotDto {
+function minimalSnapshot(): SessionSnapshotDto {
 	return {
 		...identity,
 		type: "session_snapshot",
@@ -139,7 +139,7 @@ describe("future Session content adapter", () => {
 		const text = paddedText("editor-prefill");
 		const fetcher = vi.fn(async () => response(text));
 		const resolver = createSessionContentResolver({ trustedContext, fetcher });
-		const adapter = createFutureSessionContentAdapter({ trustedContext, resolver });
+		const adapter = createSessionContentAdapter({ trustedContext, resolver });
 		const frame = extensionFrame({
 			...identity,
 			type: "extension_ui_request",
@@ -163,17 +163,17 @@ describe("future Session content adapter", () => {
 			request: { id: "editor-live", method: "editor", prefill: text },
 		});
 		if (projected.type !== "extension_ui_request") throw new Error("Extension frame was not retained");
-		expect(isExtensionUiRequestDto(projected.request)).toBe(true);
-		expect(isFutureSessionReplayFrameDto(projected, trustedContext)).toBe(false);
+		expect(isPiExtensionUiRequestDto(projected.request)).toBe(true);
+		expect(isSessionReplayFrameDto(projected, trustedContext)).toBe(false);
 		resolver.dispose();
 	});
 
 	it("keeps non-Extension tool refs lazy while projecting inline JSON only at its selected root", async () => {
 		const fetcher = vi.fn(async () => new Response(null, { status: 500 }));
 		const resolver = createSessionContentResolver({ trustedContext, fetcher });
-		const adapter = createFutureSessionContentAdapter({ trustedContext, resolver });
+		const adapter = createSessionContentAdapter({ trustedContext, resolver });
 		const args = externalJson("b");
-		const frame: FutureSessionReplayFrameDto = {
+		const frame: SessionReplayFrameDto = {
 			...identity,
 			type: "event",
 			seq: 5,
@@ -209,7 +209,7 @@ describe("future Session content adapter", () => {
 
 	it("projects inline text synchronously and retains an external text wrapper for lazy consumers", () => {
 		const resolver = createSessionContentResolver({ trustedContext, fetcher: async () => response("") });
-		const adapter = createFutureSessionContentAdapter({ trustedContext, resolver });
+		const adapter = createSessionContentAdapter({ trustedContext, resolver });
 		const deferred = externalText("d");
 
 		expect(adapter.projectTextPayload("inline")).toEqual({ kind: "inline", value: "inline" });
@@ -229,10 +229,10 @@ describe("future Session content adapter", () => {
 			return body === undefined ? new Response(null, { status: 404 }) : response(body);
 		});
 		const resolver = createSessionContentResolver({ trustedContext, fetcher });
-		const adapter = createFutureSessionContentAdapter({ trustedContext, resolver });
+		const adapter = createSessionContentAdapter({ trustedContext, resolver });
 		const lazyDetails = externalJson("1");
 		const toolResult = futureToolResult("snapshot-tool", lazyDetails);
-		const snapshot: FutureSessionSnapshotDto = {
+		const snapshot: SessionSnapshotDto = {
 			...identity,
 			type: "session_snapshot",
 			snapshotId: "snapshot-future-content",
@@ -281,12 +281,12 @@ describe("future Session content adapter", () => {
 			],
 		};
 
-		expect(isFutureSessionProjectionEventDto(snapshot.projectionEvents[0], trustedContext)).toBe(true);
-		expect(isFutureSessionMessageDto(toolResult, trustedContext)).toBe(true);
+		expect(isSessionProjectionEventDto(snapshot.projectionEvents[0], trustedContext)).toBe(true);
+		expect(isSessionMessageDto(toolResult, trustedContext)).toBe(true);
 		expect(isSessionRuntimeDto(snapshot.runtime)).toBe(true);
-		expect(isFutureExtensionUiRequestDto(snapshot.pendingExtensionRequests[0], trustedContext)).toBe(true);
-		expect(isFutureExtensionUiRequestDto(snapshot.stickyExtensionState[0], trustedContext)).toBe(true);
-		expect(isFutureSessionSnapshotDto(snapshot, trustedContext)).toBe(true);
+		expect(isExtensionUiRequestDto(snapshot.pendingExtensionRequests[0], trustedContext)).toBe(true);
+		expect(isExtensionUiRequestDto(snapshot.stickyExtensionState[0], trustedContext)).toBe(true);
+		expect(isSessionSnapshotDto(snapshot, trustedContext)).toBe(true);
 		const projected = await adapter.materializeSnapshot(snapshot);
 
 		expect(projected.pendingExtensionRequests).toEqual([
@@ -298,7 +298,7 @@ describe("future Session content adapter", () => {
 		expect(projected.settledMessages).toBe(snapshot.settledMessages);
 		expect(projected.projectionEvents).toBe(snapshot.projectionEvents);
 		expect(fetcher).toHaveBeenCalledTimes(2);
-		expect(isFutureSessionSnapshotDto(projected, trustedContext)).toBe(false);
+		expect(isSessionSnapshotDto(projected, trustedContext)).toBe(false);
 		resolver.dispose();
 	});
 
@@ -308,8 +308,8 @@ describe("future Session content adapter", () => {
 		const bodies = [first, second];
 		const fetcher = vi.fn(async () => response(bodies.shift() ?? ""));
 		const resolver = createSessionContentResolver({ trustedContext, fetcher });
-		const adapter = createFutureSessionContentAdapter({ trustedContext, resolver });
-		const snapshot: FutureExtensionUiSnapshotDto = {
+		const adapter = createSessionContentAdapter({ trustedContext, resolver });
+		const snapshot: ExtensionUiSnapshotDto = {
 			type: "extension_ui_snapshot",
 			serverEpoch: trustedContext.serverEpoch,
 			sessionHandle: identity.sessionHandle,
@@ -346,8 +346,8 @@ describe("future Session content adapter", () => {
 		const bodies = [first, second];
 		const fetcher = vi.fn(async () => response(bodies.shift() ?? ""));
 		const resolver = createSessionContentResolver({ trustedContext, fetcher });
-		const adapter = createFutureSessionContentAdapter({ trustedContext, resolver });
-		const frames: FutureSessionReplayFrameDto[] = [
+		const adapter = createSessionContentAdapter({ trustedContext, resolver });
+		const frames: SessionReplayFrameDto[] = [
 			extensionFrame({
 				...identity,
 				type: "extension_ui_request",
@@ -395,7 +395,7 @@ describe("future Session content adapter", () => {
 				});
 			},
 		});
-		const adapter = createFutureSessionContentAdapter({ trustedContext, resolver });
+		const adapter = createSessionContentAdapter({ trustedContext, resolver });
 		const controller = new AbortController();
 		const pending = adapter.materializeReplayFrame(
 			extensionFrame({
@@ -422,7 +422,7 @@ describe("future Session content adapter", () => {
 	it("fails closed against the exact trusted context before materialization", async () => {
 		const fetcher = vi.fn(async () => response(paddedText("unreachable")));
 		const resolver = createSessionContentResolver({ trustedContext, fetcher });
-		const adapter = createFutureSessionContentAdapter({ trustedContext, resolver });
+		const adapter = createSessionContentAdapter({ trustedContext, resolver });
 		const wrongEpoch: unknown = {
 			...identity,
 			serverEpoch: "other-epoch",
@@ -437,14 +437,14 @@ describe("future Session content adapter", () => {
 		};
 
 		await expect(adapter.materializeReplayFrame(wrongEpoch)).rejects.toBeInstanceOf(
-			FutureSessionContentAdapterError,
+			SessionContentAdapterError,
 		);
 		expect(fetcher).not.toHaveBeenCalled();
 		resolver.dispose();
 	});
 
 	it("rejects a malformed current request returned while materializing a Session snapshot", async () => {
-		const adapter = createFutureSessionContentAdapter({
+		const adapter = createSessionContentAdapter({
 			trustedContext,
 			resolver: fakeMaterializer({
 				type: "extension_ui_request",
@@ -454,12 +454,12 @@ describe("future Session content adapter", () => {
 		});
 
 		await expect(adapter.materializeSnapshot(minimalSnapshot())).rejects.toBeInstanceOf(
-			FutureSessionContentAdapterError,
+			SessionContentAdapterError,
 		);
 	});
 
 	it("rejects a malformed current request returned while materializing an Extension snapshot", async () => {
-		const snapshot: FutureExtensionUiSnapshotDto = {
+		const snapshot: ExtensionUiSnapshotDto = {
 			type: "extension_ui_snapshot",
 			serverEpoch: trustedContext.serverEpoch,
 			sessionHandle: identity.sessionHandle,
@@ -473,7 +473,7 @@ describe("future Session content adapter", () => {
 				},
 			],
 		};
-		const adapter = createFutureSessionContentAdapter({
+		const adapter = createSessionContentAdapter({
 			trustedContext,
 			resolver: fakeMaterializer({
 				type: "extension_ui_request",
@@ -483,7 +483,7 @@ describe("future Session content adapter", () => {
 		});
 
 		await expect(adapter.materializeExtensionSnapshot(snapshot)).rejects.toBeInstanceOf(
-			FutureSessionContentAdapterError,
+			SessionContentAdapterError,
 		);
 	});
 });

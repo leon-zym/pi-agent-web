@@ -7,15 +7,15 @@ import type {
 } from "@pi-agent-web/protocol";
 import { describe, expect, it } from "vitest";
 import {
+	type ContentTransportFacade,
 	createSessionRuntimeIdentity,
-	type FutureContentTransportFacade,
 	materializeLazyToolContent,
 	type ToolCallBlock,
 } from "../src/features/conversation/use-lazy-tool-content";
 import type {
-	FutureSessionJsonRootProjection,
-	FutureSessionTextPayloadProjection,
-} from "../src/lib/future-session-content-adapter";
+	SessionJsonRootProjection,
+	SessionTextPayloadProjection,
+} from "../src/lib/session-content-adapter";
 import type { UiToolResult } from "../src/types/view-models";
 
 const runtime: SessionRuntimeDto = {
@@ -73,7 +73,7 @@ function toolBlock(overrides: Partial<ToolCallBlock> = {}): ToolCallBlock {
 	};
 }
 
-function fakeTransport(textRequests: string[], jsonRequests: string[]): FutureContentTransportFacade {
+function fakeTransport(textRequests: string[], jsonRequests: string[]): ContentTransportFacade {
 	const jsonValues = new Map<string, SessionJsonValueDto>([
 		["a", { command: "echo materialized" }],
 		["b", { partial: "partial materialized" }],
@@ -82,18 +82,18 @@ function fakeTransport(textRequests: string[], jsonRequests: string[]): FutureCo
 	]);
 
 	return {
-		resolveFutureText: async (
+		resolveText: async (
 			_identity: SessionRuntimeIdentityDto,
-			payload: FutureSessionTextPayloadProjection,
+			payload: SessionTextPayloadProjection,
 			_signal?: AbortSignal,
 		): Promise<string> => {
 			if (payload.kind !== "external") throw new Error("text fixture was unexpectedly inline");
 			textRequests.push(payload.value.ref.sha256[0] ?? "missing");
 			return `text-${payload.value.ref.sha256[0] ?? "missing"}`;
 		},
-		resolveFutureJson: async <T>(
+		resolveJson: async <T>(
 			_identity: SessionRuntimeIdentityDto,
-			payload: FutureSessionJsonRootProjection,
+			payload: SessionJsonRootProjection,
 			guard: (value: unknown) => value is T,
 			_signal?: AbortSignal,
 		): Promise<T> => {
@@ -156,11 +156,11 @@ describe("lazy tool content consumers", () => {
 
 	it("aborts sibling roots when one parallel materialization fails", async () => {
 		let siblingSignal: AbortSignal | undefined;
-		const transport: FutureContentTransportFacade = {
-			resolveFutureText: async () => "unused",
-			resolveFutureJson: async <T>(
+		const transport: ContentTransportFacade = {
+			resolveText: async () => "unused",
+			resolveJson: async <T>(
 				_identity: SessionRuntimeIdentityDto,
-				payload: FutureSessionJsonRootProjection,
+				payload: SessionJsonRootProjection,
 				guard: (value: unknown) => value is T,
 				signal?: AbortSignal,
 			): Promise<T> => {

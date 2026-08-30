@@ -5,8 +5,8 @@
  */
 
 import {
+	type PiSessionCommandResponseDto,
 	RpcError,
-	type SessionCommandResponseDto,
 	type SessionPayloadAdmissionErrorDto,
 } from "@pi-agent-web/protocol";
 import type { Dictionary } from "./i18n";
@@ -181,7 +181,7 @@ export function displayPayloadAdmissionError(error: SessionPayloadAdmissionError
 }
 
 export function displayCommandResponseError(
-	response: Extract<SessionCommandResponseDto, { success: false }>,
+	response: Extract<PiSessionCommandResponseDto, { success: false }>,
 ): string {
 	return response.admissionError
 		? displayPayloadAdmissionError(response.admissionError)

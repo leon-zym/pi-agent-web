@@ -1,8 +1,8 @@
 import {
-	FUTURE_SESSION_CONTENT_REF_BUDGET,
-	type FutureSessionContentRefGuardContext,
+	SESSION_CONTENT_REF_BUDGET,
 	SESSION_PAYLOAD_BUDGET,
 	type SessionContentRefDto,
+	type SessionContentRefGuardContext,
 	type SessionExternalJsonDto,
 	type SessionExternalTextDto,
 	type SessionJsonValueDto,
@@ -13,11 +13,11 @@ import {
 	SessionContentResolutionError,
 } from "../src/lib/session-content-resolver";
 
-const CONTENT_BYTES = FUTURE_SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes;
-const trustedContext: FutureSessionContentRefGuardContext = Object.freeze({
+const CONTENT_BYTES = SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes;
+const trustedContext: SessionContentRefGuardContext = Object.freeze({
 	serverEpoch: "content-epoch",
 	payloadBudget: SESSION_PAYLOAD_BUDGET,
-	contentRefBudget: FUTURE_SESSION_CONTENT_REF_BUDGET,
+	contentRefBudget: SESSION_CONTENT_REF_BUDGET,
 });
 
 function ref(digest: string, byteLength = CONTENT_BYTES): SessionContentRefDto {

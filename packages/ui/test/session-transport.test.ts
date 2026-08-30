@@ -1,27 +1,29 @@
 import {
 	type ExtensionUiRequestDto,
-	FUTURE_SESSION_CONTENT_REF_BUDGET,
-	type FutureExtensionUiRequestDto,
-	type FutureSessionContentRefGuardContext,
-	type FutureSessionMessageDto,
-	type FutureSessionReplayFrameDto,
-	type FutureSessionSnapshotBeginDto,
-	type FutureSessionSnapshotChunkDto,
-	type FutureSessionSnapshotDto,
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
 	GATEWAY_SESSION_HISTORY_CAPABILITY,
 	type GatewayClientHelloDto,
 	type GatewayProtocolErrorDto,
 	type GatewayServerHelloDto,
+	type InlineSessionHistoryPageChunkDto,
+	type InlineSessionReplayFrameDto,
+	type InlineSessionSnapshotBeginDto,
+	type InlineSessionSnapshotChunkDto,
+	type InlineSessionSnapshotDto,
+	type InlineSessionWsServerMessage,
 	type NativeSessionDto,
-	type ProductSessionEventDto,
+	type PiExtensionUiRequestDto,
+	type PiProductSessionEventDto,
+	type PiSessionCommandResponseDto,
+	type PiSessionMessageDto,
+	SESSION_CONTENT_REF_BUDGET,
 	SESSION_PAYLOAD_BUDGET,
 	SESSION_WS_CLIENT_MAX_BYTES,
 	SESSION_WS_SERVER_MAX_BYTES,
-	type SessionCommandResponseDto,
+	type SessionContentRefGuardContext,
 	type SessionHistoryPageBeginDto,
-	type SessionHistoryPageChunkDto,
 	type SessionHistoryPageEndDto,
 	type SessionMessageDto,
 	type SessionReplayFrameDto,
@@ -31,17 +33,16 @@ import {
 	type SessionSnapshotDto,
 	type SessionSnapshotEndDto,
 	type SessionWsClientMessage,
-	type SessionWsServerMessage,
 	sessionHistoryChecksum,
 	sessionHistoryMessagesBytes,
 } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-	createFutureSessionContentAdapter,
-	type FutureSessionContentAdapter,
-	type FutureSessionExtensionMaterializer,
-} from "../src/lib/future-session-content-adapter";
 import { sessionDeleteCapability } from "../src/lib/session-capabilities";
+import {
+	createSessionContentAdapter,
+	type SessionContentAdapter,
+	type SessionExtensionMaterializer,
+} from "../src/lib/session-content-adapter";
 import { isCoalescibleMessageUpdate } from "../src/lib/session-event-scheduler";
 import {
 	createSessionTransport,
@@ -79,7 +80,9 @@ class FakeSocket implements SessionWebSocket {
 		}
 	}
 
-	serverMessage(message: SessionWsServerMessage | GatewayServerHelloDto | GatewayProtocolErrorDto): void {
+	serverMessage(
+		message: InlineSessionWsServerMessage | GatewayServerHelloDto | GatewayProtocolErrorDto,
+	): void {
 		this.onmessage?.({ data: JSON.stringify(message) });
 	}
 
@@ -94,22 +97,19 @@ class FakeSocket implements SessionWebSocket {
 	}
 }
 
-function serverHello(overrides: Partial<GatewayServerHelloDto> = {}): GatewayServerHelloDto {
+type ServerHelloOverrides = Omit<Partial<GatewayServerHelloDto>, "protocol"> & {
+	protocol?: { major: number; minor: number };
+};
+
+function serverHello(overrides: ServerHelloOverrides = {}): GatewayServerHelloDto {
 	return {
 		type: "server_hello",
-		protocol: { major: 1, minor: 2 },
+		protocol: { major: 1, minor: 3 },
 		serverBuild: "9.7.0-independent-server",
 		serverEpoch: "test-server-epoch",
 		piVersion: "0.84.2",
 		adapterId: "pi-rpc",
-		capabilities: [
-			"rpc.commands",
-			"rpc.events",
-			"rpc.extension_ui",
-			"session.multiplex",
-			GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
-			GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
-		],
+		capabilities: [...GATEWAY_SERVER_REQUIRED_CAPABILITIES],
 		limits: {
 			maxClientFrameBytes: 8 * 1024 * 1024,
 			maxSnapshotFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes,
@@ -117,12 +117,13 @@ function serverHello(overrides: Partial<GatewayServerHelloDto> = {}): GatewaySer
 		},
 		payloadBudget: SESSION_PAYLOAD_BUDGET,
 		...overrides,
-	};
+		contentRefBudget: overrides.contentRefBudget ?? SESSION_CONTENT_REF_BUDGET,
+	} as GatewayServerHelloDto;
 }
 
 function hotInventory(
-	overrides: Partial<Extract<SessionWsServerMessage, { type: "hot_runtime_inventory" }>> = {},
-): Extract<SessionWsServerMessage, { type: "hot_runtime_inventory" }> {
+	overrides: Partial<Extract<InlineSessionWsServerMessage, { type: "hot_runtime_inventory" }>> = {},
+): Extract<InlineSessionWsServerMessage, { type: "hot_runtime_inventory" }> {
 	return {
 		type: "hot_runtime_inventory",
 		serverEpoch: "test-server-epoch",
@@ -148,15 +149,14 @@ function harness(
 		reconnectBaseMs?: number;
 		helloTimeoutMs?: number;
 		clientBuild?: string;
-		protocolVersion?: { major: number; minor: number };
-		onResyncRequired?: (message: Extract<SessionWsServerMessage, { type: "resync_required" }>) => void;
+		onResyncRequired?: (message: Extract<InlineSessionWsServerMessage, { type: "resync_required" }>) => void;
 		resyncClock?: {
 			now: () => number;
 			setTimeout: (callback: () => void, delayMs: number) => unknown;
 			clearTimeout: (timer: unknown) => void;
 		};
 		resyncRandom?: () => number;
-		futureContentAdapter?: FutureSessionContentAdapter;
+		futureContentAdapter?: SessionContentAdapter;
 	} = {},
 ): Harness {
 	const sockets: FakeSocket[] = [];
@@ -168,7 +168,6 @@ function harness(
 			return socket;
 		},
 		url: () => "ws://session-transport.test/api/v1/ws",
-		protocolVersion: { major: 1, minor: 2 },
 		now: () => {
 			clock += 1;
 			return clock;
@@ -179,16 +178,16 @@ function harness(
 	return { controller, sockets };
 }
 
-const futureContentContext: FutureSessionContentRefGuardContext = Object.freeze({
+const futureContentContext: SessionContentRefGuardContext = Object.freeze({
 	serverEpoch: "test-server-epoch",
 	payloadBudget: SESSION_PAYLOAD_BUDGET,
-	contentRefBudget: FUTURE_SESSION_CONTENT_REF_BUDGET,
+	contentRefBudget: SESSION_CONTENT_REF_BUDGET,
 });
 
 function futureAdapter(
-	materializeExtensionRequest: FutureSessionExtensionMaterializer["materializeExtensionRequest"],
-): FutureSessionContentAdapter {
-	return createFutureSessionContentAdapter({
+	materializeExtensionRequest: SessionExtensionMaterializer["materializeExtensionRequest"],
+): SessionContentAdapter {
+	return createSessionContentAdapter({
 		trustedContext: futureContentContext,
 		resolver: { materializeExtensionRequest },
 	});
@@ -199,7 +198,7 @@ function futureSetEditorFrame(
 	generation: number,
 	seq: number,
 	id: string,
-): Extract<FutureSessionReplayFrameDto, { type: "extension_ui_request" }> {
+): Extract<SessionReplayFrameDto, { type: "extension_ui_request" }> {
 	return {
 		type: "extension_ui_request",
 		serverEpoch: "test-server-epoch",
@@ -217,7 +216,7 @@ function futureSetEditorFrame(
 					type: "content_ref",
 					serverEpoch: "test-server-epoch",
 					sha256: "a".repeat(64),
-					byteLength: FUTURE_SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes,
+					byteLength: SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes,
 					encoding: "utf-8",
 				},
 			},
@@ -229,7 +228,7 @@ function futureEventFrame(
 	sessionHandle: string,
 	generation: number,
 	seq: number,
-): Extract<FutureSessionReplayFrameDto, { type: "event" }> {
+): Extract<SessionReplayFrameDto, { type: "event" }> {
 	return {
 		type: "event",
 		serverEpoch: "test-server-epoch",
@@ -245,7 +244,7 @@ function futureToolEventFrame(
 	sessionHandle: string,
 	generation: number,
 	seq: number,
-): Extract<FutureSessionReplayFrameDto, { type: "event" }> {
+): Extract<SessionReplayFrameDto, { type: "event" }> {
 	return {
 		type: "event",
 		serverEpoch: "test-server-epoch",
@@ -263,7 +262,7 @@ function futureToolEventFrame(
 					type: "content_ref",
 					serverEpoch: "test-server-epoch",
 					sha256: "b".repeat(64),
-					byteLength: FUTURE_SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes,
+					byteLength: SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes,
 					encoding: "utf-8",
 				},
 			},
@@ -271,7 +270,7 @@ function futureToolEventFrame(
 	};
 }
 
-function futureSnapshot(sessionHandle: string, generation: number, id: string): FutureSessionSnapshotDto {
+function futureSnapshot(sessionHandle: string, generation: number, id: string): SessionSnapshotDto {
 	const request = futureSetEditorFrame(sessionHandle, generation, 1, id).request;
 	if (request.method !== "set_editor_text") throw new Error("future editor fixture was not sticky");
 	const runtimeValue = runtime(sessionHandle, generation, 0);
@@ -296,13 +295,13 @@ function futureSnapshot(sessionHandle: string, generation: number, id: string): 
 function futureChunkedSnapshotFrames(
 	sessionHandle: string,
 	id: string,
-): [FutureSessionSnapshotBeginDto, FutureSessionSnapshotChunkDto, SessionSnapshotEndDto] {
+): [SessionSnapshotBeginDto, SessionSnapshotChunkDto, SessionSnapshotEndDto] {
 	const snapshot = futureSnapshot(sessionHandle, 1, id);
 	const { type: _type, settledMessages: _settledMessages, ...snapshotHeader } = snapshot;
 	const runtimeValue = snapshot.runtime;
-	const message: FutureSessionMessageDto = { role: "user", content: "snapshot", timestamp: 1 };
+	const message: SessionMessageDto = { role: "user", content: "snapshot", timestamp: 1 };
 	const loadedBytes = sessionHistoryMessagesBytes([message]);
-	const begin: FutureSessionSnapshotBeginDto = {
+	const begin: SessionSnapshotBeginDto = {
 		...snapshotHeader,
 		type: "session_snapshot_begin",
 		history: {
@@ -313,7 +312,7 @@ function futureChunkedSnapshotFrames(
 			nextCursor: null,
 		},
 	};
-	const chunk: FutureSessionSnapshotChunkDto = {
+	const chunk: SessionSnapshotChunkDto = {
 		serverEpoch: runtimeValue.serverEpoch,
 		sessionHandle,
 		workspaceId: runtimeValue.workspaceId,
@@ -342,16 +341,16 @@ function futureChunkedSnapshotFrames(
 	return [begin, chunk, end];
 }
 
-function futureWireBytes(message: Parameters<SessionTransportController["ingestFutureFrameMessage"]>[0]) {
+function futureWireBytes(message: Parameters<SessionTransportController["ingestFrameMessage"]>[0]) {
 	return new TextEncoder().encode(JSON.stringify(message)).byteLength;
 }
 
-function ingestFuture(
+function ingest(
 	controller: SessionTransportController,
-	message: Parameters<SessionTransportController["ingestFutureFrameMessage"]>[0],
+	message: Parameters<SessionTransportController["ingestFrameMessage"]>[0],
 	rawWireBytes = futureWireBytes(message),
 ) {
-	return controller.ingestFutureFrameMessage(message, rawWireBytes);
+	return controller.ingestFrameMessage(message, rawWireBytes);
 }
 
 class ResyncClock {
@@ -382,8 +381,7 @@ class ResyncClock {
 }
 
 async function flushPromises() {
-	await Promise.resolve();
-	await Promise.resolve();
+	for (let index = 0; index < 32; index += 1) await Promise.resolve();
 }
 
 function runtime(sessionHandle: string, generation = 1, lastSeq = 0): SessionRuntimeDto {
@@ -406,7 +404,7 @@ function eventFrame(
 	sessionHandle: string,
 	generation: number,
 	seq: number,
-): Extract<SessionReplayFrameDto, { type: "event" }> {
+): Extract<InlineSessionReplayFrameDto, { type: "event" }> {
 	return {
 		type: "event",
 		serverEpoch: "test-server-epoch",
@@ -414,7 +412,7 @@ function eventFrame(
 		workspaceId: "workspace-a",
 		generation,
 		seq,
-		event: { type: "agent_start" } as ProductSessionEventDto,
+		event: { type: "agent_start" } as PiProductSessionEventDto,
 	};
 }
 
@@ -428,7 +426,7 @@ function attachmentRef(overrides: { serverEpoch?: string; byteLength?: number } 
 	};
 }
 
-function extensionRequest(id: string): Extract<ExtensionUiRequestDto, { method: "confirm" }> {
+function extensionRequest(id: string): Extract<PiExtensionUiRequestDto, { method: "confirm" }> {
 	return {
 		type: "extension_ui_request",
 		id,
@@ -444,7 +442,7 @@ function successResponse(
 	id: string,
 	command: string,
 	barrierSeq = 0,
-): Extract<SessionWsServerMessage, { type: "response" }> {
+): Extract<InlineSessionWsServerMessage, { type: "response" }> {
 	const data =
 		command === "get_state"
 			? {
@@ -477,7 +475,7 @@ function successResponse(
 			command,
 			success: true,
 			...(data === undefined ? {} : { data }),
-		} as SessionCommandResponseDto,
+		} as PiSessionCommandResponseDto,
 	};
 }
 
@@ -485,8 +483,8 @@ function extensionFrame(
 	sessionHandle: string,
 	generation: number,
 	seq: number,
-	request: ExtensionUiRequestDto,
-): Extract<SessionReplayFrameDto, { type: "extension_ui_request" }> {
+	request: PiExtensionUiRequestDto,
+): Extract<InlineSessionReplayFrameDto, { type: "extension_ui_request" }> {
 	return {
 		type: "extension_ui_request",
 		serverEpoch: "test-server-epoch",
@@ -533,7 +531,7 @@ function completeWithSnapshot(
 	sessionHandle: string,
 	generation: number,
 	asOfSeq?: number,
-	pendingExtensionRequests: SessionSnapshotDto["pendingExtensionRequests"] = [],
+	pendingExtensionRequests: InlineSessionSnapshotDto["pendingExtensionRequests"] = [],
 ): void {
 	const channel = h.controller.store.getState().sessions[sessionHandle];
 	const seq = asOfSeq ?? channel?.resync?.barrierSeq ?? 0;
@@ -553,15 +551,15 @@ function completeWithSnapshot(
 		queue: { steering: [], followUp: [] },
 		pendingExtensionRequests,
 		stickyExtensionState: [],
-	} satisfies SessionSnapshotDto);
+	} satisfies InlineSessionSnapshotDto);
 }
 
 function historySnapshotFrames(
 	sessionHandle: string,
 	generation = 1,
-): [SessionSnapshotBeginDto, SessionSnapshotChunkDto, SessionSnapshotEndDto] {
+): [InlineSessionSnapshotBeginDto, InlineSessionSnapshotChunkDto, SessionSnapshotEndDto] {
 	const runtimeValue = runtime(sessionHandle, generation, 0);
-	const messages: SessionMessageDto[] = [{ role: "user", content: "newest", timestamp: 1 }];
+	const messages: PiSessionMessageDto[] = [{ role: "user", content: "newest", timestamp: 1 }];
 	const chunkChecksum = sessionHistoryChecksum(messages);
 	const loadedBytes = sessionHistoryMessagesBytes(messages);
 	const nextCursor = "cursor-older";
@@ -621,9 +619,9 @@ function historyPageFrames(
 	sessionHandle: string,
 	requestId: string,
 	generation = 1,
-): [SessionHistoryPageBeginDto, SessionHistoryPageChunkDto, SessionHistoryPageEndDto] {
+): [SessionHistoryPageBeginDto, InlineSessionHistoryPageChunkDto, SessionHistoryPageEndDto] {
 	const runtimeValue = runtime(sessionHandle, generation, 0);
-	const messages: SessionMessageDto[] = [{ role: "user", content: "older", timestamp: 0 }];
+	const messages: PiSessionMessageDto[] = [{ role: "user", content: "older", timestamp: 0 }];
 	const chunkChecksum = sessionHistoryChecksum(messages);
 	const loadedBytes = sessionHistoryMessagesBytes(messages);
 	return [
@@ -713,7 +711,7 @@ describe("session transport Gateway negotiation", () => {
 		socket.open(false);
 		expect(socket.sent[0]).toEqual({
 			type: "client_hello",
-			protocol: { major: 1, minor: 2 },
+			protocol: { major: 1, minor: 3 },
 			clientBuild: "2.4.1-independent-ui",
 			capabilities: [
 				"rpc.commands",
@@ -722,6 +720,7 @@ describe("session transport Gateway negotiation", () => {
 				"session.multiplex",
 				GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+				"payload.epoch_content_refs",
 				GATEWAY_SESSION_HISTORY_CAPABILITY,
 			],
 			limits: { maxServerFrameBytes: SESSION_WS_SERVER_MAX_BYTES },
@@ -1538,7 +1537,7 @@ describe("session transport Gateway negotiation", () => {
 	});
 
 	it("rejects a server minor newer than the client requested", () => {
-		const h = harness({ protocolVersion: { major: 1, minor: 3 } });
+		const h = harness();
 		h.controller.store.getState().connect();
 		const socket = h.sockets[0];
 		if (!socket) throw new Error("transport did not create a socket");
@@ -1612,7 +1611,7 @@ describe("session transport Gateway negotiation", () => {
 		inlineOnlyHello.capabilities = inlineOnlyHello.capabilities.filter(
 			(capability) => capability !== GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 		);
-		delete inlineOnlyHello.payloadBudget;
+		delete (inlineOnlyHello as { payloadBudget?: unknown }).payloadBudget;
 		payloadSocket.serverMessage(inlineOnlyHello);
 		expect(missingPayload.controller.store.getState().connectionState).toBe("incompatible");
 
@@ -1665,7 +1664,7 @@ describe("session transport Gateway negotiation", () => {
 		const pending = h.controller.store
 			.getState()
 			.sendCommand("session-large", { id: "large-history", type: "get_messages" });
-		const frame: Extract<SessionWsServerMessage, { type: "response" }> = {
+		const frame: Extract<InlineSessionWsServerMessage, { type: "response" }> = {
 			type: "response",
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-large",
@@ -1704,7 +1703,7 @@ describe("session transport Gateway negotiation", () => {
 });
 
 describe("session transport multiplexing", () => {
-	it("uses the negotiated attachment context for authoritative ref events", () => {
+	it("uses the negotiated attachment context for authoritative ref events", async () => {
 		const h = harness();
 		const socket = connect(h);
 		subscribeAndPrime(h, "session-a");
@@ -1724,16 +1723,17 @@ describe("session transport multiplexing", () => {
 					],
 					timestamp: 1,
 				},
-			} as ProductSessionEventDto,
-		} satisfies Extract<SessionReplayFrameDto, { type: "event" }>;
+			} as PiProductSessionEventDto,
+		} satisfies Extract<InlineSessionReplayFrameDto, { type: "event" }>;
 
 		socket.serverMessage(frame);
+		await flushPromises();
 
 		expect(h.controller.store.getState().connectionState).toBe("online");
 		expect(delivered).toEqual([frame]);
 	});
 
-	it("uses the negotiated attachment context for authoritative ref snapshots", () => {
+	it("uses the negotiated attachment context for authoritative ref snapshots", async () => {
 		const h = harness();
 		const socket = connect(h);
 		subscribeAndPrime(h, "session-a");
@@ -1765,7 +1765,8 @@ describe("session transport multiplexing", () => {
 			queue: { steering: [], followUp: [] },
 			pendingExtensionRequests: [],
 			stickyExtensionState: [],
-		} satisfies SessionSnapshotDto);
+		} satisfies InlineSessionSnapshotDto);
+		await flushPromises();
 
 		expect(h.controller.store.getState().sessions["session-a"]?.resync).toBeNull();
 		expect(h.controller.store.getState().connectionState).toBe("online");
@@ -1843,7 +1844,7 @@ describe("session transport multiplexing", () => {
 		expect(resubscriptions).toEqual([{ type: "session_subscribe", sessionHandle: "session-a" }]);
 	});
 
-	it("ingests foreground and background Sessions independently over one socket", () => {
+	it("ingests foreground and background Sessions independently over one socket", async () => {
 		const h = harness({ rawEventLimit: 2 });
 		const socket = connect(h);
 		subscribeAndPrime(h, "session-a");
@@ -1862,6 +1863,7 @@ describe("session transport multiplexing", () => {
 		socket.serverMessage(eventFrame("session-b", 1, 1));
 		socket.serverMessage(eventFrame("session-a", 1, 2));
 		socket.serverMessage(eventFrame("session-a", 1, 3));
+		await flushPromises();
 
 		expect(aSequences).toEqual([1, 2, 3]);
 		expect(bSequences).toEqual([1]);
@@ -1938,7 +1940,7 @@ describe("session transport multiplexing", () => {
 			({
 				...eventFrame(sessionHandle, 1, seq),
 				event: { type: "agent_start", detail: "x".repeat(700) },
-			}) as unknown as SessionReplayFrameDto;
+			}) as unknown as InlineSessionReplayFrameDto;
 		h.controller.ingestServerMessage(largeEvent("session-a", 1));
 		h.controller.ingestServerMessage(largeEvent("session-a", 2));
 		expect(
@@ -2035,7 +2037,7 @@ describe("session transport replay and recovery", () => {
 			operation: "subscribe",
 			error: "session_runtime_capacity",
 		});
-		await Promise.resolve();
+		await flushPromises();
 
 		expect(h.controller.store.getState().sessions["session-a"]).toMatchObject({
 			subscribed: true,
@@ -2065,7 +2067,7 @@ describe("session transport replay and recovery", () => {
 		);
 		socket.serverMessage(successResponse("session-a", 1, "deferred-barrier", "get_state", 1));
 		socket.serverMessage(eventFrame("session-a", 1, 1));
-		await Promise.resolve();
+		await flushPromises();
 
 		expect(h.controller.store.getState().sessions["session-a"]).toMatchObject({
 			lastSeq: 1,
@@ -2159,7 +2161,7 @@ describe("session transport replay and recovery", () => {
 		const malformed = {
 			...eventFrame("session-a", 1, 1),
 			event: { type: "message_update", usage: {} },
-		} as unknown as SessionWsServerMessage;
+		} as unknown as InlineSessionWsServerMessage;
 		socket.serverMessage(malformed);
 		await expect(affected).rejects.toMatchObject({ code: "unavailable" });
 
@@ -2211,7 +2213,7 @@ describe("session transport replay and recovery", () => {
 		expect(h.controller.store.getState().sessions["session-a"]?.baselineAuthoritative).toBe(true);
 	});
 
-	it("retains independent cursors and resubscribes every Session after reconnect", () => {
+	it("retains independent cursors and resubscribes every Session after reconnect", async () => {
 		vi.useFakeTimers();
 		const h = harness({ reconnectBaseMs: 10 });
 		const first = connect(h);
@@ -2220,6 +2222,7 @@ describe("session transport replay and recovery", () => {
 		first.serverMessage(eventFrame("session-a", 1, 1));
 		first.serverMessage(eventFrame("session-a", 1, 2));
 		first.serverMessage(eventFrame("session-b", 1, 1));
+		await flushPromises();
 
 		first.serverClose();
 		expect(h.controller.store.getState().connectionState).toBe("offline");
@@ -2244,11 +2247,12 @@ describe("session transport replay and recovery", () => {
 		);
 	});
 
-	it("invalidates only a dormant snapshot so its next subscription has no cursor", () => {
+	it("invalidates only a dormant snapshot so its next subscription has no cursor", async () => {
 		const h = harness();
 		const socket = connect(h);
 		subscribeAndPrime(h, "session-a");
 		socket.serverMessage(eventFrame("session-a", 1, 1));
+		await flushPromises();
 		expect(h.controller.store.getState().invalidateSessionSnapshot("session-a")).toBe(false);
 		expect(h.controller.store.getState().sessions["session-a"]?.lastSeq).toBe(1);
 
@@ -2492,7 +2496,7 @@ describe("session transport replay and recovery", () => {
 		const oversized = {
 			...eventFrame("session-a", 1, 1),
 			event: { type: "agent_start", detail: "x".repeat(EXPECTED_RESYNC_BYTE_LIMIT + 1) },
-		} as unknown as SessionReplayFrameDto;
+		} as unknown as InlineSessionReplayFrameDto;
 		h.controller.ingestServerMessage(oversized);
 
 		expect(h.controller.store.getState().sessions["session-a"]?.resync).toMatchObject({
@@ -2517,7 +2521,7 @@ describe("session transport replay and recovery", () => {
 		const oversized = {
 			...eventFrame("session-a", 1, 2),
 			event: { type: "agent_start", detail: "x".repeat(EXPECTED_RESYNC_BYTE_LIMIT + 1) },
-		} as unknown as SessionReplayFrameDto;
+		} as unknown as InlineSessionReplayFrameDto;
 		h.controller.ingestServerMessage(oversized);
 		expect(socket.sent.at(-1)).toEqual({ type: "session_subscribe", sessionHandle: "session-a" });
 		expect(h.controller.store.getState().sessions["session-a"]?.pendingExtensionRequests).toEqual([]);
@@ -2553,7 +2557,7 @@ describe("session transport replay and recovery", () => {
 		const oversized = {
 			...eventFrame("session-a", 1, 1),
 			event: { type: "agent_start", detail: "x".repeat(EXPECTED_RESYNC_BYTE_LIMIT + 1) },
-		} as unknown as SessionReplayFrameDto;
+		} as unknown as InlineSessionReplayFrameDto;
 		h.controller.ingestServerMessage(oversized);
 
 		expect(socket.sent.at(-1)).toEqual({ type: "session_subscribe", sessionHandle: "session-a" });
@@ -2684,7 +2688,7 @@ describe("session transport replay and recovery", () => {
 		});
 	});
 
-	it("forwards extension response results only for the current generation", () => {
+	it("forwards extension response results only for the current generation", async () => {
 		const h = harness();
 		const socket = connect(h);
 		subscribeAndPrime(h, "session-a");
@@ -2699,6 +2703,7 @@ describe("session transport replay and recovery", () => {
 		});
 		expect(h.controller.store.getState().connectionState).toBe("online");
 		socket.serverMessage(extensionFrame("session-a", 1, 1, extensionRequest("dialog-one")));
+		await flushPromises();
 		expect(h.controller.store.getState().connectionState).toBe("online");
 		const outcomes: string[] = [];
 		h.controller.frameBus.subscribe("session-a", ({ message }) => {
@@ -2724,6 +2729,7 @@ describe("session transport replay and recovery", () => {
 			requestId: "dialog-one",
 			outcome: "not_running",
 		});
+		await flushPromises();
 		expect(
 			h.controller.store.getState().sessions["session-a"]?.pendingExtensionRequests.map(({ id }) => id),
 		).toEqual(["dialog-one"]);
@@ -2737,11 +2743,12 @@ describe("session transport replay and recovery", () => {
 			requestId: "dialog-one",
 			outcome: "accepted",
 		});
+		await flushPromises();
 		expect(h.controller.store.getState().sessions["session-a"]?.pendingExtensionRequests).toEqual([]);
 		expect(outcomes).toEqual(["accepted"]);
 	});
 
-	it("applies extension close frames in replay order", () => {
+	it("applies extension close frames in replay order", async () => {
 		const h = harness();
 		const socket = connect(h);
 		subscribeAndPrime(h, "session-a");
@@ -2767,6 +2774,7 @@ describe("session transport replay and recovery", () => {
 			requestId: "dialog-one",
 			reason: "expired",
 		});
+		await flushPromises();
 
 		expect(delivered).toEqual(["open:dialog-one", "close:dialog-one"]);
 		expect(h.controller.store.getState().sessions["session-a"]?.lastSeq).toBe(2);
@@ -2778,7 +2786,7 @@ describe("session transport replay and recovery", () => {
 		connect(h);
 		subscribeAndPrime(h, "session-a");
 		let seq = 0;
-		const ingest = (request: ExtensionUiRequestDto) => {
+		const ingest = (request: PiExtensionUiRequestDto) => {
 			seq += 1;
 			h.controller.ingestServerMessage(extensionFrame("session-a", 1, seq, request));
 		};
@@ -2882,6 +2890,7 @@ describe("session transport replay and recovery", () => {
 		});
 		socket.serverMessage(eventFrame("session-a", 1, 1));
 		socket.serverMessage(eventFrame("session-a", 2, 1));
+		await flushPromises();
 		expect(delivered).toEqual([1]);
 		expect(h.controller.store.getState().sessions["session-a"]?.generation).toBe(2);
 	});
@@ -3215,7 +3224,7 @@ describe("session transport replay and recovery", () => {
 		).toBe(true);
 	});
 
-	it("clears lease and raw debug state atomically when the full runtime identity changes", () => {
+	it("clears lease and raw debug state atomically when the full runtime identity changes", async () => {
 		const h = harness({ rawEventLimit: 10 });
 		const socket = connect(h);
 		subscribeAndPrime(h, "session-a");
@@ -3228,6 +3237,7 @@ describe("session transport replay and recovery", () => {
 			fencingToken: "old-fence",
 		});
 		socket.serverMessage(eventFrame("session-a", 1, 1));
+		await flushPromises();
 		expect(h.controller.store.getState().sessions["session-a"]?.rawEvents).toHaveLength(1);
 		const next = { ...runtime("session-a", 2, 0), serverEpoch: "new-epoch" };
 		h.controller.ingestServerMessage({ type: "runtime_state", runtime: next });
@@ -3254,6 +3264,7 @@ describe("session transport replay and recovery", () => {
 			.getState()
 			.sendCommand("session-a", { id: "barrier-ahead", type: "get_state" });
 		socket.serverMessage(successResponse("session-a", 1, "barrier-ahead", "get_state", 2));
+		await flushPromises();
 		h.controller.ingestServerMessage(eventFrame("session-a", 1, 1));
 		completeWithSnapshot(h, "session-a", 1, 0);
 		await flushPromises();
@@ -3388,6 +3399,7 @@ describe("session transport commands and identity", () => {
 			"session-resolved:resync_required",
 			"session-resolved:lease_status",
 			"session-resolved:session_snapshot",
+			"session-resolved:extension_ui_snapshot",
 		]);
 		expect(notices).toEqual([{ sessionHandle: "session-resolved", reason: "initial" }]);
 	});
@@ -3844,27 +3856,14 @@ describe("session transport commands and identity", () => {
 	});
 });
 
-describe("future Session content transport", () => {
-	it("keeps future ingress disabled without the private adapter", () => {
-		const h = harness();
-		connect(h);
-		subscribeAndPrime(h, "session-a");
-
-		expect(ingestFuture(h.controller, futureEventFrame("session-a", 1, 1))).toBe(false);
-		expect(h.controller.store.getState().sessions["session-a"]).toMatchObject({
-			lastSeq: 0,
-			projectedSeq: 0,
-			pendingExtensionRequests: [],
-		});
-	});
-
+describe("canonical Session content transport", () => {
 	it("serializes future live materialization behind a chunked snapshot", async () => {
 		let releaseSnapshot!: () => void;
 		const snapshotGate = new Promise<void>((resolve) => {
 			releaseSnapshot = resolve;
 		});
 		let liveMaterializationStarted = false;
-		const adapter = futureAdapter(async (request: FutureExtensionUiRequestDto) => {
+		const adapter = futureAdapter(async (request: ExtensionUiRequestDto) => {
 			if (request.id === "future-chunked-snapshot") await snapshotGate;
 			if (request.id === "future-chunked-live") liveMaterializationStarted = true;
 			if (request.method !== "set_editor_text") throw new Error("unexpected fixture request");
@@ -3892,12 +3891,10 @@ describe("future Session content transport", () => {
 			if (frame.type === "extension_ui_request") delivered.push(frame.request.id);
 		});
 
-		expect(ingestFuture(h.controller, begin)).toBe(true);
-		expect(ingestFuture(h.controller, chunk)).toBe(true);
-		expect(ingestFuture(h.controller, end)).toBe(true);
-		expect(ingestFuture(h.controller, futureSetEditorFrame(sessionHandle, 1, 1, "future-chunked-live"))).toBe(
-			true,
-		);
+		expect(ingest(h.controller, begin)).toBe(true);
+		expect(ingest(h.controller, chunk)).toBe(true);
+		expect(ingest(h.controller, end)).toBe(true);
+		expect(ingest(h.controller, futureSetEditorFrame(sessionHandle, 1, 1, "future-chunked-live"))).toBe(true);
 		await flushPromises();
 
 		expect(liveMaterializationStarted).toBe(false);
@@ -3930,13 +3927,13 @@ describe("future Session content transport", () => {
 			runtime: runtime("session-a", 1, 0),
 			reason: "initial",
 		});
-		expect(ingestFuture(h.controller, futureSnapshot("session-a", 1, "future-ordinary-snapshot"))).toBe(true);
+		expect(ingest(h.controller, futureSnapshot("session-a", 1, "future-ordinary-snapshot"))).toBe(true);
 		await vi.waitFor(() => expect(previousSignal).toBeDefined());
 
 		const [begin, chunk, end] = futureChunkedSnapshotFrames("session-a", "future-replacement");
-		expect(ingestFuture(h.controller, begin)).toBe(true);
-		expect(ingestFuture(h.controller, chunk)).toBe(true);
-		expect(ingestFuture(h.controller, end)).toBe(true);
+		expect(ingest(h.controller, begin)).toBe(true);
+		expect(ingest(h.controller, chunk)).toBe(true);
+		expect(ingest(h.controller, end)).toBe(true);
 		await vi.waitFor(() =>
 			expect(h.controller.store.getState().sessions["session-a"]?.baselineAuthoritative).toBe(true),
 		);
@@ -3954,7 +3951,7 @@ describe("future Session content transport", () => {
 		const slowGate = new Promise<void>((resolve) => {
 			releaseSlow = resolve;
 		});
-		const adapter = futureAdapter(async (request: FutureExtensionUiRequestDto) => {
+		const adapter = futureAdapter(async (request: ExtensionUiRequestDto) => {
 			if (request.id === "slow-a") await slowGate;
 			if (request.method !== "set_editor_text") throw new Error("unexpected fixture request");
 			return { ...request, text: `resolved:${request.id}` };
@@ -3972,9 +3969,9 @@ describe("future Session content transport", () => {
 			}
 		});
 
-		expect(ingestFuture(h.controller, futureSetEditorFrame("session-a", 1, 1, "slow-a"))).toBe(true);
-		expect(ingestFuture(h.controller, futureEventFrame("session-a", 1, 2))).toBe(true);
-		expect(ingestFuture(h.controller, futureEventFrame("session-b", 1, 1))).toBe(true);
+		expect(ingest(h.controller, futureSetEditorFrame("session-a", 1, 1, "slow-a"))).toBe(true);
+		expect(ingest(h.controller, futureEventFrame("session-a", 1, 2))).toBe(true);
+		expect(ingest(h.controller, futureEventFrame("session-b", 1, 1))).toBe(true);
 		await flushPromises();
 
 		expect(delivered).toEqual(["session-b:1:future"]);
@@ -4013,7 +4010,7 @@ describe("future Session content transport", () => {
 			if (message.type === "extension_ui_request") delivered.push(message.request.id);
 		});
 
-		ingestFuture(h.controller, futureSetEditorFrame("session-a", 1, 1, "failure-one"));
+		ingest(h.controller, futureSetEditorFrame("session-a", 1, 1, "failure-one"));
 		await flushPromises();
 		await flushPromises();
 
@@ -4028,7 +4025,7 @@ describe("future Session content transport", () => {
 			{ type: "session_subscribe", sessionHandle: "session-a" },
 		]);
 
-		ingestFuture(h.controller, futureSetEditorFrame("session-a", 1, 1, "failure-two"));
+		ingest(h.controller, futureSetEditorFrame("session-a", 1, 1, "failure-two"));
 		await flushPromises();
 		await flushPromises();
 
@@ -4061,7 +4058,7 @@ describe("future Session content transport", () => {
 			reason: "gap",
 		});
 
-		expect(ingestFuture(h.controller, futureSnapshot("session-a", 1, "snapshot-one"))).toBe(true);
+		expect(ingest(h.controller, futureSnapshot("session-a", 1, "snapshot-one"))).toBe(true);
 		await vi.waitFor(() =>
 			expect(h.controller.store.getState().sessions["session-a"]?.recovery?.phase).toBe("retry_wait"),
 		);
@@ -4079,7 +4076,7 @@ describe("future Session content transport", () => {
 			{ type: "session_subscribe", sessionHandle: "session-a" },
 		]);
 
-		expect(ingestFuture(h.controller, futureSnapshot("session-a", 1, "snapshot-two"))).toBe(true);
+		expect(ingest(h.controller, futureSnapshot("session-a", 1, "snapshot-two"))).toBe(true);
 		await vi.waitFor(() =>
 			expect(h.controller.store.getState().sessions["session-a"]?.baselineAuthoritative).toBe(true),
 		);
@@ -4119,14 +4116,14 @@ describe("future Session content transport", () => {
 		});
 
 		expect(
-			ingestFuture(
+			ingest(
 				h.controller,
 				futureSetEditorFrame("session-a", 1, 1, "slow-byte-tail"),
 				EXPECTED_RESYNC_BYTE_LIMIT - 1,
 			),
 		).toBe(true);
 		await vi.waitFor(() => expect(materializerSignal).toBeDefined());
-		expect(ingestFuture(h.controller, futureEventFrame("session-a", 1, 2), 2)).toBe(true);
+		expect(ingest(h.controller, futureEventFrame("session-a", 1, 2), 2)).toBe(true);
 
 		expect(materializerSignal?.aborted).toBe(true);
 		expect(h.controller.store.getState().sessions["session-a"]).toMatchObject({
@@ -4161,16 +4158,14 @@ describe("future Session content transport", () => {
 		subscribeAndPrime(h, "session-a");
 		const before = socket.sent.filter(({ type }) => type === "session_subscribe").length;
 
-		expect(ingestFuture(h.controller, futureSetEditorFrame("session-a", 1, 1, "slow-count-tail"), 1)).toBe(
-			true,
-		);
+		expect(ingest(h.controller, futureSetEditorFrame("session-a", 1, 1, "slow-count-tail"), 1)).toBe(true);
 		await vi.waitFor(() => expect(materializerSignal).toBeDefined());
 		for (let seq = 2; seq <= EXPECTED_RESYNC_FRAME_LIMIT; seq += 1) {
-			expect(ingestFuture(h.controller, futureEventFrame("session-a", 1, seq), 1)).toBe(true);
+			expect(ingest(h.controller, futureEventFrame("session-a", 1, seq), 1)).toBe(true);
 		}
-		expect(
-			ingestFuture(h.controller, futureEventFrame("session-a", 1, EXPECTED_RESYNC_FRAME_LIMIT + 1), 1),
-		).toBe(true);
+		expect(ingest(h.controller, futureEventFrame("session-a", 1, EXPECTED_RESYNC_FRAME_LIMIT + 1), 1)).toBe(
+			true,
+		);
 
 		expect(materializerSignal?.aborted).toBe(true);
 		expect(h.controller.store.getState().sessions["session-a"]).toMatchObject({
@@ -4213,9 +4208,9 @@ describe("future Session content transport", () => {
 		});
 		const before = socket.sent.filter(({ type }) => type === "session_subscribe").length;
 
-		expect(ingestFuture(h.controller, futureSnapshot("session-a", 1, "snapshot-slot-one"))).toBe(true);
+		expect(ingest(h.controller, futureSnapshot("session-a", 1, "snapshot-slot-one"))).toBe(true);
 		await vi.waitFor(() => expect(materializerSignal).toBeDefined());
-		expect(ingestFuture(h.controller, futureSnapshot("session-a", 1, "snapshot-slot-two"))).toBe(true);
+		expect(ingest(h.controller, futureSnapshot("session-a", 1, "snapshot-slot-two"))).toBe(true);
 
 		expect(materializerSignal?.aborted).toBe(true);
 		await vi.waitFor(() =>
@@ -4263,12 +4258,12 @@ describe("future Session content transport", () => {
 			runtime: runtime("session-a", 1, 0),
 			reason: "initial",
 		});
-		expect(ingestFuture(h.controller, futureSnapshot("session-a", 1, "overflowed"))).toBe(true);
+		expect(ingest(h.controller, futureSnapshot("session-a", 1, "overflowed"))).toBe(true);
 		await vi.waitFor(() => expect(materializerSignal).toBeDefined());
 
-		expect(
-			ingestFuture(h.controller, futureEventFrame("session-a", 1, 1), EXPECTED_RESYNC_BYTE_LIMIT + 1),
-		).toBe(true);
+		expect(ingest(h.controller, futureEventFrame("session-a", 1, 1), EXPECTED_RESYNC_BYTE_LIMIT + 1)).toBe(
+			true,
+		);
 
 		expect(materializerSignal?.aborted).toBe(true);
 		await vi.waitFor(() =>
@@ -4306,7 +4301,7 @@ describe("future Session content transport", () => {
 		});
 		connect(h);
 		subscribeAndPrime(h, "session-a");
-		expect(ingestFuture(h.controller, futureSetEditorFrame("session-a", 1, 1, "ordinary-fails"))).toBe(true);
+		expect(ingest(h.controller, futureSetEditorFrame("session-a", 1, 1, "ordinary-fails"))).toBe(true);
 		await flushPromises();
 		h.controller.ingestServerMessage({
 			type: "resync_required",
@@ -4315,7 +4310,7 @@ describe("future Session content transport", () => {
 			runtime: runtime("session-a", 1, 0),
 			reason: "initial",
 		});
-		expect(ingestFuture(h.controller, futureSnapshot("session-a", 1, "queued"))).toBe(true);
+		expect(ingest(h.controller, futureSnapshot("session-a", 1, "queued"))).toBe(true);
 
 		release();
 		await vi.waitFor(() =>
@@ -4354,7 +4349,7 @@ describe("future Session content transport", () => {
 			});
 		});
 
-		expect(ingestFuture(h.controller, futureToolEventFrame("session-a", 1, 1))).toBe(true);
+		expect(ingest(h.controller, futureToolEventFrame("session-a", 1, 1))).toBe(true);
 		await vi.waitFor(() =>
 			expect(h.controller.store.getState().sessions["session-a"]?.resync?.bufferedFrameCount).toBe(1),
 		);
@@ -4362,7 +4357,7 @@ describe("future Session content transport", () => {
 			...futureSnapshot("session-a", 1, "suffix"),
 			stickyExtensionState: [],
 		};
-		expect(ingestFuture(h.controller, snapshot)).toBe(true);
+		expect(ingest(h.controller, snapshot)).toBe(true);
 		await vi.waitFor(() =>
 			expect(h.controller.store.getState().sessions["session-a"]?.baselineAuthoritative).toBe(true),
 		);
@@ -4405,7 +4400,7 @@ describe("future Session content transport", () => {
 			if (message.type === "extension_ui_request") delivered.push(message.request.id);
 		});
 
-		ingestFuture(h.controller, futureSetEditorFrame("session-a", 1, 1, "disconnect-late"));
+		ingest(h.controller, futureSetEditorFrame("session-a", 1, 1, "disconnect-late"));
 		await vi.waitFor(() => expect(materializerSignal).toBeDefined());
 		socket.serverClose();
 		expect(materializerSignal?.aborted).toBe(true);
@@ -4444,7 +4439,7 @@ describe("future Session content transport", () => {
 			delivered.push(`${sessionHandle}:${message.type}:${productMode}`);
 		});
 
-		ingestFuture(h.controller, futureSetEditorFrame("session-parent", 1, 1, "parent-late"));
+		ingest(h.controller, futureSetEditorFrame("session-parent", 1, 1, "parent-late"));
 		await vi.waitFor(() => expect(parentSignal).toBeDefined());
 		h.controller.ingestServerMessage({
 			type: "session_rekeyed",
@@ -4457,7 +4452,7 @@ describe("future Session content transport", () => {
 		expect(delivered).toEqual(["session-child:session_rekeyed:current"]);
 		releaseParent();
 		await flushPromises();
-		expect(ingestFuture(h.controller, futureSetEditorFrame("session-child", 2, 1, "child"))).toBe(true);
+		expect(ingest(h.controller, futureSetEditorFrame("session-child", 2, 1, "child"))).toBe(true);
 		await vi.waitFor(() => expect(delivered).toHaveLength(2));
 
 		expect(delivered).toEqual([
@@ -4491,7 +4486,7 @@ describe("future Session content transport", () => {
 		h.controller.frameBus.subscribe("session-a", ({ message }) => {
 			if (message.type === "extension_ui_request") delivered.push(message.request.id);
 		});
-		ingestFuture(h.controller, futureSetEditorFrame("session-a", 1, 1, "old-generation"));
+		ingest(h.controller, futureSetEditorFrame("session-a", 1, 1, "old-generation"));
 		await vi.waitFor(() => expect(materializerSignal).toBeDefined());
 
 		h.controller.ingestServerMessage({
@@ -4533,7 +4528,7 @@ describe("future Session content transport", () => {
 		h.controller.frameBus.subscribe("session-a", ({ message }) => {
 			if (message.type === "extension_ui_request") delivered.push(message.request.id);
 		});
-		ingestFuture(h.controller, futureSetEditorFrame("session-a", 1, 1, "incompatible"));
+		ingest(h.controller, futureSetEditorFrame("session-a", 1, 1, "incompatible"));
 		await vi.waitFor(() => expect(materializerSignal).toBeDefined());
 
 		socket.onmessage?.({ data: "{}" });
@@ -4564,7 +4559,7 @@ describe("future Session content transport", () => {
 		h.controller.frameBus.subscribe("session-a", ({ message }) => {
 			if (message.type === "extension_ui_request") delivered.push(message.request.id);
 		});
-		ingestFuture(h.controller, futureSetEditorFrame("session-a", 1, 1, "terminal"));
+		ingest(h.controller, futureSetEditorFrame("session-a", 1, 1, "terminal"));
 		await vi.waitFor(() => expect(materializerSignal).toBeDefined());
 
 		h.controller.ingestServerMessage({
@@ -4584,7 +4579,7 @@ describe("future Session content transport", () => {
 });
 
 describe("chunked Session history transport", () => {
-	it("commits a chunked snapshot atomically and loads an older page through the same fence", () => {
+	it("commits a chunked snapshot atomically and loads an older page through the same fence", async () => {
 		const h = harness();
 		const socket = connectWithHistory(h);
 		const sessionHandle = "history-a";
@@ -4602,6 +4597,7 @@ describe("chunked Session history transport", () => {
 		socket.serverMessage(begin);
 		socket.serverMessage(chunk);
 		socket.serverMessage(end);
+		await flushPromises();
 
 		expect(h.controller.store.getState().sessions[sessionHandle]).toMatchObject({
 			baselineAuthoritative: true,
@@ -4615,7 +4611,7 @@ describe("chunked Session history transport", () => {
 			},
 		});
 
-		const loadedPages: SessionMessageDto[][] = [];
+		const loadedPages: PiSessionMessageDto[][] = [];
 		const unsubscribe = h.controller.frameBus.subscribe(sessionHandle, ({ message }) => {
 			if (message.type === "session_history_page_loaded") loadedPages.push(message.messages);
 		});
@@ -4627,6 +4623,7 @@ describe("chunked Session history transport", () => {
 		expect(request).toBeDefined();
 		const page = historyPageFrames(sessionHandle, request?.id ?? "missing");
 		for (const frame of page) socket.serverMessage(frame);
+		await flushPromises();
 		unsubscribe();
 
 		expect(loadedPages).toEqual([[{ role: "user", content: "older", timestamp: 0 }]]);
@@ -4663,7 +4660,7 @@ describe("chunked Session history transport", () => {
 		expect(h.controller.store.getState().sessions[sessionHandle]?.resync).not.toBeNull();
 	});
 
-	it("cancels an in-flight older page and ignores its late frames", () => {
+	it("cancels an in-flight older page and ignores its late frames", async () => {
 		const h = harness();
 		const socket = connectWithHistory(h);
 		const sessionHandle = "history-cancel";
@@ -4678,6 +4675,7 @@ describe("chunked Session history transport", () => {
 			reason: "initial",
 		});
 		for (const frame of historySnapshotFrames(sessionHandle)) socket.serverMessage(frame);
+		await flushPromises();
 		expect(h.controller.store.getState().loadOlderSessionHistory(sessionHandle)).toBe(true);
 		const request = socket.sent.find(
 			(message): message is Extract<SessionWsClientMessage, { type: "session_history_page" }> =>
@@ -4695,6 +4693,7 @@ describe("chunked Session history transport", () => {
 
 		for (const frame of historyPageFrames(sessionHandle, request?.id ?? "missing"))
 			socket.serverMessage(frame);
+		await flushPromises();
 		expect(h.controller.store.getState().sessions[sessionHandle]?.history).toMatchObject({
 			loadedMessages: 1,
 			nextCursor: "cursor-older",
@@ -4702,7 +4701,7 @@ describe("chunked Session history transport", () => {
 		});
 	});
 
-	it("fails a page whose begin frame crosses the snapshot identity fence", () => {
+	it("fails a page whose begin frame crosses the snapshot identity fence", async () => {
 		const h = harness();
 		const socket = connectWithHistory(h);
 		const sessionHandle = "history-page-fence";
@@ -4717,6 +4716,7 @@ describe("chunked Session history transport", () => {
 			reason: "initial",
 		});
 		for (const frame of historySnapshotFrames(sessionHandle)) socket.serverMessage(frame);
+		await flushPromises();
 		expect(h.controller.store.getState().loadOlderSessionHistory(sessionHandle)).toBe(true);
 		const request = socket.sent.find(
 			(message): message is Extract<SessionWsClientMessage, { type: "session_history_page" }> =>
@@ -4726,6 +4726,7 @@ describe("chunked Session history transport", () => {
 
 		const [begin] = historyPageFrames(sessionHandle, request.id);
 		socket.serverMessage({ ...begin, snapshotId: "foreign-snapshot" });
+		await flushPromises();
 
 		expect(h.controller.store.getState().sessions[sessionHandle]?.history).toMatchObject({
 			loading: false,

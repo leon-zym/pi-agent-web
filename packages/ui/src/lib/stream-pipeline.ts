@@ -1,8 +1,8 @@
 import type {
-	FutureProductSessionEventDto,
-	SessionEventDto,
+	InlineSessionWsServerMessage,
+	PiSessionEventDto,
+	ProductSessionEventDto,
 	SessionRuntimeDto,
-	SessionWsServerMessage,
 } from "@pi-agent-web/protocol";
 import { toast } from "sonner";
 import { migrateComposerHistory } from "../features/composer/use-composer-history";
@@ -23,7 +23,7 @@ import { isSoftIdempotentError } from "./session-controller";
 import { type CoalescibleMessageUpdate, SessionEventScheduler } from "./session-event-scheduler";
 import { updateTabBadge } from "./tab-badge";
 
-type ProjectionSessionEvent = SessionEventDto | FutureProductSessionEventDto;
+type ProjectionSessionEvent = PiSessionEventDto | ProductSessionEventDto;
 
 let initialized = false;
 const directoryReloadTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -222,7 +222,7 @@ function scheduleHiddenLifecycleAfterSnapshot(runtime: SessionRuntimeDto): void 
 }
 
 function scheduleHiddenLifecycleAfterLease(
-	message: Extract<SessionWsServerMessage, { type: "lease_status" }>,
+	message: Extract<InlineSessionWsServerMessage, { type: "lease_status" }>,
 ): void {
 	const channel = sessionTransport.store.getState().sessions[message.sessionHandle];
 	const runtime = channel?.runtime;
@@ -363,7 +363,7 @@ function applyLiveUsage(
 }
 
 function routeExtensionRequest(
-	message: Extract<SessionWsServerMessage, { type: "extension_ui_request" }>,
+	message: Extract<InlineSessionWsServerMessage, { type: "extension_ui_request" }>,
 ): void {
 	const { request, sessionHandle, generation } = message;
 	if (request.method === "notify") {
@@ -390,7 +390,7 @@ function routeRekey(previousSessionHandle: string, runtime: SessionRuntimeDto): 
 	scheduleDirectoryReload(runtime.workspaceId);
 }
 
-function routeSessionError(message: Extract<SessionWsServerMessage, { type: "session_error" }>): void {
+function routeSessionError(message: Extract<InlineSessionWsServerMessage, { type: "session_error" }>): void {
 	if (!isCurrentSession(message.sessionHandle)) return;
 	if (message.operation === "claim") {
 		toast.info(tt("lease.observer"), { description: stripAnsi(message.error) });

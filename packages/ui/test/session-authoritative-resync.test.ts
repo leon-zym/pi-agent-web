@@ -1,11 +1,12 @@
 import {
-	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
 	type GatewayClientHelloDto,
 	type GatewayServerHelloDto,
+	type InlineSessionReplayFrameDto,
+	type InlineSessionSnapshotDto,
+	SESSION_CONTENT_REF_BUDGET,
 	SESSION_PAYLOAD_BUDGET,
-	type SessionReplayFrameDto,
 	type SessionRuntimeDto,
-	type SessionSnapshotDto,
 	type SessionWsClientMessage,
 } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it } from "vitest";
@@ -34,25 +35,19 @@ class FakeSocket implements SessionWebSocket {
 		this.onopen?.();
 		this.receive({
 			type: "server_hello",
-			protocol: { major: 1, minor: 2 },
+			protocol: { major: 1, minor: 3 },
 			serverBuild: "test",
 			serverEpoch: SERVER_EPOCH,
 			piVersion: "test",
 			adapterId: "test",
-			capabilities: [
-				"rpc.commands",
-				"rpc.events",
-				"rpc.extension_ui",
-				"session.multiplex",
-				"session.hot_runtime_inventory",
-				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
-			],
+			capabilities: [...GATEWAY_SERVER_REQUIRED_CAPABILITIES],
 			limits: {
 				maxClientFrameBytes: 8 * 1024 * 1024,
 				maxSnapshotFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes,
 				maxExtensionRequests: 256,
 			},
 			payloadBudget: SESSION_PAYLOAD_BUDGET,
+			contentRefBudget: SESSION_CONTENT_REF_BUDGET,
 		} satisfies GatewayServerHelloDto);
 		this.receive({
 			type: "hot_runtime_inventory",
@@ -87,7 +82,7 @@ function runtime(lastSeq = 0): SessionRuntimeDto {
 	};
 }
 
-function snapshot(asOfSeq = 0): SessionSnapshotDto {
+function snapshot(asOfSeq = 0): InlineSessionSnapshotDto {
 	return {
 		type: "session_snapshot",
 		snapshotId: `snapshot-${String(asOfSeq)}`,
@@ -106,7 +101,7 @@ function snapshot(asOfSeq = 0): SessionSnapshotDto {
 	};
 }
 
-function event(seq: number): SessionReplayFrameDto {
+function event(seq: number): InlineSessionReplayFrameDto {
 	return {
 		type: "event",
 		serverEpoch: SERVER_EPOCH,
@@ -129,7 +124,7 @@ function setup() {
 			return socket;
 		},
 		url: () => "ws://test",
-		protocolVersion: { major: 1, minor: 2 },
+		protocolVersion: { major: 1, minor: 3 },
 	});
 	controllers.push(controller);
 	controller.store.getState().connect();

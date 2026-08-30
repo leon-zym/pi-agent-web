@@ -1,20 +1,20 @@
 import type {
-	FutureAssistantMessageDto,
-	FutureProductSessionEventDto,
-	FutureSessionMessageDto,
+	AssistantMessageDto,
+	PiSessionEventDto,
+	ProductSessionEventDto,
 	SessionContentRefDto,
-	SessionEventDto,
 	SessionExternalJsonDto,
 	SessionExternalTextDto,
 	SessionInlineJsonDto,
 	SessionJsonValueDto,
+	SessionMessageDto,
 } from "@pi-agent-web/protocol";
 import { describe, expect, it } from "vitest";
 import type {
-	ProjectedFutureSessionFrameMessage,
-	ProjectedFutureSessionReplayFrame,
-	ProjectedFutureSessionSnapshot,
-} from "../src/lib/future-session-content-adapter";
+	ProjectedSessionFrameMessage,
+	ProjectedSessionReplayFrame,
+	ProjectedSessionSnapshot,
+} from "../src/lib/session-content-adapter";
 import { initPipeline } from "../src/lib/stream-pipeline";
 import { rebuildProjectionFromMessages, useProjectionStore } from "../src/stores/projection";
 import { reduceProjection } from "../src/stores/projection-reducer";
@@ -44,7 +44,7 @@ function contentRef(seed: string): SessionContentRefDto {
 const textRef = { type: "external_text", ref: contentRef("a") } satisfies SessionExternalTextDto;
 const jsonRef = { type: "external_json", ref: contentRef("b") } satisfies SessionExternalJsonDto;
 
-function futureAssistantMessage(): FutureAssistantMessageDto {
+function futureAssistantMessage(): AssistantMessageDto {
 	return {
 		role: "assistant",
 		content: [
@@ -62,14 +62,14 @@ describe("future Session projection carriers", () => {
 		const bus = new OrderedSessionFrameBus();
 		const modes: string[] = [];
 		const orders: number[] = [];
-		const futureMessages: ProjectedFutureSessionFrameMessage[] = [];
+		const futureMessages: ProjectedSessionFrameMessage[] = [];
 		bus.subscribe("session-future", (frame) => {
 			modes.push(frame.productMode);
 			orders.push(frame.order);
 			if (frame.productMode === "future") futureMessages.push(frame.message);
 		});
-		const current: SessionEventDto = { type: "agent_start" };
-		const future: FutureProductSessionEventDto = {
+		const current: PiSessionEventDto = { type: "agent_start" };
+		const future: ProductSessionEventDto = {
 			type: "tool_execution_start",
 			toolCallId: "call-future",
 			toolName: "future-tool",
@@ -89,7 +89,7 @@ describe("future Session projection carriers", () => {
 			},
 			1,
 		);
-		const futureFrame: ProjectedFutureSessionReplayFrame = {
+		const futureFrame: ProjectedSessionReplayFrame = {
 			type: "event",
 			serverEpoch: "epoch-future-ui",
 			workspaceId: "workspace-future-ui",
@@ -99,17 +99,17 @@ describe("future Session projection carriers", () => {
 			event: future,
 		};
 		bus.emit("session-future", futureFrame, 2, "future");
-		const assertFutureEmitRequiresMode = () => {
-			// @ts-expect-error Future frames must never fall through the current-default overload.
+		const assertEmitRequiresMode = () => {
+			// @ts-expect-error  frames must never fall through the current-default overload.
 			bus.emit("session-future", futureFrame, 2);
-			// @ts-expect-error Future frames cannot be mislabeled as current.
+			// @ts-expect-error  frames cannot be mislabeled as current.
 			bus.emit("session-future", futureFrame, 2, "current");
 		};
 
 		expect(modes).toEqual(["current", "future"]);
 		expect(orders).toEqual([1, 2]);
 		expect(futureMessages).toEqual([futureFrame]);
-		expect(assertFutureEmitRequiresMode).toBeTypeOf("function");
+		expect(assertEmitRequiresMode).toBeTypeOf("function");
 	});
 
 	it("retains live future text and JSON roots as explicit lazy UI payloads", () => {
@@ -170,13 +170,13 @@ describe("future Session projection carriers", () => {
 				encoding: "utf-8",
 			},
 		};
-		const future: FutureProductSessionEventDto = {
+		const future: ProductSessionEventDto = {
 			type: "tool_execution_start",
 			toolCallId: "call-future",
 			toolName: "future-tool",
 			args: { type: "inline_json", value: nestedLookalike },
 		};
-		const current: SessionEventDto = {
+		const current: PiSessionEventDto = {
 			type: "tool_execution_start",
 			toolCallId: "call-current",
 			toolName: "current-tool",
@@ -368,7 +368,7 @@ describe("future Session projection carriers", () => {
 	});
 
 	it("retains supported future roots while rebuilding settled snapshot messages", () => {
-		const toolResult: FutureSessionMessageDto = {
+		const toolResult: SessionMessageDto = {
 			role: "toolResult",
 			toolCallId: "call-future",
 			toolName: "future-tool",
@@ -408,7 +408,7 @@ describe("future Session projection carriers", () => {
 			sessionHandle: "session-future-pipeline",
 			generation: 3,
 		};
-		const emitEvent = (seq: number, event: FutureProductSessionEventDto): void => {
+		const emitEvent = (seq: number, event: ProductSessionEventDto): void => {
 			sessionTransport.frameBus.emit(
 				envelope.sessionHandle,
 				{ ...envelope, type: "event", seq, event },
@@ -424,7 +424,7 @@ describe("future Session projection carriers", () => {
 			useProjectionStore.getState().projections[envelope.sessionHandle]?.turns[0]?.steps[0]?.blocks[1],
 		).toMatchObject({ argsPayload: { kind: "external", value: jsonRef } });
 
-		const snapshot: ProjectedFutureSessionSnapshot = {
+		const snapshot: ProjectedSessionSnapshot = {
 			...envelope,
 			type: "session_snapshot",
 			snapshotId: "snapshot-future-pipeline",

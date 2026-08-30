@@ -1,10 +1,10 @@
-import type { ExtensionUiRequestDto, ExtensionUiResponseDto } from "@pi-agent-web/protocol";
+import type { ExtensionUiResponseDto, PiExtensionUiRequestDto } from "@pi-agent-web/protocol";
 import { create } from "zustand";
 import { useComposerStore } from "./composer";
 import { sessionTransport } from "./session-transport";
 
 export type DialogRequest = Extract<
-	ExtensionUiRequestDto,
+	PiExtensionUiRequestDto,
 	{ method: "select" | "confirm" | "input" | "editor" }
 >;
 
@@ -82,14 +82,14 @@ interface ExtensionUiState extends ExtensionUiSnapshot {
 	) => void;
 	applyRequestForSession: (
 		sessionHandle: string,
-		request: ExtensionUiRequestDto,
+		request: PiExtensionUiRequestDto,
 		generation: number,
 		receivedAt?: number,
 	) => void;
 	replaceRequestsForSession: (
 		sessionHandle: string,
 		generation: number,
-		requests: ExtensionUiRequestDto[],
+		requests: PiExtensionUiRequestDto[],
 		receivedAt?: number,
 	) => void;
 }
