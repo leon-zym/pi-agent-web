@@ -2286,11 +2286,7 @@ function assertLogicalBytes(read: () => number, label: string): void {
 	}
 }
 
-export class SessionWsBridge extends SessionWsBridgeCore<"content_ref"> {
-	constructor(opts: SessionWsBridgeOptions) {
-		super(opts);
-	}
-}
+export class SessionWsBridge extends SessionWsBridgeCore<"content_ref"> {}
 
 interface SessionLeaseSnapshot {
 	type: "lease_status";

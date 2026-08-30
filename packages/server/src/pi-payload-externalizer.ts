@@ -1,12 +1,11 @@
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import {
-	type SessionContentRefGuardContext,
 	isPiExtensionUiRequestDto,
-	isSessionContentRefGuardContext,
 	isPiProductSessionEventDto,
-	isSessionAttachmentGuardContext,
 	isPiSessionCommandResponseDto,
+	isSessionAttachmentGuardContext,
+	isSessionContentRefGuardContext,
 	isSessionJsonRootDto,
 	isSessionTextPayloadDto,
 	type SessionAttachmentGuardContext,
@@ -14,6 +13,7 @@ import {
 	type SessionCommandTypeDto,
 	type SessionContentRefBudgetDto,
 	type SessionContentRefDto,
+	type SessionContentRefGuardContext,
 	type SessionPayloadBudgetDto,
 	type SessionTextPayloadDto,
 } from "@pi-agent-web/protocol";
