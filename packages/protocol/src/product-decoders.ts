@@ -40,7 +40,7 @@ import type {
 
 export const SESSION_PRODUCT_IDENTIFIER_MAX_CHARS = 256;
 export const SESSION_MODEL_LIST_MAX_ITEMS = 1_000;
-export const SESSION_SLASH_COMMAND_LIST_MAX_ITEMS = 96;
+export const SESSION_SLASH_COMMAND_LIST_MAX_ITEMS = 1_000;
 export const SESSION_COMMAND_FAILURE_ERROR_MAX_BYTES = 64 * 1024;
 export const SESSION_COMMAND_FAILURE_RESPONSE_MAX_BYTES = 496 * 1024;
 export const SESSION_STATE_RESPONSE_MAX_BYTES = 496 * 1024;
@@ -52,8 +52,6 @@ const MAX_PATH_CHARS = 8192;
 const MAX_TEXT_BYTES = 1024 * 1024;
 const MAX_STATE_NAME_BYTES = 64 * 1024;
 const MAX_BASH_OUTPUT_BYTES = 50 * 1024;
-const MAX_SOURCE_PATH_CHARS = 4096;
-const MAX_COMMAND_DESCRIPTION_BYTES = 1024;
 // get_messages is admitted behind a 64 MiB JSONL snapshot ceiling. A single
 // historical assistant block may therefore exceed the ordinary frame budget.
 const MAX_SNAPSHOT_TEXT_BYTES = 48 * 1024 * 1024;
@@ -895,15 +893,15 @@ function isSlashCommand(value: unknown): value is SlashCommandDto {
 		isRecord(value) &&
 		hasOnlyKeys(value, ["name", "description", "source", "sourceInfo"]) &&
 		isString(value.name) &&
-		isOptionalText(value.description, MAX_COMMAND_DESCRIPTION_BYTES) &&
+		isOptionalText(value.description) &&
 		isOneOf(value.source, ["extension", "prompt", "skill"]) &&
 		isRecord(value.sourceInfo) &&
 		hasOnlyKeys(value.sourceInfo, ["path", "source", "scope", "origin", "baseDir"]) &&
-		isString(value.sourceInfo.path, MAX_SOURCE_PATH_CHARS) &&
-		isString(value.sourceInfo.source, MAX_SOURCE_PATH_CHARS) &&
+		isString(value.sourceInfo.path, MAX_PATH_CHARS) &&
+		isString(value.sourceInfo.source, MAX_PATH_CHARS) &&
 		isOneOf(value.sourceInfo.scope, ["user", "project", "temporary"]) &&
 		isOneOf(value.sourceInfo.origin, ["package", "top-level"]) &&
-		(value.sourceInfo.baseDir === undefined || isString(value.sourceInfo.baseDir, MAX_SOURCE_PATH_CHARS))
+		(value.sourceInfo.baseDir === undefined || isString(value.sourceInfo.baseDir, MAX_PATH_CHARS))
 	);
 }
 

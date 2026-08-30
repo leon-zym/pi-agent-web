@@ -224,31 +224,58 @@ describe("gateway command response reservations", () => {
 		).toBe(false);
 	});
 
-	it("keeps a maximal escaped command list inside its complete-frame reservation", () => {
-		const escapedIdentifier = "\u0000".repeat(SESSION_PRODUCT_IDENTIFIER_MAX_CHARS);
-		const escapedPath = "\u0000".repeat(4_096);
+	it("uses the serialized response guard as the command-list byte boundary", () => {
 		const command = {
-			name: escapedIdentifier,
-			description: "\u0000".repeat(1_024),
+			name: "review",
+			description: "x".repeat(1_025),
 			source: "extension",
 			sourceInfo: {
-				path: escapedPath,
-				source: escapedPath,
+				path: `/${"p".repeat(4_096)}`,
+				source: "local",
 				scope: "temporary",
 				origin: "top-level",
-				baseDir: escapedPath,
+				baseDir: `/${"b".repeat(4_096)}`,
 			},
 		} as const;
 		const frame = responseFrame("get_commands", {
 			success: true,
 			data: {
-				commands: Array.from({ length: SESSION_SLASH_COMMAND_LIST_MAX_ITEMS }, () => command),
+				commands: Array.from({ length: 97 }, () => command),
 			},
 		});
 		expect(isSessionWsServerMessage(frame)).toBe(true);
 		expect(new TextEncoder().encode(JSON.stringify(frame)).byteLength).toBeLessThanOrEqual(
 			commandResponseReservationBytes("get_commands"),
 		);
+		expect(
+			isSessionCommandResponseDto({
+				type: "response",
+				command: "get_commands",
+				success: true,
+				data: {
+					commands: Array.from({ length: SESSION_SLASH_COMMAND_LIST_MAX_ITEMS + 1 }, () => ({
+						...command,
+						description: "x",
+					})),
+				},
+			}),
+		).toBe(false);
+		const overSerializedBudget = {
+			type: "response",
+			command: "get_commands",
+			success: true,
+			data: {
+				commands: Array.from({ length: 8 }, (_, index) => ({
+					...command,
+					name: `review-${index}`,
+					description: "x".repeat(SESSION_TEXT_MAX_BYTES),
+				})),
+			},
+		} as const;
+		expect(new TextEncoder().encode(JSON.stringify(overSerializedBudget)).byteLength).toBeGreaterThan(
+			8 * SESSION_TEXT_MAX_BYTES - 16 * 1024,
+		);
+		expect(isSessionCommandResponseDto(overSerializedBudget)).toBe(false);
 	});
 });
 
