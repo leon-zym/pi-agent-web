@@ -107,6 +107,18 @@ function appendNativeHistoryEntry(target: ExistingSessionTarget, index: number, 
 	);
 }
 
+function messageTextFragments(value: unknown): string[] {
+	if (typeof value !== "object" || value === null) return [];
+	const content = Reflect.get(value, "content");
+	if (typeof content === "string") return [content];
+	if (!Array.isArray(content)) return [];
+	return content.flatMap((item) => {
+		if (typeof item !== "object" || item === null || Reflect.get(item, "type") !== "text") return [];
+		const text = Reflect.get(item, "text");
+		return typeof text === "string" ? [text] : [];
+	});
+}
+
 function createHarness(options: {
 	targets: ExistingSessionTarget[];
 	onBroadcast?: (message: SessionSupervisorMessage) => void;
@@ -1817,6 +1829,174 @@ describe("SessionSupervisor", () => {
 			content: [{ type: "text", text: expect.stringContaining("6:") }],
 		});
 		expect(older.nextCursor).toEqual(expect.any(String));
+
+		const cancelled = new AbortController();
+		cancelled.abort();
+		await expect(
+			result.chunkedSnapshot.readPage(result.chunkedSnapshot.history.nextCursor!, 8, cancelled.signal),
+		).rejects.toMatchObject({ code: "session_history_cancelled" });
+	});
+
+	it("opens a small verified persisted history natively without Pi get_messages", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "small-native-history");
+		appendNativeHistoryEntry(target, 0, 128);
+		appendNativeHistoryEntry(target, 1, 128);
+		const getMessagesMarker = path.join(root, "get-messages.log");
+		const { supervisor } = createHarness({
+			targets: [target],
+			env: { PI_WEB_FIXTURE_GET_MESSAGES_MARKER: getMessagesMarker },
+			maxAutoRestarts: 0,
+		});
+
+		await expect(supervisor.activate(target.sessionHandle)).resolves.toMatchObject({ state: "idle" });
+		const result = await supervisor.subscribe(target.sessionHandle);
+		if (result.type !== "resync_required" || !result.chunkedSnapshot) {
+			throw new Error("small persisted history did not produce a native snapshot");
+		}
+		expect(result.chunkedSnapshot.history).toMatchObject({
+			totalMessages: 2,
+			loadedMessages: 2,
+			nextCursor: null,
+		});
+		expect(result.snapshot.settledMessages).toHaveLength(2);
+		expect(fs.existsSync(getMessagesMarker)).toBe(false);
+	});
+
+	it("keeps an empty verified Session on Pi until durable messages exist", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "empty-pi-history");
+		const getMessagesMarker = path.join(root, "get-messages.log");
+		const { supervisor } = createHarness({
+			targets: [target],
+			env: {
+				PI_WEB_FIXTURE_GET_MESSAGES_MARKER: getMessagesMarker,
+				PI_WEB_FIXTURE_LARGE_SETTLED_BASE: "1",
+			},
+			maxAutoRestarts: 0,
+		});
+
+		await supervisor.activate(target.sessionHandle);
+		const result = await supervisor.subscribe(target.sessionHandle);
+		if (result.type !== "resync_required") throw new Error("empty Session did not resync");
+		expect(result.chunkedSnapshot).toBeUndefined();
+		expect(result.snapshot.settledMessages).toHaveLength(1);
+		expect(fs.readFileSync(getMessagesMarker, "utf8").trim().split("\n")).toHaveLength(1);
+	});
+
+	it("keeps a new unmaterialized Session on Pi history", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const getMessagesMarker = path.join(root, "get-messages.log");
+		const { supervisor } = createHarness({
+			targets: [],
+			env: { PI_WEB_FIXTURE_GET_MESSAGES_MARKER: getMessagesMarker },
+			maxAutoRestarts: 0,
+		});
+
+		const runtime = await supervisor.createSession({
+			workspaceId: "workspace",
+			cwd,
+			sessionDir: path.join(root, "sessions"),
+			requestedNativeSessionId: "new-pi-history",
+		});
+		expect(runtime.recoverable).toBe(false);
+		expect(runtime.sessionFile ? fs.existsSync(runtime.sessionFile) : false).toBe(false);
+		expect(fs.readFileSync(getMessagesMarker, "utf8").trim().split("\n")).toHaveLength(1);
+	});
+
+	it("uses Pi compaction when live projection is newer than a small native base", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "native-live-suffix");
+		appendNativeHistoryEntry(target, 0, 128);
+		appendNativeHistoryEntry(target, 1, 128);
+		const getMessagesMarker = path.join(root, "get-messages.log");
+		const { supervisor } = createHarness({
+			targets: [target],
+			env: {
+				PI_WEB_FIXTURE_GET_MESSAGES_MARKER: getMessagesMarker,
+				PI_WEB_FIXTURE_LOAD_EXISTING_MESSAGES: "1",
+			},
+			projectionLimits: { maxLiveEventItems: 2_048 },
+			maxAutoRestarts: 0,
+		});
+		const lease = await supervisor.claim(target.sessionHandle, "controller");
+
+		for (let turn = 0; turn < 2; turn += 1) {
+			const runtime = supervisor.getRuntime(target.sessionHandle)!;
+			await supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "prompt", message: "structural-burst" },
+				{
+					connectionId: "controller",
+					expectedGeneration: runtime.generation,
+					fencingToken: lease.fencingToken,
+				},
+			);
+			await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "idle", 5_000);
+		}
+		await waitFor(() => fs.existsSync(getMessagesMarker), 5_000);
+		await waitFor(() => {
+			const snapshot = runtimeProjection(exactRuntimeObject(supervisor, target.sessionHandle)).snapshot();
+			return snapshot.projectionEvents.length === 0 && snapshot.settledMessages.length === 6;
+		}, 5_000);
+
+		const snapshot = runtimeProjection(exactRuntimeObject(supervisor, target.sessionHandle)).snapshot();
+		const text = snapshot.settledMessages.flatMap(messageTextFragments);
+		expect(text.filter((value) => value === "structural-burst")).toHaveLength(2);
+		expect(text.filter((value) => value.startsWith("structural-burst-")).length).toBe(2);
+		expect(fs.readFileSync(getMessagesMarker, "utf8").trim().split("\n")).toHaveLength(1);
+	});
+
+	it("fails native history pages closed after deletion or inode replacement", async () => {
+		for (const mutation of ["delete", "replace"] as const) {
+			const root = temporaryRoot();
+			const cwd = path.join(root, `workspace-${mutation}`);
+			fs.mkdirSync(cwd);
+			const target = createNativeSession(root, cwd, `history-${mutation}`);
+			appendLargeNativeHistory(target, 110, 128);
+			const { supervisor } = createHarness({ targets: [target], maxAutoRestarts: 0 });
+
+			await supervisor.activate(target.sessionHandle);
+			const result = await supervisor.subscribe(target.sessionHandle);
+			if (result.type !== "resync_required" || !result.chunkedSnapshot?.history.nextCursor) {
+				throw new Error("native history did not expose a page cursor");
+			}
+			const runtime = exactRuntimeObject(supervisor, target.sessionHandle);
+			const originalPlan = Reflect.get(runtime, "nativeHistoryPlan");
+			const originalSnapshotId = Reflect.get(runtime, "nativeHistorySnapshotId");
+			if (mutation === "delete") {
+				fs.unlinkSync(target.sessionFile);
+			} else {
+				const replacement = `${target.sessionFile}.replacement`;
+				fs.copyFileSync(target.sessionFile, replacement);
+				fs.renameSync(replacement, target.sessionFile);
+			}
+			const maybeCompact = Reflect.get(runtime, "maybeCompactIdleProjectionBase");
+			if (typeof maybeCompact !== "function") throw new Error("Idle compaction seam is unavailable");
+			Reflect.apply(maybeCompact, runtime, []);
+			let compaction: Promise<void> | null = null;
+			await waitFor(() => {
+				const candidate = Reflect.get(runtime, "idleBaseCompactionPromise");
+				if (!(candidate instanceof Promise)) return false;
+				compaction = candidate;
+				return true;
+			});
+			await compaction;
+			expect(Reflect.get(runtime, "nativeHistoryPlan")).toBe(originalPlan);
+			expect(Reflect.get(runtime, "nativeHistorySnapshotId")).toBe(originalSnapshotId);
+
+			await expect(
+				result.chunkedSnapshot.readPage(result.chunkedSnapshot.history.nextCursor, 8),
+			).rejects.toThrow();
+		}
 	});
 
 	it("refreshes the native history cursor when the persisted source grows while idle", async () => {
@@ -1861,7 +2041,10 @@ describe("SessionSupervisor", () => {
 		const getMessagesMarker = path.join(root, "get-messages.log");
 		const { supervisor } = createHarness({
 			targets: [target],
-			env: { PI_WEB_FIXTURE_GET_MESSAGES_MARKER: getMessagesMarker },
+			env: {
+				PI_WEB_FIXTURE_GET_MESSAGES_MARKER: getMessagesMarker,
+				PI_WEB_FIXTURE_PERSIST_MESSAGES: "1",
+			},
 			projectionLimits: { maxLiveEventItems: 2_048 },
 			maxAutoRestarts: 0,
 		});
@@ -1893,9 +2076,11 @@ describe("SessionSupervisor", () => {
 		}, 5_000);
 		await compaction;
 		expect(fs.existsSync(getMessagesMarker)).toBe(false);
-		expect(
-			runtimeProjection(exactRuntimeObject(supervisor, target.sessionHandle)).snapshot().settledMessages,
-		).toHaveLength(96);
+		const settled = runtimeProjection(exactRuntimeObject(supervisor, target.sessionHandle)).snapshot()
+			.settledMessages;
+		expect(settled).toHaveLength(96);
+		const text = settled.flatMap(messageTextFragments);
+		expect(text.filter((value) => value.includes("structural-burst"))).toHaveLength(4);
 	});
 
 	it("preflights aggregate wire bounds before ready and releases the hot slot on failure", async () => {

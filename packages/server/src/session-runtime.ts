@@ -26,7 +26,6 @@ import {
 	commandTimeoutMs,
 	expectCommandData,
 	RpcError,
-	SESSION_SNAPSHOT_MAX_BYTES,
 	SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS,
 	sessionHistoryMessagesBytes,
 } from "@pi-agent-web/protocol";
@@ -90,7 +89,6 @@ const DEFAULT_EXTENSION_STATE_MAX_BYTES = 512 * 1024;
 const DEFAULT_EXTENSION_STATE_MAX_ITEMS = SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS;
 const DEFAULT_PENDING_DIALOG_LIMIT = 32;
 const DEFAULT_MAX_PENDING_COMMANDS = 32;
-const NATIVE_HISTORY_DIRECT_THRESHOLD_BYTES = SESSION_SNAPSHOT_MAX_BYTES - 256 * 1024;
 
 function deepFreeze<T>(value: T): T {
 	if (value === null || typeof value !== "object" || Object.isFrozen(value)) return value;
@@ -1115,7 +1113,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		proc: PiProcess,
 	): Promise<readonly RuntimeMessage<M>[] | null> {
 		const sessionFile = this.sessionFile;
-		if (!sessionFile || !this.shouldUseNativeHistory(sessionFile)) return null;
+		if (!sessionFile || !this.shouldUseNativeHistory()) return null;
 		const signal = AbortSignal.timeout(this.timeoutFor("get_messages"));
 		try {
 			const plan = await scanNativeSessionHistory(
@@ -1126,6 +1124,17 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 				},
 				signal,
 			);
+			if (plan.totalMessages === 0) {
+				if (!this.isCurrentNativeHistoryRead(processToken, proc)) {
+					throw new RpcError("get_messages", "session_generation_stale");
+				}
+				// A materialized Header does not prove that Pi has no in-memory
+				// context. Keep the empty plan only as a source fingerprint and ask
+				// Pi for the authoritative base until durable messages appear.
+				this.nativeHistoryPlan = plan;
+				this.nativeHistorySnapshotId = null;
+				return null;
+			}
 			const initial = await plan.readInitial(signal);
 			const messages = await this.normalizeNativeHistoryEntries(processToken, proc, initial.entries, signal);
 			if (!this.isCurrentNativeHistoryRead(processToken, proc)) {
@@ -1154,11 +1163,12 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		processToken: number,
 		proc: PiProcess,
 		contentOwner: GenerationContentOwner<RuntimeRef<M>> | null,
-	): Promise<boolean> {
+	): Promise<boolean | null> {
 		if (!token || !this.sessionFile) return false;
 		const signal = AbortSignal.timeout(this.timeoutFor("get_messages"));
 		let lease: PiPayloadLease<RuntimeRef<M>> | null = null;
 		try {
+			const previousPlan = this.nativeHistoryPlan;
 			const plan = await scanNativeSessionHistory(
 				this.sessionFile,
 				{
@@ -1167,6 +1177,21 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 				},
 				signal,
 			);
+			if (previousPlan && !plan.hasSameSourceFile(previousPlan)) {
+				throw new SessionHistoryError(
+					"session_history_changed",
+					"native Session history file identity changed",
+				);
+			}
+			if (plan.totalMessages === 0) {
+				const ownershipCurrent = contentOwner
+					? this.isCurrentGenerationContentOwner(processToken, proc, contentOwner)
+					: !this.payloadCustody && processToken === this.processToken && this.proc === proc;
+				if (!ownershipCurrent || this.liveProjection !== projection) return false;
+				this.nativeHistoryPlan = plan;
+				this.nativeHistorySnapshotId = null;
+				return null;
+			}
 			const initial = await plan.readInitial(signal);
 			const normalized = await this.normalizeNativeHistoryEntriesWithLease(
 				processToken,
@@ -1214,13 +1239,8 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		}
 	}
 
-	private shouldUseNativeHistory(sessionFile: string): boolean {
-		try {
-			const stats = fs.statSync(sessionFile);
-			return stats.isFile() && stats.size >= NATIVE_HISTORY_DIRECT_THRESHOLD_BYTES;
-		} catch {
-			return false;
-		}
+	private shouldUseNativeHistory(): boolean {
+		return this.sessionFileIdentityVerified;
 	}
 
 	private async normalizeNativeHistoryEntries(
@@ -3747,9 +3767,9 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			return;
 		const projection = this.liveProjection;
 		const proc = this.proc;
-		const nativeHistoryNeedsRefresh = this.nativeHistoryPlanNeedsRefresh();
-		if (!projection || !proc?.running || (!projection.shouldCompactIdleBase() && !nativeHistoryNeedsRefresh))
-			return;
+		const projectionNeedsCompaction = projection?.shouldCompactIdleBase() ?? false;
+		const nativeHistoryNeedsRefresh = this.nativeHistoryPlanNeedsRefresh(projectionNeedsCompaction);
+		if (!projection || !proc?.running || (!projectionNeedsCompaction && !nativeHistoryNeedsRefresh)) return;
 		const token = projection.beginIdleBaseCompaction();
 		if (!token || (token.expectedAsOfSeq === projection.snapshot().baseSeq && !nativeHistoryNeedsRefresh))
 			return;
@@ -3764,15 +3784,19 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		let compaction!: Promise<void>;
 		compaction = (async () => {
 			let committed = false;
-			if (this.nativeHistoryPlan || nativeHistoryNeedsRefresh) {
-				committed = await this.compactIdleNativeHistoryBase(
+			let compactFromPi = !nativeHistoryNeedsRefresh;
+			if (nativeHistoryNeedsRefresh) {
+				const nativeResult = await this.compactIdleNativeHistoryBase(
 					token,
 					projection,
 					processToken,
 					proc,
 					contentOwner,
 				);
-			} else {
+				if (nativeResult === null) compactFromPi = true;
+				else committed = nativeResult;
+			}
+			if (compactFromPi) {
 				await this.productAdapter.sendDecoded(
 					proc,
 					{ type: "get_messages" },
@@ -3847,9 +3871,9 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		this.idleBaseCompactionPromise = compaction;
 	}
 
-	private nativeHistoryPlanNeedsRefresh(): boolean {
+	private nativeHistoryPlanNeedsRefresh(initializeIfMissing: boolean): boolean {
 		if (this.nativeHistoryPlan) return !this.nativeHistoryPlan.isSourceCurrent();
-		return this.sessionFile !== null && this.shouldUseNativeHistory(this.sessionFile);
+		return initializeIfMissing && this.sessionFile !== null && this.shouldUseNativeHistory();
 	}
 
 	private trackDiscardedCompactionTransfer(

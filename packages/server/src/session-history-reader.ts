@@ -166,6 +166,11 @@ export class NativeSessionHistoryPlan {
 		}
 	}
 
+	/** Compare only the durable file identity; content growth may still be valid. */
+	hasSameSourceFile(other: NativeSessionHistoryPlan): boolean {
+		return this.fingerprint.dev === other.fingerprint.dev && this.fingerprint.ino === other.fingerprint.ino;
+	}
+
 	private decodeCursor(cursor: string): number {
 		try {
 			const parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as {
