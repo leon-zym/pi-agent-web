@@ -107,7 +107,9 @@ export const ConversationToc = memo(function ConversationToc({
 		}
 		const mutationObserver =
 			content && typeof MutationObserver !== "undefined" ? new MutationObserver(scheduleUpdate) : null;
-		mutationObserver?.observe(content, { childList: true, characterData: true, subtree: true });
+		if (mutationObserver && content) {
+			mutationObserver.observe(content, { childList: true, characterData: true, subtree: true });
+		}
 
 		return () => {
 			window.removeEventListener("resize", scheduleUpdate);
