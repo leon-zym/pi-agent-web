@@ -2387,6 +2387,43 @@ describe("SessionSupervisor", () => {
 		expect(fs.readFileSync(promptMarker, "utf8").trim().split("\n")).toHaveLength(2);
 	});
 
+	it("returns to ready after a read command overlaps idle base compaction", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "idle-compaction-read-overlap");
+		const { supervisor } = createHarness({
+			targets: [target],
+			projectionLimits: { maxLiveEventItems: 8 },
+			env: { PI_WEB_FIXTURE_COMPACTION_DELAY_MS: "200" },
+		});
+		const lease = await supervisor.claim(target.sessionHandle, "controller");
+		const runtime = supervisor.getRuntime(target.sessionHandle)!;
+		const context = {
+			connectionId: "controller",
+			expectedGeneration: runtime.generation,
+			fencingToken: lease.fencingToken,
+		};
+
+		await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "prompt", message: "small-structural-turn" },
+			context,
+		);
+		await waitFor(
+			() => supervisor.getRuntime(target.sessionHandle)?.busyReasons?.includes("compaction") ?? false,
+		);
+		await supervisor.sendCommand(target.sessionHandle, { type: "get_state" }, context);
+		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.operationCount === 0);
+
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({
+			state: "idle",
+			phase: "ready",
+			operationCount: 0,
+			busyReasons: [],
+		});
+	});
+
 	it("atomically reserves two half-turns and rejects a third concurrent follow-up before Pi", async () => {
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace");

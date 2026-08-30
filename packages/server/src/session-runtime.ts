@@ -3735,10 +3735,13 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 				);
 			})
 			.finally(() => {
-				if (this.idleBaseCompactionPromise === compaction) this.idleBaseCompactionPromise = null;
+				const previousOperationalState = this.operationalStateKey();
 				this.idleBaseCompactionBusy = false;
 				this.touch();
-				this.publishOperationalState();
+				// Keep the completed promise installed while state is reconciled so the
+				// idle transition cannot immediately start the same compaction again.
+				this.refreshOperationalStateAndPublish(previousOperationalState);
+				if (this.idleBaseCompactionPromise === compaction) this.idleBaseCompactionPromise = null;
 			});
 		this.idleBaseCompactionPromise = compaction;
 	}
