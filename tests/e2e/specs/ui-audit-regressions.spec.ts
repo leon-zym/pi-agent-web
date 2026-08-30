@@ -1,5 +1,10 @@
 import fs from "node:fs";
-import type { Locator, Page } from "@playwright/test";
+import type { Locator, Page, WebSocket } from "@playwright/test";
+import {
+	dropControlledWebSockets,
+	installWebSocketDropControl,
+	observePageErrors,
+} from "../fixtures/page-observation";
 import { expect, test } from "../fixtures/test";
 
 const captureDirectory = process.env.PI_WEB_E2E_CAPTURE_DIR;
@@ -198,4 +203,90 @@ test("audio chime preference keeps localized dark-mode context", async ({ page, 
 	await expect(settings.getByRole("switch", { name: "提示音" })).not.toBeChecked();
 	await expect(settings.getByText("提示音已静音", { exact: true })).toBeVisible();
 	await capture(page, "settings-audio-muted-1280-zh-dark");
+});
+
+test("settled conversation survives the Issue 7 interaction matrix", async ({ page, harness }) => {
+	const errors = observePageErrors(page);
+	await page.setViewportSize({ width: 1280, height: 900 });
+	await page.emulateMedia({ reducedMotion: "reduce" });
+	await page.context().grantPermissions(["clipboard-read", "clipboard-write"], {
+		origin: harness.origin,
+	});
+	await installWebSocketDropControl(page);
+	const sockets: WebSocket[] = [];
+	page.on("websocket", (socket) => sockets.push(socket));
+	await openWorkbench(page, harness.origin, "en");
+
+	const reducedMotion = await page.getByRole("button", { name: "Send" }).evaluate((element) => ({
+		transitionDuration: getComputedStyle(element).transitionDuration,
+		scrollBehavior: getComputedStyle(document.documentElement).scrollBehavior,
+	}));
+	expect(reducedMotion.transitionDuration).toMatch(/^(0s|0\.001ms|0\.000001s|1e-06s)$/);
+	expect(reducedMotion.scrollBehavior).toBe("auto");
+
+	await page.locator("textarea").fill("E2E_COMPLEX_DEMO");
+	await page.getByRole("button", { name: "Send" }).click();
+	const heading = page.getByRole("heading", { name: "Synthetic change review", level: 2 });
+	await expect(heading).toBeVisible();
+	expect(
+		await page.evaluate(() =>
+			(
+				window as typeof window & {
+					find: (text: string, caseSensitive: boolean, backwards: boolean, wrap: boolean) => boolean;
+				}
+			).find("Synthetic change review", false, false, true),
+		),
+	).toBe(true);
+
+	const toolToggle = page.locator("main button[aria-expanded]").filter({ hasText: "src/demo.ts" });
+	await toolToggle.click();
+	await expect(page.locator('[data-diff-block="true"]')).toBeVisible();
+	const inspect = page.getByRole("button", { name: "Open in details panel" });
+	await inspect.click();
+	await expect(page.getByText("Synthetic edit completed", { exact: true })).toBeVisible();
+	await page.getByRole("button", { name: "Collapse details panel" }).click();
+	await expect(inspect).toBeFocused();
+
+	await page.getByRole("button", { name: "Copy", exact: true }).last().click();
+	await expect
+		.poll(() => page.evaluate(() => navigator.clipboard.readText()))
+		.toContain("Synthetic change review");
+
+	await page.getByRole("button", { name: "Settings", exact: true }).click();
+	const settings = page.getByRole("dialog", { name: "Settings" });
+	await settings.getByRole("button", { name: "Dark", exact: true }).click();
+	await expect(page.locator("html")).toHaveClass(/dark/);
+	await settings.getByRole("button", { name: "Close" }).last().click();
+
+	await expect.poll(() => sockets.length).toBeGreaterThanOrEqual(1);
+	await dropControlledWebSockets(page);
+	await expect.poll(() => sockets.length).toBeGreaterThanOrEqual(2);
+	await expect(page.locator("textarea")).toBeEnabled();
+	await expect(heading).toBeVisible();
+	await expect(page.locator('[data-diff-block="true"]')).toBeVisible();
+	await inspect.click();
+	await expect(page.getByText("Synthetic edit completed", { exact: true })).toBeVisible();
+	await page.getByRole("button", { name: "Collapse details panel" }).click();
+
+	await page.evaluate(() => {
+		Object.defineProperty(document, "hidden", { configurable: true, value: true });
+		Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+		document.dispatchEvent(new Event("visibilitychange"));
+	});
+	const hiddenPrompt = "E2E_A_SLOW_UI_AUDIT";
+	await page.locator("textarea").fill(hiddenPrompt);
+	await page.getByRole("button", { name: "Send" }).click();
+	await expect(page).toHaveTitle(/^\[Running\]/);
+	await expect(page.locator('[data-markdown-streaming="true"]')).toContainText("E2E_REPLY:");
+	harness.releasePrompt(hiddenPrompt);
+	await expect(page.locator("main").getByText(`E2E_REPLY:${hiddenPrompt}`, { exact: true })).toBeVisible();
+	await page.evaluate(() => {
+		Reflect.deleteProperty(document, "hidden");
+		Reflect.deleteProperty(document, "visibilityState");
+		document.dispatchEvent(new Event("visibilitychange"));
+	});
+	await expect(page.locator("header").getByText("Ready", { exact: true })).toBeVisible();
+	await capture(page, "issue-7-interaction-matrix-1280-en-dark");
+	expect(errors.console).toEqual([]);
+	expect(errors.page).toEqual([]);
 });

@@ -75,6 +75,8 @@ export function AppShell() {
 	const navigationDrawer = useRef<HTMLDivElement>(null);
 	const navigationTrigger = useRef<HTMLButtonElement>(null);
 	const detailsReturnFocus = useRef<HTMLElement>(null);
+	const dockedDetailsTrigger = useRef<HTMLButtonElement>(null);
+	const previousDetailsOpen = useRef(detailsOpen);
 
 	useEffect(() => {
 		const observer = new ResizeObserver(() => setViewportWidth(window.innerWidth));
@@ -140,6 +142,23 @@ export function AppShell() {
 		if (detailsWidth > 0 && detailsWidth < DETAILS_MIN) detailsWidth = 0;
 	}
 
+	useEffect(() => {
+		const wasOpen = previousDetailsOpen.current;
+		previousDetailsOpen.current = detailsOpen;
+		if (!canDockDetails || wasOpen === detailsOpen) return;
+		if (detailsOpen) {
+			if (document.activeElement instanceof HTMLElement) {
+				detailsReturnFocus.current = document.activeElement;
+			}
+			return;
+		}
+		window.requestAnimationFrame(() => {
+			const target = detailsReturnFocus.current;
+			if (target?.isConnected) target.focus();
+			else dockedDetailsTrigger.current?.focus();
+		});
+	}, [canDockDetails, detailsOpen]);
+
 	const startDrag = (which: "sidebar" | "details") => (event: React.PointerEvent) => {
 		dragging.current = which;
 		event.currentTarget.setPointerCapture(event.pointerId);
@@ -202,6 +221,7 @@ export function AppShell() {
 				<Tooltip>
 					<TooltipTrigger asChild>
 						<button
+							ref={dockedDetailsTrigger}
 							type="button"
 							aria-label={tt("details.expandPanel")}
 							className="flex w-10 shrink-0 items-start justify-center border-l border-border pt-3 text-ink-3 transition-[color,background-color,scale] hover:bg-hover hover:text-ink active:scale-95 focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"

@@ -1865,7 +1865,7 @@ function streamPrompt(command) {
 	send({ type: "message_start", message: user });
 	send({ type: "message_end", message: user });
 	send({ type: "session_info_changed" });
-	send({ type: "message_start", message: assistantMessage("") });
+	send({ type: "message_start", message: assistantMessageWithContent([], "pending") });
 	respond(command);
 
 	schedule(run, firstDelay, () => {
