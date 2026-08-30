@@ -1,14 +1,16 @@
 import type { Page, WebSocket } from "@playwright/test";
 import { observePageErrors } from "../fixtures/page-observation";
-import type { PiFixtureEvent, ProductionHarness } from "../fixtures/production-harness";
+import type { HarnessSession, PiFixtureEvent, ProductionHarness } from "../fixtures/production-harness";
 import { expect, test } from "../fixtures/test";
 import {
 	addSummaryGate,
 	addValueGate,
+	browserSessionFrameSnapshot,
 	correctnessFailureCount,
 	finishBrowserMeasurement,
 	installBrowserBenchmarkObserver,
 	markBrowserStreamEnd,
+	resetBrowserSessionFrames,
 	runBenchmarkScenario,
 	scenariosFor,
 	startBrowserMeasurement,
@@ -39,6 +41,18 @@ function maxProgressGap(events: PiFixtureEvent[], prompt: string): number {
 		previous = at;
 	}
 	return maximum;
+}
+
+async function sessionHandlesForPrompts(harness: ProductionHarness, prompts: string[]): Promise<string[]> {
+	const directory = await harness.requestJson<{ sessions: HarnessSession[] }>(
+		`/api/v1/workspaces/${encodeURIComponent(harness.workspace.workspaceHandle)}/sessions?refresh=1`,
+	);
+	return prompts.map((prompt) => {
+		const nativeSessionId = eventFor(harness, "prompt", prompt)?.sessionId;
+		const session = directory.sessions.find((candidate) => candidate.nativeSessionId === nativeSessionId);
+		if (!session) throw new Error(`Unable to resolve the materialized Session for ${prompt}`);
+		return session.sessionHandle;
+	});
 }
 
 for (const scenario of scenariosFor("concurrency")) {
@@ -108,12 +122,93 @@ for (const scenario of scenariosFor("concurrency")) {
 						await expect(page.locator("textarea")).toBeEnabled();
 					}
 				}
+				const sessionHandles = await sessionHandlesForPrompts(harness, prompts);
+				await resetBrowserSessionFrames(page, sessionHandles);
 				for (const prompt of prompts) harness.startPrompt(prompt);
 				await expect
 					.poll(() => prompts.every((prompt) => eventFor(harness, "delta", prompt) !== undefined), {
 						timeout: 30_000,
 					})
 					.toBe(true);
+
+				const expectedDeltas = Math.ceil(targetBytes / chunkBytes);
+				const checkpoints = [
+					Math.min(16, Math.max(1, expectedDeltas - 1)),
+					Math.min(64, Math.max(2, Math.floor(expectedDeltas / 2))),
+				].filter((checkpoint, checkpointIndex, values) => values.indexOf(checkpoint) === checkpointIndex);
+				const observations = prompts.map(
+					() =>
+						[] as Array<{
+							background: boolean;
+							backgroundProgress: boolean;
+							deltaFrames: number;
+							projectionLagMs: number;
+							maxFrameGapMs: number;
+						}>,
+				);
+				let selectedSessionIndex = sessionCount - 1;
+				const backgroundBaselines: Array<number | null> = prompts.map((_, sessionIndex) =>
+					sessionIndex === selectedSessionIndex ? null : 0,
+				);
+
+				for (const checkpoint of checkpoints) {
+					for (const [sessionIndex, prompt] of prompts.entries()) {
+						const previous = observations[sessionIndex]?.at(-1)?.deltaFrames ?? 0;
+						const backgroundBaseline = backgroundBaselines[sessionIndex];
+						if (backgroundBaseline === undefined) throw new Error("Background baseline is missing");
+						const minimumFrames = Math.max(
+							checkpoint,
+							previous + 1,
+							backgroundBaseline === null ? 0 : backgroundBaseline + 1,
+						);
+						await expect
+							.poll(
+								async () =>
+									(await browserSessionFrameSnapshot(page, sessionHandles[sessionIndex] ?? "")).deltaFrames,
+								{ timeout: 30_000 },
+							)
+							.toBeGreaterThanOrEqual(minimumFrames);
+						const arrival = await browserSessionFrameSnapshot(page, sessionHandles[sessionIndex] ?? "");
+						const identityPrompt = sessionIdentityPrompts[sessionIndex];
+						if (!identityPrompt) throw new Error("Session identity prompt was not captured");
+						const row = page.locator("[data-session-row]").filter({ hasText: identityPrompt });
+						const wasBackground = (await row.getAttribute("data-current")) === "false";
+						if (selectedSessionIndex !== sessionIndex) {
+							const previousSelected = selectedSessionIndex;
+							await row.getByRole("button").first().click();
+							const previousHandle = sessionHandles[previousSelected];
+							if (!previousHandle) throw new Error("Selected Session handle is missing");
+							backgroundBaselines[previousSelected] = (
+								await browserSessionFrameSnapshot(page, previousHandle)
+							).deltaFrames;
+							backgroundBaselines[sessionIndex] = null;
+							selectedSessionIndex = sessionIndex;
+						}
+						const turn = page
+							.getByRole("region", { name: /^(Conversation turn|对话轮次)$/ })
+							.filter({ hasText: prompt });
+						const streaming = turn.locator('[data-markdown-streaming="true"]');
+						await expect(streaming).toHaveCount(1);
+						await expect
+							.poll(() => streaming.evaluate((element) => element.textContent?.length ?? 0), {
+								timeout: 30_000,
+							})
+							.toBeGreaterThanOrEqual(arrival.deltaChars);
+						const projectedAt = await page.evaluate(() => performance.now());
+						observations[sessionIndex]?.push({
+							background: sessionCount === 1 || wasBackground,
+							backgroundProgress:
+								sessionCount === 1 ||
+								(backgroundBaseline !== null && arrival.deltaFrames > backgroundBaseline),
+							deltaFrames: arrival.deltaFrames,
+							projectionLagMs:
+								arrival.lastArrivalAt === null
+									? Number.POSITIVE_INFINITY
+									: projectedAt - arrival.lastArrivalAt,
+							maxFrameGapMs: arrival.maxFrameGapMs,
+						});
+					}
+				}
 
 				await expect
 					.poll(() => prompts.every((prompt) => eventFor(harness, "stream_end", prompt) !== undefined), {
@@ -152,12 +247,36 @@ for (const scenario of scenariosFor("concurrency")) {
 					0,
 				);
 				const overlapMs = Math.max(...ends) - Math.min(...starts);
+				const flatObservations = observations.flat();
+				const minimumProjectionCheckpoints = Math.min(
+					...observations.map((sessionObservations) => sessionObservations.length),
+				);
+				const minimumBackgroundCheckpoints =
+					sessionCount === 1
+						? 0
+						: Math.min(
+								...observations.map(
+									(sessionObservations) =>
+										sessionObservations.filter(
+											(observation) => observation.background && observation.backgroundProgress,
+										).length,
+								),
+							);
 				outcome.trials.push({
 					index,
 					warmup: index < scenario.warmups,
 					metrics: {
 						...browserMetrics,
-						maxProgressGapMs: Math.max(...prompts.map((prompt) => maxProgressGap(events, prompt))),
+						producerProgressGapMs: Math.max(...prompts.map((prompt) => maxProgressGap(events, prompt))),
+						browserProjectionLagMs: Math.max(
+							...flatObservations.map((observation) => observation.projectionLagMs),
+						),
+						browserFrameArrivalGapMs: Math.max(
+							...flatObservations.map((observation) => observation.maxFrameGapMs),
+						),
+						browserProjectionCheckpointDeficit: Math.max(0, 2 - minimumProjectionCheckpoints),
+						backgroundIngestCheckpointDeficit:
+							sessionCount === 1 ? 0 : Math.max(0, 2 - minimumBackgroundCheckpoints),
 						completionSkewMs: Math.max(...ends) - Math.min(...ends),
 						durationSkewMs: Math.max(...durations) - Math.min(...durations),
 						aggregateDeltaPerSecond: overlapMs > 0 ? (deltaCount * 1_000) / overlapMs : null,
@@ -166,6 +285,9 @@ for (const scenario of scenariosFor("concurrency")) {
 						allSessionsStarted: starts.every((at) => at > 0),
 						allSessionsSettled: ends.every((at) => at > 0),
 						allBackgroundProjectionsRecovered: projectedSessions === sessionCount,
+						allSessionsObservedTwice: minimumProjectionCheckpoints >= 2,
+						backgroundSessionsIngestedBetweenSwitches:
+							sessionCount === 1 || minimumBackgroundCheckpoints >= 2,
 						singleMultiplexedSocket: sockets.length === 1 && closedSockets.length === 0,
 					},
 				});
@@ -182,12 +304,30 @@ for (const scenario of scenariosFor("concurrency")) {
 			);
 			addSummaryGate(
 				outcome,
-				"maxProgressGapMs",
+				"producerProgressGapMs",
 				"p95",
 				"lte",
 				1_000,
+				"observe",
+				"Deterministic Pi pacing is an input diagnostic; it cannot establish Browser publication fairness.",
+			);
+			addSummaryGate(
+				outcome,
+				"browserProjectionCheckpointDeficit",
+				"max",
+				"lte",
+				0,
 				"hard",
-				"A one-second progress silence is a practical starvation signal under deterministic pacing.",
+				"Every Session must publish at least two increasing Browser-side projection checkpoints.",
+			);
+			addSummaryGate(
+				outcome,
+				"backgroundIngestCheckpointDeficit",
+				"max",
+				"lte",
+				0,
+				"hard",
+				"Every background Session must receive new frames between two separate view switches.",
 			);
 			addSummaryGate(
 				outcome,
@@ -195,8 +335,8 @@ for (const scenario of scenariosFor("concurrency")) {
 				"p95",
 				"lte",
 				2_000,
-				"hard",
-				"Synchronized starts make duration skew a direct bound on gross cross-Session unfairness.",
+				"observe",
+				"Duration skew is hardware-sensitive and remains observational until a reference baseline exists.",
 			);
 			addSummaryGate(
 				outcome,
@@ -209,12 +349,30 @@ for (const scenario of scenariosFor("concurrency")) {
 			);
 			addSummaryGate(
 				outcome,
+				"browserProjectionLagMs",
+				"p95",
+				"lte",
+				2_000,
+				"observe",
+				"Worst-Session Browser arrival-to-projection lag is measured, but not release-gated without a reference host.",
+			);
+			addSummaryGate(
+				outcome,
+				"browserFrameArrivalGapMs",
+				"p95",
+				"lte",
+				2_000,
+				"observe",
+				"Worst-Session Browser frame-arrival gaps are retained separately from producer pacing.",
+			);
+			addSummaryGate(
+				outcome,
 				"liveLongTaskMaxMs",
 				"p95",
 				"lte",
 				500,
-				"hard",
-				"A 500 ms ceiling catches rendering monopolization while tolerating representative-host noise.",
+				"observe",
+				"Long-task timing is hardware-sensitive and cannot be a shared release gate before calibration.",
 			);
 			addSummaryGate(
 				outcome,

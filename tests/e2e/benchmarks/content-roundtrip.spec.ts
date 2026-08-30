@@ -246,8 +246,8 @@ for (const scenario of scenariosFor("content-roundtrip")) {
 				"p95",
 				"lte",
 				3_000,
-				"hard",
-				"Repeated p95 catches accidental image re-encoding or main-thread stalls.",
+				"observe",
+				"Selection latency is hardware-sensitive and remains observational before reference calibration.",
 			);
 			addSummaryGate(
 				outcome,
@@ -255,8 +255,8 @@ for (const scenario of scenariosFor("content-roundtrip")) {
 				"p95",
 				"lte",
 				5_000,
-				"hard",
-				"The deterministic local round trip should remain interactive with a generous CI margin.",
+				"observe",
+				"Round-trip latency is recorded but cannot be a shared release gate without a reference host.",
 			);
 			addSummaryGate(
 				outcome,

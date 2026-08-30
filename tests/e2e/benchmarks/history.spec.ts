@@ -16,7 +16,8 @@ const INITIAL_TURNS = 48;
 for (const scenario of scenariosFor("history")) {
 	const sourceBytes = scenario.sourceBytes;
 	const turns = scenario.turns;
-	if (sourceBytes === undefined || turns === undefined) {
+	const historyReadMode = Reflect.get(scenario, "historyReadMode");
+	if (sourceBytes === undefined || turns === undefined || historyReadMode !== "verified_nonempty_native") {
 		throw new Error(`history scenario ${scenario.id} is missing workload parameters`);
 	}
 	test.describe(scenario.id, () => {
@@ -34,6 +35,7 @@ for (const scenario of scenariosFor("history")) {
 		test("loads the exact native source and pages older turns", async ({ page, harness }, testInfo) => {
 			test.slow();
 			await runBenchmarkScenario(page, testInfo, scenario, async (outcome) => {
+				const historyTimeoutMs = 90_000;
 				const errors = observePageErrors(page);
 				await page.goto(harness.origin, { waitUntil: "domcontentloaded" });
 				await expect(page.locator("#root > div")).toBeVisible();
@@ -56,9 +58,11 @@ for (const scenario of scenariosFor("history")) {
 					.click();
 				const viewport = page.locator('[data-chat-viewport="true"]');
 				const turnWindow = viewport.locator('[data-turn-window="true"]');
-				await expect(turnWindow).toHaveAttribute("data-turn-window-total", /\d+/, { timeout: 90_000 });
+				await expect(turnWindow).toHaveAttribute("data-turn-window-total", /\d+/, {
+					timeout: historyTimeoutMs,
+				});
 				await expect(turnWindow.locator("[data-turn-id]").last()).toContainText(HISTORY_REPLY, {
-					timeout: 90_000,
+					timeout: historyTimeoutMs,
 				});
 				const firstPageFinished = await page.evaluate(() => performance.now());
 				const initialTurns = Number(await turnWindow.getAttribute("data-turn-window-total"));
@@ -102,12 +106,11 @@ for (const scenario of scenariosFor("history")) {
 					correctness: {
 						exactSourceBoundary: actualSourceBytes === sourceBytes,
 						allTurnsPaged: (await turnWindow.getAttribute("data-turn-window-total")) === String(turns),
-						oversizedSourceUsedPagination:
-							sourceBytes < 64 * 1024 * 1024 || initialTurns === Math.min(INITIAL_TURNS, turns),
+						historyWindowMatchesReadPath: initialTurns === Math.min(INITIAL_TURNS, turns),
 						oldestTurnReachable: await viewport
 							.getByText(`${HISTORY_PROMPT} [turn 1]`, { exact: true })
 							.isVisible(),
-						noPiGetMessagesFallback: getMessages.length === 0,
+						expectedHistoryReadPath: getMessages.length === 0,
 					},
 				});
 				addValueGate(
@@ -165,6 +168,7 @@ for (const scenario of scenariosFor("history")) {
 					"Browser errors invalidate the history sample.",
 				);
 				outcome.notes.push(
+					`Declared history read path: ${historyReadMode}; Pi get_messages count: ${String(getMessages.length)}.`,
 					"History cancellation and post-cancel resource release remain an explicit coverage gap.",
 				);
 			});

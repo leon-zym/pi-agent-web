@@ -3,6 +3,7 @@ import {
 	dropControlledWebSockets,
 	installWebSocketDropControl,
 	observePageErrors,
+	sendControlledWebSocketFrame,
 } from "../fixtures/page-observation";
 import { expect, test } from "../fixtures/test";
 import {
@@ -15,6 +16,15 @@ import {
 
 interface WireFrame extends Record<string, unknown> {
 	type?: string;
+	sessionHandle?: string;
+	generation?: number;
+	isController?: boolean;
+	fencingToken?: string;
+	response?: {
+		id?: string;
+		success?: boolean;
+		error?: string;
+	};
 }
 
 function frame(payload: string | Buffer): WireFrame | undefined {
@@ -125,8 +135,8 @@ for (const scenario of scenariosFor("recovery-disconnect")) {
 				"p95",
 				"lte",
 				5_000,
-				"hard",
-				"Ten-trial p95 tolerates reconnect jitter while catching exhausted or degraded recovery.",
+				"observe",
+				"Reconnect-to-projection latency remains observational until a reference baseline is established.",
 			);
 			addSummaryGate(
 				outcome,
@@ -161,6 +171,14 @@ for (const scenario of scenariosFor("recovery-crash")) {
 		test.slow();
 		await runBenchmarkScenario(page, testInfo, scenario, async (outcome) => {
 			const errors = observePageErrors(page);
+			await installWebSocketDropControl(page);
+			const received: WireFrame[] = [];
+			page.on("websocket", (socket) => {
+				socket.on("framereceived", ({ payload }) => {
+					const parsed = frame(payload);
+					if (parsed) received.push(parsed);
+				});
+			});
 			await page.goto(harness.origin, { waitUntil: "domcontentloaded" });
 			await expect(page.locator("#root > div")).toBeVisible();
 			await expect(page.locator("textarea")).toBeEnabled();
@@ -168,6 +186,22 @@ for (const scenario of scenariosFor("recovery-crash")) {
 
 			for (let index = 0; index < trialCount; index += 1) {
 				const crashPrompt = `E2E_BENCH_CRASH:${scenario.id}:${String(index)}`;
+				const beforePrompt = `E2E_BENCH_BEFORE_CRASH_${String(index)}`;
+				await page.locator("textarea").fill(beforePrompt);
+				await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
+				const main = page.locator("main");
+				await expect(main.getByText(`E2E_REPLY:${beforePrompt}`, { exact: true })).toHaveCount(1, {
+					timeout: 30_000,
+				});
+				const oldLease = received.findLast(
+					(candidate) =>
+						candidate.type === "lease_status" &&
+						candidate.isController === true &&
+						typeof candidate.fencingToken === "string",
+				);
+				if (!oldLease?.sessionHandle || typeof oldLease.generation !== "number" || !oldLease.fencingToken) {
+					throw new Error("Pre-crash controller lease is missing");
+				}
 				const startsBefore = harness.piEvents().filter((event) => event.type === "started").length;
 				await page.locator("textarea").fill(crashPrompt);
 				await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
@@ -201,7 +235,19 @@ for (const scenario of scenariosFor("recovery-crash")) {
 				await expect(currentRow).toHaveCount(1);
 				await currentRow.getByRole("button").first().click();
 				await expect(page.locator("textarea")).toBeEnabled({ timeout: 30_000 });
-				const recoveredAt = Date.now();
+				await expect
+					.poll(
+						() =>
+							received.some(
+								(candidate) =>
+									candidate.type === "lease_status" &&
+									candidate.isController === true &&
+									typeof candidate.generation === "number" &&
+									candidate.generation > (oldLease.generation ?? Number.MAX_SAFE_INTEGER),
+							),
+						{ timeout: 30_000 },
+					)
+					.toBe(true);
 				const restarted = harness
 					.piEvents()
 					.find(
@@ -212,13 +258,34 @@ for (const scenario of scenariosFor("recovery-crash")) {
 							event.at >= crashEvent.at,
 					);
 				if (!restarted) throw new Error("restarted Pi marker is missing");
+				const stalePrompt = `E2E_BENCH_STALE_AFTER_CRASH_${String(index)}`;
+				const staleCommandId = `benchmark-stale-${String(index)}`;
+				await sendControlledWebSocketFrame(page, {
+					type: "command",
+					sessionHandle: oldLease.sessionHandle,
+					expectedGeneration: oldLease.generation,
+					fencingToken: oldLease.fencingToken,
+					command: { id: staleCommandId, type: "prompt", message: stalePrompt },
+				});
+				await expect
+					.poll(
+						() =>
+							received.find(
+								(candidate) => candidate.type === "response" && candidate.response?.id === staleCommandId,
+							),
+						{ timeout: 30_000 },
+					)
+					.toBeTruthy();
+				const staleResponse = received.find(
+					(candidate) => candidate.type === "response" && candidate.response?.id === staleCommandId,
+				);
 				const afterPrompt = `E2E_BENCH_AFTER_CRASH_${String(index)}`;
 				await page.locator("textarea").fill(afterPrompt);
 				await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
-				const main = page.locator("main");
 				await expect(main.getByText(`E2E_REPLY:${afterPrompt}`, { exact: true })).toHaveCount(1, {
 					timeout: 30_000,
 				});
+				const recoveredAt = Date.now();
 				outcome.trials.push({
 					index,
 					warmup: index < scenario.warmups,
@@ -233,6 +300,12 @@ for (const scenario of scenariosFor("recovery-crash")) {
 						newProcessIdentity: restarted.pid !== crashEvent.pid,
 						commandPathRecovered:
 							(await main.getByText(`E2E_REPLY:${afterPrompt}`, { exact: true }).count()) === 1,
+						staleGenerationRejected:
+							staleResponse?.response?.success === false &&
+							(staleResponse.response.error?.includes("session_generation_stale") ?? false),
+						staleMutationNotExecuted:
+							harness.piEvents().filter((event) => event.type === "prompt" && event.text === stalePrompt)
+								.length === 0,
 						exactlyOneCrashCommand:
 							harness.piEvents().filter((event) => event.type === "prompt" && event.text === crashPrompt)
 								.length === 1,
@@ -262,8 +335,8 @@ for (const scenario of scenariosFor("recovery-crash")) {
 				"p95",
 				"lte",
 				8_000,
-				"hard",
-				"Independent Sessions avoid the intentional three-crash circuit breaker; p95 catches slow restart.",
+				"observe",
+				"Post-crash command reply/projection latency is hardware-sensitive until a reference baseline exists.",
 			);
 			addSummaryGate(
 				outcome,

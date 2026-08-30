@@ -1,5 +1,11 @@
 {
 	"schemaVersion": 1,
+	"scope": {
+		"issue": 28,
+		"phase": 1,
+		"status": "incomplete",
+		"label": "#28 Phase 1 / incomplete"
+	},
 	"tiers": {
 		"representative": {
 			"scenarios": [
@@ -27,7 +33,7 @@
 					"sessions": 1,
 					"targetBytes": 122880,
 					"chunkBytes": 512,
-					"chunkDelayMs": 2,
+					"chunkDelayMs": 10,
 					"warmups": 1,
 					"samples": 3
 				},
@@ -37,7 +43,7 @@
 					"sessions": 4,
 					"targetBytes": 122880,
 					"chunkBytes": 512,
-					"chunkDelayMs": 2,
+					"chunkDelayMs": 10,
 					"warmups": 1,
 					"samples": 3
 				},
@@ -46,6 +52,7 @@
 					"kind": "history",
 					"sourceBytes": 68157440,
 					"turns": 96,
+					"historyReadMode": "verified_nonempty_native",
 					"warmups": 0,
 					"samples": 1
 				},
@@ -139,10 +146,20 @@
 					"samples": 8
 				},
 				{
+					"id": "history-small",
+					"kind": "history",
+					"sourceBytes": 1048576,
+					"turns": 96,
+					"historyReadMode": "verified_nonempty_native",
+					"warmups": 0,
+					"samples": 1
+				},
+				{
 					"id": "history-below-64m",
 					"kind": "history",
 					"sourceBytes": 66060288,
 					"turns": 96,
+					"historyReadMode": "verified_nonempty_native",
 					"warmups": 0,
 					"samples": 1
 				},
@@ -151,6 +168,7 @@
 					"kind": "history",
 					"sourceBytes": 67108864,
 					"turns": 96,
+					"historyReadMode": "verified_nonempty_native",
 					"warmups": 0,
 					"samples": 1
 				},
@@ -159,6 +177,7 @@
 					"kind": "history",
 					"sourceBytes": 68157440,
 					"turns": 96,
+					"historyReadMode": "verified_nonempty_native",
 					"warmups": 0,
 					"samples": 1
 				},
@@ -188,7 +207,10 @@
 		"Gateway restart cannot yet preserve the harness origin and is not benchmarked.",
 		"A deliberately slow raw WebSocket client and concurrent history/command fairness are not yet benchmarked.",
 		"Future protocol content-root references remain an explicit private L3 lane; this suite covers production attachment refs only.",
-		"History cancellation and post-cancel process/heap release are not yet measured.",
-		"Stress concurrency uses synchronized repeated finite 1 MiB turns and reports actual arrival rate; it does not yet certify an uninterrupted 60 second 1000 delta/s arrival rate."
+		"Browser-triggered history cancellation and post-cancel process/heap release are not yet measured; the server cancellation contract is covered separately.",
+		"Stress concurrency uses synchronized repeated finite 1 MiB turns and reports actual arrival rate; it does not yet certify an uninterrupted 60 second 1000 delta/s arrival rate.",
+		"The deterministic Pi fixture proves repeatable protocol behavior, not real-provider or heterogeneous reference-host performance.",
+		"Hardware-sensitive paint, long-task, heap, throughput, and latency metrics have no checked-in reference baseline or calibrated tolerance yet.",
+		"Multiple Browser clients sharing the same Gateway and adversarial socket backpressure remain outside Phase 1."
 	]
 }

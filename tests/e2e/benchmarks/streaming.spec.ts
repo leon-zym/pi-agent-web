@@ -70,15 +70,24 @@ for (const scenario of scenariosFor("streaming")) {
 				await expect
 					.poll(() => streaming.evaluate((element) => element.textContent?.length ?? 0))
 					.toBe(streamEnd.markdownChars);
+				const turn = page
+					.getByRole("region", { name: /^(Conversation turn|对话轮次)$/ })
+					.filter({ hasText: prompt });
+				const settled = turn.locator('[data-markdown-settled="true"]');
+				const streamingDomBeforeRelease = await streaming.count();
+				const settledDomBeforeRelease = await settled.count();
 				await markBrowserStreamEnd(page);
+				const structuralTransitionStarted = await page.evaluate(() => performance.now());
 				harness.releasePrompt(prompt);
 				await expect
 					.poll(() => harness.piEvents().some((event) => event.type === "settled" && event.text === prompt), {
 						timeout: 30_000,
 					})
 					.toBe(true);
-				const settled = page.locator('[data-markdown-settled="true"]').last();
+				await expect(streaming).toHaveCount(0, { timeout: 30_000 });
+				await expect(settled).toHaveCount(1, { timeout: 30_000 });
 				await expect(settled).toBeVisible({ timeout: 30_000 });
+				const structuralTransitionFinished = await page.evaluate(() => performance.now());
 				const settledText = await settled.textContent();
 				const largeFrames = harness
 					.piEvents()
@@ -92,12 +101,17 @@ for (const scenario of scenariosFor("streaming")) {
 						...metrics,
 						deltaCount: streamEnd.deltaCount,
 						publicationRatio: metrics.publicationBatches / streamEnd.deltaCount,
+						structuralDomTransitionMs: structuralTransitionFinished - structuralTransitionStarted,
 					},
 					correctness: {
 						liveTailStayedPlain: liveRichNodes === 0,
+						structuralReleaseHeldInStreamingDom:
+							streamingDomBeforeRelease === 1 && settledDomBeforeRelease === 0,
+						structuralReleasePublishedSettledDom:
+							(await streaming.count()) === 0 && (await settled.count()) === 1,
 						settledEndSentinel: settledText?.includes("STREAM_BUDGET_END") ?? false,
 						settledUnicode: settledText?.includes("🧪") ?? false,
-						structuralFramesFlushed:
+						structuralFramesEmittedInOrder:
 							largeFrames.map((event) => event.eventType).join(",") === "text_end,message_end",
 						frameBudgetPreserved: largeFrames.every((event) => (event.frameBytes ?? 0) > targetBytes),
 					},
@@ -119,8 +133,8 @@ for (const scenario of scenariosFor("streaming")) {
 				"p95",
 				"lte",
 				0.5,
-				"hard",
-				"DOM publication batches must remain materially below incoming small-delta count.",
+				"observe",
+				"Publication coalescing is measured, but rAF cadence is hardware-sensitive without calibration.",
 			);
 			addSummaryGate(
 				outcome,
@@ -128,7 +142,7 @@ for (const scenario of scenariosFor("streaming")) {
 				"p95",
 				"lte",
 				targetBytes >= 1024 * 1024 ? 2_000 : 1_000,
-				"hard",
+				"observe",
 				targetBytes >= 1024 * 1024
 					? "The repeated 1 MiB baseline is currently slow; 2 s is a regression ceiling, not the product target."
 					: "Three-sample p95 with a generous budget detects a lost/coarsely delayed first paint.",
@@ -139,7 +153,7 @@ for (const scenario of scenariosFor("streaming")) {
 				"p95",
 				"lte",
 				targetBytes >= 1024 * 1024 ? 750 : 250,
-				"hard",
+				"observe",
 				targetBytes >= 1024 * 1024
 					? "The measured repeated 1 MiB baseline includes 501 ms long tasks; 750 ms prevents further regression while keeping the debt visible."
 					: "Extends the existing 200 ms single-run diagnostic with a noise margin and repeated p95.",
@@ -150,7 +164,7 @@ for (const scenario of scenariosFor("streaming")) {
 				"p95",
 				"lte",
 				6,
-				"hard",
+				"observe",
 				"Repeated long-task bursts indicate coalescing or rendering regression.",
 			);
 			addSummaryGate(
@@ -159,7 +173,7 @@ for (const scenario of scenariosFor("streaming")) {
 				"p95",
 				"lte",
 				2_500,
-				"hard",
+				"observe",
 				"Structural settle has a repeated-sample budget derived from the existing 2 s cold gate.",
 			);
 			addSummaryGate(
@@ -168,8 +182,17 @@ for (const scenario of scenariosFor("streaming")) {
 				"p95",
 				"lte",
 				96 * 1024 * 1024,
-				"hard",
-				"Precise-heap p95 allows GC noise above the prior 64 MiB one-shot budget.",
+				"observe",
+				"Heap p95 is retained for trend evidence, not shared release gating before calibration.",
+			);
+			addSummaryGate(
+				outcome,
+				"structuralDomTransitionMs",
+				"p95",
+				"lte",
+				2_500,
+				"observe",
+				"Browser streaming-to-settled DOM transition is observed separately from fake-Pi frame markers.",
 			);
 			addSummaryGate(
 				outcome,

@@ -88,6 +88,14 @@ interface BrowserBenchmarkSnapshot {
 	turnNodes: number;
 }
 
+export interface BrowserSessionFrameSnapshot {
+	deltaFrames: number;
+	deltaChars: number;
+	firstArrivalAt: number | null;
+	lastArrivalAt: number | null;
+	maxFrameGapMs: number;
+}
+
 function isTier(value: string | undefined): value is BenchmarkTier {
 	return value === "representative" || value === "stress";
 }
@@ -287,6 +295,66 @@ export async function installBrowserBenchmarkObserver(page: Page): Promise<void>
 			publicationBatches: 0,
 			longTasks: [] as Array<{ startTime: number; duration: number }>,
 		};
+		type SessionFrameState = {
+			deltaFrames: number;
+			deltaChars: number;
+			firstArrivalAt: number | null;
+			lastArrivalAt: number | null;
+			maxFrameGapMs: number;
+		};
+		const sessionFrames = new Map<string, SessionFrameState>();
+		const observeSocket = (socket: WebSocket) => {
+			socket.addEventListener("message", (message) => {
+				if (typeof message.data !== "string") return;
+				let wire: unknown;
+				try {
+					wire = JSON.parse(message.data);
+				} catch {
+					return;
+				}
+				if (wire === null || typeof wire !== "object") return;
+				const candidate = wire as {
+					type?: unknown;
+					sessionHandle?: unknown;
+					event?: {
+						type?: unknown;
+						assistantMessageEvent?: { type?: unknown; delta?: unknown };
+					};
+				};
+				const delta = candidate.event?.assistantMessageEvent;
+				if (
+					candidate.type !== "event" ||
+					typeof candidate.sessionHandle !== "string" ||
+					candidate.event?.type !== "message_update" ||
+					delta?.type !== "text_delta" ||
+					typeof delta.delta !== "string"
+				) {
+					return;
+				}
+				const observed = sessionFrames.get(candidate.sessionHandle);
+				if (!observed) return;
+				const now = performance.now();
+				if (observed.lastArrivalAt !== null) {
+					observed.maxFrameGapMs = Math.max(observed.maxFrameGapMs, now - observed.lastArrivalAt);
+				}
+				observed.deltaFrames += 1;
+				observed.deltaChars += delta.delta.length;
+				observed.firstArrivalAt ??= now;
+				observed.lastArrivalAt = now;
+			});
+		};
+		const BenchmarkWebSocket = new Proxy(window.WebSocket, {
+			construct(target, args) {
+				const socket = Reflect.construct(target, args) as WebSocket;
+				observeSocket(socket);
+				return socket;
+			},
+		});
+		Object.defineProperty(window, "WebSocket", {
+			configurable: true,
+			value: BenchmarkWebSocket,
+			writable: true,
+		});
 		const mutationObserver = new MutationObserver(() => {
 			if (!state.active) return;
 			const live = document.querySelector<HTMLElement>('[data-markdown-streaming="true"]');
@@ -310,6 +378,22 @@ export async function installBrowserBenchmarkObserver(page: Page): Promise<void>
 			// Capability is represented by empty long-task data on unsupported browsers.
 		}
 		const api = {
+			resetSessionFrames: (sessionHandles: string[]) => {
+				sessionFrames.clear();
+				for (const sessionHandle of sessionHandles) {
+					sessionFrames.set(sessionHandle, {
+						deltaFrames: 0,
+						deltaChars: 0,
+						firstArrivalAt: null,
+						lastArrivalAt: null,
+						maxFrameGapMs: 0,
+					});
+				}
+			},
+			sessionFrameSnapshot: (sessionHandle: string): BrowserSessionFrameSnapshot | null => {
+				const observed = sessionFrames.get(sessionHandle);
+				return observed ? { ...observed } : null;
+			},
 			start: () => {
 				collectGarbage();
 				state.active = true;
@@ -361,12 +445,33 @@ export async function installBrowserBenchmarkObserver(page: Page): Promise<void>
 
 type BenchmarkWindow = typeof window & {
 	__piwebBenchmark: {
+		resetSessionFrames: (sessionHandles: string[]) => void;
+		sessionFrameSnapshot: (sessionHandle: string) => BrowserSessionFrameSnapshot | null;
 		start: () => void;
 		markStreamEnd: () => void;
 		markSettled: () => void;
 		snapshot: () => BrowserBenchmarkSnapshot;
 	};
 };
+
+export async function resetBrowserSessionFrames(page: Page, sessionHandles: string[]): Promise<void> {
+	await page.evaluate(
+		(handles) => (window as BenchmarkWindow).__piwebBenchmark.resetSessionFrames(handles),
+		sessionHandles,
+	);
+}
+
+export async function browserSessionFrameSnapshot(
+	page: Page,
+	sessionHandle: string,
+): Promise<BrowserSessionFrameSnapshot> {
+	const snapshot = await page.evaluate(
+		(handle) => (window as BenchmarkWindow).__piwebBenchmark.sessionFrameSnapshot(handle),
+		sessionHandle,
+	);
+	if (!snapshot) throw new Error(`Browser frame observer is not tracking ${sessionHandle}`);
+	return snapshot;
+}
 
 export async function startBrowserMeasurement(page: Page): Promise<void> {
 	await page.evaluate(() => (window as BenchmarkWindow).__piwebBenchmark.start());

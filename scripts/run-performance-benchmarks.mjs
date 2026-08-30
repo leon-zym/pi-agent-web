@@ -10,12 +10,9 @@ const repositoryRoot = path.resolve(scriptDirectory, "..");
 const matrixPath = path.join(repositoryRoot, "tests/e2e/benchmarks/matrix.json");
 const matrix = JSON.parse(fs.readFileSync(matrixPath, "utf8"));
 const tier = process.argv[2];
-const skipBuild = process.argv.includes("--skip-build");
 
 if (tier !== "representative" && tier !== "stress") {
-	process.stderr.write(
-		"usage: node scripts/run-performance-benchmarks.mjs <representative|stress> [--skip-build]\n",
-	);
+	process.stderr.write("usage: node scripts/run-performance-benchmarks.mjs <representative|stress>\n");
 	process.exit(2);
 }
 
@@ -42,10 +39,8 @@ function commandOutput(command, args, fallback = "unknown") {
 	}
 }
 
-if (!skipBuild) {
-	const buildStatus = run("pnpm", ["build"]);
-	if (buildStatus !== 0) process.exit(buildStatus);
-}
+const buildStatus = run("pnpm", ["build"]);
+if (buildStatus !== 0) process.exit(buildStatus);
 
 const benchmarkEnvironment = {
 	PI_WEB_BENCHMARK_TIER: tier,
@@ -81,6 +76,7 @@ const report = {
 	schemaVersion: 1,
 	generatedAt: new Date().toISOString(),
 	tier,
+	scope: matrix.scope,
 	commit,
 	dirty,
 	environment: {
@@ -107,8 +103,9 @@ function number(value) {
 
 function markdownFor(value) {
 	const lines = [
-		`# Performance benchmark — ${value.tier}`,
+		`# Performance benchmark — ${value.scope.label} — ${value.tier}`,
 		"",
+		`- Scope: ${value.scope.label}; this artifact does not close Issue #28`,
 		`- Commit: \`${value.commit}\`${value.dirty ? " (dirty worktree)" : ""}`,
 		`- Generated: ${value.generatedAt}`,
 		`- Environment: ${value.environment.platform} ${value.environment.release}, ${value.environment.cpuModel}, Node ${value.environment.node}, Chromium ${value.environment.chromium}`,
@@ -129,7 +126,11 @@ function markdownFor(value) {
 					"recoveryMs",
 					"firstPageMs",
 					"nextPageMs",
-					"maxProgressGapMs",
+					"producerProgressGapMs",
+					"browserProjectionLagMs",
+					"browserFrameArrivalGapMs",
+					"structuralDomTransitionMs",
+					"roundTripMs",
 				].includes(name),
 			)
 			.map(([name, summary]) => `${name}=${number(summary.p95)}`)
@@ -140,6 +141,10 @@ function markdownFor(value) {
 			`| ${result.scenarioId} | ${result.status} | ${String(sampleCount)} | ${metrics || "—"} | ${String(passed)}/${String(hardGates.length)} |`,
 		);
 	}
+	lines.push(
+		"",
+		"> A full scenario pass means only that this Phase 1 matrix passed. It is not evidence that Issue #28 is complete.",
+	);
 	lines.push("", "## Validation", "");
 	if (value.validationErrors.length === 0) lines.push("Artifact set is complete and schema-valid.");
 	else for (const error of value.validationErrors) lines.push(`- ${error}`);
