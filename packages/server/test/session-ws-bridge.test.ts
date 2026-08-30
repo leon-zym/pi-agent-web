@@ -18,6 +18,7 @@ import {
 	GATEWAY_SESSION_HISTORY_CAPABILITY,
 	RpcError,
 	SESSION_PAYLOAD_BUDGET,
+	SESSION_TEXT_MAX_BYTES,
 	SESSION_WS_SERVER_MAX_BYTES,
 } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it } from "vitest";
@@ -29,7 +30,10 @@ import type { ExistingSessionTarget } from "../src/session-runtime-types.js";
 import { SessionSupervisor } from "../src/session-supervisor.js";
 import {
 	MAX_SESSION_WS_BUFFERED_BYTES,
+	MAX_SESSION_WS_GATEWAY_PENDING_COMMAND_RESPONSE_BYTES,
 	MAX_SESSION_WS_IN_FLIGHT_EXACT_SUBSCRIPTIONS,
+	MAX_SESSION_WS_METADATA_RESPONSE_HEADROOM_BYTES,
+	MAX_SESSION_WS_PENDING_COMMAND_RESPONSE_BYTES,
 	SessionWsBridge,
 	type SessionWsBridgeOptions,
 } from "../src/session-ws-bridge.js";
@@ -1143,6 +1147,76 @@ describe("SessionWsBridge", () => {
 			error: "pending_command_response_capacity",
 		});
 		release?.();
+	});
+
+	it("admits the bounded metadata burst used after a Session snapshot", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "metadata-response-capacity");
+		const harness = await createHarness([target]);
+		const client = await openClient(harness);
+		const subscription = await subscribe(client, target.sessionHandle);
+		const originalSendCommand = harness.supervisor.sendCommand.bind(harness.supervisor);
+		let commandCalls = 0;
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		harness.supervisor.sendCommand = async (...args) => {
+			commandCalls += 1;
+			await gate;
+			return originalSendCommand(...args);
+		};
+		const commands: SessionCommandDto[] = [
+			{ type: "get_commands", id: "metadata-commands" },
+			{ type: "get_available_models", id: "metadata-models" },
+			{ type: "get_state", id: "metadata-state" },
+			{ type: "get_available_thinking_levels", id: "metadata-levels" },
+			{ type: "get_session_stats", id: "metadata-stats" },
+			{ type: "get_last_assistant_text", id: "metadata-racing-read" },
+		];
+
+		for (const command of commands) {
+			client.send({
+				type: "command",
+				sessionHandle: target.sessionHandle,
+				expectedGeneration: subscription.runtime.generation,
+				command,
+			});
+		}
+
+		await eventually(() => commandCalls === commands.length);
+		expect(MAX_SESSION_WS_METADATA_RESPONSE_HEADROOM_BYTES).toBe(16 * SESSION_TEXT_MAX_BYTES);
+		expect(MAX_SESSION_WS_PENDING_COMMAND_RESPONSE_BYTES).toBe(
+			SESSION_WS_SERVER_MAX_BYTES + MAX_SESSION_WS_METADATA_RESPONSE_HEADROOM_BYTES,
+		);
+		expect(MAX_SESSION_WS_PENDING_COMMAND_RESPONSE_BYTES).toBeLessThan(
+			MAX_SESSION_WS_GATEWAY_PENDING_COMMAND_RESPONSE_BYTES,
+		);
+		const overflowMark = client.mark();
+		client.send({
+			type: "command",
+			sessionHandle: target.sessionHandle,
+			expectedGeneration: subscription.runtime.generation,
+			command: { type: "get_state", id: "metadata-overflow" },
+		});
+		const overflow = await client.waitForFrame(
+			(frame): frame is ResponseFrame =>
+				frame.type === "response" && frame.response.id === "metadata-overflow",
+			overflowMark,
+		);
+		expect(overflow.response).toMatchObject({
+			success: false,
+			error: "pending_command_response_capacity",
+		});
+		expect(commandCalls).toBe(commands.length);
+		release?.();
+		for (const command of commands) {
+			await client.waitForFrame(
+				(frame): frame is ResponseFrame => frame.type === "response" && frame.response.id === command.id,
+			);
+		}
 	});
 
 	it("holds the Gateway command reservation across sockets and disconnect", async () => {

@@ -40,6 +40,8 @@ import {
 	isSessionAttachmentGuardContext,
 	isSessionCommandResponseDto,
 	isSessionMessageDto,
+	SESSION_MODEL_LIST_MAX_ITEMS,
+	SESSION_PRODUCT_IDENTIFIER_MAX_CHARS,
 	type SessionAttachmentGuardContext,
 } from "./product-decoders.js";
 import type {
@@ -477,6 +479,22 @@ export function commandTimeoutMs(commandType: string): number {
 }
 
 const SMALL_COMMAND_RESPONSE_RESERVATION_BYTES = 2 * SESSION_TEXT_MAX_BYTES;
+const JSON_STRINGIFIED_MAX_BYTES_PER_CODE_UNIT = 6;
+const MODEL_IDENTIFIER_FIELDS = 3;
+// A maximal model's keys, booleans, six bounded numbers, punctuation, and cost
+// object encode below 512 bytes; identifiers are accounted for separately.
+const MODEL_NON_IDENTIFIER_JSON_MAX_BYTES = 512;
+// Covers the response id at its escaped identifier limit plus the outer DTO.
+const MODEL_LIST_RESPONSE_ENVELOPE_MAX_BYTES = 2 * 1024;
+export const SESSION_MODEL_LIST_RESPONSE_GUARD_MAX_BYTES =
+	SESSION_MODEL_LIST_MAX_ITEMS *
+		(MODEL_IDENTIFIER_FIELDS *
+			SESSION_PRODUCT_IDENTIFIER_MAX_CHARS *
+			JSON_STRINGIFIED_MAX_BYTES_PER_CODE_UNIT +
+			MODEL_NON_IDENTIFIER_JSON_MAX_BYTES) +
+	MODEL_LIST_RESPONSE_ENVELOPE_MAX_BYTES;
+/** The next whole MiB power-of-two above the model-list guard's 5.12 MB JSON upper bound. */
+export const SESSION_MODEL_LIST_RESPONSE_RESERVATION_BYTES = 8 * SESSION_TEXT_MAX_BYTES;
 
 /**
  * Conservative upper bounds for one legal command response retained by the Gateway.
@@ -493,7 +511,7 @@ export const COMMAND_RESPONSE_RESERVATION_BYTES = {
 	get_state: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
 	set_model: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
 	cycle_model: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
-	get_available_models: SESSION_WS_SERVER_MAX_BYTES,
+	get_available_models: SESSION_MODEL_LIST_RESPONSE_RESERVATION_BYTES,
 	set_thinking_level: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
 	cycle_thinking_level: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
 	get_available_thinking_levels: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,

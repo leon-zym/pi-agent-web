@@ -6,10 +6,15 @@ import {
 	expectData,
 	isErrorResponse,
 	isReadOnlyRpcCommand,
+	isSessionCommandResponseDto,
 	isSessionWsClientMessage,
 	isSessionWsServerMessage,
 	RpcError,
 	SESSION_IMAGE_MAX_BASE64_CHARS,
+	SESSION_MODEL_LIST_MAX_ITEMS,
+	SESSION_MODEL_LIST_RESPONSE_GUARD_MAX_BYTES,
+	SESSION_MODEL_LIST_RESPONSE_RESERVATION_BYTES,
+	SESSION_PRODUCT_IDENTIFIER_MAX_CHARS,
 	SESSION_TEXT_MAX_BYTES,
 	SESSION_WS_CLIENT_MAX_BYTES,
 	SESSION_WS_SERVER_MAX_BYTES,
@@ -79,6 +84,48 @@ describe("gateway command response reservations", () => {
 		expect(commandResponseReservationBytes("bash")).toBe(SESSION_WS_SERVER_MAX_BYTES);
 		expect(commandResponseReservationBytes("get_commands")).toBe(SESSION_WS_SERVER_MAX_BYTES);
 		expect(commandResponseReservationBytes("unknown_future_command")).toBe(SESSION_WS_SERVER_MAX_BYTES);
+	});
+
+	it("reserves above the maximal model-list guard payload without using the wire ceiling", () => {
+		const escapedIdentifier = "\u0000".repeat(SESSION_PRODUCT_IDENTIFIER_MAX_CHARS);
+		const maximalModel = {
+			id: escapedIdentifier,
+			name: escapedIdentifier,
+			provider: escapedIdentifier,
+			reasoning: false,
+			contextWindow: Number.MAX_SAFE_INTEGER,
+			cost: {
+				input: -Number.MAX_SAFE_INTEGER,
+				output: Number.MIN_VALUE,
+				cacheRead: Number.MAX_SAFE_INTEGER,
+				cacheWrite: -Number.MAX_SAFE_INTEGER,
+				total: Number.MIN_VALUE,
+			},
+		};
+		const response = {
+			type: "response",
+			id: escapedIdentifier,
+			command: "get_available_models",
+			success: true,
+			data: { models: Array.from({ length: SESSION_MODEL_LIST_MAX_ITEMS }, () => maximalModel) },
+		} as const;
+
+		expect(isSessionCommandResponseDto(response)).toBe(true);
+		expect(new TextEncoder().encode(JSON.stringify(response)).byteLength).toBeLessThanOrEqual(
+			SESSION_MODEL_LIST_RESPONSE_GUARD_MAX_BYTES,
+		);
+		expect(SESSION_MODEL_LIST_RESPONSE_GUARD_MAX_BYTES).toBeLessThanOrEqual(
+			SESSION_MODEL_LIST_RESPONSE_RESERVATION_BYTES,
+		);
+		expect(commandResponseReservationBytes("get_available_models")).toBe(
+			SESSION_MODEL_LIST_RESPONSE_RESERVATION_BYTES,
+		);
+		expect(
+			isSessionCommandResponseDto({
+				...response,
+				data: { models: [...response.data.models, maximalModel] },
+			}),
+		).toBe(false);
 	});
 });
 

@@ -38,7 +38,9 @@ import type {
 	UsageDto,
 } from "./product-dto.js";
 
-const MAX_IDENTIFIER_CHARS = 256;
+export const SESSION_PRODUCT_IDENTIFIER_MAX_CHARS = 256;
+export const SESSION_MODEL_LIST_MAX_ITEMS = 1_000;
+const MAX_IDENTIFIER_CHARS = SESSION_PRODUCT_IDENTIFIER_MAX_CHARS;
 const MAX_PATH_CHARS = 8192;
 const MAX_TEXT_BYTES = 1024 * 1024;
 // get_messages is admitted behind a 64 MiB JSONL snapshot ceiling. A single
@@ -1217,7 +1219,11 @@ function isCommandData<K extends SessionCommandTypeDto>(
 					typeof value.isScoped === "boolean")
 			);
 		case "get_available_models":
-			return isRecord(value) && hasOnlyKeys(value, ["models"]) && isArrayOf(value.models, isModelDto, 1_000);
+			return (
+				isRecord(value) &&
+				hasOnlyKeys(value, ["models"]) &&
+				isArrayOf(value.models, isModelDto, SESSION_MODEL_LIST_MAX_ITEMS)
+			);
 		case "cycle_thinking_level":
 			return (
 				value === null ||

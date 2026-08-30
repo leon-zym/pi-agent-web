@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
 	analyzeFutureSessionMessageLogicalBytes,
 	analyzeFutureSessionResponseFrameLogicalBytes,
+	COMMAND_RESPONSE_RESERVATION_BYTES,
 	commandResponseReservationBytes,
 	FUTURE_SESSION_CONTENT_REF_BUDGET,
 	type FutureSessionWsServerMessage,
@@ -242,7 +243,17 @@ export const MAX_SESSION_WS_CONNECTIONS = 64;
 export const MAX_SESSION_WS_SUBSCRIBED_CHANNELS = 1024;
 export const MAX_SESSION_WS_CONCURRENT_CATCHUPS = 256;
 export const MAX_SESSION_WS_SUBSCRIPTION_ALIASES = 1024;
-export const MAX_SESSION_WS_PENDING_COMMAND_RESPONSE_BYTES = SESSION_WS_SERVER_MAX_BYTES;
+// Keep room for one wire-sized read plus the bounded metadata refresh that the
+// browser starts after a snapshot. The Gateway-wide ceiling remains authoritative.
+export const MAX_SESSION_WS_METADATA_RESPONSE_HEADROOM_BYTES =
+	COMMAND_RESPONSE_RESERVATION_BYTES.get_available_models +
+	COMMAND_RESPONSE_RESERVATION_BYTES.get_state +
+	COMMAND_RESPONSE_RESERVATION_BYTES.get_available_thinking_levels +
+	COMMAND_RESPONSE_RESERVATION_BYTES.get_session_stats +
+	// One ordinary read may race the snapshot-triggered four-command refresh.
+	COMMAND_RESPONSE_RESERVATION_BYTES.get_state;
+export const MAX_SESSION_WS_PENDING_COMMAND_RESPONSE_BYTES =
+	COMMAND_RESPONSE_RESERVATION_BYTES.get_commands + MAX_SESSION_WS_METADATA_RESPONSE_HEADROOM_BYTES;
 export const MAX_SESSION_WS_GATEWAY_PENDING_COMMAND_RESPONSE_BYTES = SESSION_WS_SERVER_MAX_BYTES * 2;
 export const MAX_SESSION_WS_GATEWAY_OUTBOUND_BYTES = SESSION_WS_SERVER_MAX_BYTES * 2;
 export const MAX_SESSION_WS_CONCURRENT_HISTORY_PAGES = 16;
