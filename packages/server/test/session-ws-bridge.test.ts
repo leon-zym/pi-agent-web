@@ -851,6 +851,7 @@ describe("SessionWsBridge", () => {
 		expect(harness.supervisor.getRuntime(target.sessionHandle)?.generation).toBe(overflowed.generation);
 
 		const restartMark = client.mark();
+		const observerRecoveryMark = observer.mark();
 		client.send({
 			type: "session_restart",
 			sessionHandle: target.sessionHandle,
@@ -871,6 +872,12 @@ describe("SessionWsBridge", () => {
 			(frame): frame is Extract<SessionWsServerMessage, { type: "session_snapshot" }> =>
 				frame.type === "session_snapshot" && frame.generation === restarted.runtime.generation,
 			restartMark,
+			5_000,
+		);
+		await observer.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_snapshot" }> =>
+				frame.type === "session_snapshot" && frame.generation === restarted.runtime.generation,
+			observerRecoveryMark,
 			5_000,
 		);
 	});

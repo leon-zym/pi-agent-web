@@ -1662,8 +1662,10 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				expectedGeneration: message.expectedGeneration,
 				fencingToken: message.fencingToken,
 			});
-			if (connection.closed || !this.connections.has(connection)) return;
-			await this.subscribe(connection, restarted.sessionHandle);
+			const subscribers = [...this.connections].filter(
+				(candidate) => !candidate.closed && this.isSubscribed(candidate, restarted.sessionHandle),
+			);
+			await Promise.all(subscribers.map((candidate) => this.subscribe(candidate, restarted.sessionHandle)));
 		} catch (error) {
 			const current = this.supervisor.getRuntime(sessionHandle);
 			if (
