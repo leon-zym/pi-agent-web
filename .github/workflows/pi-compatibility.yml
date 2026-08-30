@@ -39,4 +39,3 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm test:compat
-      - run: pnpm --filter @pi-agent-web/protocol bench:schema

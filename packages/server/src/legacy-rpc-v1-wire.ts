@@ -12,7 +12,6 @@ import {
 	isSessionEntryDto,
 	isSessionMessageDto,
 	isUsageDto,
-	PI_WIRE_RUNTIME_SCHEMAS,
 } from "@pi-agent-web/protocol";
 
 /** Upstream Pi stdout types. These are deliberately not product DTO aliases. */
@@ -208,7 +207,6 @@ export function isLegacyRpcV1RawResponse(
 	expectedCommand: SessionCommandTypeDto,
 	productGuard: (candidate: unknown) => boolean = isSessionCommandResponseDto,
 ): value is LegacyRpcV1RawResponse {
-	if (!PI_WIRE_RUNTIME_SCHEMAS.response.check(value)) return false;
 	if (
 		!isRecord(value) ||
 		value.type !== "response" ||
@@ -259,7 +257,6 @@ export function isLegacyRpcV1RawEvent(
 	value: unknown,
 	productGuard: (candidate: unknown) => boolean = isProductSessionEventDto,
 ): value is LegacyRpcV1RawEvent {
-	if (!PI_WIRE_RUNTIME_SCHEMAS.event.check(value)) return false;
 	if (!isRecord(value)) return false;
 	if (
 		value.type === "agent_end" ||
@@ -276,5 +273,5 @@ export function isLegacyRpcV1RawEvent(
 export function isLegacyRpcV1RawExtensionUiRequest(
 	value: unknown,
 ): value is LegacyRpcV1RawExtensionUiRequest {
-	return PI_WIRE_RUNTIME_SCHEMAS.extensionUiRequest.check(value) && isExtensionUiRequestDto(value);
+	return isExtensionUiRequestDto(value);
 }

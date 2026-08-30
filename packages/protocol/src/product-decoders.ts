@@ -1,4 +1,3 @@
-import { PRODUCT_RUNTIME_SCHEMAS } from "./boundary-schemas.js";
 import {
 	isSessionAttachmentRefForNegotiatedBudget,
 	isSessionContentRefBudgetDto,
@@ -587,7 +586,6 @@ export function isSessionMessageDto(
 	context?: SessionAttachmentGuardContext,
 ): value is SessionMessageDto {
 	if (context !== undefined && !isSessionAttachmentGuardContext(context)) return false;
-	if (!PRODUCT_RUNTIME_SCHEMAS.message.check(value)) return false;
 	if (!isRecord(value) || !isString(value.role, 64)) return false;
 	switch (value.role) {
 		case "user":
@@ -906,7 +904,6 @@ function isSlashCommand(value: unknown): value is SlashCommandDto {
 }
 
 export function isExtensionUiRequestDto(value: unknown): value is ExtensionUiRequestDto {
-	if (!PRODUCT_RUNTIME_SCHEMAS.extensionUiRequest.check(value)) return false;
 	if (
 		!isRecord(value) ||
 		value.type !== "extension_ui_request" ||
@@ -973,7 +970,6 @@ export function isExtensionUiRequestDto(value: unknown): value is ExtensionUiReq
 }
 
 export function isExtensionUiResponseDto(value: unknown): value is ExtensionUiResponseDto {
-	if (!PRODUCT_RUNTIME_SCHEMAS.extensionUiResponse.check(value)) return false;
 	if (!isRecord(value) || value.type !== "extension_ui_response" || !isString(value.id)) return false;
 	const valueVariant =
 		hasOnlyKeys(value, ["type", "id", "value"]) && Object.hasOwn(value, "value") && isText(value.value);
@@ -1043,7 +1039,6 @@ export function isProductSessionEventDto(
 	context?: SessionAttachmentGuardContext,
 ): value is ProductSessionEventDto {
 	if (context !== undefined && !isSessionAttachmentGuardContext(context)) return false;
-	if (!PRODUCT_RUNTIME_SCHEMAS.event.check(value)) return false;
 	if (!isRecord(value) || !isString(value.type, 64)) return false;
 	switch (value.type) {
 		case "agent_start":
@@ -1356,7 +1351,6 @@ export function isSessionCommandResponseDto(
 	context?: SessionAttachmentGuardContext,
 ): value is SessionCommandResponseDto {
 	if (context !== undefined && !isSessionAttachmentGuardContext(context)) return false;
-	if (!PRODUCT_RUNTIME_SCHEMAS.response.check(value)) return false;
 	if (
 		!isRecord(value) ||
 		value.type !== "response" ||
