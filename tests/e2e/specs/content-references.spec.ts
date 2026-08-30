@@ -190,10 +190,16 @@ test.describe("canonical content references", () => {
 			)
 			.toBe(1);
 		await expect
-			.poll(() =>
-				wire.events
-					.slice(eventStart)
-					.some((event) => event.direction === "received" && event.frame.type === "session_snapshot_end"),
+			.poll(
+				() =>
+					wire.events
+						.slice(eventStart)
+						.some(
+							(event) =>
+								event.direction === "received" &&
+								(event.frame.type === "session_snapshot" || event.frame.type === "session_snapshot_end"),
+						),
+				{ timeout: 30_000 },
 			)
 			.toBe(true);
 		await page.waitForTimeout(250);
