@@ -69,6 +69,10 @@ describe("DiffBlock & Unified Diff Parsing", () => {
 
 		// File header / name
 		expect(html).toContain("src/index.ts");
+		expect(html).toContain('data-diff-file-name="true"');
+		expect(html).toContain('title="src/index.ts"');
+		expect(html).toContain("min-h-10");
+		expect(html).toContain("grid-cols-2");
 
 		// Copy buttons
 		expect(html).toContain("复制纯净代码");

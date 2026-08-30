@@ -79,11 +79,11 @@ export function ContextMeter() {
 						)}
 					</svg>
 					{display.kind === "ready" ? (
-						<span className="hidden items-center sm:inline-flex">
+						<span className="hidden items-center lg:inline-flex">
 							<span className="font-mono tabular-nums">{Math.round(display.percent)}%</span>
 						</span>
 					) : (
-						<span className="hidden font-mono sm:inline">
+						<span className="hidden font-mono lg:inline">
 							{tt(display.kind === "loading" ? "common.computing" : "context.unavailableShort")}
 						</span>
 					)}

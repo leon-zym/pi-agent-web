@@ -130,6 +130,7 @@ export function DiffBlock({ diff, fileName, className }: DiffBlockProps) {
 	}, []);
 
 	const parsedLines = useMemo(() => parseUnifiedDiff(diff), [diff]);
+	const displayFileName = fileName || tt("tool.diff");
 
 	const handleCleanCopy = async () => {
 		const cleanCode = extractCleanCode(diff);
@@ -163,16 +164,22 @@ export function DiffBlock({ diff, fileName, className }: DiffBlockProps) {
 			)}
 		>
 			{/* Top action bar */}
-			<div className="flex h-8 items-center justify-between border-b border-border bg-surface px-3 text-xs">
-				<div className="flex items-center gap-1.5 text-ink-2">
-					<FileCode className="size-3.5 text-ink-3" />
-					<span className="font-mono text-[11px] font-medium text-ink">{fileName || tt("tool.diff")}</span>
+			<div className="flex min-h-8 flex-col border-b border-border bg-surface px-2 py-1 text-xs sm:flex-row sm:items-center sm:justify-between sm:px-3 lg:h-8 lg:py-0">
+				<div className="flex min-w-0 items-center gap-1.5 text-ink-2 sm:flex-1">
+					<FileCode aria-hidden="true" className="size-3.5 shrink-0 text-ink-3" />
+					<span
+						data-diff-file-name="true"
+						title={displayFileName}
+						className="min-w-0 truncate font-mono text-[11px] font-medium text-ink"
+					>
+						{displayFileName}
+					</span>
 				</div>
-				<div className="flex items-center gap-1">
+				<div className="grid w-full grid-cols-2 items-center gap-1 sm:flex sm:w-auto">
 					<button
 						type="button"
 						onClick={handleCleanCopy}
-						className="inline-flex items-center gap-1 rounded-xs px-2 py-0.5 text-[11px] font-medium text-ink-2 hover:bg-hover hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40"
+						className="inline-flex min-h-10 items-center justify-center gap-1 rounded-xs px-2 text-[11px] font-medium text-ink-2 hover:bg-hover hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none lg:min-h-0 lg:py-0.5"
 					>
 						{copiedClean ? (
 							<>
@@ -189,7 +196,7 @@ export function DiffBlock({ diff, fileName, className }: DiffBlockProps) {
 					<button
 						type="button"
 						onClick={handleRawCopy}
-						className="inline-flex items-center gap-1 rounded-xs px-2 py-0.5 text-[11px] font-medium text-ink-2 hover:bg-hover hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40"
+						className="inline-flex min-h-10 items-center justify-center gap-1 rounded-xs px-2 text-[11px] font-medium text-ink-2 hover:bg-hover hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none lg:min-h-0 lg:py-0.5"
 					>
 						{copiedRaw ? (
 							<>

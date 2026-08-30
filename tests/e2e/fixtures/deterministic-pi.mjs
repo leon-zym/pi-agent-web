@@ -362,11 +362,14 @@ function scheduleConsumedRelease(run, text, eventType, callback) {
 }
 
 function streamComplexPrompt(command, text, user, userEntryId) {
+	const longUiFixture = text === "E2E_COMPLEX_LONG_FILE";
 	const thinking =
 		"\u001b[36mInspecting synthetic workspace\u001b[0m\nComparing the implementation with the requested behavior.";
 	const toolCallId = `${sessionId}-complex-edit`;
 	const toolArgs = {
-		file_path: "src/demo.ts",
+		file_path: longUiFixture
+			? "src/非常长的目录名称/更长的子目录/用于验证本地化布局不会挤压的文件名.tsx"
+			: "src/demo.ts",
 		description: "Normalize status labels",
 	};
 	const toolCall = { type: "toolCall", id: toolCallId, name: "edit", arguments: toolArgs };
@@ -377,6 +380,7 @@ function streamComplexPrompt(command, text, user, userEntryId) {
 		" export function formatStatus(status: string) {",
 		"-  return status;",
 		"+  return status.toUpperCase();",
+		...(longUiFixture ? [`+  const uiCollisionSentinel = "${"W".repeat(240)}";`] : []),
 		" }",
 	].join("\n");
 	const markdown = [
@@ -1788,7 +1792,7 @@ function streamPrompt(command) {
 		streamFutureContentPrompt(command, text, user, userEntryId);
 		return;
 	}
-	if (text === "E2E_COMPLEX_DEMO" && images.length === 0) {
+	if ((text === "E2E_COMPLEX_DEMO" || text === "E2E_COMPLEX_LONG_FILE") && images.length === 0) {
 		streamComplexPrompt(command, text, user, userEntryId);
 		return;
 	}
