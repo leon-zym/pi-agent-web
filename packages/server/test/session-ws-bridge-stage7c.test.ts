@@ -118,6 +118,7 @@ function futureSupervisor(): FutureSessionWsBridgeOptions["supervisor"] {
 			isController: false,
 		}),
 		release: () => true,
+		releaseExact: () => true,
 		releaseConnection: () => [],
 		leaseFor: () => ({
 			serverEpoch: SERVER_EPOCH,

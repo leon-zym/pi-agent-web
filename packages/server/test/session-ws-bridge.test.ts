@@ -18,6 +18,7 @@ import {
 	GATEWAY_SESSION_HISTORY_CAPABILITY,
 	RpcError,
 	SESSION_PAYLOAD_BUDGET,
+	SESSION_WS_SERVER_MAX_BYTES,
 } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
@@ -72,6 +73,7 @@ class ControlledSendSocket extends EventEmitter {
 	bufferedAmount = 0;
 	readonly closeCalls: Array<{ code?: number; reason?: string }> = [];
 	readonly sentBytes: number[] = [];
+	readonly sentPayloads: string[] = [];
 	private deferNext = false;
 	private deferredCallback: ((error?: Error) => void) | undefined;
 
@@ -81,6 +83,7 @@ class ControlledSendSocket extends EventEmitter {
 
 	send(payload: string, callback?: (error?: Error) => void): void {
 		this.sentBytes.push(Buffer.byteLength(payload));
+		this.sentPayloads.push(payload);
 		if (this.deferNext) {
 			this.deferNext = false;
 			this.deferredCallback = callback;
@@ -157,6 +160,7 @@ interface BridgeTestLimits {
 	maxSubscriptionAliases?: number;
 	maxPendingCommandResponseBytes?: number;
 	maxGatewayPendingCommandResponseBytes?: number;
+	maxGatewayOutboundBytes?: number;
 }
 
 function temporaryRoot(): string {
@@ -658,7 +662,7 @@ describe("SessionWsBridge", () => {
 		expect(pageEnd).toMatchObject({ chunkCount: pageChunks.length, itemCount: 8 });
 	});
 
-	it("single-flights history reads per canonical Session and releases them on disconnect", async () => {
+	it("single-flights history reads and holds admission until cancelled I/O settles", async () => {
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace");
 		fs.mkdirSync(cwd);
@@ -708,16 +712,17 @@ describe("SessionWsBridge", () => {
 		const firstReadEntered = new Promise<void>((resolve) => {
 			firstReadStarted = resolve;
 		});
+		let settleFirstRead: (() => void) | undefined;
+		const firstReadSettlement = new Promise<void>((resolve) => {
+			settleFirstRead = resolve;
+		});
 		history.chunked.readPage = async (...args: unknown[]) => {
 			readCalls += 1;
 			if (readCalls === 1) {
 				firstReadStarted?.();
-				const signal = args[2] as AbortSignal;
-				await new Promise<void>((_resolve, reject) => {
-					signal.addEventListener("abort", () => reject(new Error("history read aborted")), {
-						once: true,
-					});
-				});
+				// FileHandle.read cannot be interrupted by AbortSignal. Model the real
+				// ownership boundary by settling only when the underlying read completes.
+				await firstReadSettlement;
 			}
 			return originalReadPage(...args);
 		};
@@ -769,11 +774,23 @@ describe("SessionWsBridge", () => {
 		expect(readCalls).toBe(2);
 
 		await first.close();
-		await eventually(
-			() =>
-				(harness.bridge as unknown as { historyPageOperations: Map<string, unknown> }).historyPageOperations
-					.size === 0,
+		const heldOperations = (
+			harness.bridge as unknown as {
+				historyPageOperations: Map<string, unknown>;
+			}
+		).historyPageOperations;
+		expect(heldOperations.size).toBe(1);
+		const cancelledMark = second.mark();
+		second.send(pageRequest("history-still-settling"));
+		const stillBusy = await second.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+				frame.type === "session_error" && frame.operation === "history_page",
+			cancelledMark,
 		);
+		expect(stillBusy.code).toBe("session_history_busy");
+		expect(readCalls).toBe(2);
+		settleFirstRead?.();
+		await eventually(() => heldOperations.size === 0);
 		const retryMark = second.mark();
 		second.send(pageRequest("history-retry"));
 		await second.waitForFrame(
@@ -799,6 +816,7 @@ describe("SessionWsBridge", () => {
 		const lease = await claim(client, target.sessionHandle);
 		if (!lease.fencingToken) throw new Error("overflow fixture did not acquire a controller lease");
 
+		const overflowMark = client.mark();
 		client.send({
 			type: "command",
 			sessionHandle: target.sessionHandle,
@@ -809,23 +827,20 @@ describe("SessionWsBridge", () => {
 		await eventually(() => harness.supervisor.getRuntime(target.sessionHandle)?.state === "crashed");
 		const overflowed = harness.supervisor.getRuntime(target.sessionHandle)!;
 		expect(overflowed.error).toBe("session_snapshot_overflow");
-
-		const failedMark = client.mark();
-		client.send({ type: "session_subscribe", sessionHandle: target.sessionHandle });
 		await client.waitForFrame(
-			(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
-				frame.type === "session_error" &&
-				frame.operation === "subscribe" &&
-				frame.code === "session_snapshot_overflow",
-			failedMark,
+			(frame): frame is Extract<SessionWsServerMessage, { type: "resync_required" }> =>
+				frame.type === "resync_required" && frame.runtime.generation === overflowed.generation,
+			overflowMark,
 		);
-		expect(
-			client.frames
-				.slice(failedMark)
-				.some(
-					(frame) => frame.type === "resync_required" && frame.runtime.generation === overflowed.generation,
-				),
-		).toBe(true);
+		const releaseMark = client.mark();
+		client.send({ type: "session_release", sessionHandle: target.sessionHandle });
+		await client.waitForFrame(
+			(frame): frame is LeaseFrame =>
+				frame.type === "lease_status" &&
+				frame.sessionHandle === target.sessionHandle &&
+				frame.isController === false,
+			releaseMark,
+		);
 		const observer = await openClient(harness);
 		const observerMark = observer.mark();
 		observer.send({ type: "session_subscribe", sessionHandle: target.sessionHandle });
@@ -850,15 +865,36 @@ describe("SessionWsBridge", () => {
 		expect(rejectedRestart.code).toBe("session_read_only");
 		expect(harness.supervisor.getRuntime(target.sessionHandle)?.generation).toBe(overflowed.generation);
 
-		const restartMark = client.mark();
-		const observerRecoveryMark = observer.mark();
-		client.send({
+		const observerLease = await claim(observer, target.sessionHandle);
+		expect(observerLease).toMatchObject({
+			generation: overflowed.generation,
+			isController: true,
+		});
+		await observer.close();
+		const successor = await openClient(harness);
+		const successorMark = successor.mark();
+		successor.send({ type: "session_subscribe", sessionHandle: target.sessionHandle });
+		await successor.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+				frame.type === "session_error" &&
+				frame.operation === "subscribe" &&
+				frame.code === "session_snapshot_overflow",
+			successorMark,
+		);
+		const successorLease = await claim(successor, target.sessionHandle);
+		if (!successorLease.fencingToken) {
+			throw new Error("inactive overflow claim did not acquire a fenced controller lease");
+		}
+
+		const restartMark = successor.mark();
+		const observerRecoveryMark = client.mark();
+		successor.send({
 			type: "session_restart",
 			sessionHandle: target.sessionHandle,
 			expectedGeneration: overflowed.generation,
-			fencingToken: lease.fencingToken,
+			fencingToken: successorLease.fencingToken,
 		});
-		const restarted = await client.waitForFrame(
+		const restarted = await successor.waitForFrame(
 			(frame): frame is Extract<SessionWsServerMessage, { type: "runtime_state" }> =>
 				frame.type === "runtime_state" &&
 				frame.runtime.generation === overflowed.generation + 1 &&
@@ -868,13 +904,13 @@ describe("SessionWsBridge", () => {
 		);
 		expect(restarted.runtime).toMatchObject({ state: "idle" });
 		expect(restarted.runtime.error).toBeUndefined();
-		await client.waitForFrame(
+		await successor.waitForFrame(
 			(frame): frame is Extract<SessionWsServerMessage, { type: "session_snapshot" }> =>
 				frame.type === "session_snapshot" && frame.generation === restarted.runtime.generation,
 			restartMark,
 			5_000,
 		);
-		await observer.waitForFrame(
+		await client.waitForFrame(
 			(frame): frame is Extract<SessionWsServerMessage, { type: "session_snapshot" }> =>
 				frame.type === "session_snapshot" && frame.generation === restarted.runtime.generation,
 			observerRecoveryMark,
@@ -994,7 +1030,7 @@ describe("SessionWsBridge", () => {
 		fs.mkdirSync(cwd);
 		const target = createNativeSession(root, cwd, "pending-response-capacity");
 		const harness = await createHarness([target], {
-			bridge: { maxPendingCommandResponseBytes: 128 * 1024 },
+			bridge: { maxPendingCommandResponseBytes: 4 * 1024 * 1024 },
 		});
 		const client = await openClient(harness);
 		const subscription = await subscribe(client, target.sessionHandle);
@@ -1053,6 +1089,62 @@ describe("SessionWsBridge", () => {
 		});
 	});
 
+	it("reserves the legal bash and command-list response ceilings before RPC execution", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "large-command-response-capacity");
+		const harness = await createHarness([target], {
+			bridge: {
+				maxPendingCommandResponseBytes: SESSION_WS_SERVER_MAX_BYTES,
+				maxGatewayPendingCommandResponseBytes: SESSION_WS_SERVER_MAX_BYTES,
+			},
+		});
+		const client = await openClient(harness);
+		const subscription = await subscribe(client, target.sessionHandle);
+		const lease = await claim(client, target.sessionHandle);
+		const originalSendCommand = harness.supervisor.sendCommand.bind(harness.supervisor);
+		let entered: (() => void) | undefined;
+		const enteredPromise = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		harness.supervisor.sendCommand = async (...args) => {
+			entered?.();
+			await gate;
+			return originalSendCommand(...args);
+		};
+
+		client.send({
+			type: "command",
+			sessionHandle: target.sessionHandle,
+			expectedGeneration: subscription.runtime.generation,
+			fencingToken: lease.fencingToken,
+			command: { type: "bash", id: "held-bash", command: "printf bounded" },
+		});
+		await enteredPromise;
+		const mark = client.mark();
+		client.send({
+			type: "command",
+			sessionHandle: target.sessionHandle,
+			expectedGeneration: subscription.runtime.generation,
+			command: { type: "get_commands", id: "blocked-command-list" },
+		});
+		const rejected = await client.waitForFrame(
+			(frame): frame is ResponseFrame =>
+				frame.type === "response" && frame.response.id === "blocked-command-list",
+			mark,
+		);
+		expect(rejected.response).toMatchObject({
+			success: false,
+			error: "pending_command_response_capacity",
+		});
+		release?.();
+	});
+
 	it("holds the Gateway command reservation across sockets and disconnect", async () => {
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace");
@@ -1060,8 +1152,8 @@ describe("SessionWsBridge", () => {
 		const target = createNativeSession(root, cwd, "gateway-pending-response-capacity");
 		const harness = await createHarness([target], {
 			bridge: {
-				maxPendingCommandResponseBytes: 128 * 1024,
-				maxGatewayPendingCommandResponseBytes: 64 * 1024,
+				maxPendingCommandResponseBytes: 4 * 1024 * 1024,
+				maxGatewayPendingCommandResponseBytes: 2 * 1024 * 1024,
 			},
 		});
 		const first = await openClient(harness);
@@ -1114,6 +1206,84 @@ describe("SessionWsBridge", () => {
 			const bridge = harness.bridge as unknown as { gatewayPendingCommandResponseBytes: number };
 			return bridge.gatewayPendingCommandResponseBytes === 0;
 		});
+	});
+
+	it("holds the aggregate command reservation while a serialized response waits on a slow socket", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "outbound-command-reservation");
+		const harness = await createHarness([target], {
+			bridge: {
+				maxPendingCommandResponseBytes: SESSION_WS_SERVER_MAX_BYTES,
+				maxGatewayPendingCommandResponseBytes: SESSION_WS_SERVER_MAX_BYTES,
+			},
+		});
+		await harness.supervisor.activate(target.sessionHandle);
+		const originalSendCommand = harness.supervisor.sendCommand.bind(harness.supervisor);
+		let commandCalls = 0;
+		harness.supervisor.sendCommand = async (...args) => {
+			commandCalls += 1;
+			return originalSendCommand(...args);
+		};
+		const connectSocket = (socket: ControlledSendSocket) => {
+			harness.bridge.wss.emit("connection", socket as unknown as WebSocket, {} as http.IncomingMessage);
+			const connections = [
+				...(harness.bridge as unknown as { connections: Set<Record<string, unknown>> }).connections,
+			];
+			const connection = connections.at(-1);
+			if (!connection) throw new Error("slow socket did not create Bridge state");
+			connection.helloComplete = true;
+			(connection.subscriptions as Set<string>).add(target.sessionHandle);
+			(connection.subscriptionAliases as Map<string, string>).set(target.sessionHandle, target.sessionHandle);
+			return connection;
+		};
+		const request = (id: string) =>
+			Buffer.from(
+				JSON.stringify({
+					type: "command",
+					sessionHandle: target.sessionHandle,
+					expectedGeneration: harness.supervisor.getRuntime(target.sessionHandle)?.generation ?? 0,
+					command: { type: "get_commands", id },
+				}),
+			);
+
+		const first = new ControlledSendSocket();
+		first.deferNextSend();
+		connectSocket(first);
+		first.emit("message", request("slow-outbound-first"), false);
+		await eventually(() => {
+			const connection = [
+				...(harness.bridge as unknown as { connections: Set<{ outboundSending: boolean }> }).connections,
+			][0];
+			return commandCalls === 1 && connection?.outboundSending;
+		});
+		expect(
+			(harness.bridge as unknown as { gatewayPendingCommandResponseBytes: number })
+				.gatewayPendingCommandResponseBytes,
+		).toBe(SESSION_WS_SERVER_MAX_BYTES);
+
+		const second = new ControlledSendSocket();
+		connectSocket(second);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		second.emit("message", request("slow-outbound-second"), false);
+		const rejection = await eventually(() =>
+			second.sentPayloads
+				.map((payload) => JSON.parse(payload) as SessionWsServerMessage)
+				.find((frame) => frame.type === "response" && frame.response.id === "slow-outbound-second"),
+		);
+		expect(commandCalls).toBe(1);
+		expect(rejection).toMatchObject({
+			response: { success: false, error: "gateway_pending_command_response_capacity" },
+		});
+
+		first.emit("close");
+		await eventually(
+			() =>
+				(harness.bridge as unknown as { gatewayPendingCommandResponseBytes: number })
+					.gatewayPendingCommandResponseBytes === 0,
+		);
+		first.releaseDeferredSend();
 	});
 
 	it("sends hello then the initial full hot inventory only after capability negotiation", async () => {
@@ -2943,6 +3113,49 @@ describe("SessionWsBridge", () => {
 		expect(socket.readyState).toBe(WebSocket.OPEN);
 	});
 
+	it("bounds aggregate serialized snapshot retention across slow sockets", async () => {
+		const harness = await createHarness([], {
+			bridge: { maxGatewayOutboundBytes: 3 * 1024 * 1024 },
+		});
+		const connections = () => [
+			...(harness.bridge as unknown as { connections: Set<Record<string, unknown>> }).connections,
+		];
+		const send = (
+			harness.bridge as unknown as {
+				send: (connection: unknown, message: SessionWsServerMessage) => void;
+			}
+		).send.bind(harness.bridge);
+		const attach = (socket: ControlledSendSocket) => {
+			socket.deferNextSend();
+			harness.bridge.wss.emit("connection", socket as unknown as WebSocket, {} as http.IncomingMessage);
+			const connection = connections().at(-1);
+			if (!connection) throw new Error("slow socket did not create Bridge state");
+			connection.helloComplete = true;
+			return connection;
+		};
+		const first = new ControlledSendSocket();
+		const firstConnection = attach(first);
+		send(firstConnection, snapshotResponse(2 * 1024 * 1024));
+		expect(first.sentBytes).toHaveLength(1);
+		const retained = (harness.bridge as unknown as { gatewayOutboundBytes: number }).gatewayOutboundBytes;
+		expect(retained).toBeGreaterThan(2 * 1024 * 1024);
+
+		const second = new ControlledSendSocket();
+		const secondConnection = attach(second);
+		send(secondConnection, snapshotResponse(2 * 1024 * 1024));
+		expect(second.sentBytes).toEqual([]);
+		expect(second.closeCalls).toEqual([{ code: 1008, reason: "policy violation" }]);
+		expect((harness.bridge as unknown as { gatewayOutboundBytes: number }).gatewayOutboundBytes).toBe(
+			retained,
+		);
+
+		first.emit("close");
+		await eventually(
+			() => (harness.bridge as unknown as { gatewayOutboundBytes: number }).gatewayOutboundBytes === 0,
+		);
+		first.releaseDeferredSend();
+	});
+
 	it("keeps the next in-flight history frame inside the stream byte budget", async () => {
 		const harness = await createHarness([]);
 		const socket = new ControlledSendSocket();
@@ -3189,7 +3402,7 @@ describe("SessionWsBridge", () => {
 		expect(successorLease.isController).toBe(true);
 	});
 
-	it("does not resurrect a controller lease when release overtakes a delayed claim", async () => {
+	it("does not let delayed claim cleanup erase a newer controller fence", async () => {
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace");
 		fs.mkdirSync(cwd);
@@ -3206,10 +3419,14 @@ describe("SessionWsBridge", () => {
 		const returnGate = new Promise<void>((resolve) => {
 			returnClaim = resolve;
 		});
+		let claimCalls = 0;
 		harness.supervisor.claim = async (...args) => {
 			const lease = await originalClaim(...args);
-			acquired?.();
-			await returnGate;
+			claimCalls += 1;
+			if (claimCalls === 1) {
+				acquired?.();
+				await returnGate;
+			}
 			return lease;
 		};
 
@@ -3225,12 +3442,24 @@ describe("SessionWsBridge", () => {
 			mark,
 		);
 		expect(released.isController).toBe(false);
+		client.send({ type: "session_claim", sessionHandle: target.sessionHandle });
+		const reclaimed = await client.waitForFrame(
+			(frame): frame is LeaseFrame =>
+				frame.type === "lease_status" &&
+				frame.sessionHandle === target.sessionHandle &&
+				frame.isController === true,
+			mark,
+		);
+		if (!reclaimed.fencingToken) throw new Error("replacement claim did not return a fence");
 		returnClaim?.();
 		await new Promise<void>((resolve) => setImmediate(resolve));
 
 		const connectionId = (bridgeConnection(harness.bridge).connection as { connectionId: string })
 			.connectionId;
-		expect(harness.supervisor.leaseFor(target.sessionHandle, connectionId).isController).toBe(false);
+		expect(harness.supervisor.leaseFor(target.sessionHandle, connectionId)).toMatchObject({
+			isController: true,
+			fencingToken: reclaimed.fencingToken,
+		});
 		expect(
 			client.frames
 				.slice(mark)
@@ -3240,7 +3469,24 @@ describe("SessionWsBridge", () => {
 						frame.sessionHandle === target.sessionHandle &&
 						frame.isController,
 				),
-		).toEqual([]);
+		).toHaveLength(1);
+	});
+
+	it("does not retain release intents for never-subscribed handles", async () => {
+		const harness = await createHarness([]);
+		const client = await openClient(harness);
+		for (let index = 0; index < 1_024; index += 1) {
+			client.send({ type: "session_unsubscribe", sessionHandle: `never-subscribed-${index}` });
+		}
+		const mark = client.mark();
+		client.send({ type: "session_claim", sessionHandle: "ordering-sentinel" });
+		await client.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+				frame.type === "session_error" && frame.sessionHandle === "ordering-sentinel",
+			mark,
+		);
+		const { connection } = bridgeConnection(harness.bridge);
+		expect((connection as { controlIntents: Map<string, unknown> }).controlIntents.size).toBe(0);
 	});
 
 	it("releases a canonical lease acquired after its socket already closed", async () => {

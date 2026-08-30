@@ -396,7 +396,12 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "curren
 	}
 
 	async claim(sessionHandle: string, connectionId: string): Promise<SessionLeaseSnapshot> {
-		const runtime = await this.ensureRuntime(sessionHandle);
+		const handle = this.resolveAlias(sessionHandle);
+		const tracked = this.runtimes.get(handle);
+		const runtime =
+			tracked?.snapshotOverflowed && tracked.state === "crashed" && tracked.recoverable
+				? tracked
+				: await this.ensureRuntime(handle);
 		return this.withPoolLock(async () => {
 			this.assertOpen();
 			const handle = runtime.sessionHandle;
@@ -429,6 +434,16 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "curren
 		const handle = this.resolveAlias(sessionHandle);
 		const lease = this.leases.get(handle);
 		if (!lease || lease.connectionId !== connectionId) return false;
+		this.leases.delete(handle);
+		return true;
+	}
+
+	releaseExact(sessionHandle: string, connectionId: string, fencingToken: string): boolean {
+		const handle = this.resolveAlias(sessionHandle);
+		const lease = this.leases.get(handle);
+		if (!lease || lease.connectionId !== connectionId || lease.fencingToken !== fencingToken) {
+			return false;
+		}
 		this.leases.delete(handle);
 		return true;
 	}
@@ -554,18 +569,12 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "curren
 			}
 			if (context) {
 				const lease = this.leases.get(handle);
-				if (lease) {
-					if (lease.connectionId !== context.connectionId || lease.fencingToken !== context.fencingToken) {
-						throw new RpcError("restart", "session_read_only");
-					}
-				} else {
-					if (context.fencingToken !== undefined) {
-						throw new RpcError("restart", "session_read_only");
-					}
-					this.leases.set(handle, {
-						connectionId: context.connectionId,
-						fencingToken: randomUUID(),
-					});
+				if (
+					!lease ||
+					lease.connectionId !== context.connectionId ||
+					lease.fencingToken !== context.fencingToken
+				) {
+					throw new RpcError("restart", "session_read_only");
 				}
 			}
 			this.clearRestart(existing.sessionHandle);
