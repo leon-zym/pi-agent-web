@@ -808,7 +808,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 						? "running"
 						: "idle",
 			);
-			this.assertWireSnapshotFits();
+			this.assertSnapshotFits();
 			this.startupReady = true;
 			const startupEmits = this.deferredStartupEmits ?? [];
 			this.deferredStartupEmits = null;
@@ -946,10 +946,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 		const consume: PiDecodedDeliveryConsumer<RuntimeResponse<M>, RuntimeRef<M>> = (delivery) => {
 			const messages = this.productAdapter.messagesFrom(delivery.value);
 			const startupCandidate =
-				this.productAdapter.mode === "content_ref" &&
-				!this.startupReady &&
-				this.transitionStage === null &&
-				candidateOwnership === undefined;
+				!this.startupReady && this.transitionStage === null && candidateOwnership === undefined;
 			const semanticRevision = this.extensionSemanticRevision;
 			const startupFrameCount = this.startupFrames.length;
 			const startupFrameBytes = this.startupFrameBytes;
@@ -1120,11 +1117,9 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 			if (!ownershipCurrent || this.liveProjection !== projection) return false;
 			const prepared = projection.prepareIdleBaseCompaction(token, normalized.messages);
 			if (!prepared) return false;
-			if (this.productAdapter.mode === "content_ref") {
-				const candidateProjection = projection.previewPreparedIdleBaseCompaction(prepared);
-				if (!candidateProjection) return false;
-				this.assertProductSnapshotCandidateFits(this.buildSessionSnapshotFromProjection(candidateProjection));
-			}
+			const candidateProjection = projection.previewPreparedIdleBaseCompaction(prepared);
+			if (!candidateProjection) return false;
+			this.assertProductSnapshotCandidateFits(this.buildSessionSnapshotFromProjection(candidateProjection));
 			if (lease) {
 				if (!contentOwner) throw new RpcError("get_messages", "unexpected_payload_transfer");
 				const transfer = lease.transfer();
@@ -1141,7 +1136,6 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 			}
 			this.nativeHistoryPlan = plan;
 			this.nativeHistorySnapshotId = randomUUID();
-			if (this.productAdapter.mode !== "content_ref") this.assertWireSnapshotFits();
 			return true;
 		} catch (error) {
 			if (error instanceof SessionHistoryError) {
@@ -1256,8 +1250,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 		messages: readonly RuntimeMessage<M>[],
 	): SessionLiveProjection<RuntimeMessage<M>, RuntimeEvent<M>, RuntimeExtensionRequest<M>> {
 		const ownerIsCurrent = () => this.isCurrentNativeHistoryRead(processToken, proc);
-		const startupCandidate =
-			this.productAdapter.mode === "content_ref" && !this.startupReady && this.transitionStage === null;
+		const startupCandidate = !this.startupReady && this.transitionStage === null;
 		const startupFrames = startupCandidate
 			? this.authoritativeContentRefStartupFrames(this.startupFrames)
 			: [];
@@ -2067,7 +2060,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 		}
 	}
 
-	private assertWireSnapshotFits(): void {
+	private assertSnapshotFits(): void {
 		const snapshot = this.buildSessionSnapshot();
 		if (this.isProductSnapshot(snapshot)) {
 			try {
@@ -2288,10 +2281,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 			seq: token.nextSeq,
 		};
 		const envelopeBytes = Buffer.byteLength(JSON.stringify(envelope));
-		if (
-			this.productAdapter.mode === "content_ref" &&
-			envelopeBytes > this.productAdapter.productSchema.maxReplayFrameWireBytes
-		) {
+		if (envelopeBytes > this.productAdapter.productSchema.maxReplayFrameWireBytes) {
 			throw this.normalizeProjectionError(new SessionLiveProjectionLimitError("live_events"));
 		}
 		const replay = [...this.replay, envelope];
@@ -2472,7 +2462,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 		delivery: PiDecodedDelivery<ExtensionUiRequestDto, EpochStoredContentRef>,
 	): PiDecodedDeliveryPlan {
 		const owner = this.generationContentOwner;
-		if (this.productAdapter.mode !== "content_ref" || !owner) {
+		if (!owner) {
 			return delivery.prepare((_transfer) => {
 				throw new RpcError("extension_ui_request", "content_ref_extension_generation_owner_unavailable");
 			});
@@ -3068,19 +3058,6 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 		this.publishFrame(frame);
 	}
 
-	private flushFrames(frames: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[]): void {
-		for (const frame of frames) {
-			if (
-				frame.type === "extension_ui_request" &&
-				BLOCKING_DIALOG_METHODS.has(frame.request.method) &&
-				!this.pendingDialogs.has(frame.request.id)
-			) {
-				continue;
-			}
-			this.publishFrame(frame);
-		}
-	}
-
 	private flushPreparedContentRefStartupFrames(
 		frames: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[],
 	): void {
@@ -3195,13 +3172,6 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 		}
 	}
 
-	private flushTransitionFrames(): void {
-		if (!this.transitionStage) return;
-		this.flushFrames(this.transitionStage.frames);
-		this.transitionStage.frames = [];
-		this.transitionStage.bytes = 0;
-	}
-
 	private commitParentConfirmedTransition(
 		proc: PiProcess,
 		stage: TransitionStage<RuntimeEvent<M>, RuntimeExtensionRequest<M>, RuntimeRef<M>>,
@@ -3212,11 +3182,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 			}
 			stage.payloadLedger.drainTo(stage.parentOwner);
 		}
-		if (this.productAdapter.mode === "content_ref") {
-			for (const message of this.commitTransitionFrames()) this.emitSupervisorMessage(message);
-		} else {
-			this.flushTransitionFrames();
-		}
+		for (const message of this.commitTransitionFrames()) this.emitSupervisorMessage(message);
 	}
 
 	private releaseTransitionStagePayloads(
@@ -3256,36 +3222,32 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 		}
 		this.deferredTransitionEmits = [];
 		try {
-			if (this.productAdapter.mode === "content_ref") {
-				try {
-					const stage = this.transitionStage;
-					if (!stage) throw new RpcError("session_transition", "session_generation_stale");
-					if (stage.frames.length === 0) return this.deferredTransitionEmits;
-					const plan = this.expandContentRefTransitionSemanticPlan(stage);
-					if (plan.frames.length === 0) {
-						stage.frames = [];
-						stage.bytes = 0;
-						return this.deferredTransitionEmits;
-					}
-					const turnBudget = this.prepareTransitionTurnBudget(plan.frames);
-					const prepared = this.prepareExtensionSemanticOperation({
-						processToken: stage.processToken,
-						...plan,
-					});
-					this.commitExtensionSemanticOperation(prepared);
-					for (const frame of plan.frames) {
-						if (frame.type === "event") this.applyFrameState(frame);
-					}
-					this.activeTurnProjectionItems = turnBudget.items;
-					this.activeTurnProjectionBytes = turnBudget.bytes;
-					this.activeTurnProjectionLogicalBytes = turnBudget.logicalBytes;
+			try {
+				const stage = this.transitionStage;
+				if (!stage) throw new RpcError("session_transition", "session_generation_stale");
+				if (stage.frames.length === 0) return this.deferredTransitionEmits;
+				const plan = this.expandContentRefTransitionSemanticPlan(stage);
+				if (plan.frames.length === 0) {
 					stage.frames = [];
 					stage.bytes = 0;
-				} catch (error) {
-					throw this.normalizeProjectionError(error);
+					return this.deferredTransitionEmits;
 				}
-			} else {
-				this.flushTransitionFrames();
+				const turnBudget = this.prepareTransitionTurnBudget(plan.frames);
+				const prepared = this.prepareExtensionSemanticOperation({
+					processToken: stage.processToken,
+					...plan,
+				});
+				this.commitExtensionSemanticOperation(prepared);
+				for (const frame of plan.frames) {
+					if (frame.type === "event") this.applyFrameState(frame);
+				}
+				this.activeTurnProjectionItems = turnBudget.items;
+				this.activeTurnProjectionBytes = turnBudget.bytes;
+				this.activeTurnProjectionLogicalBytes = turnBudget.logicalBytes;
+				stage.frames = [];
+				stage.bytes = 0;
+			} catch (error) {
+				throw this.normalizeProjectionError(error);
 			}
 			return this.deferredTransitionEmits;
 		} finally {
@@ -3721,16 +3683,14 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 								this.trackDiscardedCompactionTransfer(processToken, proc, contentOwner, transfer);
 								return true;
 							}
-							if (this.productAdapter.mode === "content_ref") {
-								const candidateProjection = projection.previewPreparedIdleBaseCompaction(prepared);
-								if (!candidateProjection) {
-									this.trackDiscardedCompactionTransfer(processToken, proc, contentOwner, transfer);
-									return true;
-								}
-								this.assertProductSnapshotCandidateFits(
-									this.buildSessionSnapshotFromProjection(candidateProjection),
-								);
+							const candidateProjection = projection.previewPreparedIdleBaseCompaction(prepared);
+							if (!candidateProjection) {
+								this.trackDiscardedCompactionTransfer(processToken, proc, contentOwner, transfer);
+								return true;
 							}
+							this.assertProductSnapshotCandidateFits(
+								this.buildSessionSnapshotFromProjection(candidateProjection),
+							);
 							if (transfer) {
 								if (!contentOwner) throw new RpcError("get_messages", "unexpected_payload_transfer");
 								contentOwner.adopt(transfer);
@@ -3739,7 +3699,6 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 								if (!projection.commitPreparedIdleBaseCompaction(prepared)) {
 									throw new RpcError("get_messages", "session_compaction_commit_invariant_failed");
 								}
-								if (this.productAdapter.mode !== "content_ref") this.assertWireSnapshotFits();
 								committed = true;
 							} catch (error) {
 								if (contentOwner) {
