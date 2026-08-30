@@ -156,10 +156,9 @@ for (const scenario of scenariosFor("concurrency")) {
 						const previous = observations[sessionIndex]?.at(-1)?.deltaFrames ?? 0;
 						const backgroundBaseline = backgroundBaselines[sessionIndex];
 						if (backgroundBaseline === undefined) throw new Error("Background baseline is missing");
-						const minimumFrames = Math.max(
-							checkpoint,
-							previous + 1,
-							backgroundBaseline === null ? 0 : backgroundBaseline + 1,
+						const minimumFrames = Math.min(
+							expectedDeltas,
+							Math.max(checkpoint, previous + 1, backgroundBaseline === null ? 0 : backgroundBaseline + 1),
 						);
 						await expect
 							.poll(
@@ -199,6 +198,7 @@ for (const scenario of scenariosFor("concurrency")) {
 							background: sessionCount === 1 || wasBackground,
 							backgroundProgress:
 								sessionCount === 1 ||
+								arrival.deltaFrames >= expectedDeltas ||
 								(backgroundBaseline !== null && arrival.deltaFrames > backgroundBaseline),
 							deltaFrames: arrival.deltaFrames,
 							projectionLagMs:
@@ -318,7 +318,7 @@ for (const scenario of scenariosFor("concurrency")) {
 				"lte",
 				0,
 				"hard",
-				"Every Session must publish at least two increasing Browser-side projection checkpoints.",
+				"Every Session must publish two Browser-side checkpoints, progressing until the terminal delta count.",
 			);
 			addSummaryGate(
 				outcome,
@@ -327,7 +327,7 @@ for (const scenario of scenariosFor("concurrency")) {
 				"lte",
 				0,
 				"hard",
-				"Every background Session must receive new frames between two separate view switches.",
+				"Every background Session must progress between view switches or already have reached the terminal delta count.",
 			);
 			addSummaryGate(
 				outcome,
