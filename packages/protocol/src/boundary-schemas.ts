@@ -1,7 +1,6 @@
 import {
 	Literal,
 	Optional,
-	type Static,
 	type TSchema,
 	Boolean as TypeBoolean,
 	Object as TypeObject,
@@ -135,11 +134,6 @@ const PI_WIRE_BOUNDARY_SHAPES = Object.freeze({
 		{ additionalProperties: true },
 	),
 });
-
-/** Static types are intentionally limited to envelope shape, not product DTO semantics. */
-export type ProductBoundaryShapeMap = {
-	[K in keyof typeof PRODUCT_BOUNDARY_SHAPES]: Static<(typeof PRODUCT_BOUNDARY_SHAPES)[K]>;
-};
 
 export const PRODUCT_RUNTIME_SCHEMAS = Object.freeze({
 	command: recordSchema("pi-web.command", PRODUCT_BOUNDARY_SHAPES.command),

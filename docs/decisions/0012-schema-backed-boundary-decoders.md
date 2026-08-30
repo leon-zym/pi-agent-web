@@ -24,8 +24,8 @@ those security decisions or duplicate the same nested traversal.
    Extension method fail before runtime. Product DTOs and the Browser protocol remain independent.
 4. Compatibility remains exact-version and fixture-driven. A candidate may be exercised through an
    explicit `PI_PATH`, but bundled resolution rejects it until its matrix status is promoted to
-   `current`. The compatibility workflow runs the fixture/conformance lane, schema benchmark, and
-   packaged empty-PATH smoke.
+   `current`. The compatibility workflow runs the fixture/conformance lane and schema benchmark;
+   repository CI separately runs the packaged empty-PATH smoke.
 
 ## Consequences
 

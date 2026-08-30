@@ -6,11 +6,7 @@ import {
 	PRODUCT_RUNTIME_SCHEMA_REGISTRY,
 	PRODUCT_RUNTIME_SCHEMAS,
 } from "../src/boundary-schemas.js";
-import {
-	createRuntimeSchema,
-	createRuntimeSchemaRegistry,
-	type RuntimeSchemaResult,
-} from "../src/runtime-schema.js";
+import { createRuntimeSchema, createRuntimeSchemaRegistry } from "../src/runtime-schema.js";
 
 interface TestFrame {
 	type: "test";
@@ -38,17 +34,6 @@ const testFrameSchema = createRuntimeSchema<TestFrame>({
 });
 
 describe("runtime schema boundary", () => {
-	it("provides a stable, redacted safeParse result without exposing validator details", () => {
-		expect(testFrameSchema.safeParse({ type: "test", value: "ok" })).toEqual({
-			success: true,
-			value: { type: "test", value: "ok" },
-		});
-		expect(testFrameSchema.safeParse({ type: "test", value: "too long!" })).toEqual({
-			success: false,
-			issue: { code: "schema_invalid", schemaId: "test.frame" },
-		});
-	});
-
 	it("runs the semantic guard only after structural admission", () => {
 		const guard = vi.fn((value: unknown): value is TestFrame => {
 			return testFrameSchema.guard(value);
@@ -75,10 +60,7 @@ describe("runtime schema boundary", () => {
 				},
 			},
 		);
-		expect(testFrameSchema.safeParse(throwingProxy)).toEqual({
-			success: false,
-			issue: { code: "schema_invalid", schemaId: "test.frame" },
-		});
+		expect(testFrameSchema.check(throwingProxy)).toBe(false);
 		const schema = createRuntimeSchema<TestFrame>({
 			id: "test.throwing",
 			shape: TypeObject({ type: Literal("test") }, { additionalProperties: true }),
@@ -86,10 +68,7 @@ describe("runtime schema boundary", () => {
 				throw new Error("must stay private");
 			},
 		});
-		expect(schema.safeParse({ type: "test" })).toEqual({
-			success: false,
-			issue: { code: "schema_invalid", schemaId: "test.throwing" },
-		});
+		expect(schema.check({ type: "test" })).toBe(false);
 	});
 
 	it("freezes a named registry and returns unknown names without guessing", () => {
@@ -100,12 +79,6 @@ describe("runtime schema boundary", () => {
 		expect(registry.get("__proto__")).toBeUndefined();
 		expect(registry.get("constructor")).toBeUndefined();
 		expect(registry.names).toEqual(["frame"]);
-	});
-
-	it("keeps the result discriminated for callers that do not use a type guard", () => {
-		const result: RuntimeSchemaResult<TestFrame> = testFrameSchema.safeParse({ type: "test", value: "ok" });
-		if (!result.success) throw new Error("fixture should be valid");
-		expect(result.value.value).toBe("ok");
 	});
 
 	it("keeps product and Pi-wire envelope registries separate", () => {
@@ -124,16 +97,13 @@ describe("runtime schema boundary", () => {
 		]);
 		expect(PI_WIRE_RUNTIME_SCHEMA_REGISTRY.names).toEqual(["response", "event", "extensionUiRequest"]);
 		expect(
-			PRODUCT_RUNTIME_SCHEMAS.response.safeParse({
+			PRODUCT_RUNTIME_SCHEMAS.response.check({
 				type: "response",
 				command: "get_state",
 				success: true,
 				unexpected: true,
 			}),
-		).toEqual({
-			success: false,
-			issue: { code: "schema_invalid", schemaId: "pi-web.response" },
-		});
+		).toBe(false);
 		expect(
 			PI_WIRE_RUNTIME_SCHEMA_REGISTRY.get("response")?.check({
 				type: "response",

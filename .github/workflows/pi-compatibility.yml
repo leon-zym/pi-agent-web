@@ -10,12 +10,10 @@ on:
       - "packages/server/src/pi-host-adapter.ts"
       - "packages/server/src/resolver.ts"
       - "packages/server/test/fixtures/pi-compatibility/**"
-      - "packages/server/test/fixtures/pi-0.84.3-toolcall-start.json"
       - "packages/server/test/pi-compatibility.test.ts"
       - "packages/server/test/pi-host-conformance.test.ts"
       - "packages/server/test/resolver.test.ts"
       - "pnpm-lock.yaml"
-      - "scripts/pack-smoke.mjs"
       - "package.json"
 
 concurrency:
@@ -42,4 +40,3 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm test:compat
       - run: pnpm --filter @pi-agent-web/protocol bench:schema
-      - run: pnpm test:pack

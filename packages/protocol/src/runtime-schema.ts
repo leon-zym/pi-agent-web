@@ -1,16 +1,6 @@
 import { Check } from "typebox/schema";
 import type { TSchema } from "typebox/type";
 
-/** A stable, redacted result for a boundary value that did not pass its schema. */
-export interface RuntimeSchemaIssue {
-	readonly code: "schema_invalid";
-	readonly schemaId: string;
-}
-
-export type RuntimeSchemaResult<T> =
-	| { readonly success: true; readonly value: T }
-	| { readonly success: false; readonly issue: RuntimeSchemaIssue };
-
 export interface RuntimeSchema<T> {
 	/** Stable identifier used in diagnostics and compatibility reports. */
 	readonly id: string;
@@ -19,7 +9,6 @@ export interface RuntimeSchema<T> {
 	/** Semantic/contextual guard owned by the boundary. */
 	readonly guard: (value: unknown) => value is T;
 	readonly check: (value: unknown) => value is T;
-	readonly safeParse: (value: unknown) => RuntimeSchemaResult<T>;
 }
 
 export interface RuntimeSchemaRegistry {
@@ -67,16 +56,11 @@ export function createRuntimeSchema<T>(definition: {
 			return false;
 		}
 	};
-	const safeParse = (value: unknown): RuntimeSchemaResult<T> =>
-		check(value)
-			? { success: true, value: value as T }
-			: { success: false, issue: { code: "schema_invalid", schemaId: definition.id } };
 	return Object.freeze({
 		id: definition.id,
 		shape: definition.shape,
 		guard: definition.guard,
 		check,
-		safeParse,
 	});
 }
 
