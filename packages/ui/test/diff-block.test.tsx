@@ -90,6 +90,18 @@ describe("DiffBlock & Unified Diff Parsing", () => {
 		expect(html).toContain("data-new-line");
 	});
 
+	it("sanitizes the displayed file label without changing the raw input", () => {
+		const longPath = `${"deep/".repeat(80)}very-long-file-name.ts`;
+		const fileName = `src/\u001b[31munsafe\u001b[0m\u001b]8;;https://example.com\u0007link\u001b]8;;\u001b\\\u202eevil\u202c\n${longPath}`;
+		const original = fileName;
+		const html = renderToStaticMarkup(<DiffBlock diff={sampleDiff} fileName={fileName} />);
+
+		expect(html).toContain(`title="src/unsafelinkevil ${longPath}"`);
+		expect(html).not.toContain("https://example.com");
+		expect(html).not.toContain("\u202e");
+		expect(fileName).toBe(original);
+	});
+
 	it("ignores backslash markers like \\ No newline at end of file in clean code and numbering", () => {
 		const diffWithWarning = `@@ -1,2 +1,2 @@
 -old line

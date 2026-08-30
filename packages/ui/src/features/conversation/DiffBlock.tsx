@@ -1,6 +1,6 @@
 import { Check, Copy, FileCode } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { stripAnsi } from "../../lib/format";
+import { displayLabel, stripAnsi } from "../../lib/format";
 import { tt, useT } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 
@@ -130,7 +130,7 @@ export function DiffBlock({ diff, fileName, className }: DiffBlockProps) {
 	}, []);
 
 	const parsedLines = useMemo(() => parseUnifiedDiff(diff), [diff]);
-	const displayFileName = fileName || tt("tool.diff");
+	const displayFileName = (fileName ? displayLabel(fileName) : "") || tt("tool.diff");
 
 	const handleCleanCopy = async () => {
 		const cleanCode = extractCleanCode(diff);

@@ -50,6 +50,16 @@ describe("stripAnsi", () => {
 		expect(tailTeaser("  \n  Single line  \n  ")).toBe("Single line");
 		expect(tailTeaser("")).toBe("");
 	});
+
+	it("keeps the last readable thought ahead of Markdown-only tail markers", () => {
+		expect(tailTeaser("Draft\nReadable conclusion.\n```\n")).toBe("Readable conclusion.");
+		expect(tailTeaser("Readable conclusion.\n###\n-\n| --- | :---: |")).toBe("Readable conclusion.");
+		expect(tailTeaser("分析过程\n\u001b[31m最终结论。\u001b[0m\n~~~markdown")).toBe("最终结论。");
+		expect(tailTeaser(" \n\t\n---\n```\n")).toBe("");
+		expect(tailTeaser("Earlier\n## Readable heading")).toBe("## Readable heading");
+		expect(tailTeaser("Earlier\n- readable list item")).toBe("- readable list item");
+		expect(tailTeaser("| --- |\n| 可读内容 |")).toBe("| 可读内容 |");
+	});
 });
 
 describe("UTF-8 text budgets", () => {
