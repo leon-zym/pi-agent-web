@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
-	isExtensionUiRequestDto,
 	isExtensionUiResponseDto,
-	isProductSessionEventDto,
-	isSessionCommandResponseDto,
-	isSessionMessageDto,
-	isSessionTreeDto,
-	isSessionWsServerMessage,
+	isInlineSessionWsServerMessage,
+	isPiExtensionUiRequestDto,
+	isPiProductSessionEventDto,
+	isPiSessionCommandResponseDto,
+	isPiSessionMessageDto,
+	isPiSessionTreeDto,
 	SESSION_PAYLOAD_BUDGET,
 } from "../src/index.js";
 
@@ -75,13 +75,13 @@ describe("product-owned protocol decoders", () => {
 			timestamp: 1,
 		};
 
-		expect(isSessionMessageDto(message)).toBe(false);
-		expect(isSessionMessageDto(message, attachmentContext)).toBe(true);
-		expect(isSessionMessageDto(message, { ...attachmentContext, serverEpoch: "gateway-epoch-b" })).toBe(
+		expect(isPiSessionMessageDto(message)).toBe(false);
+		expect(isPiSessionMessageDto(message, attachmentContext)).toBe(true);
+		expect(isPiSessionMessageDto(message, { ...attachmentContext, serverEpoch: "gateway-epoch-b" })).toBe(
 			false,
 		);
 		expect(
-			isSessionMessageDto(message, {
+			isPiSessionMessageDto(message, {
 				...attachmentContext,
 				payloadBudget: { ...SESSION_PAYLOAD_BUDGET, maxAttachmentBlobBytes: 3 },
 			}),
@@ -98,15 +98,15 @@ describe("product-owned protocol decoders", () => {
 			timestamp: 1,
 		});
 
-		expect(isSessionMessageDto(message(attachmentRef, "image/jpeg"), attachmentContext)).toBe(false);
+		expect(isPiSessionMessageDto(message(attachmentRef, "image/jpeg"), attachmentContext)).toBe(false);
 		expect(
-			isSessionMessageDto(
+			isPiSessionMessageDto(
 				message({ ...attachmentRef, mediaType: "application/json" }, "application/json"),
 				attachmentContext,
 			),
 		).toBe(false);
 		expect(
-			isSessionMessageDto(
+			isPiSessionMessageDto(
 				{
 					...message(attachmentRef, "image/png"),
 					content: Array.from({ length: 2 }, () => ({
@@ -141,11 +141,11 @@ describe("product-owned protocol decoders", () => {
 			},
 		};
 
-		expect(isSessionWsServerMessage(refEvent)).toBe(false);
-		expect(isSessionWsServerMessage(refEvent, attachmentContext)).toBe(true);
-		expect(isSessionWsServerMessage(refResponse, attachmentContext)).toBe(true);
+		expect(isInlineSessionWsServerMessage(refEvent)).toBe(false);
+		expect(isInlineSessionWsServerMessage(refEvent, attachmentContext)).toBe(true);
+		expect(isInlineSessionWsServerMessage(refResponse, attachmentContext)).toBe(true);
 		expect(
-			isSessionWsServerMessage(
+			isInlineSessionWsServerMessage(
 				{
 					...refEvent,
 					serverEpoch: "gateway-epoch-b",
@@ -206,15 +206,15 @@ describe("product-owned protocol decoders", () => {
 		];
 
 		for (const candidate of responses) {
-			expect(isSessionCommandResponseDto(candidate)).toBe(false);
-			expect(isSessionCommandResponseDto(candidate, attachmentContext)).toBe(true);
+			expect(isPiSessionCommandResponseDto(candidate)).toBe(false);
+			expect(isPiSessionCommandResponseDto(candidate, attachmentContext)).toBe(true);
 		}
 	});
 
 	it("accepts every bounded optional field emitted by the supported Pi message schema", () => {
 		const extendedUsage = { ...usage, cacheWrite1h: 1, reasoning: 1 };
 		expect(
-			isSessionMessageDto({
+			isPiSessionMessageDto({
 				role: "assistant",
 				content: [],
 				api: "anthropic-messages",
@@ -248,7 +248,7 @@ describe("product-owned protocol decoders", () => {
 		).toBe(true);
 
 		expect(
-			isSessionMessageDto({
+			isPiSessionMessageDto({
 				role: "toolResult",
 				toolCallId: "call",
 				toolName: "tool",
@@ -261,7 +261,7 @@ describe("product-owned protocol decoders", () => {
 		).toBe(true);
 
 		expect(
-			isSessionMessageDto({
+			isPiSessionMessageDto({
 				role: "bashExecution",
 				command: "pwd",
 				output: "ok",
@@ -310,7 +310,7 @@ describe("product-owned protocol decoders", () => {
 				display: true,
 			},
 		]) {
-			expect(isSessionTreeDto([{ entry, children: [] }])).toBe(true);
+			expect(isPiSessionTreeDto([{ entry, children: [] }])).toBe(true);
 		}
 	});
 
@@ -324,7 +324,7 @@ describe("product-owned protocol decoders", () => {
 		],
 	] as const)("rejects unknown fields in %s", (_label, fields) => {
 		expect(
-			isSessionMessageDto({
+			isPiSessionMessageDto({
 				role: "assistant",
 				content: [],
 				usage,
@@ -337,7 +337,7 @@ describe("product-owned protocol decoders", () => {
 
 	it("rejects a non-tool message in turn_end.toolResults", () => {
 		expect(
-			isProductSessionEventDto({
+			isPiProductSessionEventDto({
 				type: "turn_end",
 				message: { role: "user", content: "done", timestamp: 1 },
 				toolResults: [{ role: "user", content: "not a tool result", timestamp: 1 }],
@@ -435,7 +435,7 @@ describe("product-owned protocol decoders", () => {
 			},
 		],
 	] as const)("rejects unknown fields in %s", (_label, value) => {
-		expect(isSessionCommandResponseDto(value)).toBe(false);
+		expect(isPiSessionCommandResponseDto(value)).toBe(false);
 	});
 
 	it.each([
@@ -544,7 +544,7 @@ describe("product-owned protocol decoders", () => {
 			},
 		],
 	] as const)("rejects unknown fields in %s", (_label, value) => {
-		expect(isSessionMessageDto(value)).toBe(false);
+		expect(isPiSessionMessageDto(value)).toBe(false);
 	});
 
 	it.each([
@@ -566,7 +566,7 @@ describe("product-owned protocol decoders", () => {
 			{ type: "extension_error", extensionPath: "/tmp/e", event: "load", error: "bad", unexpected: true },
 		],
 	] as const)("rejects unknown fields in %s", (_label, value) => {
-		expect(isProductSessionEventDto(value)).toBe(false);
+		expect(isPiProductSessionEventDto(value)).toBe(false);
 	});
 
 	it.each([
@@ -594,7 +594,7 @@ describe("product-owned protocol decoders", () => {
 		{ type: "extension_ui_request", id: "8", method: "setTitle", title: "Title", unexpected: true },
 		{ type: "extension_ui_request", id: "9", method: "set_editor_text", text: "Text", unexpected: true },
 	] as const)("rejects unknown fields in Extension UI request $method", (value) => {
-		expect(isExtensionUiRequestDto(value)).toBe(false);
+		expect(isPiExtensionUiRequestDto(value)).toBe(false);
 	});
 
 	it("rejects unknown fields in Extension UI responses", () => {
@@ -610,13 +610,13 @@ describe("product-owned protocol decoders", () => {
 			parentId: null,
 			timestamp: "2026-08-25T00:00:00.000Z",
 		};
-		expect(isSessionTreeDto([{ entry: baseEntry, children: [], unexpected: true }])).toBe(false);
-		expect(isSessionTreeDto([{ entry: { ...baseEntry, unexpected: true }, children: [] }])).toBe(false);
+		expect(isPiSessionTreeDto([{ entry: baseEntry, children: [], unexpected: true }])).toBe(false);
+		expect(isPiSessionTreeDto([{ entry: { ...baseEntry, unexpected: true }, children: [] }])).toBe(false);
 	});
 
 	it("keeps explicitly opaque fields open while enforcing their resource bounds", () => {
 		expect(
-			isProductSessionEventDto({
+			isPiProductSessionEventDto({
 				type: "tool_execution_start",
 				toolCallId: "call",
 				toolName: "tool",
@@ -624,7 +624,7 @@ describe("product-owned protocol decoders", () => {
 			}),
 		).toBe(true);
 		expect(
-			isSessionMessageDto({
+			isPiSessionMessageDto({
 				role: "toolResult",
 				toolCallId: "call",
 				toolName: "tool",
@@ -638,7 +638,7 @@ describe("product-owned protocol decoders", () => {
 
 	it("bounds the shared failure envelope to a 64 KiB raw error", () => {
 		expect(
-			isSessionCommandResponseDto({
+			isPiSessionCommandResponseDto({
 				type: "response",
 				command: "get_state",
 				success: false,
@@ -646,7 +646,7 @@ describe("product-owned protocol decoders", () => {
 			}),
 		).toBe(true);
 		expect(
-			isSessionCommandResponseDto({
+			isPiSessionCommandResponseDto({
 				type: "response",
 				command: "get_state",
 				success: false,
@@ -657,7 +657,7 @@ describe("product-owned protocol decoders", () => {
 
 	it("bounds ordinary-line response products before Gateway serialization", () => {
 		expect(
-			isSessionCommandResponseDto({
+			isPiSessionCommandResponseDto({
 				type: "response",
 				command: "bash",
 				success: true,
@@ -669,7 +669,7 @@ describe("product-owned protocol decoders", () => {
 			}),
 		).toBe(false);
 		expect(
-			isSessionCommandResponseDto({
+			isPiSessionCommandResponseDto({
 				type: "response",
 				command: "get_state",
 				success: true,
@@ -706,9 +706,9 @@ describe("product-owned protocol decoders", () => {
 			success: true,
 			data: { commands: [command] },
 		} as const;
-		expect(isSessionCommandResponseDto(response)).toBe(true);
+		expect(isPiSessionCommandResponseDto(response)).toBe(true);
 		expect(
-			isSessionCommandResponseDto({
+			isPiSessionCommandResponseDto({
 				...response,
 				data: {
 					commands: [{ ...command, sourceInfo: { ...command.sourceInfo, unexpected: true } }],
@@ -718,11 +718,11 @@ describe("product-owned protocol decoders", () => {
 	});
 
 	it("fully validates command-specific response data", () => {
-		expect(isSessionCommandResponseDto(response(state).response)).toBe(true);
-		expect(isSessionWsServerMessage(response(state))).toBe(true);
-		expect(isSessionWsServerMessage(response({ sessionId: "only-the-shallow-envelope" }))).toBe(false);
+		expect(isPiSessionCommandResponseDto(response(state).response)).toBe(true);
+		expect(isInlineSessionWsServerMessage(response(state))).toBe(true);
+		expect(isInlineSessionWsServerMessage(response({ sessionId: "only-the-shallow-envelope" }))).toBe(false);
 		expect(
-			isSessionCommandResponseDto({
+			isPiSessionCommandResponseDto({
 				type: "response",
 				command: "get_available_models",
 				success: true,
@@ -733,7 +733,7 @@ describe("product-owned protocol decoders", () => {
 
 	it("accepts the Gateway-enriched export URL but no other export fields", () => {
 		expect(
-			isSessionCommandResponseDto({
+			isPiSessionCommandResponseDto({
 				type: "response",
 				command: "export_html",
 				success: true,
@@ -741,7 +741,7 @@ describe("product-owned protocol decoders", () => {
 			}),
 		).toBe(true);
 		expect(
-			isSessionCommandResponseDto({
+			isPiSessionCommandResponseDto({
 				type: "response",
 				command: "export_html",
 				success: true,
@@ -752,7 +752,7 @@ describe("product-owned protocol decoders", () => {
 
 	it("validates compact and bash results instead of accepting arbitrary JSON", () => {
 		expect(
-			isSessionCommandResponseDto({
+			isPiSessionCommandResponseDto({
 				type: "response",
 				command: "compact",
 				success: true,
@@ -760,7 +760,7 @@ describe("product-owned protocol decoders", () => {
 			}),
 		).toBe(true);
 		expect(
-			isSessionCommandResponseDto({
+			isPiSessionCommandResponseDto({
 				type: "response",
 				command: "compact",
 				success: true,
@@ -768,7 +768,7 @@ describe("product-owned protocol decoders", () => {
 			}),
 		).toBe(false);
 		expect(
-			isSessionCommandResponseDto({
+			isPiSessionCommandResponseDto({
 				type: "response",
 				command: "bash",
 				success: true,
@@ -794,8 +794,8 @@ describe("product-owned protocol decoders", () => {
 				],
 			},
 		});
-		expect(isSessionCommandResponseDto(messagesResponse("x".repeat(9 * 1024 * 1024)))).toBe(true);
-		expect(isSessionCommandResponseDto(messagesResponse("x".repeat(49 * 1024 * 1024)))).toBe(false);
+		expect(isPiSessionCommandResponseDto(messagesResponse("x".repeat(9 * 1024 * 1024)))).toBe(true);
+		expect(isPiSessionCommandResponseDto(messagesResponse("x".repeat(49 * 1024 * 1024)))).toBe(false);
 	});
 
 	it("rejects malformed and unknown nested event discriminants", () => {
@@ -804,22 +804,22 @@ describe("product-owned protocol decoders", () => {
 			usage,
 			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hello" },
 		};
-		expect(isProductSessionEventDto(valid)).toBe(true);
-		expect(isSessionWsServerMessage(event(valid))).toBe(true);
+		expect(isPiProductSessionEventDto(valid)).toBe(true);
+		expect(isInlineSessionWsServerMessage(event(valid))).toBe(true);
 		expect(
-			isSessionWsServerMessage(
+			isInlineSessionWsServerMessage(
 				event({ ...valid, assistantMessageEvent: { type: "future_authoritative_delta", delta: "x" } }),
 			),
 		).toBe(false);
-		expect(isSessionWsServerMessage(event({ ...valid, usage: { ...usage, totalTokens: Number.NaN } }))).toBe(
-			false,
-		);
-		expect(isSessionWsServerMessage(event({ type: "future_authoritative_event" }))).toBe(false);
+		expect(
+			isInlineSessionWsServerMessage(event({ ...valid, usage: { ...usage, totalTokens: Number.NaN } })),
+		).toBe(false);
+		expect(isInlineSessionWsServerMessage(event({ type: "future_authoritative_event" }))).toBe(false);
 	});
 
 	it("validates every Extension UI request variant beyond its envelope", () => {
 		expect(
-			isExtensionUiRequestDto({
+			isPiExtensionUiRequestDto({
 				type: "extension_ui_request",
 				id: "select-1",
 				method: "select",
@@ -828,10 +828,10 @@ describe("product-owned protocol decoders", () => {
 			}),
 		).toBe(true);
 		expect(
-			isExtensionUiRequestDto({ type: "extension_ui_request", id: "confirm-1", method: "confirm" }),
+			isPiExtensionUiRequestDto({ type: "extension_ui_request", id: "confirm-1", method: "confirm" }),
 		).toBe(false);
 		expect(
-			isExtensionUiRequestDto({
+			isPiExtensionUiRequestDto({
 				type: "extension_ui_request",
 				id: "widget-1",
 				method: "setWidget",
@@ -855,9 +855,9 @@ describe("product-owned protocol decoders", () => {
 			cursor.children.push(child);
 			cursor = child;
 		}
-		expect(isSessionTreeDto([root])).toBe(false);
+		expect(isPiSessionTreeDto([root])).toBe(false);
 		expect(
-			isSessionTreeDto([
+			isPiSessionTreeDto([
 				{
 					entry: { ...entry("future"), type: "future_entry" },
 					children: [],

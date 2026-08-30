@@ -5,10 +5,11 @@ import {
 	expectCommandData,
 	expectData,
 	isErrorResponse,
+	isInlineSessionWsServerMessage,
+	isPiSessionCommandResponseDto,
 	isReadOnlyRpcCommand,
-	isSessionCommandResponseDto,
 	isSessionWsClientMessage,
-	isSessionWsServerMessage,
+	type PiSessionCommandResponseDto,
 	RpcError,
 	SESSION_IMAGE_MAX_BASE64_CHARS,
 	SESSION_MODEL_LIST_MAX_ITEMS,
@@ -19,7 +20,6 @@ import {
 	SESSION_TEXT_MAX_BYTES,
 	SESSION_WS_CLIENT_MAX_BYTES,
 	SESSION_WS_SERVER_MAX_BYTES,
-	type SessionCommandResponseDto,
 	type SessionCommandTypeDto,
 	sessionWsClientMessageBytes,
 } from "../src/index.js";
@@ -32,7 +32,7 @@ describe("protocol response helpers", () => {
 			command: "get_state",
 			success: true,
 			data: { sessionId: "session-1" },
-		} as SessionCommandResponseDto;
+		} as PiSessionCommandResponseDto;
 
 		expect(expectData(response)).toEqual({ sessionId: "session-1" });
 		expect(isErrorResponse(response)).toBe(false);
@@ -44,7 +44,7 @@ describe("protocol response helpers", () => {
 			command: "get_messages",
 			success: true,
 			data: { messages: [] },
-		} satisfies SessionCommandResponseDto;
+		} satisfies PiSessionCommandResponseDto;
 
 		expect(expectCommandData(response, "get_messages")).toEqual({ messages: [] });
 		expect(() => expectCommandData(response, "get_state")).toThrow(
@@ -59,7 +59,7 @@ describe("protocol response helpers", () => {
 			command: "get_messages",
 			success: false,
 			error: "not ready",
-		} as SessionCommandResponseDto;
+		} as PiSessionCommandResponseDto;
 
 		expect(isErrorResponse(response)).toBe(true);
 		expect(() => expectData(response)).toThrow(RpcError);
@@ -154,7 +154,7 @@ describe("gateway command response reservations", () => {
 				success: true,
 				...(data === noData ? {} : { data }),
 			});
-			expect(isSessionWsServerMessage(success), command).toBe(true);
+			expect(isInlineSessionWsServerMessage(success), command).toBe(true);
 			expect(new TextEncoder().encode(JSON.stringify(success)).byteLength, command).toBeLessThanOrEqual(
 				commandResponseReservationBytes(command),
 			);
@@ -163,7 +163,7 @@ describe("gateway command response reservations", () => {
 				success: false,
 				error: "\u0000".repeat(64 * 1024),
 			});
-			expect(isSessionWsServerMessage(failure), `${command} failure`).toBe(true);
+			expect(isInlineSessionWsServerMessage(failure), `${command} failure`).toBe(true);
 			expect(
 				new TextEncoder().encode(JSON.stringify(failure)).byteLength,
 				`${command} failure`,
@@ -206,7 +206,7 @@ describe("gateway command response reservations", () => {
 			data: { models: Array.from({ length: SESSION_MODEL_LIST_MAX_ITEMS }, () => maximalModel) },
 		} as const;
 
-		expect(isSessionCommandResponseDto(response)).toBe(true);
+		expect(isPiSessionCommandResponseDto(response)).toBe(true);
 		expect(new TextEncoder().encode(JSON.stringify(response)).byteLength).toBeLessThanOrEqual(
 			SESSION_MODEL_LIST_RESPONSE_GUARD_MAX_BYTES,
 		);
@@ -217,7 +217,7 @@ describe("gateway command response reservations", () => {
 			SESSION_MODEL_LIST_RESPONSE_RESERVATION_BYTES,
 		);
 		expect(
-			isSessionCommandResponseDto({
+			isPiSessionCommandResponseDto({
 				...response,
 				data: { models: [...response.data.models, maximalModel] },
 			}),
@@ -243,12 +243,12 @@ describe("gateway command response reservations", () => {
 				commands: Array.from({ length: 97 }, () => command),
 			},
 		});
-		expect(isSessionWsServerMessage(frame)).toBe(true);
+		expect(isInlineSessionWsServerMessage(frame)).toBe(true);
 		expect(new TextEncoder().encode(JSON.stringify(frame)).byteLength).toBeLessThanOrEqual(
 			commandResponseReservationBytes("get_commands"),
 		);
 		expect(
-			isSessionCommandResponseDto({
+			isPiSessionCommandResponseDto({
 				type: "response",
 				command: "get_commands",
 				success: true,
@@ -275,7 +275,7 @@ describe("gateway command response reservations", () => {
 		expect(new TextEncoder().encode(JSON.stringify(overSerializedBudget)).byteLength).toBeGreaterThan(
 			8 * SESSION_TEXT_MAX_BYTES - 16 * 1024,
 		);
-		expect(isSessionCommandResponseDto(overSerializedBudget)).toBe(false);
+		expect(isPiSessionCommandResponseDto(overSerializedBudget)).toBe(false);
 	});
 });
 
@@ -481,9 +481,9 @@ describe("Session runtime browser frame guard", () => {
 			lastActivityAt: 123,
 			recoverable: true,
 		};
-		expect(isSessionWsServerMessage({ type: "runtime_state", runtime })).toBe(true);
+		expect(isInlineSessionWsServerMessage({ type: "runtime_state", runtime })).toBe(true);
 		expect(
-			isSessionWsServerMessage({
+			isInlineSessionWsServerMessage({
 				type: "extension_ui_snapshot",
 				serverEpoch: runtime.serverEpoch,
 				sessionHandle: runtime.sessionHandle,
@@ -500,7 +500,7 @@ describe("Session runtime browser frame guard", () => {
 			}),
 		).toBe(true);
 		expect(
-			isSessionWsServerMessage({
+			isInlineSessionWsServerMessage({
 				type: "extension_ui_result",
 				serverEpoch: runtime.serverEpoch,
 				sessionHandle: runtime.sessionHandle,
@@ -509,11 +509,11 @@ describe("Session runtime browser frame guard", () => {
 				outcome: "accepted",
 			}),
 		).toBe(true);
-		expect(isSessionWsServerMessage({ type: "runtime_state", runtime: { ...runtime, lastSeq: -1 } })).toBe(
-			false,
-		);
 		expect(
-			isSessionWsServerMessage({
+			isInlineSessionWsServerMessage({ type: "runtime_state", runtime: { ...runtime, lastSeq: -1 } }),
+		).toBe(false);
+		expect(
+			isInlineSessionWsServerMessage({
 				type: "event",
 				serverEpoch: runtime.serverEpoch,
 				sessionHandle: runtime.sessionHandle,

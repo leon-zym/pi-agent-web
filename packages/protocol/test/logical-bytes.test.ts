@@ -1,38 +1,38 @@
 import { describe, expect, it } from "vitest";
 import type {
-	FutureExtensionUiRequestDto,
-	FutureProductSessionEventDto,
-	FutureSessionCommandResponseDto,
-	FutureSessionEntryDto,
-	FutureSessionProjectionEventDto,
-	FutureSessionResponseFrameDto,
-	FutureSessionSnapshotDto,
-	FutureSessionTreeNodeDto,
-	FutureSessionWsServerMessage,
-	FutureToolResultMessageDto,
+	ExtensionUiRequestDto,
+	ProductSessionEventDto,
+	SessionCommandResponseDto,
 	SessionContentRefDto,
+	SessionEntryDto,
 	SessionExternalTextDto,
 	SessionJsonValueDto,
+	SessionProjectionEventDto,
+	SessionResponseFrameDto,
 	SessionRuntimeDto,
+	SessionSnapshotDto,
+	SessionTreeNodeDto,
+	SessionWsServerMessage,
+	ToolResultMessageDto,
 } from "../src/index.js";
 import {
-	analyzeFutureExtensionUiRequestLogicalBytes,
-	analyzeFutureProductSessionEventLogicalBytes,
-	analyzeFutureSessionCommandResponseLogicalBytes,
-	analyzeFutureSessionEntryLogicalBytes,
-	analyzeFutureSessionMessageLogicalBytes,
-	analyzeFutureSessionProjectionEventLogicalBytes,
-	analyzeFutureSessionReplayFrameLogicalBytes,
-	analyzeFutureSessionResponseFrameLogicalBytes,
-	analyzeFutureSessionSnapshotLogicalBytes,
-	analyzeFutureSessionTreeLogicalBytes,
-	analyzeFutureSessionWsServerMessageLogicalBytes,
-	FutureSessionLogicalBytesError,
+	analyzeExtensionUiRequestLogicalBytes,
+	analyzeProductSessionEventLogicalBytes,
+	analyzeSessionCommandResponseLogicalBytes,
+	analyzeSessionEntryLogicalBytes,
+	analyzeSessionMessageLogicalBytes,
+	analyzeSessionProjectionEventLogicalBytes,
+	analyzeSessionReplayFrameLogicalBytes,
+	analyzeSessionResponseFrameLogicalBytes,
+	analyzeSessionSnapshotLogicalBytes,
+	analyzeSessionTreeLogicalBytes,
+	analyzeSessionWsServerMessageLogicalBytes,
 	SESSION_CONTENT_BLOB_MAX_BYTES,
 	SESSION_NORMALIZED_EVENT_MAX_BYTES,
 	SESSION_PAYLOAD_BUDGET,
 	SESSION_PI_JSONL_MAX_BYTES,
 	SESSION_PI_SNAPSHOT_JSONL_MAX_BYTES,
+	SessionLogicalBytesError,
 } from "../src/index.js";
 
 const serverEpoch = "logical-byte-epoch";
@@ -52,7 +52,7 @@ function externalText(byteLength: number, sha = "a"): SessionExternalTextDto {
 	return { type: "external_text", ref: contentRef(byteLength, sha) };
 }
 
-function toolResult(text: string | SessionExternalTextDto): FutureToolResultMessageDto {
+function toolResult(text: string | SessionExternalTextDto): ToolResultMessageDto {
 	return {
 		role: "toolResult",
 		toolCallId: "tool-1",
@@ -63,7 +63,7 @@ function toolResult(text: string | SessionExternalTextDto): FutureToolResultMess
 	};
 }
 
-function entry(message = toolResult("ok")): FutureSessionEntryDto {
+function entry(message = toolResult("ok")): SessionEntryDto {
 	return {
 		type: "message",
 		id: "entry-1",
@@ -89,7 +89,7 @@ function runtime(lastSeq: number): SessionRuntimeDto {
 	};
 }
 
-function snapshot(firstBytes: number, secondBytes: number): FutureSessionSnapshotDto {
+function snapshot(firstBytes: number, secondBytes: number): SessionSnapshotDto {
 	return {
 		type: "session_snapshot",
 		snapshotId: "snapshot-a",
@@ -118,9 +118,7 @@ describe("future logical payload byte analysis", () => {
 		const bytes = utf8Bytes(text);
 		const inline = toolResult(text);
 		const external = toolResult(externalText(bytes));
-		expect(analyzeFutureSessionMessageLogicalBytes(inline)).toEqual(
-			analyzeFutureSessionMessageLogicalBytes(external),
-		);
+		expect(analyzeSessionMessageLogicalBytes(inline)).toEqual(analyzeSessionMessageLogicalBytes(external));
 	});
 
 	it("charges identical inner JSON bytes and ignores wrapper transmission shape", () => {
@@ -129,14 +127,12 @@ describe("future logical payload byte analysis", () => {
 		const inline = {
 			...toolResult("ok"),
 			details: { type: "inline_json", value: inner },
-		} satisfies FutureToolResultMessageDto;
+		} satisfies ToolResultMessageDto;
 		const external = {
 			...toolResult("ok"),
 			details: { type: "external_json", ref: contentRef(innerBytes) },
-		} satisfies FutureToolResultMessageDto;
-		expect(analyzeFutureSessionMessageLogicalBytes(inline)).toEqual(
-			analyzeFutureSessionMessageLogicalBytes(external),
-		);
+		} satisfies ToolResultMessageDto;
+		expect(analyzeSessionMessageLogicalBytes(inline)).toEqual(analyzeSessionMessageLogicalBytes(external));
 	});
 
 	it("counts metadata canonically and every repeated logical root occurrence", () => {
@@ -144,10 +140,10 @@ describe("future logical payload byte analysis", () => {
 		const two = {
 			...one,
 			content: [...one.content, { type: "text", text: externalText(MIB) }],
-		} satisfies FutureToolResultMessageDto;
-		const emptyRoot = analyzeFutureSessionMessageLogicalBytes(toolResult("")).byteLength;
-		const oneRoot = analyzeFutureSessionMessageLogicalBytes(one).byteLength;
-		const twoRoots = analyzeFutureSessionMessageLogicalBytes(two).byteLength;
+		} satisfies ToolResultMessageDto;
+		const emptyRoot = analyzeSessionMessageLogicalBytes(toolResult("")).byteLength;
+		const oneRoot = analyzeSessionMessageLogicalBytes(one).byteLength;
+		const twoRoots = analyzeSessionMessageLogicalBytes(two).byteLength;
 		expect(oneRoot - emptyRoot).toBe(MIB);
 		expect(twoRoots - oneRoot).toBeGreaterThan(MIB);
 		expect(twoRoots - oneRoot).toBeLessThan(MIB + 64);
@@ -162,26 +158,26 @@ describe("future logical payload byte analysis", () => {
 			method: "editor",
 			title: "Edit",
 			prefill: text,
-		} satisfies FutureExtensionUiRequestDto;
+		} satisfies ExtensionUiRequestDto;
 		const externalEditor = {
 			...inlineEditor,
 			prefill: externalText(textBytes),
-		} satisfies FutureExtensionUiRequestDto;
-		expect(analyzeFutureExtensionUiRequestLogicalBytes(inlineEditor)).toEqual(
-			analyzeFutureExtensionUiRequestLogicalBytes(externalEditor),
+		} satisfies ExtensionUiRequestDto;
+		expect(analyzeExtensionUiRequestLogicalBytes(inlineEditor)).toEqual(
+			analyzeExtensionUiRequestLogicalBytes(externalEditor),
 		);
 		const inlineSetEditorText = {
 			type: "extension_ui_request",
 			id: "set-editor-a",
 			method: "set_editor_text",
 			text,
-		} satisfies FutureExtensionUiRequestDto;
+		} satisfies ExtensionUiRequestDto;
 		const externalSetEditorText = {
 			...inlineSetEditorText,
 			text: externalText(textBytes),
-		} satisfies FutureExtensionUiRequestDto;
-		expect(analyzeFutureExtensionUiRequestLogicalBytes(inlineSetEditorText)).toEqual(
-			analyzeFutureExtensionUiRequestLogicalBytes(externalSetEditorText),
+		} satisfies ExtensionUiRequestDto;
+		expect(analyzeExtensionUiRequestLogicalBytes(inlineSetEditorText)).toEqual(
+			analyzeExtensionUiRequestLogicalBytes(externalSetEditorText),
 		);
 
 		const lines = ["one", "界"];
@@ -192,20 +188,20 @@ describe("future logical payload byte analysis", () => {
 			method: "setWidget",
 			widgetKey: "tests",
 			widgetLines: { type: "inline_json", value: lines },
-		} satisfies FutureExtensionUiRequestDto;
+		} satisfies ExtensionUiRequestDto;
 		const externalWidget = {
 			...inlineWidget,
 			widgetLines: { type: "external_json", ref: contentRef(widgetBytes) },
-		} satisfies FutureExtensionUiRequestDto;
-		expect(analyzeFutureExtensionUiRequestLogicalBytes(inlineWidget)).toEqual(
-			analyzeFutureExtensionUiRequestLogicalBytes(externalWidget),
+		} satisfies ExtensionUiRequestDto;
+		expect(analyzeExtensionUiRequestLogicalBytes(inlineWidget)).toEqual(
+			analyzeExtensionUiRequestLogicalBytes(externalWidget),
 		);
 
-		const oneOccurrence = analyzeFutureSessionSnapshotLogicalBytes({
+		const oneOccurrence = analyzeSessionSnapshotLogicalBytes({
 			...snapshot(MIB, MIB),
 			pendingExtensionRequests: [externalEditor],
 		}).byteLength;
-		const twoOccurrences = analyzeFutureSessionSnapshotLogicalBytes({
+		const twoOccurrences = analyzeSessionSnapshotLogicalBytes({
 			...snapshot(MIB, MIB),
 			pendingExtensionRequests: [externalEditor, { ...externalEditor, id: "editor-b" }],
 		}).byteLength;
@@ -226,29 +222,29 @@ describe("future logical payload byte analysis", () => {
 		const message = {
 			...toolResult("ok"),
 			details: { type: "inline_json", value: inner },
-		} satisfies FutureToolResultMessageDto;
-		const withoutDetails = analyzeFutureSessionMessageLogicalBytes(toolResult("ok")).byteLength;
-		const withDetails = analyzeFutureSessionMessageLogicalBytes(message).byteLength;
+		} satisfies ToolResultMessageDto;
+		const withoutDetails = analyzeSessionMessageLogicalBytes(toolResult("ok")).byteLength;
+		const withDetails = analyzeSessionMessageLogicalBytes(message).byteLength;
 		expect(withDetails - withoutDetails).toBeLessThan(1024);
 		expect(withDetails - withoutDetails).toBeGreaterThan(0);
 	});
 
 	it("returns an exact safe positive result and stops at limit - 1 / = / + 1", () => {
 		const message = toolResult("payload");
-		const exact = analyzeFutureSessionMessageLogicalBytes(message).byteLength;
+		const exact = analyzeSessionMessageLogicalBytes(message).byteLength;
 		expect(Number.isSafeInteger(exact)).toBe(true);
 		expect(exact).toBeGreaterThan(0);
-		expect(analyzeFutureSessionMessageLogicalBytes(message, { maxBytes: exact })).toEqual({
+		expect(analyzeSessionMessageLogicalBytes(message, { maxBytes: exact })).toEqual({
 			byteLength: exact,
 		});
-		expect(() => analyzeFutureSessionMessageLogicalBytes(message, { maxBytes: exact - 1 })).toThrowError(
+		expect(() => analyzeSessionMessageLogicalBytes(message, { maxBytes: exact - 1 })).toThrowError(
 			expect.objectContaining({
 				code: "limit_exceeded",
 				limit: exact - 1,
 				actual: exact,
 			}),
 		);
-		expect(analyzeFutureSessionMessageLogicalBytes(message, { maxBytes: exact + 1 })).toEqual({
+		expect(analyzeSessionMessageLogicalBytes(message, { maxBytes: exact + 1 })).toEqual({
 			byteLength: exact,
 		});
 	});
@@ -264,9 +260,9 @@ describe("future logical payload byte analysis", () => {
 			},
 			isError: false,
 			timestamp: 1,
-		} satisfies FutureToolResultMessageDto;
-		expect(() => analyzeFutureSessionMessageLogicalBytes(message, { maxBytes: 128 })).toThrow(
-			FutureSessionLogicalBytesError,
+		} satisfies ToolResultMessageDto;
+		expect(() => analyzeSessionMessageLogicalBytes(message, { maxBytes: 128 })).toThrow(
+			SessionLogicalBytesError,
 		);
 	});
 
@@ -274,12 +270,12 @@ describe("future logical payload byte analysis", () => {
 		const event = {
 			type: "message_end",
 			message: toolResult(externalText(SESSION_PI_JSONL_MAX_BYTES)),
-		} satisfies FutureProductSessionEventDto;
+		} satisfies ProductSessionEventDto;
 		expect(() =>
-			analyzeFutureProductSessionEventLogicalBytes(event, { maxBytes: SESSION_PI_JSONL_MAX_BYTES }),
-		).toThrow(FutureSessionLogicalBytesError);
+			analyzeProductSessionEventLogicalBytes(event, { maxBytes: SESSION_PI_JSONL_MAX_BYTES }),
+		).toThrow(SessionLogicalBytesError);
 		expect(
-			analyzeFutureProductSessionEventLogicalBytes(event, { maxBytes: SESSION_NORMALIZED_EVENT_MAX_BYTES })
+			analyzeProductSessionEventLogicalBytes(event, { maxBytes: SESSION_NORMALIZED_EVENT_MAX_BYTES })
 				.byteLength,
 		).toBeGreaterThan(SESSION_PI_JSONL_MAX_BYTES);
 
@@ -288,31 +284,31 @@ describe("future logical payload byte analysis", () => {
 			command: "get_messages",
 			success: true,
 			data: { messages: [toolResult(externalText(SESSION_CONTENT_BLOB_MAX_BYTES))] },
-		} satisfies FutureSessionCommandResponseDto;
+		} satisfies SessionCommandResponseDto;
 		expect(
-			analyzeFutureSessionCommandResponseLogicalBytes(history, {
+			analyzeSessionCommandResponseLogicalBytes(history, {
 				maxBytes: SESSION_PI_SNAPSHOT_JSONL_MAX_BYTES,
 			}).byteLength,
 		).toBeGreaterThan(SESSION_CONTENT_BLOB_MAX_BYTES);
 
-		const baseline = analyzeFutureSessionSnapshotLogicalBytes(snapshot(MIB, MIB)).byteLength - 2 * MIB;
+		const baseline = analyzeSessionSnapshotLogicalBytes(snapshot(MIB, MIB)).byteLength - 2 * MIB;
 		const remaining = SESSION_PI_SNAPSHOT_JSONL_MAX_BYTES - baseline;
 		const exact = snapshot(Math.floor(remaining / 2), Math.ceil(remaining / 2));
 		expect(
-			analyzeFutureSessionSnapshotLogicalBytes(exact, { maxBytes: SESSION_PI_SNAPSHOT_JSONL_MAX_BYTES }),
+			analyzeSessionSnapshotLogicalBytes(exact, { maxBytes: SESSION_PI_SNAPSHOT_JSONL_MAX_BYTES }),
 		).toEqual({ byteLength: SESSION_PI_SNAPSHOT_JSONL_MAX_BYTES });
 		expect(() =>
-			analyzeFutureSessionSnapshotLogicalBytes(snapshot(32 * MIB, 32 * MIB), {
+			analyzeSessionSnapshotLogicalBytes(snapshot(32 * MIB, 32 * MIB), {
 				maxBytes: SESSION_PI_SNAPSHOT_JSONL_MAX_BYTES,
 			}),
-		).toThrow(FutureSessionLogicalBytesError);
+		).toThrow(SessionLogicalBytesError);
 	});
 
 	it("exposes every verified future frame entry point with the same accounting core", () => {
 		const message = toolResult(externalText(MIB));
 		const historyEntry = entry(message);
-		const tree = [{ entry: historyEntry, children: [] }] satisfies FutureSessionTreeNodeDto[];
-		const event = { type: "message_end", message } satisfies FutureProductSessionEventDto;
+		const tree = [{ entry: historyEntry, children: [] }] satisfies SessionTreeNodeDto[];
+		const event = { type: "message_end", message } satisfies ProductSessionEventDto;
 		const projection = {
 			type: "event",
 			serverEpoch,
@@ -321,11 +317,9 @@ describe("future logical payload byte analysis", () => {
 			generation: 1,
 			seq: 1,
 			event,
-		} satisfies FutureSessionProjectionEventDto;
-		const ws = { type: "runtime_state", runtime: runtime(1) } satisfies FutureSessionWsServerMessage;
-		expect(analyzeFutureSessionWsServerMessageLogicalBytes(ws).byteLength).toBe(
-			utf8Bytes(JSON.stringify(ws)),
-		);
+		} satisfies SessionProjectionEventDto;
+		const ws = { type: "runtime_state", runtime: runtime(1) } satisfies SessionWsServerMessage;
+		expect(analyzeSessionWsServerMessageLogicalBytes(ws).byteLength).toBe(utf8Bytes(JSON.stringify(ws)));
 		const responseFrame = {
 			type: "response",
 			serverEpoch,
@@ -338,20 +332,20 @@ describe("future logical payload byte analysis", () => {
 				success: true,
 				data: { messages: [message] },
 			},
-		} satisfies FutureSessionResponseFrameDto;
+		} satisfies SessionResponseFrameDto;
 		for (const result of [
-			analyzeFutureSessionEntryLogicalBytes(historyEntry),
-			analyzeFutureSessionTreeLogicalBytes(tree),
-			analyzeFutureSessionProjectionEventLogicalBytes(projection),
-			analyzeFutureSessionReplayFrameLogicalBytes(projection),
-			analyzeFutureSessionResponseFrameLogicalBytes(responseFrame),
-			analyzeFutureSessionWsServerMessageLogicalBytes(ws),
+			analyzeSessionEntryLogicalBytes(historyEntry),
+			analyzeSessionTreeLogicalBytes(tree),
+			analyzeSessionProjectionEventLogicalBytes(projection),
+			analyzeSessionReplayFrameLogicalBytes(projection),
+			analyzeSessionResponseFrameLogicalBytes(responseFrame),
+			analyzeSessionWsServerMessageLogicalBytes(ws),
 		]) {
 			expect(result.byteLength).toBeGreaterThan(0);
 		}
 	});
 
-	it("does not mutate the current 1.2 budget or guard surfaces", () => {
+	it("keeps Pi JSONL and Browser content budgets independent", () => {
 		expect(SESSION_PAYLOAD_BUDGET.maxPiJsonlFrameBytes).toBe(8 * MIB);
 		expect("maxContentBlobBytes" in SESSION_PAYLOAD_BUDGET).toBe(false);
 	});

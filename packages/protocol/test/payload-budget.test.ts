@@ -2,13 +2,13 @@ import { describe, expect, it } from "vitest";
 import {
 	attachmentRefMatchesServerEpoch,
 	expectCommandData,
-	isProductSessionEventDto,
+	isInlineSessionWsServerMessage,
+	isPiProductSessionEventDto,
+	isPiSessionCommandResponseDto,
 	isSessionAttachmentRefDto,
 	isSessionAttachmentRefForNegotiatedBudget,
-	isSessionCommandResponseDto,
 	isSessionPayloadAdmissionErrorDto,
 	isSessionPayloadBudgetDto,
-	isSessionWsServerMessage,
 	SESSION_ATTACHMENT_BLOB_MAX_BYTES,
 	SESSION_EVENT_ENVELOPE_HEADROOM_BYTES,
 	SESSION_PAYLOAD_BUDGET,
@@ -71,8 +71,8 @@ describe("Session payload budget", () => {
 		const rawBytes = Buffer.byteLength(JSON.stringify(event));
 		const replayBytes = Buffer.byteLength(JSON.stringify(replayFrame));
 
-		expect(isProductSessionEventDto(event)).toBe(true);
-		expect(isSessionWsServerMessage(replayFrame)).toBe(true);
+		expect(isPiProductSessionEventDto(event)).toBe(true);
+		expect(isInlineSessionWsServerMessage(replayFrame)).toBe(true);
 		expect(rawBytes).toBe(SESSION_PAYLOAD_BUDGET.maxPiJsonlFrameBytes);
 		expect(replayBytes - rawBytes).toBeLessThanOrEqual(SESSION_EVENT_ENVELOPE_HEADROOM_BYTES);
 		expect(replayBytes).toBeLessThanOrEqual(SESSION_PAYLOAD_BUDGET.maxNormalizedEventFrameBytes);
@@ -289,7 +289,7 @@ describe("structured payload admission errors", () => {
 	it("validates stable localization fields and carries them on failed command responses", () => {
 		expect(isSessionPayloadAdmissionErrorDto(admissionError)).toBe(true);
 		expect(
-			isSessionCommandResponseDto({
+			isPiSessionCommandResponseDto({
 				type: "response",
 				id: "prompt-1",
 				command: "prompt",
@@ -349,7 +349,7 @@ describe("structured payload admission errors", () => {
 
 		expect(isSessionPayloadAdmissionErrorDto(itemLimitError)).toBe(true);
 		expect(
-			isSessionCommandResponseDto({
+			isPiSessionCommandResponseDto({
 				type: "response",
 				id: "prompt-1",
 				command: "prompt",

@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
-	isProductSessionEventDto,
-	isSessionMessageDto,
-	isSessionSnapshotDto,
+	type InlineSessionSnapshotDto,
+	isInlineSessionSnapshotDto,
+	isInlineSessionWsServerMessage,
+	isPiProductSessionEventDto,
+	isPiSessionMessageDto,
 	isSessionWsClientMessage,
-	isSessionWsServerMessage,
 	SESSION_PAYLOAD_BUDGET,
 	type SessionRuntimeDto,
-	type SessionSnapshotDto,
 	sessionWsServerMessageBytes,
 } from "../src/index.js";
 
@@ -42,7 +42,7 @@ function projectionEvent(seq: number, epoch = serverEpoch) {
 	};
 }
 
-function snapshot(overrides: Partial<SessionSnapshotDto> = {}): SessionSnapshotDto {
+function snapshot(overrides: Partial<InlineSessionSnapshotDto> = {}): InlineSessionSnapshotDto {
 	return {
 		type: "session_snapshot",
 		snapshotId: "snapshot-a",
@@ -135,14 +135,15 @@ describe("epoch-aware Session resync protocol", () => {
 				reason: "epoch_changed",
 			},
 		];
-		for (const frame of frames) expect(isSessionWsServerMessage(frame), JSON.stringify(frame)).toBe(true);
+		for (const frame of frames)
+			expect(isInlineSessionWsServerMessage(frame), JSON.stringify(frame)).toBe(true);
 
 		for (const frame of frames.slice(1)) {
 			const { serverEpoch: _omitted, ...legacy } = frame as Record<string, unknown>;
-			expect(isSessionWsServerMessage(legacy), JSON.stringify(legacy)).toBe(false);
+			expect(isInlineSessionWsServerMessage(legacy), JSON.stringify(legacy)).toBe(false);
 		}
 		expect(
-			isSessionWsServerMessage({
+			isInlineSessionWsServerMessage({
 				type: "session_rekeyed",
 				serverEpoch: "wrong-epoch",
 				previousSessionHandle: "pending-a",
@@ -150,7 +151,7 @@ describe("epoch-aware Session resync protocol", () => {
 			}),
 		).toBe(false);
 		expect(
-			isSessionWsServerMessage({
+			isInlineSessionWsServerMessage({
 				type: "resync_required",
 				serverEpoch: "wrong-epoch",
 				sessionHandle: "session-a",
@@ -167,15 +168,15 @@ describe("epoch-aware Session resync protocol", () => {
 			operationCount: 1,
 			busyReasons: ["command"],
 		};
-		expect(isSessionWsServerMessage({ type: "runtime_state", runtime: operational })).toBe(true);
+		expect(isInlineSessionWsServerMessage({ type: "runtime_state", runtime: operational })).toBe(true);
 		expect(
-			isSessionWsServerMessage({
+			isInlineSessionWsServerMessage({
 				type: "runtime_state",
 				runtime: { ...operational, operationCount: -1 },
 			}),
 		).toBe(false);
 		expect(
-			isSessionWsServerMessage({
+			isInlineSessionWsServerMessage({
 				type: "runtime_state",
 				runtime: { ...operational, busyReasons: ["command", "command"] },
 			}),
@@ -200,7 +201,7 @@ describe("epoch-aware Session resync protocol", () => {
 
 		for (const runtimeValue of invalid) {
 			expect(
-				isSessionWsServerMessage({ type: "runtime_state", runtime: runtimeValue }),
+				isInlineSessionWsServerMessage({ type: "runtime_state", runtime: runtimeValue }),
 				JSON.stringify(runtimeValue),
 			).toBe(false);
 		}
@@ -216,22 +217,22 @@ describe("epoch-aware Session resync protocol", () => {
 			code: "session_snapshot_unavailable",
 			retryable: true,
 		};
-		expect(isSessionWsServerMessage(error)).toBe(true);
-		expect(isSessionWsServerMessage({ ...error, code: undefined })).toBe(false);
-		expect(isSessionWsServerMessage({ ...error, retryable: "yes" })).toBe(false);
-		expect(isSessionWsServerMessage({ ...error, code: "" })).toBe(false);
+		expect(isInlineSessionWsServerMessage(error)).toBe(true);
+		expect(isInlineSessionWsServerMessage({ ...error, code: undefined })).toBe(false);
+		expect(isInlineSessionWsServerMessage({ ...error, retryable: "yes" })).toBe(false);
+		expect(isInlineSessionWsServerMessage({ ...error, code: "" })).toBe(false);
 	});
 
 	it("strictly rejects unknown runtime and envelope fields", () => {
 		expect(
-			isSessionWsServerMessage({
+			isInlineSessionWsServerMessage({
 				type: "runtime_state",
 				runtime: runtime({ unexpected: true } as Partial<SessionRuntimeDto>),
 			}),
 		).toBe(false);
-		expect(isSessionWsServerMessage({ ...projectionEvent(5), unexpected: true })).toBe(false);
+		expect(isInlineSessionWsServerMessage({ ...projectionEvent(5), unexpected: true })).toBe(false);
 		expect(
-			isSessionWsServerMessage({
+			isInlineSessionWsServerMessage({
 				type: "response",
 				serverEpoch,
 				sessionHandle: "session-a",
@@ -245,13 +246,13 @@ describe("epoch-aware Session resync protocol", () => {
 
 	it("accepts one bounded atomic snapshot without authority or ephemeral notify state", () => {
 		const valid = snapshot();
-		expect(isSessionSnapshotDto(valid)).toBe(true);
-		expect(isSessionWsServerMessage(valid)).toBe(true);
+		expect(isInlineSessionSnapshotDto(valid)).toBe(true);
+		expect(isInlineSessionWsServerMessage(valid)).toBe(true);
 
-		expect(isSessionSnapshotDto({ ...valid, fencingToken: "must-not-cross" })).toBe(false);
-		expect(isSessionSnapshotDto({ ...valid, lease: { isController: true } })).toBe(false);
+		expect(isInlineSessionSnapshotDto({ ...valid, fencingToken: "must-not-cross" })).toBe(false);
+		expect(isInlineSessionSnapshotDto({ ...valid, lease: { isController: true } })).toBe(false);
 		expect(
-			isSessionSnapshotDto({
+			isInlineSessionSnapshotDto({
 				...valid,
 				stickyExtensionState: [
 					{
@@ -298,32 +299,34 @@ describe("epoch-aware Session resync protocol", () => {
 		});
 		const context = { serverEpoch, payloadBudget: SESSION_PAYLOAD_BUDGET };
 
-		expect(isSessionMessageDto(value.settledMessages[0], context)).toBe(true);
-		expect(isProductSessionEventDto(value.projectionEvents[0]?.event, context)).toBe(true);
-		expect(isSessionSnapshotDto(value)).toBe(false);
-		expect(isSessionSnapshotDto(value, context)).toBe(true);
-		expect(isSessionWsServerMessage(value, context)).toBe(true);
-		expect(isSessionSnapshotDto(value, { ...context, serverEpoch: "gateway-epoch-b" })).toBe(false);
+		expect(isPiSessionMessageDto(value.settledMessages[0], context)).toBe(true);
+		expect(isPiProductSessionEventDto(value.projectionEvents[0]?.event, context)).toBe(true);
+		expect(isInlineSessionSnapshotDto(value)).toBe(false);
+		expect(isInlineSessionSnapshotDto(value, context)).toBe(true);
+		expect(isInlineSessionWsServerMessage(value, context)).toBe(true);
+		expect(isInlineSessionSnapshotDto(value, { ...context, serverEpoch: "gateway-epoch-b" })).toBe(false);
 	});
 
 	it("rejects mixed incarnations and invalid snapshot waterlines", () => {
-		expect(isSessionSnapshotDto(snapshot({ baseSeq: 5 }))).toBe(false);
-		expect(isSessionSnapshotDto(snapshot({ asOfSeq: 3 }))).toBe(false);
-		expect(isSessionSnapshotDto(snapshot({ runtime: runtime({ lastSeq: 3 }) }))).toBe(false);
-		expect(isSessionSnapshotDto(snapshot({ runtime: runtime({ serverEpoch: "wrong-epoch" }) }))).toBe(false);
-		expect(isSessionSnapshotDto(snapshot({ projectionEvents: [projectionEvent(2, "wrong-epoch")] }))).toBe(
+		expect(isInlineSessionSnapshotDto(snapshot({ baseSeq: 5 }))).toBe(false);
+		expect(isInlineSessionSnapshotDto(snapshot({ asOfSeq: 3 }))).toBe(false);
+		expect(isInlineSessionSnapshotDto(snapshot({ runtime: runtime({ lastSeq: 3 }) }))).toBe(false);
+		expect(isInlineSessionSnapshotDto(snapshot({ runtime: runtime({ serverEpoch: "wrong-epoch" }) }))).toBe(
 			false,
 		);
 		expect(
-			isSessionSnapshotDto(snapshot({ projectionEvents: [projectionEvent(2), projectionEvent(2)] })),
+			isInlineSessionSnapshotDto(snapshot({ projectionEvents: [projectionEvent(2, "wrong-epoch")] })),
 		).toBe(false);
-		expect(isSessionSnapshotDto(snapshot({ projectionEvents: [projectionEvent(1)] }))).toBe(false);
-		expect(isSessionSnapshotDto(snapshot({ projectionEvents: [projectionEvent(5)] }))).toBe(false);
+		expect(
+			isInlineSessionSnapshotDto(snapshot({ projectionEvents: [projectionEvent(2), projectionEvent(2)] })),
+		).toBe(false);
+		expect(isInlineSessionSnapshotDto(snapshot({ projectionEvents: [projectionEvent(1)] }))).toBe(false);
+		expect(isInlineSessionSnapshotDto(snapshot({ projectionEvents: [projectionEvent(5)] }))).toBe(false);
 	});
 
 	it("enforces snapshot item, nesting, and text byte ceilings", () => {
 		expect(
-			isSessionSnapshotDto(
+			isInlineSessionSnapshotDto(
 				snapshot({
 					pendingExtensionRequests: Array.from({ length: 257 }, (_, index) => ({
 						type: "extension_ui_request" as const,
@@ -339,7 +342,7 @@ describe("epoch-aware Session resync protocol", () => {
 		let nested: Record<string, unknown> = {};
 		for (let depth = 0; depth < 40; depth += 1) nested = { child: nested };
 		expect(
-			isSessionSnapshotDto(
+			isInlineSessionSnapshotDto(
 				snapshot({
 					projectionEvents: [
 						{
@@ -357,7 +360,7 @@ describe("epoch-aware Session resync protocol", () => {
 		).toBe(false);
 
 		expect(
-			isSessionSnapshotDto(
+			isInlineSessionSnapshotDto(
 				snapshot({
 					settledMessages: [
 						{
@@ -376,12 +379,12 @@ describe("epoch-aware Session resync protocol", () => {
 		const inheritedRoot = Object.create(valid) as unknown;
 		const inheritedQueue = Object.create({ steering: [], followUp: [] }) as unknown;
 
-		expect(isSessionSnapshotDto(inheritedRoot)).toBe(false);
-		expect(isSessionSnapshotDto({ ...valid, queue: inheritedQueue })).toBe(false);
+		expect(isInlineSessionSnapshotDto(inheritedRoot)).toBe(false);
+		expect(isInlineSessionSnapshotDto({ ...valid, queue: inheritedQueue })).toBe(false);
 	});
 
 	it("rejects serialization hooks, accessors, symbols, and non-enumerable properties", () => {
-		const withToJson = snapshot() as SessionSnapshotDto & { toJSON?: () => unknown };
+		const withToJson = snapshot() as InlineSessionSnapshotDto & { toJSON?: () => unknown };
 		Object.defineProperty(withToJson, "toJSON", {
 			value: () => ({}),
 			enumerable: false,
@@ -393,7 +396,7 @@ describe("epoch-aware Session resync protocol", () => {
 			enumerable: true,
 		});
 
-		const withSymbol = snapshot() as SessionSnapshotDto & Record<PropertyKey, unknown>;
+		const withSymbol = snapshot() as InlineSessionSnapshotDto & Record<PropertyKey, unknown>;
 		withSymbol[Symbol("hidden")] = "not-on-the-wire";
 
 		const withHiddenProperty = snapshot();
@@ -402,10 +405,10 @@ describe("epoch-aware Session resync protocol", () => {
 			enumerable: false,
 		});
 
-		expect(isSessionSnapshotDto(withToJson)).toBe(false);
-		expect(isSessionSnapshotDto(withAccessor)).toBe(false);
-		expect(isSessionSnapshotDto(withSymbol)).toBe(false);
-		expect(isSessionSnapshotDto(withHiddenProperty)).toBe(false);
+		expect(isInlineSessionSnapshotDto(withToJson)).toBe(false);
+		expect(isInlineSessionSnapshotDto(withAccessor)).toBe(false);
+		expect(isInlineSessionSnapshotDto(withSymbol)).toBe(false);
+		expect(isInlineSessionSnapshotDto(withHiddenProperty)).toBe(false);
 	});
 
 	it("rejects exotic containers that are not deeply immutable JSON values", () => {
@@ -427,9 +430,9 @@ describe("epoch-aware Session resync protocol", () => {
 							args,
 						},
 					},
-				] as SessionSnapshotDto["projectionEvents"],
+				] as InlineSessionSnapshotDto["projectionEvents"],
 			});
-			expect(isSessionSnapshotDto(candidate), Object.prototype.toString.call(args)).toBe(false);
+			expect(isInlineSessionSnapshotDto(candidate), Object.prototype.toString.call(args)).toBe(false);
 		}
 	});
 
@@ -438,7 +441,7 @@ describe("epoch-aware Session resync protocol", () => {
 			queue: { steering: ["汉字"], followUp: ["🙂"] },
 		});
 		const expectedBytes = new TextEncoder().encode(JSON.stringify(candidate)).byteLength;
-		expect(isSessionSnapshotDto(candidate)).toBe(true);
+		expect(isInlineSessionSnapshotDto(candidate)).toBe(true);
 		expect(sessionWsServerMessageBytes(candidate)).toBe(expectedBytes);
 	});
 });

@@ -1,18 +1,18 @@
 import type {
-	FutureExtensionUiRequestDto,
-	FutureProductSessionEventDto,
-	FutureSessionCommandResponseDto,
-	FutureSessionEntryDto,
-	FutureSessionMessageDto,
-	FutureSessionTreeNodeDto,
-} from "./future-product-dto.js";
-import type {
-	FutureSessionProjectionEventDto,
-	FutureSessionReplayFrameDto,
-	FutureSessionResponseFrameDto,
-	FutureSessionSnapshotDto,
-	FutureSessionWsServerMessage,
+	SessionProjectionEventDto,
+	SessionReplayFrameDto,
+	SessionResponseFrameDto,
+	SessionSnapshotDto,
+	SessionWsServerMessage,
 } from "./index.js";
+import type {
+	ExtensionUiRequestDto,
+	ProductSessionEventDto,
+	SessionCommandResponseDto,
+	SessionEntryDto,
+	SessionMessageDto,
+	SessionTreeNodeDto,
+} from "./product-dto.js";
 
 const MAX_ANALYZED_BYTES = Number.MAX_SAFE_INTEGER - 1;
 
@@ -48,25 +48,25 @@ type Schema =
 
 type UnknownRecord = Record<string, unknown>;
 
-export interface FutureSessionLogicalBytesOptions {
+export interface SessionLogicalBytesOptions {
 	maxBytes?: number;
 }
 
-export interface FutureSessionLogicalBytesResult {
+export interface SessionLogicalBytesResult {
 	byteLength: number;
 }
 
-export type FutureSessionLogicalBytesErrorCode = "invalid_limit" | "invalid_value" | "limit_exceeded";
+export type SessionLogicalBytesErrorCode = "invalid_limit" | "invalid_value" | "limit_exceeded";
 
-export class FutureSessionLogicalBytesError extends Error {
+export class SessionLogicalBytesError extends Error {
 	constructor(
-		readonly code: FutureSessionLogicalBytesErrorCode,
+		readonly code: SessionLogicalBytesErrorCode,
 		message: string,
 		readonly limit?: number,
 		readonly actual?: number,
 	) {
 		super(message);
-		this.name = "FutureSessionLogicalBytesError";
+		this.name = "SessionLogicalBytesError";
 	}
 }
 
@@ -78,10 +78,10 @@ class LogicalByteCounter {
 
 	add(amount: number): void {
 		if (!Number.isSafeInteger(amount) || amount < 0) {
-			throw new FutureSessionLogicalBytesError("invalid_value", "future logical byte amount is invalid");
+			throw new SessionLogicalBytesError("invalid_value", "future logical byte amount is invalid");
 		}
 		if (amount > this.limit - this.bytes) {
-			throw new FutureSessionLogicalBytesError(
+			throw new SessionLogicalBytesError(
 				"limit_exceeded",
 				"future logical payload exceeded its byte limit",
 				this.limit,
@@ -153,14 +153,14 @@ function countTextRoot(value: unknown, counter: LogicalByteCounter): void {
 		!Number.isSafeInteger(value.ref.byteLength) ||
 		Number(value.ref.byteLength) <= 0
 	) {
-		throw new FutureSessionLogicalBytesError("invalid_value", "future logical text root is invalid");
+		throw new SessionLogicalBytesError("invalid_value", "future logical text root is invalid");
 	}
 	counter.add(Number(value.ref.byteLength));
 }
 
 function countJsonRoot(value: unknown, counter: LogicalByteCounter): void {
 	if (!isRecord(value)) {
-		throw new FutureSessionLogicalBytesError("invalid_value", "future logical JSON root is invalid");
+		throw new SessionLogicalBytesError("invalid_value", "future logical JSON root is invalid");
 	}
 	if (value.type === "inline_json" && Object.hasOwn(value, "value")) {
 		countCanonical(value.value, "ordinary", counter);
@@ -172,7 +172,7 @@ function countJsonRoot(value: unknown, counter: LogicalByteCounter): void {
 		!Number.isSafeInteger(value.ref.byteLength) ||
 		Number(value.ref.byteLength) <= 0
 	) {
-		throw new FutureSessionLogicalBytesError("invalid_value", "future logical JSON root is invalid");
+		throw new SessionLogicalBytesError("invalid_value", "future logical JSON root is invalid");
 	}
 	counter.add(Number(value.ref.byteLength));
 }
@@ -329,13 +329,13 @@ function countCanonical(value: unknown, schema: Schema, counter: LogicalByteCoun
 	}
 	if (typeof value === "number") {
 		if (!Number.isFinite(value) || Math.abs(value) > Number.MAX_SAFE_INTEGER) {
-			throw new FutureSessionLogicalBytesError("invalid_value", "future logical number is invalid");
+			throw new SessionLogicalBytesError("invalid_value", "future logical number is invalid");
 		}
 		counter.add((Object.is(value, -0) ? "0" : String(value)).length);
 		return;
 	}
 	if (typeof value !== "object" || value === null || counter.activeObjects.has(value)) {
-		throw new FutureSessionLogicalBytesError("invalid_value", "future logical value is not canonical JSON");
+		throw new SessionLogicalBytesError("invalid_value", "future logical value is not canonical JSON");
 	}
 	counter.activeObjects.add(value);
 	try {
@@ -349,7 +349,7 @@ function countCanonical(value: unknown, schema: Schema, counter: LogicalByteCoun
 			return;
 		}
 		if (!isRecord(value)) {
-			throw new FutureSessionLogicalBytesError("invalid_value", "future logical object is invalid");
+			throw new SessionLogicalBytesError("invalid_value", "future logical object is invalid");
 		}
 		const record = value;
 		counter.add(1);
@@ -372,93 +372,93 @@ function countCanonical(value: unknown, schema: Schema, counter: LogicalByteCoun
 function analyze(
 	value: unknown,
 	schema: Schema,
-	options: FutureSessionLogicalBytesOptions = {},
-): FutureSessionLogicalBytesResult {
+	options: SessionLogicalBytesOptions = {},
+): SessionLogicalBytesResult {
 	const maxBytes = options.maxBytes ?? MAX_ANALYZED_BYTES;
 	if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > MAX_ANALYZED_BYTES) {
-		throw new FutureSessionLogicalBytesError("invalid_limit", "future logical byte limit is invalid");
+		throw new SessionLogicalBytesError("invalid_limit", "future logical byte limit is invalid");
 	}
 	const counter = new LogicalByteCounter(maxBytes);
 	countCanonical(value, schema, counter);
 	if (!Number.isSafeInteger(counter.bytes) || counter.bytes <= 0) {
-		throw new FutureSessionLogicalBytesError("invalid_value", "future logical byte result is invalid");
+		throw new SessionLogicalBytesError("invalid_value", "future logical byte result is invalid");
 	}
 	return Object.freeze({ byteLength: counter.bytes });
 }
 
-export function analyzeFutureSessionMessageLogicalBytes(
-	value: FutureSessionMessageDto,
-	options?: FutureSessionLogicalBytesOptions,
-): FutureSessionLogicalBytesResult {
+export function analyzeSessionMessageLogicalBytes(
+	value: SessionMessageDto,
+	options?: SessionLogicalBytesOptions,
+): SessionLogicalBytesResult {
 	return analyze(value, "message", options);
 }
 
-export function analyzeFutureSessionEntryLogicalBytes(
-	value: FutureSessionEntryDto,
-	options?: FutureSessionLogicalBytesOptions,
-): FutureSessionLogicalBytesResult {
+export function analyzeSessionEntryLogicalBytes(
+	value: SessionEntryDto,
+	options?: SessionLogicalBytesOptions,
+): SessionLogicalBytesResult {
 	return analyze(value, "entry", options);
 }
 
-export function analyzeFutureSessionTreeLogicalBytes(
-	value: FutureSessionTreeNodeDto[],
-	options?: FutureSessionLogicalBytesOptions,
-): FutureSessionLogicalBytesResult {
+export function analyzeSessionTreeLogicalBytes(
+	value: SessionTreeNodeDto[],
+	options?: SessionLogicalBytesOptions,
+): SessionLogicalBytesResult {
 	return analyze(value, "tree", options);
 }
 
-export function analyzeFutureProductSessionEventLogicalBytes(
-	value: FutureProductSessionEventDto,
-	options?: FutureSessionLogicalBytesOptions,
-): FutureSessionLogicalBytesResult {
+export function analyzeProductSessionEventLogicalBytes(
+	value: ProductSessionEventDto,
+	options?: SessionLogicalBytesOptions,
+): SessionLogicalBytesResult {
 	return analyze(value, "event", options);
 }
 
-export function analyzeFutureExtensionUiRequestLogicalBytes(
-	value: FutureExtensionUiRequestDto,
-	options?: FutureSessionLogicalBytesOptions,
-): FutureSessionLogicalBytesResult {
+export function analyzeExtensionUiRequestLogicalBytes(
+	value: ExtensionUiRequestDto,
+	options?: SessionLogicalBytesOptions,
+): SessionLogicalBytesResult {
 	return analyze(value, "extension_request", options);
 }
 
-export function analyzeFutureSessionCommandResponseLogicalBytes(
-	value: FutureSessionCommandResponseDto,
-	options?: FutureSessionLogicalBytesOptions,
-): FutureSessionLogicalBytesResult {
+export function analyzeSessionCommandResponseLogicalBytes(
+	value: SessionCommandResponseDto,
+	options?: SessionLogicalBytesOptions,
+): SessionLogicalBytesResult {
 	return analyze(value, "response", options);
 }
 
-export function analyzeFutureSessionProjectionEventLogicalBytes(
-	value: FutureSessionProjectionEventDto,
-	options?: FutureSessionLogicalBytesOptions,
-): FutureSessionLogicalBytesResult {
+export function analyzeSessionProjectionEventLogicalBytes(
+	value: SessionProjectionEventDto,
+	options?: SessionLogicalBytesOptions,
+): SessionLogicalBytesResult {
 	return analyze(value, "projection", options);
 }
 
-export function analyzeFutureSessionReplayFrameLogicalBytes(
-	value: FutureSessionReplayFrameDto,
-	options?: FutureSessionLogicalBytesOptions,
-): FutureSessionLogicalBytesResult {
+export function analyzeSessionReplayFrameLogicalBytes(
+	value: SessionReplayFrameDto,
+	options?: SessionLogicalBytesOptions,
+): SessionLogicalBytesResult {
 	return analyze(value, "replay", options);
 }
 
-export function analyzeFutureSessionSnapshotLogicalBytes(
-	value: FutureSessionSnapshotDto,
-	options?: FutureSessionLogicalBytesOptions,
-): FutureSessionLogicalBytesResult {
+export function analyzeSessionSnapshotLogicalBytes(
+	value: SessionSnapshotDto,
+	options?: SessionLogicalBytesOptions,
+): SessionLogicalBytesResult {
 	return analyze(value, "snapshot", options);
 }
 
-export function analyzeFutureSessionResponseFrameLogicalBytes(
-	value: FutureSessionResponseFrameDto,
-	options?: FutureSessionLogicalBytesOptions,
-): FutureSessionLogicalBytesResult {
+export function analyzeSessionResponseFrameLogicalBytes(
+	value: SessionResponseFrameDto,
+	options?: SessionLogicalBytesOptions,
+): SessionLogicalBytesResult {
 	return analyze(value, "response_frame", options);
 }
 
-export function analyzeFutureSessionWsServerMessageLogicalBytes(
-	value: FutureSessionWsServerMessage,
-	options?: FutureSessionLogicalBytesOptions,
-): FutureSessionLogicalBytesResult {
+export function analyzeSessionWsServerMessageLogicalBytes(
+	value: SessionWsServerMessage,
+	options?: SessionLogicalBytesOptions,
+): SessionLogicalBytesResult {
 	return analyze(value, "ws", options);
 }

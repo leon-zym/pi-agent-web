@@ -1,25 +1,25 @@
 import { describe, expect, it } from "vitest";
 import {
-	FUTURE_SESSION_CONTENT_REF_BUDGET,
 	isExtensionUiRequestDto,
 	isExtensionUiResponseDto,
-	isFutureExtensionUiRequestDto,
-	isFutureProductSessionEventDto,
-	isFutureSessionCommandResponseDto,
-	isFutureSessionEntryDto,
-	isFutureSessionMessageDto,
-	isFutureSessionProjectionEventDto,
-	isFutureSessionReplayFrameDto,
-	isFutureSessionSnapshotDto,
-	isFutureSessionTreeDto,
-	isFutureSessionWsServerMessage,
+	isInlineSessionSnapshotDto,
+	isInlineSessionWsServerMessage,
+	isPiExtensionUiRequestDto,
+	isPiProductSessionEventDto,
+	isPiSessionCommandResponseDto,
+	isPiSessionMessageDto,
 	isProductSessionEventDto,
 	isSessionCommandResponseDto,
+	isSessionEntryDto,
 	isSessionMessageDto,
+	isSessionProjectionEventDto,
+	isSessionReplayFrameDto,
 	isSessionSnapshotDto,
+	isSessionTreeDto,
 	isSessionWsClientMessage,
 	isSessionWsServerMessage,
 	SESSION_CONTENT_INLINE_THRESHOLD_BYTES,
+	SESSION_CONTENT_REF_BUDGET,
 	SESSION_PAYLOAD_BUDGET,
 } from "../src/index.js";
 
@@ -27,7 +27,7 @@ const serverEpoch = "future-frame-epoch";
 const context = {
 	serverEpoch,
 	payloadBudget: SESSION_PAYLOAD_BUDGET,
-	contentRefBudget: FUTURE_SESSION_CONTENT_REF_BUDGET,
+	contentRefBudget: SESSION_CONTENT_REF_BUDGET,
 };
 const attachmentContext = { serverEpoch, payloadBudget: SESSION_PAYLOAD_BUDGET };
 const ref = {
@@ -163,16 +163,16 @@ describe("future protocol 1.3 content-bearing frames", () => {
 			},
 		] as const;
 		for (const request of requests) {
-			expect(isFutureExtensionUiRequestDto(request, context)).toBe(true);
-			expect(isFutureExtensionUiRequestDto(request)).toBe(false);
-			expect(isFutureExtensionUiRequestDto(request, { ...context, serverEpoch: "wrong" })).toBe(
+			expect(isExtensionUiRequestDto(request, context)).toBe(true);
+			expect(isExtensionUiRequestDto(request)).toBe(false);
+			expect(isExtensionUiRequestDto(request, { ...context, serverEpoch: "wrong" })).toBe(
 				request.id === "widget-inline-a",
 			);
-			expect(isExtensionUiRequestDto(request)).toBe(false);
+			expect(isPiExtensionUiRequestDto(request)).toBe(false);
 		}
 
 		expect(
-			isFutureExtensionUiRequestDto(
+			isExtensionUiRequestDto(
 				{
 					type: "extension_ui_request",
 					id: "widget-clear",
@@ -183,7 +183,7 @@ describe("future protocol 1.3 content-bearing frames", () => {
 			),
 		).toBe(true);
 		expect(
-			isFutureExtensionUiRequestDto(
+			isExtensionUiRequestDto(
 				{
 					type: "extension_ui_request",
 					id: "widget-bare",
@@ -195,7 +195,7 @@ describe("future protocol 1.3 content-bearing frames", () => {
 			),
 		).toBe(false);
 		expect(
-			isFutureExtensionUiRequestDto(
+			isExtensionUiRequestDto(
 				{
 					type: "extension_ui_request",
 					id: "widget-wrong-shape",
@@ -207,7 +207,7 @@ describe("future protocol 1.3 content-bearing frames", () => {
 			),
 		).toBe(false);
 		expect(
-			isFutureExtensionUiRequestDto(
+			isExtensionUiRequestDto(
 				{
 					type: "extension_ui_request",
 					id: "status-a",
@@ -271,22 +271,20 @@ describe("future protocol 1.3 content-bearing frames", () => {
 			},
 		] as const;
 		for (const message of messages) {
-			expect(isFutureSessionMessageDto(message, context)).toBe(true);
-			expect(isFutureSessionMessageDto(message)).toBe(false);
-			expect(isFutureSessionMessageDto(message, { ...context, serverEpoch: "wrong" })).toBe(false);
+			expect(isSessionMessageDto(message, context)).toBe(true);
+			expect(isSessionMessageDto(message)).toBe(false);
+			expect(isSessionMessageDto(message, { ...context, serverEpoch: "wrong" })).toBe(false);
 		}
-		expect(isSessionMessageDto(toolResult(), attachmentContext)).toBe(false);
+		expect(isPiSessionMessageDto(toolResult(), attachmentContext)).toBe(false);
 		// In 1.2 this exact JSON root remains ordinary tool argument data; only the
 		// future contextual guard gives it wrapper semantics.
-		expect(isSessionMessageDto(assistant(), attachmentContext)).toBe(true);
+		expect(isPiSessionMessageDto(assistant(), attachmentContext)).toBe(true);
 	});
 
 	it("keeps unreviewed message slots on the current contract", () => {
-		expect(isFutureSessionMessageDto({ role: "user", content: externalText, timestamp: 1 }, context)).toBe(
-			false,
-		);
+		expect(isSessionMessageDto({ role: "user", content: externalText, timestamp: 1 }, context)).toBe(false);
 		expect(
-			isFutureSessionMessageDto(
+			isSessionMessageDto(
 				{
 					role: "assistant",
 					content: [{ type: "text", text: externalText }],
@@ -298,7 +296,7 @@ describe("future protocol 1.3 content-bearing frames", () => {
 			),
 		).toBe(false);
 		expect(
-			isFutureSessionMessageDto(
+			isSessionMessageDto(
 				{ role: "custom", customType: "bare", content: externalText, display: true, timestamp: 1 },
 				context,
 			),
@@ -317,13 +315,13 @@ describe("future protocol 1.3 content-bearing frames", () => {
 			display: true,
 		} as const;
 		const tree = [{ entry: entry(), children: [{ entry: customMessage, children: [] }] }];
-		expect(isFutureSessionEntryDto(entry(), context)).toBe(true);
-		expect(isFutureSessionEntryDto(entry())).toBe(false);
-		expect(isFutureSessionEntryDto(customMessage, context)).toBe(true);
-		expect(isFutureSessionTreeDto(tree, context)).toBe(true);
-		expect(isFutureSessionTreeDto(tree)).toBe(false);
+		expect(isSessionEntryDto(entry(), context)).toBe(true);
+		expect(isSessionEntryDto(entry())).toBe(false);
+		expect(isSessionEntryDto(customMessage, context)).toBe(true);
+		expect(isSessionTreeDto(tree, context)).toBe(true);
+		expect(isSessionTreeDto(tree)).toBe(false);
 		expect(
-			isFutureSessionEntryDto(
+			isSessionEntryDto(
 				{
 					type: "custom",
 					id: "opaque-1",
@@ -370,14 +368,14 @@ describe("future protocol 1.3 content-bearing frames", () => {
 			},
 		] as const;
 		for (const event of events) {
-			expect(isFutureProductSessionEventDto(event, context)).toBe(true);
+			expect(isProductSessionEventDto(event, context)).toBe(true);
 		}
-		expect(isFutureProductSessionEventDto(events[0])).toBe(false);
-		expect(isProductSessionEventDto({ type: "message_end", message: toolResult() }, attachmentContext)).toBe(
-			false,
-		);
+		expect(isProductSessionEventDto(events[0])).toBe(false);
 		expect(
-			isProductSessionEventDto(
+			isPiProductSessionEventDto({ type: "message_end", message: toolResult() }, attachmentContext),
+		).toBe(false);
+		expect(
+			isPiProductSessionEventDto(
 				{ type: "tool_execution_start", toolCallId: "tool-1", toolName: "read", args: inlineJson },
 				attachmentContext,
 			),
@@ -389,10 +387,10 @@ describe("future protocol 1.3 content-bearing frames", () => {
 			aborted: false,
 			willRetry: false,
 		} as const;
-		expect(isFutureProductSessionEventDto(opaqueCompaction, context)).toBe(true);
-		expect(isProductSessionEventDto(opaqueCompaction, attachmentContext)).toBe(true);
+		expect(isProductSessionEventDto(opaqueCompaction, context)).toBe(true);
+		expect(isPiProductSessionEventDto(opaqueCompaction, attachmentContext)).toBe(true);
 		expect(
-			isFutureProductSessionEventDto(
+			isProductSessionEventDto(
 				{
 					type: "message_update",
 					usage,
@@ -411,9 +409,9 @@ describe("future protocol 1.3 content-bearing frames", () => {
 					? { entries: [entry()], leafId: "entry-1" }
 					: { tree: [{ entry: entry(), children: [] }], leafId: "entry-1" };
 		const response = { type: "response", command, success: true, data } as const;
-		expect(isFutureSessionCommandResponseDto(response, context)).toBe(true);
-		expect(isFutureSessionCommandResponseDto(response)).toBe(false);
-		expect(isSessionCommandResponseDto(response, attachmentContext)).toBe(false);
+		expect(isSessionCommandResponseDto(response, context)).toBe(true);
+		expect(isSessionCommandResponseDto(response)).toBe(false);
+		expect(isPiSessionCommandResponseDto(response, attachmentContext)).toBe(false);
 	});
 
 	it("carries future content through replay, projection, snapshot, and WS guards", () => {
@@ -431,20 +429,20 @@ describe("future protocol 1.3 content-bearing frames", () => {
 				data: { messages: [toolResult()] },
 			},
 		} as const;
-		expect(isFutureSessionProjectionEventDto(event, context)).toBe(true);
-		expect(isFutureSessionProjectionEventDto(event)).toBe(false);
-		expect(isFutureSessionReplayFrameDto(event, context)).toBe(true);
-		expect(isFutureSessionReplayFrameDto(event)).toBe(false);
-		expect(isFutureSessionSnapshotDto(snapshot(), context)).toBe(true);
-		expect(isFutureSessionSnapshotDto(snapshot())).toBe(false);
-		expect(isFutureSessionWsServerMessage(event, context)).toBe(true);
-		expect(isFutureSessionWsServerMessage(snapshot(), context)).toBe(true);
-		expect(isFutureSessionWsServerMessage(responseFrame, context)).toBe(true);
-		expect(isFutureSessionWsServerMessage(event)).toBe(false);
-		expect(isSessionSnapshotDto(snapshot(), attachmentContext)).toBe(false);
-		expect(isSessionWsServerMessage(responseFrame, attachmentContext)).toBe(false);
+		expect(isSessionProjectionEventDto(event, context)).toBe(true);
+		expect(isSessionProjectionEventDto(event)).toBe(false);
+		expect(isSessionReplayFrameDto(event, context)).toBe(true);
+		expect(isSessionReplayFrameDto(event)).toBe(false);
+		expect(isSessionSnapshotDto(snapshot(), context)).toBe(true);
+		expect(isSessionSnapshotDto(snapshot())).toBe(false);
+		expect(isSessionWsServerMessage(event, context)).toBe(true);
+		expect(isSessionWsServerMessage(snapshot(), context)).toBe(true);
+		expect(isSessionWsServerMessage(responseFrame, context)).toBe(true);
+		expect(isSessionWsServerMessage(event)).toBe(false);
+		expect(isInlineSessionSnapshotDto(snapshot(), attachmentContext)).toBe(false);
+		expect(isInlineSessionWsServerMessage(responseFrame, attachmentContext)).toBe(false);
 		expect(
-			isFutureSessionWsServerMessage(
+			isSessionWsServerMessage(
 				{
 					type: "extension_ui_result",
 					serverEpoch,
@@ -470,8 +468,8 @@ describe("future protocol 1.3 content-bearing frames", () => {
 				text: externalText,
 			},
 		} as const;
-		expect(isFutureSessionReplayFrameDto(futureExtensionFrame, context)).toBe(true);
-		expect(isSessionWsServerMessage(futureExtensionFrame, attachmentContext)).toBe(false);
+		expect(isSessionReplayFrameDto(futureExtensionFrame, context)).toBe(true);
+		expect(isInlineSessionWsServerMessage(futureExtensionFrame, attachmentContext)).toBe(false);
 		const extensionSnapshot = {
 			type: "extension_ui_snapshot",
 			serverEpoch,
@@ -479,8 +477,8 @@ describe("future protocol 1.3 content-bearing frames", () => {
 			generation: 2,
 			requests: [futureExtensionFrame.request],
 		} as const;
-		expect(isFutureSessionWsServerMessage(extensionSnapshot, context)).toBe(true);
-		expect(isSessionWsServerMessage(extensionSnapshot, attachmentContext)).toBe(false);
+		expect(isSessionWsServerMessage(extensionSnapshot, context)).toBe(true);
+		expect(isInlineSessionWsServerMessage(extensionSnapshot, attachmentContext)).toBe(false);
 
 		const snapshotWithExtension = {
 			...snapshot(),
@@ -500,31 +498,26 @@ describe("future protocol 1.3 content-bearing frames", () => {
 				},
 			],
 		} as const;
-		expect(isFutureExtensionUiRequestDto(snapshotWithExtension.pendingExtensionRequests[0], context)).toBe(
+		expect(isExtensionUiRequestDto(snapshotWithExtension.pendingExtensionRequests[0], context)).toBe(true);
+		expect(isExtensionUiRequestDto(snapshotWithExtension.stickyExtensionState[0], context)).toBe(true);
+		expect(isSessionSnapshotDto({ ...snapshotWithExtension, stickyExtensionState: [] }, context)).toBe(true);
+		expect(isSessionSnapshotDto({ ...snapshotWithExtension, pendingExtensionRequests: [] }, context)).toBe(
 			true,
 		);
-		expect(isFutureExtensionUiRequestDto(snapshotWithExtension.stickyExtensionState[0], context)).toBe(true);
-		expect(isFutureSessionSnapshotDto({ ...snapshotWithExtension, stickyExtensionState: [] }, context)).toBe(
-			true,
-		);
-		expect(
-			isFutureSessionSnapshotDto({ ...snapshotWithExtension, pendingExtensionRequests: [] }, context),
-		).toBe(true);
-		expect(isFutureSessionSnapshotDto(snapshotWithExtension, context)).toBe(true);
-		expect(isSessionSnapshotDto(snapshotWithExtension, attachmentContext)).toBe(false);
+		expect(isSessionSnapshotDto(snapshotWithExtension, context)).toBe(true);
+		expect(isInlineSessionSnapshotDto(snapshotWithExtension, attachmentContext)).toBe(false);
 	});
 
-	it("keeps current 1.2 full-frame guards and wire budgets frozen", () => {
+	it("keeps upstream Pi inline guards separate from Browser content-reference DTOs", () => {
 		expect("maxContentBlobBytes" in SESSION_PAYLOAD_BUDGET).toBe(false);
-		expect(isSessionMessageDto({ role: "user", content: "current", timestamp: 1 })).toBe(true);
+		expect(isPiSessionMessageDto({ role: "user", content: "current", timestamp: 1 })).toBe(true);
 		expect(
-			isSessionCommandResponseDto({
+			isPiSessionCommandResponseDto({
 				type: "response",
 				command: "get_messages",
 				success: true,
 				data: { messages: [] },
 			}),
 		).toBe(true);
-		expect(isSessionWsServerMessage({ type: "runtime_state", runtime: runtime() })).toBe(true);
 	});
 });

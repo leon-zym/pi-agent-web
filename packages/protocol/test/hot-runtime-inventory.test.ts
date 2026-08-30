@@ -1,13 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+	GATEWAY_PROTOCOL_VERSION,
 	type GatewayClientHelloDto,
 	type GatewayServerHelloDto,
+	isInlineSessionWsServerMessage,
 	isSessionWsClientMessage,
-	isSessionWsServerMessage,
 	negotiateHotRuntimeInventory,
+	SESSION_CONTENT_REF_BUDGET,
 	SESSION_HOT_RUNTIME_INVENTORY_MAX_BYTES,
 	SESSION_HOT_RUNTIME_INVENTORY_MAX_ITEMS,
+	SESSION_PAYLOAD_BUDGET,
 	sessionWsServerMessageBytes,
 } from "../src/index.js";
 
@@ -37,7 +40,7 @@ function inventory(overrides: Record<string, unknown> = {}) {
 function clientHello(overrides: Partial<GatewayClientHelloDto> = {}): GatewayClientHelloDto {
 	return {
 		type: "client_hello",
-		protocol: { major: 1, minor: 1 },
+		protocol: GATEWAY_PROTOCOL_VERSION,
 		clientBuild: "client-test",
 		capabilities: [GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY],
 		limits: { maxServerFrameBytes: SESSION_HOT_RUNTIME_INVENTORY_MAX_BYTES },
@@ -48,7 +51,7 @@ function clientHello(overrides: Partial<GatewayClientHelloDto> = {}): GatewayCli
 function serverHello(overrides: Partial<GatewayServerHelloDto> = {}): GatewayServerHelloDto {
 	return {
 		type: "server_hello",
-		protocol: { major: 1, minor: 1 },
+		protocol: GATEWAY_PROTOCOL_VERSION,
 		serverBuild: "server-test",
 		serverEpoch,
 		piVersion: "test",
@@ -59,6 +62,8 @@ function serverHello(overrides: Partial<GatewayServerHelloDto> = {}): GatewaySer
 			maxSnapshotFrameBytes: SESSION_HOT_RUNTIME_INVENTORY_MAX_BYTES,
 			maxExtensionRequests: 1,
 		},
+		payloadBudget: SESSION_PAYLOAD_BUDGET,
+		contentRefBudget: SESSION_CONTENT_REF_BUDGET,
 		...overrides,
 	};
 }
@@ -73,12 +78,12 @@ describe("hot Runtime inventory protocol", () => {
 				entry(3, { state: "waiting_ui" }),
 			],
 		});
-		expect(isSessionWsServerMessage(value)).toBe(true);
+		expect(isInlineSessionWsServerMessage(value)).toBe(true);
 	});
 
 	it("rejects item and exact UTF-8 byte overflow", () => {
 		expect(
-			isSessionWsServerMessage(
+			isInlineSessionWsServerMessage(
 				inventory({
 					runtimes: Array.from({ length: SESSION_HOT_RUNTIME_INVENTORY_MAX_ITEMS + 1 }, (_, index) =>
 						entry(index),
@@ -104,7 +109,7 @@ describe("hot Runtime inventory protocol", () => {
 		expect(sessionWsServerMessageBytes(fullMaximumInventory)).toBeLessThanOrEqual(
 			SESSION_HOT_RUNTIME_INVENTORY_MAX_BYTES,
 		);
-		expect(isSessionWsServerMessage(fullMaximumInventory)).toBe(true);
+		expect(isInlineSessionWsServerMessage(fullMaximumInventory)).toBe(true);
 
 		const byteOverflow = {
 			...fullMaximumInventory,
@@ -113,7 +118,7 @@ describe("hot Runtime inventory protocol", () => {
 		expect(sessionWsServerMessageBytes(byteOverflow)).toBeGreaterThan(
 			SESSION_HOT_RUNTIME_INVENTORY_MAX_BYTES,
 		);
-		expect(isSessionWsServerMessage(byteOverflow)).toBe(false);
+		expect(isInlineSessionWsServerMessage(byteOverflow)).toBe(false);
 	});
 
 	it("negotiates only from the client and selected Gateway hello intersection", () => {
@@ -121,9 +126,6 @@ describe("hot Runtime inventory protocol", () => {
 			negotiated: false,
 			reason: "capability_missing",
 		});
-		expect(
-			negotiateHotRuntimeInventory(clientHello({ protocol: { major: 1, minor: 0 } }), serverHello()),
-		).toEqual({ negotiated: false, reason: "protocol_minor_unsupported" });
 		expect(
 			negotiateHotRuntimeInventory(
 				{
@@ -156,18 +158,6 @@ describe("hot Runtime inventory protocol", () => {
 			),
 		).toEqual({ negotiated: false, reason: "server_frame_limit_too_small" });
 		expect(
-			negotiateHotRuntimeInventory(clientHello({ protocol: { major: 2, minor: 1 } }), serverHello()),
-		).toEqual({ negotiated: false, reason: "protocol_major_unsupported" });
-		expect(
-			negotiateHotRuntimeInventory(clientHello(), serverHello({ protocol: { major: 2, minor: 1 } })),
-		).toEqual({ negotiated: false, reason: "protocol_major_unsupported" });
-		expect(
-			negotiateHotRuntimeInventory(clientHello(), serverHello({ protocol: { major: 1, minor: 0 } })),
-		).toEqual({ negotiated: false, reason: "protocol_minor_unsupported" });
-		expect(
-			negotiateHotRuntimeInventory(clientHello(), serverHello({ protocol: { major: 1, minor: 2 } })),
-		).toEqual({ negotiated: false, reason: "protocol_selection_invalid" });
-		expect(
 			negotiateHotRuntimeInventory(
 				clientHello(),
 				serverHello({
@@ -183,33 +173,37 @@ describe("hot Runtime inventory protocol", () => {
 	});
 
 	it("rejects duplicates, mixed epochs, dormant states, and malformed revisions", () => {
-		expect(isSessionWsServerMessage(inventory({ runtimes: [entry(), entry()] }))).toBe(false);
+		expect(isInlineSessionWsServerMessage(inventory({ runtimes: [entry(), entry()] }))).toBe(false);
 		expect(
-			isSessionWsServerMessage(
+			isInlineSessionWsServerMessage(
 				inventory({ runtimes: [entry(0), entry(1, { serverEpoch: "gateway-epoch-b" })] }),
 			),
 		).toBe(false);
 		for (const state of ["crashed", "dormant", "unknown"]) {
-			expect(isSessionWsServerMessage(inventory({ runtimes: [entry(0, { state })] }))).toBe(false);
+			expect(isInlineSessionWsServerMessage(inventory({ runtimes: [entry(0, { state })] }))).toBe(false);
 		}
 		for (const revision of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
-			expect(isSessionWsServerMessage(inventory({ revision }))).toBe(false);
+			expect(isInlineSessionWsServerMessage(inventory({ revision }))).toBe(false);
 		}
 	});
 
 	it("rejects unknown, inherited, accessor, symbol, and exotic inventory values", () => {
-		expect(isSessionWsServerMessage(inventory({ unexpected: true }))).toBe(false);
-		expect(isSessionWsServerMessage(inventory({ runtimes: [{ ...entry(), unexpected: true }] }))).toBe(false);
-		expect(isSessionWsServerMessage(Object.create(inventory()))).toBe(false);
+		expect(isInlineSessionWsServerMessage(inventory({ unexpected: true }))).toBe(false);
+		expect(isInlineSessionWsServerMessage(inventory({ runtimes: [{ ...entry(), unexpected: true }] }))).toBe(
+			false,
+		);
+		expect(isInlineSessionWsServerMessage(Object.create(inventory()))).toBe(false);
 
 		const accessor = inventory();
 		Object.defineProperty(accessor, "revision", { enumerable: true, get: () => 4 });
-		expect(isSessionWsServerMessage(accessor)).toBe(false);
+		expect(isInlineSessionWsServerMessage(accessor)).toBe(false);
 		const symbol = inventory();
 		Object.defineProperty(symbol, Symbol("hidden"), { enumerable: true, value: true });
-		expect(isSessionWsServerMessage(symbol)).toBe(false);
-		expect(isSessionWsServerMessage(inventory({ runtimes: new Map([["session", entry()]]) }))).toBe(false);
-		expect(isSessionWsServerMessage(inventory({ runtimes: [new Date()] }))).toBe(false);
+		expect(isInlineSessionWsServerMessage(symbol)).toBe(false);
+		expect(isInlineSessionWsServerMessage(inventory({ runtimes: new Map([["session", entry()]]) }))).toBe(
+			false,
+		);
+		expect(isInlineSessionWsServerMessage(inventory({ runtimes: [new Date()] }))).toBe(false);
 	});
 });
 
