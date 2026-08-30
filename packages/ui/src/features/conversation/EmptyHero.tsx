@@ -20,8 +20,7 @@ export function EmptyHero() {
 						: tt("hero.firstTurn")}
 			</p>
 			<p className="max-w-sm text-[13px] leading-relaxed text-ink-3">
-				{tt("hero.hint1")}
-				{tt("hero.hint2")}
+				{tt("hero.hint1")} {tt("hero.hint2")}
 			</p>
 		</div>
 	);
