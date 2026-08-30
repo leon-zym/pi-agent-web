@@ -2145,7 +2145,18 @@ describe("SessionSupervisor", () => {
 				fencingToken: lease.fencingToken,
 			},
 		);
-		await waitFor(() => (supervisor.getRuntime(target.sessionHandle)?.lastSeq ?? 0) >= 8);
+		await waitFor(
+			() =>
+				runtimeProjection(exactRuntimeObject(supervisor, target.sessionHandle))
+					.snapshot()
+					.projectionEvents.filter(
+						(frame) =>
+							frame.event.type === "message_end" &&
+							frame.event.message.role === "toolResult" &&
+							frame.event.message.details?.type === "external_json",
+					).length === 6,
+			5_000,
+		);
 
 		const initial = await supervisor.subscribe(target.sessionHandle);
 		if (initial.type !== "resync_required") throw new Error("initial subscription did not resync");
