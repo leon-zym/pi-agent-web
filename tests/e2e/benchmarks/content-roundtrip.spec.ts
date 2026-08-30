@@ -295,7 +295,7 @@ for (const scenario of scenariosFor("content-roundtrip")) {
 				"Browser errors invalidate the content round trip.",
 			);
 			outcome.notes.push(
-				"This production lane covers epoch attachment refs. Private future content-root refs remain separate.",
+				"This production lane covers epoch attachment refs. Generic typed content-root references are covered by the default Browser gate but are not benchmarked as a separate scenario.",
 			);
 		});
 	});

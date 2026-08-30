@@ -69,7 +69,7 @@ export interface SessionAttachmentGuardContext {
 	payloadBudget: SessionPayloadBudgetDto;
 }
 
-/** Trusted future protocol 1.3 context; never derive either field from a candidate payload. */
+/** Trusted protocol 1.3 content-reference context; never derive either field from a candidate payload. */
 export interface SessionContentRefGuardContext {
 	serverEpoch: string;
 	payloadBudget: SessionPayloadBudgetDto;

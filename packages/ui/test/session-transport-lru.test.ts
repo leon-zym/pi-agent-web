@@ -279,7 +279,7 @@ describe("Active WebSocket Subscription LRU admission target with liveness guard
 		expect(sessions["session-7"]?.subscribed).toBe(true);
 	});
 
-	it("does not evict a command-busy session whose legacy state is still idle", () => {
+	it("does not evict a command-busy session whose state field is still idle", () => {
 		const { controller, sockets } = harness();
 		controller.store.getState().connect();
 		open(sockets[0]);

@@ -62,7 +62,7 @@ export class GenerationContentOwner<TRef extends EpochStoredContentRef = Session
 			rejectFatalCleanup = reject;
 		});
 		this.rejectFatalCleanup = rejectFatalCleanup;
-		// The future Runtime integration observes this promise. Avoid process-level
+		// The Runtime lifecycle integration observes this promise. Avoid process-level
 		// unhandled-rejection noise while the owner remains server-private.
 		void this.fatalCleanup.catch(() => {});
 	}

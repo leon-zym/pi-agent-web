@@ -11,7 +11,7 @@ import { useExtensionUiStore } from "../stores/extension-ui";
 import { useModelDirectoryStore } from "../stores/model-directory";
 import { useProjectionStore } from "../stores/projection";
 import { reconcileHiddenSessionLifecycle, useSessionDirectoryStore } from "../stores/session-directory";
-import type { SessionFrameBusMessage, SessionFrameProductMode } from "../stores/session-frame-bus";
+import type { SessionFrameBusMessage, SessionFrameRepresentation } from "../stores/session-frame-bus";
 import { useSessionStatsStore } from "../stores/session-stats";
 import { hasFreshLeaseBaseline, SESSION_FRAME_DEFERRED, sessionTransport } from "../stores/session-transport";
 import { useSlashCommandsStore } from "../stores/slash-commands";
@@ -60,7 +60,7 @@ export function initPipeline(): void {
 	if (initialized) return;
 	initialized = true;
 
-	sessionTransport.frameBus.subscribeAll((frame) => routeSessionFrame(frame.message, frame.productMode));
+	sessionTransport.frameBus.subscribeAll((frame) => routeSessionFrame(frame.message, frame.representation));
 	sessionTransport.globalBus.subscribe((message) => {
 		if (message.type === "hot_runtime_inventory") {
 			useSessionDirectoryStore.getState().applyHotRuntimeInventory(message);
@@ -78,11 +78,11 @@ export function initPipeline(): void {
 
 function routeSessionFrame(
 	message: SessionFrameBusMessage,
-	productMode: SessionFrameProductMode,
+	representation: SessionFrameRepresentation,
 ): void | typeof SESSION_FRAME_DEFERRED {
 	switch (message.type) {
 		case "event":
-			return routeEvent(message, productMode);
+			return routeEvent(message, representation);
 		case "extension_ui_request":
 			projectionEventScheduler.flushSession(message.sessionHandle, message.generation);
 			routeExtensionRequest(message);
@@ -124,7 +124,7 @@ function routeSessionFrame(
 				message.sessionHandle,
 				message.settledMessages,
 				message.projectionEvents.map((frame) => frame.event),
-				productMode,
+				representation,
 			);
 			useComposerStore.getState().setQueueForSession(message.sessionHandle, {
 				steering: [...message.queue.steering],
@@ -152,7 +152,7 @@ function routeSessionFrame(
 			projectionEventScheduler.flushSession(message.sessionHandle, message.generation);
 			useProjectionStore
 				.getState()
-				.prependHistoricalMessages(message.sessionHandle, message.messages, productMode);
+				.prependHistoricalMessages(message.sessionHandle, message.messages, representation);
 			return;
 		case "session_rekeyed":
 			projectionEventScheduler.discardSession(message.previousSessionHandle);
@@ -247,7 +247,7 @@ function scheduleHiddenLifecycleAfterLease(
 
 function routeEvent(
 	message: Extract<SessionFrameBusMessage, { type: "event" }>,
-	productMode: SessionFrameProductMode,
+	representation: SessionFrameRepresentation,
 ): void | typeof SESSION_FRAME_DEFERRED {
 	const { event, generation, seq, sessionHandle, workspaceId } = message;
 	const coalescible = coalescibleMessageUpdate(event);
@@ -321,7 +321,7 @@ function routeEvent(
 			break;
 	}
 
-	useProjectionStore.getState().applyEvent(sessionHandle, event, productMode);
+	useProjectionStore.getState().applyEvent(sessionHandle, event, representation);
 	if (
 		(event.type === "message_end" && event.message.role === "assistant") ||
 		(event.type === "message_update" &&

@@ -65,7 +65,7 @@ export interface SessionLiveProjectionOptions<
 	runtimePhase?: SessionLiveRuntimePhase;
 	limits?: Partial<SessionLiveProjectionLimits>;
 	attachmentGuardContext?: SessionAttachmentGuardContext;
-	/** Explicit future schema; omission preserves the protocol 1.2 projection path. */
+	/** Optional schema seam for focused in-memory tests; production always supplies the product schema. */
 	schema?: SessionProjectionProductSchema<TMessage, TEvent, TExtensionRequest>;
 }
 
@@ -297,7 +297,7 @@ export class SessionLiveProjection<
 		return this.commitPreparedBatchCore(token);
 	}
 
-	/** Compatibility seam for callers that do not transfer externalized payload ownership. */
+	/** Direct-commit seam for callers that do not transfer externalized payload ownership. */
 	commitInlineOnly(
 		identity: SessionLiveProjectionIdentity,
 		input: SessionLiveProjectionInput<TEvent, TExtensionRequest>,
@@ -411,7 +411,7 @@ export class SessionLiveProjection<
 		);
 	}
 
-	/** Compatibility seam for callers that do not transfer externalized payload ownership. */
+	/** Direct compaction seam for callers that do not transfer externalized payload ownership. */
 	commitIdleBaseCompactionInlineOnly(
 		token: SessionLiveProjectionCompactionToken,
 		settledMessages: readonly TMessage[],

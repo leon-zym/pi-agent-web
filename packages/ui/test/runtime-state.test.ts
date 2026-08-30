@@ -12,7 +12,7 @@ function runtime(state: "starting" | "idle" | "running" | "waiting_ui" | "crashe
 }
 
 describe("runtime-state", () => {
-	it("falls back to legacy state when phase is absent", () => {
+	it("falls back to the state field when phase is absent", () => {
 		expect(runtimePhase(runtime("starting"))).toBe("starting");
 		expect(runtimeIsBusy(runtime("starting"))).toBe(true);
 		expect(runtimeIsBusy(runtime("running"))).toBe(true);

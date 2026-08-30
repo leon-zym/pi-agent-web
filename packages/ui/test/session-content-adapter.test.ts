@@ -27,14 +27,14 @@ import { createSessionContentResolver } from "../src/lib/session-content-resolve
 
 const CONTENT_BYTES = SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes;
 const trustedContext: SessionContentRefGuardContext = Object.freeze({
-	serverEpoch: "future-content-epoch",
+	serverEpoch: "projected-content-epoch",
 	payloadBudget: SESSION_PAYLOAD_BUDGET,
 	contentRefBudget: SESSION_CONTENT_REF_BUDGET,
 });
 const identity = Object.freeze({
 	serverEpoch: trustedContext.serverEpoch,
-	sessionHandle: "session-future-content",
-	workspaceId: "workspace-future-content",
+	sessionHandle: "session-projected-content",
+	workspaceId: "workspace-projected-content",
 	generation: 2,
 });
 
@@ -78,7 +78,7 @@ function response(text: string): Response {
 	});
 }
 
-function futureToolResult(id: string, details: SessionExternalJsonDto): SessionMessageDto {
+function projectedToolResult(id: string, details: SessionExternalJsonDto): SessionMessageDto {
 	return {
 		role: "toolResult",
 		toolCallId: id,
@@ -106,13 +106,13 @@ function minimalSnapshot(): SessionSnapshotDto {
 	return {
 		...identity,
 		type: "session_snapshot",
-		snapshotId: "minimal-future-content",
+		snapshotId: "minimal-projected-content",
 		baseSeq: 0,
 		asOfSeq: 0,
 		runtime: {
 			...identity,
 			nativeSessionId: "minimal-native",
-			sessionFile: "/tmp/minimal-future-content.jsonl",
+			sessionFile: "/tmp/minimal-projected-content.jsonl",
 			cwd: "/tmp",
 			lastSeq: 0,
 			state: "waiting_ui",
@@ -134,7 +134,7 @@ function minimalSnapshot(): SessionSnapshotDto {
 	};
 }
 
-describe("future Session content adapter", () => {
+describe("projected Session content adapter", () => {
 	it("eagerly materializes an ordered live/replay Extension frame and reruns the current guard", async () => {
 		const text = paddedText("editor-prefill");
 		const fetcher = vi.fn(async () => response(text));
@@ -217,7 +217,7 @@ describe("future Session content adapter", () => {
 		resolver.dispose();
 	});
 
-	it("materializes Extension state in a future snapshot without touching message or event refs", async () => {
+	it("materializes Extension state in a projected snapshot without touching message or event refs", async () => {
 		const editor = paddedText("snapshot-editor");
 		const widget = ["alpha", "beta"];
 		const bodies = new Map([
@@ -231,17 +231,17 @@ describe("future Session content adapter", () => {
 		const resolver = createSessionContentResolver({ trustedContext, fetcher });
 		const adapter = createSessionContentAdapter({ trustedContext, resolver });
 		const lazyDetails = externalJson("1");
-		const toolResult = futureToolResult("snapshot-tool", lazyDetails);
+		const toolResult = projectedToolResult("snapshot-tool", lazyDetails);
 		const snapshot: SessionSnapshotDto = {
 			...identity,
 			type: "session_snapshot",
-			snapshotId: "snapshot-future-content",
+			snapshotId: "snapshot-projected-content",
 			baseSeq: 1,
 			asOfSeq: 2,
 			runtime: {
 				...identity,
-				nativeSessionId: "native-future-content",
-				sessionFile: "/tmp/future-content.jsonl",
+				nativeSessionId: "native-projected-content",
+				sessionFile: "/tmp/projected-content.jsonl",
 				cwd: "/tmp",
 				lastSeq: 2,
 				state: "idle",
@@ -256,7 +256,7 @@ describe("future Session content adapter", () => {
 					seq: 2,
 					event: {
 						type: "message_end",
-						message: futureToolResult("snapshot-event-tool", externalJson("8")),
+						message: projectedToolResult("snapshot-event-tool", externalJson("8")),
 					},
 				},
 			],

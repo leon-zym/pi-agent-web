@@ -10,7 +10,7 @@ import {
 	projectProjectionTextSequence,
 	reduceProjection,
 } from "./projection-reducer";
-import type { SessionFrameProductMode } from "./session-frame-bus";
+import type { SessionFrameRepresentation } from "./session-frame-bus";
 import { sessionTransport } from "./session-transport";
 
 const MAX_CACHED_SESSIONS = 3;
@@ -24,32 +24,32 @@ interface ProjectionState {
 	applyEvent: (
 		sessionId: string,
 		event: Parameters<typeof reduceProjection>[1],
-		productMode?: SessionFrameProductMode,
+		representation?: SessionFrameRepresentation,
 	) => void;
 	/** Reduce an ordered event batch and publish one Zustand commit. */
 	applyEvents: (
 		sessionId: string,
 		events: Parameters<typeof reduceProjection>[1][],
-		productMode?: SessionFrameProductMode,
+		representation?: SessionFrameRepresentation,
 	) => void;
 	/** Rebuild the projection from a get_messages snapshot (reconnect/first load). */
 	rebuildFromMessages: (
 		sessionId: string,
 		messages: unknown[],
-		productMode?: SessionFrameProductMode,
+		representation?: SessionFrameRepresentation,
 	) => void;
 	/** Prepend one complete, older history page without disturbing the live tail. */
 	prependHistoricalMessages: (
 		sessionId: string,
 		messages: unknown[],
-		productMode?: SessionFrameProductMode,
+		representation?: SessionFrameRepresentation,
 	) => void;
 	/** Atomically build and publish one authoritative snapshot projection. */
 	applyAuthoritativeSnapshot: (
 		sessionId: string,
 		settledMessages: unknown[],
 		projectionEvents: ProjectionSessionEvent[],
-		productMode?: SessionFrameProductMode,
+		representation?: SessionFrameRepresentation,
 	) => void;
 	/** Settle a locally active turn when the owning Pi process is lost. */
 	markRuntimeFailure: (sessionId: string, error?: string) => void;
@@ -83,16 +83,16 @@ export const useProjectionStore = create<ProjectionState>()((set, get) => ({
 	order: [],
 	currentSessionId: null,
 
-	applyEvent: (sessionId, event, productMode) => get().applyEvents(sessionId, [event], productMode),
+	applyEvent: (sessionId, event, representation) => get().applyEvents(sessionId, [event], representation),
 
-	applyEvents: (sessionId, events, productMode) => {
+	applyEvents: (sessionId, events, representation) => {
 		if (events.length === 0) return;
 		const state = get();
 		let next = state.projections[sessionId] ?? createEmptyProjection(sessionId);
 		for (const event of events) {
 			next = reduceProjection(next, event, {
 				now: Date.now(),
-				productMode,
+				representation,
 				resolveInjectionSource: (text) =>
 					useComposerStore.getState().consumeInjectionSourceForSession(sessionId, text),
 			});
@@ -101,22 +101,22 @@ export const useProjectionStore = create<ProjectionState>()((set, get) => ({
 		set(prune({ ...state, projections: { ...state.projections, [sessionId]: next }, order }));
 	},
 
-	rebuildFromMessages: (sessionId, messages, productMode) => {
+	rebuildFromMessages: (sessionId, messages, representation) => {
 		const state = get();
 		historicalBatchBySession.delete(sessionId);
 		// A snapshot is applied only while the Session transport holds later
 		// frames behind a resync barrier, so it is authoritative even if the
 		// previous local projection appeared to be streaming.
-		const next = rebuildProjectionFromMessages(sessionId, messages, productMode);
+		const next = rebuildProjectionFromMessages(sessionId, messages, representation);
 		const order = touch(state.order, sessionId);
 		set(prune({ ...state, projections: { ...state.projections, [sessionId]: next }, order }));
 	},
 
-	prependHistoricalMessages: (sessionId, messages, productMode) => {
+	prependHistoricalMessages: (sessionId, messages, representation) => {
 		if (messages.length === 0) return;
 		const state = get();
 		const current = state.projections[sessionId] ?? createEmptyProjection(sessionId);
-		const older = rebuildProjectionFromMessages(sessionId, messages, productMode);
+		const older = rebuildProjectionFromMessages(sessionId, messages, representation);
 		if (older.turns.length === 0) return;
 		const batch = (historicalBatchBySession.get(sessionId) ?? 0) + 1;
 		historicalBatchBySession.set(sessionId, batch);
@@ -129,15 +129,15 @@ export const useProjectionStore = create<ProjectionState>()((set, get) => ({
 		set(prune({ ...state, projections: { ...state.projections, [sessionId]: next }, order }));
 	},
 
-	applyAuthoritativeSnapshot: (sessionId, settledMessages, projectionEvents, productMode) => {
+	applyAuthoritativeSnapshot: (sessionId, settledMessages, projectionEvents, representation) => {
 		const state = get();
 		historicalBatchBySession.delete(sessionId);
-		let next = rebuildProjectionFromMessages(sessionId, settledMessages, productMode);
+		let next = rebuildProjectionFromMessages(sessionId, settledMessages, representation);
 		for (const event of projectionEvents) {
 			if (event.type === "extension_error") continue;
 			next = reduceProjection(next, event, {
 				now: Date.now(),
-				productMode,
+				representation,
 				resolveInjectionSource: (text) =>
 					useComposerStore.getState().consumeInjectionSourceForSession(sessionId, text),
 			});
@@ -244,7 +244,7 @@ function remapHistoricalTurn(
 export function rebuildProjectionFromMessages(
 	sessionId: string,
 	messages: unknown[],
-	productMode: SessionFrameProductMode = "current",
+	representation: SessionFrameRepresentation = "wire",
 ): ConversationProjection {
 	type LiteBlock = {
 		type?: string;
@@ -339,14 +339,14 @@ export function rebuildProjectionFromMessages(
 						};
 					}
 					if (block.type === "toolCall") {
-						const args = projectProjectionJsonValue(block.arguments, productMode);
+						const args = projectProjectionJsonValue(block.arguments, representation);
 						return {
 							type: "tool_call" as const,
 							key,
 							toolCallId: block.id ?? "",
 							toolName: block.name ?? "",
 							argsText:
-								productMode === "future"
+								representation === "projected"
 									? args.payload?.kind === "external"
 										? ""
 										: (JSON.stringify(args.value) ?? "")
@@ -387,10 +387,10 @@ export function rebuildProjectionFromMessages(
 		if (message.role === "toolResult") {
 			const step = turn.steps[turn.steps.length - 1];
 			if (!step) continue;
-			const content = projectProjectionTextSequence(message.content, productMode);
+			const content = projectProjectionTextSequence(message.content, representation);
 			const details =
-				productMode === "future" && message.details !== undefined
-					? projectProjectionJsonValue(message.details, productMode)
+				representation === "projected" && message.details !== undefined
+					? projectProjectionJsonValue(message.details, representation)
 					: { value: message.details };
 			const result = {
 				toolCallId: message.toolCallId ?? "",

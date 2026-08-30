@@ -7,6 +7,10 @@ Protocol 1.3 activation is part of the same release change as this document upda
 design below is unchanged; the activation state records the production contract after the atomic
 Main, Supervisor, Bridge, route, Browser, and documentation switch.
 
+The detailed decision below is historical rationale. ADR 0013 and `docs/protocol.md` define the
+current single-version Gateway contract; references to a 1.2 compatibility surface describe the
+pre-activation state and the explicit mismatch fixtures only.
+
 ## Context
 
 ADR 0010 introduced epoch-scoped references for raster images. The current attachment store keys a

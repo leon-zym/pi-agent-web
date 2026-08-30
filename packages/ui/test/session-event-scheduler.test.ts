@@ -320,7 +320,7 @@ describe("SessionEventScheduler", () => {
 		expect(scheduler.getMetrics()).toMatchObject({ sourceEvents: 6, reducerEvents: 3, commits: 1 });
 	});
 
-	it("cancels scheduled work and discards future input after dispose", () => {
+	it("cancels scheduled work and discards queued input after dispose", () => {
 		const clock = createClock();
 		let commits = 0;
 		const scheduler = new SessionEventScheduler({

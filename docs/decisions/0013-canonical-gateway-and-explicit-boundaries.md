@@ -6,11 +6,11 @@
 
 ## Context
 
-Protocol 1.3 added typed content references while 1.2 remained implemented as a parallel success
-path. Server factories, DTO families, Browser transports, and tests duplicated current and future
-execution. A shallow TypeBox registry also repeated structural checks before the existing contextual
-guards. The public attachment PUT route had no product caller because Browser command images remain
-inline and Pi output uses an internal staged publication path.
+Protocol 1.3 added typed content references while 1.2 was still implemented as a parallel success
+path. Server factories, DTO families, Browser transports, and tests duplicated inline and
+content-reference execution. A shallow TypeBox registry also repeated structural checks before the
+existing contextual guards. The public attachment PUT route had no product caller because Browser
+command images remain inline and Pi output uses an internal staged publication path.
 
 This multiplicity increased review surface, bundle size, and the chance that fixes reached only one
 mode. There was no supported independently released client or product requirement that justified

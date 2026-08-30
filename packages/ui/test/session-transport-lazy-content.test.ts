@@ -167,7 +167,7 @@ function adapter(
 }
 
 function harness(
-	futureContentAdapter?: SessionContentAdapter,
+	contentAdapter?: SessionContentAdapter,
 	onResyncRequired?: (message: Extract<InlineSessionWsServerMessage, { type: "resync_required" }>) => void,
 ): Harness {
 	const sockets: FakeSocket[] = [];
@@ -180,7 +180,7 @@ function harness(
 		url: () => "ws://lazy-content.test/api/v1/ws",
 		reconnectBaseMs: 0,
 		protocolVersion: { major: 1, minor: 3 },
-		futureContentAdapter,
+		contentAdapter,
 		onResyncRequired,
 	});
 	controllers.push(controller);
@@ -259,7 +259,7 @@ afterEach(() => {
 	for (const controller of controllers.splice(0)) controller.dispose();
 });
 
-describe("Session transport lazy future content facade", () => {
+describe("Session transport lazy projected content facade", () => {
 	it("resolves frozen four-field identities without putting runtime data in the facade", async () => {
 		const resolveText: NonNullable<SessionExtensionMaterializer["resolveText"]> = vi.fn(
 			async (_value, signal) => {

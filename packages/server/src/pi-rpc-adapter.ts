@@ -148,7 +148,7 @@ function hasOversizeEvidence(limit: unknown, actual: unknown): boolean {
 	);
 }
 
-const LEGACY_MODEL_KEYS = new Set([
+const PI_MODEL_KEYS = new Set([
 	"id",
 	"name",
 	"api",
@@ -201,10 +201,10 @@ function isCount(value: unknown): value is number {
 /**
  * Pi's reviewed Model wire has provider-routing fields the Browser does not
  * consume. Validate that exact upstream shape, then copy only product fields so
- * headers/base URLs and future unknown keys never cross the adapter boundary.
+ * headers/base URLs and unrecognized keys never cross the adapter boundary.
  */
 function normalizePiModel(value: unknown): unknown {
-	if (!isRecord(value) || !Object.keys(value).every((key) => LEGACY_MODEL_KEYS.has(key))) return value;
+	if (!isRecord(value) || !Object.keys(value).every((key) => PI_MODEL_KEYS.has(key))) return value;
 	if (
 		(value.api !== undefined && !isBoundedString(value.api, 256)) ||
 		(value.baseUrl !== undefined && (typeof value.baseUrl !== "string" || value.baseUrl.length > 8_192)) ||

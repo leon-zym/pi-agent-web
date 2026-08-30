@@ -285,7 +285,7 @@ function releaseSessionChannel(sessionHandle: string): void {
 	const runtime = channel.runtime;
 	// The gateway cannot see browser-only drafts or attachments. Keep the lease for an
 	// unmaterialized Session while local content exists so its orphan reaper cannot
-	// discard the only runtime that still owns that draft's future Session identity.
+	// discard the only runtime that still owns that draft's pending Session identity.
 	if (runtime?.recoverable === false && hasLocalTransientContent(sessionHandle)) return;
 	if (channel.lease.isController || channel.lease.fencingToken || channel.controllerIntent) {
 		transport.releaseSession(sessionHandle);

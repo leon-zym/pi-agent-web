@@ -78,12 +78,12 @@ class LogicalByteCounter {
 
 	add(amount: number): void {
 		if (!Number.isSafeInteger(amount) || amount < 0) {
-			throw new SessionLogicalBytesError("invalid_value", "future logical byte amount is invalid");
+			throw new SessionLogicalBytesError("invalid_value", "logical byte amount is invalid");
 		}
 		if (amount > this.limit - this.bytes) {
 			throw new SessionLogicalBytesError(
 				"limit_exceeded",
-				"future logical payload exceeded its byte limit",
+				"logical payload exceeded its byte limit",
 				this.limit,
 				this.limit + 1,
 			);
@@ -153,14 +153,14 @@ function countTextRoot(value: unknown, counter: LogicalByteCounter): void {
 		!Number.isSafeInteger(value.ref.byteLength) ||
 		Number(value.ref.byteLength) <= 0
 	) {
-		throw new SessionLogicalBytesError("invalid_value", "future logical text root is invalid");
+		throw new SessionLogicalBytesError("invalid_value", "logical text root is invalid");
 	}
 	counter.add(Number(value.ref.byteLength));
 }
 
 function countJsonRoot(value: unknown, counter: LogicalByteCounter): void {
 	if (!isRecord(value)) {
-		throw new SessionLogicalBytesError("invalid_value", "future logical JSON root is invalid");
+		throw new SessionLogicalBytesError("invalid_value", "logical JSON root is invalid");
 	}
 	if (value.type === "inline_json" && Object.hasOwn(value, "value")) {
 		countCanonical(value.value, "ordinary", counter);
@@ -172,7 +172,7 @@ function countJsonRoot(value: unknown, counter: LogicalByteCounter): void {
 		!Number.isSafeInteger(value.ref.byteLength) ||
 		Number(value.ref.byteLength) <= 0
 	) {
-		throw new SessionLogicalBytesError("invalid_value", "future logical JSON root is invalid");
+		throw new SessionLogicalBytesError("invalid_value", "logical JSON root is invalid");
 	}
 	counter.add(Number(value.ref.byteLength));
 }
@@ -329,13 +329,13 @@ function countCanonical(value: unknown, schema: Schema, counter: LogicalByteCoun
 	}
 	if (typeof value === "number") {
 		if (!Number.isFinite(value) || Math.abs(value) > Number.MAX_SAFE_INTEGER) {
-			throw new SessionLogicalBytesError("invalid_value", "future logical number is invalid");
+			throw new SessionLogicalBytesError("invalid_value", "logical number is invalid");
 		}
 		counter.add((Object.is(value, -0) ? "0" : String(value)).length);
 		return;
 	}
 	if (typeof value !== "object" || value === null || counter.activeObjects.has(value)) {
-		throw new SessionLogicalBytesError("invalid_value", "future logical value is not canonical JSON");
+		throw new SessionLogicalBytesError("invalid_value", "logical value is not canonical JSON");
 	}
 	counter.activeObjects.add(value);
 	try {
@@ -349,7 +349,7 @@ function countCanonical(value: unknown, schema: Schema, counter: LogicalByteCoun
 			return;
 		}
 		if (!isRecord(value)) {
-			throw new SessionLogicalBytesError("invalid_value", "future logical object is invalid");
+			throw new SessionLogicalBytesError("invalid_value", "logical object is invalid");
 		}
 		const record = value;
 		counter.add(1);
@@ -376,12 +376,12 @@ function analyze(
 ): SessionLogicalBytesResult {
 	const maxBytes = options.maxBytes ?? MAX_ANALYZED_BYTES;
 	if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > MAX_ANALYZED_BYTES) {
-		throw new SessionLogicalBytesError("invalid_limit", "future logical byte limit is invalid");
+		throw new SessionLogicalBytesError("invalid_limit", "logical byte limit is invalid");
 	}
 	const counter = new LogicalByteCounter(maxBytes);
 	countCanonical(value, schema, counter);
 	if (!Number.isSafeInteger(counter.bytes) || counter.bytes <= 0) {
-		throw new SessionLogicalBytesError("invalid_value", "future logical byte result is invalid");
+		throw new SessionLogicalBytesError("invalid_value", "logical byte result is invalid");
 	}
 	return Object.freeze({ byteLength: counter.bytes });
 }

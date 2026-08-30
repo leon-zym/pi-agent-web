@@ -120,7 +120,7 @@ export interface PiGenericPayloadExternalizerOptions
 	extends Omit<PiPayloadExternalizerOptions, "contentStore" | "productGuard"> {
 	contentStore: PiGenericPayloadExternalizerContentStore;
 	genericContent: Readonly<{ contentRefBudget: SessionContentRefBudgetDto }>;
-	/** Deterministic supplemental future-product guard after built-in provenance validation. */
+	/** Deterministic supplemental content-reference guard after built-in provenance validation. */
 	productGuard?: (
 		candidate: unknown,
 		context: SessionContentRefGuardContext,
@@ -182,7 +182,7 @@ export async function externalizePiPayload<T = unknown>(
 		const value = transformed.value;
 		throwIfAborted(options.signal);
 		const attachmentContext = { serverEpoch: options.serverEpoch, payloadBudget: options.payloadBudget };
-		const context = generic ? futureContext(options) : attachmentContext;
+		const context = generic ? contentRefContext(options) : attachmentContext;
 		const guardCandidate = generic ? transformed.currentGuardShadow : value;
 		const productValid =
 			input.kind === "event"
@@ -224,7 +224,7 @@ function isGenericOptions(
 	return "genericContent" in options;
 }
 
-function futureContext(options: PiGenericPayloadExternalizerOptions): SessionContentRefGuardContext {
+function contentRefContext(options: PiGenericPayloadExternalizerOptions): SessionContentRefGuardContext {
 	return {
 		serverEpoch: options.serverEpoch,
 		payloadBudget: options.payloadBudget,
@@ -249,7 +249,7 @@ function assertOptions(options: AnyPiPayloadExternalizerOptions): void {
 	}
 	if (
 		isGenericOptions(options) &&
-		(!isSessionContentRefGuardContext(futureContext(options)) ||
+		(!isSessionContentRefGuardContext(contentRefContext(options)) ||
 			typeof options.contentStore.stageUtf8 !== "function" ||
 			typeof options.contentStore.holdPublishedUtf8 !== "function")
 	) {
@@ -670,7 +670,7 @@ async function externalizeTextRoot(value: string, state: FrameState): Promise<Ge
 		product = Object.freeze({ type: "external_text" as const, ref: exact.ref });
 		shadow = "";
 	}
-	if (!isSessionTextPayloadDto(product, futureContext(options))) {
+	if (!isSessionTextPayloadDto(product, contentRefContext(options))) {
 		throw new PiPayloadExternalizationError(
 			"invalid_product_payload",
 			"Externalized Pi text failed its product guard",
@@ -695,7 +695,7 @@ async function externalizeJsonRoot(value: unknown, state: FrameState): Promise<G
 		product = Object.freeze({ type: "external_json" as const, ref: exact.ref });
 		shadow = null;
 	}
-	if (!isSessionJsonRootDto(product, futureContext(options))) {
+	if (!isSessionJsonRootDto(product, contentRefContext(options))) {
 		throw new PiPayloadExternalizationError(
 			"invalid_product_payload",
 			"Externalized Pi JSON failed its product guard",

@@ -189,9 +189,9 @@ export interface SessionTransportOptions {
 	resyncClock?: SessionResyncClock;
 	resyncRandom?: () => number;
 	/** Protocol 1.3 content adapter; production installs the default from the trusted hello context. */
-	futureContentAdapter?: SessionContentAdapter;
+	contentAdapter?: SessionContentAdapter;
 	/** Protocol 1.3 hello-scoped adapter install; custom factories are validated before activation. */
-	futureContentAdapterFactory?: SessionContentAdapterFactory;
+	contentAdapterFactory?: SessionContentAdapterFactory;
 }
 
 export interface SessionContentAdapterInstallation {
@@ -238,13 +238,13 @@ export interface SessionTransportController {
 	store: StoreApi<SessionTransportState>;
 	frameBus: OrderedSessionFrameBus;
 	globalBus: SessionTransportGlobalBus;
-	/** Hello-scoped future content facade; its identity is not a React dependency. */
+	/** Hello-scoped content facade; its identity is not a React dependency. */
 	resolveText: (
 		identity: SessionLazyIdentity,
 		payload: SessionTextPayloadProjection,
 		callerSignal?: AbortSignal,
 	) => Promise<string>;
-	/** Hello-scoped future content facade with a caller-owned typed JSON guard. */
+	/** Hello-scoped content facade with a caller-owned typed JSON guard. */
 	resolveJson: <T>(
 		identity: SessionLazyIdentity,
 		payload: SessionJsonRootProjection,

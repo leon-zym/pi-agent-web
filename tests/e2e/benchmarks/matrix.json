@@ -206,7 +206,7 @@
 	"knownCoverageGaps": [
 		"Gateway restart cannot yet preserve the harness origin and is not benchmarked.",
 		"A deliberately slow raw WebSocket client and concurrent history/command fairness are not yet benchmarked.",
-		"Future protocol content-root references remain an explicit private L3 lane; this suite covers production attachment refs only.",
+		"Generic typed content-root references are covered by the default Browser gate but are not benchmarked as a separate performance scenario; this suite measures production attachment refs.",
 		"Browser-triggered history cancellation and post-cancel process/heap release are not yet measured; the server cancellation contract is covered separately.",
 		"Stress concurrency uses synchronized repeated finite 1 MiB turns and reports actual arrival rate; it does not yet certify an uninterrupted 60 second 1000 delta/s arrival rate.",
 		"The deterministic Pi fixture proves repeatable protocol behavior, not real-provider or heterogeneous reference-host performance.",

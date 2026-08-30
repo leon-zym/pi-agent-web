@@ -156,7 +156,7 @@ function harness(
 			clearTimeout: (timer: unknown) => void;
 		};
 		resyncRandom?: () => number;
-		futureContentAdapter?: SessionContentAdapter;
+		contentAdapter?: SessionContentAdapter;
 	} = {},
 ): Harness {
 	const sockets: FakeSocket[] = [];
@@ -178,22 +178,22 @@ function harness(
 	return { controller, sockets };
 }
 
-const futureContentContext: SessionContentRefGuardContext = Object.freeze({
+const projectedContentContext: SessionContentRefGuardContext = Object.freeze({
 	serverEpoch: "test-server-epoch",
 	payloadBudget: SESSION_PAYLOAD_BUDGET,
 	contentRefBudget: SESSION_CONTENT_REF_BUDGET,
 });
 
-function futureAdapter(
+function projectedAdapter(
 	materializeExtensionRequest: SessionExtensionMaterializer["materializeExtensionRequest"],
 ): SessionContentAdapter {
 	return createSessionContentAdapter({
-		trustedContext: futureContentContext,
+		trustedContext: projectedContentContext,
 		resolver: { materializeExtensionRequest },
 	});
 }
 
-function futureSetEditorFrame(
+function projectedSetEditorFrame(
 	sessionHandle: string,
 	generation: number,
 	seq: number,
@@ -224,7 +224,7 @@ function futureSetEditorFrame(
 	};
 }
 
-function futureEventFrame(
+function projectedEventFrame(
 	sessionHandle: string,
 	generation: number,
 	seq: number,
@@ -240,7 +240,7 @@ function futureEventFrame(
 	};
 }
 
-function futureToolEventFrame(
+function projectedToolEventFrame(
 	sessionHandle: string,
 	generation: number,
 	seq: number,
@@ -254,7 +254,7 @@ function futureToolEventFrame(
 		seq,
 		event: {
 			type: "tool_execution_start",
-			toolCallId: "future-tool-call",
+			toolCallId: "projected-tool-call",
 			toolName: "fixture",
 			args: {
 				type: "external_json",
@@ -270,13 +270,13 @@ function futureToolEventFrame(
 	};
 }
 
-function futureSnapshot(sessionHandle: string, generation: number, id: string): SessionSnapshotDto {
-	const request = futureSetEditorFrame(sessionHandle, generation, 1, id).request;
-	if (request.method !== "set_editor_text") throw new Error("future editor fixture was not sticky");
+function projectedSnapshot(sessionHandle: string, generation: number, id: string): SessionSnapshotDto {
+	const request = projectedSetEditorFrame(sessionHandle, generation, 1, id).request;
+	if (request.method !== "set_editor_text") throw new Error("projected editor fixture was not sticky");
 	const runtimeValue = runtime(sessionHandle, generation, 0);
 	return {
 		type: "session_snapshot",
-		snapshotId: `future-${id}`,
+		snapshotId: `projected-${id}`,
 		serverEpoch: runtimeValue.serverEpoch,
 		workspaceId: runtimeValue.workspaceId,
 		sessionHandle,
@@ -292,11 +292,11 @@ function futureSnapshot(sessionHandle: string, generation: number, id: string): 
 	};
 }
 
-function futureChunkedSnapshotFrames(
+function projectedChunkedSnapshotFrames(
 	sessionHandle: string,
 	id: string,
 ): [SessionSnapshotBeginDto, SessionSnapshotChunkDto, SessionSnapshotEndDto] {
-	const snapshot = futureSnapshot(sessionHandle, 1, id);
+	const snapshot = projectedSnapshot(sessionHandle, 1, id);
 	const { type: _type, settledMessages: _settledMessages, ...snapshotHeader } = snapshot;
 	const runtimeValue = snapshot.runtime;
 	const message: SessionMessageDto = { role: "user", content: "snapshot", timestamp: 1 };
@@ -341,14 +341,14 @@ function futureChunkedSnapshotFrames(
 	return [begin, chunk, end];
 }
 
-function futureWireBytes(message: Parameters<SessionTransportController["ingestFrameMessage"]>[0]) {
+function projectedWireBytes(message: Parameters<SessionTransportController["ingestFrameMessage"]>[0]) {
 	return new TextEncoder().encode(JSON.stringify(message)).byteLength;
 }
 
 function ingest(
 	controller: SessionTransportController,
 	message: Parameters<SessionTransportController["ingestFrameMessage"]>[0],
-	rawWireBytes = futureWireBytes(message),
+	rawWireBytes = projectedWireBytes(message),
 ) {
 	return controller.ingestFrameMessage(message, rawWireBytes);
 }
@@ -855,7 +855,7 @@ describe("session transport Gateway negotiation", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "hot-a",
 			operation: "subscribe",
-			error: "snapshot_unavailable",
+			error: "session_snapshot_unavailable",
 		});
 
 		expect(
@@ -3857,21 +3857,21 @@ describe("session transport commands and identity", () => {
 });
 
 describe("canonical Session content transport", () => {
-	it("serializes future live materialization behind a chunked snapshot", async () => {
+	it("serializes projected live materialization behind a chunked snapshot", async () => {
 		let releaseSnapshot!: () => void;
 		const snapshotGate = new Promise<void>((resolve) => {
 			releaseSnapshot = resolve;
 		});
 		let liveMaterializationStarted = false;
-		const adapter = futureAdapter(async (request: ExtensionUiRequestDto) => {
-			if (request.id === "future-chunked-snapshot") await snapshotGate;
-			if (request.id === "future-chunked-live") liveMaterializationStarted = true;
+		const adapter = projectedAdapter(async (request: ExtensionUiRequestDto) => {
+			if (request.id === "projected-chunked-snapshot") await snapshotGate;
+			if (request.id === "projected-chunked-live") liveMaterializationStarted = true;
 			if (request.method !== "set_editor_text") throw new Error("unexpected fixture request");
 			return { ...request, text: `resolved:${request.id}` };
 		});
-		const h = harness({ futureContentAdapter: adapter });
+		const h = harness({ contentAdapter: adapter });
 		connect(h);
-		const sessionHandle = "future-chunked-session";
+		const sessionHandle = "projected-chunked-session";
 		const state = h.controller.store.getState();
 		state.subscribeSession(sessionHandle);
 		const runtimeValue = runtime(sessionHandle, 1, 0);
@@ -3884,7 +3884,7 @@ describe("canonical Session content transport", () => {
 			reason: "initial",
 		});
 
-		const [begin, chunk, end] = futureChunkedSnapshotFrames(sessionHandle, "future-chunked-snapshot");
+		const [begin, chunk, end] = projectedChunkedSnapshotFrames(sessionHandle, "projected-chunked-snapshot");
 		const delivered: string[] = [];
 		h.controller.frameBus.subscribe(sessionHandle, ({ message: frame }) => {
 			if (frame.type === "session_snapshot") delivered.push("snapshot");
@@ -3894,30 +3894,32 @@ describe("canonical Session content transport", () => {
 		expect(ingest(h.controller, begin)).toBe(true);
 		expect(ingest(h.controller, chunk)).toBe(true);
 		expect(ingest(h.controller, end)).toBe(true);
-		expect(ingest(h.controller, futureSetEditorFrame(sessionHandle, 1, 1, "future-chunked-live"))).toBe(true);
+		expect(ingest(h.controller, projectedSetEditorFrame(sessionHandle, 1, 1, "projected-chunked-live"))).toBe(
+			true,
+		);
 		await flushPromises();
 
 		expect(liveMaterializationStarted).toBe(false);
 		expect(delivered).toEqual([]);
 		releaseSnapshot();
-		await vi.waitFor(() => expect(delivered).toEqual(["snapshot", "future-chunked-live"]));
+		await vi.waitFor(() => expect(delivered).toEqual(["snapshot", "projected-chunked-live"]));
 	});
 
-	it("replaces a pending future snapshot before starting a chunked snapshot", async () => {
+	it("replaces a pending projected snapshot before starting a chunked snapshot", async () => {
 		let releasePrevious!: () => void;
 		let previousSignal: AbortSignal | undefined;
 		const previousGate = new Promise<void>((resolve) => {
 			releasePrevious = resolve;
 		});
-		const adapter = futureAdapter(async (request, signal) => {
-			if (request.id === "future-ordinary-snapshot") {
+		const adapter = projectedAdapter(async (request, signal) => {
+			if (request.id === "projected-ordinary-snapshot") {
 				previousSignal = signal;
 				await previousGate;
 			}
 			if (request.method !== "set_editor_text") throw new Error("unexpected fixture request");
 			return { ...request, text: `resolved:${request.id}` };
 		});
-		const h = harness({ futureContentAdapter: adapter });
+		const h = harness({ contentAdapter: adapter });
 		connect(h);
 		subscribeAndPrime(h, "session-a");
 		h.controller.ingestServerMessage({
@@ -3927,10 +3929,10 @@ describe("canonical Session content transport", () => {
 			runtime: runtime("session-a", 1, 0),
 			reason: "initial",
 		});
-		expect(ingest(h.controller, futureSnapshot("session-a", 1, "future-ordinary-snapshot"))).toBe(true);
+		expect(ingest(h.controller, projectedSnapshot("session-a", 1, "projected-ordinary-snapshot"))).toBe(true);
 		await vi.waitFor(() => expect(previousSignal).toBeDefined());
 
-		const [begin, chunk, end] = futureChunkedSnapshotFrames("session-a", "future-replacement");
+		const [begin, chunk, end] = projectedChunkedSnapshotFrames("session-a", "projected-replacement");
 		expect(ingest(h.controller, begin)).toBe(true);
 		expect(ingest(h.controller, chunk)).toBe(true);
 		expect(ingest(h.controller, end)).toBe(true);
@@ -3940,41 +3942,41 @@ describe("canonical Session content transport", () => {
 
 		expect(previousSignal?.aborted).toBe(true);
 		expect(h.controller.store.getState().sessions["session-a"]?.pendingExtensionRequests).toEqual([
-			expect.objectContaining({ id: "future-replacement" }),
+			expect.objectContaining({ id: "projected-replacement" }),
 		]);
 		releasePrevious();
 		await flushPromises();
 	});
 
-	it("serializes future Extension materialization per Session without blocking another Session", async () => {
+	it("serializes projected Extension materialization per Session without blocking another Session", async () => {
 		let releaseSlow!: () => void;
 		const slowGate = new Promise<void>((resolve) => {
 			releaseSlow = resolve;
 		});
-		const adapter = futureAdapter(async (request: ExtensionUiRequestDto) => {
+		const adapter = projectedAdapter(async (request: ExtensionUiRequestDto) => {
 			if (request.id === "slow-a") await slowGate;
 			if (request.method !== "set_editor_text") throw new Error("unexpected fixture request");
 			return { ...request, text: `resolved:${request.id}` };
 		});
-		const h = harness({ futureContentAdapter: adapter });
+		const h = harness({ contentAdapter: adapter });
 		connect(h);
 		subscribeAndPrime(h, "session-a");
 		subscribeAndPrime(h, "session-b");
 		const delivered: string[] = [];
-		h.controller.frameBus.subscribeAll(({ message, productMode }) => {
+		h.controller.frameBus.subscribeAll(({ message, representation }) => {
 			if (message.type === "extension_ui_request") {
-				delivered.push(`${message.sessionHandle}:${message.request.id}:${productMode}`);
+				delivered.push(`${message.sessionHandle}:${message.request.id}:${representation}`);
 			} else if (message.type === "event") {
-				delivered.push(`${message.sessionHandle}:${String(message.seq)}:${productMode}`);
+				delivered.push(`${message.sessionHandle}:${String(message.seq)}:${representation}`);
 			}
 		});
 
-		expect(ingest(h.controller, futureSetEditorFrame("session-a", 1, 1, "slow-a"))).toBe(true);
-		expect(ingest(h.controller, futureEventFrame("session-a", 1, 2))).toBe(true);
-		expect(ingest(h.controller, futureEventFrame("session-b", 1, 1))).toBe(true);
+		expect(ingest(h.controller, projectedSetEditorFrame("session-a", 1, 1, "slow-a"))).toBe(true);
+		expect(ingest(h.controller, projectedEventFrame("session-a", 1, 2))).toBe(true);
+		expect(ingest(h.controller, projectedEventFrame("session-b", 1, 1))).toBe(true);
 		await flushPromises();
 
-		expect(delivered).toEqual(["session-b:1:future"]);
+		expect(delivered).toEqual(["session-b:1:projected"]);
 		expect(h.controller.store.getState().sessions["session-a"]).toMatchObject({
 			lastSeq: 0,
 			projectedSeq: 0,
@@ -3985,7 +3987,11 @@ describe("canonical Session content transport", () => {
 		releaseSlow();
 		await vi.waitFor(() => expect(delivered).toHaveLength(3));
 
-		expect(delivered).toEqual(["session-b:1:future", "session-a:slow-a:future", "session-a:2:future"]);
+		expect(delivered).toEqual([
+			"session-b:1:projected",
+			"session-a:slow-a:projected",
+			"session-a:2:projected",
+		]);
 		expect(h.controller.store.getState().sessions["session-a"]).toMatchObject({
 			lastSeq: 2,
 			projectedSeq: 2,
@@ -3993,13 +3999,13 @@ describe("canonical Session content transport", () => {
 		});
 	});
 
-	it("fails future materialization with zero semantic progress and one cursorless resync", async () => {
+	it("fails projected materialization with zero semantic progress and one cursorless resync", async () => {
 		const notices: string[] = [];
-		const adapter = futureAdapter(async () => {
+		const adapter = projectedAdapter(async () => {
 			throw new Error("content unavailable");
 		});
 		const h = harness({
-			futureContentAdapter: adapter,
+			contentAdapter: adapter,
 			onResyncRequired: (message) => notices.push(message.reason),
 		});
 		const socket = connect(h);
@@ -4010,7 +4016,7 @@ describe("canonical Session content transport", () => {
 			if (message.type === "extension_ui_request") delivered.push(message.request.id);
 		});
 
-		ingest(h.controller, futureSetEditorFrame("session-a", 1, 1, "failure-one"));
+		ingest(h.controller, projectedSetEditorFrame("session-a", 1, 1, "failure-one"));
 		await flushPromises();
 		await flushPromises();
 
@@ -4025,7 +4031,7 @@ describe("canonical Session content transport", () => {
 			{ type: "session_subscribe", sessionHandle: "session-a" },
 		]);
 
-		ingest(h.controller, futureSetEditorFrame("session-a", 1, 1, "failure-two"));
+		ingest(h.controller, projectedSetEditorFrame("session-a", 1, 1, "failure-two"));
 		await flushPromises();
 		await flushPromises();
 
@@ -4033,17 +4039,17 @@ describe("canonical Session content transport", () => {
 		expect(notices.filter((reason) => reason === "gap")).toHaveLength(1);
 	});
 
-	it("retries a failed future snapshot waiter cursorlessly before committing the replacement", async () => {
+	it("retries a failed projected snapshot waiter cursorlessly before committing the replacement", async () => {
 		const clock = new ResyncClock();
 		let attempts = 0;
-		const adapter = futureAdapter(async (request) => {
+		const adapter = projectedAdapter(async (request) => {
 			attempts += 1;
 			if (attempts === 1) throw new Error("first snapshot content failed");
 			if (request.method !== "set_editor_text") throw new Error("unexpected fixture request");
 			return { ...request, text: "recovered snapshot text" };
 		});
 		const h = harness({
-			futureContentAdapter: adapter,
+			contentAdapter: adapter,
 			resyncClock: clock,
 			resyncRandom: () => 0.5,
 		});
@@ -4058,7 +4064,7 @@ describe("canonical Session content transport", () => {
 			reason: "gap",
 		});
 
-		expect(ingest(h.controller, futureSnapshot("session-a", 1, "snapshot-one"))).toBe(true);
+		expect(ingest(h.controller, projectedSnapshot("session-a", 1, "snapshot-one"))).toBe(true);
 		await vi.waitFor(() =>
 			expect(h.controller.store.getState().sessions["session-a"]?.recovery?.phase).toBe("retry_wait"),
 		);
@@ -4076,7 +4082,7 @@ describe("canonical Session content transport", () => {
 			{ type: "session_subscribe", sessionHandle: "session-a" },
 		]);
 
-		expect(ingest(h.controller, futureSnapshot("session-a", 1, "snapshot-two"))).toBe(true);
+		expect(ingest(h.controller, projectedSnapshot("session-a", 1, "snapshot-two"))).toBe(true);
 		await vi.waitFor(() =>
 			expect(h.controller.store.getState().sessions["session-a"]?.baselineAuthoritative).toBe(true),
 		);
@@ -4088,21 +4094,21 @@ describe("canonical Session content transport", () => {
 		});
 	});
 
-	it("aborts a pending future tail that exceeds the replay wire-byte budget", async () => {
+	it("aborts a pending projected tail that exceeds the replay wire-byte budget", async () => {
 		let materializerSignal: AbortSignal | undefined;
 		let release!: () => void;
 		const gate = new Promise<void>((resolve) => {
 			release = resolve;
 		});
 		const notices: string[] = [];
-		const adapter = futureAdapter(async (request, signal) => {
+		const adapter = projectedAdapter(async (request, signal) => {
 			materializerSignal = signal;
 			await gate;
 			if (request.method !== "set_editor_text") throw new Error("unexpected fixture request");
 			return { ...request, text: "late text" };
 		});
 		const h = harness({
-			futureContentAdapter: adapter,
+			contentAdapter: adapter,
 			onResyncRequired: (message) => notices.push(message.reason),
 		});
 		const socket = connect(h);
@@ -4118,12 +4124,12 @@ describe("canonical Session content transport", () => {
 		expect(
 			ingest(
 				h.controller,
-				futureSetEditorFrame("session-a", 1, 1, "slow-byte-tail"),
+				projectedSetEditorFrame("session-a", 1, 1, "slow-byte-tail"),
 				EXPECTED_RESYNC_BYTE_LIMIT - 1,
 			),
 		).toBe(true);
 		await vi.waitFor(() => expect(materializerSignal).toBeDefined());
-		expect(ingest(h.controller, futureEventFrame("session-a", 1, 2), 2)).toBe(true);
+		expect(ingest(h.controller, projectedEventFrame("session-a", 1, 2), 2)).toBe(true);
 
 		expect(materializerSignal?.aborted).toBe(true);
 		expect(h.controller.store.getState().sessions["session-a"]).toMatchObject({
@@ -4141,31 +4147,31 @@ describe("canonical Session content transport", () => {
 		expect(delivered).toEqual([]);
 	});
 
-	it("aborts a pending future tail that exceeds the replay frame-count budget", async () => {
+	it("aborts a pending projected tail that exceeds the replay frame-count budget", async () => {
 		let materializerSignal: AbortSignal | undefined;
 		let release!: () => void;
 		const gate = new Promise<void>((resolve) => {
 			release = resolve;
 		});
-		const adapter = futureAdapter(async (request, signal) => {
+		const adapter = projectedAdapter(async (request, signal) => {
 			materializerSignal = signal;
 			await gate;
 			if (request.method !== "set_editor_text") throw new Error("unexpected fixture request");
 			return { ...request, text: "late text" };
 		});
-		const h = harness({ futureContentAdapter: adapter });
+		const h = harness({ contentAdapter: adapter });
 		const socket = connect(h);
 		subscribeAndPrime(h, "session-a");
 		const before = socket.sent.filter(({ type }) => type === "session_subscribe").length;
 
-		expect(ingest(h.controller, futureSetEditorFrame("session-a", 1, 1, "slow-count-tail"), 1)).toBe(true);
+		expect(ingest(h.controller, projectedSetEditorFrame("session-a", 1, 1, "slow-count-tail"), 1)).toBe(true);
 		await vi.waitFor(() => expect(materializerSignal).toBeDefined());
 		for (let seq = 2; seq <= EXPECTED_RESYNC_FRAME_LIMIT; seq += 1) {
-			expect(ingest(h.controller, futureEventFrame("session-a", 1, seq), 1)).toBe(true);
+			expect(ingest(h.controller, projectedEventFrame("session-a", 1, seq), 1)).toBe(true);
 		}
-		expect(ingest(h.controller, futureEventFrame("session-a", 1, EXPECTED_RESYNC_FRAME_LIMIT + 1), 1)).toBe(
-			true,
-		);
+		expect(
+			ingest(h.controller, projectedEventFrame("session-a", 1, EXPECTED_RESYNC_FRAME_LIMIT + 1), 1),
+		).toBe(true);
 
 		expect(materializerSignal?.aborted).toBe(true);
 		expect(h.controller.store.getState().sessions["session-a"]).toMatchObject({
@@ -4179,21 +4185,21 @@ describe("canonical Session content transport", () => {
 		await flushPromises();
 	});
 
-	it("fails the exact snapshot waiter when a second future snapshot occupies its tail slot", async () => {
+	it("fails the exact snapshot waiter when a second projected snapshot occupies its tail slot", async () => {
 		const clock = new ResyncClock();
 		let materializerSignal: AbortSignal | undefined;
 		let release!: () => void;
 		const gate = new Promise<void>((resolve) => {
 			release = resolve;
 		});
-		const adapter = futureAdapter(async (request, signal) => {
+		const adapter = projectedAdapter(async (request, signal) => {
 			materializerSignal = signal;
 			await gate;
 			if (request.method !== "set_editor_text") throw new Error("unexpected fixture request");
 			return { ...request, text: "late text" };
 		});
 		const h = harness({
-			futureContentAdapter: adapter,
+			contentAdapter: adapter,
 			resyncClock: clock,
 			resyncRandom: () => 0.5,
 		});
@@ -4208,9 +4214,9 @@ describe("canonical Session content transport", () => {
 		});
 		const before = socket.sent.filter(({ type }) => type === "session_subscribe").length;
 
-		expect(ingest(h.controller, futureSnapshot("session-a", 1, "snapshot-slot-one"))).toBe(true);
+		expect(ingest(h.controller, projectedSnapshot("session-a", 1, "snapshot-slot-one"))).toBe(true);
 		await vi.waitFor(() => expect(materializerSignal).toBeDefined());
-		expect(ingest(h.controller, futureSnapshot("session-a", 1, "snapshot-slot-two"))).toBe(true);
+		expect(ingest(h.controller, projectedSnapshot("session-a", 1, "snapshot-slot-two"))).toBe(true);
 
 		expect(materializerSignal?.aborted).toBe(true);
 		await vi.waitFor(() =>
@@ -4231,21 +4237,21 @@ describe("canonical Session content transport", () => {
 		await flushPromises();
 	});
 
-	it("fails a pending snapshot waiter when an ordinary future frame overflows its tail", async () => {
+	it("fails a pending snapshot waiter when an ordinary projected frame overflows its tail", async () => {
 		const clock = new ResyncClock();
 		let materializerSignal: AbortSignal | undefined;
 		let release!: () => void;
 		const gate = new Promise<void>((resolve) => {
 			release = resolve;
 		});
-		const adapter = futureAdapter(async (request, signal) => {
+		const adapter = projectedAdapter(async (request, signal) => {
 			materializerSignal = signal;
 			await gate;
 			if (request.method !== "set_editor_text") throw new Error("unexpected fixture request");
 			return { ...request, text: "late snapshot text" };
 		});
 		const h = harness({
-			futureContentAdapter: adapter,
+			contentAdapter: adapter,
 			resyncClock: clock,
 			resyncRandom: () => 0.5,
 		});
@@ -4258,10 +4264,10 @@ describe("canonical Session content transport", () => {
 			runtime: runtime("session-a", 1, 0),
 			reason: "initial",
 		});
-		expect(ingest(h.controller, futureSnapshot("session-a", 1, "overflowed"))).toBe(true);
+		expect(ingest(h.controller, projectedSnapshot("session-a", 1, "overflowed"))).toBe(true);
 		await vi.waitFor(() => expect(materializerSignal).toBeDefined());
 
-		expect(ingest(h.controller, futureEventFrame("session-a", 1, 1), EXPECTED_RESYNC_BYTE_LIMIT + 1)).toBe(
+		expect(ingest(h.controller, projectedEventFrame("session-a", 1, 1), EXPECTED_RESYNC_BYTE_LIMIT + 1)).toBe(
 			true,
 		);
 
@@ -4286,7 +4292,7 @@ describe("canonical Session content transport", () => {
 		const gate = new Promise<void>((resolve) => {
 			release = resolve;
 		});
-		const adapter = futureAdapter(async (request) => {
+		const adapter = projectedAdapter(async (request) => {
 			if (request.id === "ordinary-fails") {
 				await gate;
 				throw new Error("ordinary content failed");
@@ -4295,13 +4301,13 @@ describe("canonical Session content transport", () => {
 			return { ...request, text: "snapshot text" };
 		});
 		const h = harness({
-			futureContentAdapter: adapter,
+			contentAdapter: adapter,
 			resyncClock: clock,
 			resyncRandom: () => 0.5,
 		});
 		connect(h);
 		subscribeAndPrime(h, "session-a");
-		expect(ingest(h.controller, futureSetEditorFrame("session-a", 1, 1, "ordinary-fails"))).toBe(true);
+		expect(ingest(h.controller, projectedSetEditorFrame("session-a", 1, 1, "ordinary-fails"))).toBe(true);
 		await flushPromises();
 		h.controller.ingestServerMessage({
 			type: "resync_required",
@@ -4310,7 +4316,7 @@ describe("canonical Session content transport", () => {
 			runtime: runtime("session-a", 1, 0),
 			reason: "initial",
 		});
-		expect(ingest(h.controller, futureSnapshot("session-a", 1, "queued"))).toBe(true);
+		expect(ingest(h.controller, projectedSnapshot("session-a", 1, "queued"))).toBe(true);
 
 		release();
 		await vi.waitFor(() =>
@@ -4325,9 +4331,9 @@ describe("canonical Session content transport", () => {
 		});
 	});
 
-	it("retains future provenance for a buffered snapshot suffix in delivery order", async () => {
-		const adapter = futureAdapter(async (request) => request);
-		const h = harness({ futureContentAdapter: adapter });
+	it("retains projected provenance for a buffered snapshot suffix in delivery order", async () => {
+		const adapter = projectedAdapter(async (request) => request);
+		const h = harness({ contentAdapter: adapter });
 		connect(h);
 		subscribeAndPrime(h, "session-a");
 		h.controller.ingestServerMessage({
@@ -4337,11 +4343,11 @@ describe("canonical Session content transport", () => {
 			runtime: runtime("session-a", 1, 0),
 			reason: "gap",
 		});
-		const delivered: Array<{ type: string; productMode: string; args?: unknown }> = [];
-		h.controller.frameBus.subscribe("session-a", ({ message, productMode }) => {
+		const delivered: Array<{ type: string; representation: string; args?: unknown }> = [];
+		h.controller.frameBus.subscribe("session-a", ({ message, representation }) => {
 			delivered.push({
 				type: message.type,
-				productMode,
+				representation,
 				args:
 					message.type === "event" && message.event.type === "tool_execution_start"
 						? message.event.args
@@ -4349,12 +4355,12 @@ describe("canonical Session content transport", () => {
 			});
 		});
 
-		expect(ingest(h.controller, futureToolEventFrame("session-a", 1, 1))).toBe(true);
+		expect(ingest(h.controller, projectedToolEventFrame("session-a", 1, 1))).toBe(true);
 		await vi.waitFor(() =>
 			expect(h.controller.store.getState().sessions["session-a"]?.resync?.bufferedFrameCount).toBe(1),
 		);
 		const snapshot = {
-			...futureSnapshot("session-a", 1, "suffix"),
+			...projectedSnapshot("session-a", 1, "suffix"),
 			stickyExtensionState: [],
 		};
 		expect(ingest(h.controller, snapshot)).toBe(true);
@@ -4363,10 +4369,10 @@ describe("canonical Session content transport", () => {
 		);
 
 		expect(delivered).toEqual([
-			{ type: "session_snapshot", productMode: "future", args: undefined },
+			{ type: "session_snapshot", representation: "projected", args: undefined },
 			{
 				type: "event",
-				productMode: "future",
+				representation: "projected",
 				args: expect.objectContaining({
 					type: "external_json",
 					ref: expect.objectContaining({ sha256: "b".repeat(64) }),
@@ -4380,19 +4386,19 @@ describe("canonical Session content transport", () => {
 		});
 	});
 
-	it("aborts future work on disconnect and ignores a late materializer settlement", async () => {
+	it("aborts projected work on disconnect and ignores a late materializer settlement", async () => {
 		let materializerSignal: AbortSignal | undefined;
 		let release!: () => void;
 		const gate = new Promise<void>((resolve) => {
 			release = resolve;
 		});
-		const adapter = futureAdapter(async (request, signal) => {
+		const adapter = projectedAdapter(async (request, signal) => {
 			materializerSignal = signal;
 			await gate;
 			if (request.method !== "set_editor_text") throw new Error("unexpected fixture request");
 			return { ...request, text: "late text" };
 		});
-		const h = harness({ futureContentAdapter: adapter });
+		const h = harness({ contentAdapter: adapter });
 		const socket = connect(h);
 		subscribeAndPrime(h, "session-a");
 		const delivered: string[] = [];
@@ -4400,7 +4406,7 @@ describe("canonical Session content transport", () => {
 			if (message.type === "extension_ui_request") delivered.push(message.request.id);
 		});
 
-		ingest(h.controller, futureSetEditorFrame("session-a", 1, 1, "disconnect-late"));
+		ingest(h.controller, projectedSetEditorFrame("session-a", 1, 1, "disconnect-late"));
 		await vi.waitFor(() => expect(materializerSignal).toBeDefined());
 		socket.serverClose();
 		expect(materializerSignal?.aborted).toBe(true);
@@ -4417,13 +4423,13 @@ describe("canonical Session content transport", () => {
 		});
 	});
 
-	it("cuts off a parent future tail synchronously at rekey before child delivery", async () => {
+	it("cuts off a parent projected tail synchronously at rekey before child delivery", async () => {
 		let parentSignal: AbortSignal | undefined;
 		let releaseParent!: () => void;
 		const parentGate = new Promise<void>((resolve) => {
 			releaseParent = resolve;
 		});
-		const adapter = futureAdapter(async (request, signal) => {
+		const adapter = projectedAdapter(async (request, signal) => {
 			if (request.id === "parent-late") {
 				parentSignal = signal;
 				await parentGate;
@@ -4431,15 +4437,15 @@ describe("canonical Session content transport", () => {
 			if (request.method !== "set_editor_text") throw new Error("unexpected fixture request");
 			return { ...request, text: `resolved:${request.id}` };
 		});
-		const h = harness({ futureContentAdapter: adapter });
+		const h = harness({ contentAdapter: adapter });
 		connect(h);
 		subscribeAndPrime(h, "session-parent");
 		const delivered: string[] = [];
-		h.controller.frameBus.subscribe("session-parent", ({ sessionHandle, message, productMode }) => {
-			delivered.push(`${sessionHandle}:${message.type}:${productMode}`);
+		h.controller.frameBus.subscribe("session-parent", ({ sessionHandle, message, representation }) => {
+			delivered.push(`${sessionHandle}:${message.type}:${representation}`);
 		});
 
-		ingest(h.controller, futureSetEditorFrame("session-parent", 1, 1, "parent-late"));
+		ingest(h.controller, projectedSetEditorFrame("session-parent", 1, 1, "parent-late"));
 		await vi.waitFor(() => expect(parentSignal).toBeDefined());
 		h.controller.ingestServerMessage({
 			type: "session_rekeyed",
@@ -4449,15 +4455,15 @@ describe("canonical Session content transport", () => {
 		});
 
 		expect(parentSignal?.aborted).toBe(true);
-		expect(delivered).toEqual(["session-child:session_rekeyed:current"]);
+		expect(delivered).toEqual(["session-child:session_rekeyed:wire"]);
 		releaseParent();
 		await flushPromises();
-		expect(ingest(h.controller, futureSetEditorFrame("session-child", 2, 1, "child"))).toBe(true);
+		expect(ingest(h.controller, projectedSetEditorFrame("session-child", 2, 1, "child"))).toBe(true);
 		await vi.waitFor(() => expect(delivered).toHaveLength(2));
 
 		expect(delivered).toEqual([
-			"session-child:session_rekeyed:current",
-			"session-child:extension_ui_request:future",
+			"session-child:session_rekeyed:wire",
+			"session-child:extension_ui_request:projected",
 		]);
 		expect(h.controller.store.getState().sessions["session-parent"]?.pendingExtensionRequests).toEqual([]);
 		expect(h.controller.store.getState().sessions["session-child"]).toMatchObject({
@@ -4467,26 +4473,26 @@ describe("canonical Session content transport", () => {
 		});
 	});
 
-	it("aborts an old-generation future tail before installing a resync identity", async () => {
+	it("aborts an old-generation projected tail before installing a resync identity", async () => {
 		let materializerSignal: AbortSignal | undefined;
 		let release!: () => void;
 		const gate = new Promise<void>((resolve) => {
 			release = resolve;
 		});
-		const adapter = futureAdapter(async (request, signal) => {
+		const adapter = projectedAdapter(async (request, signal) => {
 			materializerSignal = signal;
 			await gate;
 			if (request.method !== "set_editor_text") throw new Error("unexpected fixture request");
 			return { ...request, text: "late old-generation text" };
 		});
-		const h = harness({ futureContentAdapter: adapter });
+		const h = harness({ contentAdapter: adapter });
 		connect(h);
 		subscribeAndPrime(h, "session-a");
 		const delivered: string[] = [];
 		h.controller.frameBus.subscribe("session-a", ({ message }) => {
 			if (message.type === "extension_ui_request") delivered.push(message.request.id);
 		});
-		ingest(h.controller, futureSetEditorFrame("session-a", 1, 1, "old-generation"));
+		ingest(h.controller, projectedSetEditorFrame("session-a", 1, 1, "old-generation"));
 		await vi.waitFor(() => expect(materializerSignal).toBeDefined());
 
 		h.controller.ingestServerMessage({
@@ -4509,26 +4515,26 @@ describe("canonical Session content transport", () => {
 		});
 	});
 
-	it("aborts future work when protocol incompatibility resets the transport", async () => {
+	it("aborts projected work when protocol incompatibility resets the transport", async () => {
 		let materializerSignal: AbortSignal | undefined;
 		let release!: () => void;
 		const gate = new Promise<void>((resolve) => {
 			release = resolve;
 		});
-		const adapter = futureAdapter(async (request, signal) => {
+		const adapter = projectedAdapter(async (request, signal) => {
 			materializerSignal = signal;
 			await gate;
 			if (request.method !== "set_editor_text") throw new Error("unexpected fixture request");
 			return { ...request, text: "late incompatible text" };
 		});
-		const h = harness({ futureContentAdapter: adapter });
+		const h = harness({ contentAdapter: adapter });
 		const socket = connect(h);
 		subscribeAndPrime(h, "session-a");
 		const delivered: string[] = [];
 		h.controller.frameBus.subscribe("session-a", ({ message }) => {
 			if (message.type === "extension_ui_request") delivered.push(message.request.id);
 		});
-		ingest(h.controller, futureSetEditorFrame("session-a", 1, 1, "incompatible"));
+		ingest(h.controller, projectedSetEditorFrame("session-a", 1, 1, "incompatible"));
 		await vi.waitFor(() => expect(materializerSignal).toBeDefined());
 
 		socket.onmessage?.({ data: "{}" });
@@ -4540,26 +4546,26 @@ describe("canonical Session content transport", () => {
 		expect(delivered).toEqual([]);
 	});
 
-	it("aborts future work when a terminal subscribe error closes the Session", async () => {
+	it("aborts projected work when a terminal subscribe error closes the Session", async () => {
 		let materializerSignal: AbortSignal | undefined;
 		let release!: () => void;
 		const gate = new Promise<void>((resolve) => {
 			release = resolve;
 		});
-		const adapter = futureAdapter(async (request, signal) => {
+		const adapter = projectedAdapter(async (request, signal) => {
 			materializerSignal = signal;
 			await gate;
 			if (request.method !== "set_editor_text") throw new Error("unexpected fixture request");
 			return { ...request, text: "late terminal text" };
 		});
-		const h = harness({ futureContentAdapter: adapter });
+		const h = harness({ contentAdapter: adapter });
 		connect(h);
 		subscribeAndPrime(h, "session-a");
 		const delivered: string[] = [];
 		h.controller.frameBus.subscribe("session-a", ({ message }) => {
 			if (message.type === "extension_ui_request") delivered.push(message.request.id);
 		});
-		ingest(h.controller, futureSetEditorFrame("session-a", 1, 1, "terminal"));
+		ingest(h.controller, projectedSetEditorFrame("session-a", 1, 1, "terminal"));
 		await vi.waitFor(() => expect(materializerSignal).toBeDefined());
 
 		h.controller.ingestServerMessage({

@@ -6,7 +6,7 @@ export type RuntimeStateSource = {
 	phase?: SessionRuntimePhaseDto;
 };
 
-/** Resolve the newer operational phase while remaining compatible with legacy state-only DTOs. */
+/** Resolve the operational phase, falling back when an inventory entry has state only. */
 export function runtimePhase(runtime: RuntimeStateSource | null | undefined): SessionRuntimePhaseDto | null {
 	if (!runtime) return null;
 	if (runtime.phase !== undefined) return runtime.phase;
@@ -44,7 +44,7 @@ export function runtimeIsSettled(runtime: RuntimeStateSource | null | undefined)
 	return phase === "ready" || phase === "crashed" || phase === "dormant";
 }
 
-/** Map an operational phase back to the legacy display state used by existing UI rows. */
+/** Map an operational phase back to the state field consumed by existing UI rows. */
 export function runtimeStateForDisplay(
 	runtime: RuntimeStateSource | null | undefined,
 ): SessionRuntimeStateDto | undefined {

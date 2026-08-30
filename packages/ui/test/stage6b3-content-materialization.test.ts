@@ -152,7 +152,7 @@ function isNestedLookalikeDocument(value: unknown): value is NestedLookalikeDocu
 	);
 }
 
-describe("Stage6b3 future Session content materialization attacks", () => {
+describe("Stage6b3 Session content materialization attacks", () => {
 	it("does zero GETs for inline text and inline JSON", async () => {
 		const fetcher = vi.fn(async (): Promise<Response> => {
 			throw new Error("inline content must not issue a GET");

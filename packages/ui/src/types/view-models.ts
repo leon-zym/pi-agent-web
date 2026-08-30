@@ -51,7 +51,7 @@ export interface UiToolResult {
 	toolName: string;
 	/** Flattened text content shown to the user. */
 	content: string;
-	/** Ordered future text roots retained without eagerly fetching external values. */
+	/** Ordered external text roots retained without eagerly fetching their values. */
 	textPayloads?: SessionTextPayloadProjection[];
 	isError: boolean;
 	details?: unknown;
