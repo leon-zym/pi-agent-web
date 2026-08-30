@@ -58,7 +58,7 @@ export function TurnTail({ turn, sessionHandle }: { turn: ProductTurn; sessionHa
 	const cost = turn.usage?.cost ?? 0;
 
 	return (
-		<div className="flex min-h-6 items-center gap-2 text-[11px] text-ink-3 max-lg:min-h-10">
+		<div className="flex min-h-6 items-center gap-2 text-[11px] text-ink-3 [@media(hover:none)]:min-h-10">
 			{turn.status === "error" && (
 				<span className="inline-flex items-center gap-1 text-danger">
 					<CircleAlert className="size-3.5" />

@@ -33,6 +33,7 @@ const deferNewSessionFile =
 	(process.env.PI_WEB_E2E_DEFER_NEW_SESSION_FILE === "1" ||
 		countRecordedStarts(markerPath) >= deferNewSessionFileAfterStarts);
 const recoveryFeatures = process.env.PI_WEB_E2E_RECOVERY_FEATURES === "1";
+const longContextCost = process.env.PI_WEB_E2E_LONG_CONTEXT_COST === "1";
 // This branch is inert unless the explicitly opt-in private Browser fixture asks for it.
 const futureContentRefFixture = process.env.PI_WEB_E2E_CONTENT_REF_FIXTURE === "1";
 let delayedExistingState = false;
@@ -2023,7 +2024,7 @@ function handleLine(line) {
 				tokens: recoveryFeatures
 					? { input: 32_000, output: 12_000, cacheRead: 0, cacheWrite: 0, total: 44_000 }
 					: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 },
-				cost: 0,
+				cost: longContextCost ? 1_234_567.89 : 0,
 				contextUsage: recoveryFeatures
 					? { tokens: 44_000, contextWindow: 128_000, percent: 34.375 }
 					: { tokens: null, contextWindow: 128_000, percent: null },

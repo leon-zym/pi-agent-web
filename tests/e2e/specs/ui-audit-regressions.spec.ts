@@ -11,7 +11,10 @@ const captureDirectory = process.env.PI_WEB_E2E_CAPTURE_DIR;
 
 test.use({
 	harnessOptions: {
-		extraEnv: { PI_WEB_E2E_RECOVERY_FEATURES: "1" },
+		extraEnv: {
+			PI_WEB_E2E_LONG_CONTEXT_COST: "1",
+			PI_WEB_E2E_RECOVERY_FEATURES: "1",
+		},
 	},
 });
 
@@ -38,42 +41,112 @@ async function minimumTarget(locator: Locator, minimum = 40): Promise<void> {
 	expect(box?.height ?? 0).toBeGreaterThanOrEqual(minimum);
 }
 
-test("context details stay inside the wide-screen meter", async ({ page, harness }) => {
+async function expectContextComposerAt640(page: Page, locale: "en" | "zh-CN"): Promise<void> {
 	await page.setViewportSize({ width: 640, height: 900 });
+	const meter = page.getByTestId("context-meter");
+	await expect(meter).toHaveAttribute("data-state", "ready");
+	const detail = meter.locator(":scope > span");
+	await expect(detail).toBeVisible();
+	await expect(meter).toContainText("34%");
+
+	const geometry = await page.evaluate(() => {
+		const meterElement = document.querySelector<HTMLElement>('[data-testid="context-meter"]');
+		const composer = document.querySelector<HTMLElement>('[data-testid="composer-card"]');
+		if (!meterElement || !composer) throw new Error("missing composer geometry target");
+		const meterRect = meterElement.getBoundingClientRect();
+		const composerRect = composer.getBoundingClientRect();
+		return {
+			composerClientWidth: composer.clientWidth,
+			composerRectLeft: composerRect.left,
+			composerRectRight: composerRect.right,
+			composerScrollWidth: composer.scrollWidth,
+			documentScrollWidth: document.documentElement.scrollWidth,
+			meterClientWidth: meterElement.clientWidth,
+			meterRectLeft: meterRect.left,
+			meterRectRight: meterRect.right,
+			meterScrollWidth: meterElement.scrollWidth,
+			viewportWidth: window.innerWidth,
+		};
+	});
+	expect(geometry.documentScrollWidth, `${locale} document overflow`).toBeLessThanOrEqual(
+		geometry.viewportWidth,
+	);
+	expect(geometry.composerScrollWidth, `${locale} composer overflow`).toBeLessThanOrEqual(
+		geometry.composerClientWidth,
+	);
+	expect(geometry.composerRectLeft).toBeGreaterThanOrEqual(0);
+	expect(geometry.composerRectRight).toBeLessThanOrEqual(geometry.viewportWidth);
+	expect(geometry.meterScrollWidth, `${locale} context meter overflow`).toBeLessThanOrEqual(
+		geometry.meterClientWidth,
+	);
+	expect(geometry.meterRectLeft).toBeGreaterThanOrEqual(geometry.composerRectLeft);
+	expect(geometry.meterRectRight).toBeLessThanOrEqual(geometry.composerRectRight);
+}
+
+for (const locale of ["en", "zh-CN"] as const) {
+	test(`640px ${locale} fine pointer shows context percentage without composer overflow`, async ({
+		page,
+		harness,
+	}) => {
+		await page.setViewportSize({ width: 640, height: 900 });
+		await openWorkbench(page, harness.origin, locale);
+		expect(await page.evaluate(() => matchMedia("(hover: hover)").matches)).toBe(true);
+		await expectContextComposerAt640(page, locale);
+
+		const meter = page.getByTestId("context-meter");
+		await meter.hover();
+		const tooltip = page.locator('[data-slot="tooltip-content"]');
+		await expect(tooltip).toBeVisible();
+		await expect(tooltip).toContainText("$1234567.89");
+		await capture(page, `context-meter-640-${locale}-fine-light`);
+	});
+}
+
+test("context percentage remains compact below the sm breakpoint", async ({ page, harness }) => {
+	await page.setViewportSize({ width: 375, height: 812 });
 	await openWorkbench(page, harness.origin, "en");
 	const meter = page.getByTestId("context-meter");
 	await expect(meter).toHaveAttribute("data-state", "ready");
 	const detail = meter.locator(":scope > span");
+	await expect(detail).toBeHidden();
+	const geometry = await meter.evaluate((element) => ({
+		clientWidth: element.clientWidth,
+		scrollWidth: element.scrollWidth,
+	}));
+	expect(geometry.scrollWidth).toBeLessThanOrEqual(geometry.clientWidth);
+});
 
-	for (const width of [375, 640]) {
-		await page.setViewportSize({ width, height: 900 });
-		await expect(detail).toBeHidden();
-		const geometry = await meter.evaluate((element) => ({
-			clientWidth: element.clientWidth,
-			scrollWidth: element.scrollWidth,
-		}));
-		expect(geometry.scrollWidth, `${String(width)}px context meter`).toBeLessThanOrEqual(
-			geometry.clientWidth,
-		);
-	}
+test("768px fine pointer keeps the turn tail compact", async ({ page, harness }) => {
+	await page.setViewportSize({ width: 768, height: 900 });
+	await openWorkbench(page, harness.origin, "en");
+	expect(await page.evaluate(() => matchMedia("(hover: hover)").matches)).toBe(true);
+	await page.locator("textarea").fill("E2E_COMPLEX_DEMO");
+	await page.getByRole("button", { name: "Send" }).click();
+	await expect(page.getByRole("heading", { name: "Synthetic change review", level: 2 })).toBeVisible();
 
-	for (const width of [768, 1023, 1280]) {
-		await page.setViewportSize({ width, height: 900 });
-		await expect(detail).toBeVisible();
-		await expect(meter).toContainText("34%");
-		const geometry = await meter.evaluate((element) => ({
-			clientWidth: element.clientWidth,
-			scrollWidth: element.scrollWidth,
-		}));
-		expect(geometry.scrollWidth, `${String(width)}px context meter`).toBeLessThanOrEqual(
-			geometry.clientWidth,
-		);
-	}
-	await capture(page, "context-meter-1024-en-light");
+	const turnTail = page.getByRole("button", { name: "Copy" }).last().locator("..");
+	const box = await turnTail.boundingBox();
+	expect(box).not.toBeNull();
+	expect(box?.height ?? Number.POSITIVE_INFINITY).toBeLessThan(40);
+	await capture(page, "turn-tail-768-en-fine-light");
 });
 
 test.describe("small touch geometry", () => {
 	test.use({ hasTouch: true });
+
+	for (const locale of ["en", "zh-CN"] as const) {
+		test(`640px ${locale} coarse pointer shows context percentage without composer overflow`, async ({
+			page,
+			harness,
+		}) => {
+			await page.setViewportSize({ width: 640, height: 900 });
+			await openWorkbench(page, harness.origin, locale);
+			expect(await page.evaluate(() => matchMedia("(hover: none)").matches)).toBe(true);
+			await expectContextComposerAt640(page, locale);
+			await minimumTarget(page.getByTestId("context-meter"));
+			await capture(page, `context-meter-640-${locale}-touch-light`);
+		});
+	}
 
 	test("localized long Diff toolbar wraps without clipping", async ({ page, harness }) => {
 		await page.setViewportSize({ width: 375, height: 812 });
@@ -153,6 +226,12 @@ test.describe("small touch geometry", () => {
 		for (const control of [reasoningInspect, toolToggle, toolInspect, turnCopy, turnFork, userCopy]) {
 			await minimumTarget(control);
 		}
+		const turnTail = turnCopy.locator("..");
+		const turnTailBox = await turnTail.boundingBox();
+		expect(turnTailBox).not.toBeNull();
+		expect(turnTailBox?.height ?? 0).toBeGreaterThanOrEqual(40);
+		await turnTail.evaluate((element) => element.scrollIntoView({ block: "center" }));
+		await capture(page, "turn-tail-768-en-touch-light");
 		await page.setViewportSize({ width: 375, height: 812 });
 		await reasoningToggle.scrollIntoViewIfNeeded();
 		await capture(page, "conversation-controls-375-en-light");
