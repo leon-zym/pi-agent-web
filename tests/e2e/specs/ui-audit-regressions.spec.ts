@@ -153,3 +153,49 @@ test("wide conversation content hides the TOC from sight and focus", async ({ pa
 	await expect(toc).toHaveAttribute("aria-hidden", "false");
 	await expect(toc).toBeVisible();
 });
+
+test("audio chime preference is discoverable and persists", async ({ page, harness }) => {
+	await page.setViewportSize({ width: 1280, height: 900 });
+	await openWorkbench(page, harness.origin, "en");
+	await page.getByRole("button", { name: "Settings", exact: true }).click();
+
+	const settings = page.getByRole("dialog", { name: "Settings" });
+	const audio = settings.getByRole("switch", { name: "Audio chime" });
+	await expect(settings).toBeVisible();
+	await expect(audio).toBeChecked();
+	await expect(settings.getByText("Sound enabled", { exact: true })).toBeVisible();
+
+	await audio.focus();
+	await page.keyboard.press("Space");
+	await expect(audio).not.toBeChecked();
+	await expect(settings.getByText("Sound muted", { exact: true })).toBeVisible();
+	await expect.poll(() => page.evaluate(() => localStorage.getItem("piweb:audio-muted"))).toBe("true");
+
+	await settings.getByRole("button", { name: "Close" }).last().click();
+	await page.reload({ waitUntil: "domcontentloaded" });
+	await expect(page.locator("textarea")).toBeEnabled();
+	await page.getByRole("button", { name: "Settings", exact: true }).click();
+	await expect(
+		page.getByRole("dialog", { name: "Settings" }).getByRole("switch", {
+			name: "Audio chime",
+		}),
+	).not.toBeChecked();
+});
+
+test("audio chime preference keeps localized dark-mode context", async ({ page, harness }) => {
+	await page.setViewportSize({ width: 1280, height: 900 });
+	await page.addInitScript(() => {
+		localStorage.setItem("pi-web-locale", "zh-CN");
+		localStorage.setItem("pi-web-theme", "dark");
+		localStorage.setItem("piweb:audio-muted", "true");
+	});
+	await page.goto(harness.origin, { waitUntil: "domcontentloaded" });
+	await expect(page.locator("textarea")).toBeEnabled();
+	await expect(page.locator("html")).toHaveClass(/dark/);
+	await page.getByRole("button", { name: "设置", exact: true }).click();
+
+	const settings = page.getByRole("dialog", { name: "设置" });
+	await expect(settings.getByRole("switch", { name: "提示音" })).not.toBeChecked();
+	await expect(settings.getByText("提示音已静音", { exact: true })).toBeVisible();
+	await capture(page, "settings-audio-muted-1280-zh-dark");
+});

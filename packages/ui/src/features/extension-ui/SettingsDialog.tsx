@@ -11,6 +11,7 @@ import {
 } from "../../components/ui/dialog";
 import { Separator } from "../../components/ui/separator";
 import { Switch } from "../../components/ui/switch";
+import { isAudioMuted, setAudioMuted } from "../../lib/audio-feedback";
 import { displayError } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { isSessionControlReady } from "../../lib/session-capabilities";
@@ -76,6 +77,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 		SessionStateDto,
 		"autoCompactionEnabled" | "steeringMode" | "followUpMode"
 	> | null>(null);
+	const [audioMuted, setAudioMutedState] = useState(isAudioMuted);
 	const { preference, set: setTheme } = useTheme();
 
 	useEffect(() => {
@@ -101,6 +103,10 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 			cancelled = true;
 		};
 	}, [open, sessionHandle]);
+
+	useEffect(() => {
+		if (open) setAudioMutedState(isAudioMuted());
+	}, [open]);
 
 	const toggleAutoCompaction = async (enabled: boolean) => {
 		if (!sessionHandle || !state) return;
@@ -148,6 +154,11 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 	};
 
 	const disabled = !sessionHandle || !state || !canControl;
+	const setAudioEnabled = (enabled: boolean) => {
+		const muted = !enabled;
+		setAudioMuted(muted);
+		setAudioMutedState(muted);
+	};
 
 	return (
 		<Dialog open={open} onOpenChange={onOpenChange}>
@@ -210,17 +221,36 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 
 					<div>
 						<SectionLabel>{tt("settings.appearance")}</SectionLabel>
-						<div className="flex items-center justify-between gap-4">
-							<p className="text-[13px] text-ink">{tt("sidebar.theme")}</p>
-							<Segmented
-								options={[
-									{ value: "light", label: tt("sidebar.themeLight") },
-									{ value: "dark", label: tt("sidebar.themeDark") },
-									{ value: "system", label: tt("sidebar.themeSystem") },
-								]}
-								value={preference}
-								onChange={setTheme}
-							/>
+						<div className="flex flex-col gap-3">
+							<div className="flex items-center justify-between gap-4">
+								<p className="text-[13px] text-ink">{tt("sidebar.theme")}</p>
+								<Segmented
+									options={[
+										{ value: "light", label: tt("sidebar.themeLight") },
+										{ value: "dark", label: tt("sidebar.themeDark") },
+										{ value: "system", label: tt("sidebar.themeSystem") },
+									]}
+									value={preference}
+									onChange={setTheme}
+								/>
+							</div>
+							<div className="flex min-h-10 items-center justify-between gap-4">
+								<div className="min-w-0">
+									<label htmlFor="audio-chime" className="text-[13px] text-ink">
+										{tt("audio.toggle")}
+									</label>
+									<p id="audio-chime-status" className="text-[12px] text-ink-3">
+										{tt(audioMuted ? "audio.muted" : "audio.unmuted")}
+									</p>
+								</div>
+								<Switch
+									id="audio-chime"
+									checked={!audioMuted}
+									onCheckedChange={setAudioEnabled}
+									aria-label={tt("audio.toggle")}
+									aria-describedby="audio-chime-status"
+								/>
+							</div>
 						</div>
 					</div>
 
