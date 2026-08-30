@@ -214,7 +214,7 @@ setInterval(() => {}, 1000);
 			resolvePiRuntime({
 				piPath: entry,
 				env: { PATH: "", PI_WEB_PROBE_MARKER: marker },
-				probeTimeoutMs: 100,
+				probeTimeoutMs: 500,
 			}),
 			"pi_probe_timeout",
 		);
