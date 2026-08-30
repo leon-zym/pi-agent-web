@@ -1,20 +1,5 @@
 /** Browser-safe, product-owned WebSocket and REST DTOs shared by the gateway and UI. */
 
-import { PRODUCT_RUNTIME_SCHEMAS } from "./boundary-schemas.js";
-import {
-	isFutureExtensionUiRequestDto,
-	isFutureProductSessionEventDto,
-	isFutureSessionCommandResponseDto,
-	isFutureSessionMessageDto,
-} from "./future-product-decoders.js";
-import type {
-	FutureBlockingExtensionUiRequestDto,
-	FutureExtensionUiRequestDto,
-	FutureProductSessionEventDto,
-	FutureSessionCommandResponseDto,
-	FutureSessionMessageDto,
-	FutureStickyExtensionUiRequestDto,
-} from "./future-product-dto.js";
 import {
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 	GATEWAY_PROTOCOL_VERSION,
@@ -32,25 +17,41 @@ import {
 	type SessionPayloadAdmissionErrorDto,
 } from "./payload-budget.js";
 import {
-	type FutureSessionContentRefGuardContext,
-	isExtensionUiRequestDto,
 	isExtensionUiResponseDto,
-	isFutureSessionContentRefGuardContext,
-	isProductSessionEventDto,
+	isPiExtensionUiRequestDto,
+	isPiProductSessionEventDto,
+	isPiSessionCommandResponseDto,
+	isPiSessionMessageDto,
 	isSessionAttachmentGuardContext,
+	isSessionContentRefGuardContext,
+	SESSION_MODEL_LIST_MAX_ITEMS,
+	SESSION_PRODUCT_IDENTIFIER_MAX_CHARS,
+	type SessionAttachmentGuardContext,
+	type SessionContentRefGuardContext,
+} from "./pi-product-decoders.js";
+import type {
+	ExtensionUiResponseDto,
+	PiExtensionUiRequestDto,
+	PiProductSessionEventDto,
+	PiSessionCommandDataMap,
+	PiSessionCommandResponseDto,
+	PiSessionMessageDto,
+	SessionCommandDto,
+	SessionCommandTypeDto,
+} from "./pi-product-dto.js";
+import {
+	isExtensionUiRequestDto,
+	isProductSessionEventDto,
 	isSessionCommandResponseDto,
 	isSessionMessageDto,
-	type SessionAttachmentGuardContext,
 } from "./product-decoders.js";
 import type {
+	BlockingExtensionUiRequestDto,
 	ExtensionUiRequestDto,
-	ExtensionUiResponseDto,
 	ProductSessionEventDto,
-	SessionCommandDataMap,
-	SessionCommandDto,
 	SessionCommandResponseDto,
-	SessionCommandTypeDto,
 	SessionMessageDto,
+	StickyExtensionUiRequestDto,
 } from "./product-dto.js";
 import {
 	isSessionHistoryChecksum,
@@ -65,12 +66,11 @@ import {
 	sessionHistoryMessagesBytes,
 } from "./session-history.js";
 
-export * from "./boundary-schemas.js";
-export * from "./future-logical-bytes.js";
-export * from "./future-product-decoders.js";
-export * from "./future-product-dto.js";
 export * from "./gateway-handshake.js";
+export * from "./logical-bytes.js";
 export * from "./payload-budget.js";
+export * from "./pi-product-decoders.js";
+export * from "./pi-product-dto.js";
 export * from "./product-decoders.js";
 export * from "./product-dto.js";
 export * from "./session-history.js";
@@ -204,7 +204,6 @@ function isPromptLikeCommand(value: UnknownRecord, allowStreamingBehavior: boole
 }
 
 function isRpcCommand(value: unknown): value is SessionCommandDto {
-	if (!PRODUCT_RUNTIME_SCHEMAS.command.check(value)) return false;
 	if (!isRecord(value) || !isString(value.type, 64)) return false;
 
 	switch (value.type) {
@@ -332,7 +331,13 @@ export type SessionWsClientMessage =
 	  }
 	| { type: "session_unsubscribe"; sessionHandle: string }
 	| { type: "session_claim"; sessionHandle: string }
-	| { type: "session_release"; sessionHandle: string };
+	| { type: "session_release"; sessionHandle: string }
+	| {
+			type: "session_restart";
+			sessionHandle: string;
+			expectedGeneration: number;
+			fencingToken: string;
+	  };
 
 function isGeneration(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
@@ -351,7 +356,6 @@ export function isSessionReplayCursorDto(value: unknown): value is SessionReplay
 
 /** Strictly validate every Session browser frame before it reaches a runtime. */
 export function isSessionWsClientMessage(value: unknown): value is SessionWsClientMessage {
-	if (!PRODUCT_RUNTIME_SCHEMAS.wsClient.check(value)) return false;
 	if (!isRecord(value) || !isString(value.type, 64) || !isString(value.sessionHandle)) return false;
 	if (sessionWsClientMessageBytes(value) > SESSION_WS_CLIENT_MAX_BYTES) return false;
 
@@ -409,6 +413,12 @@ export function isSessionWsClientMessage(value: unknown): value is SessionWsClie
 		case "session_claim":
 		case "session_release":
 			return hasOnlyKeys(value, ["type", "sessionHandle"]);
+		case "session_restart":
+			return (
+				hasOnlyKeys(value, ["type", "sessionHandle", "expectedGeneration", "fencingToken"]) &&
+				isGeneration(value.expectedGeneration) &&
+				isString(value.fencingToken)
+			);
 		default:
 			return false;
 	}
@@ -429,7 +439,7 @@ export interface ExtensionErrorEvent {
 	error: string;
 }
 
-export type PiWebSessionEvent = ProductSessionEventDto;
+export type PiWebSessionEvent = PiProductSessionEventDto;
 
 /**
  * Gateway command deadlines. Pi owns execution; these bounds only prevent an
@@ -462,6 +472,73 @@ export function commandTimeoutMs(commandType: string): number {
 		default:
 			return COMMAND_TIMEOUT_MS.default;
 	}
+}
+
+/** Common failures may contain a 64 KiB raw error that expands sixfold in JSON. */
+const SMALL_COMMAND_RESPONSE_RESERVATION_BYTES = 512 * 1024;
+const LARGE_ORDINARY_COMMAND_RESPONSE_RESERVATION_BYTES = 8 * SESSION_TEXT_MAX_BYTES;
+const JSON_STRINGIFIED_MAX_BYTES_PER_CODE_UNIT = 6;
+const MODEL_IDENTIFIER_FIELDS = 3;
+// A maximal model's keys, booleans, six bounded numbers, punctuation, and cost
+// object encode below 512 bytes; identifiers are accounted for separately.
+const MODEL_NON_IDENTIFIER_JSON_MAX_BYTES = 512;
+// Covers the response id at its escaped identifier limit plus the outer DTO.
+const MODEL_LIST_RESPONSE_ENVELOPE_MAX_BYTES = 2 * 1024;
+export const SESSION_MODEL_LIST_RESPONSE_GUARD_MAX_BYTES =
+	SESSION_MODEL_LIST_MAX_ITEMS *
+		(MODEL_IDENTIFIER_FIELDS *
+			SESSION_PRODUCT_IDENTIFIER_MAX_CHARS *
+			JSON_STRINGIFIED_MAX_BYTES_PER_CODE_UNIT +
+			MODEL_NON_IDENTIFIER_JSON_MAX_BYTES) +
+	MODEL_LIST_RESPONSE_ENVELOPE_MAX_BYTES;
+/** The next whole MiB power-of-two above the model-list guard's 5.12 MB JSON upper bound. */
+export const SESSION_MODEL_LIST_RESPONSE_RESERVATION_BYTES = 8 * SESSION_TEXT_MAX_BYTES;
+
+/**
+ * Conservative upper bounds for one legal command response retained by the Gateway.
+ * Keep this exhaustive table beside the response guards so admission cannot drift
+ * below a newly widened DTO. Commands with collection, snapshot, or arbitrary JSON
+ * output reserve the negotiated wire ceiling.
+ */
+export const COMMAND_RESPONSE_RESERVATION_BYTES = {
+	prompt: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	steer: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	follow_up: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	abort: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	new_session: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	get_state: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	set_model: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	cycle_model: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	get_available_models: SESSION_MODEL_LIST_RESPONSE_RESERVATION_BYTES,
+	set_thinking_level: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	cycle_thinking_level: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	get_available_thinking_levels: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	set_steering_mode: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	set_follow_up_mode: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	compact: LARGE_ORDINARY_COMMAND_RESPONSE_RESERVATION_BYTES,
+	set_auto_compaction: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	set_auto_retry: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	abort_retry: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	bash: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	abort_bash: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	get_session_stats: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	export_html: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	switch_session: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	fork: LARGE_ORDINARY_COMMAND_RESPONSE_RESERVATION_BYTES,
+	clone: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	get_fork_messages: LARGE_ORDINARY_COMMAND_RESPONSE_RESERVATION_BYTES,
+	get_entries: SESSION_WS_SERVER_MAX_BYTES,
+	get_tree: SESSION_WS_SERVER_MAX_BYTES,
+	get_last_assistant_text: LARGE_ORDINARY_COMMAND_RESPONSE_RESERVATION_BYTES,
+	set_session_name: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	get_messages: SESSION_WS_SERVER_MAX_BYTES,
+	get_commands: LARGE_ORDINARY_COMMAND_RESPONSE_RESERVATION_BYTES,
+} as const satisfies Readonly<Record<SessionCommandTypeDto, number>>;
+
+export function commandResponseReservationBytes(commandType: string): number {
+	return Object.hasOwn(COMMAND_RESPONSE_RESERVATION_BYTES, commandType)
+		? COMMAND_RESPONSE_RESERVATION_BYTES[commandType as keyof typeof COMMAND_RESPONSE_RESERVATION_BYTES]
+		: SESSION_WS_SERVER_MAX_BYTES;
 }
 
 /** RPC reads that never require a controller lease. Keep this policy shared by gateway and browser. */
@@ -594,11 +671,11 @@ export interface SessionSequencedEnvelopeDto extends SessionRuntimeIdentityDto {
 	seq: number;
 }
 
-export type SessionReplayFrameDto =
+export type InlineSessionReplayFrameDto =
 	| (SessionSequencedEnvelopeDto & { type: "event"; event: PiWebSessionEvent })
 	| (SessionSequencedEnvelopeDto & {
 			type: "extension_ui_request";
-			request: ExtensionUiRequestDto;
+			request: PiExtensionUiRequestDto;
 	  })
 	| (SessionSequencedEnvelopeDto & {
 			type: "extension_ui_closed";
@@ -606,15 +683,15 @@ export type SessionReplayFrameDto =
 			reason: "answered" | "cancelled" | "expired" | "process_lost" | "replaced";
 	  });
 
-export type SessionProjectionEventDto = Extract<SessionReplayFrameDto, { type: "event" }>;
+export type InlineSessionProjectionEventDto = Extract<InlineSessionReplayFrameDto, { type: "event" }>;
 
-export type BlockingExtensionUiRequestDto = Extract<
-	ExtensionUiRequestDto,
+export type PiBlockingExtensionUiRequestDto = Extract<
+	PiExtensionUiRequestDto,
 	{ method: "select" | "confirm" | "input" | "editor" }
 >;
 
-export type StickyExtensionUiRequestDto = Extract<
-	ExtensionUiRequestDto,
+export type PiStickyExtensionUiRequestDto = Extract<
+	PiExtensionUiRequestDto,
 	{ method: "setStatus" | "setWidget" | "setTitle" | "set_editor_text" }
 >;
 
@@ -624,20 +701,20 @@ export type StickyExtensionUiRequestDto = Extract<
  * Controller lease/fencing state is connection-local and notifications are
  * ephemeral, so neither is part of this Session snapshot.
  */
-export interface SessionSnapshotDto extends SessionRuntimeIdentityDto {
+export interface InlineSessionSnapshotDto extends SessionRuntimeIdentityDto {
 	type: "session_snapshot";
 	snapshotId: string;
 	baseSeq: number;
 	asOfSeq: number;
 	runtime: SessionRuntimeDto;
-	settledMessages: SessionMessageDto[];
-	projectionEvents: SessionProjectionEventDto[];
+	settledMessages: PiSessionMessageDto[];
+	projectionEvents: InlineSessionProjectionEventDto[];
 	queue: {
 		steering: string[];
 		followUp: string[];
 	};
-	pendingExtensionRequests: BlockingExtensionUiRequestDto[];
-	stickyExtensionState: StickyExtensionUiRequestDto[];
+	pendingExtensionRequests: PiBlockingExtensionUiRequestDto[];
+	stickyExtensionState: PiStickyExtensionUiRequestDto[];
 }
 
 export interface SessionHistoryMetadataDto {
@@ -649,16 +726,17 @@ export interface SessionHistoryMetadataDto {
 }
 
 /** The non-payload portion of a chunked authoritative snapshot. */
-export interface SessionSnapshotBeginDto extends Omit<SessionSnapshotDto, "type" | "settledMessages"> {
+export interface InlineSessionSnapshotBeginDto
+	extends Omit<InlineSessionSnapshotDto, "type" | "settledMessages"> {
 	type: "session_snapshot_begin";
 	history: SessionHistoryMetadataDto;
 }
 
-export interface SessionSnapshotChunkDto extends SessionRuntimeIdentityDto {
+export interface InlineSessionSnapshotChunkDto extends SessionRuntimeIdentityDto {
 	type: "session_snapshot_chunk";
 	snapshotId: string;
 	chunkIndex: number;
-	messages: SessionMessageDto[];
+	messages: PiSessionMessageDto[];
 	itemCount: number;
 	byteCount: number;
 	checksum: string;
@@ -683,12 +761,12 @@ export interface SessionHistoryPageBeginDto extends SessionRuntimeIdentityDto {
 	history: SessionHistoryMetadataDto;
 }
 
-export interface SessionHistoryPageChunkDto extends SessionRuntimeIdentityDto {
+export interface InlineSessionHistoryPageChunkDto extends SessionRuntimeIdentityDto {
 	type: "session_history_page_chunk";
 	requestId: string;
 	snapshotId: string;
 	chunkIndex: number;
-	messages: SessionMessageDto[];
+	messages: PiSessionMessageDto[];
 	itemCount: number;
 	byteCount: number;
 	checksum: string;
@@ -705,13 +783,13 @@ export interface SessionHistoryPageEndDto extends SessionRuntimeIdentityDto {
 	nextCursor: string | null;
 }
 
-export interface SessionResponseFrameDto {
+export interface InlineSessionResponseFrameDto {
 	type: "response";
 	serverEpoch: string;
 	sessionHandle: string;
 	generation: number;
 	barrierSeq: number;
-	response: SessionCommandResponseDto;
+	response: PiSessionCommandResponseDto;
 	previousSessionHandle?: string;
 }
 
@@ -750,7 +828,7 @@ export interface SessionErrorDto {
 	type: "session_error";
 	serverEpoch: string;
 	sessionHandle: string;
-	operation: "subscribe" | "claim" | "release" | "extension_ui_response" | "history_page";
+	operation: "subscribe" | "claim" | "release" | "restart" | "extension_ui_response" | "history_page";
 	error: string;
 	/** Stable machine-readable code; optional for backwards-compatible peers. */
 	code?: string;
@@ -758,25 +836,25 @@ export interface SessionErrorDto {
 	retryable?: boolean;
 }
 
-export type SessionWsServerMessage =
-	| SessionResponseFrameDto
-	| SessionReplayFrameDto
+export type InlineSessionWsServerMessage =
+	| InlineSessionResponseFrameDto
+	| InlineSessionReplayFrameDto
 	| { type: "runtime_state"; runtime: SessionRuntimeDto }
 	| SessionLeaseStatusDto
 	| SessionResyncRequiredDto
-	| SessionSnapshotDto
-	| SessionSnapshotBeginDto
-	| SessionSnapshotChunkDto
+	| InlineSessionSnapshotDto
+	| InlineSessionSnapshotBeginDto
+	| InlineSessionSnapshotChunkDto
 	| SessionSnapshotEndDto
 	| SessionHistoryPageBeginDto
-	| SessionHistoryPageChunkDto
+	| InlineSessionHistoryPageChunkDto
 	| SessionHistoryPageEndDto
 	| {
 			type: "extension_ui_snapshot";
 			serverEpoch: string;
 			sessionHandle: string;
 			generation: number;
-			requests: ExtensionUiRequestDto[];
+			requests: PiExtensionUiRequestDto[];
 	  }
 	| {
 			type: "extension_ui_result";
@@ -792,78 +870,78 @@ export type SessionWsServerMessage =
 	| { type: "session_directory_changed"; workspaceId: string }
 	| { type: "auth_changed"; workspaceId?: string };
 
-export type FutureSessionReplayFrameDto =
-	| (SessionSequencedEnvelopeDto & { type: "event"; event: FutureProductSessionEventDto })
+export type SessionReplayFrameDto =
+	| (SessionSequencedEnvelopeDto & { type: "event"; event: ProductSessionEventDto })
 	| (SessionSequencedEnvelopeDto & {
 			type: "extension_ui_request";
-			request: FutureExtensionUiRequestDto;
+			request: ExtensionUiRequestDto;
 	  })
-	| Exclude<SessionReplayFrameDto, { type: "event" | "extension_ui_request" }>;
+	| Exclude<InlineSessionReplayFrameDto, { type: "event" | "extension_ui_request" }>;
 
-export type FutureSessionProjectionEventDto = Extract<FutureSessionReplayFrameDto, { type: "event" }>;
+export type SessionProjectionEventDto = Extract<SessionReplayFrameDto, { type: "event" }>;
 
-export interface FutureSessionSnapshotDto
+export interface SessionSnapshotDto
 	extends Omit<
-		SessionSnapshotDto,
+		InlineSessionSnapshotDto,
 		"settledMessages" | "projectionEvents" | "pendingExtensionRequests" | "stickyExtensionState"
 	> {
-	settledMessages: FutureSessionMessageDto[];
-	projectionEvents: FutureSessionProjectionEventDto[];
-	pendingExtensionRequests: FutureBlockingExtensionUiRequestDto[];
-	stickyExtensionState: FutureStickyExtensionUiRequestDto[];
+	settledMessages: SessionMessageDto[];
+	projectionEvents: SessionProjectionEventDto[];
+	pendingExtensionRequests: BlockingExtensionUiRequestDto[];
+	stickyExtensionState: StickyExtensionUiRequestDto[];
 }
 
-export interface FutureSessionSnapshotBeginDto
+export interface SessionSnapshotBeginDto
 	extends Omit<
-		SessionSnapshotBeginDto,
+		InlineSessionSnapshotBeginDto,
 		"projectionEvents" | "pendingExtensionRequests" | "stickyExtensionState"
 	> {
-	projectionEvents: FutureSessionProjectionEventDto[];
-	pendingExtensionRequests: FutureBlockingExtensionUiRequestDto[];
-	stickyExtensionState: FutureStickyExtensionUiRequestDto[];
+	projectionEvents: SessionProjectionEventDto[];
+	pendingExtensionRequests: BlockingExtensionUiRequestDto[];
+	stickyExtensionState: StickyExtensionUiRequestDto[];
 }
 
-export interface FutureSessionSnapshotChunkDto extends Omit<SessionSnapshotChunkDto, "messages"> {
-	messages: FutureSessionMessageDto[];
+export interface SessionSnapshotChunkDto extends Omit<InlineSessionSnapshotChunkDto, "messages"> {
+	messages: SessionMessageDto[];
 }
 
-export interface FutureSessionHistoryPageChunkDto extends Omit<SessionHistoryPageChunkDto, "messages"> {
-	messages: FutureSessionMessageDto[];
+export interface SessionHistoryPageChunkDto extends Omit<InlineSessionHistoryPageChunkDto, "messages"> {
+	messages: SessionMessageDto[];
 }
 
-export interface FutureSessionResponseFrameDto extends Omit<SessionResponseFrameDto, "response"> {
-	response: FutureSessionCommandResponseDto;
+export interface SessionResponseFrameDto extends Omit<InlineSessionResponseFrameDto, "response"> {
+	response: SessionCommandResponseDto;
 }
 
-export interface FutureExtensionUiSnapshotDto {
+export interface ExtensionUiSnapshotDto {
 	type: "extension_ui_snapshot";
 	serverEpoch: string;
 	sessionHandle: string;
 	generation: number;
-	requests: FutureExtensionUiRequestDto[];
+	requests: ExtensionUiRequestDto[];
 }
 
-export type FutureSessionWsServerMessage =
-	| FutureSessionResponseFrameDto
-	| FutureSessionReplayFrameDto
-	| FutureSessionSnapshotDto
-	| FutureSessionSnapshotBeginDto
-	| FutureSessionSnapshotChunkDto
+export type SessionWsServerMessage =
+	| SessionResponseFrameDto
+	| SessionReplayFrameDto
+	| SessionSnapshotDto
+	| SessionSnapshotBeginDto
+	| SessionSnapshotChunkDto
 	| SessionSnapshotEndDto
 	| SessionHistoryPageBeginDto
-	| FutureSessionHistoryPageChunkDto
+	| SessionHistoryPageChunkDto
 	| SessionHistoryPageEndDto
-	| FutureExtensionUiSnapshotDto
+	| ExtensionUiSnapshotDto
 	| Exclude<
-			SessionWsServerMessage,
-			| SessionResponseFrameDto
-			| SessionReplayFrameDto
-			| SessionSnapshotDto
-			| SessionSnapshotBeginDto
-			| SessionSnapshotChunkDto
+			InlineSessionWsServerMessage,
+			| InlineSessionResponseFrameDto
+			| InlineSessionReplayFrameDto
+			| InlineSessionSnapshotDto
+			| InlineSessionSnapshotBeginDto
+			| InlineSessionSnapshotChunkDto
 			| SessionSnapshotEndDto
 			| SessionHistoryPageBeginDto
-			| SessionHistoryPageChunkDto
+			| InlineSessionHistoryPageChunkDto
 			| SessionHistoryPageEndDto
 			| { type: "extension_ui_snapshot" }
 	  >;
@@ -1182,10 +1260,10 @@ export function isHotRuntimeInventoryDto(value: unknown): value is HotRuntimeInv
 	}
 }
 
-function isProjectionEventDto(
+function isInlineProjectionEventDto(
 	value: unknown,
 	context?: SessionAttachmentGuardContext,
-): value is SessionProjectionEventDto {
+): value is InlineSessionProjectionEventDto {
 	return (
 		isRecord(value) &&
 		hasOnlyKeys(value, [
@@ -1199,26 +1277,25 @@ function isProjectionEventDto(
 		]) &&
 		value.type === "event" &&
 		hasSessionEnvelope(value) &&
-		isProductSessionEventDto(value.event, context)
+		isPiProductSessionEventDto(value.event, context)
 	);
 }
 
-function isBlockingExtensionRequest(value: unknown): value is BlockingExtensionUiRequestDto {
-	return isExtensionUiRequestDto(value) && ["select", "confirm", "input", "editor"].includes(value.method);
+function isInlineBlockingExtensionRequest(value: unknown): value is PiBlockingExtensionUiRequestDto {
+	return isPiExtensionUiRequestDto(value) && ["select", "confirm", "input", "editor"].includes(value.method);
 }
 
-function isStickyExtensionRequest(value: unknown): value is StickyExtensionUiRequestDto {
+function isInlineStickyExtensionRequest(value: unknown): value is PiStickyExtensionUiRequestDto {
 	return (
-		isExtensionUiRequestDto(value) &&
+		isPiExtensionUiRequestDto(value) &&
 		["setStatus", "setWidget", "setTitle", "set_editor_text"].includes(value.method)
 	);
 }
 
-function isCanonicalSessionSnapshotDto(
+function isCanonicalInlineSessionSnapshotDto(
 	value: unknown,
 	context?: SessionAttachmentGuardContext,
-): value is SessionSnapshotDto {
-	if (!PRODUCT_RUNTIME_SCHEMAS.snapshot.check(value)) return false;
+): value is InlineSessionSnapshotDto {
 	if (
 		!isRecord(value) ||
 		!hasOnlyKeys(value, [
@@ -1252,7 +1329,7 @@ function isCanonicalSessionSnapshotDto(
 		value.runtime.lastSeq !== value.asOfSeq ||
 		!Array.isArray(value.settledMessages) ||
 		value.settledMessages.length > SESSION_SNAPSHOT_MAX_MESSAGES ||
-		!value.settledMessages.every((message) => isSessionMessageDto(message, context)) ||
+		!value.settledMessages.every((message) => isPiSessionMessageDto(message, context)) ||
 		!Array.isArray(value.projectionEvents) ||
 		value.projectionEvents.length > SESSION_SNAPSHOT_MAX_PROJECTION_EVENTS ||
 		!isRecord(value.queue) ||
@@ -1265,10 +1342,10 @@ function isCanonicalSessionSnapshotDto(
 		!value.queue.followUp.every((item) => isBoundedString(item, SESSION_TEXT_MAX_BYTES)) ||
 		!Array.isArray(value.pendingExtensionRequests) ||
 		value.pendingExtensionRequests.length > SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS ||
-		!value.pendingExtensionRequests.every(isBlockingExtensionRequest) ||
+		!value.pendingExtensionRequests.every(isInlineBlockingExtensionRequest) ||
 		!Array.isArray(value.stickyExtensionState) ||
 		value.stickyExtensionState.length > SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS ||
-		!value.stickyExtensionState.every(isStickyExtensionRequest)
+		!value.stickyExtensionState.every(isInlineStickyExtensionRequest)
 	) {
 		return false;
 	}
@@ -1276,7 +1353,7 @@ function isCanonicalSessionSnapshotDto(
 	let previousSeq = value.baseSeq;
 	for (const event of value.projectionEvents) {
 		if (
-			!isProjectionEventDto(event, context) ||
+			!isInlineProjectionEventDto(event, context) ||
 			!isSameRuntimeIncarnation(value as unknown as SessionRuntimeIdentityDto, event) ||
 			event.seq <= previousSeq ||
 			event.seq > value.asOfSeq
@@ -1334,19 +1411,19 @@ function isHistoryFrameIdentity(value: UnknownRecord, context?: SessionAttachmen
 function isHistoryMessages(
 	value: unknown,
 	context: SessionAttachmentGuardContext | undefined,
-): value is SessionMessageDto[] {
+): value is PiSessionMessageDto[] {
 	return (
 		Array.isArray(value) &&
 		value.length <= SESSION_HISTORY_MAX_CHUNK_MESSAGES &&
 		isHistoryCount(sessionHistoryMessagesBytes(value)) &&
-		value.every((message) => isSessionMessageDto(message, context))
+		value.every((message) => isPiSessionMessageDto(message, context))
 	);
 }
 
-function isSessionSnapshotBeginDto(
+function isInlineSessionSnapshotBeginDto(
 	value: unknown,
 	context?: SessionAttachmentGuardContext,
-): value is SessionSnapshotBeginDto {
+): value is InlineSessionSnapshotBeginDto {
 	if (
 		!isRecord(value) ||
 		!hasOnlyKeys(value, [
@@ -1386,10 +1463,10 @@ function isSessionSnapshotBeginDto(
 		!value.queue.followUp.every((item) => isBoundedString(item, SESSION_TEXT_MAX_BYTES)) ||
 		!Array.isArray(value.pendingExtensionRequests) ||
 		value.pendingExtensionRequests.length > SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS ||
-		!value.pendingExtensionRequests.every(isBlockingExtensionRequest) ||
+		!value.pendingExtensionRequests.every(isInlineBlockingExtensionRequest) ||
 		!Array.isArray(value.stickyExtensionState) ||
 		value.stickyExtensionState.length > SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS ||
-		!value.stickyExtensionState.every(isStickyExtensionRequest) ||
+		!value.stickyExtensionState.every(isInlineStickyExtensionRequest) ||
 		!isSessionHistoryMetadataDto(value.history)
 	) {
 		return false;
@@ -1398,7 +1475,7 @@ function isSessionSnapshotBeginDto(
 	let previousSeq = value.baseSeq;
 	for (const event of value.projectionEvents) {
 		if (
-			!isProjectionEventDto(event, context) ||
+			!isInlineProjectionEventDto(event, context) ||
 			!isSameRuntimeIncarnation(value as unknown as SessionRuntimeIdentityDto, event) ||
 			event.seq <= previousSeq ||
 			event.seq > value.asOfSeq
@@ -1410,10 +1487,10 @@ function isSessionSnapshotBeginDto(
 	return true;
 }
 
-function isSessionHistoryChunkDto(
+function isInlineSessionHistoryChunkDto(
 	value: unknown,
 	context: SessionAttachmentGuardContext | undefined,
-): value is SessionSnapshotChunkDto | SessionHistoryPageChunkDto {
+): value is InlineSessionSnapshotChunkDto | InlineSessionHistoryPageChunkDto {
 	if (!isRecord(value) || !isHistoryFrameIdentity(value, context)) return false;
 	const isSnapshotChunk = value.type === "session_snapshot_chunk";
 	const isPageChunk = value.type === "session_history_page_chunk";
@@ -1566,26 +1643,25 @@ function isSessionHistoryPageEndDto(
 	);
 }
 
-export function isSessionSnapshotDto(
+export function isInlineSessionSnapshotDto(
 	value: unknown,
 	context?: SessionAttachmentGuardContext,
-): value is SessionSnapshotDto {
+): value is InlineSessionSnapshotDto {
 	if (context !== undefined && !isSessionAttachmentGuardContext(context)) return false;
 	const serialized = boundedCanonicalSnapshotJson(value);
 	if (serialized === null) return false;
 	try {
-		return isCanonicalSessionSnapshotDto(JSON.parse(serialized), context);
+		return isCanonicalInlineSessionSnapshotDto(JSON.parse(serialized), context);
 	} catch {
 		return false;
 	}
 }
 
 /** Validate gateway-to-browser Session frames before they enter UI state. */
-export function isSessionWsServerMessage(
+export function isInlineSessionWsServerMessage(
 	value: unknown,
 	context?: SessionAttachmentGuardContext,
-): value is SessionWsServerMessage {
-	if (!PRODUCT_RUNTIME_SCHEMAS.wsServer.check(value)) return false;
+): value is InlineSessionWsServerMessage {
 	if (!isRecord(value) || !isString(value.type, 64)) return false;
 	if (context !== undefined && !isSessionAttachmentGuardContext(context)) return false;
 	if (
@@ -1597,7 +1673,7 @@ export function isSessionWsServerMessage(
 	) {
 		return false;
 	}
-	if (value.type === "session_snapshot") return isSessionSnapshotDto(value, context);
+	if (value.type === "session_snapshot") return isInlineSessionSnapshotDto(value, context);
 	if (
 		value.type === "session_snapshot_begin" ||
 		value.type === "session_snapshot_chunk" ||
@@ -1607,11 +1683,11 @@ export function isSessionWsServerMessage(
 		value.type === "session_history_page_end"
 	) {
 		if (sessionWsServerMessageBytes(value) > SESSION_WS_SERVER_MAX_BYTES) return false;
-		if (value.type === "session_snapshot_begin") return isSessionSnapshotBeginDto(value, context);
-		if (value.type === "session_snapshot_chunk") return isSessionHistoryChunkDto(value, context);
+		if (value.type === "session_snapshot_begin") return isInlineSessionSnapshotBeginDto(value, context);
+		if (value.type === "session_snapshot_chunk") return isInlineSessionHistoryChunkDto(value, context);
 		if (value.type === "session_snapshot_end") return isSessionSnapshotEndDto(value, context);
 		if (value.type === "session_history_page_begin") return isSessionHistoryPageBeginDto(value, context);
-		if (value.type === "session_history_page_chunk") return isSessionHistoryChunkDto(value, context);
+		if (value.type === "session_history_page_chunk") return isInlineSessionHistoryChunkDto(value, context);
 		return isSessionHistoryPageEndDto(value, context);
 	}
 	if (sessionWsServerMessageBytes(value) > SESSION_WS_SERVER_MAX_BYTES) return false;
@@ -1636,7 +1712,7 @@ export function isSessionWsServerMessage(
 				(value.workspaceId === undefined || isString(value.workspaceId))
 			);
 		case "event":
-			return isProjectionEventDto(value, context);
+			return isInlineProjectionEventDto(value, context);
 		case "extension_ui_request":
 			return (
 				hasOnlyKeys(value, [
@@ -1649,7 +1725,7 @@ export function isSessionWsServerMessage(
 					"request",
 				]) &&
 				hasSessionEnvelope(value) &&
-				isExtensionUiRequestDto(value.request)
+				isPiExtensionUiRequestDto(value.request)
 			);
 		case "extension_ui_closed":
 			return (
@@ -1682,7 +1758,9 @@ export function isSessionWsServerMessage(
 				isString(value.sessionHandle) &&
 				isGeneration(value.generation) &&
 				isGeneration(value.barrierSeq) &&
-				isSessionCommandResponseDto(value.response, context)
+				(value.previousSessionHandle === undefined || isString(value.previousSessionHandle)) &&
+				isPiSessionCommandResponseDto(value.response, context) &&
+				sessionWsServerMessageBytes(value) <= commandResponseReservationBytes(value.response.command)
 			);
 		case "lease_status":
 			return (
@@ -1720,7 +1798,7 @@ export function isSessionWsServerMessage(
 				isGeneration(value.generation) &&
 				Array.isArray(value.requests) &&
 				value.requests.length <= SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS &&
-				value.requests.every(isExtensionUiRequestDto)
+				value.requests.every(isPiExtensionUiRequestDto)
 			);
 		case "extension_ui_result":
 			return (
@@ -1744,7 +1822,7 @@ export function isSessionWsServerMessage(
 				]) ||
 				!isString(value.serverEpoch, 128) ||
 				!isString(value.sessionHandle) ||
-				!["subscribe", "claim", "release", "extension_ui_response", "history_page"].includes(
+				!["subscribe", "claim", "release", "restart", "extension_ui_response", "history_page"].includes(
 					String(value.operation),
 				) ||
 				!isBoundedString(value.error, SESSION_TEXT_MAX_BYTES)
@@ -1763,19 +1841,17 @@ export function isSessionWsServerMessage(
 	}
 }
 
-function futureAttachmentContext(
-	context: FutureSessionContentRefGuardContext,
-): SessionAttachmentGuardContext {
+function canonicalAttachmentContext(context: SessionContentRefGuardContext): SessionAttachmentGuardContext {
 	return { serverEpoch: context.serverEpoch, payloadBudget: context.payloadBudget };
 }
 
-export function isFutureSessionProjectionEventDto(
+export function isSessionProjectionEventDto(
 	value: unknown,
-	context?: FutureSessionContentRefGuardContext,
-): value is FutureSessionProjectionEventDto {
+	context?: SessionContentRefGuardContext,
+): value is SessionProjectionEventDto {
 	return (
 		context !== undefined &&
-		isFutureSessionContentRefGuardContext(context) &&
+		isSessionContentRefGuardContext(context) &&
 		isRecord(value) &&
 		hasOnlyKeys(value, [
 			"type",
@@ -1789,16 +1865,16 @@ export function isFutureSessionProjectionEventDto(
 		value.type === "event" &&
 		hasSessionEnvelope(value) &&
 		value.serverEpoch === context.serverEpoch &&
-		isFutureProductSessionEventDto(value.event, context)
+		isProductSessionEventDto(value.event, context)
 	);
 }
 
-export function isFutureSessionReplayFrameDto(
+export function isSessionReplayFrameDto(
 	value: unknown,
-	context?: FutureSessionContentRefGuardContext,
-): value is FutureSessionReplayFrameDto {
-	if (!context || !isFutureSessionContentRefGuardContext(context) || !isRecord(value)) return false;
-	if (value.type === "event") return isFutureSessionProjectionEventDto(value, context);
+	context?: SessionContentRefGuardContext,
+): value is SessionReplayFrameDto {
+	if (!context || !isSessionContentRefGuardContext(context) || !isRecord(value)) return false;
+	if (value.type === "event") return isSessionProjectionEventDto(value, context);
 	if (value.type === "extension_ui_request") {
 		return (
 			hasOnlyKeys(value, [
@@ -1812,37 +1888,36 @@ export function isFutureSessionReplayFrameDto(
 			]) &&
 			hasSessionEnvelope(value) &&
 			value.serverEpoch === context.serverEpoch &&
-			isFutureExtensionUiRequestDto(value.request, context)
+			isExtensionUiRequestDto(value.request, context)
 		);
 	}
 	if (value.type !== "extension_ui_closed") return false;
-	return isSessionWsServerMessage(value, futureAttachmentContext(context));
+	return isInlineSessionWsServerMessage(value, canonicalAttachmentContext(context));
 }
 
-function isFutureBlockingExtensionRequest(
+function isBlockingExtensionRequest(
 	value: unknown,
-	context: FutureSessionContentRefGuardContext,
-): value is FutureBlockingExtensionUiRequestDto {
+	context: SessionContentRefGuardContext,
+): value is BlockingExtensionUiRequestDto {
 	return (
-		isFutureExtensionUiRequestDto(value, context) &&
-		["select", "confirm", "input", "editor"].includes(value.method)
+		isExtensionUiRequestDto(value, context) && ["select", "confirm", "input", "editor"].includes(value.method)
 	);
 }
 
-function isFutureStickyExtensionRequest(
+function isStickyExtensionRequest(
 	value: unknown,
-	context: FutureSessionContentRefGuardContext,
-): value is FutureStickyExtensionUiRequestDto {
+	context: SessionContentRefGuardContext,
+): value is StickyExtensionUiRequestDto {
 	return (
-		isFutureExtensionUiRequestDto(value, context) &&
+		isExtensionUiRequestDto(value, context) &&
 		["setStatus", "setWidget", "setTitle", "set_editor_text"].includes(value.method)
 	);
 }
 
-function isFutureSessionSnapshotBeginDto(
+function isSessionSnapshotBeginDto(
 	value: unknown,
-	context: FutureSessionContentRefGuardContext,
-): value is FutureSessionSnapshotBeginDto {
+	context: SessionContentRefGuardContext,
+): value is SessionSnapshotBeginDto {
 	if (
 		!isRecord(value) ||
 		!hasOnlyKeys(value, [
@@ -1862,7 +1937,7 @@ function isFutureSessionSnapshotBeginDto(
 			"history",
 		]) ||
 		value.type !== "session_snapshot_begin" ||
-		!isHistoryFrameIdentity(value, futureAttachmentContext(context)) ||
+		!isHistoryFrameIdentity(value, canonicalAttachmentContext(context)) ||
 		!isString(value.snapshotId, SESSION_HISTORY_MAX_SNAPSHOT_ID_BYTES) ||
 		!isGeneration(value.baseSeq) ||
 		!isGeneration(value.asOfSeq) ||
@@ -1882,10 +1957,10 @@ function isFutureSessionSnapshotBeginDto(
 		!value.queue.followUp.every((item) => isBoundedString(item, SESSION_TEXT_MAX_BYTES)) ||
 		!Array.isArray(value.pendingExtensionRequests) ||
 		value.pendingExtensionRequests.length > SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS ||
-		!value.pendingExtensionRequests.every((request) => isFutureBlockingExtensionRequest(request, context)) ||
+		!value.pendingExtensionRequests.every((request) => isBlockingExtensionRequest(request, context)) ||
 		!Array.isArray(value.stickyExtensionState) ||
 		value.stickyExtensionState.length > SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS ||
-		!value.stickyExtensionState.every((request) => isFutureStickyExtensionRequest(request, context)) ||
+		!value.stickyExtensionState.every((request) => isStickyExtensionRequest(request, context)) ||
 		!isSessionHistoryMetadataDto(value.history)
 	) {
 		return false;
@@ -1894,7 +1969,7 @@ function isFutureSessionSnapshotBeginDto(
 	let previousSeq = value.baseSeq;
 	for (const event of value.projectionEvents) {
 		if (
-			!isFutureSessionProjectionEventDto(event, context) ||
+			!isSessionProjectionEventDto(event, context) ||
 			!isSameRuntimeIncarnation(value as unknown as SessionRuntimeIdentityDto, event) ||
 			event.seq <= previousSeq ||
 			event.seq > value.asOfSeq
@@ -1906,11 +1981,11 @@ function isFutureSessionSnapshotBeginDto(
 	return true;
 }
 
-function isFutureSessionHistoryChunkDto(
+function isSessionHistoryChunkDto(
 	value: unknown,
-	context: FutureSessionContentRefGuardContext,
-): value is FutureSessionSnapshotChunkDto | FutureSessionHistoryPageChunkDto {
-	if (!isRecord(value) || !isHistoryFrameIdentity(value, futureAttachmentContext(context))) return false;
+	context: SessionContentRefGuardContext,
+): value is SessionSnapshotChunkDto | SessionHistoryPageChunkDto {
+	if (!isRecord(value) || !isHistoryFrameIdentity(value, canonicalAttachmentContext(context))) return false;
 	const isSnapshotChunk = value.type === "session_snapshot_chunk";
 	const isPageChunk = value.type === "session_history_page_chunk";
 	if (!isSnapshotChunk && !isPageChunk) return false;
@@ -1954,7 +2029,7 @@ function isFutureSessionHistoryChunkDto(
 		value.chunkIndex >= SESSION_HISTORY_MAX_MESSAGES ||
 		!Array.isArray(value.messages) ||
 		value.messages.length > SESSION_HISTORY_MAX_CHUNK_MESSAGES ||
-		!value.messages.every((message) => isFutureSessionMessageDto(message, context)) ||
+		!value.messages.every((message) => isSessionMessageDto(message, context)) ||
 		!isHistoryCount(value.itemCount) ||
 		value.itemCount !== value.messages.length ||
 		!isHistoryCount(value.byteCount) ||
@@ -1968,11 +2043,10 @@ function isFutureSessionHistoryChunkDto(
 	return true;
 }
 
-function isCanonicalFutureSessionSnapshotDto(
+function isCanonicalSessionSnapshotDto(
 	value: unknown,
-	context: FutureSessionContentRefGuardContext,
-): value is FutureSessionSnapshotDto {
-	if (!PRODUCT_RUNTIME_SCHEMAS.snapshot.check(value)) return false;
+	context: SessionContentRefGuardContext,
+): value is SessionSnapshotDto {
 	if (
 		!isRecord(value) ||
 		!hasOnlyKeys(value, [
@@ -2006,7 +2080,7 @@ function isCanonicalFutureSessionSnapshotDto(
 		value.runtime.lastSeq !== value.asOfSeq ||
 		!Array.isArray(value.settledMessages) ||
 		value.settledMessages.length > SESSION_SNAPSHOT_MAX_MESSAGES ||
-		!value.settledMessages.every((message) => isFutureSessionMessageDto(message, context)) ||
+		!value.settledMessages.every((message) => isSessionMessageDto(message, context)) ||
 		!Array.isArray(value.projectionEvents) ||
 		value.projectionEvents.length > SESSION_SNAPSHOT_MAX_PROJECTION_EVENTS ||
 		!isRecord(value.queue) ||
@@ -2019,10 +2093,10 @@ function isCanonicalFutureSessionSnapshotDto(
 		!value.queue.followUp.every((item) => isBoundedString(item, SESSION_TEXT_MAX_BYTES)) ||
 		!Array.isArray(value.pendingExtensionRequests) ||
 		value.pendingExtensionRequests.length > SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS ||
-		!value.pendingExtensionRequests.every((request) => isFutureBlockingExtensionRequest(request, context)) ||
+		!value.pendingExtensionRequests.every((request) => isBlockingExtensionRequest(request, context)) ||
 		!Array.isArray(value.stickyExtensionState) ||
 		value.stickyExtensionState.length > SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS ||
-		!value.stickyExtensionState.every((request) => isFutureStickyExtensionRequest(request, context))
+		!value.stickyExtensionState.every((request) => isStickyExtensionRequest(request, context))
 	) {
 		return false;
 	}
@@ -2030,7 +2104,7 @@ function isCanonicalFutureSessionSnapshotDto(
 	let previousSeq = value.baseSeq;
 	for (const event of value.projectionEvents) {
 		if (
-			!isFutureSessionProjectionEventDto(event, context) ||
+			!isSessionProjectionEventDto(event, context) ||
 			!isSameRuntimeIncarnation(value as unknown as SessionRuntimeIdentityDto, event) ||
 			event.seq <= previousSeq ||
 			event.seq > value.asOfSeq
@@ -2042,27 +2116,26 @@ function isCanonicalFutureSessionSnapshotDto(
 	return true;
 }
 
-export function isFutureSessionSnapshotDto(
+export function isSessionSnapshotDto(
 	value: unknown,
-	context?: FutureSessionContentRefGuardContext,
-): value is FutureSessionSnapshotDto {
-	if (!context || !isFutureSessionContentRefGuardContext(context)) return false;
+	context?: SessionContentRefGuardContext,
+): value is SessionSnapshotDto {
+	if (!context || !isSessionContentRefGuardContext(context)) return false;
 	const serialized = boundedCanonicalSnapshotJson(value);
 	if (serialized === null) return false;
 	try {
-		return isCanonicalFutureSessionSnapshotDto(JSON.parse(serialized), context);
+		return isCanonicalSessionSnapshotDto(JSON.parse(serialized), context);
 	} catch {
 		return false;
 	}
 }
 
-export function isFutureSessionWsServerMessage(
+export function isSessionWsServerMessage(
 	value: unknown,
-	context?: FutureSessionContentRefGuardContext,
-): value is FutureSessionWsServerMessage {
-	if (!PRODUCT_RUNTIME_SCHEMAS.wsServer.check(value)) return false;
-	if (!context || !isFutureSessionContentRefGuardContext(context) || !isRecord(value)) return false;
-	if (value.type === "session_snapshot") return isFutureSessionSnapshotDto(value, context);
+	context?: SessionContentRefGuardContext,
+): value is SessionWsServerMessage {
+	if (!context || !isSessionContentRefGuardContext(context) || !isRecord(value)) return false;
+	if (value.type === "session_snapshot") return isSessionSnapshotDto(value, context);
 	if (
 		value.type === "session_snapshot_begin" ||
 		value.type === "session_snapshot_chunk" ||
@@ -2072,21 +2145,21 @@ export function isFutureSessionWsServerMessage(
 		value.type === "session_history_page_end"
 	) {
 		if (sessionWsServerMessageBytes(value) > SESSION_WS_SERVER_MAX_BYTES) return false;
-		if (value.type === "session_snapshot_begin") return isFutureSessionSnapshotBeginDto(value, context);
-		if (value.type === "session_snapshot_chunk") return isFutureSessionHistoryChunkDto(value, context);
+		if (value.type === "session_snapshot_begin") return isSessionSnapshotBeginDto(value, context);
+		if (value.type === "session_snapshot_chunk") return isSessionHistoryChunkDto(value, context);
 		if (value.type === "session_snapshot_end") {
-			return isSessionSnapshotEndDto(value, futureAttachmentContext(context));
+			return isSessionSnapshotEndDto(value, canonicalAttachmentContext(context));
 		}
 		if (value.type === "session_history_page_begin") {
-			return isSessionHistoryPageBeginDto(value, futureAttachmentContext(context));
+			return isSessionHistoryPageBeginDto(value, canonicalAttachmentContext(context));
 		}
-		if (value.type === "session_history_page_chunk") return isFutureSessionHistoryChunkDto(value, context);
-		return isSessionHistoryPageEndDto(value, futureAttachmentContext(context));
+		if (value.type === "session_history_page_chunk") return isSessionHistoryChunkDto(value, context);
+		return isSessionHistoryPageEndDto(value, canonicalAttachmentContext(context));
 	}
 	if (sessionWsServerMessageBytes(value) > SESSION_WS_SERVER_MAX_BYTES) return false;
-	if (value.type === "event") return isFutureSessionProjectionEventDto(value, context);
+	if (value.type === "event") return isSessionProjectionEventDto(value, context);
 	if (value.type === "extension_ui_request" || value.type === "extension_ui_closed") {
-		return isFutureSessionReplayFrameDto(value, context);
+		return isSessionReplayFrameDto(value, context);
 	}
 	if (value.type === "extension_ui_snapshot") {
 		return (
@@ -2096,7 +2169,7 @@ export function isFutureSessionWsServerMessage(
 			isGeneration(value.generation) &&
 			Array.isArray(value.requests) &&
 			value.requests.length <= SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS &&
-			value.requests.every((request) => isFutureExtensionUiRequestDto(request, context))
+			value.requests.every((request) => isExtensionUiRequestDto(request, context))
 		);
 	}
 	if (value.type === "response") {
@@ -2116,10 +2189,11 @@ export function isFutureSessionWsServerMessage(
 			isGeneration(value.generation) &&
 			isGeneration(value.barrierSeq) &&
 			(value.previousSessionHandle === undefined || isString(value.previousSessionHandle)) &&
-			isFutureSessionCommandResponseDto(value.response, context)
+			isSessionCommandResponseDto(value.response, context) &&
+			sessionWsServerMessageBytes(value) <= commandResponseReservationBytes(value.response.command)
 		);
 	}
-	return isSessionWsServerMessage(value, futureAttachmentContext(context));
+	return isInlineSessionWsServerMessage(value, canonicalAttachmentContext(context));
 }
 
 // ============================================================================
@@ -2192,8 +2266,8 @@ export class RpcError extends Error {
 }
 
 export function isErrorResponse(
-	response: SessionCommandResponseDto,
-): response is Extract<SessionCommandResponseDto, { success: false }> {
+	response: PiSessionCommandResponseDto,
+): response is Extract<PiSessionCommandResponseDto, { success: false }> {
 	return response.type === "response" && response.success === false;
 }
 
@@ -2201,7 +2275,7 @@ export function isErrorResponse(
  * Extract data from a success response and throw RpcError on a failed response.
  * Responses without a data payload return undefined.
  */
-export function expectData(response: SessionCommandResponseDto): unknown {
+export function expectData(response: PiSessionCommandResponseDto): unknown {
 	if (response.type !== "response") throw new RpcError("<no-command>", "not a response frame");
 	if (response.success === false) {
 		throw new RpcError(response.command, response.error, response.admissionError);
@@ -2211,14 +2285,14 @@ export function expectData(response: SessionCommandResponseDto): unknown {
 
 /** Extract the product-owned data shape for an expected command. */
 export function expectCommandData<K extends SessionCommandTypeDto>(
-	response: SessionCommandResponseDto,
+	response: PiSessionCommandResponseDto,
 	command: K,
-): SessionCommandDataMap[K] {
+): PiSessionCommandDataMap[K] {
 	if (response.command !== command) {
 		throw new RpcError(response.command, `expected ${command} response, received ${response.command}`);
 	}
 	if (response.success === false) {
 		throw new RpcError(response.command, response.error, response.admissionError);
 	}
-	return ("data" in response ? response.data : undefined) as SessionCommandDataMap[K];
+	return ("data" in response ? response.data : undefined) as PiSessionCommandDataMap[K];
 }

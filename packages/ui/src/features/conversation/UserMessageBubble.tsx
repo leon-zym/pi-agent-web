@@ -10,7 +10,7 @@ import { cn } from "../../lib/utils";
 import type { UiUserMessage } from "../../types/view-models";
 
 /**
- * Right-aligned light-blue bubble (DESIGN.md): max 525px, 22px radius,
+ * Right-aligned semantic user bubble: max 525px, 22px radius,
  * queued injections carry a 插队/排队 badge.
  */
 interface UserMessageBubbleProps {
@@ -89,11 +89,13 @@ export const UserMessageBubble = memo(function UserMessageBubble({
 					type="button"
 					aria-label={tt("userMessage.copyAria")}
 					className={cn(
-						"absolute -bottom-2 -left-2 flex size-6 items-center justify-center rounded-full border border-border bg-surface text-ink-3 opacity-0 shadow-lv1 transition-opacity [@media(hover:hover)]:group-hover:opacity-100",
+						"absolute -bottom-2 -left-2 flex size-6 items-center justify-center rounded-full text-ink-3 opacity-0 transition-opacity [@media(hover:hover)]:group-hover:opacity-100 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none [@media(hover:none)]:-bottom-4 [@media(hover:none)]:-left-4 [@media(hover:none)]:size-10 [@media(hover:none)]:opacity-100",
 					)}
 					onClick={copy}
 				>
-					{copied ? <Check className="size-3 text-success" /> : <Copy className="size-3" />}
+					<span className="flex size-6 items-center justify-center rounded-full border border-border bg-surface shadow-lv1">
+						{copied ? <Check className="size-3 text-success" /> : <Copy className="size-3" />}
+					</span>
 				</button>
 			</div>
 			{!message.delivered && <span className="text-xs text-ink-3">{tt("status.waitingInjection")}</span>}

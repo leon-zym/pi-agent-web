@@ -1,8 +1,13 @@
 # ADR 0010: Epoch-scoped attachment references and payload budgets
 
-- Status: Accepted (amended)
+- Status: Accepted; Browser/Gateway activation wording amended by ADR 0013
 - Date: 2026-08-27
 - Amended: 2026-08-28
+
+The payload budgets, epoch-scoped store, and ownership decisions remain active. The numbered
+Browser/Gateway rollout below records the staged pre-activation design; ADR 0013 and
+`docs/protocol.md` supersede its minor-1/minor-2 compatibility wording with the current single
+Gateway protocol 1.3 contract.
 
 ## Context
 

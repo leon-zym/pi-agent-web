@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { deflateSync } from "node:zlib";
 import {
+	GATEWAY_CONTENT_REF_CAPABILITY,
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 	type GatewayClientHelloDto,
@@ -17,13 +18,13 @@ import {
 } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
-import { type LegacyServerHandle, startServerWithCurrentMode } from "../src/main.js";
+import { type ServerHandle, startServer } from "../src/main.js";
 
 const fixturePath = path.join(import.meta.dirname, "fixtures", "session-runtime-pi.mjs");
 const IMAGE_BYTES = 1024 * 1024 + 257;
 const PROMPT = "payload-reference-large-image-events";
 const roots: string[] = [];
-const handles: LegacyServerHandle[] = [];
+const handles: ServerHandle[] = [];
 const clients: ClientProbe[] = [];
 
 type GatewayFrame = GatewayServerHelloDto | SessionWsServerMessage;
@@ -109,7 +110,7 @@ function refsIn(value: unknown): SessionAttachmentRefDto[] {
 }
 
 async function createHarness(): Promise<{
-	handle: LegacyServerHandle;
+	handle: ServerHandle;
 	baseUrl: string;
 	cookie: string;
 	sessionHandle: string;
@@ -118,7 +119,7 @@ async function createHarness(): Promise<{
 	roots.push(root);
 	const workspacePath = path.join(root, "workspace");
 	fs.mkdirSync(workspacePath, { recursive: true });
-	const handle = await startServerWithCurrentMode({
+	const handle = await startServer({
 		config: {
 			port: 0,
 			host: "127.0.0.1",
@@ -171,7 +172,7 @@ async function openClient(
 	});
 	client.sendRaw({
 		type: "client_hello",
-		protocol: { major: 1, minor: 2 },
+		protocol: { major: 1, minor: 3 },
 		clientBuild: "payload-reference-gateway-integration",
 		capabilities: [
 			"rpc.commands",
@@ -180,6 +181,7 @@ async function openClient(
 			"session.multiplex",
 			GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 			GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+			GATEWAY_CONTENT_REF_CAPABILITY,
 		],
 		limits: { maxServerFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes },
 	});
@@ -266,7 +268,7 @@ describe("payload reference production Gateway vertical integration", () => {
 
 		// Activation is intentionally required: no inline compatibility fallback may reach the Browser.
 		expect(hello).toMatchObject({
-			protocol: { major: 1, minor: 2 },
+			protocol: { major: 1, minor: 3 },
 			serverEpoch: harness.handle.serverEpoch,
 			capabilities: expect.arrayContaining([GATEWAY_PAYLOAD_BUDGET_CAPABILITY]),
 			payloadBudget: SESSION_PAYLOAD_BUDGET,

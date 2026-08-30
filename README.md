@@ -1,108 +1,82 @@
 # Pi Agent Web
 
-[English](README.md) · [简体中文](README.zh-CN.md)
+English | [Chinese](README.zh-CN.md)
 
-Pi Agent Web is a local, Session-native web workbench for Pi Coding Agent's RPC mode. It opens
-Pi's existing JSONL Sessions, runs active Sessions independently, and keeps background work alive
-while you move between conversations.
+Pi Agent Web is a local web workbench for Pi Coding Agent's RPC mode. It opens Pi's native JSONL
+Sessions, keeps active Sessions independent, and lets background work continue while the Browser
+moves between conversations.
 
-Pi JSONL remains the durable source of truth. Pi Agent Web does not copy Workspace or Session
-history into a second database. A Workspace is derived from the canonical `cwd` in each JSONL
-header; a small preference store keeps presentation and discovery hints only.
+Pi JSONL is the durable source of truth. Pi Agent Web does not copy Workspace or Session history
+into another database.
 
-> Pi Agent Web is a development preview. Interfaces and compatibility may change, and defects may
-> interrupt normal use. Keep important work under version control and retain your usual backups.
+> Pi Agent Web is a development preview. Interfaces can change and defects can interrupt work.
+> Keep important work under version control and retain normal backups.
 
-## Local Preview Boundary
+## Product boundary
 
-The gateway is a single-user, same-origin control surface that listens only on loopback addresses.
-After the bootstrap request issues an HttpOnly cookie, all other REST and WebSocket requests require
-it and are checked against the loopback Host plus the exact same Origin or Fetch Metadata. Development
-traffic reaches the gateway through Vite's same-origin proxy, which rejects cross-origin callers
-before rewriting the request; production never trusts Vite's port.
-These checks are intended for local browser use, not for a hosted service, LAN deployment, remote
-accounts, multi-user collaboration, or isolation from a hostile local user. Do not expose `pi-web`
-through a public reverse proxy.
+The Gateway is a single-user, same-origin control surface that listens only on loopback addresses.
+It is not a hosted service, a LAN server, a multi-user collaboration system, or a security boundary
+against a hostile local user. Do not expose `pi-web` through a public reverse proxy.
 
-Provider credentials, extensions, settings, and JSONL history remain in the user's Pi installation.
-This repository does not bundle them, and credential-free CI does not need them.
+Provider credentials, extensions, settings, and Session history remain in the user's Pi
+installation. Credential-free development and CI use deterministic fixtures.
 
-## Features
+## What it provides
 
-- Pi-native discovery uses canonical JSONL file paths for Session identity and header `cwd` paths
-  for Workspace grouping. Preferences never replace, rewrite, or delete native history.
-- Each hot Session runs at most one `pi --mode rpc` process. Dormant Sessions have no process, and a
-  bounded pool allows same-Workspace and cross-Workspace Sessions to run concurrently.
-- The browser and gateway multiplex isolated Session channels over one authenticated WebSocket.
-  Controller leases, generation, fencing, sequence cursors, replay, resync, and Extension UI state
-  are scoped to each Session.
-- Selecting a conversation changes only the visible view. Other subscribed Sessions continue to
-  receive events, so switching Workspace or Session does not stop background work.
-- Startup opens a fresh Session in the most recently used Web Workspace instead of selecting the
-  first history row. Expanding Workspace groups never changes the active Session; untouched
-  unpersisted Sessions are abandoned without deleting any JSONL file.
-- The workbench supports streaming replies, reasoning and tool steps, settled GFM and code,
-  model/thinking controls, atomic slash/skill command tags, Extension UI, and image attachments,
-  including image-only prompts.
-- The gateway applies bounded JSONL, frame, command, replay, and client-buffer limits. Session
-  deletion is fenced and moves a verified file to recoverable trash instead of unlinking it.
+- Native Session discovery without a second history store.
+- One independently supervised Pi process per active Session, with a bounded hot-process pool.
+- One authenticated WebSocket carrying isolated Session channels.
+- Streaming replies, reasoning, tool activity, Markdown, images, slash commands, and Extension UI.
+- Session-scoped drafts, controls, projections, recovery, and background event ingestion.
+- Fenced mutations, bounded payloads, explicit resync, and recoverable Session deletion.
 
-## Product Demo
+Selecting a Session changes only the visible Browser view. It does not use Pi's global
+`switch_session` or `new_session` commands, and it does not stop another Session.
 
-Workbench views:
+## Preview
 
 <table>
 <tr>
-<td align="center"><img src="docs/assets/demo/overall.png" alt="Pi Agent Web Session-native workbench showing a settled coding-agent response" width="560" /><br /><sub>Focused conversation workbench</sub></td>
-<td align="center"><img src="docs/assets/demo/tool-inspect.png" alt="Pi Agent Web tool diff and inspector" width="560" /><br /><sub>Tool result and contextual inspector</sub></td>
+<td align="center"><img src="docs/assets/demo/overall.png" alt="Pi Agent Web conversation workbench" width="560" /><br /><sub>Conversation workbench</sub></td>
+<td align="center"><img src="docs/assets/demo/tool-inspect.png" alt="Pi Agent Web tool inspector" width="560" /><br /><sub>Tool inspection</sub></td>
 </tr>
 <tr>
-<td align="center"><img src="docs/assets/demo/dark-mode.png" alt="Pi Agent Web dark theme with token-based syntax highlighting" width="560" /><br /><sub>Dark theme</sub></td>
-<td align="center"><img src="docs/assets/demo/mobile.png" alt="Pi Agent Web responsive 375 pixel Session view" width="220" /><br /><sub>375 px responsive view</sub></td>
+<td align="center"><img src="docs/assets/demo/dark-mode.png" alt="Pi Agent Web dark theme" width="560" /><br /><sub>Dark theme</sub></td>
+<td align="center"><img src="docs/assets/demo/mobile.png" alt="Pi Agent Web narrow viewport" width="220" /><br /><sub>Narrow viewport</sub></td>
 </tr>
 </table>
 
-All demo content comes from the deterministic browser fixture. The screenshots contain no provider
-credentials, private paths, or user Session history.
+The demo uses deterministic fixtures and contains no provider credentials, private paths, or user
+Session history.
 
-## Session Model
+## Architecture at a glance
 
 ```text
-Browser: selected view + per-Session stores
-  └─ one authenticated WebSocket, N isolated Session channels
-       └─ Gateway: native catalog + bounded hot-runtime pool
-            ├─ Workspace X / Session A ─ Pi process A ─ A.jsonl
-            ├─ Workspace X / Session B ─ Pi process B ─ B.jsonl
-            └─ Workspace Y / Session C ─ dormant, JSONL only
+Browser: selected view and Session-scoped stores
+  -> one authenticated WebSocket with isolated Session channels
+     -> Gateway: native catalog and bounded hot-process pool
+        -> Pi RPC process per active Session
+           -> native Pi JSONL
 ```
 
-The selected Session is a browser view pointer, not Pi's global current Session. Activating a
-historical Session starts its process on demand. Idle, persisted Sessions can return to dormant
-state when the pool needs capacity, then reopen from the same native JSONL file.
+A canonical JSONL file identifies a persisted Session. The canonical `cwd` in its header identifies
+the Workspace. A dormant historical Session owns no process and starts on demand.
 
-Absolute default, global, and environment-configured Pi directories are discoverable without a Web
-preference. A project-only `sessionDir`, or any relative Agent/Session directory interpreted from a
-Pi child's Workspace cwd, cannot be derived without first knowing that Workspace path. Removing the
-Workspace removes that discovery hint, not its JSONL files; adding the same canonical path restores
-discovery.
+Mutations require the exact Session generation and current fencing token. Read-only observers do
+not require a controller lease. Unknown identity or ordering fails closed and triggers explicit
+recovery rather than silent cursor repair.
 
-Mutating commands require the exact Session generation and current fencing token. Read-only
-observers can follow events without claiming control. On reconnect, bounded replay fills a known
-gap; if the cursor or identity is uncertain, the client performs an explicit snapshot resync.
+## Quick start
 
-## Quick Start
-
-Requirements: Node.js 22+, pnpm 11.21.0, and a Pi Coding Agent runtime.
+Requirements: Node.js 22 or later, pnpm 11.21.0, and a compatible Pi Coding Agent runtime.
 
 ```bash
 pnpm install --frozen-lockfile
 pnpm dev
 ```
 
-Development mode starts the gateway on `:3000` and Vite on `:5173` by default. Open the loopback
-URL printed by Vite, add a local Workspace, then open an existing native Session or create one. Vite
-proxies API and WebSocket traffic as gateway-origin requests; `:5173` is not a trusted production
-Origin.
+Development mode starts the Gateway on port 3000 and Vite on port 5173 by default. Open the
+loopback URL printed by Vite.
 
 Build the SPA before starting the single-port CLI:
 
@@ -110,74 +84,60 @@ Build the SPA before starting the single-port CLI:
 pnpm build
 pnpm start
 
-# Pass CLI arguments through the root script
+# Forward CLI arguments through the root script.
 pnpm start -- --pi-path /path/to/rpc-entry.js --port 3100 --no-open
 ```
 
-`pi-web` accepts `127.0.0.1`, `localhost`, or `::1` as `--host`. By default it uses and validates
-the exact Pi dependency installed with the distribution; an unrelated `pi` on `PATH` is ignored.
-`--pi-path` / `PI_PATH` is an expert override and must pass the same version/capability probe. Common
-options are `--pi-path`, `--host`, `--port`, `--no-open`, and `--help`.
+`pi-web` accepts only loopback hosts. It normally uses the exact Pi dependency installed with the
+distribution. `--pi-path` and `PI_PATH` are expert overrides and must pass the same bounded version
+and capability probe.
 
-The naming boundary is intentional: `pi-agent-web` is the repository, service, and
-`@pi-agent-web/*` package namespace; `pi-web` is the user-facing command.
+The names have different scopes: `pi-agent-web` is the repository and package namespace;
+`pi-web` is the user-facing command.
 
 ## Verification
 
 ```bash
-pnpm verify                                      # lint, types, deterministic tests, build
-pnpm test:smoke                                  # authenticated REST/WebSocket with fake Pi
-pnpm test:e2e                                    # packaged browser E2E with fake Pi
-pnpm test:pack                                   # pack/install four packages; verify help; launch via the bin
-PI_WEB_RUN_E2E=1 pnpm test:e2e:real              # explicit real Pi/provider compatibility
+pnpm verify                 # lint, types, deterministic tests, and production build
+pnpm test:smoke             # authenticated REST and WebSocket smoke test
+pnpm test:browser           # packaged deterministic Browser suite
+pnpm test:pack              # tarball install and CLI launch smoke test
+pnpm test:compat            # exact-version Pi compatibility fixtures
+pnpm bench:representative   # reproducible representative performance matrix
+pnpm bench:stress           # explicit long-running stress matrix
+PI_WEB_RUN_E2E=1 pnpm test:e2e:real  # explicit credential-bearing real-Pi acceptance
 ```
 
-`pnpm test:e2e` is an alias for `pnpm test:browser`. CI runs `verify`, `test:smoke`,
-`test:pack`, and the packaged Chromium suite without provider credentials. Real Pi checks remain
-explicit because they use the developer's configured provider.
+The performance matrix is Issue #28 Phase 1 and remains incomplete. Structural correctness is
+gated; host-sensitive latency, throughput, long-task, and heap results remain observational until a
+reference-host baseline exists. See [Development](docs/development.md) for test boundaries.
 
-The real Pi suite covers concurrent Sessions on one WebSocket, image-only input, content
-isolation, follow-up and abort while streaming, clone rekeying, parent/child history isolation,
-and RPC metadata. It creates isolated temporary Workspace, Session, Web-data, and Pi Agent roots;
-only `auth.json` and `models.json` are copied into the private temporary Agent root. It neither loads
-the user's extensions/settings nor scans or modifies existing Pi history, and it verifies that the
-real `settings.json` fingerprint is unchanged after every run.
-
-## Distribution Status
+## Distribution status
 
 The four `@pi-agent-web/*` packages are not published to npm. Clone the repository and use the
-commands above; do not rely on an `npx @pi-agent-web/cli` installation yet.
+commands above. `pnpm test:pack` verifies local tarballs without implying a registry release.
 
-`pnpm test:pack` creates local tarballs for protocol, server, UI, and CLI in a temporary directory.
-It checks package contents and dependencies, installs the tarballs, verifies `--help` through the
-binary and equivalent local `npx` path, then starts the single-port workbench with the installed
-binary. This verifies packaging without implying a registry release.
+The source is available under the [MIT License](LICENSE).
 
-The source is available under the [MIT License](LICENSE). The current boundary is a GitHub preview,
-not a stable npm or production release.
-
-## Project Structure
+## Repository map
 
 ```text
-packages/
-  protocol/  Browser-safe DTOs, runtime guards, and command policy
-  server/    Native catalog, bounded Session runtime pool, REST, and multiplexed WebSocket
-  ui/        React 19 workbench with Session-scoped stores and streaming projection
-  cli/       pi-web launcher, static UI discovery, and bounded shutdown
-docs/
-  decisions/ Accepted architecture decision records
-  *.md       Architecture, protocol, UI/UX, and development contracts
+packages/protocol  Browser-safe DTOs, guards, policy, and budgets
+packages/server    Local Gateway, native discovery, and Session supervision
+packages/ui        React workbench and Session-scoped Browser state
+packages/cli       pi-web launcher and bounded shutdown
+docs/              Current contracts and architecture decisions
 ```
 
-## Documentation
+## Documentation authority
 
-- [Architecture](docs/architecture.md): identity, process ownership, concurrency, and recovery
-- [Protocol](docs/protocol.md): verified Pi RPC facts and the browser/gateway contract
-- [UI and UX](docs/ui-ux.md): interaction, accessibility, and responsive behavior
+- [Architecture](docs/architecture.md): identities, ownership, concurrency, and recovery
+- [Protocol](docs/protocol.md): Pi RPC facts and the Browser/Gateway contract
+- [UI and UX](docs/ui-ux.md): user-visible behavior and accessibility
+- [Design](docs/design.md): visual language and acceptance criteria
 - [Development](docs/development.md): test layers, CI, packaging, and release checks
-- [GitHub Issues](https://github.com/leon-zym/pi-agent-web/issues): backlog, sequencing, and completion status
-- [Architecture decisions](docs/decisions/README.md): accepted decisions and rejected alternatives
-- [Visual design](DESIGN.md): visual tokens and component rules
-- [简体中文](README.zh-CN.md): Chinese README
+- [Architecture decisions](docs/decisions/README.md): rationale, supersession, and rejected alternatives
+- [GitHub Issues](https://github.com/leon-zym/pi-agent-web/issues): backlog and delivery status
 
-Files under `docs/notes/` and `tmp/` are ignored working material, not current product contracts.
+Current contracts describe the product as it exists now. Historical reasoning belongs in ADRs.
+Files under `docs/notes/` and `tmp/` are ignored working material, not product authority.

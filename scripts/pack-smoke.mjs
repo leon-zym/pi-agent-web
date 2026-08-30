@@ -168,7 +168,7 @@ try {
 			readiness?.ready !== true ||
 			readiness?.runtime?.source !== "bundled" ||
 			readiness?.runtime?.version !== "0.84.2" ||
-			readiness?.runtime?.adapterId !== "legacy-rpc-v1"
+			readiness?.runtime?.adapterId !== "pi-rpc"
 		) {
 			throw new Error(`Packaged Gateway selected an unexpected runtime: ${JSON.stringify(readiness)}`);
 		}

@@ -100,6 +100,8 @@ describe("ConversationToc outline rail", () => {
 
 		expect(html).toContain("opacity-0");
 		expect(html).toContain("pointer-events-none");
+		expect(html).toContain("invisible");
+		expect(html).toContain('aria-hidden="true"');
 	});
 
 	it("does not render when turns is empty", () => {

@@ -1,15 +1,16 @@
 import {
-	type ExtensionUiRequestDto,
-	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
 	type GatewayClientHelloDto,
 	type GatewayServerHelloDto,
-	isSessionSnapshotDto,
-	isSessionWsServerMessage,
-	type ProductSessionEventDto,
+	type InlineSessionReplayFrameDto,
+	type InlineSessionSnapshotDto,
+	isInlineSessionSnapshotDto,
+	isInlineSessionWsServerMessage,
+	type PiExtensionUiRequestDto,
+	type PiProductSessionEventDto,
+	SESSION_CONTENT_REF_BUDGET,
 	SESSION_PAYLOAD_BUDGET,
-	type SessionReplayFrameDto,
 	type SessionRuntimeDto,
-	type SessionSnapshotDto,
 	type SessionWsClientMessage,
 } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -48,25 +49,19 @@ class FakeSocket implements SessionWebSocket {
 		this.onopen?.();
 		this.receive({
 			type: "server_hello",
-			protocol: { major: 1, minor: 2 },
+			protocol: { major: 1, minor: 3 },
 			serverBuild: "test",
 			serverEpoch: SERVER_EPOCH,
 			piVersion: "test",
 			adapterId: "test",
-			capabilities: [
-				"rpc.commands",
-				"rpc.events",
-				"rpc.extension_ui",
-				"session.multiplex",
-				"session.hot_runtime_inventory",
-				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
-			],
+			capabilities: [...GATEWAY_SERVER_REQUIRED_CAPABILITIES],
 			limits: {
 				maxClientFrameBytes: 8 * 1024 * 1024,
 				maxSnapshotFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes,
 				maxExtensionRequests: 256,
 			},
 			payloadBudget: SESSION_PAYLOAD_BUDGET,
+			contentRefBudget: SESSION_CONTENT_REF_BUDGET,
 		} satisfies GatewayServerHelloDto);
 		this.receive({
 			type: "hot_runtime_inventory",
@@ -103,8 +98,8 @@ function runtime(lastSeq: number): SessionRuntimeDto {
 
 function frame(
 	seq: number,
-	event: ProductSessionEventDto,
-): Extract<SessionReplayFrameDto, { type: "event" }> {
+	event: PiProductSessionEventDto,
+): Extract<InlineSessionReplayFrameDto, { type: "event" }> {
 	return {
 		type: "event",
 		serverEpoch: SERVER_EPOCH,
@@ -117,8 +112,8 @@ function frame(
 }
 
 function snapshot(
-	pendingExtensionRequests: SessionSnapshotDto["pendingExtensionRequests"] = [],
-): SessionSnapshotDto {
+	pendingExtensionRequests: InlineSessionSnapshotDto["pendingExtensionRequests"] = [],
+): InlineSessionSnapshotDto {
 	return {
 		type: "session_snapshot",
 		snapshotId: "pipeline-snapshot",
@@ -149,7 +144,7 @@ async function setup() {
 			return socket;
 		},
 		url: () => "ws://pipeline.test",
-		protocolVersion: { major: 1, minor: 2 },
+		protocolVersion: { major: 1, minor: 3 },
 	});
 	controllers.push(controller);
 	vi.doMock("../src/stores/session-transport", async () => ({
@@ -194,11 +189,12 @@ describe("stream pipeline snapshot suffix delivery", () => {
 			type: "message_update",
 			usage: USAGE,
 			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hello" },
-		} as ProductSessionEventDto);
-		expect(isSessionWsServerMessage(delta)).toBe(true);
-		expect(isSessionSnapshotDto(snapshot())).toBe(true);
+		} as PiProductSessionEventDto);
+		expect(isInlineSessionWsServerMessage(delta)).toBe(true);
+		expect(isInlineSessionSnapshotDto(snapshot())).toBe(true);
 		socket.receive(delta);
 		socket.receive(snapshot());
+		await vi.advanceTimersByTimeAsync(0);
 
 		expect(controller.store.getState().sessions[SESSION_HANDLE]).toMatchObject({
 			baselineAuthoritative: false,
@@ -227,11 +223,14 @@ describe("stream pipeline snapshot suffix delivery", () => {
 			type: "message_update",
 			usage: USAGE,
 			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "done" },
-		} as ProductSessionEventDto);
-		expect(isSessionWsServerMessage(delta)).toBe(true);
+		} as PiProductSessionEventDto);
+		expect(isInlineSessionWsServerMessage(delta)).toBe(true);
 		socket.receive(delta);
 		socket.receive(frame(4, { type: "agent_settled" }));
 		socket.receive(snapshot());
+		await vi.waitFor(() =>
+			expect(controller.store.getState().sessions[SESSION_HANDLE]?.baselineAuthoritative).toBe(true),
+		);
 
 		expect(controller.store.getState().sessions[SESSION_HANDLE]).toMatchObject({
 			baselineAuthoritative: true,
@@ -250,7 +249,7 @@ describe("stream pipeline snapshot suffix delivery", () => {
 	it("does not let an acknowledged skipped request advance past an unconfirmed delta", async () => {
 		vi.useFakeTimers();
 		const { controller, socket, useExtensionUiStore } = await setup();
-		const request: Extract<ExtensionUiRequestDto, { method: "confirm" }> = {
+		const request: Extract<PiExtensionUiRequestDto, { method: "confirm" }> = {
 			type: "extension_ui_request",
 			id: "already-answered",
 			method: "confirm",
@@ -261,7 +260,7 @@ describe("stream pipeline snapshot suffix delivery", () => {
 			type: "message_update",
 			usage: USAGE,
 			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "before request" },
-		} as ProductSessionEventDto);
+		} as PiProductSessionEventDto);
 		const requestFrame = {
 			type: "extension_ui_request",
 			serverEpoch: SERVER_EPOCH,
@@ -271,8 +270,8 @@ describe("stream pipeline snapshot suffix delivery", () => {
 			seq: 4,
 			request,
 		} as const;
-		expect(isSessionWsServerMessage(delta)).toBe(true);
-		expect(isSessionWsServerMessage(requestFrame)).toBe(true);
+		expect(isInlineSessionWsServerMessage(delta)).toBe(true);
+		expect(isInlineSessionWsServerMessage(requestFrame)).toBe(true);
 		socket.receive(delta);
 		socket.receive(requestFrame);
 		socket.receive({
@@ -284,6 +283,7 @@ describe("stream pipeline snapshot suffix delivery", () => {
 			outcome: "accepted",
 		});
 		socket.receive(snapshot([request]));
+		await vi.advanceTimersByTimeAsync(0);
 
 		expect(controller.store.getState().sessions[SESSION_HANDLE]).toMatchObject({
 			baselineAuthoritative: false,

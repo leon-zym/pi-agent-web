@@ -1,169 +1,135 @@
 # Pi Agent Web
 
-[English](README.md) · [简体中文](README.zh-CN.md)
+[English](README.md) | 简体中文
 
-Pi Agent Web 是 Pi Coding Agent RPC 模式的本机 Web 工作台，直接使用 Pi 原生 Session。它会打开
-Pi 现有的 JSONL Session，让活跃 Session 独立运行；用户切换对话时，后台任务仍会继续。
+Pi Agent Web 是 Pi Coding Agent RPC 模式的本地 Web 工作台。它直接打开 Pi 原生 JSONL
+会话，让各个活跃会话独立运行。即使浏览器切换到了其他对话，后台任务也能继续执行。
 
-Pi JSONL 始终是持久化事实来源。Pi Agent Web 不会把 Workspace 或 Session 历史复制到第二套
-数据库。Workspace 来自各 JSONL Header 中规范化 `cwd` 路径的投影；轻量偏好存储只保留展示和
-发现提示。
+Pi JSONL 是持久化数据的唯一事实来源。Pi Agent Web 不会将工作区或会话历史复制到另一个数据库。
 
-> Pi Agent Web 目前是开发预览版。界面与兼容性可能变化，缺陷也可能中断正常使用。重要工作请
-> 纳入版本控制，并保留日常备份。
+> Pi Agent Web 目前处于开发预览阶段。接口可能发生变化，缺陷也可能中断工作。请将重要工作纳入
+> 版本控制，并按日常方式保留备份。
 
-## 本地预览边界
+## 产品边界
 
-网关是单用户、本机同源控制面，只监听 loopback 地址。bootstrap 请求签发 HttpOnly Cookie 后，
-其余 REST 与 WebSocket 请求必须携带该 Cookie，并校验 loopback Host 以及完全相同的 Origin 或
-Fetch Metadata。开发流量通过 Vite 的同源代理进入网关；代理会先拒绝跨 Origin 调用，再改写请求，
-而生产环境从不信任 Vite 端口。这些措施面向
-本机浏览器使用，不能替代托管服务、局域网部署、远程账户、多用户协作或敌对本机用户隔离。不要
-通过公网反向代理暴露 `pi-web`。
+网关是一个仅供单用户使用的同源本地控制界面，只监听回环地址。它不是托管服务、局域网服务器、
+多人协作系统，也不能防御恶意本地用户。请勿通过公共反向代理暴露 `pi-web`。
 
-Provider 凭据、扩展、设置和 JSONL 历史仍留在用户自己的 Pi 安装中。本仓库不会打包这些内容，无
-凭据 CI 也不需要读取它们。
+提供商凭据、扩展、设置和会话历史仍由用户现有的 Pi 安装管理。开发环境和 CI 使用不含凭据的
+确定性测试夹具。
 
-## 特性
+## 主要能力
 
-- Pi 原生发现以 JSONL 文件的规范路径标识 Session，以 Header `cwd` 归组 Workspace。偏好
-  设置不会替代、改写或删除原生历史。
-- 每个热 Session 最多运行一个 `pi --mode rpc` 进程，休眠 Session 不占用进程；有界进程池允许
-  同一 Workspace 或不同 Workspace 的 Session 并发运行。
-- 浏览器与网关通过一条已认证 WebSocket 复用相互隔离的 Session 通道。控制租约、运行代次、
-  `fencingToken`、序列游标、回放、重同步和 Extension UI 状态都按 Session 划分。
-- 选择对话只会切换当前视图，其他已订阅 Session 继续接收事件；切换 Workspace 或 Session 不会停止
-  后台任务。
-- 启动时会在 Web 最近使用的 Workspace 新建 Session，而不是自动打开历史第一项。展开 Workspace
-  分组不会改变当前 Session；未落盘且从未使用的空 Session 会被安全忘记，不会删除任何 JSONL。
-- 工作台支持流式回复、思考与工具步骤、完整 GFM 与代码渲染、模型与思考强度控制、Slash 命令、
-  原子化 Slash/Skill Command Tag、Extension UI 以及图片附件，包括纯图片提示。
-- 网关对 JSONL、帧、命令、回放和客户端缓冲设有边界。删除 Session 时会校验身份和
-  `fencingToken`，再将文件移入可恢复回收区，而不是直接调用 `unlink`。
+- 直接发现原生会话，不建立第二套历史存储。
+- 每个活跃会话由独立的 Pi 进程负责，进程池有明确上限。
+- 一个经过认证的 WebSocket 承载相互隔离的会话通道。
+- 支持流式回复、思考过程、工具活动、Markdown、图片、斜杠命令和扩展界面。
+- 草稿、控制权、投影状态、恢复流程和后台事件均按会话隔离。
+- 对变更操作执行围栏校验，限制载荷规模，提供显式重同步和可恢复的会话删除。
 
-## 产品 Demo
+选择会话只会改变浏览器当前显示的内容。它不会调用 Pi 的全局 `switch_session` 或
+`new_session` 命令，也不会停止其他会话。
 
-工作台界面：
+## 界面预览
 
 <table>
 <tr>
-<td align="center"><img src="docs/assets/demo/overall.png" alt="Pi Agent Web Session 原生工作台与已完成的 Coding Agent 回复" width="560" /><br /><sub>聚焦对话的工作台</sub></td>
-<td align="center"><img src="docs/assets/demo/tool-inspect.png" alt="Pi Agent Web 工具 diff 与检查面板" width="560" /><br /><sub>工具结果与上下文检查面板</sub></td>
+<td align="center"><img src="docs/assets/demo/overall.png" alt="Pi Agent Web 对话工作台" width="560" /><br /><sub>对话工作台</sub></td>
+<td align="center"><img src="docs/assets/demo/tool-inspect.png" alt="Pi Agent Web 工具检查器" width="560" /><br /><sub>工具检查</sub></td>
 </tr>
 <tr>
-<td align="center"><img src="docs/assets/demo/dark-mode.png" alt="Pi Agent Web 深色主题与语义化语法高亮" width="560" /><br /><sub>深色主题</sub></td>
-<td align="center"><img src="docs/assets/demo/mobile.png" alt="Pi Agent Web 375 像素响应式 Session 视图" width="220" /><br /><sub>375 像素响应式界面</sub></td>
+<td align="center"><img src="docs/assets/demo/dark-mode.png" alt="Pi Agent Web 深色主题" width="560" /><br /><sub>深色主题</sub></td>
+<td align="center"><img src="docs/assets/demo/mobile.png" alt="Pi Agent Web 窄视口界面" width="220" /><br /><sub>窄视口</sub></td>
 </tr>
 </table>
 
-所有 Demo 内容都来自确定性浏览器 fixture；截图不包含 Provider 凭据、私人路径或用户 Session 历史。
+演示内容使用确定性测试夹具，不包含提供商凭据、私有路径或用户会话历史。
 
-## Session 模型
+## 架构概览
 
 ```text
-浏览器：当前视图 + 按 Session 划分的状态存储
-  └─ 一条已认证 WebSocket，N 条相互隔离的 Session 通道
-       └─ 网关：原生目录 + 有界热运行时池
-            ├─ Workspace X / Session A ─ Pi 进程 A ─ A.jsonl
-            ├─ Workspace X / Session B ─ Pi 进程 B ─ B.jsonl
-            └─ Workspace Y / Session C ─ 休眠，仅保留 JSONL
+浏览器：当前视图和按会话隔离的状态存储
+  -> 一个经过认证的 WebSocket，内部包含相互隔离的会话通道
+     -> 网关：原生目录和有上限的活跃进程池
+        -> 每个活跃会话对应一个 Pi RPC 进程
+           -> Pi 原生 JSONL
 ```
 
-当前 Session 是浏览器的视图指针，不是 Pi 的全局当前 Session。打开历史 Session 时，网关按需启动
-对应进程；当进程池需要容量时，空闲且已持久化的 Session 可以回到休眠状态，之后仍从同一份
-原生 JSONL 文件重新打开。
+持久化会话以 JSONL 文件的规范路径作为身份。文件头中的规范 `cwd` 标识工作区。休眠的历史会话
+不占用进程，需要时才会启动。
 
-绝对路径的 Pi 默认、全局与环境配置目录不依赖 Web 偏好即可发现。仅由项目配置指定的
-`sessionDir`，以及任何按 Pi child 的 Workspace cwd 解释的相对 Agent/Session 目录，都无法在
-不知道 Workspace 路径时推导。移除 Workspace 只会移除这条发现提示，不会删除 JSONL；重新添加
-同一规范路径即可恢复发现。
-
-修改类命令必须携带准确的 Session 运行代次和当前 `fencingToken`。只读观察者无需取得控制权也能
-跟随事件。重连时，有界回放会补齐已知缺口；如果游标或身份不确定，客户端会明确执行快照重同步。
+变更操作需要匹配会话的准确代次和当前围栏令牌。只读观察者不需要控制租约。身份或顺序不明确时，
+系统会拒绝操作并进入显式恢复流程，而不是静默修补游标。
 
 ## 快速开始
 
-要求 Node.js 22+、pnpm 11.21.0，并准备一个 Pi Coding Agent 运行时。
+环境要求：Node.js 22 或更高版本、pnpm 11.21.0，以及兼容的 Pi Coding Agent 运行时。
 
 ```bash
 pnpm install --frozen-lockfile
 pnpm dev
 ```
 
-开发模式默认启动 `:3000` 上的网关和 `:5173` 上的 Vite。打开 Vite 输出的 loopback 地址，添加
-本地 Workspace，然后打开已有原生 Session 或新建 Session。Vite 只把来访同源的 API 与 WebSocket
-改写为网关同源请求；`:5173` 不是生产环境的受信 Origin。
+开发模式默认在 3000 端口启动网关，在 5173 端口启动 Vite。请打开 Vite 输出的回环地址。
 
-启动单端口 CLI 前，先构建 SPA：
+使用单端口命令行程序之前，需要先构建单页应用：
 
 ```bash
 pnpm build
 pnpm start
 
-# 通过根脚本传递 CLI 参数
+# 通过根目录脚本传递命令行参数。
 pnpm start -- --pi-path /path/to/rpc-entry.js --port 3100 --no-open
 ```
 
-`pi-web` 的 `--host` 只接受 `127.0.0.1`、`localhost` 或 `::1`。默认使用并验证随发行包安装的精确
-Pi 依赖，不会被 `PATH` 中无关的 `pi` 覆盖。`--pi-path` / `PI_PATH` 是 expert override，也必须通过
-相同的版本/能力探测。常用参数有 `--pi-path`、`--host`、`--port`、`--no-open` 和 `--help`。
+`pi-web` 只接受回环主机。它通常使用发行包中安装的准确 Pi 依赖。`--pi-path` 和 `PI_PATH`
+是面向高级用户的覆盖选项，指定的运行时必须通过相同的限时版本与能力探测。
 
-命名边界有意保留：`pi-agent-web` 是仓库、服务和 `@pi-agent-web/*` 软件包命名空间；`pi-web` 是
-面向用户的命令。
+两个名称的作用不同：`pi-agent-web` 是仓库和包命名空间，`pi-web` 是面向用户的命令。
 
 ## 验证
 
 ```bash
-pnpm verify                                      # lint、类型、确定性测试、构建
-pnpm test:smoke                                  # fake Pi 驱动的已认证 REST/WebSocket
-pnpm test:e2e                                    # fake Pi 驱动的打包产物浏览器 E2E
-pnpm test:pack                                   # 打包安装四包、验证 help，并由 bin 启动工作台
-PI_WEB_RUN_E2E=1 pnpm test:e2e:real              # 显式运行真实 Pi/Provider 兼容性测试
+pnpm verify                 # 代码检查、类型检查、确定性测试和生产构建
+pnpm test:smoke             # 经过认证的 REST 和 WebSocket 冒烟测试
+pnpm test:browser           # 基于打包产物的确定性浏览器测试
+pnpm test:pack              # 本地包安装和命令行启动冒烟测试
+pnpm test:compat            # 准确版本的 Pi 兼容性夹具
+pnpm bench:representative   # 可复现的代表性性能矩阵
+pnpm bench:stress           # 显式执行的长时间压力矩阵
+PI_WEB_RUN_E2E=1 pnpm test:e2e:real  # 显式执行、会使用凭据的真实 Pi 验收
 ```
 
-`pnpm test:e2e` 是 `pnpm test:browser` 的别名。CI 不使用 Provider 凭据，会运行 `verify`、
-`test:smoke`、`test:pack` 和打包产物 Chromium 测试套件。真实 Pi 检查会使用开发者已经配置的 Provider，
-因此必须显式运行。
-
-真实 Pi 测试套件覆盖同一 WebSocket 上的多 Session 并发、纯图片输入、内容隔离、流式阶段的
-follow-up 与 abort、clone rekey、父子历史隔离和 RPC 元数据。它使用隔离的临时 Workspace 与
-Session、Web 数据及 Pi Agent 根目录，仅将 `auth.json` 与 `models.json` 复制进权限受限的临时
-Agent 目录；不会加载用户扩展或设置，不会扫描或修改已有 Pi 历史，并会在每次运行结束后验证真实
-`settings.json` 的指纹未发生变化。
+性能矩阵属于 Issue #28 第一阶段，目前尚未完成。结构正确性已有强制门禁；延迟、吞吐量、长任务和
+堆内存等受宿主机影响的指标仍只作观察，需建立参考主机基线后才能成为发布门禁。测试边界参见
+[开发文档](docs/development.md)。
 
 ## 分发状态
 
-四个 `@pi-agent-web/*` 软件包尚未发布到 npm。请 clone 本仓库并使用上面的命令；目前不要依赖
-`npx @pi-agent-web/cli` 安装。
+四个 `@pi-agent-web/*` 包尚未发布到 npm。请克隆仓库并使用上面的命令。本地
+`pnpm test:pack` 会验证包产物，但不代表已经完成公共注册表发布。
 
-`pnpm test:pack` 会在临时目录中为 protocol、server、UI 和 CLI 生成本地 tarball，检查软件包内容
-与依赖并安装；随后通过可执行文件与等价的本地 `npx` 路径验证 `--help`，再由已安装的可执行文件
-启动单端口工作台。这个流程只验证打包结果，不代表已经发布到 registry。
+源代码采用 [MIT License](LICENSE) 许可。
 
-源码采用 [MIT License](LICENSE)。当前定位是 GitHub 预览版，不是稳定的 npm 或生产发行版。
-
-## 项目结构
+## 仓库结构
 
 ```text
-packages/
-  protocol/  Browser-safe DTO、运行时 guard 与命令策略
-  server/    原生目录、有界 Session 运行时池、REST 与多路复用 WebSocket
-  ui/        React 19 工作台、按 Session 划分的 store 与流式投影
-  cli/       pi-web 启动器、静态 UI 发现与有界关停
-docs/
-  decisions/ 已接受的架构决策记录
-  *.md       架构、协议、UI/UX 与开发契约
+packages/protocol  浏览器安全的数据传输对象、守卫、策略和预算
+packages/server    本地网关、原生发现和会话监督
+packages/ui        React 工作台和按会话隔离的浏览器状态
+packages/cli       pi-web 启动器和有边界的退出流程
+docs/              当前契约和架构决策
 ```
 
-## 文档
+## 文档权威性
 
-- [架构](docs/architecture.md)：身份、进程所有权、并发与恢复
-- [协议](docs/protocol.md)：已验证的 Pi RPC 事实与浏览器/网关契约
-- [UI 与 UX](docs/ui-ux.md)：交互、可访问性与响应式行为
-- [开发](docs/development.md)：测试层级、CI、打包与发布门禁
-- [GitHub Issues](https://github.com/leon-zym/pi-agent-web/issues)：待办、排序与完成状态
-- [架构决策](docs/decisions/README.md)：已接受的决策与被拒绝的替代方案
-- [视觉设计](DESIGN.md)：视觉变量与组件规则
-- [English](README.md)：英文 README
+- [架构](docs/architecture.md)：身份、所有权、并发和恢复
+- [协议](docs/protocol.md)：Pi RPC 事实和浏览器与网关之间的契约
+- [UI 与 UX](docs/ui-ux.md)：用户可见行为和可访问性
+- [视觉设计](docs/design.md)：视觉语言和验收标准
+- [开发](docs/development.md)：测试层次、CI、打包和发布检查
+- [架构决策](docs/decisions/README.md)：决策理由、替代关系和被否决的方案
+- [GitHub Issues](https://github.com/leon-zym/pi-agent-web/issues)：待办事项和交付状态
 
-`docs/notes/` 与 `tmp/` 下的文件是被 Git 忽略的过程材料，不是当前产品契约。
+当前契约只描述产品现状。历史决策过程保存在 ADR 中。`docs/notes/` 和 `tmp/` 下的文件是被忽略的
+临时工作材料，不属于产品权威文档。

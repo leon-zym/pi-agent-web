@@ -4,11 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import {
 	GATEWAY_CONTENT_REF_CAPABILITY,
-	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+	GATEWAY_PROTOCOL_VERSION,
+	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
 	SESSION_PAYLOAD_BUDGET,
 } from "@pi-agent-web/protocol";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { type LegacyServerHandle, startServerWithCurrentMode } from "../src/main.js";
+import { type ServerHandle, startServer } from "../src/main.js";
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-gateway-test-"));
 const workspacePath = path.join(tempRoot, "workspace");
@@ -22,7 +23,7 @@ const PROVIDER_ID_LIMIT = 256;
 const API_KEY_LIMIT = 16 * 1024;
 const WORKSPACE_PATH_LIMIT = 8192;
 
-let handle: LegacyServerHandle;
+let handle: ServerHandle;
 let base: string;
 let cookie: string;
 let workspaceHandle: string;
@@ -52,15 +53,9 @@ async function openSocket(headers: Record<string, string>): Promise<import("ws")
 	ws.send(
 		JSON.stringify({
 			type: "client_hello",
-			protocol: { major: 1, minor: 2 },
+			protocol: GATEWAY_PROTOCOL_VERSION,
 			clientBuild: "gateway-security-test",
-			capabilities: [
-				"rpc.commands",
-				"rpc.events",
-				"rpc.extension_ui",
-				"session.multiplex",
-				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
-			],
+			capabilities: [...GATEWAY_SERVER_REQUIRED_CAPABILITIES],
 			limits: { maxServerFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes },
 		}),
 	);
@@ -107,7 +102,7 @@ async function rawGet(pathname: string, headers: Record<string, string>): Promis
 
 beforeAll(async () => {
 	fs.mkdirSync(workspacePath, { recursive: true });
-	handle = await startServerWithCurrentMode({
+	handle = await startServer({
 		config: { port: 0, host: "127.0.0.1", agentDir, sessionRootDir, webDataDir },
 		piPath: fakePiPath,
 		handleSignals: false,
@@ -149,7 +144,7 @@ afterAll(async () => {
 
 describe("gateway access control", () => {
 	it("rejects non-loopback listener configuration", async () => {
-		await expect(startServerWithCurrentMode({ config: { host: "0.0.0.0" } })).rejects.toThrow("PI_WEB_HOST");
+		await expect(startServer({ config: { host: "0.0.0.0" } })).rejects.toThrow("PI_WEB_HOST");
 	});
 
 	it("boots only from the Gateway origin without exposing the session secret", async () => {
@@ -163,7 +158,7 @@ describe("gateway access control", () => {
 		expect((await fetch(`${base}/api/v1/bootstrap`, { headers: { Origin: viteOrigin } })).status).toBe(403);
 	});
 
-	it("keeps the generic content capability unavailable in the production 1.2 hello", async () => {
+	it("advertises the canonical content-reference contract in the production hello", async () => {
 		const WebSocketCtor = (await import("ws")).default;
 		const ws = new WebSocketCtor(`${base.replace("http", "ws")}/api/v1/ws`, {
 			headers: authenticatedHeaders(),
@@ -186,21 +181,15 @@ describe("gateway access control", () => {
 			ws.send(
 				JSON.stringify({
 					type: "client_hello",
-					protocol: { major: 1, minor: 2 },
+					protocol: GATEWAY_PROTOCOL_VERSION,
 					clientBuild: "generic-content-inert-test",
-					capabilities: [
-						"rpc.commands",
-						"rpc.events",
-						"rpc.extension_ui",
-						"session.multiplex",
-						GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
-					],
+					capabilities: [...GATEWAY_SERVER_REQUIRED_CAPABILITIES],
 					limits: { maxServerFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes },
 				}),
 			);
 			const serverHello = await hello;
-			expect(serverHello.protocol).toEqual({ major: 1, minor: 2 });
-			expect(serverHello.capabilities).not.toContain(GATEWAY_CONTENT_REF_CAPABILITY);
+			expect(serverHello.protocol).toEqual(GATEWAY_PROTOCOL_VERSION);
+			expect(serverHello.capabilities).toContain(GATEWAY_CONTENT_REF_CAPABILITY);
 		} finally {
 			ws.close();
 		}

@@ -1,5 +1,5 @@
 /**
- * Background tab badge & title indicator (DESIGN.md 8.3).
+ * Background tab badge and title indicator for optional status feedback.
  * Updates document.title and draws a status indicator dot on the favicon canvas when the tab is hidden.
  */
 

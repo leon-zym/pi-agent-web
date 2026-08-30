@@ -1,9 +1,39 @@
 /**
- * Native Web Audio API chime synthesis (DESIGN.md 8.2).
+ * Native Web Audio API chime synthesis for optional status feedback.
  * Synthesizes pure sine tones directly without external audio assets.
  */
 
 const STORAGE_KEY = "piweb:audio-muted";
+const audioMutedListeners = new Set<() => void>();
+
+function notifyAudioMutedListeners(): void {
+	for (const listener of audioMutedListeners) listener();
+}
+
+function onAudioMutedStorage(event: StorageEvent): void {
+	if (event.key === STORAGE_KEY || event.key === null) notifyAudioMutedListeners();
+}
+
+export function subscribeAudioMuted(listener: () => void): () => void {
+	audioMutedListeners.add(listener);
+	if (
+		audioMutedListeners.size === 1 &&
+		typeof window !== "undefined" &&
+		typeof window.addEventListener === "function"
+	) {
+		window.addEventListener("storage", onAudioMutedStorage);
+	}
+	return () => {
+		audioMutedListeners.delete(listener);
+		if (
+			audioMutedListeners.size === 0 &&
+			typeof window !== "undefined" &&
+			typeof window.removeEventListener === "function"
+		) {
+			window.removeEventListener("storage", onAudioMutedStorage);
+		}
+	};
+}
 
 export function isAudioMuted(): boolean {
 	try {
@@ -16,14 +46,20 @@ export function isAudioMuted(): boolean {
 	return false;
 }
 
-export function setAudioMuted(muted: boolean): void {
+export function setAudioMuted(muted: boolean): boolean {
 	try {
 		if (typeof localStorage !== "undefined") {
-			localStorage.setItem(STORAGE_KEY, muted ? "true" : "false");
+			const previous = isAudioMuted();
+			const value = muted ? "true" : "false";
+			localStorage.setItem(STORAGE_KEY, value);
+			if (localStorage.getItem(STORAGE_KEY) !== value) return false;
+			if (previous !== muted) notifyAudioMutedListeners();
+			return true;
 		}
 	} catch {
 		// Ignore storage access restrictions
 	}
+	return false;
 }
 
 function getAudioContext(): AudioContext | null {

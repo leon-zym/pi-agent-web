@@ -1,55 +1,50 @@
 import {
 	commandTimeoutMs,
-	type ExtensionUiRequestDto,
 	type ExtensionUiResponseDto,
-	type FutureSessionCommandResponseDto,
-	type FutureSessionContentRefGuardContext,
-	type FutureSessionEntryDto,
-	type FutureSessionHistoryPageChunkDto,
-	type FutureSessionMessageDto,
-	type FutureSessionResponseFrameDto,
-	type FutureSessionSnapshotBeginDto,
-	type FutureSessionSnapshotChunkDto,
-	type FutureSessionSnapshotDto,
-	type FutureSessionTreeNodeDto,
-	GATEWAY_CONTENT_REF_PROTOCOL_MINOR,
 	GATEWAY_PROTOCOL_VERSION,
 	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
 	GATEWAY_SESSION_HISTORY_CAPABILITY,
 	type GatewayClientHelloDto,
-	type GatewayContentRefClientHelloDto,
-	type GatewayContentRefServerHelloDto,
+	type GatewayServerHelloDto,
 	type HotRuntimeInventoryDto,
 	type HotRuntimeInventoryEntryDto,
+	type InlineSessionHistoryPageChunkDto,
+	type InlineSessionReplayFrameDto,
+	type InlineSessionSnapshotBeginDto,
+	type InlineSessionSnapshotChunkDto,
+	type InlineSessionSnapshotDto,
+	type InlineSessionWsServerMessage,
 	isBoundedJsonValue,
-	isFutureSessionCommandResponseDto,
-	isFutureSessionWsServerMessage,
-	isGatewayContentRefServerHello,
 	isGatewayProtocolError,
 	isGatewayServerHello,
+	isInlineSessionSnapshotDto,
+	isPiSessionCommandResponseDto,
+	isPiSessionEntryDto,
+	isPiSessionMessageDto,
+	isPiSessionTreeDto,
 	isReadOnlyRpcCommand,
 	isSessionCommandResponseDto,
-	isSessionEntryDto,
-	isSessionMessageDto,
-	isSessionSnapshotDto,
-	isSessionTreeDto,
 	isSessionWsServerMessage,
-	negotiateGatewayContentRef,
-	negotiateGatewayPayloadBudget,
-	negotiateHotRuntimeInventory,
+	negotiateGatewayHello,
+	type PiExtensionUiRequestDto,
+	type PiSessionCommandResponseDto,
+	type PiSessionEntryDto,
+	type PiSessionMessageDto,
+	type PiSessionTreeNodeDto,
 	SESSION_SUBSCRIPTION_RETRYABLE_ERROR_CODES,
 	SESSION_WS_CLIENT_MAX_BYTES,
 	SESSION_WS_SERVER_MAX_BYTES,
 	type SessionAttachmentGuardContext,
 	type SessionCommandDto,
 	type SessionCommandResponseDto,
+	type SessionContentRefGuardContext,
 	type SessionEntryDto,
 	type SessionHistoryPageBeginDto,
 	type SessionHistoryPageChunkDto,
 	type SessionHistoryPageEndDto,
 	type SessionMessageDto,
 	type SessionReplayCursorDto,
-	type SessionReplayFrameDto,
+	type SessionResponseFrameDto,
 	type SessionRuntimeDto,
 	type SessionRuntimeIdentityDto,
 	type SessionSnapshotBeginDto,
@@ -58,22 +53,21 @@ import {
 	type SessionSnapshotEndDto,
 	type SessionTreeNodeDto,
 	type SessionWsClientMessage,
-	type SessionWsServerMessage,
 	sessionWsClientMessageBytes,
 } from "@pi-agent-web/protocol";
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
-import {
-	createFutureSessionContentAdapter,
-	type FutureSessionContentAdapter,
-	type FutureSessionJsonFieldGuard,
-	type FutureSessionJsonRootProjection,
-	type FutureSessionTextPayloadProjection,
-	type ProjectedFutureExtensionUiSnapshot,
-	type ProjectedFutureSessionReplayFrame,
-	type ProjectedFutureSessionSnapshot,
-} from "../lib/future-session-content-adapter";
 import { runtimeIsReady, runtimePhase } from "../lib/runtime-state";
+import {
+	createSessionContentAdapter,
+	type ProjectedExtensionUiSnapshot,
+	type ProjectedSessionReplayFrame,
+	type ProjectedSessionSnapshot,
+	type SessionContentAdapter,
+	type SessionJsonFieldGuard,
+	type SessionJsonRootProjection,
+	type SessionTextPayloadProjection,
+} from "../lib/session-content-adapter";
 import { createSessionContentResolver } from "../lib/session-content-resolver";
 import { SessionHistoryStreamAssembler } from "../lib/session-history-stream";
 import {
@@ -88,17 +82,17 @@ import {
 } from "./session-frame-bus";
 import {
 	emptySessionHistoryState,
-	type FutureSessionContentAdapterFactory,
-	type FutureSessionContentAdapterInstallation,
-	type FutureSessionLazyIdentity,
-	type FutureSessionTransportFrameMessage,
 	type HotRuntimeInventoryToken,
 	hasFreshLeaseBaseline,
 	type SessionChannelState,
+	type SessionContentAdapterFactory,
+	type SessionContentAdapterInstallation,
 	type SessionHistoryState,
+	type SessionLazyIdentity,
 	type SessionSubscriptionAdmission,
 	type SessionTransportController,
 	SessionTransportError,
+	type SessionTransportFrameMessage,
 	type SessionTransportOptions,
 	type SessionTransportState,
 	type SessionWebSocket,
@@ -116,13 +110,13 @@ export {
 } from "./session-frame-bus";
 export {
 	emptySessionHistoryState,
-	type FutureSessionContentAdapterFactory,
-	type FutureSessionContentAdapterInstallation,
-	type FutureSessionLazyIdentity,
 	type HotRuntimeInventoryToken,
 	hasFreshLeaseBaseline,
 	type SessionChannelState,
+	type SessionContentAdapterFactory,
+	type SessionContentAdapterInstallation,
 	type SessionHistoryState,
+	type SessionLazyIdentity,
 	type SessionLeaseState,
 	type SessionRawEventRecord,
 	type SessionResyncState,
@@ -147,27 +141,13 @@ const DEFAULT_HELLO_TIMEOUT_MS = 5_000;
 const MAX_RESYNC_BUFFERED_FRAMES = 1_024;
 const MAX_RESYNC_BUFFERED_BYTES = 1024 * 1024;
 export const MAX_ACTIVE_SUBSCRIPTIONS = 6;
-const LEGACY_RETRYABLE_SUBSCRIPTION_ERROR_CODES = ["snapshot_unavailable"] as const;
 const MAX_PENDING_EXTENSION_REQUESTS = 256;
 const MAX_DELIVERED_NOTIFY_KEYS = 256;
 const MAX_DELIVERED_NOTIFY_IDENTITIES = 64;
 const SESSION_HISTORY_PAGE_LIMIT = 128;
 const CLIENT_BUILD = "0.1.0";
 const CLIENT_CAPABILITIES = [...GATEWAY_SERVER_REQUIRED_CAPABILITIES, GATEWAY_SESSION_HISTORY_CAPABILITY];
-const LEGACY_CLIENT_CAPABILITIES = [
-	"rpc.commands",
-	"rpc.events",
-	"rpc.extension_ui",
-	"session.multiplex",
-	"session.hot_runtime_inventory",
-	"payload.epoch_attachment_refs",
-] as const;
-const LEGACY_CLIENT_ADVERTISED_CAPABILITIES = [
-	...LEGACY_CLIENT_CAPABILITIES,
-	GATEWAY_SESSION_HISTORY_CAPABILITY,
-] as const;
-
-const FUTURE_CONTENT_ADAPTER_METHODS = [
+const CONTENT_ADAPTER_METHODS = [
 	"projectTextPayload",
 	"projectJsonRoot",
 	"materializeTextPayload",
@@ -178,22 +158,20 @@ const FUTURE_CONTENT_ADAPTER_METHODS = [
 	"materializeExtensionSnapshot",
 ] as const;
 
-function isFutureSessionContentAdapterInstallation(
-	value: unknown,
-): value is FutureSessionContentAdapterInstallation {
+function isSessionContentAdapterInstallation(value: unknown): value is SessionContentAdapterInstallation {
 	if (typeof value !== "object" || value === null) return false;
 	const installation = value as { adapter?: unknown; dispose?: unknown };
 	if (typeof installation.dispose !== "function") return false;
 	if (typeof installation.adapter !== "object" || installation.adapter === null) return false;
 	const adapter = installation.adapter as Record<string, unknown>;
-	return FUTURE_CONTENT_ADAPTER_METHODS.every((method) => typeof adapter[method] === "function");
+	return CONTENT_ADAPTER_METHODS.every((method) => typeof adapter[method] === "function");
 }
 
-const defaultFutureSessionContentAdapterFactory: FutureSessionContentAdapterFactory = (trustedContext) => {
+const defaultSessionContentAdapterFactory: SessionContentAdapterFactory = (trustedContext) => {
 	const resolver = createSessionContentResolver({ trustedContext });
 	try {
 		return {
-			adapter: createFutureSessionContentAdapter({ trustedContext, resolver }),
+			adapter: createSessionContentAdapter({ trustedContext, resolver }),
 			dispose: () => resolver.dispose(),
 		};
 	} catch (error) {
@@ -203,21 +181,20 @@ const defaultFutureSessionContentAdapterFactory: FutureSessionContentAdapterFact
 };
 
 type WireSendResult = "sent" | "payload_too_large" | "unavailable";
-type TransportClientHello = GatewayClientHelloDto | GatewayContentRefClientHelloDto;
-type NegotiatedProductMode = "current" | "future";
-type TransportReplayFrame = SessionReplayFrameDto | ProjectedFutureSessionReplayFrame;
+type TransportClientHello = GatewayClientHelloDto;
+type TransportReplayFrame = InlineSessionReplayFrameDto | ProjectedSessionReplayFrame;
 
 type BufferedReplayFrame =
-	| { message: SessionReplayFrameDto; productMode: "current" }
-	| { message: ProjectedFutureSessionReplayFrame; productMode: "future" };
+	| { message: InlineSessionReplayFrameDto; representation: "wire" }
+	| { message: ProjectedSessionReplayFrame; representation: "projected" };
 
 type TransportSessionSnapshotFrame =
-	| { message: SessionSnapshotDto; productMode: "current" }
-	| { message: ProjectedFutureSessionSnapshot; productMode: "future" };
+	| { message: InlineSessionSnapshotDto; representation: "wire" }
+	| { message: ProjectedSessionSnapshot; representation: "projected" };
 
-type HistorySnapshotBegin = SessionSnapshotBeginDto | FutureSessionSnapshotBeginDto;
-type HistorySnapshotChunk = SessionSnapshotChunkDto | FutureSessionSnapshotChunkDto;
-type HistoryPageChunk = SessionHistoryPageChunkDto | FutureSessionHistoryPageChunkDto;
+type HistorySnapshotBegin = InlineSessionSnapshotBeginDto | SessionSnapshotBeginDto;
+type HistorySnapshotChunk = InlineSessionSnapshotChunkDto | SessionSnapshotChunkDto;
+type HistoryPageChunk = InlineSessionHistoryPageChunkDto | SessionHistoryPageChunkDto;
 type CompletedHistorySnapshot = ReturnType<
 	SessionHistoryStreamAssembler<
 		unknown,
@@ -230,7 +207,7 @@ type CompletedHistorySnapshot = ReturnType<
 interface SnapshotHistoryAssembly {
 	identity: SessionRuntimeIdentityDto;
 	snapshotId: string;
-	productMode: "current" | "future";
+	representation: "wire" | "projected";
 	controller: AbortController;
 	assembler: SessionHistoryStreamAssembler<
 		unknown,
@@ -249,7 +226,7 @@ interface SnapshotHistoryAssembly {
 interface PageHistoryAssembly {
 	identity: SessionRuntimeIdentityDto;
 	requestId: string;
-	productMode: "current" | "future";
+	representation: "wire" | "projected";
 	controller: AbortController;
 	assembler: SessionHistoryStreamAssembler<
 		unknown,
@@ -262,12 +239,12 @@ interface PageHistoryAssembly {
 
 type TransportExtensionSnapshotFrame =
 	| {
-			message: Extract<SessionWsServerMessage, { type: "extension_ui_snapshot" }>;
-			productMode: "current";
+			message: Extract<InlineSessionWsServerMessage, { type: "extension_ui_snapshot" }>;
+			representation: "wire";
 	  }
-	| { message: ProjectedFutureExtensionUiSnapshot; productMode: "future" };
+	| { message: ProjectedExtensionUiSnapshot; representation: "projected" };
 
-interface FutureProjectionTail {
+interface ProjectionTail {
 	identity: SessionRuntimeIdentityDto;
 	controller: AbortController;
 	promise: Promise<void>;
@@ -277,21 +254,21 @@ interface FutureProjectionTail {
 	snapshotWaiter: SnapshotWaiter | null;
 }
 
-interface FutureLazyIdentityScope {
-	identity: FutureSessionLazyIdentity;
+interface LazyIdentityScope {
+	identity: SessionLazyIdentity;
 	controller: AbortController;
-	operations: Set<FutureLazyOperation>;
+	operations: Set<LazyOperation>;
 }
 
-interface FutureLazyOperation {
-	scope: FutureLazyIdentityScope;
+interface LazyOperation {
+	scope: LazyIdentityScope;
 	controller: AbortController;
 	onIdentityAbort: () => void;
 	callerSignal: AbortSignal | null;
 	onCallerAbort: (() => void) | null;
 }
 
-type ResponseMessage = Extract<SessionWsServerMessage, { type: "response" }>;
+type ResponseMessage = Extract<InlineSessionWsServerMessage, { type: "response" }>;
 
 interface PendingCommand {
 	id: string;
@@ -301,16 +278,16 @@ interface PendingCommand {
 	sessionHandle: string;
 	generation: number;
 	commandType: SessionCommandDto["type"];
-	futureHistory?: FutureHistoryOperation;
-	futureHistoryBarrierSeq?: number;
-	futureHistoryResponseKey?: string;
+	historyOperation?: HistoryOperation;
+	historyBarrierSeq?: number;
+	historyResponseKey?: string;
 	response?: ResponseMessage;
-	resolve: (response: SessionCommandResponseDto) => void;
+	resolve: (response: PiSessionCommandResponseDto) => void;
 	reject: (error: Error) => void;
 	timer: ReturnType<typeof setTimeout>;
 }
 
-interface FutureHistoryOperation {
+interface HistoryOperation {
 	id: string;
 	token: number;
 	identity: SessionRuntimeIdentityDto;
@@ -380,9 +357,9 @@ function isMutation(command: SessionCommandDto): boolean {
 }
 
 function replaceExtensionRequest(
-	requests: ExtensionUiRequestDto[],
-	request: ExtensionUiRequestDto,
-): ExtensionUiRequestDto[] {
+	requests: PiExtensionUiRequestDto[],
+	request: PiExtensionUiRequestDto,
+): PiExtensionUiRequestDto[] {
 	const semanticKey = extensionRequestSemanticKey(request);
 	if (semanticKey === null) return requests;
 	return [
@@ -393,7 +370,7 @@ function replaceExtensionRequest(
 	].slice(-MAX_PENDING_EXTENSION_REQUESTS);
 }
 
-function extensionRequestSemanticKey(request: ExtensionUiRequestDto): string | null {
+function extensionRequestSemanticKey(request: PiExtensionUiRequestDto): string | null {
 	switch (request.method) {
 		case "select":
 		case "confirm":
@@ -413,16 +390,16 @@ function extensionRequestSemanticKey(request: ExtensionUiRequestDto): string | n
 	}
 }
 
-function normalizeExtensionRequests(requests: ExtensionUiRequestDto[]): ExtensionUiRequestDto[] {
-	let normalized: ExtensionUiRequestDto[] = [];
+function normalizeExtensionRequests(requests: PiExtensionUiRequestDto[]): PiExtensionUiRequestDto[] {
+	let normalized: PiExtensionUiRequestDto[] = [];
 	for (const request of requests) normalized = replaceExtensionRequest(normalized, request);
 	return normalized;
 }
 
 function applyReplayExtensionState(
-	requests: ExtensionUiRequestDto[],
+	requests: PiExtensionUiRequestDto[],
 	message: TransportReplayFrame,
-): ExtensionUiRequestDto[] {
+): PiExtensionUiRequestDto[] {
 	if (message.type === "extension_ui_request") return replaceExtensionRequest(requests, message.request);
 	if (message.type === "extension_ui_closed") {
 		return requests.filter((request) => request.id !== message.requestId);
@@ -434,7 +411,7 @@ function isIdentityTransitionCommand(commandType: SessionCommandDto["type"]): bo
 	return commandType === "fork" || commandType === "clone";
 }
 
-function isFutureHistoryCommand(commandType: SessionCommandDto["type"]): boolean {
+function isHistoryCommand(commandType: SessionCommandDto["type"]): boolean {
 	return commandType === "get_messages" || commandType === "get_entries" || commandType === "get_tree";
 }
 
@@ -442,7 +419,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-interface FutureResponseEnvelopeCandidate {
+interface ResponseEnvelopeCandidate {
 	id: string;
 	command: string;
 	serverEpoch: string;
@@ -450,7 +427,7 @@ interface FutureResponseEnvelopeCandidate {
 	generation: number;
 }
 
-function futureResponseEnvelopeCandidate(value: unknown): FutureResponseEnvelopeCandidate | null {
+function responseEnvelopeCandidate(value: unknown): ResponseEnvelopeCandidate | null {
 	if (!isRecord(value) || value.type !== "response" || !isRecord(value.response)) return null;
 	if (
 		typeof value.serverEpoch !== "string" ||
@@ -495,10 +472,7 @@ function validCursor(channel: SessionChannelState): SessionReplayCursorDto | und
 
 function subscriptionAdmissionCode(error: string, code?: string): string {
 	if (code) return code.slice(0, 128);
-	const known = [
-		...SESSION_SUBSCRIPTION_RETRYABLE_ERROR_CODES,
-		...LEGACY_RETRYABLE_SUBSCRIPTION_ERROR_CODES,
-	].find((errorCode) => error.includes(errorCode));
+	const known = SESSION_SUBSCRIPTION_RETRYABLE_ERROR_CODES.find((errorCode) => error.includes(errorCode));
 	if (known) return known;
 	const token = error.match(/[A-Za-z][A-Za-z0-9_-]*/)?.[0];
 	return (token ?? "subscription_rejected").slice(0, 128);
@@ -506,9 +480,7 @@ function subscriptionAdmissionCode(error: string, code?: string): string {
 
 function isRetryableSubscriptionError(error: string, retryable?: boolean): boolean {
 	if (retryable !== undefined) return retryable;
-	return [...SESSION_SUBSCRIPTION_RETRYABLE_ERROR_CODES, ...LEGACY_RETRYABLE_SUBSCRIPTION_ERROR_CODES].some(
-		(code) => error.includes(code),
-	);
+	return SESSION_SUBSCRIPTION_RETRYABLE_ERROR_CODES.some((code) => error.includes(code));
 }
 
 function identityKey(identity: SessionRuntimeIdentityDto): string {
@@ -534,8 +506,8 @@ function identitiesMatch(
 	);
 }
 
-function futureLazyAbortError(): DOMException {
-	return new DOMException("Future Session lazy content operation was aborted", "AbortError");
+function lazyAbortError(): DOMException {
+	return new DOMException("Session lazy content operation was aborted", "AbortError");
 }
 
 interface SnapshotWaiter {
@@ -576,30 +548,17 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	const reconnectMaxMs = Math.max(reconnectBaseMs, options.reconnectMaxMs ?? DEFAULT_RECONNECT_MAX_MS);
 	const helloTimeoutMs = Math.max(1, options.helloTimeoutMs ?? DEFAULT_HELLO_TIMEOUT_MS);
 	const maxActiveSubscriptions = Math.max(1, options.maxActiveSubscriptions ?? MAX_ACTIVE_SUBSCRIPTIONS);
-	const configuredProtocolVersion = options.protocolVersion ?? GATEWAY_PROTOCOL_VERSION;
-	const configuredFutureContentAdapter = options.futureContentAdapter;
-	const futureModeRequested =
-		options.futureContentAdapterFactory !== undefined ||
-		(configuredProtocolVersion.major === GATEWAY_PROTOCOL_VERSION.major &&
-			configuredProtocolVersion.minor === GATEWAY_CONTENT_REF_PROTOCOL_MINOR);
-	const futureContentAdapterFactory =
-		options.futureContentAdapterFactory ??
-		(configuredFutureContentAdapter
-			? () => ({ adapter: configuredFutureContentAdapter, dispose: () => {} })
-			: futureModeRequested
-				? defaultFutureSessionContentAdapterFactory
-				: undefined);
-	const clientHelloProtocol = futureModeRequested
-		? { major: GATEWAY_PROTOCOL_VERSION.major, minor: GATEWAY_CONTENT_REF_PROTOCOL_MINOR }
-		: configuredProtocolVersion;
-	const clientHelloCapabilities = futureModeRequested
-		? [...CLIENT_CAPABILITIES]
-		: [...LEGACY_CLIENT_ADVERTISED_CAPABILITIES];
+	const configuredContentAdapter = options.contentAdapter;
+	const contentAdapterFactory =
+		options.contentAdapterFactory ??
+		(configuredContentAdapter
+			? () => ({ adapter: configuredContentAdapter, dispose: () => {} })
+			: defaultSessionContentAdapterFactory);
 	const clientHello: TransportClientHello = {
 		type: "client_hello",
-		protocol: clientHelloProtocol,
+		protocol: GATEWAY_PROTOCOL_VERSION,
 		clientBuild: options.clientBuild ?? CLIENT_BUILD,
-		capabilities: clientHelloCapabilities,
+		capabilities: [...CLIENT_CAPABILITIES],
 		limits: { maxServerFrameBytes: SESSION_WS_SERVER_MAX_BYTES },
 	};
 	const frameBus = new OrderedSessionFrameBus();
@@ -615,6 +574,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	const deliveredNotifyKeys = new Map<string, DeliveredNotifyKeys>();
 	let deliveredNotifyIdentityOrder: string[] = [];
 	const claimAttempts = new Set<string>();
+	const releasedControlIntents = new Set<string>();
+	const pendingOverflowRestarts = new Map<string, SessionRuntimeIdentityDto>();
 	const baselineRefreshes = new Set<string>();
 	const subscriptionBaselines = new Map<string, string | null>();
 	let subscribedLruOrder: string[] = [];
@@ -636,16 +597,15 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	let negotiatedServerEpoch: string | null = null;
 	let historyNegotiated = false;
 	let attachmentGuardContext: Readonly<SessionAttachmentGuardContext> | null = null;
-	let futureContentRefGuardContext: Readonly<FutureSessionContentRefGuardContext> | null = null;
-	let negotiatedProductMode: NegotiatedProductMode | null = null;
-	let activeFutureContentAdapter = options.futureContentAdapter;
-	let installedFutureContent: FutureSessionContentAdapterInstallation | null = null;
+	let contentRefGuardContext: Readonly<SessionContentRefGuardContext> | null = null;
+	let activeContentAdapter = options.contentAdapter;
+	let installedContent: SessionContentAdapterInstallation | null = null;
 	const wireTextEncoder = new TextEncoder();
 	let hotRuntimeRevision = -1;
 	let hotRuntimeByHandle = new Map<string, HotRuntimeInventoryEntryDto>();
 	const connectionObservations = new Map<string, SessionRuntimeIdentityDto>();
-	const futureProjectionTails = new Map<string, FutureProjectionTail>();
-	const futureLazyIdentityScopes = new Map<string, FutureLazyIdentityScope>();
+	const projectionTails = new Map<string, ProjectionTail>();
+	const lazyIdentityScopes = new Map<string, LazyIdentityScope>();
 	const initialInventoryWaiters = new Set<InitialInventoryWaiter>();
 	const exactHotRecoveryQueue: string[] = [];
 	const queuedExactHotRecoveries = new Set<string>();
@@ -672,7 +632,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		releaseSession,
 		sendCommand,
 		sendExtensionUiResponse,
-		manualRetryResync: (sessionHandle) => resyncCoordinator.manualRetry(sessionHandle),
+		manualRetryResync,
 		retrySessionSubscription,
 	}));
 
@@ -692,12 +652,11 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		initialInventoryWaiters.clear();
 	}
 
-	function disposeInstalledFutureContent(): void {
-		const installed = installedFutureContent;
-		installedFutureContent = null;
-		futureContentRefGuardContext = null;
-		negotiatedProductMode = null;
-		activeFutureContentAdapter = configuredFutureContentAdapter;
+	function disposeInstalledContent(): void {
+		const installed = installedContent;
+		installedContent = null;
+		contentRefGuardContext = null;
+		activeContentAdapter = configuredContentAdapter;
 		if (!installed) return;
 		try {
 			installed.dispose();
@@ -706,31 +665,30 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		}
 	}
 
-	function installFutureContentForHello(message: GatewayContentRefServerHelloDto): boolean {
-		if (!futureContentAdapterFactory || negotiatedProductMode !== null) return false;
-		const negotiation = negotiateGatewayContentRef(clientHello, message);
+	function installContentForHello(message: GatewayServerHelloDto): boolean {
+		if (!contentAdapterFactory || contentRefGuardContext !== null) return false;
+		const negotiation = negotiateGatewayHello(clientHello, message);
 		if (!negotiation.negotiated) return false;
-		const context: Readonly<FutureSessionContentRefGuardContext> = Object.freeze({
+		const context: Readonly<SessionContentRefGuardContext> = Object.freeze({
 			serverEpoch: message.serverEpoch,
 			payloadBudget: Object.freeze({ ...negotiation.payloadBudget }),
 			contentRefBudget: Object.freeze({ ...negotiation.contentRefBudget }),
 		});
-		let installation: FutureSessionContentAdapterInstallation;
+		let installation: SessionContentAdapterInstallation;
 		try {
-			const candidate = futureContentAdapterFactory(context);
-			if (!isFutureSessionContentAdapterInstallation(candidate)) return false;
+			const candidate = contentAdapterFactory(context);
+			if (!isSessionContentAdapterInstallation(candidate)) return false;
 			installation = candidate;
 		} catch {
 			return false;
 		}
-		futureContentRefGuardContext = context;
+		contentRefGuardContext = context;
 		attachmentGuardContext = Object.freeze({
 			serverEpoch: context.serverEpoch,
 			payloadBudget: context.payloadBudget,
 		});
-		activeFutureContentAdapter = installation.adapter;
-		installedFutureContent = installation;
-		negotiatedProductMode = "future";
+		activeContentAdapter = installation.adapter;
+		installedContent = installation;
 		historyNegotiated =
 			message.capabilities.includes(GATEWAY_SESSION_HISTORY_CAPABILITY) &&
 			clientHello.capabilities.includes(GATEWAY_SESSION_HISTORY_CAPABILITY);
@@ -806,8 +764,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				}
 				barrierSeq = Math.max(barrierSeq, response.barrierSeq);
 			}
-			if (pending.futureHistoryBarrierSeq !== undefined) {
-				barrierSeq = Math.max(barrierSeq, pending.futureHistoryBarrierSeq);
+			if (pending.historyBarrierSeq !== undefined) {
+				barrierSeq = Math.max(barrierSeq, pending.historyBarrierSeq);
 			}
 		}
 		return barrierSeq;
@@ -878,7 +836,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 
 	function hasDeliveredNotify(
 		identity: SessionRuntimeIdentityDto,
-		message: Extract<SessionReplayFrameDto, { type: "extension_ui_request" }>,
+		message: Extract<InlineSessionReplayFrameDto, { type: "extension_ui_request" }>,
 	): boolean {
 		const retained = deliveredNotifyKeys.get(identity.sessionHandle);
 		if (!retained || !identitiesMatch(retained.identity, identity)) return false;
@@ -887,7 +845,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 
 	function rememberDeliveredNotify(
 		identity: SessionRuntimeIdentityDto,
-		message: Extract<SessionReplayFrameDto, { type: "extension_ui_request" }>,
+		message: Extract<InlineSessionReplayFrameDto, { type: "extension_ui_request" }>,
 	): void {
 		const existing = deliveredNotifyKeys.get(identity.sessionHandle);
 		let retained = existing && identitiesMatch(existing.identity, identity) ? existing : undefined;
@@ -1016,71 +974,25 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				enterIncompatible(next);
 				return;
 			}
-			if (futureModeRequested && negotiatedProductMode === null) {
+			if (contentRefGuardContext === null) {
 				if (
-					!isGatewayContentRefServerHello(value) ||
+					!isGatewayServerHello(value) ||
 					store.getState().connectionState !== "connecting" ||
-					!installFutureContentForHello(value)
+					!installContentForHello(value)
 				) {
 					enterIncompatible(next);
 					return;
 				}
 				return;
 			}
-			if (isGatewayServerHello(value)) {
-				if (!LEGACY_CLIENT_CAPABILITIES.every((capability) => value.capabilities.includes(capability))) {
-					enterIncompatible(next);
-					return;
-				}
-				const inventoryNegotiation = negotiateHotRuntimeInventory(clientHello, value);
-				const payloadNegotiation = negotiateGatewayPayloadBudget(clientHello, value);
-				if (!inventoryNegotiation.negotiated || !payloadNegotiation.negotiated) {
-					enterIncompatible(next);
-					return;
-				}
-				if (store.getState().connectionState !== "connecting") {
-					enterIncompatible(next);
-					return;
-				}
-				negotiatedMaxClientFrameBytes = Math.min(
-					SESSION_WS_CLIENT_MAX_BYTES,
-					value.limits.maxClientFrameBytes,
-				);
-				negotiatedMaxServerFrameBytes = value.limits.maxSnapshotFrameBytes;
-				negotiatedServerEpoch = value.serverEpoch;
-				historyNegotiated =
-					value.capabilities.includes(GATEWAY_SESSION_HISTORY_CAPABILITY) &&
-					clientHello.capabilities.includes(GATEWAY_SESSION_HISTORY_CAPABILITY);
-				attachmentGuardContext = Object.freeze({
-					serverEpoch: value.serverEpoch,
-					payloadBudget: Object.freeze({ ...payloadNegotiation.budget }),
-				});
-				negotiatedProductMode = "current";
-				hotRuntimeRevision = -1;
-				return;
-			}
-			const currentGuardContext = attachmentGuardContext;
-			const futureGuardContext = futureContentRefGuardContext;
-			if (currentGuardContext === null || negotiatedProductMode === null) {
+			const negotiatedContentRefContext = contentRefGuardContext;
+			if (negotiatedContentRefContext === null) {
 				enterIncompatible(next);
 				return;
 			}
 			if (store.getState().connectionState === "connecting" && negotiatedServerEpoch !== null) {
-				if (negotiatedProductMode === "future") {
-					if (
-						futureGuardContext === null ||
-						!isFutureSessionWsServerMessage(value, futureGuardContext) ||
-						value.type !== "hot_runtime_inventory" ||
-						value.serverEpoch !== negotiatedServerEpoch
-					) {
-						enterIncompatible(next);
-						return;
-					}
-					handleHotRuntimeInventory(value, true);
-					return;
-				}
 				if (
-					!isSessionWsServerMessage(value, currentGuardContext) ||
+					!isSessionWsServerMessage(value, negotiatedContentRefContext) ||
 					value.type !== "hot_runtime_inventory" ||
 					value.serverEpoch !== negotiatedServerEpoch
 				) {
@@ -1094,60 +1006,51 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				enterIncompatible(next);
 				return;
 			}
-			if (negotiatedProductMode === "future") {
-				if (futureGuardContext === null || !isFutureSessionWsServerMessage(value, futureGuardContext)) {
-					if (!handleInvalidFutureResponse(value)) enterIncompatible(next);
-					return;
-				}
-				switch (value.type) {
-					case "response":
-					case "event":
-					case "extension_ui_request":
-					case "extension_ui_closed":
-					case "session_snapshot":
-					case "extension_ui_snapshot":
-						if (!ingestFutureFrameMessage(value, rawWireBytes)) return;
-						return;
-					case "session_snapshot_begin":
-					case "session_snapshot_chunk":
-					case "session_snapshot_end":
-					case "session_history_page_begin":
-					case "session_history_page_chunk":
-					case "session_history_page_end":
-						if (!ingestFutureFrameMessage(value, rawWireBytes)) return;
-						return;
-					case "hot_runtime_inventory":
-						handleHotRuntimeInventory(value);
-						return;
-					case "runtime_state":
-						handleRuntimeState(value);
-						return;
-					case "lease_status":
-						handleLease(value);
-						return;
-					case "resync_required":
-						handleResyncRequired(value);
-						return;
-					case "extension_ui_result":
-						handleExtensionResult(value);
-						return;
-					case "session_rekeyed":
-						handleRekey(value);
-						return;
-					case "session_error":
-						handleSessionError(value);
-						return;
-					case "session_directory_changed":
-					case "auth_changed":
-						globalBus.emit(value);
-						return;
-				}
-			}
-			if (!isSessionWsServerMessage(value, currentGuardContext)) {
-				enterIncompatible(next);
+			if (!isSessionWsServerMessage(value, negotiatedContentRefContext)) {
+				if (!handleInvalidResponse(value)) enterIncompatible(next);
 				return;
 			}
-			ingestServerMessage(value);
+			switch (value.type) {
+				case "response":
+				case "event":
+				case "extension_ui_request":
+				case "extension_ui_closed":
+				case "session_snapshot":
+				case "extension_ui_snapshot":
+				case "session_snapshot_begin":
+				case "session_snapshot_chunk":
+				case "session_snapshot_end":
+				case "session_history_page_begin":
+				case "session_history_page_chunk":
+				case "session_history_page_end":
+					ingestFrameMessage(value, rawWireBytes);
+					return;
+				case "hot_runtime_inventory":
+					handleHotRuntimeInventory(value);
+					return;
+				case "runtime_state":
+					handleRuntimeState(value);
+					return;
+				case "lease_status":
+					handleLease(value);
+					return;
+				case "resync_required":
+					handleResyncRequired(value);
+					return;
+				case "extension_ui_result":
+					handleExtensionResult(value);
+					return;
+				case "session_rekeyed":
+					handleRekey(value);
+					return;
+				case "session_error":
+					handleSessionError(value);
+					return;
+				case "session_directory_changed":
+				case "auth_changed":
+					globalBus.emit(value);
+					return;
+			}
 		};
 	}
 
@@ -1220,10 +1123,10 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	}
 
 	function resetDisconnectedState(connectionState: "offline" | "incompatible"): void {
-		abortAllFutureProjections();
-		abortAllFutureLazyOperations();
-		abortAllFutureHistoryOperations();
-		disposeInstalledFutureContent();
+		abortAllProjections();
+		abortAllLazyOperations();
+		abortAllHistoryOperations();
+		disposeInstalledContent();
 		clearHelloTimer();
 		negotiatedMaxClientFrameBytes = SESSION_WS_CLIENT_MAX_BYTES;
 		negotiatedMaxServerFrameBytes = SESSION_WS_SERVER_MAX_BYTES;
@@ -1232,6 +1135,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		attachmentGuardContext = null;
 		hotRuntimeRevision = -1;
 		claimAttempts.clear();
+		releasedControlIntents.clear();
+		pendingOverflowRestarts.clear();
 		baselineRefreshes.clear();
 		subscriptionBaselines.clear();
 		activeExactHotRecovery = null;
@@ -1363,7 +1268,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				: { ...current, subscribed: true, freshLeaseBaseline: null, subscriptionAdmission: null },
 		);
 		if (protectedOverage) markProtectedSubscriptionOverage(sessionHandle);
-		if (store.getState().connectionState !== "online" || negotiatedProductMode === null) return;
+		if (store.getState().connectionState !== "online" || contentRefGuardContext === null) return;
 		const cursor = validCursor(channel);
 		sendSubscription(sessionHandle, cursor);
 	}
@@ -1372,7 +1277,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		const channel = store.getState().sessions[sessionHandle];
 		if (channel?.subscriptionAdmission?.kind !== "rejected") return false;
 		if (!channel.subscriptionAdmission.retryable) return false;
-		if (store.getState().connectionState !== "online" || negotiatedProductMode === null) return false;
+		if (store.getState().connectionState !== "online" || contentRefGuardContext === null) return false;
 		setChannel(sessionHandle, (current) => ({ ...current, subscriptionAdmission: null }));
 		if (!channel.subscribed) {
 			subscribeSession(sessionHandle);
@@ -1411,7 +1316,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		const operation: PageHistoryAssembly = {
 			identity: channel.runtime,
 			requestId,
-			productMode: negotiatedProductMode ?? "current",
+			representation: "projected",
 			controller: new AbortController(),
 			assembler: new SessionHistoryStreamAssembler<
 				unknown,
@@ -1483,9 +1388,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		if (!channel?.subscribed) return;
 		cancelSessionHistory(sessionHandle);
 		abortHistoryForSession(sessionHandle);
-		abortFutureProjection(sessionHandle);
-		abortFutureLazyOperationsForSession(sessionHandle);
-		rejectFutureHistoryForSession(sessionHandle, new SessionTransportError("session_not_subscribed"));
+		abortProjection(sessionHandle);
+		abortLazyOperationsForSession(sessionHandle);
+		rejectHistoryForSession(sessionHandle, new SessionTransportError("session_not_subscribed"));
 		const lruIdx = subscribedLruOrder.indexOf(sessionHandle);
 		if (lruIdx !== -1) subscribedLruOrder.splice(lruIdx, 1);
 		setChannel(sessionHandle, (current) => ({
@@ -1498,6 +1403,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			subscriptionAdmission: null,
 		}));
 		claimAttempts.delete(sessionHandle);
+		releasedControlIntents.delete(sessionHandle);
+		pendingOverflowRestarts.delete(sessionHandle);
 		baselineRefreshes.delete(sessionHandle);
 		subscriptionBaselines.delete(sessionHandle);
 		connectionObservations.delete(sessionHandle);
@@ -1514,9 +1421,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	function invalidateSessionSnapshot(sessionHandle: string): boolean {
 		const channel = store.getState().sessions[sessionHandle];
 		if (channel?.subscribed) return false;
-		abortFutureProjection(sessionHandle);
-		abortFutureLazyOperationsForSession(sessionHandle);
-		rejectFutureHistoryForSession(
+		abortProjection(sessionHandle);
+		abortLazyOperationsForSession(sessionHandle);
+		rejectHistoryForSession(
 			sessionHandle,
 			new SessionTransportError("session_not_ready", "Dormant Session snapshot was invalidated"),
 		);
@@ -1528,6 +1435,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		acknowledgedExtensionRequests.delete(sessionHandle);
 		clearDeliveredNotifyKeys(sessionHandle);
 		claimAttempts.delete(sessionHandle);
+		pendingOverflowRestarts.delete(sessionHandle);
 		baselineRefreshes.delete(sessionHandle);
 		subscriptionBaselines.delete(sessionHandle);
 		discardRawEvents(sessionHandle, false);
@@ -1538,6 +1446,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	function claimSession(sessionHandle: string): boolean {
 		const channel = store.getState().sessions[sessionHandle];
 		if (!channel?.subscribed) return false;
+		releasedControlIntents.delete(sessionHandle);
 		setChannel(sessionHandle, (channel) => ({ ...channel, controllerIntent: true }));
 		claimSessionIfReady(sessionHandle);
 		return true;
@@ -1567,6 +1476,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		const channel = store.getState().sessions[sessionHandle];
 		if (!channel?.subscribed) return false;
 		claimAttempts.delete(sessionHandle);
+		releasedControlIntents.add(sessionHandle);
+		pendingOverflowRestarts.delete(sessionHandle);
 		setChannel(sessionHandle, (current) => ({
 			...current,
 			controllerIntent: false,
@@ -1590,11 +1501,43 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		return sendWire({ type: "session_release", sessionHandle }) === "sent";
 	}
 
+	function manualRetryResync(sessionHandle: string): boolean {
+		const channel = store.getState().sessions[sessionHandle];
+		const recovery = resyncCoordinator.getState(sessionHandle);
+		if (
+			channel?.runtime?.error === "session_snapshot_overflow" &&
+			channel.generation !== null &&
+			recovery?.phase === "degraded"
+		) {
+			releasedControlIntents.delete(sessionHandle);
+			setChannel(sessionHandle, (current) => ({ ...current, controllerIntent: true }));
+			if (channel.lease.fencingToken) {
+				return (
+					sendWire({
+						type: "session_restart",
+						sessionHandle,
+						expectedGeneration: channel.generation,
+						fencingToken: channel.lease.fencingToken,
+					}) === "sent"
+				);
+			}
+			pendingOverflowRestarts.set(sessionHandle, channel.runtime);
+			claimAttempts.add(sessionHandle);
+			if (sendWire({ type: "session_claim", sessionHandle }) !== "sent") {
+				claimAttempts.delete(sessionHandle);
+				pendingOverflowRestarts.delete(sessionHandle);
+				return false;
+			}
+			return true;
+		}
+		return resyncCoordinator.manualRetry(sessionHandle);
+	}
+
 	function sendCommand(
 		sessionHandle: string,
 		command: SessionCommandDto,
 		timeoutMs = commandTimeoutMs(command.type),
-	): Promise<SessionCommandResponseDto> {
+	): Promise<PiSessionCommandResponseDto> {
 		const channel = store.getState().sessions[sessionHandle];
 		if (!channel?.subscribed) {
 			return Promise.reject(new SessionTransportError("session_not_subscribed"));
@@ -1621,7 +1564,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			return Promise.reject(new SessionTransportError("duplicate_command_id"));
 		}
 		const generation = channel.generation;
-		return new Promise<SessionCommandResponseDto>((resolve, reject) => {
+		return new Promise<PiSessionCommandResponseDto>((resolve, reject) => {
 			const timer = setTimeout(
 				() => {
 					rejectPending(id, new SessionTransportError("timeout", `Command ${command.type} timed out`));
@@ -1640,8 +1583,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				reject,
 				timer,
 			};
-			if (isFutureHistoryCommand(command.type) && activeFutureContentAdapter) {
-				pending.futureHistory = createFutureHistoryOperation(pending);
+			if (isHistoryCommand(command.type) && activeContentAdapter) {
+				pending.historyOperation = createHistoryOperation(pending);
 			}
 			pendingCommands.set(id, pending);
 			const delivery = sendWire({
@@ -1880,13 +1823,13 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		}
 	}
 
-	function ingestServerMessage(message: SessionWsServerMessage): void {
+	function ingestServerMessage(message: InlineSessionWsServerMessage): void {
 		switch (message.type) {
 			case "hot_runtime_inventory":
 				handleHotRuntimeInventory(message);
 				return;
 			case "response":
-				handleResponse(message);
+				handleInlineResponse(message);
 				return;
 			case "runtime_state":
 				handleRuntimeState(message);
@@ -1906,22 +1849,22 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				handleSessionSnapshot(message);
 				return;
 			case "session_snapshot_begin":
-				handleSessionSnapshotBegin(message, "current");
+				handleSessionSnapshotBegin(message, "wire");
 				return;
 			case "session_snapshot_chunk":
-				handleSessionSnapshotChunk(message, "current");
+				handleSessionSnapshotChunk(message, "wire");
 				return;
 			case "session_snapshot_end":
-				handleSessionSnapshotEnd(message, "current");
+				handleSessionSnapshotEnd(message, "wire");
 				return;
 			case "session_history_page_begin":
-				handleSessionHistoryPageBegin(message, "current");
+				handleSessionHistoryPageBegin(message, "wire");
 				return;
 			case "session_history_page_chunk":
-				handleSessionHistoryPageChunk(message, "current");
+				handleSessionHistoryPageChunk(message, "wire");
 				return;
 			case "session_history_page_end":
-				handleSessionHistoryPageEnd(message, "current");
+				handleSessionHistoryPageEnd(message, "wire");
 				return;
 			case "extension_ui_snapshot":
 				handleExtensionSnapshot(message);
@@ -1945,9 +1888,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	function assertCurrentMessage(
 		value: unknown,
 		guardContext: Readonly<SessionAttachmentGuardContext> | null,
-	): SessionMessageDto {
-		if (!isSessionMessageDto(value, guardContext ?? undefined)) {
-			throw new Error("Future Session history message failed its current product guard");
+	): PiSessionMessageDto {
+		if (!isPiSessionMessageDto(value, guardContext ?? undefined)) {
+			throw new Error("Session history message failed its current product guard");
 		}
 		return value;
 	}
@@ -1955,9 +1898,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	function assertCurrentEntry(
 		value: unknown,
 		guardContext: Readonly<SessionAttachmentGuardContext> | null,
-	): SessionEntryDto {
-		if (!isSessionEntryDto(value, guardContext ?? undefined)) {
-			throw new Error("Future Session history entry failed its current product guard");
+	): PiSessionEntryDto {
+		if (!isPiSessionEntryDto(value, guardContext ?? undefined)) {
+			throw new Error("Session history entry failed its current product guard");
 		}
 		return value;
 	}
@@ -1965,9 +1908,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	function assertCurrentTree(
 		value: unknown,
 		guardContext: Readonly<SessionAttachmentGuardContext> | null,
-	): SessionTreeNodeDto[] {
-		if (!isSessionTreeDto(value, guardContext ?? undefined)) {
-			throw new Error("Future Session history tree failed its current product guard");
+	): PiSessionTreeNodeDto[] {
+		if (!isPiSessionTreeDto(value, guardContext ?? undefined)) {
+			throw new Error("Session history tree failed its current product guard");
 		}
 		return value;
 	}
@@ -1975,23 +1918,23 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	function assertCurrentResponse(
 		value: unknown,
 		guardContext: Readonly<SessionAttachmentGuardContext> | null,
-	): SessionCommandResponseDto {
-		if (!isSessionCommandResponseDto(value, guardContext ?? undefined)) {
-			throw new Error("Future Session command response failed its current product guard");
+	): PiSessionCommandResponseDto {
+		if (!isPiSessionCommandResponseDto(value, guardContext ?? undefined)) {
+			throw new Error("Session command response failed its current product guard");
 		}
 		return value;
 	}
 
-	async function materializeFutureMessage(
-		message: FutureSessionMessageDto,
-		adapter: FutureSessionContentAdapter,
+	async function materializeMessage(
+		message: SessionMessageDto,
+		adapter: SessionContentAdapter,
 		signal: AbortSignal,
 		guardContext: Readonly<SessionAttachmentGuardContext> | null,
-	): Promise<SessionMessageDto> {
+	): Promise<PiSessionMessageDto> {
 		let candidate: unknown;
 		switch (message.role) {
 			case "assistant": {
-				const content: Extract<SessionMessageDto, { role: "assistant" }>["content"] = [];
+				const content: Extract<PiSessionMessageDto, { role: "assistant" }>["content"] = [];
 				for (const block of message.content) {
 					if (block.type !== "toolCall") {
 						content.push(block);
@@ -2008,7 +1951,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				break;
 			}
 			case "toolResult": {
-				const content: Extract<SessionMessageDto, { role: "toolResult" }>["content"] = [];
+				const content: Extract<PiSessionMessageDto, { role: "toolResult" }>["content"] = [];
 				for (const block of message.content) {
 					if (block.type !== "text") {
 						content.push(block);
@@ -2031,7 +1974,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				break;
 			}
 			case "custom": {
-				let content: Extract<SessionMessageDto, { role: "custom" }>["content"];
+				let content: Extract<PiSessionMessageDto, { role: "custom" }>["content"];
 				if (Array.isArray(message.content)) {
 					content = [];
 					for (const block of message.content) {
@@ -2059,20 +2002,20 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		return assertCurrentMessage(candidate, guardContext);
 	}
 
-	async function materializeFutureEntry(
-		entry: FutureSessionEntryDto,
-		adapter: FutureSessionContentAdapter,
+	async function materializeEntry(
+		entry: SessionEntryDto,
+		adapter: SessionContentAdapter,
 		signal: AbortSignal,
 		guardContext: Readonly<SessionAttachmentGuardContext> | null,
-	): Promise<SessionEntryDto> {
+	): Promise<PiSessionEntryDto> {
 		let candidate: unknown;
 		if (entry.type === "message") {
 			candidate = {
 				...entry,
-				message: await materializeFutureMessage(entry.message, adapter, signal, guardContext),
+				message: await materializeMessage(entry.message, adapter, signal, guardContext),
 			};
 		} else if (entry.type === "custom_message") {
-			let content: Extract<SessionEntryDto, { type: "custom_message" }>["content"];
+			let content: Extract<PiSessionEntryDto, { type: "custom_message" }>["content"];
 			if (Array.isArray(entry.content)) {
 				content = [];
 				for (const block of entry.content) {
@@ -2098,57 +2041,57 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		return assertCurrentEntry(candidate, guardContext);
 	}
 
-	async function materializeFutureTreeNode(
-		node: FutureSessionTreeNodeDto,
-		adapter: FutureSessionContentAdapter,
+	async function materializeTreeNode(
+		node: SessionTreeNodeDto,
+		adapter: SessionContentAdapter,
 		signal: AbortSignal,
 		guardContext: Readonly<SessionAttachmentGuardContext> | null,
-	): Promise<SessionTreeNodeDto> {
-		const children: SessionTreeNodeDto[] = [];
+	): Promise<PiSessionTreeNodeDto> {
+		const children: PiSessionTreeNodeDto[] = [];
 		for (const child of node.children) {
-			children.push(await materializeFutureTreeNode(child, adapter, signal, guardContext));
+			children.push(await materializeTreeNode(child, adapter, signal, guardContext));
 		}
 		const candidate: unknown = {
 			...node,
-			entry: await materializeFutureEntry(node.entry, adapter, signal, guardContext),
+			entry: await materializeEntry(node.entry, adapter, signal, guardContext),
 			children,
 		};
 		const checked = assertCurrentTree([candidate], guardContext);
 		const first = checked[0];
-		if (!first) throw new Error("Future Session history tree root disappeared during materialization");
+		if (!first) throw new Error("Session history tree root disappeared during materialization");
 		return first;
 	}
 
-	async function materializeFutureResponse(
-		response: FutureSessionCommandResponseDto,
-		adapter: FutureSessionContentAdapter,
+	async function materializeResponse(
+		response: SessionCommandResponseDto,
+		adapter: SessionContentAdapter,
 		signal: AbortSignal,
 		guardContext: Readonly<SessionAttachmentGuardContext> | null,
-		futureGuardContext: Readonly<FutureSessionContentRefGuardContext> | null,
-	): Promise<SessionCommandResponseDto> {
-		if (futureGuardContext && !isFutureSessionCommandResponseDto(response, futureGuardContext)) {
-			throw new Error("Future Session command response failed its negotiated future guard");
+		contentRefContext: Readonly<SessionContentRefGuardContext> | null,
+	): Promise<PiSessionCommandResponseDto> {
+		if (contentRefContext && !isSessionCommandResponseDto(response, contentRefContext)) {
+			throw new Error("Session command response failed its negotiated content-reference guard");
 		}
 		if (response.success === false) return assertCurrentResponse(response, guardContext);
 		switch (response.command) {
 			case "get_messages": {
-				const messages: SessionMessageDto[] = [];
+				const messages: PiSessionMessageDto[] = [];
 				for (const message of response.data.messages) {
-					messages.push(await materializeFutureMessage(message, adapter, signal, guardContext));
+					messages.push(await materializeMessage(message, adapter, signal, guardContext));
 				}
 				return assertCurrentResponse({ ...response, data: { ...response.data, messages } }, guardContext);
 			}
 			case "get_entries": {
-				const entries: SessionEntryDto[] = [];
+				const entries: PiSessionEntryDto[] = [];
 				for (const entry of response.data.entries) {
-					entries.push(await materializeFutureEntry(entry, adapter, signal, guardContext));
+					entries.push(await materializeEntry(entry, adapter, signal, guardContext));
 				}
 				return assertCurrentResponse({ ...response, data: { ...response.data, entries } }, guardContext);
 			}
 			case "get_tree": {
-				const tree: SessionTreeNodeDto[] = [];
+				const tree: PiSessionTreeNodeDto[] = [];
 				for (const node of response.data.tree) {
-					tree.push(await materializeFutureTreeNode(node, adapter, signal, guardContext));
+					tree.push(await materializeTreeNode(node, adapter, signal, guardContext));
 				}
 				return assertCurrentResponse({ ...response, data: { ...response.data, tree } }, guardContext);
 			}
@@ -2157,7 +2100,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		}
 	}
 
-	function createFutureHistoryOperation(pending: PendingCommand): FutureHistoryOperation {
+	function createHistoryOperation(pending: PendingCommand): HistoryOperation {
 		return {
 			id: pending.id,
 			token: pending.token,
@@ -2172,13 +2115,13 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		};
 	}
 
-	function currentFutureHistoryPending(operation: FutureHistoryOperation): PendingCommand | null {
+	function currentHistoryPending(operation: HistoryOperation): PendingCommand | null {
 		const pending = pendingCommands.get(operation.id);
 		if (
 			!pending ||
 			pending.token !== operation.token ||
-			pending.futureHistory !== operation ||
-			!isFutureHistoryCommand(pending.commandType) ||
+			pending.historyOperation !== operation ||
+			!isHistoryCommand(pending.commandType) ||
 			pending.serverEpoch !== operation.identity.serverEpoch ||
 			pending.workspaceId !== operation.identity.workspaceId ||
 			pending.sessionHandle !== operation.identity.sessionHandle ||
@@ -2190,36 +2133,36 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		return channel?.subscribed && identitiesMatch(channel.runtime, operation.identity) ? pending : null;
 	}
 
-	function abortFutureHistoryOperation(pending: PendingCommand): void {
-		const operation = pending.futureHistory;
+	function abortHistoryOperation(pending: PendingCommand): void {
+		const operation = pending.historyOperation;
 		if (!operation) return;
-		pending.futureHistory = undefined;
+		pending.historyOperation = undefined;
 		operation.controller.abort();
 	}
 
-	function rejectFutureHistoryForSession(sessionHandle: string, error: Error): void {
+	function rejectHistoryForSession(sessionHandle: string, error: Error): void {
 		for (const pending of [...pendingCommands.values()]) {
 			if (
-				isFutureHistoryCommand(pending.commandType) &&
+				isHistoryCommand(pending.commandType) &&
 				(pending.sessionHandle === sessionHandle ||
-					pending.futureHistory?.identity.sessionHandle === sessionHandle)
+					pending.historyOperation?.identity.sessionHandle === sessionHandle)
 			) {
 				rejectPending(pending.id, error);
 			}
 		}
 	}
 
-	function abortAllFutureHistoryOperations(): void {
+	function abortAllHistoryOperations(): void {
 		for (const pending of pendingCommands.values()) {
-			if (pending.futureHistory) abortFutureHistoryOperation(pending);
+			if (pending.historyOperation) abortHistoryOperation(pending);
 		}
 	}
 
-	function handleInvalidFutureResponse(value: unknown): boolean {
-		const candidate = futureResponseEnvelopeCandidate(value);
+	function handleInvalidResponse(value: unknown): boolean {
+		const candidate = responseEnvelopeCandidate(value);
 		if (!candidate) return false;
 		const pending = pendingCommands.get(candidate.id);
-		if (!pending || !isFutureHistoryCommand(pending.commandType)) return false;
+		if (!pending || !isHistoryCommand(pending.commandType)) return false;
 		const exactIdentity =
 			pending.commandType === candidate.command &&
 			pending.serverEpoch === candidate.serverEpoch &&
@@ -2235,9 +2178,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			);
 			return true;
 		}
-		const error = new Error("Future Session command response failed its negotiated guard");
+		const error = new Error("Session command response failed its negotiated guard");
 		const channel = store.getState().sessions[candidate.sessionHandle];
-		if (pending.futureHistory && currentFutureHistoryPending(pending.futureHistory) === pending) {
+		if (pending.historyOperation && currentHistoryPending(pending.historyOperation) === pending) {
 			reportProjectionFailure(candidate.sessionHandle, candidate.generation, error);
 		} else if (
 			channel?.subscribed &&
@@ -2254,53 +2197,50 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		return true;
 	}
 
-	function startFutureHistoryMaterialization(
-		message: FutureSessionResponseFrameDto,
-		pending: PendingCommand,
-	): boolean {
+	function startHistoryMaterialization(message: SessionResponseFrameDto, pending: PendingCommand): boolean {
 		const responseKey = JSON.stringify(message);
-		if (pending.futureHistoryResponseKey !== undefined) {
-			if (pending.futureHistoryResponseKey === responseKey) return true;
+		if (pending.historyResponseKey !== undefined) {
+			if (pending.historyResponseKey === responseKey) return true;
 			rejectPending(
 				pending.id,
 				new SessionTransportError(
 					"response_mismatch",
-					`Response ${pending.id} changed while future history was materializing`,
+					`Response ${pending.id} changed while content history was materializing`,
 				),
 			);
 			return true;
 		}
-		const operation = pending.futureHistory ?? createFutureHistoryOperation(pending);
+		const operation = pending.historyOperation ?? createHistoryOperation(pending);
 		if (operation.started) return true;
 		operation.started = true;
-		pending.futureHistory = operation;
-		pending.futureHistoryBarrierSeq = message.barrierSeq;
-		pending.futureHistoryResponseKey = responseKey;
-		const adapter = activeFutureContentAdapter;
+		pending.historyOperation = operation;
+		pending.historyBarrierSeq = message.barrierSeq;
+		pending.historyResponseKey = responseKey;
+		const adapter = activeContentAdapter;
 		if (!adapter) {
 			rejectPending(
 				pending.id,
-				new SessionTransportError("unavailable", "Future history materialization is disabled"),
+				new SessionTransportError("unavailable", " history materialization is disabled"),
 			);
 			return true;
 		}
 		const guardContext = attachmentGuardContext;
-		const futureGuardContext = futureContentRefGuardContext;
-		void materializeFutureResponse(
+		const negotiatedContentRefContext = contentRefGuardContext;
+		void materializeResponse(
 			message.response,
 			adapter,
 			operation.controller.signal,
 			guardContext,
-			futureGuardContext,
+			negotiatedContentRefContext,
 		)
 			.then((response) => {
-				if (operation.controller.signal.aborted || currentFutureHistoryPending(operation) !== pending) return;
-				pending.futureHistory = undefined;
+				if (operation.controller.signal.aborted || currentHistoryPending(operation) !== pending) return;
+				pending.historyOperation = undefined;
 				pending.response = { ...message, response };
 				resolvePendingResponse(pending);
 			})
 			.catch((error: unknown) => {
-				if (operation.controller.signal.aborted || currentFutureHistoryPending(operation) !== pending) return;
+				if (operation.controller.signal.aborted || currentHistoryPending(operation) !== pending) return;
 				const failure = error instanceof Error ? error : new Error(String(error));
 				reportProjectionFailure(pending.sessionHandle, pending.generation, failure);
 				rejectPending(pending.id, failure);
@@ -2308,7 +2248,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		return true;
 	}
 
-	function handleFutureResponse(message: FutureSessionResponseFrameDto): boolean {
+	function handleResponse(message: SessionResponseFrameDto): boolean {
 		const id = message.response.id;
 		if (!id) return true;
 		const pending = pendingCommands.get(id);
@@ -2331,24 +2271,21 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			);
 			return true;
 		}
-		if (isFutureHistoryCommand(pending.commandType)) {
-			return startFutureHistoryMaterialization(message, pending);
+		if (isHistoryCommand(pending.commandType)) {
+			return startHistoryMaterialization(message, pending);
 		}
-		const adapter = activeFutureContentAdapter;
+		const adapter = activeContentAdapter;
 		if (!adapter) {
-			rejectPending(
-				id,
-				new SessionTransportError("unavailable", "Future response materialization is disabled"),
-			);
+			rejectPending(id, new SessionTransportError("unavailable", " response materialization is disabled"));
 			return true;
 		}
 		const controller = new AbortController();
-		void materializeFutureResponse(
+		void materializeResponse(
 			message.response,
 			adapter,
 			controller.signal,
 			attachmentGuardContext,
-			futureContentRefGuardContext,
+			contentRefGuardContext,
 		)
 			.then((response) => {
 				if (controller.signal.aborted || pendingCommands.get(id) !== pending) return;
@@ -2362,11 +2299,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		return true;
 	}
 
-	function ingestFutureFrameMessage(
-		message: FutureSessionTransportFrameMessage,
-		rawWireBytes: number,
-	): boolean {
-		const adapter = activeFutureContentAdapter;
+	function ingestFrameMessage(message: SessionTransportFrameMessage, rawWireBytes: number): boolean {
+		const adapter = activeContentAdapter;
 		if (!adapter || disposed) return false;
 		if (
 			!Number.isSafeInteger(rawWireBytes) ||
@@ -2375,58 +2309,58 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		) {
 			return false;
 		}
-		if (message.type === "response") return handleFutureResponse(message);
-		const identity = futureFrameIdentity(message);
-		if (!identity || !isCurrentFutureProjectionIdentity(identity)) return false;
+		if (message.type === "response") return handleResponse(message);
+		const identity = frameIdentity(message);
+		if (!identity || !isCurrentProjectionIdentity(identity)) return false;
 		switch (message.type) {
 			case "event":
 			case "extension_ui_request":
 			case "extension_ui_closed":
-				return enqueueFutureProjection(identity, rawWireBytes, null, async (signal) => {
+				return enqueueProjection(identity, rawWireBytes, null, async (signal) => {
 					const projected = await adapter.materializeReplayFrame(message, signal);
-					return () => handleReplayFrame(projected, "future");
+					return () => handleReplayFrame(projected, "projected");
 				});
 			case "session_snapshot": {
 				const key = identityKey(identity);
 				const waiter = snapshotWaiters.get(key);
 				if (!waiter) return false;
-				return enqueueFutureProjection(identity, rawWireBytes, waiter, async (signal) => {
+				return enqueueProjection(identity, rawWireBytes, waiter, async (signal) => {
 					const projected = await adapter.materializeSnapshot(message, signal);
 					return () => {
 						if (snapshotWaiters.get(key)?.token !== waiter.token) return;
-						commitSessionSnapshot(projected, "future");
+						commitSessionSnapshot(projected, "projected");
 					};
 				});
 			}
 			case "session_snapshot_begin":
-				handleSessionSnapshotBegin(message, "future", rawWireBytes);
+				handleSessionSnapshotBegin(message, "projected", rawWireBytes);
 				return true;
 			case "session_snapshot_chunk":
-				handleSessionSnapshotChunk(message, "future");
+				handleSessionSnapshotChunk(message, "projected");
 				return true;
 			case "session_snapshot_end":
-				handleSessionSnapshotEnd(message, "future");
+				handleSessionSnapshotEnd(message, "projected");
 				return true;
 			case "session_history_page_begin":
-				handleSessionHistoryPageBegin(message, "future");
+				handleSessionHistoryPageBegin(message, "projected");
 				return true;
 			case "session_history_page_chunk":
-				handleSessionHistoryPageChunk(message, "future");
+				handleSessionHistoryPageChunk(message, "projected");
 				return true;
 			case "session_history_page_end":
-				handleSessionHistoryPageEnd(message, "future");
+				handleSessionHistoryPageEnd(message, "projected");
 				return true;
 			case "extension_ui_snapshot":
-				return enqueueFutureProjection(identity, rawWireBytes, null, async (signal) => {
+				return enqueueProjection(identity, rawWireBytes, null, async (signal) => {
 					const projected = await adapter.materializeExtensionSnapshot(message, signal);
-					return () => handleExtensionSnapshot(projected, "future");
+					return () => handleExtensionSnapshot(projected, "projected");
 				});
 		}
 	}
 
 	function handleSessionSnapshotBegin(
 		message: HistorySnapshotBegin,
-		productMode: "current" | "future",
+		representation: "wire" | "projected",
 		rawWireBytes = 0,
 	): void {
 		const channel = store.getState().sessions[message.sessionHandle];
@@ -2439,10 +2373,10 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			snapshotHistoryAssemblies.delete(key);
 			abortSnapshotHistoryAssembly(previous);
 		}
-		if (productMode === "future") {
-			const pendingTail = futureProjectionTails.get(message.sessionHandle);
+		if (representation === "projected") {
+			const pendingTail = projectionTails.get(message.sessionHandle);
 			if (pendingTail?.snapshotPending) {
-				discardFutureProjectionTail(message.sessionHandle, pendingTail);
+				discardProjectionTail(message.sessionHandle, pendingTail);
 			}
 		}
 		const assembler = new SessionHistoryStreamAssembler<
@@ -2460,14 +2394,14 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		const assembly: SnapshotHistoryAssembly = {
 			identity: message,
 			snapshotId: message.snapshotId,
-			productMode,
+			representation,
 			controller: new AbortController(),
 			assembler,
 			waiterToken: waiter.token,
 			finishing: false,
 			completed: null,
 		};
-		if (productMode === "future") {
+		if (representation === "projected") {
 			const completion = new Promise<CompletedHistorySnapshot>((resolve, reject) => {
 				assembly.resolveCompletion = resolve;
 				assembly.rejectCompletion = (error) => reject(error);
@@ -2486,43 +2420,43 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				error: null,
 			},
 		}));
-		if (productMode === "future") {
-			const accepted = enqueueFutureProjection(message, rawWireBytes, waiter, async (signal) => {
+		if (representation === "projected") {
+			const accepted = enqueueProjection(message, rawWireBytes, waiter, async (signal) => {
 				const completed = await assembly.completion;
 				if (!completed || signal.aborted || assembly.controller.signal.aborted) {
-					throw new DOMException("Future Session snapshot was aborted", "AbortError");
+					throw new DOMException("Session snapshot was aborted", "AbortError");
 				}
-				const adapter = activeFutureContentAdapter;
+				const adapter = activeContentAdapter;
 				if (!adapter || completed.begin.type !== "session_snapshot_begin") {
-					throw new Error("Future history snapshot materialization is unavailable");
+					throw new Error(" history snapshot materialization is unavailable");
 				}
 				const { type: _type, history: _history, ...header } = completed.begin;
 				const projected = await adapter.materializeSnapshot(
 					{
 						...header,
 						type: "session_snapshot",
-						settledMessages: completed.messages as FutureSessionMessageDto[],
-					} as FutureSessionSnapshotDto,
+						settledMessages: completed.messages as SessionMessageDto[],
+					} as SessionSnapshotDto,
 					AbortSignal.any([signal, assembly.controller.signal]),
 				);
 				return () => {
 					if (!isCurrentSnapshotAssembly(assembly)) return;
 					snapshotHistoryAssemblies.delete(key);
-					commitSessionSnapshot(projected, "future");
+					commitSessionSnapshot(projected, "projected");
 				};
 			});
 			if (!accepted) {
-				failChunkedSnapshot(message, new Error("Future history snapshot could not be queued"), waiter);
+				failChunkedSnapshot(message, new Error(" history snapshot could not be queued"), waiter);
 			}
 		}
 	}
 
 	function handleSessionSnapshotChunk(
 		message: HistorySnapshotChunk,
-		productMode: "current" | "future",
+		representation: "wire" | "projected",
 	): void {
 		const assembly = snapshotHistoryAssemblies.get(identityKey(message));
-		if (!assembly || assembly.productMode !== productMode || assembly.finishing) return;
+		if (!assembly || assembly.representation !== representation || assembly.finishing) return;
 		try {
 			assembly.assembler.chunk(message);
 		} catch (error) {
@@ -2534,10 +2468,13 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		}
 	}
 
-	function handleSessionSnapshotEnd(message: SessionSnapshotEndDto, productMode: "current" | "future"): void {
+	function handleSessionSnapshotEnd(
+		message: SessionSnapshotEndDto,
+		representation: "wire" | "projected",
+	): void {
 		const key = identityKey(message);
 		const assembly = snapshotHistoryAssemblies.get(key);
-		if (!assembly || assembly.productMode !== productMode || assembly.finishing) return;
+		if (!assembly || assembly.representation !== representation || assembly.finishing) return;
 		let completed: ReturnType<typeof assembly.assembler.end>;
 		try {
 			completed = assembly.assembler.end(message);
@@ -2550,10 +2487,10 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			return;
 		}
 		assembly.finishing = true;
-		if (productMode === "current") {
+		if (representation === "wire") {
 			snapshotHistoryAssemblies.delete(key);
 			commitSessionSnapshot(
-				currentSnapshotFromHistory(completed.begin as SessionSnapshotBeginDto, completed.messages),
+				currentSnapshotFromHistory(completed.begin as InlineSessionSnapshotBeginDto, completed.messages),
 			);
 			return;
 		}
@@ -2567,14 +2504,14 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	}
 
 	function currentSnapshotFromHistory(
-		begin: SessionSnapshotBeginDto,
+		begin: InlineSessionSnapshotBeginDto,
 		messages: unknown[],
-	): SessionSnapshotDto {
+	): InlineSessionSnapshotDto {
 		const { type: _type, history: _history, ...header } = begin;
 		return {
 			...header,
 			type: "session_snapshot",
-			settledMessages: messages as SessionMessageDto[],
+			settledMessages: messages as PiSessionMessageDto[],
 		};
 	}
 
@@ -2620,21 +2557,21 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			);
 		}
 		assembly.controller.abort();
-		if (assembly.productMode === "future") {
-			const tail = futureProjectionTails.get(assembly.identity.sessionHandle);
+		if (assembly.representation === "projected") {
+			const tail = projectionTails.get(assembly.identity.sessionHandle);
 			if (tail?.snapshotPending && tail.snapshotWaiter?.token === assembly.waiterToken) {
-				discardFutureProjectionTail(assembly.identity.sessionHandle, tail);
+				discardProjectionTail(assembly.identity.sessionHandle, tail);
 			}
 		}
 	}
 
 	function handleSessionHistoryPageBegin(
 		message: SessionHistoryPageBeginDto,
-		productMode: "current" | "future",
+		representation: "wire" | "projected",
 	): void {
 		const operation = pageHistoryAssemblies.get(message.requestId);
 		const channel = store.getState().sessions[message.sessionHandle];
-		if (!operation || operation.productMode !== productMode) return;
+		if (!operation || operation.representation !== representation) return;
 		if (
 			!channel?.subscribed ||
 			!channel.baselineAuthoritative ||
@@ -2653,9 +2590,12 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		}
 	}
 
-	function handleSessionHistoryPageChunk(message: HistoryPageChunk, productMode: "current" | "future"): void {
+	function handleSessionHistoryPageChunk(
+		message: HistoryPageChunk,
+		representation: "wire" | "projected",
+	): void {
 		const operation = pageHistoryAssemblies.get(message.requestId);
-		if (!operation || operation.productMode !== productMode || operation.finishing) return;
+		if (!operation || operation.representation !== representation || operation.finishing) return;
 		try {
 			operation.assembler.chunk(message);
 		} catch (error) {
@@ -2665,10 +2605,10 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 
 	function handleSessionHistoryPageEnd(
 		message: SessionHistoryPageEndDto,
-		productMode: "current" | "future",
+		representation: "wire" | "projected",
 	): void {
 		const operation = pageHistoryAssemblies.get(message.requestId);
-		if (!operation || operation.productMode !== productMode || operation.finishing) return;
+		if (!operation || operation.representation !== representation || operation.finishing) return;
 		let completed: ReturnType<typeof operation.assembler.end>;
 		try {
 			completed = operation.assembler.end(message);
@@ -2677,22 +2617,22 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			return;
 		}
 		operation.finishing = true;
-		if (productMode === "current") {
+		if (representation === "wire") {
 			pageHistoryAssemblies.delete(operation.requestId);
 			completeHistoryPage(
 				operation,
-				completed.messages as SessionMessageDto[],
+				completed.messages as PiSessionMessageDto[],
 				completed.begin,
 				completed.end,
 			);
 			return;
 		}
-		void finishFutureHistoryPage(operation, completed);
+		void finishHistoryPage(operation, completed);
 	}
 
 	function completeHistoryPage(
 		operation: PageHistoryAssembly,
-		messages: SessionMessageDto[],
+		messages: PiSessionMessageDto[],
 		begin: SessionHistoryPageBeginDto,
 		end: SessionHistoryPageEndDto,
 	): void {
@@ -2739,22 +2679,17 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		}));
 	}
 
-	async function finishFutureHistoryPage(
+	async function finishHistoryPage(
 		operation: PageHistoryAssembly,
 		completed: ReturnType<typeof operation.assembler.end>,
 	): Promise<void> {
 		try {
-			const adapter = activeFutureContentAdapter;
-			if (!adapter) throw new Error("Future history page materialization is unavailable");
-			const messages: SessionMessageDto[] = [];
-			for (const message of completed.messages as FutureSessionMessageDto[]) {
+			const adapter = activeContentAdapter;
+			if (!adapter) throw new Error(" history page materialization is unavailable");
+			const messages: PiSessionMessageDto[] = [];
+			for (const message of completed.messages as SessionMessageDto[]) {
 				messages.push(
-					await materializeFutureMessage(
-						message,
-						adapter,
-						operation.controller.signal,
-						attachmentGuardContext,
-					),
+					await materializeMessage(message, adapter, operation.controller.signal, attachmentGuardContext),
 				);
 			}
 			if (!isCurrentPageAssembly(operation)) return;
@@ -2788,9 +2723,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		}));
 	}
 
-	function futureFrameIdentity(
-		message: FutureSessionTransportFrameMessage,
-	): SessionRuntimeIdentityDto | null {
+	function frameIdentity(message: SessionTransportFrameMessage): SessionRuntimeIdentityDto | null {
 		if (message.type === "response") return null;
 		if (message.type === "extension_ui_snapshot") {
 			const runtime = store.getState().sessions[message.sessionHandle]?.runtime;
@@ -2811,12 +2744,12 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		};
 	}
 
-	function isCurrentFutureProjectionIdentity(identity: SessionRuntimeIdentityDto): boolean {
+	function isCurrentProjectionIdentity(identity: SessionRuntimeIdentityDto): boolean {
 		const channel = store.getState().sessions[identity.sessionHandle];
 		return Boolean(channel?.subscribed && identitiesMatch(channel.runtime, identity));
 	}
 
-	function captureFutureLazyIdentity(identity: FutureSessionLazyIdentity): FutureSessionLazyIdentity {
+	function captureLazyIdentity(identity: SessionLazyIdentity): SessionLazyIdentity {
 		return Object.freeze({
 			serverEpoch: identity.serverEpoch,
 			workspaceId: identity.workspaceId,
@@ -2825,7 +2758,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		});
 	}
 
-	function isCurrentFutureLazyIdentity(identity: FutureSessionLazyIdentity): boolean {
+	function isCurrentLazyIdentity(identity: SessionLazyIdentity): boolean {
 		const channel = store.getState().sessions[identity.sessionHandle];
 		return Boolean(
 			channel?.subscribed &&
@@ -2835,32 +2768,32 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		);
 	}
 
-	function futureLazyIdentityScope(identity: FutureSessionLazyIdentity): FutureLazyIdentityScope {
+	function lazyIdentityScope(identity: SessionLazyIdentity): LazyIdentityScope {
 		const key = identityKey(identity);
-		const existing = futureLazyIdentityScopes.get(key);
+		const existing = lazyIdentityScopes.get(key);
 		if (existing && !existing.controller.signal.aborted) return existing;
-		if (existing) futureLazyIdentityScopes.delete(key);
-		const scope: FutureLazyIdentityScope = {
+		if (existing) lazyIdentityScopes.delete(key);
+		const scope: LazyIdentityScope = {
 			identity,
 			controller: new AbortController(),
-			operations: new Set<FutureLazyOperation>(),
+			operations: new Set<LazyOperation>(),
 		};
-		futureLazyIdentityScopes.set(key, scope);
+		lazyIdentityScopes.set(key, scope);
 		return scope;
 	}
 
-	function registerFutureLazyOperation(
-		identity: FutureSessionLazyIdentity,
+	function registerLazyOperation(
+		identity: SessionLazyIdentity,
 		callerSignal: AbortSignal | undefined,
-	): FutureLazyOperation {
-		const scope = futureLazyIdentityScope(identity);
+	): LazyOperation {
+		const scope = lazyIdentityScope(identity);
 		const controller = new AbortController();
 		const onIdentityAbort = (): void => controller.abort();
 		const onCallerAbort = (): void => controller.abort();
 		scope.controller.signal.addEventListener("abort", onIdentityAbort, { once: true });
 		callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
 		if (scope.controller.signal.aborted || callerSignal?.aborted) controller.abort();
-		const operation: FutureLazyOperation = {
+		const operation: LazyOperation = {
 			scope,
 			controller,
 			onIdentityAbort,
@@ -2871,118 +2804,118 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		return operation;
 	}
 
-	function releaseFutureLazyOperation(operation: FutureLazyOperation): void {
+	function releaseLazyOperation(operation: LazyOperation): void {
 		operation.scope.controller.signal.removeEventListener("abort", operation.onIdentityAbort);
 		if (operation.callerSignal && operation.onCallerAbort) {
 			operation.callerSignal.removeEventListener("abort", operation.onCallerAbort);
 		}
 		operation.scope.operations.delete(operation);
 		const key = identityKey(operation.scope.identity);
-		if (futureLazyIdentityScopes.get(key) === operation.scope && operation.scope.operations.size === 0) {
-			futureLazyIdentityScopes.delete(key);
+		if (lazyIdentityScopes.get(key) === operation.scope && operation.scope.operations.size === 0) {
+			lazyIdentityScopes.delete(key);
 		}
 	}
 
-	function abortFutureLazyIdentity(identity: FutureSessionLazyIdentity): void {
+	function abortLazyIdentity(identity: SessionLazyIdentity): void {
 		const key = identityKey(identity);
-		const scope = futureLazyIdentityScopes.get(key);
+		const scope = lazyIdentityScopes.get(key);
 		if (!scope) return;
-		futureLazyIdentityScopes.delete(key);
+		lazyIdentityScopes.delete(key);
 		scope.controller.abort();
 	}
 
-	function abortFutureLazyOperationsForSession(sessionHandle: string): void {
-		for (const [key, scope] of [...futureLazyIdentityScopes]) {
+	function abortLazyOperationsForSession(sessionHandle: string): void {
+		for (const [key, scope] of [...lazyIdentityScopes]) {
 			if (scope.identity.sessionHandle !== sessionHandle) continue;
-			futureLazyIdentityScopes.delete(key);
+			lazyIdentityScopes.delete(key);
 			scope.controller.abort();
 		}
 	}
 
-	function abortAllFutureLazyOperations(): void {
-		for (const scope of futureLazyIdentityScopes.values()) scope.controller.abort();
-		futureLazyIdentityScopes.clear();
+	function abortAllLazyOperations(): void {
+		for (const scope of lazyIdentityScopes.values()) scope.controller.abort();
+		lazyIdentityScopes.clear();
 	}
 
-	async function resolveFutureText(
-		identity: FutureSessionLazyIdentity,
-		payload: FutureSessionTextPayloadProjection,
+	async function resolveText(
+		identity: SessionLazyIdentity,
+		payload: SessionTextPayloadProjection,
 		callerSignal?: AbortSignal,
 	): Promise<string> {
-		const captured = captureFutureLazyIdentity(identity);
-		if (disposed || callerSignal?.aborted || !isCurrentFutureLazyIdentity(captured)) {
-			throw futureLazyAbortError();
+		const captured = captureLazyIdentity(identity);
+		if (disposed || callerSignal?.aborted || !isCurrentLazyIdentity(captured)) {
+			throw lazyAbortError();
 		}
-		const adapter = activeFutureContentAdapter;
+		const adapter = activeContentAdapter;
 		if (!adapter) {
-			throw new SessionTransportError("unavailable", "Future Session lazy content is disabled");
+			throw new SessionTransportError("unavailable", "Session lazy content is disabled");
 		}
-		const operation = registerFutureLazyOperation(captured, callerSignal);
+		const operation = registerLazyOperation(captured, callerSignal);
 		try {
 			const value = await adapter.materializeTextPayload(payload.value, operation.controller.signal);
-			if (operation.controller.signal.aborted || !isCurrentFutureLazyIdentity(captured)) {
-				throw futureLazyAbortError();
+			if (operation.controller.signal.aborted || !isCurrentLazyIdentity(captured)) {
+				throw lazyAbortError();
 			}
 			return value;
 		} catch (error: unknown) {
-			if (operation.controller.signal.aborted || !isCurrentFutureLazyIdentity(captured)) {
-				throw futureLazyAbortError();
+			if (operation.controller.signal.aborted || !isCurrentLazyIdentity(captured)) {
+				throw lazyAbortError();
 			}
 			if (reportProjectionFailure(captured.sessionHandle, captured.generation, error)) {
-				abortFutureLazyIdentity(captured);
+				abortLazyIdentity(captured);
 			}
 			throw error;
 		} finally {
-			releaseFutureLazyOperation(operation);
+			releaseLazyOperation(operation);
 		}
 	}
 
-	async function resolveFutureJson<T>(
-		identity: FutureSessionLazyIdentity,
-		payload: FutureSessionJsonRootProjection,
-		fieldGuard: FutureSessionJsonFieldGuard<T>,
+	async function resolveJson<T>(
+		identity: SessionLazyIdentity,
+		payload: SessionJsonRootProjection,
+		fieldGuard: SessionJsonFieldGuard<T>,
 		callerSignal?: AbortSignal,
 	): Promise<T> {
-		const captured = captureFutureLazyIdentity(identity);
-		if (disposed || callerSignal?.aborted || !isCurrentFutureLazyIdentity(captured)) {
-			throw futureLazyAbortError();
+		const captured = captureLazyIdentity(identity);
+		if (disposed || callerSignal?.aborted || !isCurrentLazyIdentity(captured)) {
+			throw lazyAbortError();
 		}
-		const adapter = activeFutureContentAdapter;
+		const adapter = activeContentAdapter;
 		if (!adapter) {
-			throw new SessionTransportError("unavailable", "Future Session lazy content is disabled");
+			throw new SessionTransportError("unavailable", "Session lazy content is disabled");
 		}
-		const operation = registerFutureLazyOperation(captured, callerSignal);
+		const operation = registerLazyOperation(captured, callerSignal);
 		try {
 			const value = await adapter.materializeJsonRoot(payload.value, fieldGuard, operation.controller.signal);
-			if (operation.controller.signal.aborted || !isCurrentFutureLazyIdentity(captured)) {
-				throw futureLazyAbortError();
+			if (operation.controller.signal.aborted || !isCurrentLazyIdentity(captured)) {
+				throw lazyAbortError();
 			}
 			return value;
 		} catch (error: unknown) {
-			if (operation.controller.signal.aborted || !isCurrentFutureLazyIdentity(captured)) {
-				throw futureLazyAbortError();
+			if (operation.controller.signal.aborted || !isCurrentLazyIdentity(captured)) {
+				throw lazyAbortError();
 			}
 			if (reportProjectionFailure(captured.sessionHandle, captured.generation, error)) {
-				abortFutureLazyIdentity(captured);
+				abortLazyIdentity(captured);
 			}
 			throw error;
 		} finally {
-			releaseFutureLazyOperation(operation);
+			releaseLazyOperation(operation);
 		}
 	}
 
-	function enqueueFutureProjection(
+	function enqueueProjection(
 		identity: SessionRuntimeIdentityDto,
 		rawWireBytes: number,
 		snapshotWaiter: SnapshotWaiter | null,
 		prepare: (signal: AbortSignal) => Promise<() => void>,
 	): boolean {
 		const isSnapshot = snapshotWaiter !== null;
-		const existing = futureProjectionTails.get(identity.sessionHandle);
+		const existing = projectionTails.get(identity.sessionHandle);
 		if (existing && !identitiesMatch(existing.identity, identity)) {
-			discardFutureProjectionTail(identity.sessionHandle, existing);
+			discardProjectionTail(identity.sessionHandle, existing);
 		}
-		let current = futureProjectionTails.get(identity.sessionHandle);
+		let current = projectionTails.get(identity.sessionHandle);
 		if (!current) {
 			current = {
 				identity,
@@ -2993,7 +2926,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				snapshotPending: false,
 				snapshotWaiter: null,
 			};
-			futureProjectionTails.set(identity.sessionHandle, current);
+			projectionTails.set(identity.sessionHandle, current);
 		}
 		const replayOverflow =
 			!isSnapshot &&
@@ -3002,12 +2935,12 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		if ((isSnapshot && current.snapshotPending) || replayOverflow) {
 			const failure = new SessionTransportError(
 				"payload_too_large",
-				"Pending future Session projection exceeded its bounded admission",
+				"Pending projected Session frame work exceeded its bounded admission",
 			);
 			const pendingSnapshotWaiter = current.snapshotWaiter;
-			discardFutureProjectionTail(identity.sessionHandle, current);
+			discardProjectionTail(identity.sessionHandle, current);
 			if (pendingSnapshotWaiter) {
-				failFutureSnapshotProjection(identity, failure, pendingSnapshotWaiter);
+				failSnapshotProjection(identity, failure, pendingSnapshotWaiter);
 			} else reportProjectionFailure(identity.sessionHandle, identity.generation, failure);
 			return true;
 		}
@@ -3023,22 +2956,22 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		let promise: Promise<void>;
 		promise = previous
 			.then(async () => {
-				if (controller.signal.aborted || !isCurrentFutureProjectionIdentity(identity)) return;
+				if (controller.signal.aborted || !isCurrentProjectionIdentity(identity)) return;
 				const commit = await prepare(controller.signal);
-				if (controller.signal.aborted || !isCurrentFutureProjectionIdentity(identity)) return;
+				if (controller.signal.aborted || !isCurrentProjectionIdentity(identity)) return;
 				commit();
 			})
 			.catch((error: unknown) => {
-				if (controller.signal.aborted || !isCurrentFutureProjectionIdentity(identity)) return;
+				if (controller.signal.aborted || !isCurrentProjectionIdentity(identity)) return;
 				const pendingSnapshotWaiter = current.snapshotWaiter;
-				discardFutureProjectionTail(identity.sessionHandle, current);
+				discardProjectionTail(identity.sessionHandle, current);
 				if (pendingSnapshotWaiter) {
 					const failure = error instanceof Error ? error : new Error(String(error));
-					failFutureSnapshotProjection(identity, failure, pendingSnapshotWaiter);
+					failSnapshotProjection(identity, failure, pendingSnapshotWaiter);
 				} else reportProjectionFailure(identity.sessionHandle, identity.generation, error);
 			})
 			.finally(() => {
-				if (futureProjectionTails.get(identity.sessionHandle) !== current) return;
+				if (projectionTails.get(identity.sessionHandle) !== current) return;
 				if (isSnapshot) {
 					current.snapshotPending = false;
 					current.snapshotWaiter = null;
@@ -3047,16 +2980,16 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 					current.pendingReplayBytes -= rawWireBytes;
 				}
 				if (current.promise === promise && current.pendingReplayFrames === 0 && !current.snapshotPending) {
-					futureProjectionTails.delete(identity.sessionHandle);
+					projectionTails.delete(identity.sessionHandle);
 				}
 			});
 		current.promise = promise;
 		return true;
 	}
 
-	function discardFutureProjectionTail(sessionHandle: string, entry: FutureProjectionTail): void {
-		if (futureProjectionTails.get(sessionHandle) === entry) {
-			futureProjectionTails.delete(sessionHandle);
+	function discardProjectionTail(sessionHandle: string, entry: ProjectionTail): void {
+		if (projectionTails.get(sessionHandle) === entry) {
+			projectionTails.delete(sessionHandle);
 		}
 		entry.pendingReplayFrames = 0;
 		entry.pendingReplayBytes = 0;
@@ -3065,19 +2998,21 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		entry.controller.abort();
 	}
 
-	function abortFutureProjection(sessionHandle: string): void {
-		const entry = futureProjectionTails.get(sessionHandle);
+	function abortProjection(sessionHandle: string): void {
+		const entry = projectionTails.get(sessionHandle);
 		if (!entry) return;
-		discardFutureProjectionTail(sessionHandle, entry);
+		discardProjectionTail(sessionHandle, entry);
 	}
 
-	function abortAllFutureProjections(): void {
-		for (const [sessionHandle, entry] of futureProjectionTails) {
-			discardFutureProjectionTail(sessionHandle, entry);
+	function abortAllProjections(): void {
+		for (const [sessionHandle, entry] of projectionTails) {
+			discardProjectionTail(sessionHandle, entry);
 		}
 	}
 
-	function handleSessionError(message: Extract<SessionWsServerMessage, { type: "session_error" }>): void {
+	function handleSessionError(
+		message: Extract<InlineSessionWsServerMessage, { type: "session_error" }>,
+	): void {
 		const activeExact = activeExactHotRecovery;
 		const exactErrorMatches =
 			message.operation === "subscribe" &&
@@ -3125,9 +3060,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		}
 		if (message.operation === "subscribe") {
 			recordSubscriptionRejection(message.sessionHandle, message.error, message.code, message.retryable);
-			abortFutureProjection(message.sessionHandle);
-			abortFutureLazyOperationsForSession(message.sessionHandle);
-			rejectFutureHistoryForSession(
+			abortProjection(message.sessionHandle);
+			abortLazyOperationsForSession(message.sessionHandle);
+			rejectHistoryForSession(
 				message.sessionHandle,
 				new SessionTransportError("session_not_subscribed", message.error),
 			);
@@ -3156,11 +3091,12 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			}
 		} else if (message.operation === "claim") {
 			claimAttempts.delete(message.sessionHandle);
+			pendingOverflowRestarts.delete(message.sessionHandle);
 		}
 		frameBus.emit(message.sessionHandle, message, now());
 	}
 
-	function handleResponse(message: ResponseMessage): void {
+	function handleInlineResponse(message: ResponseMessage): void {
 		const id = message.response.id;
 		if (!id) return;
 		const pending = pendingCommands.get(id);
@@ -3183,15 +3119,15 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			);
 			return;
 		}
-		abortFutureHistoryOperation(pending);
-		pending.futureHistoryBarrierSeq = undefined;
+		abortHistoryOperation(pending);
+		pending.historyBarrierSeq = undefined;
 		pending.response = message;
 		resolvePendingResponse(pending);
 	}
 
 	function resolvePendingResponse(pending: PendingCommand): void {
 		const message = pending.response;
-		if (!message || pending.futureHistory) return;
+		if (!message || pending.historyOperation) return;
 		const channel = store.getState().sessions[message.sessionHandle];
 		if (
 			!channel?.baselineAuthoritative ||
@@ -3217,7 +3153,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		}
 	}
 
-	function handleRuntimeState(message: Extract<SessionWsServerMessage, { type: "runtime_state" }>): void {
+	function handleRuntimeState(
+		message: Extract<InlineSessionWsServerMessage, { type: "runtime_state" }>,
+	): void {
 		const sessionHandle = message.runtime.sessionHandle;
 		const current = store.getState().sessions[sessionHandle];
 		if (!current?.subscribed) return;
@@ -3231,9 +3169,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		const identityChanged = current.runtime !== null && !identitiesMatch(current.runtime, message.runtime);
 		if (identityChanged) {
 			abortHistoryForSession(sessionHandle);
-			abortFutureProjection(sessionHandle);
-			abortFutureLazyOperationsForSession(sessionHandle);
-			rejectFutureHistoryForSession(
+			abortProjection(sessionHandle);
+			abortLazyOperationsForSession(sessionHandle);
+			rejectHistoryForSession(
 				sessionHandle,
 				new SessionTransportError("response_mismatch", "Session generation changed before response"),
 			);
@@ -3242,6 +3180,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			acknowledgedExtensionRequests.delete(sessionHandle);
 			clearDeliveredNotifyKeys(sessionHandle);
 			claimAttempts.delete(sessionHandle);
+			pendingOverflowRestarts.delete(sessionHandle);
 			baselineRefreshes.delete(sessionHandle);
 			subscriptionBaselines.delete(sessionHandle);
 			discardRawEvents(sessionHandle, false);
@@ -3273,17 +3212,17 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		resolvePendingResponsesForSession(sessionHandle);
 	}
 
-	function handleReplayFrame(message: SessionReplayFrameDto): void;
-	function handleReplayFrame(message: ProjectedFutureSessionReplayFrame, productMode: "future"): void;
+	function handleReplayFrame(message: InlineSessionReplayFrameDto): void;
+	function handleReplayFrame(message: ProjectedSessionReplayFrame, representation: "projected"): void;
 	function handleReplayFrame(
 		...input:
-			| [message: SessionReplayFrameDto]
-			| [message: ProjectedFutureSessionReplayFrame, productMode: "future"]
+			| [message: InlineSessionReplayFrameDto]
+			| [message: ProjectedSessionReplayFrame, representation: "projected"]
 	): void {
 		const frame: BufferedReplayFrame =
 			input.length === 1
-				? { message: input[0], productMode: "current" }
-				: { message: input[0], productMode: "future" };
+				? { message: input[0], representation: "wire" }
+				: { message: input[0], representation: "projected" };
 		const { message } = frame;
 		const current = store.getState().sessions[message.sessionHandle];
 		const currentRuntime = current?.runtime;
@@ -3324,7 +3263,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				sessionHandle: message.sessionHandle,
 				runtime,
 				reason: "gap",
-			} satisfies Extract<SessionWsServerMessage, { type: "resync_required" }>;
+			} satisfies Extract<InlineSessionWsServerMessage, { type: "resync_required" }>;
 			const result = bufferReplayFrame(frame);
 			if (result === "overflow") return;
 			if (result === "buffered" && message.type === "event") {
@@ -3348,8 +3287,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	}
 
 	function emitReplayFrame(frame: BufferedReplayFrame, receivedAt: number) {
-		return frame.productMode === "future"
-			? frameBus.emit(frame.message.sessionHandle, frame.message, receivedAt, "future")
+		return frame.representation === "projected"
+			? frameBus.emit(frame.message.sessionHandle, frame.message, receivedAt, "projected")
 			: frameBus.emit(frame.message.sessionHandle, frame.message, receivedAt);
 	}
 
@@ -3511,7 +3450,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			sessionHandle: message.sessionHandle,
 			runtime,
 			reason: "gap",
-		} satisfies Extract<SessionWsServerMessage, { type: "resync_required" }>;
+		} satisfies Extract<InlineSessionWsServerMessage, { type: "resync_required" }>;
 		handleResyncRequired(required, false);
 	}
 
@@ -3574,9 +3513,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		if (!channel?.subscribed || channel.generation !== generation) return false;
 		if (!channel.runtime) return false;
 		if (channel.resync?.requiresFreshBaseline) return false;
-		abortFutureLazyOperationsForSession(sessionHandle);
-		const failure = error instanceof Error ? error : new Error(String(error ?? "Future projection failed"));
-		rejectFutureHistoryForSession(sessionHandle, failure);
+		abortLazyOperationsForSession(sessionHandle);
+		const failure = error instanceof Error ? error : new Error(String(error ?? " projection failed"));
+		rejectHistoryForSession(sessionHandle, failure);
 		clearIdentityBuffers(channel.runtime);
 		acknowledgedExtensionRequests.delete(sessionHandle);
 		baselineRefreshes.delete(sessionHandle);
@@ -3610,7 +3549,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		return true;
 	}
 
-	function handleLease(message: Extract<SessionWsServerMessage, { type: "lease_status" }>): void {
+	function handleLease(message: Extract<InlineSessionWsServerMessage, { type: "lease_status" }>): void {
 		const current = store.getState().sessions[message.sessionHandle];
 		if (
 			!current?.subscribed ||
@@ -3618,6 +3557,17 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			current.generation !== message.generation
 		) {
 			return;
+		}
+		let effectiveMessage = message;
+		if (message.isController && releasedControlIntents.has(message.sessionHandle)) {
+			sendWire({ type: "session_release", sessionHandle: message.sessionHandle });
+			effectiveMessage = {
+				type: "lease_status",
+				serverEpoch: message.serverEpoch,
+				sessionHandle: message.sessionHandle,
+				generation: message.generation,
+				isController: false,
+			};
 		}
 		if (subscriptionBaselines.get(message.sessionHandle) === identityKey(current.runtime)) {
 			subscriptionBaselines.delete(message.sessionHandle);
@@ -3627,20 +3577,38 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			freshLeaseBaseline: channel.runtime,
 			subscriptionAdmission:
 				channel.subscriptionAdmission?.kind === "rejected" ? null : channel.subscriptionAdmission,
-			lease: message.isController
+			lease: effectiveMessage.isController
 				? {
 						isController: true,
-						...(message.fencingToken ? { fencingToken: message.fencingToken } : {}),
+						...(effectiveMessage.fencingToken ? { fencingToken: effectiveMessage.fencingToken } : {}),
 					}
 				: { isController: false },
 		}));
-		frameBus.emit(message.sessionHandle, message, now());
+		frameBus.emit(message.sessionHandle, effectiveMessage, now());
 		if (current.runtime) advanceExactHotRecovery(current.runtime, "lease");
-		if (!message.isController) claimSessionIfReady(message.sessionHandle);
+		if (effectiveMessage.isController && effectiveMessage.fencingToken) {
+			const pendingRestart = pendingOverflowRestarts.get(message.sessionHandle);
+			if (
+				pendingRestart &&
+				identitiesMatch(pendingRestart, current.runtime) &&
+				current.runtime?.error === "session_snapshot_overflow"
+			) {
+				pendingOverflowRestarts.delete(message.sessionHandle);
+				claimAttempts.delete(message.sessionHandle);
+				sendWire({
+					type: "session_restart",
+					sessionHandle: message.sessionHandle,
+					expectedGeneration: message.generation,
+					fencingToken: effectiveMessage.fencingToken,
+				});
+			}
+		} else {
+			claimSessionIfReady(message.sessionHandle);
+		}
 	}
 
 	function handleResyncRequired(
-		message: Extract<SessionWsServerMessage, { type: "resync_required" }>,
+		message: Extract<InlineSessionWsServerMessage, { type: "resync_required" }>,
 		serverInitiated = true,
 	): void {
 		const current = store.getState().sessions[message.sessionHandle];
@@ -3659,15 +3627,15 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			return;
 		}
 		abortHistoryForSession(message.sessionHandle);
-		abortFutureLazyOperationsForSession(message.sessionHandle);
+		abortLazyOperationsForSession(message.sessionHandle);
 		connectionObservations.set(message.sessionHandle, message.runtime);
 		if (activeExactHotRecovery && identitiesMatch(activeExactHotRecovery.identity, message.runtime)) {
 			activeExactHotRecovery.recoveryStarted = true;
 		}
 		const sameIdentity = identitiesMatch(current.runtime, message.runtime);
 		if (!sameIdentity && current.runtime) {
-			abortFutureProjection(message.sessionHandle);
-			rejectFutureHistoryForSession(
+			abortProjection(message.sessionHandle);
+			rejectHistoryForSession(
 				message.sessionHandle,
 				new SessionTransportError("response_mismatch", "Session generation changed during resync"),
 			);
@@ -3754,7 +3722,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		waiter.reject(error);
 	}
 
-	function failFutureSnapshotProjection(
+	function failSnapshotProjection(
 		identity: SessionRuntimeIdentityDto,
 		error: Error,
 		waiter: SnapshotWaiter,
@@ -3847,21 +3815,23 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		return true;
 	}
 
-	function handleSessionSnapshot(message: SessionSnapshotDto): void {
+	function handleSessionSnapshot(message: InlineSessionSnapshotDto): void {
 		const guardContext = attachmentGuardContext;
-		if (guardContext === null || !isSessionSnapshotDto(message, guardContext)) return;
+		if (guardContext === null || !isInlineSessionSnapshotDto(message, guardContext)) return;
 		commitSessionSnapshot(message);
 	}
 
-	function commitSessionSnapshot(message: SessionSnapshotDto): void;
-	function commitSessionSnapshot(message: ProjectedFutureSessionSnapshot, productMode: "future"): void;
+	function commitSessionSnapshot(message: InlineSessionSnapshotDto): void;
+	function commitSessionSnapshot(message: ProjectedSessionSnapshot, representation: "projected"): void;
 	function commitSessionSnapshot(
-		...input: [message: SessionSnapshotDto] | [message: ProjectedFutureSessionSnapshot, productMode: "future"]
+		...input:
+			| [message: InlineSessionSnapshotDto]
+			| [message: ProjectedSessionSnapshot, representation: "projected"]
 	): void {
 		const snapshotFrame: TransportSessionSnapshotFrame =
 			input.length === 1
-				? { message: input[0], productMode: "current" }
-				: { message: input[0], productMode: "future" };
+				? { message: input[0], representation: "wire" }
+				: { message: input[0], representation: "projected" };
 		const { message } = snapshotFrame;
 		const channel = store.getState().sessions[message.sessionHandle];
 		if (!channel?.subscribed || !channel.resync || !identitiesMatch(channel.runtime, message)) return;
@@ -3897,9 +3867,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		const snapshotForProjection: TransportSessionSnapshotFrame =
 			acknowledged.size === 0
 				? snapshotFrame
-				: snapshotFrame.productMode === "future"
+				: snapshotFrame.representation === "projected"
 					? {
-							productMode: "future",
+							representation: "projected",
 							message: {
 								...snapshotFrame.message,
 								pendingExtensionRequests: snapshotFrame.message.pendingExtensionRequests.filter(
@@ -3911,7 +3881,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 							},
 						}
 					: {
-							productMode: "current",
+							representation: "wire",
 							message: {
 								...snapshotFrame.message,
 								pendingExtensionRequests: snapshotFrame.message.pendingExtensionRequests.filter(
@@ -3975,24 +3945,24 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	}
 
 	function emitSessionSnapshot(frame: TransportSessionSnapshotFrame) {
-		return frame.productMode === "future"
-			? frameBus.emit(frame.message.sessionHandle, frame.message, now(), "future")
+		return frame.representation === "projected"
+			? frameBus.emit(frame.message.sessionHandle, frame.message, now(), "projected")
 			: frameBus.emit(frame.message.sessionHandle, frame.message, now());
 	}
 
 	function handleExtensionSnapshot(
-		message: Extract<SessionWsServerMessage, { type: "extension_ui_snapshot" }>,
+		message: Extract<InlineSessionWsServerMessage, { type: "extension_ui_snapshot" }>,
 	): void;
-	function handleExtensionSnapshot(message: ProjectedFutureExtensionUiSnapshot, productMode: "future"): void;
+	function handleExtensionSnapshot(message: ProjectedExtensionUiSnapshot, representation: "projected"): void;
 	function handleExtensionSnapshot(
 		...input:
-			| [message: Extract<SessionWsServerMessage, { type: "extension_ui_snapshot" }>]
-			| [message: ProjectedFutureExtensionUiSnapshot, productMode: "future"]
+			| [message: Extract<InlineSessionWsServerMessage, { type: "extension_ui_snapshot" }>]
+			| [message: ProjectedExtensionUiSnapshot, representation: "projected"]
 	): void {
 		const frame: TransportExtensionSnapshotFrame =
 			input.length === 1
-				? { message: input[0], productMode: "current" }
-				: { message: input[0], productMode: "future" };
+				? { message: input[0], representation: "wire" }
+				: { message: input[0], representation: "projected" };
 		const { message } = frame;
 		const current = store.getState().sessions[message.sessionHandle];
 		if (
@@ -4008,8 +3978,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			pendingExtensionRequests: normalizeExtensionRequests(message.requests),
 		}));
 		const delivery =
-			frame.productMode === "future"
-				? frameBus.emit(message.sessionHandle, frame.message, now(), "future")
+			frame.representation === "projected"
+				? frameBus.emit(message.sessionHandle, frame.message, now(), "projected")
 				: frameBus.emit(message.sessionHandle, frame.message, now());
 		if (delivery.errors.length > 0) {
 			reportProjectionFailure(message.sessionHandle, message.generation, delivery.errors[0]);
@@ -4018,7 +3988,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	}
 
 	function handleExtensionResult(
-		message: Extract<SessionWsServerMessage, { type: "extension_ui_result" }>,
+		message: Extract<InlineSessionWsServerMessage, { type: "extension_ui_result" }>,
 	): void {
 		const current = store.getState().sessions[message.sessionHandle];
 		if (
@@ -4049,27 +4019,27 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		}
 	}
 
-	function handleRekey(message: Extract<SessionWsServerMessage, { type: "session_rekeyed" }>): void {
+	function handleRekey(message: Extract<InlineSessionWsServerMessage, { type: "session_rekeyed" }>): void {
 		if (message.serverEpoch !== message.runtime.serverEpoch) return;
 		const previousSessionHandle = message.previousSessionHandle;
 		const sessionHandle = message.runtime.sessionHandle;
 		const state = store.getState();
 		const previous = state.sessions[previousSessionHandle];
 		if (!previous?.subscribed) return;
-		abortFutureProjection(previousSessionHandle);
+		abortProjection(previousSessionHandle);
 		abortHistoryForSession(previousSessionHandle);
-		abortFutureLazyOperationsForSession(previousSessionHandle);
-		rejectFutureHistoryForSession(
+		abortLazyOperationsForSession(previousSessionHandle);
+		rejectHistoryForSession(
 			previousSessionHandle,
-			new SessionTransportError("response_mismatch", "Session rekeyed before future history completed"),
+			new SessionTransportError("response_mismatch", "Session rekeyed before content history completed"),
 		);
-		abortFutureProjection(sessionHandle);
+		abortProjection(sessionHandle);
 		abortHistoryForSession(sessionHandle);
-		abortFutureLazyOperationsForSession(sessionHandle);
+		abortLazyOperationsForSession(sessionHandle);
 		if (sessionHandle !== previousSessionHandle) {
-			rejectFutureHistoryForSession(
+			rejectHistoryForSession(
 				sessionHandle,
-				new SessionTransportError("response_mismatch", "Session rekeyed before future history completed"),
+				new SessionTransportError("response_mismatch", "Session rekeyed before content history completed"),
 			);
 		}
 		const exactRekeyInFlight = activeExactHotRecovery?.identity.sessionHandle === previousSessionHandle;
@@ -4143,6 +4113,11 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		discardRawEvents(sessionHandle, false);
 		claimAttempts.delete(previousSessionHandle);
 		claimAttempts.delete(sessionHandle);
+		pendingOverflowRestarts.delete(previousSessionHandle);
+		pendingOverflowRestarts.delete(sessionHandle);
+		if (releasedControlIntents.delete(previousSessionHandle)) {
+			releasedControlIntents.add(sessionHandle);
+		}
 		const prevIdx = subscribedLruOrder.indexOf(previousSessionHandle);
 		if (prevIdx !== -1) subscribedLruOrder.splice(prevIdx, 1);
 		touchSubscriptionLru(sessionHandle);
@@ -4163,7 +4138,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	function rejectPending(id: string, error: Error): void {
 		const pending = pendingCommands.get(id);
 		if (!pending) return;
-		abortFutureHistoryOperation(pending);
+		abortHistoryOperation(pending);
 		pendingCommands.delete(id);
 		clearTimeout(pending.timer);
 		pending.reject(error);
@@ -4183,8 +4158,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 
 	function dispose(): void {
 		if (disposed) return;
-		abortAllFutureProjections();
-		abortAllFutureLazyOperations();
+		abortAllProjections();
+		abortAllLazyOperations();
 		disconnect();
 		disposed = true;
 		rejectInitialInventoryWaiters(new SessionTransportError("unavailable", "Session transport disposed"));
@@ -4199,6 +4174,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		deliveredNotifyKeys.clear();
 		deliveredNotifyIdentityOrder = [];
 		claimAttempts.clear();
+		releasedControlIntents.clear();
+		pendingOverflowRestarts.clear();
 		baselineRefreshes.clear();
 		subscriptionBaselines.clear();
 		subscribedLruOrder = [];
@@ -4212,10 +4189,10 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		store,
 		frameBus,
 		globalBus,
-		resolveFutureText,
-		resolveFutureJson,
+		resolveText,
+		resolveJson,
 		ingestServerMessage,
-		ingestFutureFrameMessage,
+		ingestFrameMessage,
 		confirmProjectionDelivery,
 		isSnapshotSuffixProjectionPending,
 		reportProjectionFailure,

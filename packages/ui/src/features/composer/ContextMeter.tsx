@@ -59,7 +59,7 @@ export function ContextMeter() {
 					}
 					data-state={display.kind}
 					data-testid="context-meter"
-					className="flex size-7 shrink-0 items-center justify-center gap-1.5 rounded-full text-xs text-ink-3 max-lg:size-10 lg:h-7 lg:w-auto lg:px-1"
+					className="flex size-7 shrink-0 items-center justify-center gap-1.5 rounded-full text-xs text-ink-3 sm:h-7 sm:w-auto sm:px-1 [@media(hover:none)]:h-10 [@media(hover:none)]:min-w-10 [@media(hover:none)]:px-2"
 				>
 					<svg viewBox="0 0 20 20" className="size-5 shrink-0 -rotate-90" aria-hidden="true">
 						<circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" strokeWidth="2" opacity="0.2" />

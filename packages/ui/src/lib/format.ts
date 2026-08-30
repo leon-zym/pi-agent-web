@@ -5,8 +5,8 @@
  */
 
 import {
+	type PiSessionCommandResponseDto,
 	RpcError,
-	type SessionCommandResponseDto,
 	type SessionPayloadAdmissionErrorDto,
 } from "@pi-agent-web/protocol";
 import type { Dictionary } from "./i18n";
@@ -181,7 +181,7 @@ export function displayPayloadAdmissionError(error: SessionPayloadAdmissionError
 }
 
 export function displayCommandResponseError(
-	response: Extract<SessionCommandResponseDto, { success: false }>,
+	response: Extract<PiSessionCommandResponseDto, { success: false }>,
 ): string {
 	return response.admissionError
 		? displayPayloadAdmissionError(response.admissionError)
@@ -218,8 +218,21 @@ export function lastLine(text: string): string {
 	return text.trim();
 }
 
+function isMarkdownOnlyTailLine(line: string): boolean {
+	if (/^(?:`{3,}|~{3,})(?:\s*[\p{L}\p{N}_.+-]+)?$/u.test(line)) return true;
+	if (/^#{1,6}$/u.test(line)) return true;
+	if (/^(?:[-+*]|\d+[.)]|[-+*]\s+\[[ xX]\])$/u.test(line)) return true;
+	if (/^(?:[-*_]\s*){3,}$/u.test(line)) return true;
+	if (!line.includes("|")) return false;
+	const cells = line
+		.split("|")
+		.map((cell) => cell.trim())
+		.filter(Boolean);
+	return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/u.test(cell));
+}
+
 /**
- * Tail teaser summary for thinking settlement (DESIGN.md):
+ * Tail teaser summary for settled thinking:
  * extracts the last meaningful line or conclusion paragraph.
  */
 export function tailTeaser(text: string): string {
@@ -229,5 +242,9 @@ export function tailTeaser(text: string): string {
 		.split("\n")
 		.map((l) => l.trim())
 		.filter((l) => l.length > 0);
-	return lines[lines.length - 1] ?? "";
+	for (let index = lines.length - 1; index >= 0; index -= 1) {
+		const line = lines[index];
+		if (line && !isMarkdownOnlyTailLine(line)) return line;
+	}
+	return "";
 }

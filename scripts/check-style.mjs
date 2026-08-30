@@ -5,7 +5,7 @@
  *
  * Style Anti-Pattern Linter for packages/ui/src
  *
- * Enforces design system invariants from DESIGN.md:
+ * Enforces design system invariants from docs/design.md:
  * 1. no-hardcoded-hex: Disallow raw hex colors in TSX/TS/CSS (except root theme tokens in index.css)
  * 2. no-gradient: Disallow decorative gradients (except .thinking-sweep in index.css and functional scroll masks)
  * 3. no-glassmorphism: Disallow arbitrary backdrop-blur (except whitelisted modal overlays/dock)
@@ -173,7 +173,9 @@ async function main() {
 			console.error(`\n💥 Failed: Found ${totalViolations} style anti-pattern violation(s).`);
 			process.exit(1);
 		} else {
-			console.log(`✅ Passed: All ${files.length} UI source files conform to DESIGN.md style invariants.`);
+			console.log(
+				`✅ Passed: All ${files.length} UI source files conform to docs/design.md style invariants.`,
+			);
 			process.exit(0);
 		}
 	} catch (err) {

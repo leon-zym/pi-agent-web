@@ -1,4 +1,4 @@
-import type { SessionCommandResponseDto } from "@pi-agent-web/protocol";
+import type { PiSessionCommandResponseDto } from "@pi-agent-web/protocol";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useI18n } from "../src/lib/i18n";
@@ -62,13 +62,13 @@ describe("submitDraft structured admission recovery", () => {
 				limitBytes: 1024,
 				actualBytes: 2048,
 			},
-		} satisfies SessionCommandResponseDto;
+		} satisfies PiSessionCommandResponseDto;
 		const success = {
 			type: "response",
 			id: "successful-prompt",
 			command: "prompt",
 			success: true,
-		} satisfies SessionCommandResponseDto;
+		} satisfies PiSessionCommandResponseDto;
 		const sendCommand = vi.fn().mockResolvedValueOnce(failure).mockResolvedValueOnce(success);
 		sessionTransport.store.setState({ sendCommand });
 		const toastError = vi.spyOn(toast, "error").mockImplementation(() => "toast-id");

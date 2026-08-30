@@ -365,9 +365,11 @@ async function expectObservationBaseline(
 				frame.sessionHandle === sessionHandle &&
 				typeof frame.expectedHotRuntime === "object",
 		);
-	const snapshotsFor = (sessionHandle: string) =>
+	const snapshotCompletionsFor = (sessionHandle: string) =>
 		observation.received.filter(
-			(frame) => frame.type === "session_snapshot" && frame.sessionHandle === sessionHandle,
+			(frame) =>
+				(frame.type === "session_snapshot" || frame.type === "session_snapshot_end") &&
+				frame.sessionHandle === sessionHandle,
 		);
 	const leasesFor = (sessionHandle: string) =>
 		observation.received.filter(
@@ -378,7 +380,10 @@ async function expectObservationBaseline(
 		.poll(() => [...expectedHandles].every((sessionHandle) => exactFor(sessionHandle).length === 1))
 		.toBe(true);
 	await expect
-		.poll(() => [...expectedHandles].every((sessionHandle) => snapshotsFor(sessionHandle).length === 1))
+		.poll(
+			() => [...expectedHandles].every((sessionHandle) => snapshotCompletionsFor(sessionHandle).length === 1),
+			{ timeout: 30_000 },
+		)
 		.toBe(true);
 	await expect
 		.poll(() => [...expectedHandles].every((sessionHandle) => leasesFor(sessionHandle).length >= 1))
@@ -404,7 +409,7 @@ async function expectObservationBaseline(
 				serverEpoch: expect.any(String),
 			});
 		}
-		expect(snapshotsFor(sessionHandle)).toHaveLength(1);
+		expect(snapshotCompletionsFor(sessionHandle)).toHaveLength(1);
 		expect(leasesFor(sessionHandle).length).toBeGreaterThanOrEqual(1);
 	}
 	const serverHelloIndex = observation.events.findIndex(
@@ -469,7 +474,9 @@ function expectExactBaselineCounts(observation: SocketWireObservation, expectedH
 		).toHaveLength(1);
 		expect(
 			observation.received.filter(
-				(frame) => frame.type === "session_snapshot" && frame.sessionHandle === sessionHandle,
+				(frame) =>
+					(frame.type === "session_snapshot" || frame.type === "session_snapshot_end") &&
+					frame.sessionHandle === sessionHandle,
 			),
 		).toHaveLength(1);
 	}
@@ -582,7 +589,9 @@ test("hard reload observes every hot Runtime exactly once without activating dor
 		);
 		expect(inventoryRuntime?.state).toBe("running");
 		const snapshot = reloadSocket.received.find(
-			(frame) => frame.type === "session_snapshot" && frame.sessionHandle === transient.sessionHandle,
+			(frame) =>
+				(frame.type === "session_snapshot" || frame.type === "session_snapshot_begin") &&
+				frame.sessionHandle === transient.sessionHandle,
 		);
 		expect(snapshot).toBeDefined();
 		expect((snapshot?.runtime as WireFrame | undefined)?.recoverable).toBe(false);

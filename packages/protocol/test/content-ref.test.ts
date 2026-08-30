@@ -1,21 +1,20 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-	FUTURE_SESSION_CONTENT_REF_BUDGET,
 	GATEWAY_CLIENT_REQUIRED_CAPABILITIES,
 	GATEWAY_CONTENT_REF_CAPABILITY,
-	GATEWAY_CONTENT_REF_PROTOCOL_MINOR,
 	GATEWAY_PROTOCOL_VERSION,
 	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
-	isFutureSessionContentRefGuardContext,
 	isSessionContentRefBudgetDto,
 	isSessionContentRefDto,
 	isSessionContentRefForNegotiatedBudget,
+	isSessionContentRefGuardContext,
 	isSessionExternalTextDto,
 	isSessionJsonRootDto,
 	isSessionPayloadBudgetDto,
 	isSessionTextPayloadDto,
 	SESSION_CONTENT_BLOB_MAX_BYTES,
 	SESSION_CONTENT_INLINE_THRESHOLD_BYTES,
+	SESSION_CONTENT_REF_BUDGET,
 	SESSION_PAYLOAD_BUDGET,
 } from "../src/index.js";
 
@@ -30,20 +29,19 @@ describe("protocol 1.3 content references", () => {
 	const context = {
 		serverEpoch: "epoch-a",
 		payloadBudget: SESSION_PAYLOAD_BUDGET,
-		contentRefBudget: FUTURE_SESSION_CONTENT_REF_BUDGET,
+		contentRefBudget: SESSION_CONTENT_REF_BUDGET,
 	};
 
 	it("publishes the active capability in the production protocol", () => {
 		expect(GATEWAY_PROTOCOL_VERSION).toEqual({ major: 1, minor: 3 });
-		expect(GATEWAY_CONTENT_REF_PROTOCOL_MINOR).toBe(3);
 		expect(GATEWAY_CONTENT_REF_CAPABILITY).toBe("payload.epoch_content_refs");
 		expect(GATEWAY_CLIENT_REQUIRED_CAPABILITIES).toContain(GATEWAY_CONTENT_REF_CAPABILITY);
 		expect(GATEWAY_SERVER_REQUIRED_CAPABILITIES).toContain(GATEWAY_CONTENT_REF_CAPABILITY);
 	});
 
-	it("keeps the current 1.2 budget exact while publishing a separate future 48 MiB budget", () => {
+	it("keeps attachment and generic content budgets independently exact", () => {
 		expect(SESSION_CONTENT_BLOB_MAX_BYTES).toBe(48 * 1024 * 1024);
-		expect(FUTURE_SESSION_CONTENT_REF_BUDGET).toEqual({
+		expect(SESSION_CONTENT_REF_BUDGET).toEqual({
 			maxContentBlobBytes: SESSION_CONTENT_BLOB_MAX_BYTES,
 			inlineContentThresholdBytes: 256 * 1024,
 		});
@@ -58,36 +56,34 @@ describe("protocol 1.3 content references", () => {
 		).toBe(false);
 		expect(SESSION_PAYLOAD_BUDGET.maxAttachmentBlobBytes).toBe(8 * 1024 * 1024);
 		expect(SESSION_PAYLOAD_BUDGET.maxAttachmentCacheBytes).toBe(64 * 1024 * 1024);
-		expect(isSessionContentRefBudgetDto(FUTURE_SESSION_CONTENT_REF_BUDGET)).toBe(true);
-		expect(isFutureSessionContentRefGuardContext(context)).toBe(true);
-		expect(
-			isSessionContentRefBudgetDto({ ...FUTURE_SESSION_CONTENT_REF_BUDGET, maxContentBlobBytes: 0 }),
-		).toBe(false);
+		expect(isSessionContentRefBudgetDto(SESSION_CONTENT_REF_BUDGET)).toBe(true);
+		expect(isSessionContentRefGuardContext(context)).toBe(true);
+		expect(isSessionContentRefBudgetDto({ ...SESSION_CONTENT_REF_BUDGET, maxContentBlobBytes: 0 })).toBe(
+			false,
+		);
 		expect(
 			isSessionContentRefBudgetDto({
-				...FUTURE_SESSION_CONTENT_REF_BUDGET,
+				...SESSION_CONTENT_REF_BUDGET,
 				maxContentBlobBytes: SESSION_CONTENT_BLOB_MAX_BYTES + 1,
 			}),
 		).toBe(false);
-		expect(isSessionContentRefBudgetDto({ ...FUTURE_SESSION_CONTENT_REF_BUDGET, unexpected: true })).toBe(
-			false,
-		);
+		expect(isSessionContentRefBudgetDto({ ...SESSION_CONTENT_REF_BUDGET, unexpected: true })).toBe(false);
 		const { payloadBudget: _omittedPayloadBudget, ...contextWithoutPayloadBudget } = context;
-		expect(isFutureSessionContentRefGuardContext(contextWithoutPayloadBudget)).toBe(false);
+		expect(isSessionContentRefGuardContext(contextWithoutPayloadBudget)).toBe(false);
 		expect(
 			isSessionContentRefBudgetDto({
-				...FUTURE_SESSION_CONTENT_REF_BUDGET,
+				...SESSION_CONTENT_REF_BUDGET,
 				inlineContentThresholdBytes: SESSION_CONTENT_INLINE_THRESHOLD_BYTES - 1,
 			}),
 		).toBe(false);
 		expect(
 			isSessionContentRefBudgetDto({
-				...FUTURE_SESSION_CONTENT_REF_BUDGET,
+				...SESSION_CONTENT_REF_BUDGET,
 				maxContentBlobBytes: SESSION_CONTENT_INLINE_THRESHOLD_BYTES - 1,
 			}),
 		).toBe(false);
 		expect(
-			isFutureSessionContentRefGuardContext({
+			isSessionContentRefGuardContext({
 				...context,
 				payloadBudget: {
 					...SESSION_PAYLOAD_BUDGET,
@@ -100,12 +96,12 @@ describe("protocol 1.3 content references", () => {
 
 	it("accepts only an exact epoch-scoped UTF-8 content reference", () => {
 		expect(isSessionContentRefDto(contentRef)).toBe(true);
-		expect(
-			isSessionContentRefForNegotiatedBudget(contentRef, "epoch-a", FUTURE_SESSION_CONTENT_REF_BUDGET),
-		).toBe(true);
-		expect(
-			isSessionContentRefForNegotiatedBudget(contentRef, "epoch-b", FUTURE_SESSION_CONTENT_REF_BUDGET),
-		).toBe(false);
+		expect(isSessionContentRefForNegotiatedBudget(contentRef, "epoch-a", SESSION_CONTENT_REF_BUDGET)).toBe(
+			true,
+		);
+		expect(isSessionContentRefForNegotiatedBudget(contentRef, "epoch-b", SESSION_CONTENT_REF_BUDGET)).toBe(
+			false,
+		);
 		expect(isSessionContentRefDto({ ...contentRef, encoding: "utf8" })).toBe(false);
 		expect(isSessionContentRefDto({ ...contentRef, sha256: "A".repeat(64) })).toBe(false);
 		expect(isSessionContentRefDto({ ...contentRef, byteLength: SESSION_CONTENT_BLOB_MAX_BYTES + 1 })).toBe(
@@ -118,7 +114,7 @@ describe("protocol 1.3 content references", () => {
 		expect(isSessionContentRefDto(accessor)).toBe(false);
 		expect(
 			isSessionContentRefForNegotiatedBudget(contentRef, "epoch-a", {
-				...FUTURE_SESSION_CONTENT_REF_BUDGET,
+				...SESSION_CONTENT_REF_BUDGET,
 				maxContentBlobBytes: contentRef.byteLength - 1,
 			}),
 		).toBe(false);
@@ -190,7 +186,7 @@ describe("protocol 1.3 content references", () => {
 				{
 					...context,
 					contentRefBudget: {
-						...FUTURE_SESSION_CONTENT_REF_BUDGET,
+						...SESSION_CONTENT_REF_BUDGET,
 						maxContentBlobBytes: contentRef.byteLength - 1,
 					},
 				},

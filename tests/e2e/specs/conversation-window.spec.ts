@@ -35,6 +35,19 @@ test("long history keeps mounted turns bounded and reveals older turns on demand
 	await expect(
 		viewport.getByText(`E2E_LONG_HISTORY_REPLY ${String(HISTORY_TURNS)}`, { exact: true }),
 	).toBeVisible();
+	await expect(turnWindow).toHaveAttribute("data-turn-window-total", "48");
+	let loadedTurns = 48;
+	while (loadedTurns < HISTORY_TURNS) {
+		await turnWindow.locator('[data-load-older-turns="true"]').click();
+		await expect
+			.poll(async () => Number(await turnWindow.getAttribute("data-turn-window-total")), {
+				timeout: 30_000,
+			})
+			.toBeGreaterThan(loadedTurns);
+		loadedTurns = Number(await turnWindow.getAttribute("data-turn-window-total"));
+	}
+	await viewport.getByRole("button", { name: /^(Back to latest|回到最新消息)$/ }).click();
+	await expect(turnWindow).toHaveAttribute("data-turn-window-end", String(HISTORY_TURNS));
 
 	const initial = await turnWindow.evaluate((element) => ({
 		total: Number(element.getAttribute("data-turn-window-total")),
@@ -116,12 +129,12 @@ test("long history keeps mounted turns bounded and reveals older turns on demand
 	expect(resizedAnchor.id).toBe(anchorBefore.id);
 	expect(resizedAnchor.offset).toBeGreaterThanOrEqual(-2);
 
-	const firstTick = page.locator('[data-toc-tick="turn-1"]');
+	const firstTick = page.locator("[data-toc-tick]").first();
 	await firstTick.evaluate((button) => (button as HTMLButtonElement).click());
 	await expect.poll(async () => Number(await turnWindow.getAttribute("data-turn-window-start"))).toBe(0);
-	await expect(viewport.locator('[data-turn-id="turn-1"]')).toBeVisible();
+	await expect(viewport.locator("[data-turn-id]").first()).toBeVisible();
 	const selectedText = await viewport.evaluate(() => {
-		const target = document.querySelector<HTMLElement>('[data-turn-id="turn-1"]');
+		const target = document.querySelector<HTMLElement>('[data-chat-viewport="true"] [data-turn-id]');
 		if (!target) throw new Error("missing selected turn");
 		const selection = window.getSelection();
 		if (!selection) throw new Error("selection API unavailable");

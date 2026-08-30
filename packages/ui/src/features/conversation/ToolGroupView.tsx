@@ -42,7 +42,7 @@ export function formatToolGroupSummary(
 }
 
 /**
- * Settled ToolGroup Aggregation & Stacked Layout (DESIGN.md Section 5.3):
+ * Settled tool aggregation and stacked layout:
  * - Aggregates >2 consecutive tool calls in settled steps into a single collapsible row.
  * - Expands into a stacked layout with 1px hairline dividers, rounded-t-md on first item,
  *   rounded-none on middle items, and rounded-b-md on last item.
@@ -71,7 +71,7 @@ export function ToolGroupView({
 				aria-expanded={expanded}
 				onClick={() => setExpanded(!expanded)}
 				className={cn(
-					"group flex h-6 min-w-0 items-center gap-1.5 rounded-sm px-1 text-left outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-primary/40",
+					"group flex min-h-6 min-w-0 items-center gap-1.5 rounded-sm px-1 text-left outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-primary/40 [@media(hover:none)]:min-h-10",
 				)}
 			>
 				<ChevronRight

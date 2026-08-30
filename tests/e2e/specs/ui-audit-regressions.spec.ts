@@ -1,0 +1,511 @@
+import fs from "node:fs";
+import type { Locator, Page, WebSocket } from "@playwright/test";
+import {
+	dropControlledWebSockets,
+	installWebSocketDropControl,
+	observePageErrors,
+} from "../fixtures/page-observation";
+import { expect, test } from "../fixtures/test";
+
+const captureDirectory = process.env.PI_WEB_E2E_CAPTURE_DIR;
+
+test.use({
+	harnessOptions: {
+		extraEnv: {
+			PI_WEB_E2E_LONG_CONTEXT_COST: "1",
+			PI_WEB_E2E_RECOVERY_FEATURES: "1",
+		},
+	},
+});
+
+async function capture(page: Page, name: string): Promise<void> {
+	if (!captureDirectory) return;
+	fs.mkdirSync(captureDirectory, { recursive: true });
+	await page.screenshot({ path: `${captureDirectory}/${name}.png`, animations: "disabled" });
+}
+
+async function openWorkbench(page: Page, origin: string, locale: "en" | "zh-CN"): Promise<void> {
+	await page.addInitScript((storedLocale) => {
+		localStorage.setItem("pi-web-locale", storedLocale);
+		localStorage.setItem("pi-web-theme", "light");
+	}, locale);
+	await page.goto(origin, { waitUntil: "domcontentloaded" });
+	await expect(page.locator("textarea")).toBeEnabled();
+}
+
+async function minimumTarget(locator: Locator, minimum = 40): Promise<void> {
+	await expect(locator).toBeVisible();
+	const box = await locator.boundingBox();
+	expect(box).not.toBeNull();
+	expect(box?.width ?? 0).toBeGreaterThanOrEqual(minimum);
+	expect(box?.height ?? 0).toBeGreaterThanOrEqual(minimum);
+}
+
+async function expectContextComposerAt640(page: Page, locale: "en" | "zh-CN"): Promise<void> {
+	await page.setViewportSize({ width: 640, height: 900 });
+	const meter = page.getByTestId("context-meter");
+	await expect(meter).toHaveAttribute("data-state", "ready");
+	const detail = meter.locator(":scope > span");
+	await expect(detail).toBeVisible();
+	await expect(meter).toContainText("34%");
+
+	const geometry = await page.evaluate(() => {
+		const meterElement = document.querySelector<HTMLElement>('[data-testid="context-meter"]');
+		const composer = document.querySelector<HTMLElement>('[data-testid="composer-card"]');
+		if (!meterElement || !composer) throw new Error("missing composer geometry target");
+		const meterRect = meterElement.getBoundingClientRect();
+		const composerRect = composer.getBoundingClientRect();
+		return {
+			composerClientWidth: composer.clientWidth,
+			composerRectLeft: composerRect.left,
+			composerRectRight: composerRect.right,
+			composerScrollWidth: composer.scrollWidth,
+			documentScrollWidth: document.documentElement.scrollWidth,
+			meterClientWidth: meterElement.clientWidth,
+			meterRectLeft: meterRect.left,
+			meterRectRight: meterRect.right,
+			meterScrollWidth: meterElement.scrollWidth,
+			viewportWidth: window.innerWidth,
+		};
+	});
+	expect(geometry.documentScrollWidth, `${locale} document overflow`).toBeLessThanOrEqual(
+		geometry.viewportWidth,
+	);
+	expect(geometry.composerScrollWidth, `${locale} composer overflow`).toBeLessThanOrEqual(
+		geometry.composerClientWidth,
+	);
+	expect(geometry.composerRectLeft).toBeGreaterThanOrEqual(0);
+	expect(geometry.composerRectRight).toBeLessThanOrEqual(geometry.viewportWidth);
+	expect(geometry.meterScrollWidth, `${locale} context meter overflow`).toBeLessThanOrEqual(
+		geometry.meterClientWidth,
+	);
+	expect(geometry.meterRectLeft).toBeGreaterThanOrEqual(geometry.composerRectLeft);
+	expect(geometry.meterRectRight).toBeLessThanOrEqual(geometry.composerRectRight);
+}
+
+for (const locale of ["en", "zh-CN"] as const) {
+	test(`640px ${locale} fine pointer shows context percentage without composer overflow`, async ({
+		page,
+		harness,
+	}) => {
+		await page.setViewportSize({ width: 640, height: 900 });
+		await openWorkbench(page, harness.origin, locale);
+		expect(await page.evaluate(() => matchMedia("(hover: hover)").matches)).toBe(true);
+		await expectContextComposerAt640(page, locale);
+
+		const meter = page.getByTestId("context-meter");
+		await meter.hover();
+		const tooltip = page.locator('[data-slot="tooltip-content"]');
+		await expect(tooltip).toBeVisible();
+		await expect(tooltip).toContainText("$1234567.89");
+		await capture(page, `context-meter-640-${locale}-fine-light`);
+	});
+}
+
+test("context percentage remains compact below the sm breakpoint", async ({ page, harness }) => {
+	await page.setViewportSize({ width: 375, height: 812 });
+	await openWorkbench(page, harness.origin, "en");
+	const meter = page.getByTestId("context-meter");
+	await expect(meter).toHaveAttribute("data-state", "ready");
+	const detail = meter.locator(":scope > span");
+	await expect(detail).toBeHidden();
+	const geometry = await meter.evaluate((element) => ({
+		clientWidth: element.clientWidth,
+		scrollWidth: element.scrollWidth,
+	}));
+	expect(geometry.scrollWidth).toBeLessThanOrEqual(geometry.clientWidth);
+});
+
+test("768px fine pointer keeps the turn tail compact", async ({ page, harness }) => {
+	await page.setViewportSize({ width: 768, height: 900 });
+	await openWorkbench(page, harness.origin, "en");
+	expect(await page.evaluate(() => matchMedia("(hover: hover)").matches)).toBe(true);
+	await page.locator("textarea").fill("E2E_COMPLEX_DEMO");
+	await page.getByRole("button", { name: "Send" }).click();
+	await expect(page.getByRole("heading", { name: "Synthetic change review", level: 2 })).toBeVisible();
+
+	const turnTail = page.getByRole("button", { name: "Copy" }).last().locator("..");
+	const box = await turnTail.boundingBox();
+	expect(box).not.toBeNull();
+	expect(box?.height ?? Number.POSITIVE_INFINITY).toBeLessThan(40);
+	await capture(page, "turn-tail-768-en-fine-light");
+});
+
+test.describe("small touch geometry", () => {
+	test.use({ hasTouch: true });
+
+	for (const locale of ["en", "zh-CN"] as const) {
+		test(`640px ${locale} coarse pointer shows context percentage without composer overflow`, async ({
+			page,
+			harness,
+		}) => {
+			await page.setViewportSize({ width: 640, height: 900 });
+			await openWorkbench(page, harness.origin, locale);
+			expect(await page.evaluate(() => matchMedia("(hover: none)").matches)).toBe(true);
+			await expectContextComposerAt640(page, locale);
+			await minimumTarget(page.getByTestId("context-meter"));
+			await capture(page, `context-meter-640-${locale}-touch-light`);
+		});
+	}
+
+	test("localized long Diff toolbar wraps without clipping", async ({ page, harness }) => {
+		await page.setViewportSize({ width: 375, height: 812 });
+		await openWorkbench(page, harness.origin, "zh-CN");
+		await page.locator("textarea").fill("E2E_COMPLEX_LONG_FILE");
+		await page.getByRole("button", { name: "发送" }).click();
+		await expect(page.getByRole("heading", { name: "Synthetic change review", level: 2 })).toBeVisible();
+
+		const toolToggle = page.locator("main button[aria-expanded]").filter({ hasText: "非常长的目录名称" });
+		await toolToggle.click();
+		const diff = page.locator('[data-diff-block="true"]');
+		await expect(diff).toBeVisible();
+		const fileName = diff.locator('[data-diff-file-name="true"]');
+		await expect(fileName).toHaveAttribute("title", /用于验证本地化布局不会挤压/);
+		const toolbar = diff.locator(":scope > div").first();
+		const geometry = await toolbar.evaluate((element) => ({
+			clientWidth: element.clientWidth,
+			scrollWidth: element.scrollWidth,
+			clientHeight: element.clientHeight,
+			scrollHeight: element.scrollHeight,
+		}));
+		expect(geometry.scrollWidth).toBeLessThanOrEqual(geometry.clientWidth);
+		expect(geometry.scrollHeight).toBeLessThanOrEqual(geometry.clientHeight);
+		for (const button of await diff.getByRole("button").all()) await minimumTarget(button);
+		await fileName.scrollIntoViewIfNeeded();
+		await capture(page, "diff-toolbar-375-zh-light");
+	});
+
+	test("conversation controls keep touch targets and complete reasoning access", async ({
+		page,
+		harness,
+	}) => {
+		await page.setViewportSize({ width: 375, height: 812 });
+		await openWorkbench(page, harness.origin, "en");
+		await page.locator("textarea").fill("E2E_COMPLEX_DEMO");
+		await page.getByRole("button", { name: "Send" }).click();
+		await expect(page.getByRole("heading", { name: "Synthetic change review", level: 2 })).toBeVisible();
+
+		const reasoningToggle = page
+			.locator("main button[aria-expanded]")
+			.filter({ hasText: "Comparing the implementation with the requested behavior." });
+		const reasoningInspect = page.getByRole("button", { name: "Open reasoning in details panel" });
+		const toolToggle = page.locator("main button[aria-expanded]").filter({ hasText: "src/demo.ts" });
+		const toolInspect = page.getByRole("button", { name: "Open in details panel" });
+		const turnCopy = page.getByRole("button", { name: "Copy" }).last();
+		const turnFork = page.getByRole("button", { name: "Fork" }).last();
+		const userCopy = page.getByRole("button", { name: "Copy message" });
+		const controls = [
+			reasoningToggle,
+			reasoningInspect,
+			toolToggle,
+			toolInspect,
+			turnCopy,
+			turnFork,
+			userCopy,
+		];
+
+		for (const control of controls) await minimumTarget(control);
+		await reasoningToggle.focus();
+		await page.keyboard.press("Tab");
+		await expect(reasoningInspect).toBeFocused();
+		const focusedStyle = await reasoningInspect.evaluate((element) => {
+			const style = getComputedStyle(element);
+			return { boxShadow: style.boxShadow, opacity: style.opacity };
+		});
+		expect(focusedStyle.opacity).toBe("1");
+		expect(focusedStyle.boxShadow).not.toBe("none");
+
+		await reasoningToggle.click();
+		const fullReasoning = page
+			.locator("p")
+			.filter({ hasText: "Comparing the implementation with the requested behavior." });
+		await expect(fullReasoning).toBeVisible();
+		await expect(fullReasoning).toContainText("Inspecting synthetic workspace");
+
+		await page.setViewportSize({ width: 768, height: 900 });
+		for (const control of [reasoningInspect, toolToggle, toolInspect, turnCopy, turnFork, userCopy]) {
+			await minimumTarget(control);
+		}
+		const turnTail = turnCopy.locator("..");
+		const turnTailBox = await turnTail.boundingBox();
+		expect(turnTailBox).not.toBeNull();
+		expect(turnTailBox?.height ?? 0).toBeGreaterThanOrEqual(40);
+		await turnTail.evaluate((element) => element.scrollIntoView({ block: "center" }));
+		await capture(page, "turn-tail-768-en-touch-light");
+		await page.setViewportSize({ width: 375, height: 812 });
+		await reasoningToggle.scrollIntoViewIfNeeded();
+		await capture(page, "conversation-controls-375-en-light");
+	});
+});
+
+test("contained Diff overflow keeps the TOC visible and collision focus returns to reading", async ({
+	page,
+	harness,
+}) => {
+	await page.setViewportSize({ width: 1600, height: 900 });
+	await openWorkbench(page, harness.origin, "en");
+	await page.locator("textarea").fill("E2E_COMPLEX_LONG_FILE");
+	await page.getByRole("button", { name: "Send" }).click();
+	await expect(page.getByRole("heading", { name: "Synthetic change review", level: 2 })).toBeVisible();
+
+	const toc = page.locator('[data-conversation-toc="true"]');
+	await expect(toc).toBeVisible();
+	await expect(toc).toHaveAttribute("aria-hidden", "false");
+	const toolToggle = page.locator("main button[aria-expanded]").filter({ hasText: "非常长的目录名称" });
+	await toolToggle.click();
+	const diff = page.locator('[data-diff-block="true"]');
+	await expect(diff).toBeVisible();
+	const scroller = diff.locator(".scroll-slim");
+	expect(
+		await scroller.evaluate((element) => element.scrollWidth > element.clientWidth),
+		"fixture must exercise contained horizontal overflow",
+	).toBe(true);
+	await expect(toc).toHaveAttribute("aria-hidden", "false");
+	await expect(toc).toBeVisible();
+	await capture(page, "toc-with-contained-diff-1600-en-light");
+
+	const tick = toc.getByRole("button").first();
+	await tick.focus();
+	await expect(tick).toBeFocused();
+	await page.setViewportSize({ width: 1280, height: 900 });
+	await expect(toc).toHaveAttribute("aria-hidden", "true");
+	await expect(page.locator('[data-chat-viewport="true"]')).toBeFocused();
+	await page.setViewportSize({ width: 1600, height: 900 });
+	await expect(toc).toHaveAttribute("aria-hidden", "false");
+});
+
+test("docked details keeps deterministic focus when its opener unmounts", async ({ page, harness }) => {
+	await page.setViewportSize({ width: 1280, height: 900 });
+	await openWorkbench(page, harness.origin, "en");
+
+	let expand = page.getByRole("button", { name: "Expand details panel" });
+	await expand.focus();
+	await expand.click();
+	let collapse = page.getByRole("button", { name: "Collapse details panel" });
+	await expect(collapse).toBeFocused();
+	await collapse.click();
+	expand = page.getByRole("button", { name: "Expand details panel" });
+	await expect(expand).toBeFocused();
+
+	await expand.click();
+	collapse = page.getByRole("button", { name: "Collapse details panel" });
+	await expect(collapse).toBeFocused();
+	await collapse.click();
+	await expect(page.getByRole("button", { name: "Expand details panel" })).toBeFocused();
+
+	await page.locator("textarea").fill("E2E_COMPLEX_DEMO");
+	await page.getByRole("button", { name: "Send" }).click();
+	await expect(page.getByRole("heading", { name: "Synthetic change review", level: 2 })).toBeVisible();
+	const toolToggle = page.locator("main button[aria-expanded]").filter({ hasText: "src/demo.ts" });
+	await toolToggle.click();
+	const inspect = page.getByRole("button", { name: "Open in details panel" });
+	await inspect.click();
+	await expect(page.getByRole("button", { name: "Collapse details panel" })).toBeFocused();
+	await page.getByRole("button", { name: "New session" }).first().click();
+	await expect(inspect).toHaveCount(0);
+	await page.getByRole("button", { name: "Collapse details panel" }).click();
+	await expect(page.getByRole("button", { name: "Expand details panel" })).toBeFocused();
+});
+
+test("audio chime preference is discoverable and persists", async ({ page, harness }) => {
+	await page.setViewportSize({ width: 1280, height: 900 });
+	await openWorkbench(page, harness.origin, "en");
+	await page.getByRole("button", { name: "Settings", exact: true }).click();
+
+	const settings = page.getByRole("dialog", { name: "Settings" });
+	const audio = settings.getByRole("switch", { name: "Audio chime" });
+	await expect(settings).toBeVisible();
+	await expect(audio).toBeChecked();
+	await expect(settings.getByText("Sound enabled", { exact: true })).toBeVisible();
+
+	await audio.focus();
+	await page.keyboard.press("Space");
+	await expect(audio).not.toBeChecked();
+	await expect(settings.getByText("Sound muted", { exact: true })).toBeVisible();
+	await expect.poll(() => page.evaluate(() => localStorage.getItem("piweb:audio-muted"))).toBe("true");
+
+	await settings.getByRole("button", { name: "Close" }).last().click();
+	await page.reload({ waitUntil: "domcontentloaded" });
+	await expect(page.locator("textarea")).toBeEnabled();
+	await page.getByRole("button", { name: "Settings", exact: true }).click();
+	await expect(
+		page.getByRole("dialog", { name: "Settings" }).getByRole("switch", {
+			name: "Audio chime",
+		}),
+	).not.toBeChecked();
+});
+
+test.describe("coarse pointer production geometry", () => {
+	test.use({ hasTouch: true });
+
+	test("wide touch surfaces expose conversation, TOC, and audio controls", async ({ page, harness }) => {
+		await page.setViewportSize({ width: 1280, height: 900 });
+		await openWorkbench(page, harness.origin, "en");
+		expect(await page.evaluate(() => matchMedia("(hover: none)").matches)).toBe(true);
+		await page.locator("textarea").fill("E2E_COMPLEX_DEMO");
+		await page.getByRole("button", { name: "Send" }).click();
+		await expect(page.getByRole("heading", { name: "Synthetic change review", level: 2 })).toBeVisible();
+
+		const reasoningToggle = page
+			.locator("main button[aria-expanded]")
+			.filter({ hasText: "Comparing the implementation with the requested behavior." });
+		const reasoningInspect = page.getByRole("button", { name: "Open reasoning in details panel" });
+		const toolToggle = page.locator("main button[aria-expanded]").filter({ hasText: "src/demo.ts" });
+		const toolInspect = page.getByRole("button", { name: "Open in details panel" });
+		const turnCopy = page.getByRole("button", { name: "Copy" }).last();
+		const turnFork = page.getByRole("button", { name: "Fork" }).last();
+		const userCopy = page.getByRole("button", { name: "Copy message" });
+		for (const control of [
+			reasoningToggle,
+			reasoningInspect,
+			toolToggle,
+			toolInspect,
+			turnCopy,
+			turnFork,
+			userCopy,
+		]) {
+			await minimumTarget(control);
+		}
+		for (const control of [reasoningInspect, toolInspect, userCopy]) {
+			expect(await control.evaluate((element) => getComputedStyle(element).opacity)).toBe("1");
+		}
+		await capture(page, "conversation-controls-1280-touch-en-light");
+
+		await page.getByRole("button", { name: "Settings", exact: true }).click();
+		const audio = page.getByRole("dialog", { name: "Settings" }).getByRole("switch", {
+			name: "Audio chime",
+		});
+		await minimumTarget(audio);
+		await page
+			.getByRole("dialog", { name: "Settings" })
+			.getByRole("button", { name: "Close" })
+			.last()
+			.click();
+
+		await page.setViewportSize({ width: 1600, height: 900 });
+		const toc = page.locator('[data-conversation-toc="true"]');
+		await expect(toc).toBeVisible();
+		await minimumTarget(toc.getByRole("button").first());
+		await capture(page, "conversation-toc-1600-touch-en-light");
+	});
+
+	test("320px rail reaches drawer Settings and audio preference", async ({ page, harness }) => {
+		await page.setViewportSize({ width: 320, height: 720 });
+		await openWorkbench(page, harness.origin, "en");
+		await page.getByRole("button", { name: "Open sessions" }).click();
+		const drawer = page.getByRole("dialog", { name: "Sessions" });
+		await expect(drawer).toBeVisible();
+		await drawer.getByRole("button", { name: "Settings", exact: true }).click();
+		const settings = page.getByRole("dialog", { name: "Settings" });
+		const audio = settings.getByRole("switch", { name: "Audio chime" });
+		await expect(settings).toBeVisible();
+		await minimumTarget(audio);
+		await audio.click();
+		await expect.poll(() => page.evaluate(() => localStorage.getItem("piweb:audio-muted"))).toBe("true");
+		await capture(page, "settings-audio-320-touch-en-light");
+	});
+});
+
+test("audio chime preference keeps localized dark-mode context", async ({ page, harness }) => {
+	await page.setViewportSize({ width: 1280, height: 900 });
+	await page.addInitScript(() => {
+		localStorage.setItem("pi-web-locale", "zh-CN");
+		localStorage.setItem("pi-web-theme", "dark");
+		localStorage.setItem("piweb:audio-muted", "true");
+	});
+	await page.goto(harness.origin, { waitUntil: "domcontentloaded" });
+	await expect(page.locator("textarea")).toBeEnabled();
+	await expect(page.locator("html")).toHaveClass(/dark/);
+	await page.getByRole("button", { name: "设置", exact: true }).click();
+
+	const settings = page.getByRole("dialog", { name: "设置" });
+	await expect(settings.getByRole("switch", { name: "提示音" })).not.toBeChecked();
+	await expect(settings.getByText("提示音已静音", { exact: true })).toBeVisible();
+	await capture(page, "settings-audio-muted-1280-zh-dark");
+});
+
+test("settled conversation survives the Issue 7 interaction matrix", async ({ page, harness }) => {
+	const errors = observePageErrors(page);
+	await page.setViewportSize({ width: 1280, height: 900 });
+	await page.emulateMedia({ reducedMotion: "reduce" });
+	await page.context().grantPermissions(["clipboard-read", "clipboard-write"], {
+		origin: harness.origin,
+	});
+	await installWebSocketDropControl(page);
+	const sockets: WebSocket[] = [];
+	page.on("websocket", (socket) => sockets.push(socket));
+	await openWorkbench(page, harness.origin, "en");
+
+	const reducedMotion = await page.getByRole("button", { name: "Send" }).evaluate((element) => ({
+		transitionDuration: getComputedStyle(element).transitionDuration,
+		scrollBehavior: getComputedStyle(document.documentElement).scrollBehavior,
+	}));
+	expect(reducedMotion.transitionDuration).toMatch(/^(0s|0\.001ms|0\.000001s|1e-06s)$/);
+	expect(reducedMotion.scrollBehavior).toBe("auto");
+
+	await page.locator("textarea").fill("E2E_COMPLEX_DEMO");
+	await page.getByRole("button", { name: "Send" }).click();
+	const heading = page.getByRole("heading", { name: "Synthetic change review", level: 2 });
+	await expect(heading).toBeVisible();
+	expect(
+		await page.evaluate(() =>
+			(
+				window as typeof window & {
+					find: (text: string, caseSensitive: boolean, backwards: boolean, wrap: boolean) => boolean;
+				}
+			).find("Synthetic change review", false, false, true),
+		),
+	).toBe(true);
+
+	const toolToggle = page.locator("main button[aria-expanded]").filter({ hasText: "src/demo.ts" });
+	await toolToggle.click();
+	await expect(page.locator('[data-diff-block="true"]')).toBeVisible();
+	const inspect = page.getByRole("button", { name: "Open in details panel" });
+	await inspect.click();
+	await expect(page.getByText("Synthetic edit completed", { exact: true })).toBeVisible();
+	await page.getByRole("button", { name: "Collapse details panel" }).click();
+	await expect(inspect).toBeFocused();
+
+	await page.getByRole("button", { name: "Copy", exact: true }).last().click();
+	await expect
+		.poll(() => page.evaluate(() => navigator.clipboard.readText()))
+		.toContain("Synthetic change review");
+
+	await page.getByRole("button", { name: "Settings", exact: true }).click();
+	const settings = page.getByRole("dialog", { name: "Settings" });
+	await settings.getByRole("button", { name: "Dark", exact: true }).click();
+	await expect(page.locator("html")).toHaveClass(/dark/);
+	await settings.getByRole("button", { name: "Close" }).last().click();
+
+	await expect.poll(() => sockets.length).toBeGreaterThanOrEqual(1);
+	await dropControlledWebSockets(page);
+	await expect.poll(() => sockets.length).toBeGreaterThanOrEqual(2);
+	await expect(page.locator("textarea")).toBeEnabled();
+	await expect(heading).toBeVisible();
+	await expect(page.locator('[data-diff-block="true"]')).toBeVisible();
+	await inspect.click();
+	await expect(page.getByText("Synthetic edit completed", { exact: true })).toBeVisible();
+	await page.getByRole("button", { name: "Collapse details panel" }).click();
+
+	await page.evaluate(() => {
+		Object.defineProperty(document, "hidden", { configurable: true, value: true });
+		Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+		document.dispatchEvent(new Event("visibilitychange"));
+	});
+	const hiddenPrompt = "E2E_A_SLOW_UI_AUDIT";
+	await page.locator("textarea").fill(hiddenPrompt);
+	await page.getByRole("button", { name: "Send" }).click();
+	await expect(page).toHaveTitle(/^\[Running\]/);
+	await expect(page.locator('[data-markdown-streaming="true"]')).toContainText("E2E_REPLY:");
+	harness.releasePrompt(hiddenPrompt);
+	await expect(page.locator("main").getByText(`E2E_REPLY:${hiddenPrompt}`, { exact: true })).toBeVisible();
+	await page.evaluate(() => {
+		Reflect.deleteProperty(document, "hidden");
+		Reflect.deleteProperty(document, "visibilityState");
+		document.dispatchEvent(new Event("visibilitychange"));
+	});
+	await expect(page.locator("header").getByText("Ready", { exact: true })).toBeVisible();
+	await capture(page, "issue-7-interaction-matrix-1280-en-dark");
+	expect(errors.console).toEqual([]);
+	expect(errors.page).toEqual([]);
+});

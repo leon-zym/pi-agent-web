@@ -1,12 +1,11 @@
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import {
-	type FutureSessionContentRefGuardContext,
-	isExtensionUiRequestDto,
-	isFutureSessionContentRefGuardContext,
-	isProductSessionEventDto,
+	isPiExtensionUiRequestDto,
+	isPiProductSessionEventDto,
+	isPiSessionCommandResponseDto,
 	isSessionAttachmentGuardContext,
-	isSessionCommandResponseDto,
+	isSessionContentRefGuardContext,
 	isSessionJsonRootDto,
 	isSessionTextPayloadDto,
 	type SessionAttachmentGuardContext,
@@ -14,6 +13,7 @@ import {
 	type SessionCommandTypeDto,
 	type SessionContentRefBudgetDto,
 	type SessionContentRefDto,
+	type SessionContentRefGuardContext,
 	type SessionPayloadBudgetDto,
 	type SessionTextPayloadDto,
 } from "@pi-agent-web/protocol";
@@ -31,11 +31,11 @@ import {
 	type StagedEpochContent,
 } from "./epoch-content-store.js";
 import {
-	isLegacyRpcV1FutureContentRawEvent,
-	isLegacyRpcV1FutureContentRawExtensionUiRequest,
-	isLegacyRpcV1FutureContentRawResponse,
-} from "./legacy-rpc-v1-content-wire.js";
-import { isLegacyRpcV1RawEvent, isLegacyRpcV1RawResponse } from "./legacy-rpc-v1-wire.js";
+	isPiRpcContentRawEvent,
+	isPiRpcContentRawExtensionUiRequest,
+	isPiRpcContentRawResponse,
+} from "./pi-rpc-content-wire.js";
+import { isPiRpcRawEvent, isPiRpcRawResponse } from "./pi-rpc-wire.js";
 import { createRasterAdmissionValidator, RasterAdmissionError } from "./raster-admission.js";
 
 type UnknownRecord = Record<string, unknown>;
@@ -120,10 +120,10 @@ export interface PiGenericPayloadExternalizerOptions
 	extends Omit<PiPayloadExternalizerOptions, "contentStore" | "productGuard"> {
 	contentStore: PiGenericPayloadExternalizerContentStore;
 	genericContent: Readonly<{ contentRefBudget: SessionContentRefBudgetDto }>;
-	/** Deterministic supplemental future-product guard after built-in provenance validation. */
+	/** Deterministic supplemental content-reference guard after built-in provenance validation. */
 	productGuard?: (
 		candidate: unknown,
-		context: FutureSessionContentRefGuardContext,
+		context: SessionContentRefGuardContext,
 		input: PiPayloadExternalizerInput,
 	) => boolean;
 }
@@ -182,14 +182,14 @@ export async function externalizePiPayload<T = unknown>(
 		const value = transformed.value;
 		throwIfAborted(options.signal);
 		const attachmentContext = { serverEpoch: options.serverEpoch, payloadBudget: options.payloadBudget };
-		const context = generic ? futureContext(options) : attachmentContext;
+		const context = generic ? contentRefContext(options) : attachmentContext;
 		const guardCandidate = generic ? transformed.currentGuardShadow : value;
 		const productValid =
 			input.kind === "event"
-				? isProductSessionEventDto(guardCandidate, attachmentContext)
+				? isPiProductSessionEventDto(guardCandidate, attachmentContext)
 				: input.kind === "extension_ui_request"
-					? isExtensionUiRequestDto(guardCandidate)
-					: isSessionCommandResponseDto(guardCandidate, attachmentContext);
+					? isPiExtensionUiRequestDto(guardCandidate)
+					: isPiSessionCommandResponseDto(guardCandidate, attachmentContext);
 		const supplementalGuard = options.productGuard as
 			| ((
 					candidate: unknown,
@@ -224,7 +224,7 @@ function isGenericOptions(
 	return "genericContent" in options;
 }
 
-function futureContext(options: PiGenericPayloadExternalizerOptions): FutureSessionContentRefGuardContext {
+function contentRefContext(options: PiGenericPayloadExternalizerOptions): SessionContentRefGuardContext {
 	return {
 		serverEpoch: options.serverEpoch,
 		payloadBudget: options.payloadBudget,
@@ -249,7 +249,7 @@ function assertOptions(options: AnyPiPayloadExternalizerOptions): void {
 	}
 	if (
 		isGenericOptions(options) &&
-		(!isFutureSessionContentRefGuardContext(futureContext(options)) ||
+		(!isSessionContentRefGuardContext(contentRefContext(options)) ||
 			typeof options.contentStore.stageUtf8 !== "function" ||
 			typeof options.contentStore.holdPublishedUtf8 !== "function")
 	) {
@@ -260,13 +260,13 @@ function assertOptions(options: AnyPiPayloadExternalizerOptions): void {
 function assertRawInput(input: PiPayloadExternalizerInput, generic: boolean): void {
 	const valid = generic
 		? input.kind === "event"
-			? isLegacyRpcV1FutureContentRawEvent(input.value)
+			? isPiRpcContentRawEvent(input.value)
 			: input.kind === "extension_ui_request"
-				? isLegacyRpcV1FutureContentRawExtensionUiRequest(input.value)
-				: isLegacyRpcV1FutureContentRawResponse(input.value, input.expectedCommand)
+				? isPiRpcContentRawExtensionUiRequest(input.value)
+				: isPiRpcContentRawResponse(input.value, input.expectedCommand)
 		: input.kind === "event"
-			? isLegacyRpcV1RawEvent(input.value)
-			: input.kind === "response" && isLegacyRpcV1RawResponse(input.value, input.expectedCommand);
+			? isPiRpcRawEvent(input.value)
+			: input.kind === "response" && isPiRpcRawResponse(input.value, input.expectedCommand);
 	if (!valid) {
 		throw new PiPayloadExternalizationError("invalid_raw_payload", "Pi payload failed raw provenance guards");
 	}
@@ -670,7 +670,7 @@ async function externalizeTextRoot(value: string, state: FrameState): Promise<Ge
 		product = Object.freeze({ type: "external_text" as const, ref: exact.ref });
 		shadow = "";
 	}
-	if (!isSessionTextPayloadDto(product, futureContext(options))) {
+	if (!isSessionTextPayloadDto(product, contentRefContext(options))) {
 		throw new PiPayloadExternalizationError(
 			"invalid_product_payload",
 			"Externalized Pi text failed its product guard",
@@ -695,7 +695,7 @@ async function externalizeJsonRoot(value: unknown, state: FrameState): Promise<G
 		product = Object.freeze({ type: "external_json" as const, ref: exact.ref });
 		shadow = null;
 	}
-	if (!isSessionJsonRootDto(product, futureContext(options))) {
+	if (!isSessionJsonRootDto(product, contentRefContext(options))) {
 		throw new PiPayloadExternalizationError(
 			"invalid_product_payload",
 			"Externalized Pi JSON failed its product guard",

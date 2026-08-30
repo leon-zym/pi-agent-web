@@ -3,7 +3,7 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 /*
- * Semantic tokens (DESIGN.md). @theme inline maps utilities to runtime CSS
+ * Semantic tokens (docs/design.md). @theme inline maps utilities to runtime CSS
  * variables so the .dark class swaps the whole palette without rebuilding.
  */
 @theme inline {
@@ -156,7 +156,7 @@
   .scroll-slim::-webkit-scrollbar-track {
     background: transparent;
   }
-  /* 2.6s streaming sweep for the reasoning row (DESIGN.md signature motion) */
+  /* 2.6s streaming sweep for the reasoning row (docs/design.md active-work motion) */
   .thinking-sweep {
     position: relative;
     overflow: hidden;

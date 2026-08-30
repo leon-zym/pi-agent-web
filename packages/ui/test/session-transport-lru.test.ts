@@ -4,7 +4,11 @@ import type {
 	SessionRuntimeDto,
 	SessionWsClientMessage,
 } from "@pi-agent-web/protocol";
-import { GATEWAY_PAYLOAD_BUDGET_CAPABILITY, SESSION_PAYLOAD_BUDGET } from "@pi-agent-web/protocol";
+import {
+	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
+	SESSION_CONTENT_REF_BUDGET,
+	SESSION_PAYLOAD_BUDGET,
+} from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	createSessionTransport,
@@ -36,25 +40,19 @@ function open(socket: FakeSocket | undefined): void {
 	socket.onmessage?.({
 		data: JSON.stringify({
 			type: "server_hello",
-			protocol: { major: 1, minor: 2 },
+			protocol: { major: 1, minor: 3 },
 			serverBuild: "test-server",
 			serverEpoch: "test-epoch",
 			piVersion: "0.84.2",
-			adapterId: "legacy-rpc-v1",
-			capabilities: [
-				"rpc.commands",
-				"rpc.events",
-				"rpc.extension_ui",
-				"session.multiplex",
-				"session.hot_runtime_inventory",
-				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
-			],
+			adapterId: "pi-rpc",
+			capabilities: [...GATEWAY_SERVER_REQUIRED_CAPABILITIES],
 			limits: {
 				maxClientFrameBytes: 8 * 1024 * 1024,
 				maxSnapshotFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes,
 				maxExtensionRequests: 256,
 			},
 			payloadBudget: SESSION_PAYLOAD_BUDGET,
+			contentRefBudget: SESSION_CONTENT_REF_BUDGET,
 		}),
 	});
 	socket.onmessage?.({
@@ -83,7 +81,7 @@ function harness(options: { maxActiveSubscriptions?: number } = {}): Harness {
 			return socket;
 		},
 		url: () => "ws://test/ws",
-		protocolVersion: { major: 1, minor: 2 },
+		protocolVersion: { major: 1, minor: 3 },
 		...options,
 	});
 	controllers.push(controller);
@@ -281,7 +279,7 @@ describe("Active WebSocket Subscription LRU admission target with liveness guard
 		expect(sessions["session-7"]?.subscribed).toBe(true);
 	});
 
-	it("does not evict a command-busy session whose legacy state is still idle", () => {
+	it("does not evict a command-busy session whose state field is still idle", () => {
 		const { controller, sockets } = harness();
 		controller.store.getState().connect();
 		open(sockets[0]);

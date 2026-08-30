@@ -4,8 +4,8 @@ import { StringDecoder } from "node:string_decoder";
 export const MAX_JSONL_LINE_BYTES = 8 * 1024 * 1024;
 /** Pi emits get_messages as one JSONL response, so snapshots receive a larger but still finite budget. */
 export const MAX_JSONL_SNAPSHOT_LINE_BYTES = 64 * 1024 * 1024;
-/** Future typed-content mode admits selected externalizable raw frames up to this hard ceiling. */
-export const MAX_JSONL_FUTURE_CONTENT_LINE_BYTES = 64 * 1024 * 1024;
+/** Canonical content-reference mode admits selected externalizable raw frames up to this hard ceiling. */
+export const MAX_JSONL_CONTENT_REF_LINE_BYTES = 64 * 1024 * 1024;
 
 export class JsonlLineTooLongError extends Error {
 	constructor(maxBytes: number) {
@@ -25,8 +25,7 @@ export type JsonlLineConsumer = (line: string) => unknown;
 /**
  * Strict LF-only JSONL line reader.
  *
- * Semantically identical to pi's src/modes/rpc/jsonl.ts (see docs/protocol.md,
- * Appendix B):
+ * Semantically identical to Pi's RPC JSONL reader:
  * - Split on LF only; U+2028/U+2029 are legal inside JSON strings, so Node's
  *   readline must never be used.
  * - Tolerate a trailing \r (accept CRLF input).

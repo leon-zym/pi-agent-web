@@ -108,10 +108,10 @@ function editDiff(ctx: ToolPresenterContext): string | undefined {
 	return diffFromDetails((ctx.block.result as Record<string, unknown>).details);
 }
 
-function DiffBody({ diff }: { diff: string }) {
+function DiffBody({ diff, fileName }: { diff: string; fileName?: string }) {
 	return (
 		<section aria-label={tt("tool.diff")}>
-			<DiffBlock diff={diff} />
+			<DiffBlock diff={diff} fileName={fileName} />
 		</section>
 	);
 }
@@ -174,10 +174,11 @@ const editPresenter: ToolPresenter = {
 	renderBody: (ctx) => {
 		const diff = editDiff(ctx);
 		if (!diff) return null;
+		const fileName = argString(ctx.block.args, ["file_path", "path"]);
 		const error = hasToolError(ctx) ? toolErrorText(ctx) : "";
 		return (
 			<div className="flex flex-col gap-2">
-				<DiffBody diff={diff} />
+				<DiffBody diff={diff} fileName={fileName} />
 				{error && error !== diff && (
 					<pre className="scroll-slim max-h-[260px] overflow-auto rounded-md bg-danger/5 p-3 font-mono text-xs leading-[18px] whitespace-pre-wrap break-words text-danger">
 						{error}

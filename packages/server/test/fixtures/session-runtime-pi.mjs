@@ -39,6 +39,8 @@ let startupFloodSent = false;
 let initialStateRequest = true;
 let getMessagesRequestCount = 0;
 let transitionPayloadPostPending = false;
+let persistedParentId = null;
+let persistedMessageCount = 0;
 const usage = {
 	input: 1,
 	output: 1,
@@ -92,9 +94,16 @@ function assistantMessage(text) {
 
 if (requestedFile) {
 	sessionFile = path.resolve(requestedFile);
-	const firstLine = fs.readFileSync(sessionFile, "utf8").split("\n", 1)[0];
-	const header = JSON.parse(firstLine);
+	const lines = fs.readFileSync(sessionFile, "utf8").split("\n").filter(Boolean);
+	const header = JSON.parse(lines[0]);
 	sessionId = header.id;
+	const entries = lines.slice(1).map((line) => JSON.parse(line));
+	persistedParentId = entries.at(-1)?.id ?? null;
+	if (process.env.PI_WEB_FIXTURE_LOAD_EXISTING_MESSAGES === "1") {
+		for (const entry of entries) {
+			if (entry.type === "message" && entry.message) messages.push(entry.message);
+		}
+	}
 } else {
 	sessionId = process.env.PI_WEB_FIXTURE_READY_ID ?? requestedId ?? "fixture-new";
 	const sessionDir = path.resolve(requestedDir ?? process.cwd());
@@ -155,6 +164,24 @@ function ensurePersisted() {
 			cwd: process.cwd(),
 		})}\n`,
 	);
+}
+
+function persistMessageIfConfigured(message) {
+	if (process.env.PI_WEB_FIXTURE_PERSIST_MESSAGES !== "1") return;
+	ensurePersisted();
+	const id = `fixture-persisted-${String(persistedMessageCount)}`;
+	persistedMessageCount += 1;
+	fs.appendFileSync(
+		sessionFile,
+		`${JSON.stringify({
+			type: "message",
+			id,
+			parentId: persistedParentId,
+			timestamp: new Date().toISOString(),
+			message,
+		})}\n`,
+	);
+	persistedParentId = id;
 }
 
 function configuredBytes(name) {
@@ -468,7 +495,9 @@ function streamPrompt(command) {
 	if (process.env.PI_WEB_FIXTURE_PROMPT_MARKER) {
 		fs.appendFileSync(process.env.PI_WEB_FIXTURE_PROMPT_MARKER, `${String(text)}\n`);
 	}
-	messages.push({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() });
+	const userMessage = { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
+	messages.push(userMessage);
+	persistMessageIfConfigured(userMessage);
 	if (process.env.PI_WEB_FIXTURE_SKIP_PROMPT_PERSIST !== "1") ensurePersisted();
 	if (typeof text === "string" && text.startsWith("snapshot-checkpoint:")) {
 		streamSnapshotCheckpoint(command, text.slice("snapshot-checkpoint:".length));
@@ -527,7 +556,7 @@ function streamPrompt(command) {
 			type: "extension_ui_request",
 			id: `future-editor-${sessionId}`,
 			method: "editor",
-			title: "Future editor",
+			title: "Canonical editor",
 			prefill: "e".repeat(320 * 1024),
 		});
 		if (process.env.PI_WEB_FIXTURE_FUTURE_EDITOR_SETTLES === "1") {
@@ -607,7 +636,7 @@ function streamPrompt(command) {
 			method: "confirm",
 			title: "Aggregate overflow",
 			message: "must be synchronously cleared",
-			timeout: 300,
+			timeout: 5_000,
 		});
 		for (let index = 0; index < 6; index += 1) {
 			send({
@@ -641,7 +670,9 @@ function streamPrompt(command) {
 	}
 	if (text === "structural-burst") {
 		for (let index = 0; index < 900; index += 1) send({ type: "turn_start" });
-		messages.push(assistantMessage(`structural-burst-${String(messages.length)}`));
+		const message = assistantMessage(`structural-burst-${String(messages.length)}`);
+		messages.push(message);
+		persistMessageIfConfigured(message);
 		send({ type: "agent_end", messages: [], willRetry: false });
 		send({ type: "agent_settled" });
 		return;

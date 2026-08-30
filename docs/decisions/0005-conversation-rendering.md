@@ -53,7 +53,7 @@ On the same local benchmark fixture:
 - Moving settled Markdown behind a lazy boundary keeps the initial route independent from the
   syntax-highlighting/Markdown chunk; the current production sizes and working budgets are listed
   below.
-- A 64 KiB GFM/code fixture costs roughly 130–180 ms in the current Node SSR
+- A 64 KiB GFM/code fixture costs roughly 130 to 180 ms in the current Node SSR
   parse/highlight/render proxy. This flags a browser long-task risk; it is not itself a Chromium
   mount/layout/paint measurement and is not claimed as solved by lazy loading or the streaming
   circuit breakers.

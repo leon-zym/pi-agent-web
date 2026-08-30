@@ -3,8 +3,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
-	isProductSessionEventDto,
-	isSessionCommandResponseDto,
+	isPiProductSessionEventDto,
+	isPiSessionCommandResponseDto,
 	SESSION_PAYLOAD_BUDGET,
 } from "@pi-agent-web/protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -142,7 +142,10 @@ describe("Pi payload image externalizer", () => {
 			const result = await externalizeEvent(store, value);
 			expect(refsIn(result.value)).toHaveLength(value.type === "turn_end" ? 2 : 1);
 			expect(
-				isProductSessionEventDto(result.value, { serverEpoch: EPOCH, payloadBudget: SESSION_PAYLOAD_BUDGET }),
+				isPiProductSessionEventDto(result.value, {
+					serverEpoch: EPOCH,
+					payloadBudget: SESSION_PAYLOAD_BUDGET,
+				}),
 			).toBe(true);
 			if (value.type === "turn_end") {
 				expect((result.value as typeof value).toolResults[0]?.details).toBe(opaque);
@@ -204,7 +207,7 @@ describe("Pi payload image externalizer", () => {
 			);
 			expect(refsIn(result.value)).toHaveLength(command === "get_tree" ? 2 : 1);
 			expect(
-				isSessionCommandResponseDto(result.value, {
+				isPiSessionCommandResponseDto(result.value, {
 					serverEpoch: EPOCH,
 					payloadBudget: SESSION_PAYLOAD_BUDGET,
 				}),

@@ -618,7 +618,7 @@ function AddWorkspaceDialog({
 }
 
 /**
- * Workspace / session browser (DESIGN.md): expanded 280px tree or 56px rail.
+ * Workspace and Session browser with an expanded tree or 56px rail.
  * Rows are hover-fill only; the selected session gets a 2px primary bar.
  */
 interface WorkspaceSidebarProps {
@@ -686,8 +686,8 @@ export function WorkspaceSidebar({
 								className="group relative mb-2 flex size-10 items-center justify-center rounded-sm bg-primary-soft text-primary focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
 								onClick={onOpenNavigation ?? onToggleRail}
 							>
-								<Bot className="size-5 transition-opacity group-hover:opacity-0 group-focus-visible:opacity-0" />
-								<PanelLeftOpen className="absolute size-4 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100" />
+								<Bot className="size-5 transition-opacity group-hover:opacity-0 group-focus-visible:opacity-0 [@media(hover:none)]:opacity-0" />
+								<PanelLeftOpen className="absolute size-4 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100 [@media(hover:none)]:opacity-100" />
 							</button>
 						</TooltipTrigger>
 						<TooltipContent side="right">

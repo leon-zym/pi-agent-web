@@ -102,6 +102,7 @@ describe("ToolGroup & Stacked Layout", () => {
 		expect(collapsedHtml).toContain("read × 1");
 		expect(collapsedHtml).toContain("grep × 1");
 		expect(collapsedHtml).toContain("bash × 1");
+		expect(collapsedHtml).toContain("[@media(hover:none)]:min-h-10");
 
 		const expandedHtml = renderToStaticMarkup(
 			<ToolGroupView tools={tools} resultsByToolCallId={resultsIndex} defaultOpen={true} durationMs={1200} />,

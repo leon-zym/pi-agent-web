@@ -58,7 +58,7 @@ export function TurnTail({ turn, sessionHandle }: { turn: ProductTurn; sessionHa
 	const cost = turn.usage?.cost ?? 0;
 
 	return (
-		<div className="flex min-h-6 items-center gap-2 text-[11px] text-ink-3">
+		<div className="flex min-h-6 items-center gap-2 text-[11px] text-ink-3 [@media(hover:none)]:min-h-10">
 			{turn.status === "error" && (
 				<span className="inline-flex items-center gap-1 text-danger">
 					<CircleAlert className="size-3.5" />
@@ -85,7 +85,7 @@ export function TurnTail({ turn, sessionHandle }: { turn: ProductTurn; sessionHa
 			<span className="flex-1" />
 			<button
 				type="button"
-				className="inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-ink-3 transition-colors hover:bg-hover hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
+				className="inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-ink-3 transition-colors hover:bg-hover hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none [@media(hover:none)]:min-h-10 [@media(hover:none)]:px-2"
 				onClick={() => void copyTurn()}
 			>
 				{copied ? <Check className="size-3" /> : <Copy className="size-3" />}
@@ -93,7 +93,7 @@ export function TurnTail({ turn, sessionHandle }: { turn: ProductTurn; sessionHa
 			</button>
 			<button
 				type="button"
-				className="inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-ink-3 transition-colors hover:bg-hover hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40"
+				className="inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-ink-3 transition-colors hover:bg-hover hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40 [@media(hover:none)]:min-h-10 [@media(hover:none)]:px-2"
 				onClick={() => void forkLast()}
 				disabled={!canControl}
 			>

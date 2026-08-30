@@ -4,6 +4,10 @@ ADRs record decisions that change identity, process ownership, protocol ordering
 operations, or major UI performance strategy. Current contracts remain in the parent documentation;
 an ADR explains why the contract exists and which alternatives were rejected.
 
+Read superseded ADR text as historical context only. `docs/architecture.md`, `docs/protocol.md`,
+`docs/ui-ux.md`, and `docs/design.md` define current behavior; the newest accepted ADR wins when
+earlier records describe a different implementation.
+
 | ADR | Decision |
 |---|---|
 | [0001](0001-pi-native-identity.md) | Pi-native Session and Workspace identity |
@@ -17,7 +21,8 @@ an ADR explains why the contract exists and which alternatives were rejected.
 | [0009](0009-authoritative-hot-runtime-inventory-and-browser-reconciliation.md) | Authoritative hot Runtime inventory and Browser reconciliation |
 | [0010](0010-epoch-scoped-attachment-references-and-payload-budgets.md) | Epoch-scoped attachment references and payload budgets |
 | [0011](0011-epoch-scoped-typed-content-references.md) | Epoch-scoped typed content references for UTF-8 text and JSON |
-| [0012](0012-schema-backed-boundary-decoders.md) | Schema-backed Pi and product boundary decoders |
+| [0012](0012-schema-backed-boundary-decoders.md) | Superseded schema-backed Pi and product boundary decoders |
+| [0013](0013-canonical-gateway-and-explicit-boundaries.md) | One canonical Gateway protocol and explicit boundary guards |
 
 New ADRs use: Status, Date, Context, Decision, Consequences, Rejected alternatives, Verification.
 Accepted ADRs are amended or superseded by a later ADR; do not silently reverse them in a handoff or

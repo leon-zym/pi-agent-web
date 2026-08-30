@@ -104,7 +104,7 @@ function restoreSessionScroll(element: HTMLDivElement, saved: SavedSessionScroll
 }
 
 /**
- * Scroll container with pinned-follow semantics (DESIGN.md): follow only
+ * Scroll container with pinned-follow semantics: follow only
  * while within 24px of the bottom; reading up pauses follow; a floating
  * button returns to the newest message.
  */
@@ -235,11 +235,13 @@ export function ChatViewport() {
 		<div
 			ref={scrollRef}
 			onScroll={onScroll}
+			tabIndex={-1}
 			data-chat-viewport="true"
 			className="scroll-slim h-full overflow-x-hidden overflow-y-auto overscroll-contain"
 		>
 			<div
 				ref={contentRef}
+				data-conversation-content="true"
 				className="mx-auto flex min-h-full min-w-0 w-full max-w-[748px] flex-col px-6 py-6"
 			>
 				{recovery && (

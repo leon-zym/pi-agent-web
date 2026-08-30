@@ -69,6 +69,10 @@ describe("DiffBlock & Unified Diff Parsing", () => {
 
 		// File header / name
 		expect(html).toContain("src/index.ts");
+		expect(html).toContain('data-diff-file-name="true"');
+		expect(html).toContain('title="src/index.ts"');
+		expect(html).toContain("min-h-10");
+		expect(html).toContain("grid-cols-2");
 
 		// Copy buttons
 		expect(html).toContain("复制纯净代码");
@@ -84,6 +88,18 @@ describe("DiffBlock & Unified Diff Parsing", () => {
 		expect(html).toContain("data-diff-line");
 		expect(html).toContain("data-old-line");
 		expect(html).toContain("data-new-line");
+	});
+
+	it("sanitizes the displayed file label without changing the raw input", () => {
+		const longPath = `${"deep/".repeat(80)}very-long-file-name.ts`;
+		const fileName = `src/\u001b[31munsafe\u001b[0m\u001b]8;;https://example.com\u0007link\u001b]8;;\u001b\\\u202eevil\u202c\n${longPath}`;
+		const original = fileName;
+		const html = renderToStaticMarkup(<DiffBlock diff={sampleDiff} fileName={fileName} />);
+
+		expect(html).toContain(`title="src/unsafelinkevil ${longPath}"`);
+		expect(html).not.toContain("https://example.com");
+		expect(html).not.toContain("\u202e");
+		expect(fileName).toBe(original);
 	});
 
 	it("ignores backslash markers like \\ No newline at end of file in clean code and numbering", () => {

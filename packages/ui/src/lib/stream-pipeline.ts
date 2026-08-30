@@ -1,8 +1,8 @@
 import type {
-	FutureProductSessionEventDto,
-	SessionEventDto,
+	InlineSessionWsServerMessage,
+	PiSessionEventDto,
+	ProductSessionEventDto,
 	SessionRuntimeDto,
-	SessionWsServerMessage,
 } from "@pi-agent-web/protocol";
 import { toast } from "sonner";
 import { migrateComposerHistory } from "../features/composer/use-composer-history";
@@ -11,7 +11,7 @@ import { useExtensionUiStore } from "../stores/extension-ui";
 import { useModelDirectoryStore } from "../stores/model-directory";
 import { useProjectionStore } from "../stores/projection";
 import { reconcileHiddenSessionLifecycle, useSessionDirectoryStore } from "../stores/session-directory";
-import type { SessionFrameBusMessage, SessionFrameProductMode } from "../stores/session-frame-bus";
+import type { SessionFrameBusMessage, SessionFrameRepresentation } from "../stores/session-frame-bus";
 import { useSessionStatsStore } from "../stores/session-stats";
 import { hasFreshLeaseBaseline, SESSION_FRAME_DEFERRED, sessionTransport } from "../stores/session-transport";
 import { useSlashCommandsStore } from "../stores/slash-commands";
@@ -23,7 +23,7 @@ import { isSoftIdempotentError } from "./session-controller";
 import { type CoalescibleMessageUpdate, SessionEventScheduler } from "./session-event-scheduler";
 import { updateTabBadge } from "./tab-badge";
 
-type ProjectionSessionEvent = SessionEventDto | FutureProductSessionEventDto;
+type ProjectionSessionEvent = PiSessionEventDto | ProductSessionEventDto;
 
 let initialized = false;
 const directoryReloadTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -60,7 +60,7 @@ export function initPipeline(): void {
 	if (initialized) return;
 	initialized = true;
 
-	sessionTransport.frameBus.subscribeAll((frame) => routeSessionFrame(frame.message, frame.productMode));
+	sessionTransport.frameBus.subscribeAll((frame) => routeSessionFrame(frame.message, frame.representation));
 	sessionTransport.globalBus.subscribe((message) => {
 		if (message.type === "hot_runtime_inventory") {
 			useSessionDirectoryStore.getState().applyHotRuntimeInventory(message);
@@ -78,11 +78,11 @@ export function initPipeline(): void {
 
 function routeSessionFrame(
 	message: SessionFrameBusMessage,
-	productMode: SessionFrameProductMode,
+	representation: SessionFrameRepresentation,
 ): void | typeof SESSION_FRAME_DEFERRED {
 	switch (message.type) {
 		case "event":
-			return routeEvent(message, productMode);
+			return routeEvent(message, representation);
 		case "extension_ui_request":
 			projectionEventScheduler.flushSession(message.sessionHandle, message.generation);
 			routeExtensionRequest(message);
@@ -124,7 +124,7 @@ function routeSessionFrame(
 				message.sessionHandle,
 				message.settledMessages,
 				message.projectionEvents.map((frame) => frame.event),
-				productMode,
+				representation,
 			);
 			useComposerStore.getState().setQueueForSession(message.sessionHandle, {
 				steering: [...message.queue.steering],
@@ -152,7 +152,7 @@ function routeSessionFrame(
 			projectionEventScheduler.flushSession(message.sessionHandle, message.generation);
 			useProjectionStore
 				.getState()
-				.prependHistoricalMessages(message.sessionHandle, message.messages, productMode);
+				.prependHistoricalMessages(message.sessionHandle, message.messages, representation);
 			return;
 		case "session_rekeyed":
 			projectionEventScheduler.discardSession(message.previousSessionHandle);
@@ -222,7 +222,7 @@ function scheduleHiddenLifecycleAfterSnapshot(runtime: SessionRuntimeDto): void 
 }
 
 function scheduleHiddenLifecycleAfterLease(
-	message: Extract<SessionWsServerMessage, { type: "lease_status" }>,
+	message: Extract<InlineSessionWsServerMessage, { type: "lease_status" }>,
 ): void {
 	const channel = sessionTransport.store.getState().sessions[message.sessionHandle];
 	const runtime = channel?.runtime;
@@ -247,7 +247,7 @@ function scheduleHiddenLifecycleAfterLease(
 
 function routeEvent(
 	message: Extract<SessionFrameBusMessage, { type: "event" }>,
-	productMode: SessionFrameProductMode,
+	representation: SessionFrameRepresentation,
 ): void | typeof SESSION_FRAME_DEFERRED {
 	const { event, generation, seq, sessionHandle, workspaceId } = message;
 	const coalescible = coalescibleMessageUpdate(event);
@@ -321,7 +321,7 @@ function routeEvent(
 			break;
 	}
 
-	useProjectionStore.getState().applyEvent(sessionHandle, event, productMode);
+	useProjectionStore.getState().applyEvent(sessionHandle, event, representation);
 	if (
 		(event.type === "message_end" && event.message.role === "assistant") ||
 		(event.type === "message_update" &&
@@ -363,7 +363,7 @@ function applyLiveUsage(
 }
 
 function routeExtensionRequest(
-	message: Extract<SessionWsServerMessage, { type: "extension_ui_request" }>,
+	message: Extract<InlineSessionWsServerMessage, { type: "extension_ui_request" }>,
 ): void {
 	const { request, sessionHandle, generation } = message;
 	if (request.method === "notify") {
@@ -390,7 +390,7 @@ function routeRekey(previousSessionHandle: string, runtime: SessionRuntimeDto): 
 	scheduleDirectoryReload(runtime.workspaceId);
 }
 
-function routeSessionError(message: Extract<SessionWsServerMessage, { type: "session_error" }>): void {
+function routeSessionError(message: Extract<InlineSessionWsServerMessage, { type: "session_error" }>): void {
 	if (!isCurrentSession(message.sessionHandle)) return;
 	if (message.operation === "claim") {
 		toast.info(tt("lease.observer"), { description: stripAnsi(message.error) });

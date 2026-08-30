@@ -1,14 +1,15 @@
 import {
-	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
 	type GatewayClientHelloDto,
 	type GatewayServerHelloDto,
+	type InlineSessionReplayFrameDto,
+	type InlineSessionSnapshotDto,
+	SESSION_CONTENT_REF_BUDGET,
 	SESSION_PAYLOAD_BUDGET,
-	type SessionReplayFrameDto,
 	type SessionRuntimeDto,
-	type SessionSnapshotDto,
 	type SessionWsClientMessage,
 } from "@pi-agent-web/protocol";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	createSessionTransport,
 	type SessionTransportController,
@@ -34,25 +35,19 @@ class FakeSocket implements SessionWebSocket {
 		this.onopen?.();
 		this.receive({
 			type: "server_hello",
-			protocol: { major: 1, minor: 2 },
+			protocol: { major: 1, minor: 3 },
 			serverBuild: "test",
 			serverEpoch: SERVER_EPOCH,
 			piVersion: "test",
 			adapterId: "test",
-			capabilities: [
-				"rpc.commands",
-				"rpc.events",
-				"rpc.extension_ui",
-				"session.multiplex",
-				"session.hot_runtime_inventory",
-				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
-			],
+			capabilities: [...GATEWAY_SERVER_REQUIRED_CAPABILITIES],
 			limits: {
 				maxClientFrameBytes: 8 * 1024 * 1024,
 				maxSnapshotFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes,
 				maxExtensionRequests: 256,
 			},
 			payloadBudget: SESSION_PAYLOAD_BUDGET,
+			contentRefBudget: SESSION_CONTENT_REF_BUDGET,
 		} satisfies GatewayServerHelloDto);
 		this.receive({
 			type: "hot_runtime_inventory",
@@ -87,7 +82,7 @@ function runtime(lastSeq = 0): SessionRuntimeDto {
 	};
 }
 
-function snapshot(asOfSeq = 0): SessionSnapshotDto {
+function snapshot(asOfSeq = 0): InlineSessionSnapshotDto {
 	return {
 		type: "session_snapshot",
 		snapshotId: `snapshot-${String(asOfSeq)}`,
@@ -106,7 +101,7 @@ function snapshot(asOfSeq = 0): SessionSnapshotDto {
 	};
 }
 
-function event(seq: number): SessionReplayFrameDto {
+function event(seq: number): InlineSessionReplayFrameDto {
 	return {
 		type: "event",
 		serverEpoch: SERVER_EPOCH,
@@ -129,7 +124,7 @@ function setup() {
 			return socket;
 		},
 		url: () => "ws://test",
-		protocolVersion: { major: 1, minor: 2 },
+		protocolVersion: { major: 1, minor: 3 },
 	});
 	controllers.push(controller);
 	controller.store.getState().connect();
@@ -145,7 +140,7 @@ afterEach(() => {
 });
 
 describe("authoritative Session snapshot transport", () => {
-	it("commits one guarded snapshot before releasing only its contiguous suffix", () => {
+	it("commits one guarded snapshot before releasing only its contiguous suffix", async () => {
 		const { controller, socket } = setup();
 		const delivered: Array<string | number> = [];
 		controller.frameBus.subscribe("session-a", ({ message }) => {
@@ -161,6 +156,7 @@ describe("authoritative Session snapshot transport", () => {
 		});
 		socket.receive(event(1));
 		socket.receive(snapshot(0));
+		await vi.waitFor(() => expect(delivered).toHaveLength(4));
 
 		expect(delivered).toEqual(["runtime_state", "resync_required", "session_snapshot", 1]);
 		expect(controller.store.getState().sessions["session-a"]).toMatchObject({
@@ -195,7 +191,7 @@ describe("authoritative Session snapshot transport", () => {
 		).toBe(false);
 	});
 
-	it("retains an old-epoch cursor until the server explicitly fences it", () => {
+	it("retains an old-epoch cursor until the server explicitly fences it", async () => {
 		const { controller, socket, sockets } = setup();
 		socket.receive({ type: "runtime_state", runtime: runtime(2) });
 		socket.receive({
@@ -206,6 +202,9 @@ describe("authoritative Session snapshot transport", () => {
 			reason: "initial",
 		});
 		socket.receive(snapshot(2));
+		await vi.waitFor(() =>
+			expect(controller.store.getState().sessions["session-a"]?.baselineAuthoritative).toBe(true),
+		);
 		controller.store.getState().disconnect();
 		controller.store.getState().connect();
 		const second = sockets[1];

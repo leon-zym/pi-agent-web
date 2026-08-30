@@ -1,34 +1,34 @@
 import type {
-	ExtensionUiRequestDto,
 	ExtensionUiResponseDto,
-	FutureExtensionUiSnapshotDto,
-	FutureSessionContentRefGuardContext,
-	FutureSessionHistoryPageChunkDto,
-	FutureSessionReplayFrameDto,
-	FutureSessionResponseFrameDto,
-	FutureSessionSnapshotBeginDto,
-	FutureSessionSnapshotChunkDto,
-	FutureSessionSnapshotDto,
+	ExtensionUiSnapshotDto,
 	GatewayProtocolVersionDto,
 	HotRuntimeInventoryDto,
+	InlineSessionReplayFrameDto,
+	InlineSessionWsServerMessage,
+	PiExtensionUiRequestDto,
+	PiSessionCommandResponseDto,
 	SessionCommandDto,
-	SessionCommandResponseDto,
+	SessionContentRefGuardContext,
 	SessionHistoryMetadataDto,
 	SessionHistoryPageBeginDto,
+	SessionHistoryPageChunkDto,
 	SessionHistoryPageEndDto,
 	SessionReplayFrameDto,
+	SessionResponseFrameDto,
 	SessionRuntimeDto,
 	SessionRuntimeIdentityDto,
+	SessionSnapshotBeginDto,
+	SessionSnapshotChunkDto,
+	SessionSnapshotDto,
 	SessionSnapshotEndDto,
-	SessionWsServerMessage,
 } from "@pi-agent-web/protocol";
 import type { StoreApi } from "zustand/vanilla";
 import type {
-	FutureSessionContentAdapter,
-	FutureSessionJsonFieldGuard,
-	FutureSessionJsonRootProjection,
-	FutureSessionTextPayloadProjection,
-} from "../lib/future-session-content-adapter";
+	SessionContentAdapter,
+	SessionJsonFieldGuard,
+	SessionJsonRootProjection,
+	SessionTextPayloadProjection,
+} from "../lib/session-content-adapter";
 import type { SessionResyncState as SessionRecoveryState, SessionResyncClock } from "../lib/session-resync";
 import type { OrderedSessionFrameBus, SessionTransportGlobalBus } from "./session-frame-bus";
 
@@ -40,7 +40,7 @@ export interface SessionLeaseState {
 }
 
 export interface SessionResyncState {
-	reason: Extract<SessionWsServerMessage, { type: "resync_required" }>["reason"];
+	reason: Extract<InlineSessionWsServerMessage, { type: "resync_required" }>["reason"];
 	generation: number;
 	/** The snapshot must cover at least this sequence before buffered frames can be released. */
 	barrierSeq: number;
@@ -78,23 +78,23 @@ export interface SessionRawEventRecord {
 	seq: number;
 	eventType: string;
 	payload:
-		| Extract<SessionReplayFrameDto, { type: "event" }>["event"]
-		| Extract<FutureSessionReplayFrameDto, { type: "event" }>["event"];
+		| Extract<InlineSessionReplayFrameDto, { type: "event" }>["event"]
+		| Extract<SessionReplayFrameDto, { type: "event" }>["event"];
 }
 
-export type FutureSessionTransportFrameMessage =
-	| FutureSessionResponseFrameDto
-	| FutureSessionReplayFrameDto
-	| FutureSessionSnapshotDto
-	| FutureSessionSnapshotBeginDto
-	| FutureSessionSnapshotChunkDto
+export type SessionTransportFrameMessage =
+	| SessionResponseFrameDto
+	| SessionReplayFrameDto
+	| SessionSnapshotDto
+	| SessionSnapshotBeginDto
+	| SessionSnapshotChunkDto
 	| SessionSnapshotEndDto
 	| SessionHistoryPageBeginDto
-	| FutureSessionHistoryPageChunkDto
+	| SessionHistoryPageChunkDto
 	| SessionHistoryPageEndDto
-	| FutureExtensionUiSnapshotDto;
+	| ExtensionUiSnapshotDto;
 
-export type FutureSessionLazyIdentity = Readonly<
+export type SessionLazyIdentity = Readonly<
 	Pick<SessionRuntimeIdentityDto, "serverEpoch" | "workspaceId" | "sessionHandle" | "generation">
 >;
 
@@ -114,7 +114,7 @@ export interface SessionChannelState {
 	/** Highest sequence synchronously applied or durably accepted by the projection pipeline. */
 	projectedSeq: number;
 	lease: SessionLeaseState;
-	pendingExtensionRequests: ExtensionUiRequestDto[];
+	pendingExtensionRequests: PiExtensionUiRequestDto[];
 	resync: SessionResyncState | null;
 	recovery: SessionRecoveryState | null;
 	history: SessionHistoryState;
@@ -185,23 +185,23 @@ export interface SessionTransportOptions {
 	/** UI build identity is diagnostic only; compatibility is negotiated by protocolVersion. */
 	clientBuild?: string;
 	protocolVersion?: GatewayProtocolVersionDto;
-	onResyncRequired?: (message: Extract<SessionWsServerMessage, { type: "resync_required" }>) => void;
+	onResyncRequired?: (message: Extract<InlineSessionWsServerMessage, { type: "resync_required" }>) => void;
 	resyncClock?: SessionResyncClock;
 	resyncRandom?: () => number;
 	/** Protocol 1.3 content adapter; production installs the default from the trusted hello context. */
-	futureContentAdapter?: FutureSessionContentAdapter;
+	contentAdapter?: SessionContentAdapter;
 	/** Protocol 1.3 hello-scoped adapter install; custom factories are validated before activation. */
-	futureContentAdapterFactory?: FutureSessionContentAdapterFactory;
+	contentAdapterFactory?: SessionContentAdapterFactory;
 }
 
-export interface FutureSessionContentAdapterInstallation {
-	adapter: FutureSessionContentAdapter;
+export interface SessionContentAdapterInstallation {
+	adapter: SessionContentAdapter;
 	dispose: () => void;
 }
 
-export type FutureSessionContentAdapterFactory = (
-	context: Readonly<FutureSessionContentRefGuardContext>,
-) => FutureSessionContentAdapterInstallation;
+export type SessionContentAdapterFactory = (
+	context: Readonly<SessionContentRefGuardContext>,
+) => SessionContentAdapterInstallation;
 
 export interface SessionTransportState {
 	connectionState: SessionTransportConnectionState;
@@ -222,7 +222,7 @@ export interface SessionTransportState {
 		sessionHandle: string,
 		command: SessionCommandDto,
 		timeoutMs?: number,
-	) => Promise<SessionCommandResponseDto>;
+	) => Promise<PiSessionCommandResponseDto>;
 	sendExtensionUiResponse: (sessionHandle: string, response: ExtensionUiResponseDto) => boolean;
 	manualRetryResync: (sessionHandle: string) => boolean;
 	/** Retry a rejected background subscription without changing the visible Session. */
@@ -238,23 +238,23 @@ export interface SessionTransportController {
 	store: StoreApi<SessionTransportState>;
 	frameBus: OrderedSessionFrameBus;
 	globalBus: SessionTransportGlobalBus;
-	/** Hello-scoped future content facade; its identity is not a React dependency. */
-	resolveFutureText: (
-		identity: FutureSessionLazyIdentity,
-		payload: FutureSessionTextPayloadProjection,
+	/** Hello-scoped content facade; its identity is not a React dependency. */
+	resolveText: (
+		identity: SessionLazyIdentity,
+		payload: SessionTextPayloadProjection,
 		callerSignal?: AbortSignal,
 	) => Promise<string>;
-	/** Hello-scoped future content facade with a caller-owned typed JSON guard. */
-	resolveFutureJson: <T>(
-		identity: FutureSessionLazyIdentity,
-		payload: FutureSessionJsonRootProjection,
-		fieldGuard: FutureSessionJsonFieldGuard<T>,
+	/** Hello-scoped content facade with a caller-owned typed JSON guard. */
+	resolveJson: <T>(
+		identity: SessionLazyIdentity,
+		payload: SessionJsonRootProjection,
+		fieldGuard: SessionJsonFieldGuard<T>,
 		callerSignal?: AbortSignal,
 	) => Promise<T>;
 	/** Public for deterministic protocol tests and non-WebSocket adapters. */
-	ingestServerMessage: (message: SessionWsServerMessage) => void;
+	ingestServerMessage: (message: InlineSessionWsServerMessage) => void;
 	/** Queue one already-guarded private protocol 1.3 frame for exact-identity materialization. */
-	ingestFutureFrameMessage: (message: FutureSessionTransportFrameMessage, rawWireBytes: number) => boolean;
+	ingestFrameMessage: (message: SessionTransportFrameMessage, rawWireBytes: number) => boolean;
 	/** Confirm that deferred projection work has applied every retained frame through lastSeq. */
 	confirmProjectionDelivery: (sessionHandle: string, generation: number) => boolean;
 	/** True only while the matching resync attempt is projecting its guarded snapshot suffix. */

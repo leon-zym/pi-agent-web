@@ -1,9 +1,13 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { GATEWAY_PAYLOAD_BUDGET_CAPABILITY, SESSION_PAYLOAD_BUDGET } from "@pi-agent-web/protocol";
+import {
+	GATEWAY_PROTOCOL_VERSION,
+	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
+	SESSION_PAYLOAD_BUDGET,
+} from "@pi-agent-web/protocol";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { type LegacyServerHandle, startServerWithCurrentMode } from "../src/main.js";
+import { type ServerHandle, startServer } from "../src/main.js";
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-session-control-"));
 const workspacePath = path.join(tempRoot, "workspace");
@@ -17,7 +21,7 @@ interface RuntimeIdentity {
 	generation: number;
 }
 
-let handle: LegacyServerHandle;
+let handle: ServerHandle;
 let base: string;
 let cookie: string;
 let workspaceHandle: string;
@@ -38,15 +42,9 @@ async function openSocket(): Promise<import("ws").WebSocket> {
 	ws.send(
 		JSON.stringify({
 			type: "client_hello",
-			protocol: { major: 1, minor: 2 },
+			protocol: GATEWAY_PROTOCOL_VERSION,
 			clientBuild: "workspace-control-test",
-			capabilities: [
-				"rpc.commands",
-				"rpc.events",
-				"rpc.extension_ui",
-				"session.multiplex",
-				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
-			],
+			capabilities: [...GATEWAY_SERVER_REQUIRED_CAPABILITIES],
 			limits: { maxServerFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes },
 		}),
 	);
@@ -126,7 +124,7 @@ async function closeSocket(ws: import("ws").WebSocket): Promise<void> {
 
 beforeAll(async () => {
 	fs.mkdirSync(workspacePath, { recursive: true });
-	handle = await startServerWithCurrentMode({
+	handle = await startServer({
 		config: { port: 0, host: "127.0.0.1", agentDir, sessionRootDir, webDataDir },
 		piPath: fakePiPath,
 		handleSignals: false,

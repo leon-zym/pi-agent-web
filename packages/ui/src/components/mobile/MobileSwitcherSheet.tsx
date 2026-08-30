@@ -145,7 +145,7 @@ export function MobileSwitcherContent({
 }
 
 /**
- * Mobile touch drawer bottom sheet for switching workspaces and sessions (DESIGN.md 4.3).
+ * Mobile touch drawer for switching Workspaces and Sessions.
  * All touch hit targets >= 40px.
  */
 export function MobileSwitcherSheet({

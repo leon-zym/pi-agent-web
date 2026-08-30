@@ -4,6 +4,7 @@ import {
 	playAttentionChime,
 	playCompletionChime,
 	setAudioMuted,
+	subscribeAudioMuted,
 } from "../src/lib/audio-feedback";
 
 describe("audio-feedback", () => {
@@ -71,10 +72,29 @@ describe("audio-feedback", () => {
 
 	it("manages mute state through localStorage", () => {
 		expect(isAudioMuted()).toBe(false);
-		setAudioMuted(true);
+		expect(setAudioMuted(true)).toBe(true);
 		expect(isAudioMuted()).toBe(true);
-		setAudioMuted(false);
+		expect(setAudioMuted(false)).toBe(true);
 		expect(isAudioMuted()).toBe(false);
+	});
+
+	it("notifies same-tab subscribers only after a successful persisted write", () => {
+		const listener = vi.fn();
+		const unsubscribe = subscribeAudioMuted(listener);
+
+		expect(setAudioMuted(true)).toBe(true);
+		expect(listener).toHaveBeenCalledTimes(1);
+		unsubscribe();
+
+		vi.stubGlobal("localStorage", {
+			getItem: (key: string) => storage.get(key) ?? null,
+			setItem: () => {
+				throw new Error("quota denied");
+			},
+		});
+		expect(setAudioMuted(false)).toBe(false);
+		expect(isAudioMuted()).toBe(true);
+		expect(listener).toHaveBeenCalledTimes(1);
 	});
 
 	it("plays completion chime (440Hz -> 880Hz ascending 120ms sine wave)", async () => {

@@ -5,14 +5,10 @@ import { type SessionEntry, sessionEntryToContextMessages } from "@earendil-work
 import type {
 	ExtensionUiRequestDto,
 	ExtensionUiResponseDto,
-	FutureExtensionUiRequestDto,
-	FutureProductSessionEventDto,
-	FutureSessionCommandResponseDto,
-	FutureSessionMessageDto,
-	FutureSessionSnapshotDto,
 	HotRuntimeInventoryEntryDto,
+	PiExtensionUiRequestDto,
+	PiSessionCommandResponseDto,
 	ProductSessionEventDto,
-	SessionAttachmentRefDto,
 	SessionCommandDto,
 	SessionCommandResponseDto,
 	SessionMessageDto,
@@ -22,21 +18,16 @@ import type {
 	SessionStateDto,
 } from "@pi-agent-web/protocol";
 import {
-	analyzeFutureSessionCommandResponseLogicalBytes,
+	analyzeSessionCommandResponseLogicalBytes,
 	commandTimeoutMs,
-	expectCommandData,
 	RpcError,
-	SESSION_SNAPSHOT_MAX_BYTES,
 	SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS,
 	sessionHistoryMessagesBytes,
 } from "@pi-agent-web/protocol";
 import type { EpochContentHold, EpochStoredContentRef } from "./epoch-content-store.js";
 import { GenerationContentOwner } from "./generation-content-owner.js";
 import { canonicalizeSessionFile, sessionHandleForCanonicalFile } from "./native-session-catalog.js";
-import type {
-	PiHostAttachmentPayloadExternalizer,
-	PiHostFuturePayloadExternalizer,
-} from "./pi-host-adapter.js";
+import type { PiHostPayloadExternalizer } from "./pi-host-adapter.js";
 import type { PiPayloadLease, PiPayloadLeaseTransfer } from "./pi-payload-externalizer.js";
 import type {
 	PiDecodedDelivery,
@@ -62,11 +53,7 @@ import {
 	type SessionLiveProjectionPreparedCommit,
 	type SessionLiveProjectionSnapshot,
 } from "./session-live-projection.js";
-import {
-	createCurrentSessionProductSchema,
-	type SessionProductSchema,
-	SessionProductSchemaLogicalError,
-} from "./session-product-schema.js";
+import { type SessionProductSchema, SessionProductSchemaLogicalError } from "./session-product-schema.js";
 import {
 	type ExistingSessionTarget,
 	eventSettlesWork,
@@ -89,7 +76,7 @@ const DEFAULT_TRANSIENT_BUFFER_MAX_BYTES = 4 * 1024 * 1024;
 const DEFAULT_EXTENSION_STATE_MAX_BYTES = 512 * 1024;
 const DEFAULT_EXTENSION_STATE_MAX_ITEMS = SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS;
 const DEFAULT_PENDING_DIALOG_LIMIT = 32;
-const NATIVE_HISTORY_DIRECT_THRESHOLD_BYTES = SESSION_SNAPSHOT_MAX_BYTES - 256 * 1024;
+const DEFAULT_MAX_PENDING_COMMANDS = 32;
 
 function deepFreeze<T>(value: T): T {
 	if (value === null || typeof value !== "object" || Object.isFrozen(value)) return value;
@@ -122,7 +109,7 @@ interface PendingTurnReservation {
 interface TransitionStage<
 	TEvent = ProductSessionEventDto,
 	TExtensionRequest = ExtensionUiRequestDto,
-	TRef extends EpochStoredContentRef = SessionAttachmentRefDto,
+	TRef extends EpochStoredContentRef = EpochStoredContentRef,
 > {
 	phase: "awaiting_response" | "verifying" | "applying";
 	frames: BufferedFrame<TEvent, TExtensionRequest>[];
@@ -219,30 +206,20 @@ type SessionRuntimePiProcessOptions = Omit<
 	PiProcessOptions,
 	| "payloadExternalizer"
 	| "onDecodedEvent"
-	| "onFutureDecodedEvent"
-	| "onFutureDecodedExtensionUiRequest"
+	| "onDecodedExtensionUiRequest"
 	| "onEvent"
 	| "onExtensionUiRequest"
 >;
 
 export interface RuntimeProductMap {
-	current: {
+	content_ref: {
 		message: SessionMessageDto;
 		event: ProductSessionEventDto;
 		response: SessionCommandResponseDto;
 		snapshot: SessionSnapshotDto;
-		ref: SessionAttachmentRefDto;
-		externalizer: PiHostAttachmentPayloadExternalizer;
-		extensionRequest: ExtensionUiRequestDto;
-	};
-	future_content: {
-		message: FutureSessionMessageDto;
-		event: FutureProductSessionEventDto;
-		response: FutureSessionCommandResponseDto;
-		snapshot: FutureSessionSnapshotDto;
 		ref: EpochStoredContentRef;
-		externalizer: PiHostFuturePayloadExternalizer;
-		extensionRequest: FutureExtensionUiRequestDto;
+		externalizer: PiHostPayloadExternalizer;
+		extensionRequest: ExtensionUiRequestDto;
 	};
 }
 
@@ -260,7 +237,7 @@ export interface SessionRuntimePayloadCustody<M extends SessionRuntimeProductMod
 	readonly releaseHold: (hold: EpochContentHold<RuntimeRef<M>>) => Promise<void>;
 }
 
-export interface SessionRuntimePiPayloadServices<M extends SessionRuntimeProductMode = "current">
+export interface SessionRuntimePiPayloadServices<M extends SessionRuntimeProductMode = "content_ref">
 	extends SessionRuntimePayloadCustody<M> {
 	readonly mode: M;
 	readonly productSchema: SessionProductSchema<
@@ -271,16 +248,13 @@ export interface SessionRuntimePiPayloadServices<M extends SessionRuntimeProduct
 	>;
 }
 
-export type CurrentSessionRuntimePiPayloadServices = SessionRuntimePiPayloadServices<"current">;
-export type FutureSessionRuntimePiPayloadServices = SessionRuntimePiPayloadServices<"future_content">;
-
 export type SessionRuntimeProductEvent<M extends SessionRuntimeProductMode> = RuntimeEvent<M>;
 export type SessionRuntimeProductExtensionRequest<M extends SessionRuntimeProductMode> =
 	RuntimeExtensionRequest<M>;
 export type SessionRuntimeProductResponse<M extends SessionRuntimeProductMode> = RuntimeResponse<M>;
 export type SessionRuntimeProductSnapshot<M extends SessionRuntimeProductMode> = RuntimeSnapshot<M>;
 
-export interface SessionRuntimeCoreOptions<M extends SessionRuntimeProductMode = "current"> {
+export interface SessionRuntimeCoreOptions<M extends SessionRuntimeProductMode = "content_ref"> {
 	serverEpoch: string;
 	target: SessionTarget;
 	resolved: ProbedPiRuntime;
@@ -292,6 +266,8 @@ export interface SessionRuntimeCoreOptions<M extends SessionRuntimeProductMode =
 	extensionStateMaxBytes?: number;
 	extensionStateMaxItems?: number;
 	pendingDialogLimit?: number;
+	/** Hard cap for RPC command responses pending on this canonical Session. */
+	maxPendingCommands?: number;
 	projectionLimits?: Partial<SessionLiveProjectionLimits>;
 	productAdapter: SessionRuntimeProductAdapter<M>;
 	payloadCustody?: SessionRuntimePayloadCustody<M>;
@@ -308,40 +284,17 @@ export interface SessionRuntimeCoreOptions<M extends SessionRuntimeProductMode =
 }
 
 export interface SessionRuntimeOptions
-	extends Omit<SessionRuntimeCoreOptions<"current">, "productAdapter" | "payloadCustody"> {
-	/** Legacy current-mode payload services; production future mode installs the typed pipeline. */
-	piPayloadServices?: CurrentSessionRuntimePiPayloadServices;
+	extends Omit<SessionRuntimeCoreOptions<"content_ref">, "productAdapter" | "payloadCustody"> {
+	piPayloadServices: SessionRuntimePiPayloadServices;
 }
 
-export interface FutureSessionRuntimeOptions
-	extends Omit<SessionRuntimeCoreOptions<"future_content">, "productAdapter" | "payloadCustody"> {
-	piPayloadServices: FutureSessionRuntimePiPayloadServices;
-}
-
-export function createCurrentSessionRuntimePiPayloadServices(input: {
-	externalizer: PiHostAttachmentPayloadExternalizer;
+export function createSessionRuntimePiPayloadServices(input: {
+	externalizer: PiHostPayloadExternalizer;
 	productSchema: SessionProductSchema;
-	releaseHold: (hold: EpochContentHold) => Promise<void>;
-}): CurrentSessionRuntimePiPayloadServices {
-	const services: CurrentSessionRuntimePiPayloadServices = {
-		mode: "current",
-		...input,
-	};
-	return Object.freeze(services);
-}
-
-export function createFutureSessionRuntimePiPayloadServices(input: {
-	externalizer: PiHostFuturePayloadExternalizer;
-	productSchema: SessionProductSchema<
-		FutureSessionMessageDto,
-		FutureProductSessionEventDto,
-		FutureSessionSnapshotDto,
-		FutureExtensionUiRequestDto
-	>;
 	releaseHold: (hold: EpochContentHold<EpochStoredContentRef>) => Promise<void>;
-}): FutureSessionRuntimePiPayloadServices {
-	const services: FutureSessionRuntimePiPayloadServices = {
-		mode: "future_content",
+}): SessionRuntimePiPayloadServices {
+	const services: SessionRuntimePiPayloadServices = {
+		mode: "content_ref",
 		...input,
 	};
 	return Object.freeze(services);
@@ -362,10 +315,9 @@ export interface SessionRuntimeProductAdapter<M extends SessionRuntimeProductMod
 			proc: PiProcess,
 			delivery: PiDecodedDelivery<RuntimeEvent<M>, RuntimeRef<M>>,
 		) => PiDecodedDeliveryPlan,
-		consumeExtensionRequest: (request: RuntimeExtensionRequest<M>) => void,
-		consumeFutureExtensionRequest: (
+		consumeExtensionRequest: (
 			proc: PiProcess,
-			delivery: PiDecodedDelivery<FutureExtensionUiRequestDto, EpochStoredContentRef>,
+			delivery: PiDecodedDelivery<RuntimeExtensionRequest<M>, RuntimeRef<M>>,
 		) => PiDecodedDeliveryPlan,
 	): PiProcess;
 	sendDecoded(
@@ -378,75 +330,31 @@ export interface SessionRuntimeProductAdapter<M extends SessionRuntimeProductMod
 	transitionResponseLogicalBytes(response: RuntimeResponse<M>): number;
 }
 
-function createCurrentProductAdapter(
-	productSchema: SessionProductSchema = createCurrentSessionProductSchema(),
-): SessionRuntimeProductAdapter<"current"> {
-	const adapter: SessionRuntimeProductAdapter<"current"> = {
-		mode: "current",
+function createProductAdapter(
+	productSchema: SessionProductSchema,
+): SessionRuntimeProductAdapter<"content_ref"> {
+	const adapter: SessionRuntimeProductAdapter<"content_ref"> = {
+		mode: "content_ref",
 		productSchema,
-		createProcess: (
-			options,
-			payloadCustody,
-			consumeEvent,
-			consumeExtensionRequest,
-			_consumeFutureExtensionRequest,
-		) => {
+		createProcess: (options, payloadCustody, consumeEvent, consumeExtensionRequest) => {
+			if (!payloadCustody) throw new TypeError("Session Runtime requires payload custody");
 			let owner: PiProcess | undefined;
 			const proc = new PiProcess({
 				...options,
-				...(payloadCustody ? { payloadExternalizer: payloadCustody.externalizer } : {}),
+				payloadExternalizer: payloadCustody.externalizer,
 				onDecodedEvent: (delivery) => {
 					if (!owner) throw new RpcError("event", "session_process_not_installed");
 					return consumeEvent(owner, delivery);
 				},
-				onExtensionUiRequest: consumeExtensionRequest,
+				onDecodedExtensionUiRequest: (delivery) => {
+					if (!owner) throw new RpcError("extension_ui_request", "session_process_not_installed");
+					return consumeExtensionRequest(owner, delivery);
+				},
 			});
 			owner = proc;
 			return proc;
 		},
 		sendDecoded: (proc, command, consume, timeoutMs) => proc.sendDecoded(command, consume, timeoutMs),
-		messagesFrom: (response) => expectCommandData(response, "get_messages").messages,
-		transitionResponseLogicalBytes: () => 0,
-	};
-	return Object.freeze(adapter);
-}
-
-function createFutureProductAdapter(
-	productSchema: SessionProductSchema<
-		FutureSessionMessageDto,
-		FutureProductSessionEventDto,
-		FutureSessionSnapshotDto,
-		FutureExtensionUiRequestDto
-	>,
-): SessionRuntimeProductAdapter<"future_content"> {
-	const adapter: SessionRuntimeProductAdapter<"future_content"> = {
-		mode: "future_content",
-		productSchema,
-		createProcess: (
-			options,
-			payloadCustody,
-			consumeEvent,
-			_consumeExtensionRequest,
-			consumeFutureExtensionRequest,
-		) => {
-			if (!payloadCustody) throw new TypeError("Future Session Runtime requires payload custody");
-			let owner: PiProcess | undefined;
-			const proc = new PiProcess({
-				...options,
-				payloadExternalizer: payloadCustody.externalizer,
-				onFutureDecodedEvent: (delivery) => {
-					if (!owner) throw new RpcError("event", "session_process_not_installed");
-					return consumeEvent(owner, delivery);
-				},
-				onFutureDecodedExtensionUiRequest: (delivery) => {
-					if (!owner) throw new RpcError("extension_ui_request", "session_process_not_installed");
-					return consumeFutureExtensionRequest(owner, delivery);
-				},
-			});
-			owner = proc;
-			return proc;
-		},
-		sendDecoded: (proc, command, consume, timeoutMs) => proc.sendFutureDecoded(command, consume, timeoutMs),
 		messagesFrom: (response) => {
 			if (response.success !== true || response.command !== "get_messages") {
 				throw new RpcError("get_messages", "unexpected Pi response");
@@ -454,7 +362,7 @@ function createFutureProductAdapter(
 			return response.data.messages;
 		},
 		transitionResponseLogicalBytes: (response) =>
-			analyzeFutureSessionCommandResponseLogicalBytes(response, {
+			analyzeSessionCommandResponseLogicalBytes(response, {
 				maxBytes: productSchema.maxActiveTurnLogicalBytes,
 			}).byteLength,
 	};
@@ -468,7 +376,7 @@ function createFutureProductAdapter(
  * gives every emitted frame a generation-local sequence, and keeps a bounded
  * replay ring for reconnect. Session navigation is deliberately absent.
  */
-export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current"> {
+export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_ref"> {
 	private readonly productAdapter: SessionRuntimeProductAdapter<M>;
 	private readonly payloadCustody: SessionRuntimePayloadCustody<M> | null;
 	private readonly opts: Required<
@@ -481,6 +389,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			| "extensionStateMaxBytes"
 			| "extensionStateMaxItems"
 			| "pendingDialogLimit"
+			| "maxPendingCommands"
 		>
 	> &
 		SessionRuntimeCoreOptions<M>;
@@ -589,6 +498,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			extensionStateMaxBytes: Math.max(0, opts.extensionStateMaxBytes ?? DEFAULT_EXTENSION_STATE_MAX_BYTES),
 			extensionStateMaxItems: Math.max(0, opts.extensionStateMaxItems ?? DEFAULT_EXTENSION_STATE_MAX_ITEMS),
 			pendingDialogLimit: Math.max(0, opts.pendingDialogLimit ?? DEFAULT_PENDING_DIALOG_LIMIT),
+			maxPendingCommands: Math.max(1, Math.floor(opts.maxPendingCommands ?? DEFAULT_MAX_PENDING_COMMANDS)),
 		};
 		if (
 			opts.productAdapter.productSchema.serverEpoch !== undefined &&
@@ -670,6 +580,11 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 
 	get snapshotOverflowed(): boolean {
 		return this.snapshotOverflow;
+	}
+
+	/** True while this Runtime still owns its bounded in-memory projection. */
+	get retainsProjectionReservation(): boolean {
+		return this.state === "crashed" && this.liveProjection !== null;
 	}
 
 	rebuildTarget(): ExistingSessionTarget | null {
@@ -868,7 +783,6 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			processOptions,
 			this.payloadCustody,
 			(owner, delivery) => this.prepareDecodedEvent(processToken, owner, delivery),
-			(request) => this.handleExtensionRequest(processToken, request),
 			(owner, delivery) => this.prepareDecodedExtensionRequest(processToken, owner, delivery),
 		);
 		this.proc = proc;
@@ -881,14 +795,20 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			await this.initializeProjectionBase(processToken, proc);
 			this.deferredStartupEmits = [];
 			this.setState(this.pendingDialogs.size > 0 ? "waiting_ui" : "idle");
-			if (this.productAdapter.mode === "future_content") {
-				this.flushPreparedFutureStartupFrames(this.startupFrames);
-			} else {
-				this.flushFrames(this.startupFrames);
-			}
+			this.flushPreparedContentRefStartupFrames(this.startupFrames);
 			this.startupFrames = [];
 			this.startupFrameBytes = 0;
-			this.assertWireSnapshotFits();
+			this.setState(
+				this.pendingDialogs.size > 0
+					? "waiting_ui"
+					: this.agentBusy ||
+							this.compactionBusy ||
+							this.idleBaseCompactionBusy ||
+							this.pendingTurnReservations.size > 0
+						? "running"
+						: "idle",
+			);
+			this.assertSnapshotFits();
 			this.startupReady = true;
 			const startupEmits = this.deferredStartupEmits ?? [];
 			this.deferredStartupEmits = null;
@@ -1026,14 +946,13 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		const consume: PiDecodedDeliveryConsumer<RuntimeResponse<M>, RuntimeRef<M>> = (delivery) => {
 			const messages = this.productAdapter.messagesFrom(delivery.value);
 			const startupCandidate =
-				this.productAdapter.mode === "future_content" &&
-				!this.startupReady &&
-				this.transitionStage === null &&
-				candidateOwnership === undefined;
+				!this.startupReady && this.transitionStage === null && candidateOwnership === undefined;
 			const semanticRevision = this.extensionSemanticRevision;
 			const startupFrameCount = this.startupFrames.length;
 			const startupFrameBytes = this.startupFrameBytes;
-			const startupFrames = startupCandidate ? this.authoritativeFutureStartupFrames(this.startupFrames) : [];
+			const startupFrames = startupCandidate
+				? this.authoritativeContentRefStartupFrames(this.startupFrames)
+				: [];
 			const extensionState = {
 				pendingDialogs: new Map(this.pendingDialogs),
 				stickyExtension: new Map(this.stickyExtension),
@@ -1105,7 +1024,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		proc: PiProcess,
 	): Promise<readonly RuntimeMessage<M>[] | null> {
 		const sessionFile = this.sessionFile;
-		if (!sessionFile || !this.shouldUseNativeHistory(sessionFile)) return null;
+		if (!sessionFile || !this.shouldUseNativeHistory()) return null;
 		const signal = AbortSignal.timeout(this.timeoutFor("get_messages"));
 		try {
 			const plan = await scanNativeSessionHistory(
@@ -1116,6 +1035,17 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 				},
 				signal,
 			);
+			if (plan.totalMessages === 0) {
+				if (!this.isCurrentNativeHistoryRead(processToken, proc)) {
+					throw new RpcError("get_messages", "session_generation_stale");
+				}
+				// A materialized Header does not prove that Pi has no in-memory
+				// context. Keep the empty plan only as a source fingerprint and ask
+				// Pi for the authoritative base until durable messages appear.
+				this.nativeHistoryPlan = plan;
+				this.nativeHistorySnapshotId = null;
+				return null;
+			}
 			const initial = await plan.readInitial(signal);
 			const messages = await this.normalizeNativeHistoryEntries(processToken, proc, initial.entries, signal);
 			if (!this.isCurrentNativeHistoryRead(processToken, proc)) {
@@ -1144,11 +1074,12 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		processToken: number,
 		proc: PiProcess,
 		contentOwner: GenerationContentOwner<RuntimeRef<M>> | null,
-	): Promise<boolean> {
+	): Promise<boolean | null> {
 		if (!token || !this.sessionFile) return false;
 		const signal = AbortSignal.timeout(this.timeoutFor("get_messages"));
 		let lease: PiPayloadLease<RuntimeRef<M>> | null = null;
 		try {
+			const previousPlan = this.nativeHistoryPlan;
 			const plan = await scanNativeSessionHistory(
 				this.sessionFile,
 				{
@@ -1157,6 +1088,21 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 				},
 				signal,
 			);
+			if (previousPlan && !plan.hasSameSourceFile(previousPlan)) {
+				throw new SessionHistoryError(
+					"session_history_changed",
+					"native Session history file identity changed",
+				);
+			}
+			if (plan.totalMessages === 0) {
+				const ownershipCurrent = contentOwner
+					? this.isCurrentGenerationContentOwner(processToken, proc, contentOwner)
+					: !this.payloadCustody && processToken === this.processToken && this.proc === proc;
+				if (!ownershipCurrent || this.liveProjection !== projection) return false;
+				this.nativeHistoryPlan = plan;
+				this.nativeHistorySnapshotId = null;
+				return null;
+			}
 			const initial = await plan.readInitial(signal);
 			const normalized = await this.normalizeNativeHistoryEntriesWithLease(
 				processToken,
@@ -1171,11 +1117,9 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			if (!ownershipCurrent || this.liveProjection !== projection) return false;
 			const prepared = projection.prepareIdleBaseCompaction(token, normalized.messages);
 			if (!prepared) return false;
-			if (this.productAdapter.mode === "future_content") {
-				const candidateProjection = projection.previewPreparedIdleBaseCompaction(prepared);
-				if (!candidateProjection) return false;
-				this.assertProductSnapshotCandidateFits(this.buildSessionSnapshotFromProjection(candidateProjection));
-			}
+			const candidateProjection = projection.previewPreparedIdleBaseCompaction(prepared);
+			if (!candidateProjection) return false;
+			this.assertProductSnapshotCandidateFits(this.buildSessionSnapshotFromProjection(candidateProjection));
 			if (lease) {
 				if (!contentOwner) throw new RpcError("get_messages", "unexpected_payload_transfer");
 				const transfer = lease.transfer();
@@ -1192,7 +1136,6 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			}
 			this.nativeHistoryPlan = plan;
 			this.nativeHistorySnapshotId = randomUUID();
-			if (this.productAdapter.mode !== "future_content") this.assertWireSnapshotFits();
 			return true;
 		} catch (error) {
 			if (error instanceof SessionHistoryError) {
@@ -1204,13 +1147,8 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		}
 	}
 
-	private shouldUseNativeHistory(sessionFile: string): boolean {
-		try {
-			const stats = fs.statSync(sessionFile);
-			return stats.isFile() && stats.size >= NATIVE_HISTORY_DIRECT_THRESHOLD_BYTES;
-		} catch {
-			return false;
-		}
+	private shouldUseNativeHistory(): boolean {
+		return this.sessionFileIdentityVerified;
 	}
 
 	private async normalizeNativeHistoryEntries(
@@ -1312,9 +1250,10 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		messages: readonly RuntimeMessage<M>[],
 	): SessionLiveProjection<RuntimeMessage<M>, RuntimeEvent<M>, RuntimeExtensionRequest<M>> {
 		const ownerIsCurrent = () => this.isCurrentNativeHistoryRead(processToken, proc);
-		const startupCandidate =
-			this.productAdapter.mode === "future_content" && !this.startupReady && this.transitionStage === null;
-		const startupFrames = startupCandidate ? this.authoritativeFutureStartupFrames(this.startupFrames) : [];
+		const startupCandidate = !this.startupReady && this.transitionStage === null;
+		const startupFrames = startupCandidate
+			? this.authoritativeContentRefStartupFrames(this.startupFrames)
+			: [];
 		const extensionState = {
 			pendingDialogs: new Map(this.pendingDialogs),
 			stickyExtension: new Map(this.stickyExtension),
@@ -1494,6 +1433,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	): Promise<RuntimeResponse<M>> {
 		const admitted = await this.withCommandAdmission(async () => {
 			this.assertGeneration(command.type, expectedGeneration);
+			this.assertPendingCommandCapacity(command.type);
 			admit();
 			const expectsWork = commandMayStartWork(command.type);
 			const turnReleaseCutoff = commandReleasesQueuedWork(command.type)
@@ -1599,6 +1539,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	): Promise<{ response: RuntimeResponse<M>; previousSessionHandle?: string }> {
 		return this.withCommandAdmission(async () => {
 			this.assertGeneration(command.type, expectedGeneration);
+			this.assertPendingCommandCapacity(command.type);
 			admit();
 			const blocker = this.identityTransitionBlocker();
 			if (blocker) throw new RpcError(command.type, `session_busy:${blocker}`);
@@ -1822,6 +1763,12 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		});
 	}
 
+	private assertPendingCommandCapacity(commandType: string): void {
+		if (this.inFlight >= this.opts.maxPendingCommands) {
+			throw new RpcError(commandType, "session_runtime_command_capacity");
+		}
+	}
+
 	private timeoutFor(commandType: string): number {
 		return this.opts.commandTimeoutFor?.(commandType) ?? commandTimeoutMs(commandType);
 	}
@@ -1973,6 +1920,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 				totalBytes: Math.max(plan.totalBytes, loadedBytes),
 				nextCursor: plan.initialCursor,
 			},
+			pageTargetBytes: (cursor, limit) => plan.pageTargetBytes(cursor, limit),
 			readPage: (cursor, limit, signal) =>
 				this.readNativeHistoryPage(processToken, proc, generation, snapshotId, cursor, limit, signal),
 		};
@@ -2112,7 +2060,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		}
 	}
 
-	private assertWireSnapshotFits(): void {
+	private assertSnapshotFits(): void {
 		const snapshot = this.buildSessionSnapshot();
 		if (this.isProductSnapshot(snapshot)) {
 			try {
@@ -2333,10 +2281,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			seq: token.nextSeq,
 		};
 		const envelopeBytes = Buffer.byteLength(JSON.stringify(envelope));
-		if (
-			this.productAdapter.mode === "future_content" &&
-			envelopeBytes > this.productAdapter.productSchema.maxReplayFrameWireBytes
-		) {
+		if (envelopeBytes > this.productAdapter.productSchema.maxReplayFrameWireBytes) {
 			throw this.normalizeProjectionError(new SessionLiveProjectionLimitError("live_events"));
 		}
 		const replay = [...this.replay, envelope];
@@ -2498,12 +2443,6 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	private handleExtensionRequest(processToken: number, request: RuntimeExtensionRequest<M>): void {
 		if (processToken !== this.processToken) return;
 		this.verifyMaterializedSessionFile();
-		if (this.productAdapter.mode === "current" && this.startupReady && !this.transitionStage) {
-			this.commitExtensionSemanticOperation(
-				this.prepareExtensionRequestSemanticOperation(processToken, request),
-			);
-			return;
-		}
 		if (BLOCKING_DIALOG_METHODS.has(request.method)) {
 			const publishImmediately =
 				this.transitionStage?.phase === "awaiting_response" || this.transitionStage?.phase === "applying";
@@ -2520,12 +2459,12 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	private prepareDecodedExtensionRequest(
 		processToken: number,
 		proc: PiProcess,
-		delivery: PiDecodedDelivery<FutureExtensionUiRequestDto, EpochStoredContentRef>,
+		delivery: PiDecodedDelivery<ExtensionUiRequestDto, EpochStoredContentRef>,
 	): PiDecodedDeliveryPlan {
 		const owner = this.generationContentOwner;
-		if (this.productAdapter.mode !== "future_content" || !owner) {
+		if (!owner) {
 			return delivery.prepare((_transfer) => {
-				throw new RpcError("extension_ui_request", "future_extension_generation_owner_unavailable");
+				throw new RpcError("extension_ui_request", "content_ref_extension_generation_owner_unavailable");
 			});
 		}
 		if (!this.startupReady && this.transitionStage === null) {
@@ -2534,9 +2473,9 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 				if (!this.isCurrentGenerationContentOwner(processToken, proc, owner)) {
 					throw new RpcError("extension_ui_request", "session_generation_stale");
 				}
-				if (!futureExtensionTransferMatches(delivery.value, transfer)) {
+				if (!contentRefExtensionTransferMatches(delivery.value, transfer)) {
 					this.manuallyStopped = true;
-					throw new RpcError("extension_ui_request", "future_extension_payload_ref_mismatch");
+					throw new RpcError("extension_ui_request", "content_ref_extension_payload_ref_mismatch");
 				}
 				if (!this.startupExtensionOperationEligible(prepared)) {
 					this.manuallyStopped = true;
@@ -2549,7 +2488,10 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		}
 		if (this.transitionStage !== null) {
 			const transitionStage = this.transitionStage;
-			if (transitionStage.phase !== "applying" && futureExtensionStagesDuringTransition(delivery.value)) {
+			if (
+				transitionStage.phase !== "applying" &&
+				contentRefExtensionStagesDuringTransition(delivery.value, transitionStage.phase)
+			) {
 				if (
 					!transitionStage.payloadLedger ||
 					!this.isCurrentPayloadTransition(processToken, proc, transitionStage)
@@ -2576,11 +2518,14 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 					) {
 						throw new RpcError("extension_ui_request", "session_generation_stale");
 					}
-					if (!futureExtensionTransferMatches(delivery.value, transfer)) {
+					if (!contentRefExtensionTransferMatches(delivery.value, transfer)) {
 						this.manuallyStopped = true;
-						throw new RpcError("extension_ui_request", "future_extension_payload_ref_mismatch");
+						throw new RpcError("extension_ui_request", "content_ref_extension_payload_ref_mismatch");
 					}
 					transitionStage.payloadLedger.admit({ transfer, logicalBytes });
+					if (BLOCKING_DIALOG_METHODS.has(delivery.value.method)) {
+						this.trackDialog(delivery.value, processToken, false);
+					}
 					transitionStage.frames = nextFrames;
 					transitionStage.bytes = nextBytes;
 					this.touch();
@@ -2600,14 +2545,14 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 						this.transitionStage === transitionStage &&
 						transitionStage?.phase === "awaiting_response" &&
 						BLOCKING_DIALOG_METHODS.has(delivery.value.method) &&
-						futureExtensionRequestRefs(delivery.value).length === 0 &&
-						transfer === null
+						contentRefExtensionTransferMatches(delivery.value, transfer)
 					) {
+						if (transfer) owner.adopt(transfer);
 						this.handleExtensionRequest(processToken, delivery.value);
 						return true;
 					}
 					this.manuallyStopped = true;
-					throw new RpcError("extension_ui_request", "future_extension_delivery_phase_unsupported");
+					throw new RpcError("extension_ui_request", "content_ref_extension_delivery_phase_unsupported");
 				});
 			}
 		}
@@ -2617,9 +2562,9 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			if (!this.isCurrentGenerationContentOwner(processToken, proc, owner)) {
 				throw new RpcError("extension_ui_request", "session_generation_stale");
 			}
-			if (!futureExtensionTransferMatches(delivery.value, transfer)) {
+			if (!contentRefExtensionTransferMatches(delivery.value, transfer)) {
 				this.manuallyStopped = true;
-				throw new RpcError("extension_ui_request", "future_extension_payload_ref_mismatch");
+				throw new RpcError("extension_ui_request", "content_ref_extension_payload_ref_mismatch");
 			}
 			if (!this.extensionSemanticOperationEligible(prepared)) {
 				this.manuallyStopped = true;
@@ -2842,28 +2787,6 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			timersToArm,
 			warnOversizedSticky,
 		};
-	}
-
-	private prepareExtensionCloseSemanticOperation(
-		processToken: number,
-		requestId: string,
-		reason: Extract<
-			BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>,
-			{ type: "extension_ui_closed" }
-		>["reason"],
-		dialog: PendingDialog<RuntimeExtensionRequest<M>>,
-	): PreparedExtensionSemanticOperation<RuntimeMessage<M>, RuntimeEvent<M>, RuntimeExtensionRequest<M>> {
-		const pendingDialogs = new Map(this.pendingDialogs);
-		pendingDialogs.delete(requestId);
-		return this.prepareExtensionSemanticOperation({
-			processToken,
-			frames: [{ type: "extension_ui_closed", requestId, reason }],
-			pendingDialogs,
-			stickyExtension: new Map(this.stickyExtension),
-			timersToClear: [dialog],
-			timersToArm: [],
-			warnOversizedSticky: false,
-		});
 	}
 
 	private prepareExtensionSemanticOperation(input: {
@@ -3135,23 +3058,10 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		this.publishFrame(frame);
 	}
 
-	private flushFrames(frames: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[]): void {
-		for (const frame of frames) {
-			if (
-				frame.type === "extension_ui_request" &&
-				BLOCKING_DIALOG_METHODS.has(frame.request.method) &&
-				!this.pendingDialogs.has(frame.request.id)
-			) {
-				continue;
-			}
-			this.publishFrame(frame);
-		}
-	}
-
-	private flushPreparedFutureStartupFrames(
+	private flushPreparedContentRefStartupFrames(
 		frames: BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[],
 	): void {
-		for (const frame of this.authoritativeFutureStartupFrames(frames)) {
+		for (const frame of this.authoritativeContentRefStartupFrames(frames)) {
 			if (frame.type === "event") {
 				this.publishFrame(frame);
 			} else {
@@ -3160,7 +3070,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		}
 	}
 
-	private authoritativeFutureStartupFrames(
+	private authoritativeContentRefStartupFrames(
 		frames: readonly BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[],
 	): BufferedFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>>[] {
 		return frames.filter(
@@ -3262,13 +3172,6 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		}
 	}
 
-	private flushTransitionFrames(): void {
-		if (!this.transitionStage) return;
-		this.flushFrames(this.transitionStage.frames);
-		this.transitionStage.frames = [];
-		this.transitionStage.bytes = 0;
-	}
-
 	private commitParentConfirmedTransition(
 		proc: PiProcess,
 		stage: TransitionStage<RuntimeEvent<M>, RuntimeExtensionRequest<M>, RuntimeRef<M>>,
@@ -3279,11 +3182,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			}
 			stage.payloadLedger.drainTo(stage.parentOwner);
 		}
-		if (this.productAdapter.mode === "future_content") {
-			for (const message of this.commitTransitionFrames()) this.emitSupervisorMessage(message);
-		} else {
-			this.flushTransitionFrames();
-		}
+		for (const message of this.commitTransitionFrames()) this.emitSupervisorMessage(message);
 	}
 
 	private releaseTransitionStagePayloads(
@@ -3323,31 +3222,32 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		}
 		this.deferredTransitionEmits = [];
 		try {
-			if (this.productAdapter.mode === "future_content") {
-				try {
-					const stage = this.transitionStage;
-					if (!stage) throw new RpcError("session_transition", "session_generation_stale");
-					if (stage.frames.length === 0) return this.deferredTransitionEmits;
-					const plan = this.expandFutureTransitionSemanticPlan(stage);
-					const turnBudget = this.prepareTransitionTurnBudget(plan.frames);
-					const prepared = this.prepareExtensionSemanticOperation({
-						processToken: stage.processToken,
-						...plan,
-					});
-					this.commitExtensionSemanticOperation(prepared);
-					for (const frame of plan.frames) {
-						if (frame.type === "event") this.applyFrameState(frame);
-					}
-					this.activeTurnProjectionItems = turnBudget.items;
-					this.activeTurnProjectionBytes = turnBudget.bytes;
-					this.activeTurnProjectionLogicalBytes = turnBudget.logicalBytes;
+			try {
+				const stage = this.transitionStage;
+				if (!stage) throw new RpcError("session_transition", "session_generation_stale");
+				if (stage.frames.length === 0) return this.deferredTransitionEmits;
+				const plan = this.expandContentRefTransitionSemanticPlan(stage);
+				if (plan.frames.length === 0) {
 					stage.frames = [];
 					stage.bytes = 0;
-				} catch (error) {
-					throw this.normalizeProjectionError(error);
+					return this.deferredTransitionEmits;
 				}
-			} else {
-				this.flushTransitionFrames();
+				const turnBudget = this.prepareTransitionTurnBudget(plan.frames);
+				const prepared = this.prepareExtensionSemanticOperation({
+					processToken: stage.processToken,
+					...plan,
+				});
+				this.commitExtensionSemanticOperation(prepared);
+				for (const frame of plan.frames) {
+					if (frame.type === "event") this.applyFrameState(frame);
+				}
+				this.activeTurnProjectionItems = turnBudget.items;
+				this.activeTurnProjectionBytes = turnBudget.bytes;
+				this.activeTurnProjectionLogicalBytes = turnBudget.logicalBytes;
+				stage.frames = [];
+				stage.bytes = 0;
+			} catch (error) {
+				throw this.normalizeProjectionError(error);
 			}
 			return this.deferredTransitionEmits;
 		} finally {
@@ -3355,7 +3255,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		}
 	}
 
-	private expandFutureTransitionSemanticPlan(
+	private expandContentRefTransitionSemanticPlan(
 		stage: TransitionStage<RuntimeEvent<M>, RuntimeExtensionRequest<M>, RuntimeRef<M>>,
 	): ExtensionSemanticPlan<RuntimeEvent<M>, RuntimeExtensionRequest<M>> {
 		let pendingDialogs = new Map(this.pendingDialogs);
@@ -3367,6 +3267,17 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		let bytes = 0;
 		for (const frame of stage.frames) {
 			if (frame.type === "extension_ui_request") {
+				if (BLOCKING_DIALOG_METHODS.has(frame.request.method)) {
+					if (this.pendingDialogs.get(frame.request.id)?.request === frame.request) {
+						const frameBytes = bufferedFrameBytes(frame);
+						if (frameBytes > this.opts.transientBufferMaxBytes - bytes) {
+							throw new RpcError("session_transition", "transition_frame_buffer_limit_exceeded");
+						}
+						bytes += frameBytes;
+						frames.push(frame);
+					}
+					continue;
+				}
 				const plan = this.planExtensionRequestSemanticMutation(frame.request, true, {
 					pendingDialogs,
 					stickyExtension,
@@ -3476,14 +3387,14 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		}
 		afterProjectionCommit?.();
 		this.touch();
-		const envelope: SessionReplayFrame = {
+		const envelope: SessionReplayFrame<RuntimeEvent<M>, RuntimeExtensionRequest<M>> = {
 			...frame,
 			serverEpoch: this.opts.serverEpoch,
 			sessionHandle: this.sessionHandle,
 			workspaceId: this.workspaceId,
 			generation: this.generation,
 			seq,
-		} as SessionReplayFrame;
+		};
 		const bytes = Buffer.byteLength(JSON.stringify(envelope));
 		if (isReplayableFrame(frame)) {
 			this.replay.push(envelope);
@@ -3596,12 +3507,6 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	): boolean {
 		const dialog = this.pendingDialogs.get(requestId);
 		if (!dialog) return false;
-		if (emit && this.productAdapter.mode === "current" && this.startupReady && !this.transitionStage) {
-			this.commitExtensionSemanticOperation(
-				this.prepareExtensionCloseSemanticOperation(this.processToken, requestId, reason, dialog),
-			);
-			return true;
-		}
 		const commitClose = () => {
 			if (dialog.timer) clearTimeout(dialog.timer);
 			if (this.pendingDialogs.get(requestId) === dialog) {
@@ -3728,9 +3633,9 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			return;
 		const projection = this.liveProjection;
 		const proc = this.proc;
-		const nativeHistoryNeedsRefresh = this.nativeHistoryPlanNeedsRefresh();
-		if (!projection || !proc?.running || (!projection.shouldCompactIdleBase() && !nativeHistoryNeedsRefresh))
-			return;
+		const projectionNeedsCompaction = projection?.shouldCompactIdleBase() ?? false;
+		const nativeHistoryNeedsRefresh = this.nativeHistoryPlanNeedsRefresh(projectionNeedsCompaction);
+		if (!projection || !proc?.running || (!projectionNeedsCompaction && !nativeHistoryNeedsRefresh)) return;
 		const token = projection.beginIdleBaseCompaction();
 		if (!token || (token.expectedAsOfSeq === projection.snapshot().baseSeq && !nativeHistoryNeedsRefresh))
 			return;
@@ -3745,15 +3650,19 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 		let compaction!: Promise<void>;
 		compaction = (async () => {
 			let committed = false;
-			if (this.nativeHistoryPlan || nativeHistoryNeedsRefresh) {
-				committed = await this.compactIdleNativeHistoryBase(
+			let compactFromPi = !nativeHistoryNeedsRefresh;
+			if (nativeHistoryNeedsRefresh) {
+				const nativeResult = await this.compactIdleNativeHistoryBase(
 					token,
 					projection,
 					processToken,
 					proc,
 					contentOwner,
 				);
-			} else {
+				if (nativeResult === null) compactFromPi = true;
+				else committed = nativeResult;
+			}
+			if (compactFromPi) {
 				await this.productAdapter.sendDecoded(
 					proc,
 					{ type: "get_messages" },
@@ -3774,16 +3683,14 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 								this.trackDiscardedCompactionTransfer(processToken, proc, contentOwner, transfer);
 								return true;
 							}
-							if (this.productAdapter.mode === "future_content") {
-								const candidateProjection = projection.previewPreparedIdleBaseCompaction(prepared);
-								if (!candidateProjection) {
-									this.trackDiscardedCompactionTransfer(processToken, proc, contentOwner, transfer);
-									return true;
-								}
-								this.assertProductSnapshotCandidateFits(
-									this.buildSessionSnapshotFromProjection(candidateProjection),
-								);
+							const candidateProjection = projection.previewPreparedIdleBaseCompaction(prepared);
+							if (!candidateProjection) {
+								this.trackDiscardedCompactionTransfer(processToken, proc, contentOwner, transfer);
+								return true;
 							}
+							this.assertProductSnapshotCandidateFits(
+								this.buildSessionSnapshotFromProjection(candidateProjection),
+							);
 							if (transfer) {
 								if (!contentOwner) throw new RpcError("get_messages", "unexpected_payload_transfer");
 								contentOwner.adopt(transfer);
@@ -3792,7 +3699,6 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 								if (!projection.commitPreparedIdleBaseCompaction(prepared)) {
 									throw new RpcError("get_messages", "session_compaction_commit_invariant_failed");
 								}
-								if (this.productAdapter.mode !== "future_content") this.assertWireSnapshotFits();
 								committed = true;
 							} catch (error) {
 								if (contentOwner) {
@@ -3820,17 +3726,20 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 				);
 			})
 			.finally(() => {
-				if (this.idleBaseCompactionPromise === compaction) this.idleBaseCompactionPromise = null;
+				const previousOperationalState = this.operationalStateKey();
 				this.idleBaseCompactionBusy = false;
 				this.touch();
-				this.publishOperationalState();
+				// Keep the completed promise installed while state is reconciled so the
+				// idle transition cannot immediately start the same compaction again.
+				this.refreshOperationalStateAndPublish(previousOperationalState);
+				if (this.idleBaseCompactionPromise === compaction) this.idleBaseCompactionPromise = null;
 			});
 		this.idleBaseCompactionPromise = compaction;
 	}
 
-	private nativeHistoryPlanNeedsRefresh(): boolean {
+	private nativeHistoryPlanNeedsRefresh(initializeIfMissing: boolean): boolean {
 		if (this.nativeHistoryPlan) return !this.nativeHistoryPlan.isSourceCurrent();
-		return this.sessionFile !== null && this.shouldUseNativeHistory(this.sessionFile);
+		return initializeIfMissing && this.sessionFile !== null && this.shouldUseNativeHistory();
 	}
 
 	private trackDiscardedCompactionTransfer(
@@ -4087,33 +3996,16 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	}
 }
 
-/** Current protocol wrapper retained as the public Runtime API. */
-export class SessionRuntime extends SessionRuntimeCore<"current"> {
+/** Canonical Browser protocol Runtime API. */
+export class SessionRuntime extends SessionRuntimeCore<"content_ref"> {
 	constructor(opts: SessionRuntimeOptions) {
 		const { piPayloadServices, ...coreOptions } = opts;
 		super({
 			...coreOptions,
-			productAdapter: createCurrentProductAdapter(piPayloadServices?.productSchema),
+			productAdapter: createProductAdapter(piPayloadServices.productSchema),
 			payloadCustody: piPayloadServices,
 		});
 	}
-}
-
-class FutureSessionRuntime extends SessionRuntimeCore<"future_content"> {
-	constructor(opts: FutureSessionRuntimeOptions) {
-		const { piPayloadServices, ...coreOptions } = opts;
-		super({
-			...coreOptions,
-			productAdapter: createFutureProductAdapter(piPayloadServices.productSchema),
-			payloadCustody: piPayloadServices,
-		});
-	}
-}
-
-export function createFutureSessionRuntime(
-	opts: FutureSessionRuntimeOptions,
-): SessionRuntimeCore<"future_content"> {
-	return new FutureSessionRuntime(opts);
 }
 
 function commandMayStartWork(commandType: string): boolean {
@@ -4133,9 +4025,7 @@ function commandReleasesQueuedWork(commandType: string): boolean {
 	return commandType === "abort" || commandType === "abort_retry";
 }
 
-function transitionWasCancelled(
-	response: SessionCommandResponseDto | FutureSessionCommandResponseDto,
-): boolean {
+function transitionWasCancelled(response: PiSessionCommandResponseDto | SessionCommandResponseDto): boolean {
 	if (response.success !== true || !("data" in response)) return false;
 	const data = response.data;
 	return typeof data === "object" && data !== null && "cancelled" in data && data.cancelled === true;
@@ -4153,24 +4043,24 @@ function isReplayableFrame<TEvent, TExtensionRequest extends { readonly method: 
 	return !(frame.type === "extension_ui_request" && frame.request.method === "notify");
 }
 
-function extensionRequestBytes(request: ExtensionUiRequestDto | FutureExtensionUiRequestDto): number {
+function extensionRequestBytes(request: PiExtensionUiRequestDto | ExtensionUiRequestDto): number {
 	return Buffer.byteLength(JSON.stringify(request));
 }
 
-function stickyRequestKey(request: ExtensionUiRequestDto | FutureExtensionUiRequestDto): string {
+function stickyRequestKey(request: PiExtensionUiRequestDto | ExtensionUiRequestDto): string {
 	if (request.method === "setStatus") return `setStatus:${request.statusKey}`;
 	if (request.method === "setWidget") return `setWidget:${request.widgetKey}`;
 	return request.method;
 }
 
-function stickyRequestClearsState(request: ExtensionUiRequestDto | FutureExtensionUiRequestDto): boolean {
+function stickyRequestClearsState(request: PiExtensionUiRequestDto | ExtensionUiRequestDto): boolean {
 	return (
 		(request.method === "setStatus" && request.statusText === undefined) ||
 		(request.method === "setWidget" && request.widgetLines === undefined)
 	);
 }
 
-function futureExtensionRequestRefs(request: FutureExtensionUiRequestDto): readonly EpochStoredContentRef[] {
+function contentRefExtensionRequestRefs(request: ExtensionUiRequestDto): readonly EpochStoredContentRef[] {
 	if (
 		request.method === "editor" &&
 		typeof request.prefill === "object" &&
@@ -4198,15 +4088,18 @@ function futureExtensionRequestRefs(request: FutureExtensionUiRequestDto): reado
 	return [];
 }
 
-function futureExtensionStagesDuringTransition(request: FutureExtensionUiRequestDto): boolean {
-	return !BLOCKING_DIALOG_METHODS.has(request.method);
+function contentRefExtensionStagesDuringTransition(
+	request: ExtensionUiRequestDto,
+	phase: TransitionStage["phase"],
+): boolean {
+	return !BLOCKING_DIALOG_METHODS.has(request.method) || phase === "verifying";
 }
 
-function futureExtensionTransferMatches(
-	request: FutureExtensionUiRequestDto,
+function contentRefExtensionTransferMatches(
+	request: ExtensionUiRequestDto,
 	transfer: PiPayloadLeaseTransfer<EpochStoredContentRef> | null,
 ): boolean {
-	const expected = futureExtensionRequestRefs(request);
+	const expected = contentRefExtensionRequestRefs(request);
 	const actual = transfer?.refs ?? [];
 	return (
 		expected.length === actual.length &&

@@ -1,31 +1,27 @@
 import { randomUUID } from "node:crypto";
 import {
-	analyzeFutureSessionMessageLogicalBytes,
-	analyzeFutureSessionResponseFrameLogicalBytes,
-	FUTURE_SESSION_CONTENT_REF_BUDGET,
-	type FutureSessionWsServerMessage,
+	analyzeSessionMessageLogicalBytes,
+	analyzeSessionResponseFrameLogicalBytes,
+	COMMAND_RESPONSE_RESERVATION_BYTES,
+	commandResponseReservationBytes,
 	GATEWAY_CLIENT_REQUIRED_CAPABILITIES,
 	GATEWAY_CONTENT_REF_CAPABILITY,
-	GATEWAY_CONTENT_REF_PROTOCOL_MINOR,
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 	GATEWAY_PROTOCOL_VERSION,
 	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
 	GATEWAY_SESSION_HISTORY_CAPABILITY,
-	type GatewayContentRefServerHelloDto,
 	type GatewayProtocolErrorDto,
 	type GatewayServerHelloDto,
 	type HotRuntimeInventoryDto,
-	isFutureSessionContentRefGuardContext,
-	isFutureSessionWsServerMessage,
+	hasUnsupportedGatewayProtocolMajor,
 	isGatewayClientHello,
-	isGatewayContentRefClientHello,
-	isSessionAttachmentGuardContext,
+	isSessionContentRefGuardContext,
 	isSessionWsClientMessage,
-	negotiateGatewayContentRef,
-	negotiateGatewayPayloadBudget,
-	negotiateHotRuntimeInventory,
+	isSessionWsServerMessage,
+	negotiateGatewayHello,
 	RpcError,
+	SESSION_CONTENT_REF_BUDGET,
 	SESSION_HISTORY_MAX_CHUNK_BYTES,
 	SESSION_HISTORY_MAX_CHUNK_MESSAGES,
 	SESSION_HISTORY_MAX_STREAM_BYTES,
@@ -45,10 +41,7 @@ import {
 } from "@pi-agent-web/protocol";
 import type { WebSocket } from "ws";
 import { WebSocketServer } from "ws";
-import type {
-	GatewayFuturePayloadActivation,
-	GatewayPayloadActivation,
-} from "./gateway-payload-activation.js";
+import type { GatewayPayloadActivation } from "./gateway-payload-activation.js";
 import type {
 	SessionRuntimeProductEvent,
 	SessionRuntimeProductExtensionRequest,
@@ -57,13 +50,9 @@ import type {
 	SessionRuntimeProductSnapshot,
 } from "./session-runtime.js";
 import type { ReplayResult, SessionSupervisorMessage } from "./session-runtime-types.js";
-import type {
-	HotRuntimeSubscriptionToken,
-	SessionSupervisor,
-	SessionSupervisorCore,
-} from "./session-supervisor.js";
+import type { HotRuntimeSubscriptionToken, SessionSupervisorCore } from "./session-supervisor.js";
 
-interface ConnectionState<M extends SessionRuntimeProductMode = "current"> {
+interface ConnectionState<M extends SessionRuntimeProductMode = "content_ref"> {
 	connectionId: string;
 	ws: WebSocket;
 	subscriptions: Set<string>;
@@ -73,6 +62,8 @@ interface ConnectionState<M extends SessionRuntimeProductMode = "current"> {
 	catchUpLargeItems: number;
 	nextCatchUpOrder: number;
 	controlledSessions: Set<string>;
+	controlIntents: Map<string, ControlIntent>;
+	nextControlIntentRevision: number;
 	pendingCommands: Set<string>;
 	pendingCommandResponseBytes: number;
 	outboundQueue: OutboundPayload[];
@@ -80,6 +71,7 @@ interface ConnectionState<M extends SessionRuntimeProductMode = "current"> {
 	outboundLargeItems: number;
 	outboundHistoryQueuedBytes: number;
 	outboundSending: boolean;
+	outboundActive?: OutboundPayload;
 	alive: boolean;
 	closed: boolean;
 	epoch: number;
@@ -88,6 +80,7 @@ interface ConnectionState<M extends SessionRuntimeProductMode = "current"> {
 	historyNegotiated: boolean;
 	historySnapshots: Map<string, HistorySnapshot<M>>;
 	historyPages: Map<string, HistoryPageOperation>;
+	restartableOverflows: Map<string, number>;
 	hotInventoryRevision: number;
 	deferredHotInventory?: HotRuntimeInventoryDto;
 	admittedExactOperations: number;
@@ -100,6 +93,8 @@ interface OutboundPayload {
 	bytes: number;
 	large: boolean;
 	history: boolean;
+	release?: () => void;
+	retained: boolean;
 }
 
 type BridgeEvent<M extends SessionRuntimeProductMode> = SessionRuntimeProductEvent<M>;
@@ -116,16 +111,16 @@ type BridgeReplayResult<M extends SessionRuntimeProductMode> = ReplayResult<
 	BridgeExtensionRequest<M>,
 	BridgeSnapshot<M>["settledMessages"][number]
 >;
-type BridgeServerMessage<M extends SessionRuntimeProductMode> = M extends "future_content"
-	? FutureSessionWsServerMessage
-	: SessionWsServerMessage;
+type BridgeServerMessage<M extends SessionRuntimeProductMode> = SessionWsServerMessage;
 
-interface BufferedCatchUpMessage<M extends SessionRuntimeProductMode = "current"> {
+interface BufferedCatchUpMessage<M extends SessionRuntimeProductMode = "content_ref"> {
 	message: BridgeSupervisorMessage<M>;
 	payload: string;
+	bytes: number;
+	retained: boolean;
 }
 
-interface SessionCatchUp<M extends SessionRuntimeProductMode = "current"> {
+interface SessionCatchUp<M extends SessionRuntimeProductMode = "content_ref"> {
 	requestedHandle: string;
 	currentHandle: string;
 	handles: Set<string>;
@@ -152,7 +147,14 @@ interface HistorySnapshot<M extends SessionRuntimeProductMode> {
 interface HistoryPageOperation {
 	sessionHandle: string;
 	requestId: string;
+	connectionId: string;
 	controller: AbortController;
+	retainedBytes: number;
+	retained: boolean;
+}
+
+interface ControlIntent {
+	revision: number;
 }
 
 interface BashCommandIdMapping {
@@ -170,8 +172,10 @@ type SessionWsBridgeSupervisor<M extends SessionRuntimeProductMode> = Pick<
 	| "revalidateHotExactSubscription"
 	| "claim"
 	| "release"
+	| "releaseExact"
 	| "releaseConnection"
 	| "leaseFor"
+	| "restart"
 	| "sendCommand"
 	| "sendExtensionUiResponse"
 >;
@@ -196,23 +200,22 @@ interface SessionWsBridgeOptionsBase<M extends SessionRuntimeProductMode> {
 	maxSubscriptionAliases?: number;
 	/** Weighted cap for command responses retained while their RPC is pending. */
 	maxPendingCommandResponseBytes?: number;
+	/** Gateway-wide weighted cap for command responses pending across all sockets. */
+	maxGatewayPendingCommandResponseBytes?: number;
+	/** Gateway-wide cap for serialized payloads retained by active or queued socket sends. */
+	maxGatewayOutboundBytes?: number;
+	/** Gateway-wide cap for concurrent historical page reads. */
+	maxConcurrentHistoryPages?: number;
 	log?: (level: "info" | "warn" | "error", message: string) => void;
 }
 
-export interface SessionWsBridgeOptions extends SessionWsBridgeOptionsBase<"current"> {
-	supervisor: SessionSupervisor;
-	/** Required production activation for epoch attachment references and the negotiated budget. */
-	payloadActivation?: Pick<GatewayPayloadActivation, "context">;
+export interface SessionWsBridgeOptions extends SessionWsBridgeOptionsBase<"content_ref"> {
+	payloadActivation: Pick<GatewayPayloadActivation, "context" | "externalizer" | "supervisorServices">;
 }
 
-/** Server-private future Bridge options. This is intentionally not part of the 1.2 activation. */
-export interface FutureSessionWsBridgeOptions extends SessionWsBridgeOptionsBase<"future_content"> {
-	payloadActivation: Pick<GatewayFuturePayloadActivation, "context" | "externalizer" | "supervisorServices">;
-}
-
-type FutureBridgeActivation = FutureSessionWsBridgeOptions["payloadActivation"];
+type BridgeActivation = SessionWsBridgeOptions["payloadActivation"];
 type SessionWsBridgeCoreOptions<M extends SessionRuntimeProductMode> = SessionWsBridgeOptionsBase<M> & {
-	payloadActivation?: SessionWsBridgeOptions["payloadActivation"] | FutureBridgeActivation;
+	payloadActivation: BridgeActivation;
 };
 
 export const MAX_SESSION_WS_IN_FLIGHT_COMMANDS = 32;
@@ -222,19 +225,28 @@ export const MAX_SESSION_WS_CONNECTIONS = 64;
 export const MAX_SESSION_WS_SUBSCRIBED_CHANNELS = 1024;
 export const MAX_SESSION_WS_CONCURRENT_CATCHUPS = 256;
 export const MAX_SESSION_WS_SUBSCRIPTION_ALIASES = 1024;
-export const MAX_SESSION_WS_PENDING_COMMAND_RESPONSE_BYTES = SESSION_WS_SERVER_MAX_BYTES;
+export const MAX_SESSION_WS_METADATA_BURST_SESSIONS = 6;
+// One Session snapshot refresh starts these five reads together. Six independent
+// Sessions retain 105 MiB; one additional 8 MiB ordinary read brings the proven
+// per-connection maximum to 113 MiB. A seventh complete burst would exceed it.
+export const MAX_SESSION_WS_METADATA_RESPONSE_HEADROOM_BYTES =
+	COMMAND_RESPONSE_RESERVATION_BYTES.get_commands +
+	COMMAND_RESPONSE_RESERVATION_BYTES.get_available_models +
+	COMMAND_RESPONSE_RESERVATION_BYTES.get_state +
+	COMMAND_RESPONSE_RESERVATION_BYTES.get_available_thinking_levels +
+	COMMAND_RESPONSE_RESERVATION_BYTES.get_session_stats;
+export const MAX_SESSION_WS_ORDINARY_READ_RESPONSE_BYTES =
+	COMMAND_RESPONSE_RESERVATION_BYTES.get_last_assistant_text;
+export const MAX_SESSION_WS_PENDING_COMMAND_RESPONSE_BYTES =
+	MAX_SESSION_WS_METADATA_BURST_SESSIONS * MAX_SESSION_WS_METADATA_RESPONSE_HEADROOM_BYTES +
+	MAX_SESSION_WS_ORDINARY_READ_RESPONSE_BYTES;
+export const MAX_SESSION_WS_GATEWAY_PENDING_COMMAND_RESPONSE_BYTES = SESSION_WS_SERVER_MAX_BYTES * 2;
+export const MAX_SESSION_WS_GATEWAY_OUTBOUND_BYTES = SESSION_WS_SERVER_MAX_BYTES * 2;
+export const MAX_SESSION_WS_CONCURRENT_HISTORY_PAGES = 16;
 const MAX_SESSION_WS_FRAME_BYTES = SESSION_WS_SERVER_MAX_BYTES;
-const MAX_SESSION_WS_SMALL_COMMAND_RESPONSE_BYTES = 64 * 1024;
 const DEFAULT_SESSION_HISTORY_CHUNK_TARGET_BYTES = 4 * 1024 * 1024;
-const LEGACY_GATEWAY_PROTOCOL_MINOR = 2;
 const RETRYABLE_SESSION_ERROR_CODES = new Set<string>(SESSION_SUBSCRIPTION_RETRYABLE_ERROR_CODES);
-const LEGACY_GATEWAY_CLIENT_REQUIRED_CAPABILITIES = [
-	"rpc.commands",
-	"rpc.events",
-	"rpc.extension_ui",
-	"session.multiplex",
-	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
-] as const;
+const RETRYABLE_HISTORY_ERROR_CODES = new Set(["session_history_busy", "session_history_capacity"]);
 
 /** Multiplexes one browser socket across any number of independent Sessions. */
 class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
@@ -246,14 +258,19 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 	private readonly serverEpoch: string;
 	private readonly serverBuild: string;
 	private readonly runtime: SessionWsBridgeOptions["runtime"];
-	private readonly payloadActivation: SessionWsBridgeOptions["payloadActivation"];
-	private readonly futureActivation: FutureBridgeActivation | undefined;
+	private readonly payloadActivation: BridgeActivation;
 	private readonly helloTimeoutMs: number;
 	private readonly maxConnections: number;
 	private readonly maxSubscribedChannels: number;
 	private readonly maxConcurrentCatchUps: number;
 	private readonly maxSubscriptionAliases: number;
 	private readonly maxPendingCommandResponseBytes: number;
+	private readonly maxGatewayPendingCommandResponseBytes: number;
+	private readonly maxGatewayOutboundBytes: number;
+	private readonly maxConcurrentHistoryPages: number;
+	private gatewayPendingCommandResponseBytes = 0;
+	private gatewayOutboundBytes = 0;
+	private readonly historyPageOperations = new Map<string, HistoryPageOperation>();
 	private requestCounter = 0;
 	private closePromise: Promise<void> | null = null;
 	private readonly bashCommandIds = new Map<string, BashCommandIdMapping>();
@@ -264,32 +281,14 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		this.serverEpoch = opts.supervisor.serverEpoch;
 		this.serverBuild = opts.serverBuild;
 		const activation = opts.payloadActivation;
-		if (isFutureBridgeActivation(activation)) {
-			assertFutureBridgeActivation(activation, this.serverEpoch);
-			this.futureActivation = activation;
-			this.payloadActivation = undefined;
-		} else {
-			if (
-				opts.runtime.capabilities.includes(GATEWAY_PAYLOAD_BUDGET_CAPABILITY) ||
-				opts.runtime.capabilities.includes(GATEWAY_CONTENT_REF_CAPABILITY) ||
-				(activation !== undefined &&
-					(!isSessionAttachmentGuardContext(activation.context) ||
-						activation.context.serverEpoch !== this.serverEpoch))
-			) {
-				throw new TypeError("Session WebSocket payload activation is invalid");
-			}
-			this.payloadActivation = activation;
-		}
+		assertBridgeActivation(activation, this.serverEpoch);
+		this.payloadActivation = activation;
 		const capabilities = [...opts.runtime.capabilities];
-		if (this.futureActivation) {
-			if (!capabilities.includes(GATEWAY_PAYLOAD_BUDGET_CAPABILITY)) {
-				capabilities.push(GATEWAY_PAYLOAD_BUDGET_CAPABILITY);
-			}
-			if (!capabilities.includes(GATEWAY_CONTENT_REF_CAPABILITY)) {
-				capabilities.push(GATEWAY_CONTENT_REF_CAPABILITY);
-			}
-		} else if (opts.payloadActivation) {
+		if (!capabilities.includes(GATEWAY_PAYLOAD_BUDGET_CAPABILITY)) {
 			capabilities.push(GATEWAY_PAYLOAD_BUDGET_CAPABILITY);
+		}
+		if (!capabilities.includes(GATEWAY_CONTENT_REF_CAPABILITY)) {
+			capabilities.push(GATEWAY_CONTENT_REF_CAPABILITY);
 		}
 		this.runtime = {
 			...opts.runtime,
@@ -312,6 +311,18 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		this.maxPendingCommandResponseBytes = positiveLimit(
 			opts.maxPendingCommandResponseBytes,
 			MAX_SESSION_WS_PENDING_COMMAND_RESPONSE_BYTES,
+		);
+		this.maxGatewayPendingCommandResponseBytes = positiveLimit(
+			opts.maxGatewayPendingCommandResponseBytes,
+			MAX_SESSION_WS_GATEWAY_PENDING_COMMAND_RESPONSE_BYTES,
+		);
+		this.maxGatewayOutboundBytes = positiveLimit(
+			opts.maxGatewayOutboundBytes,
+			MAX_SESSION_WS_GATEWAY_OUTBOUND_BYTES,
+		);
+		this.maxConcurrentHistoryPages = positiveLimit(
+			opts.maxConcurrentHistoryPages,
+			MAX_SESSION_WS_CONCURRENT_HISTORY_PAGES,
 		);
 		this.wss = new WebSocketServer({ noServer: true, maxPayload: SESSION_WS_CLIENT_MAX_BYTES });
 		this.wss.on("connection", (ws) => this.handleConnection(ws));
@@ -391,8 +402,33 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			}
 			if (this.isSubscribed(connection, sessionHandle)) {
 				this.sendPayload(connection, payload, message.type === "event");
+				if (message.type === "runtime_state") {
+					this.establishLiveOverflowRecovery(connection, message.runtime);
+				}
 			}
 		}
+	}
+
+	private establishLiveOverflowRecovery(connection: ConnectionState<M>, runtime: SessionRuntimeDto): void {
+		const current = this.supervisor.getRuntime(runtime.sessionHandle);
+		if (
+			runtime.error !== "session_snapshot_overflow" ||
+			current?.generation !== runtime.generation ||
+			current.error !== runtime.error ||
+			current.state !== runtime.state ||
+			connection.restartableOverflows.get(runtime.sessionHandle) === runtime.generation
+		) {
+			return;
+		}
+		connection.restartableOverflows.set(runtime.sessionHandle, runtime.generation);
+		this.send(connection, {
+			type: "resync_required",
+			serverEpoch: this.serverEpoch,
+			sessionHandle: runtime.sessionHandle,
+			runtime,
+			reason: "gap",
+		});
+		this.sendLease(connection, this.supervisor.leaseFor(runtime.sessionHandle, connection.connectionId));
 	}
 
 	broadcastHotRuntimeInventory(inventory: HotRuntimeInventoryDto): void {
@@ -437,6 +473,16 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			if (connection.controlledSessions.delete(message.previousSessionHandle)) {
 				connection.controlledSessions.add(message.runtime.sessionHandle);
 			}
+			const restartGeneration = connection.restartableOverflows.get(message.previousSessionHandle);
+			if (restartGeneration !== undefined) {
+				connection.restartableOverflows.delete(message.previousSessionHandle);
+				connection.restartableOverflows.set(message.runtime.sessionHandle, restartGeneration);
+			}
+			const controlIntent = connection.controlIntents.get(message.previousSessionHandle);
+			if (controlIntent) {
+				connection.controlIntents.delete(message.previousSessionHandle);
+				connection.controlIntents.set(message.runtime.sessionHandle, controlIntent);
+			}
 			if (wasSubscribed && catchUps.length === 0) this.sendPayload(connection, payload);
 		}
 	}
@@ -465,6 +511,8 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			catchUpLargeItems: 0,
 			nextCatchUpOrder: 0,
 			controlledSessions: new Set(),
+			controlIntents: new Map(),
+			nextControlIntentRevision: 0,
 			pendingCommands: new Set(),
 			pendingCommandResponseBytes: 0,
 			outboundQueue: [],
@@ -480,6 +528,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			historyNegotiated: false,
 			historySnapshots: new Map(),
 			historyPages: new Map(),
+			restartableOverflows: new Map(),
 			hotInventoryRevision: -1,
 			admittedExactOperations: 0,
 			negotiatedMaxServerFrameBytes: MAX_SESSION_WS_FRAME_BYTES,
@@ -549,6 +598,9 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			case "session_release":
 				this.release(connection, message.sessionHandle);
 				return;
+			case "session_restart":
+				await this.handleRestart(connection, message);
+				return;
 			case "command":
 				await this.handleCommand(connection, message);
 				return;
@@ -565,28 +617,24 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 	}
 
 	private handleClientHello(connection: ConnectionState<M>, value: unknown): void {
-		if (this.futureActivation) {
-			this.handleFutureClientHello(connection, value);
-			return;
-		}
 		if (!isGatewayClientHello(value)) {
-			const code =
-				typeof value === "object" && value !== null && "type" in value && value.type === "client_hello"
+			const code = hasUnsupportedGatewayProtocolMajor(value)
+				? "protocol_major_unsupported"
+				: typeof value === "object" && value !== null && "type" in value && value.type === "client_hello"
 					? "invalid_hello"
 					: "hello_required";
 			this.sendProtocolErrorAndClose(connection, code);
 			return;
 		}
-		if (value.protocol.major !== GATEWAY_PROTOCOL_VERSION.major) {
-			this.sendProtocolErrorAndClose(connection, "protocol_major_unsupported");
-			return;
-		}
 
 		const requestedCapabilities = new Set(value.capabilities);
 		if (
-			LEGACY_GATEWAY_CLIENT_REQUIRED_CAPABILITIES.some(
+			GATEWAY_CLIENT_REQUIRED_CAPABILITIES.some(
 				(capability) =>
 					!requestedCapabilities.has(capability) || !this.runtime.capabilities.includes(capability),
+			) ||
+			GATEWAY_SERVER_REQUIRED_CAPABILITIES.some(
+				(capability) => !this.runtime.capabilities.includes(capability),
 			)
 		) {
 			this.sendProtocolErrorAndClose(connection, "capability_unsupported");
@@ -601,10 +649,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		);
 		const hello: GatewayServerHelloDto = {
 			type: "server_hello",
-			protocol: {
-				major: GATEWAY_PROTOCOL_VERSION.major,
-				minor: Math.min(value.protocol.minor, LEGACY_GATEWAY_PROTOCOL_MINOR),
-			},
+			protocol: GATEWAY_PROTOCOL_VERSION,
 			serverBuild: this.serverBuild,
 			serverEpoch: this.serverEpoch,
 			piVersion: this.runtime.version,
@@ -615,110 +660,14 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				maxSnapshotFrameBytes: connection.negotiatedMaxServerFrameBytes,
 				maxExtensionRequests: 128,
 			},
-			...(this.payloadActivation ? { payloadBudget: this.payloadActivation.context.payloadBudget } : {}),
+			payloadBudget: this.payloadActivation.context.payloadBudget,
+			contentRefBudget: this.payloadActivation.context.contentRefBudget,
 		};
-		const payloadNegotiation = negotiateGatewayPayloadBudget(value, hello);
+		const payloadNegotiation = negotiateGatewayHello(value, hello);
 		if (payloadNegotiation.negotiated === false) {
 			this.sendProtocolErrorAndClose(connection, "capability_unsupported");
 			return;
 		}
-		const inventoryNegotiation = negotiateHotRuntimeInventory(value, hello);
-		if (
-			inventoryNegotiation.negotiated === false &&
-			inventoryNegotiation.reason === "server_frame_limit_too_small" &&
-			value.protocol.minor >= 1 &&
-			value.capabilities.includes(GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY) &&
-			hello.capabilities.includes(GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY)
-		) {
-			this.sendProtocolErrorAndClose(connection, "capability_unsupported");
-			return;
-		}
-		connection.helloComplete = true;
-		connection.hotInventoryNegotiated = inventoryNegotiation.negotiated;
-		connection.historyNegotiated =
-			value.capabilities.includes(GATEWAY_SESSION_HISTORY_CAPABILITY) &&
-			hello.capabilities.includes(GATEWAY_SESSION_HISTORY_CAPABILITY);
-		if (connection.helloTimer) clearTimeout(connection.helloTimer);
-		connection.helloTimer = undefined;
-		this.sendPayload(connection, JSON.stringify(hello));
-		if (inventoryNegotiation.negotiated) {
-			this.sendHotRuntimeInventory(connection, this.supervisor.getHotRuntimeInventory());
-		}
-	}
-
-	private handleFutureClientHello(connection: ConnectionState<M>, value: unknown): void {
-		const activation = this.futureActivation;
-		if (!activation) {
-			this.sendProtocolErrorAndClose(connection, "capability_unsupported");
-			return;
-		}
-		if (!isGatewayContentRefClientHello(value)) {
-			if (isGatewayClientHello(value) && value.protocol.major !== GATEWAY_PROTOCOL_VERSION.major) {
-				this.sendProtocolErrorAndClose(connection, "protocol_major_unsupported");
-				return;
-			}
-			const code =
-				isGatewayClientHello(value) && value.protocol.minor === GATEWAY_CONTENT_REF_PROTOCOL_MINOR
-					? "capability_unsupported"
-					: typeof value === "object" && value !== null && "type" in value && value.type === "client_hello"
-						? "capability_unsupported"
-						: "hello_required";
-			this.sendProtocolErrorAndClose(connection, code);
-			return;
-		}
-
-		const requestedCapabilities = new Set(value.capabilities);
-		const requiredCapabilities = [...GATEWAY_CLIENT_REQUIRED_CAPABILITIES];
-		if (
-			requiredCapabilities.some(
-				(capability) =>
-					!requestedCapabilities.has(capability) || !this.runtime.capabilities.includes(capability),
-			)
-		) {
-			this.sendProtocolErrorAndClose(connection, "capability_unsupported");
-			return;
-		}
-		if (
-			GATEWAY_SERVER_REQUIRED_CAPABILITIES.some(
-				(capability) => !this.runtime.capabilities.includes(capability),
-			)
-		) {
-			this.sendProtocolErrorAndClose(connection, "capability_unsupported");
-			return;
-		}
-
-		connection.negotiatedMaxServerFrameBytes = Math.min(
-			value.limits.maxServerFrameBytes,
-			MAX_SESSION_WS_FRAME_BYTES,
-		);
-		const negotiatedCapabilities = this.runtime.capabilities.filter((capability) =>
-			requestedCapabilities.has(capability),
-		);
-		const hello: GatewayContentRefServerHelloDto = {
-			type: "server_hello",
-			protocol: {
-				major: GATEWAY_PROTOCOL_VERSION.major,
-				minor: GATEWAY_CONTENT_REF_PROTOCOL_MINOR,
-			},
-			serverBuild: this.serverBuild,
-			serverEpoch: this.serverEpoch,
-			piVersion: this.runtime.version,
-			adapterId: this.runtime.adapterId,
-			capabilities: negotiatedCapabilities,
-			limits: {
-				maxClientFrameBytes: SESSION_WS_CLIENT_MAX_BYTES,
-				maxSnapshotFrameBytes: connection.negotiatedMaxServerFrameBytes,
-				maxExtensionRequests: 128,
-			},
-			payloadBudget: activation.context.payloadBudget,
-			contentRefBudget: activation.context.contentRefBudget,
-		};
-		const payloadNegotiation = negotiateGatewayContentRef(value, hello);
-		if (payloadNegotiation.negotiated === false) {
-			this.sendProtocolErrorAndClose(connection, "capability_unsupported");
-			return;
-		}
-
 		const hasInventoryCapability =
 			value.capabilities.includes(GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY) &&
 			hello.capabilities.includes(GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY);
@@ -753,8 +702,8 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			code,
 			supported: {
 				major: GATEWAY_PROTOCOL_VERSION.major,
-				minMinor: this.futureActivation ? GATEWAY_CONTENT_REF_PROTOCOL_MINOR : 0,
-				maxMinor: this.futureActivation ? GATEWAY_CONTENT_REF_PROTOCOL_MINOR : LEGACY_GATEWAY_PROTOCOL_MINOR,
+				minMinor: GATEWAY_PROTOCOL_VERSION.minor,
+				maxMinor: GATEWAY_PROTOCOL_VERSION.minor,
 			},
 		};
 		try {
@@ -898,6 +847,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				for (const frame of result.frames) this.send(connection, frame as BridgeServerMessage<M>);
 			}
 			this.sendLease(connection, this.supervisor.leaseFor(resolvedHandle, connection.connectionId));
+			connection.restartableOverflows.delete(resolvedHandle);
 
 			if (!this.isCurrentCatchUp(connection, catchUp, lifecycleEpoch)) return;
 			const buffered = [...catchUp.buffered];
@@ -910,13 +860,17 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 					this.isNewerThanBaseline(entry.message, result.runtime, index, baselineMarker)
 				) {
 					this.sendPayload(connection, entry.payload, entry.message.type === "event");
+					if (entry.message.type === "runtime_state") {
+						this.establishLiveOverflowRecovery(connection, entry.message.runtime);
+					}
 				}
 			}
 			this.flushDeferredHotInventory(connection);
 		} catch (error) {
 			if (!this.isCurrentCatchUp(connection, catchUp, lifecycleEpoch)) return;
-			if (catchUp.exactTransactional) this.rollbackExactCatchUp(connection, catchUp);
-			else {
+			const retainedOverflow = this.establishOverflowRecoverySubscription(connection, catchUp, error);
+			if (!retainedOverflow && catchUp.exactTransactional) this.rollbackExactCatchUp(connection, catchUp);
+			else if (!retainedOverflow) {
 				this.enqueueBufferedRekeys(connection, catchUp);
 				this.cancelCatchUp(connection, catchUp);
 			}
@@ -927,6 +881,49 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				connection.admittedExactOperations = Math.max(0, connection.admittedExactOperations - 1);
 			}
 		}
+	}
+
+	private establishOverflowRecoverySubscription(
+		connection: ConnectionState<M>,
+		catchUp: SessionCatchUp<M>,
+		error: unknown,
+	): boolean {
+		if (
+			catchUp.exactTransactional ||
+			sessionErrorCode(this.errorText(error)) !== "session_snapshot_overflow"
+		) {
+			return false;
+		}
+		const runtime = this.supervisor.getRuntime(catchUp.currentHandle);
+		if (runtime?.error !== "session_snapshot_overflow") return false;
+		if (!this.adoptCatchUpHandle(connection, catchUp, runtime.sessionHandle, catchUp.rekeyVersion)) {
+			return false;
+		}
+		this.send(connection, { type: "runtime_state", runtime });
+		this.send(connection, {
+			type: "resync_required",
+			serverEpoch: this.serverEpoch,
+			sessionHandle: runtime.sessionHandle,
+			runtime,
+			reason: "gap",
+		});
+		this.sendLease(connection, this.supervisor.leaseFor(runtime.sessionHandle, connection.connectionId));
+		const buffered = [...catchUp.buffered];
+		const baselineMarker = this.findBaselineMarker(buffered, runtime);
+		this.establishLiveSubscription(connection, catchUp, runtime.sessionHandle);
+		connection.restartableOverflows.set(runtime.sessionHandle, runtime.generation);
+		for (const [index, entry] of buffered.entries()) {
+			if (
+				this.isNonReplayableCatchUpMessage(entry.message) ||
+				this.isNewerThanBaseline(entry.message, runtime, index, baselineMarker)
+			) {
+				this.sendPayload(connection, entry.payload, entry.message.type === "event");
+				if (entry.message.type === "runtime_state") {
+					this.establishLiveOverflowRecovery(connection, entry.message.runtime);
+				}
+			}
+		}
+		return true;
 	}
 
 	private sendChunkedSnapshot(
@@ -1011,17 +1008,50 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		}
 		const existing = connection.historyPages.get(message.id);
 		if (existing) {
-			existing.controller.abort();
-			connection.historyPages.delete(message.id);
+			this.releaseHistoryPage(connection, existing, true);
+		}
+		const currentSessionOperation = this.historyPageOperations.get(sessionHandle);
+		if (currentSessionOperation) {
+			if (currentSessionOperation.connectionId === connection.connectionId) {
+				this.releaseHistoryPage(connection, currentSessionOperation, true);
+			}
+			this.sendSessionError(connection, message.sessionHandle, "history_page", "session_history_busy");
+			return;
+		}
+		if (this.historyPageOperations.size >= this.maxConcurrentHistoryPages) {
+			this.sendSessionError(connection, message.sessionHandle, "history_page", "session_history_capacity");
+			return;
+		}
+		let targetBytes: number;
+		try {
+			targetBytes = history.chunked.pageTargetBytes(message.cursor, message.limit);
+		} catch (error) {
+			this.sendSessionError(connection, message.sessionHandle, "history_page", error);
+			return;
+		}
+		if (
+			!Number.isSafeInteger(targetBytes) ||
+			targetBytes < 0 ||
+			this.gatewayOutboundBytes + targetBytes > this.maxGatewayOutboundBytes
+		) {
+			this.sendSessionError(connection, message.sessionHandle, "history_page", "session_history_capacity");
+			return;
 		}
 		const operation: HistoryPageOperation = {
 			sessionHandle,
 			requestId: message.id,
+			connectionId: connection.connectionId,
 			controller: new AbortController(),
+			retainedBytes: targetBytes,
+			retained: true,
 		};
+		this.gatewayOutboundBytes += targetBytes;
 		connection.historyPages.set(message.id, operation);
+		this.historyPageOperations.set(sessionHandle, operation);
 		try {
-			const page = await history.chunked.readPage(message.cursor, message.limit, operation.controller.signal);
+			const page = await history.chunked
+				.readPage(message.cursor, message.limit, operation.controller.signal)
+				.finally(() => this.releaseHistoryPageBytes(operation));
 			if (!this.isCurrentHistoryPage(connection, operation, history)) return;
 			const chunks = splitHistoryMessages(
 				page.messages,
@@ -1082,7 +1112,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				this.sendSessionError(connection, message.sessionHandle, "history_page", error);
 			}
 		} finally {
-			if (connection.historyPages.get(message.id) === operation) connection.historyPages.delete(message.id);
+			this.settleHistoryPage(connection, operation);
 		}
 	}
 
@@ -1099,8 +1129,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			history?.snapshotId === message.snapshotId &&
 			history.generation === message.expectedGeneration
 		) {
-			connection.historyPages.delete(message.id);
-			operation.controller.abort();
+			this.releaseHistoryPage(connection, operation, true);
 		}
 	}
 
@@ -1120,11 +1149,35 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 
 	private clearHistorySnapshot(connection: ConnectionState<M>, sessionHandle: string): void {
 		connection.historySnapshots.delete(sessionHandle);
-		for (const [requestId, operation] of connection.historyPages) {
+		for (const operation of [...connection.historyPages.values()]) {
 			if (operation.sessionHandle !== sessionHandle) continue;
-			connection.historyPages.delete(requestId);
-			operation.controller.abort();
+			this.releaseHistoryPage(connection, operation, true);
 		}
+	}
+
+	private releaseHistoryPage(
+		connection: ConnectionState<M>,
+		operation: HistoryPageOperation,
+		abort: boolean,
+	): void {
+		if (connection.historyPages.get(operation.requestId) === operation) {
+			connection.historyPages.delete(operation.requestId);
+		}
+		if (abort && !operation.controller.signal.aborted) operation.controller.abort();
+	}
+
+	private settleHistoryPage(connection: ConnectionState<M>, operation: HistoryPageOperation): void {
+		this.releaseHistoryPageBytes(operation);
+		this.releaseHistoryPage(connection, operation, false);
+		if (this.historyPageOperations.get(operation.sessionHandle) === operation) {
+			this.historyPageOperations.delete(operation.sessionHandle);
+		}
+	}
+
+	private releaseHistoryPageBytes(operation: HistoryPageOperation): void {
+		if (!operation.retained) return;
+		operation.retained = false;
+		this.gatewayOutboundBytes = Math.max(0, this.gatewayOutboundBytes - operation.retainedBytes);
 	}
 
 	private maxHistoryChunkBytes(connection: ConnectionState<M>): number {
@@ -1230,6 +1283,9 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 
 	private unsubscribe(connection: ConnectionState<M>, sessionHandle: string): void {
 		const canonicalHandle = this.connectionSessionHandle(connection, sessionHandle);
+		this.invalidateControlIntent(connection, canonicalHandle);
+		connection.restartableOverflows.delete(sessionHandle);
+		connection.restartableOverflows.delete(canonicalHandle);
 		for (const catchUp of [...connection.catchUps]) {
 			if (
 				catchUp.requestedHandle === sessionHandle ||
@@ -1306,6 +1362,10 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		const bytes = Buffer.byteLength(payload);
 		const large = this.classifyPayload(connection, bytes, message.type === "event");
 		if (large === undefined) return;
+		if (this.gatewayOutboundBytes + bytes > this.maxGatewayOutboundBytes) {
+			this.closeForPolicyViolation(connection, "gateway outbound capacity");
+			return;
+		}
 		if (large) {
 			if (connection.catchUpLargeItems >= 1) {
 				this.closeForPolicyViolation(connection, "Session catch-up buffer exceeded its limit");
@@ -1321,7 +1381,8 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			catchUp.bufferedSmallBytes += bytes;
 			connection.catchUpSmallBufferedBytes += bytes;
 		}
-		catchUp.buffered.push({ message, payload });
+		this.gatewayOutboundBytes += bytes;
+		catchUp.buffered.push({ message, payload, bytes, retained: true });
 	}
 
 	private cancelCatchUp(connection: ConnectionState<M>, catchUp: SessionCatchUp<M>): void {
@@ -1331,6 +1392,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			connection.catchUpSmallBufferedBytes - catchUp.bufferedSmallBytes,
 		);
 		connection.catchUpLargeItems = Math.max(0, connection.catchUpLargeItems - catchUp.bufferedLargeItems);
+		for (const entry of catchUp.buffered) this.releaseBufferedCatchUpMessage(entry);
 		catchUp.buffered = [];
 		catchUp.bufferedSmallBytes = 0;
 		catchUp.bufferedLargeItems = 0;
@@ -1343,8 +1405,16 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 
 	private enqueueBufferedRekeys(connection: ConnectionState<M>, catchUp: SessionCatchUp<M>): void {
 		for (const entry of catchUp.buffered) {
-			if (entry.message.type === "session_rekeyed") this.sendPayload(connection, entry.payload);
+			if (entry.message.type !== "session_rekeyed") continue;
+			this.releaseBufferedCatchUpMessage(entry);
+			this.sendPayload(connection, entry.payload);
 		}
+	}
+
+	private releaseBufferedCatchUpMessage(entry: BufferedCatchUpMessage<M>): void {
+		if (!entry.retained) return;
+		entry.retained = false;
+		this.gatewayOutboundBytes = Math.max(0, this.gatewayOutboundBytes - entry.bytes);
 	}
 
 	private transferCatchUpJournalAndCancel(
@@ -1468,20 +1538,24 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			this.sendSessionError(connection, sessionHandle, "claim", "session_not_subscribed");
 			return;
 		}
+		const intent = this.recordControlIntent(connection, sessionHandle);
+		if (!intent) return;
+		const intentRevision = intent.revision;
 		const lifecycleEpoch = connection.epoch;
+		let leaseHandle = sessionHandle;
 		try {
 			const lease = await this.supervisor.claim(sessionHandle, connection.connectionId);
+			leaseHandle = lease.sessionHandle;
+			const currentIntent =
+				connection.controlIntents.get(lease.sessionHandle) ?? connection.controlIntents.get(sessionHandle);
 			const connectionExpired =
 				connection.closed || connection.epoch !== lifecycleEpoch || !this.connections.has(connection);
-			if (connectionExpired || !this.isSubscribed(connection, lease.sessionHandle)) {
-				if (lease.isController) {
-					if (connectionExpired) {
-						this.supervisor.releaseConnection(connection.connectionId);
-					} else {
-						const canonicalHandle =
-							connection.subscriptionAliases.get(lease.sessionHandle) ?? lease.sessionHandle;
-						this.supervisor.release(canonicalHandle, connection.connectionId);
-					}
+			const intentExpired = currentIntent !== intent || currentIntent.revision !== intentRevision;
+			if (connectionExpired || intentExpired || !this.isSubscribed(connection, lease.sessionHandle)) {
+				if (lease.isController && lease.fencingToken) {
+					const canonicalHandle =
+						connection.subscriptionAliases.get(lease.sessionHandle) ?? lease.sessionHandle;
+					this.supervisor.releaseExact(canonicalHandle, connection.connectionId, lease.fencingToken);
 				}
 				return;
 			}
@@ -1490,18 +1564,96 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		} catch (error) {
 			if (connection.closed || connection.epoch !== lifecycleEpoch) return;
 			this.sendSessionError(connection, sessionHandle, "claim", error);
+		} finally {
+			this.clearControlIntent(connection, intent, sessionHandle, leaseHandle);
 		}
 	}
 
 	private release(connection: ConnectionState<M>, sessionHandle: string): void {
 		try {
 			const canonicalHandle = this.connectionSessionHandle(connection, sessionHandle);
+			this.invalidateControlIntent(connection, canonicalHandle);
 			this.supervisor.release(canonicalHandle, connection.connectionId);
 			connection.controlledSessions.delete(sessionHandle);
 			connection.controlledSessions.delete(canonicalHandle);
 			this.sendLease(connection, this.supervisor.leaseFor(canonicalHandle, connection.connectionId));
 		} catch (error) {
 			this.sendSessionError(connection, sessionHandle, "release", error);
+		}
+	}
+
+	private recordControlIntent(
+		connection: ConnectionState<M>,
+		sessionHandle: string,
+	): ControlIntent | undefined {
+		const canonicalHandle = this.connectionSessionHandle(connection, sessionHandle);
+		if (connection.controlIntents.has(canonicalHandle)) return undefined;
+		const intent: ControlIntent = {
+			revision: ++connection.nextControlIntentRevision,
+		};
+		connection.controlIntents.set(canonicalHandle, intent);
+		if (sessionHandle !== canonicalHandle) connection.controlIntents.delete(sessionHandle);
+		return intent;
+	}
+
+	private invalidateControlIntent(connection: ConnectionState<M>, sessionHandle: string): void {
+		const canonicalHandle = this.connectionSessionHandle(connection, sessionHandle);
+		connection.controlIntents.delete(sessionHandle);
+		connection.controlIntents.delete(canonicalHandle);
+	}
+
+	private clearControlIntent(
+		connection: ConnectionState<M>,
+		intent: ControlIntent,
+		...sessionHandles: string[]
+	): void {
+		for (const sessionHandle of sessionHandles) {
+			const canonicalHandle = this.connectionSessionHandle(connection, sessionHandle);
+			if (connection.controlIntents.get(sessionHandle) === intent) {
+				connection.controlIntents.delete(sessionHandle);
+			}
+			if (connection.controlIntents.get(canonicalHandle) === intent) {
+				connection.controlIntents.delete(canonicalHandle);
+			}
+		}
+	}
+
+	private async handleRestart(
+		connection: ConnectionState<M>,
+		message: Extract<SessionWsClientMessage, { type: "session_restart" }>,
+	): Promise<void> {
+		const runtime = this.supervisor.getRuntime(message.sessionHandle);
+		const sessionHandle =
+			runtime?.sessionHandle ?? this.connectionSessionHandle(connection, message.sessionHandle);
+		if (connection.restartableOverflows.get(sessionHandle) !== message.expectedGeneration) {
+			this.sendSessionError(connection, message.sessionHandle, "restart", "session_restart_not_available");
+			return;
+		}
+		const lifecycleEpoch = connection.epoch;
+		connection.restartableOverflows.delete(sessionHandle);
+		try {
+			const restarted = await this.supervisor.restart(sessionHandle, {
+				connectionId: connection.connectionId,
+				expectedGeneration: message.expectedGeneration,
+				fencingToken: message.fencingToken,
+			});
+			const subscribers = [...this.connections].filter(
+				(candidate) => !candidate.closed && this.isSubscribed(candidate, restarted.sessionHandle),
+			);
+			await Promise.all(subscribers.map((candidate) => this.subscribe(candidate, restarted.sessionHandle)));
+		} catch (error) {
+			const current = this.supervisor.getRuntime(sessionHandle);
+			if (
+				!connection.closed &&
+				connection.epoch === lifecycleEpoch &&
+				this.connections.has(connection) &&
+				this.isSubscribed(connection, sessionHandle) &&
+				current?.generation === message.expectedGeneration &&
+				current.error === "session_snapshot_overflow"
+			) {
+				connection.restartableOverflows.set(current.sessionHandle, current.generation);
+			}
+			this.sendSessionError(connection, message.sessionHandle, "restart", error);
 		}
 	}
 
@@ -1517,9 +1669,16 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			this.sendCommandError(connection, message, "too_many_in_flight_commands");
 			return;
 		}
-		const responseWeight = commandResponseWeight(message.command.type);
+		const responseWeight = commandResponseReservationBytes(message.command.type);
 		if (connection.pendingCommandResponseBytes + responseWeight > this.maxPendingCommandResponseBytes) {
 			this.sendCommandError(connection, message, "pending_command_response_capacity");
+			return;
+		}
+		if (
+			this.gatewayPendingCommandResponseBytes + responseWeight >
+			this.maxGatewayPendingCommandResponseBytes
+		) {
+			this.sendCommandError(connection, message, "gateway_pending_command_response_capacity");
 			return;
 		}
 
@@ -1527,6 +1686,21 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		const clientId = message.command.id;
 		connection.pendingCommands.add(internalId);
 		connection.pendingCommandResponseBytes += responseWeight;
+		this.gatewayPendingCommandResponseBytes += responseWeight;
+		let reservationReleased = false;
+		const releaseReservation = () => {
+			if (reservationReleased) return;
+			reservationReleased = true;
+			connection.pendingCommandResponseBytes = Math.max(
+				0,
+				connection.pendingCommandResponseBytes - responseWeight,
+			);
+			this.gatewayPendingCommandResponseBytes = Math.max(
+				0,
+				this.gatewayPendingCommandResponseBytes - responseWeight,
+			);
+		};
+		let reservationTransferred = false;
 		const command = { ...message.command, id: internalId } as SessionCommandDto;
 		if (command.type === "bash" && clientId) {
 			this.bashCommandIds.set(internalId, { connectionId: connection.connectionId, clientId });
@@ -1546,17 +1720,14 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				response: this.restoreClientId(result.response, clientId),
 				...(result.previousSessionHandle ? { previousSessionHandle: result.previousSessionHandle } : {}),
 			} as BridgeServerMessage<M>;
-			this.send(connection, responseFrame);
+			reservationTransferred = this.send(connection, responseFrame, releaseReservation);
 		} catch (error) {
-			this.sendCommandError(connection, message, error);
+			reservationTransferred = this.sendCommandError(connection, message, error, releaseReservation);
 			this.log("warn", `command ${message.command.type} failed: ${this.errorText(error)}`);
 		} finally {
 			this.bashCommandIds.delete(internalId);
 			connection.pendingCommands.delete(internalId);
-			connection.pendingCommandResponseBytes = Math.max(
-				0,
-				connection.pendingCommandResponseBytes - responseWeight,
-			);
+			if (!reservationTransferred) releaseReservation();
 		}
 	}
 
@@ -1596,24 +1767,29 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		connection: ConnectionState<M>,
 		message: Extract<SessionWsClientMessage, { type: "command" }>,
 		error: unknown,
-	): void {
+		release?: () => void,
+	): boolean {
 		const runtime = this.supervisor.getRuntime(message.sessionHandle);
 		const admissionError = error instanceof RpcError ? error.admissionError : undefined;
-		this.send(connection, {
-			type: "response",
-			serverEpoch: this.serverEpoch,
-			sessionHandle: runtime?.sessionHandle ?? message.sessionHandle,
-			generation: runtime?.generation ?? message.expectedGeneration ?? 0,
-			barrierSeq: runtime?.lastSeq ?? 0,
-			response: {
-				...(message.command.id ? { id: message.command.id } : {}),
+		return this.send(
+			connection,
+			{
 				type: "response",
-				command: message.command.type,
-				success: false,
-				error: this.errorText(error),
-				...(admissionError ? { admissionError } : {}),
+				serverEpoch: this.serverEpoch,
+				sessionHandle: runtime?.sessionHandle ?? message.sessionHandle,
+				generation: runtime?.generation ?? message.expectedGeneration ?? 0,
+				barrierSeq: runtime?.lastSeq ?? 0,
+				response: {
+					...(message.command.id ? { id: message.command.id } : {}),
+					type: "response",
+					command: message.command.type,
+					success: false,
+					error: this.errorText(error),
+					...(admissionError ? { admissionError } : {}),
+				},
 			},
-		});
+			release,
+		);
 	}
 
 	private sendSessionError(
@@ -1631,7 +1807,9 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			operation,
 			error: errorText,
 			code,
-			retryable: operation === "subscribe" && RETRYABLE_SESSION_ERROR_CODES.has(code),
+			retryable:
+				(operation === "subscribe" && RETRYABLE_SESSION_ERROR_CODES.has(code)) ||
+				(operation === "history_page" && RETRYABLE_HISTORY_ERROR_CODES.has(code)),
 		});
 	}
 
@@ -1656,15 +1834,21 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		connection.epoch += 1;
 		this.connections.delete(connection);
 		for (const catchUp of [...connection.catchUps]) this.cancelCatchUp(connection, catchUp);
-		for (const operation of connection.historyPages.values()) operation.controller.abort();
-		connection.historyPages.clear();
+		for (const operation of [...connection.historyPages.values()]) {
+			this.releaseHistoryPage(connection, operation, true);
+		}
 		connection.historySnapshots.clear();
+		connection.restartableOverflows.clear();
 		this.supervisor.releaseConnection(connection.connectionId);
 		connection.subscriptions.clear();
 		connection.subscriptionAliases.clear();
 		connection.controlledSessions.clear();
+		connection.controlIntents.clear();
 		connection.pendingCommands.clear();
 		connection.pendingCommandResponseBytes = 0;
+		if (connection.outboundActive) this.releaseOutboundPayload(connection.outboundActive);
+		connection.outboundActive = undefined;
+		for (const item of connection.outboundQueue) this.releaseOutboundPayload(item);
 		connection.outboundQueue = [];
 		connection.outboundSmallQueuedBytes = 0;
 		connection.outboundLargeItems = 0;
@@ -1745,7 +1929,11 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		if (inventory) this.sendHotRuntimeInventory(connection, inventory);
 	}
 
-	private send(connection: ConnectionState<M>, message: BridgeServerMessage<M>): void {
+	private send(
+		connection: ConnectionState<M>,
+		message: BridgeServerMessage<M>,
+		release?: () => void,
+	): boolean {
 		const history =
 			message.type === "session_snapshot_begin" ||
 			message.type === "session_snapshot_chunk" ||
@@ -1753,7 +1941,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			message.type === "session_history_page_begin" ||
 			message.type === "session_history_page_chunk" ||
 			message.type === "session_history_page_end";
-		this.sendPayload(
+		return this.sendPayload(
 			connection,
 			this.payloadForConnection(connection, message),
 			message.type === "event" ||
@@ -1763,6 +1951,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				message.type === "session_snapshot_chunk" ||
 				message.type === "session_history_page_chunk",
 			history,
+			release,
 		);
 	}
 
@@ -1791,8 +1980,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 	}
 
 	private serializeMessage(message: BridgeServerMessage<M> | BridgeSupervisorMessage<M>): string {
-		if (!this.futureActivation) return JSON.stringify(message);
-		return serializeFutureBridgeMessage(message, this.futureActivation);
+		return serializeBridgeMessage(message, this.payloadActivation);
 	}
 
 	private classifyPayload(
@@ -1821,47 +2009,88 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		payload: string,
 		allowLarge = false,
 		history = false,
-	): void {
-		if (connection.closed) return;
-		if (connection.ws.readyState !== connection.ws.OPEN) return;
+		release?: () => void,
+	): boolean {
+		if (connection.closed || connection.ws.readyState !== connection.ws.OPEN) {
+			release?.();
+			return false;
+		}
 		const bytes = Buffer.byteLength(payload);
 		const large = this.classifyPayload(connection, bytes, allowLarge);
-		if (large === undefined) return;
+		if (large === undefined) {
+			release?.();
+			return false;
+		}
 		if (!history && large && connection.outboundLargeItems >= 1) {
 			this.closeForPolicyViolation(connection, "slow WebSocket client");
-			return;
+			release?.();
+			return false;
 		}
 		if (history && connection.outboundHistoryQueuedBytes + bytes > SESSION_HISTORY_MAX_STREAM_BYTES) {
 			this.closeForPolicyViolation(connection, "history stream exceeded its outbound limit");
-			return;
+			release?.();
+			return false;
 		}
 		if (connection.outboundSending) {
-			if (history) {
-				connection.outboundHistoryQueuedBytes += bytes;
-			} else if (large) {
-				connection.outboundLargeItems += 1;
-			} else if (connection.outboundSmallQueuedBytes + bytes > MAX_SESSION_WS_BUFFERED_BYTES) {
+			if (!history && !large && connection.outboundSmallQueuedBytes + bytes > MAX_SESSION_WS_BUFFERED_BYTES) {
 				this.closeForPolicyViolation(connection, "slow WebSocket client");
-				return;
-			} else {
-				connection.outboundSmallQueuedBytes += bytes;
+				release?.();
+				return false;
 			}
-			connection.outboundQueue.push({ payload, bytes, large, history });
-			return;
+			const item = this.retainOutboundPayload(connection, payload, bytes, large, history, release);
+			if (!item) return false;
+			if (history) connection.outboundHistoryQueuedBytes += bytes;
+			else if (large) connection.outboundLargeItems += 1;
+			else connection.outboundSmallQueuedBytes += bytes;
+			connection.outboundQueue.push(item);
+			return true;
 		}
 		if (connection.ws.bufferedAmount > MAX_SESSION_WS_BUFFERED_BYTES) {
 			this.closeForPolicyViolation(connection, "slow WebSocket client");
-			return;
+			release?.();
+			return false;
 		}
+		const item = this.retainOutboundPayload(connection, payload, bytes, large, history, release);
+		if (!item) return false;
 		if (history) connection.outboundHistoryQueuedBytes += bytes;
 		else if (large) connection.outboundLargeItems += 1;
-		this.startPayloadSend(connection, { payload, bytes, large, history });
+		this.startPayloadSend(connection, item);
+		return true;
+	}
+
+	private retainOutboundPayload(
+		connection: ConnectionState<M>,
+		payload: string,
+		bytes: number,
+		large: boolean,
+		history: boolean,
+		release?: () => void,
+	): OutboundPayload | undefined {
+		if (this.gatewayOutboundBytes + bytes > this.maxGatewayOutboundBytes) {
+			this.closeForPolicyViolation(connection, "gateway outbound capacity");
+			release?.();
+			return undefined;
+		}
+		this.gatewayOutboundBytes += bytes;
+		return { payload, bytes, large, history, release, retained: true };
+	}
+
+	private releaseOutboundPayload(item: OutboundPayload): void {
+		if (item.retained) {
+			item.retained = false;
+			this.gatewayOutboundBytes = Math.max(0, this.gatewayOutboundBytes - item.bytes);
+		}
+		item.release?.();
+		item.release = undefined;
 	}
 
 	private startPayloadSend(connection: ConnectionState<M>, item: OutboundPayload): void {
 		connection.outboundSending = true;
+		connection.outboundActive = item;
 		try {
 			connection.ws.send(item.payload, (error) => {
+				this.releaseOutboundPayload(item);
+				if (connection.outboundActive === item) connection.outboundActive = undefined;
 				if (connection.closed) return;
 				connection.outboundSending = false;
 				if (item.history) {
@@ -1883,12 +2112,15 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 					connection.outboundSmallQueuedBytes = Math.max(0, connection.outboundSmallQueuedBytes - next.bytes);
 				}
 				if (connection.ws.bufferedAmount > MAX_SESSION_WS_BUFFERED_BYTES) {
+					this.releaseOutboundPayload(next);
 					this.closeForPolicyViolation(connection, "slow WebSocket client");
 					return;
 				}
 				this.startPayloadSend(connection, next);
 			});
 		} catch {
+			this.releaseOutboundPayload(item);
+			if (connection.outboundActive === item) connection.outboundActive = undefined;
 			this.disconnect(connection);
 		}
 	}
@@ -1898,42 +2130,30 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 	}
 }
 
-function isFutureBridgeActivation(
-	value: SessionWsBridgeOptions["payloadActivation"] | FutureBridgeActivation | undefined,
-): value is FutureBridgeActivation {
-	return value !== undefined && Object.hasOwn(value.context, "contentRefBudget");
-}
-
-function assertFutureBridgeActivation(value: FutureBridgeActivation, serverEpoch: string): void {
+function assertBridgeActivation(value: BridgeActivation, serverEpoch: string): void {
 	const { context, externalizer, supervisorServices } = value;
 	const canonicalPayloadBudget =
 		JSON.stringify(context.payloadBudget) === JSON.stringify(SESSION_PAYLOAD_BUDGET);
 	const canonicalContentRefBudget =
-		JSON.stringify(context.contentRefBudget) === JSON.stringify(FUTURE_SESSION_CONTENT_REF_BUDGET);
+		JSON.stringify(context.contentRefBudget) === JSON.stringify(SESSION_CONTENT_REF_BUDGET);
 	if (
-		!isFutureSessionContentRefGuardContext(context) ||
+		!isSessionContentRefGuardContext(context) ||
 		context.serverEpoch !== serverEpoch ||
 		!canonicalPayloadBudget ||
 		!canonicalContentRefBudget ||
-		externalizer.mode !== "future_content" ||
+		externalizer.mode !== "content_ref" ||
 		externalizer.context !== context ||
-		supervisorServices.mode !== "future_content" ||
+		supervisorServices.mode !== "content_ref" ||
 		supervisorServices.externalizer !== externalizer ||
-		supervisorServices.productSchema.mode !== "future_content" ||
+		supervisorServices.productSchema.mode !== "content_ref" ||
 		supervisorServices.productSchema.serverEpoch !== serverEpoch
 	) {
-		throw new TypeError("Future Session WebSocket payload activation is invalid");
+		throw new TypeError("Session WebSocket payload activation is invalid");
 	}
 }
 
 function positiveLimit(value: number | undefined, fallback: number): number {
 	return Number.isFinite(value) ? Math.min(fallback, Math.max(1, Math.floor(value as number))) : fallback;
-}
-
-function commandResponseWeight(commandType: string): number {
-	return ["get_entries", "get_messages", "get_tree"].includes(commandType)
-		? MAX_SESSION_WS_FRAME_BYTES
-		: MAX_SESSION_WS_SMALL_COMMAND_RESPONSE_BYTES;
 }
 
 function sessionErrorCode(errorText: string): string {
@@ -1986,45 +2206,45 @@ function splitHistoryMessages<T>(
 	return chunks;
 }
 
-function serializeFutureBridgeMessage(message: unknown, activation: FutureBridgeActivation): string {
-	if (!isFutureSessionWsServerMessage(message, activation.context)) {
-		throw new TypeError("Future Session WebSocket message failed its exact context guard");
+function serializeBridgeMessage(message: unknown, activation: BridgeActivation): string {
+	if (!isSessionWsServerMessage(message, activation.context)) {
+		throw new TypeError("Session WebSocket message failed its exact context guard");
 	}
 	const schema = activation.supervisorServices.productSchema;
 	if (message.type === "event") {
 		if (!schema.guardEvent(message.event)) {
-			throw new TypeError("Future Session event failed its product provenance guard");
+			throw new TypeError("Session event failed its product provenance guard");
 		}
 		assertLogicalBytes(() => schema.activeTurnEventLogicalBytes(message.event), "event");
 	}
 	if (message.type === "extension_ui_request") {
 		if (!schema.guardExtensionRequest(message.request)) {
-			throw new TypeError("Future Session Extension request failed its product provenance guard");
+			throw new TypeError("Session Extension request failed its product provenance guard");
 		}
 		assertLogicalBytes(() => schema.extensionRequestLogicalBytes(message.request), "Extension request");
 	}
 	if (message.type === "extension_ui_snapshot") {
 		for (const request of message.requests) {
 			if (!schema.guardExtensionRequest(request)) {
-				throw new TypeError("Future Session Extension snapshot failed its product provenance guard");
+				throw new TypeError("Session Extension snapshot failed its product provenance guard");
 			}
 			assertLogicalBytes(() => schema.extensionRequestLogicalBytes(request), "Extension snapshot request");
 		}
 	}
 	if (message.type === "session_snapshot") {
 		if (!schema.guardSnapshot(message)) {
-			throw new TypeError("Future Session snapshot failed its product provenance guard");
+			throw new TypeError("Session snapshot failed its product provenance guard");
 		}
 		assertLogicalBytes(() => schema.snapshotLogicalBytes(message), "snapshot");
 	}
 	if (message.type === "session_snapshot_chunk" || message.type === "session_history_page_chunk") {
 		for (const historyMessage of message.messages) {
 			if (!schema.guardMessage(historyMessage)) {
-				throw new TypeError("Future Session history message failed its product provenance guard");
+				throw new TypeError("Session history message failed its product provenance guard");
 			}
 			assertLogicalBytes(
 				() =>
-					analyzeFutureSessionMessageLogicalBytes(historyMessage, {
+					analyzeSessionMessageLogicalBytes(historyMessage, {
 						maxBytes: schema.maxSnapshotLogicalBytes,
 					}).byteLength,
 				"history message",
@@ -2034,17 +2254,16 @@ function serializeFutureBridgeMessage(message: unknown, activation: FutureBridge
 	if (message.type === "response") {
 		assertLogicalBytes(
 			() =>
-				analyzeFutureSessionResponseFrameLogicalBytes(message, { maxBytes: schema.maxSnapshotLogicalBytes })
+				analyzeSessionResponseFrameLogicalBytes(message, { maxBytes: schema.maxSnapshotLogicalBytes })
 					.byteLength,
 			"response",
 		);
 	}
 	const payload = JSON.stringify(message);
-	if (typeof payload !== "string")
-		throw new TypeError("Future Session WebSocket message is not serializable");
+	if (typeof payload !== "string") throw new TypeError("Session WebSocket message is not serializable");
 	const bytes = Buffer.byteLength(payload);
 	if (message.type === "event" && bytes > schema.maxNormalizedEventWireBytes) {
-		throw new TypeError("Future Session event exceeded its normalized wire budget");
+		throw new TypeError("Session event exceeded its normalized wire budget");
 	}
 	if (
 		message.type === "event" ||
@@ -2052,11 +2271,11 @@ function serializeFutureBridgeMessage(message: unknown, activation: FutureBridge
 		message.type === "extension_ui_closed"
 	) {
 		if (bytes > schema.maxReplayFrameWireBytes) {
-			throw new TypeError("Future Session replay frame exceeded its wire budget");
+			throw new TypeError("Session replay frame exceeded its wire budget");
 		}
 	}
 	if (message.type === "session_snapshot" && bytes > schema.maxSnapshotCanonicalWireBytes) {
-		throw new TypeError("Future Session snapshot exceeded its canonical wire budget");
+		throw new TypeError("Session snapshot exceeded its canonical wire budget");
 	}
 	return payload;
 }
@@ -2065,27 +2284,11 @@ function assertLogicalBytes(read: () => number, label: string): void {
 	try {
 		read();
 	} catch (error) {
-		throw new TypeError(`Future Session ${label} exceeded its logical content budget`, { cause: error });
+		throw new TypeError(`Session ${label} exceeded its logical content budget`, { cause: error });
 	}
 }
 
-/** Public current wrapper; its 1.2 serialization and hello behavior remain unchanged. */
-export class SessionWsBridge extends SessionWsBridgeCore<"current"> {
-	// biome-ignore lint/complexity/noUselessConstructor: keep the public current-only option boundary.
-	constructor(opts: SessionWsBridgeOptions) {
-		super(opts);
-	}
-}
-
-/** Server-private future Bridge handle. It is deliberately omitted from the server public barrel. */
-export type FutureSessionWsBridge = Pick<
-	SessionWsBridgeCore<"future_content">,
-	"wss" | "close" | "broadcast" | "broadcastHotRuntimeInventory"
->;
-
-export function createFutureSessionWsBridge(opts: FutureSessionWsBridgeOptions): FutureSessionWsBridge {
-	return new SessionWsBridgeCore<"future_content">(opts);
-}
+export class SessionWsBridge extends SessionWsBridgeCore<"content_ref"> {}
 
 interface SessionLeaseSnapshot {
 	type: "lease_status";

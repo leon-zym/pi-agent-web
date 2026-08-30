@@ -1,6 +1,11 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import {
+	buildSessionContext,
+	type SessionEntry,
+	sessionEntryToContextMessages,
+} from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
 import { scanNativeSessionHistory } from "../src/session-history-reader.js";
 
@@ -106,6 +111,39 @@ describe("Native Session history reader", () => {
 
 		const initial = await plan.readInitial();
 		expect(initial.entries.map((entry) => entry.id)).toEqual(["compact", "b", "c"]);
+	});
+
+	it("matches Pi context selection across branches, compaction, and summaries", async () => {
+		const entries = [
+			message("a", null, "user", "old question"),
+			message("b", "a", "assistant", "kept answer"),
+			message("x", "a", "assistant", "abandoned branch"),
+			{
+				type: "compaction",
+				id: "compact",
+				parentId: "b",
+				timestamp: "2026-01-01T00:00:03.000Z",
+				summary: "summary",
+				firstKeptEntryId: "b",
+				tokensBefore: 10,
+			},
+			message("c", "compact", "user", "new question"),
+			{
+				type: "branch_summary",
+				id: "summary",
+				parentId: "c",
+				timestamp: "2026-01-01T00:00:04.000Z",
+				fromId: "x",
+				summary: "branch context",
+			},
+		] as SessionEntry[];
+		const file = await sessionFile([header(), ...entries]);
+		const plan = await scanNativeSessionHistory(file, { initialMessageLimit: 32 });
+		const initial = await plan.readInitial();
+
+		expect(initial.entries.flatMap(sessionEntryToContextMessages)).toEqual(
+			buildSessionContext(entries, "summary").messages,
+		);
 	});
 
 	it("fails closed when the source changes between bounded reads", async () => {

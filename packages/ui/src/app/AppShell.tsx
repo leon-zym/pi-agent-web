@@ -50,8 +50,17 @@ function clamp(value: number, min: number, max: number): number {
 	return Math.min(max, Math.max(min, value));
 }
 
+function isValidFocusTarget(target: Element | null): target is HTMLElement {
+	return (
+		target instanceof HTMLElement &&
+		target.isConnected &&
+		target !== document.body &&
+		target !== document.documentElement
+	);
+}
+
 /**
- * Three-column app shell with the DSH squeeze policy (DESIGN.md):
+ * Three-column app shell with a bounded squeeze policy:
  * details shrinks to 300, then moves into an overlay, and only then may the
  * center drop below 640. The sidebar can be manually reduced to a 56px rail
  * and does so automatically under 1024px.
@@ -75,6 +84,9 @@ export function AppShell() {
 	const navigationDrawer = useRef<HTMLDivElement>(null);
 	const navigationTrigger = useRef<HTMLButtonElement>(null);
 	const detailsReturnFocus = useRef<HTMLElement>(null);
+	const dockedDetailsTrigger = useRef<HTMLButtonElement>(null);
+	const dockedDetailsPanel = useRef<HTMLDivElement>(null);
+	const previousDetailsOpen = useRef(detailsOpen);
 
 	useEffect(() => {
 		const observer = new ResizeObserver(() => setViewportWidth(window.innerWidth));
@@ -82,7 +94,7 @@ export function AppShell() {
 		return () => observer.disconnect();
 	}, []);
 
-	// visualViewport adaptation to prevent virtual keyboard shift (DESIGN.md 4.3)
+	// visualViewport adaptation prevents mobile keyboard shift.
 	useEffect(() => {
 		if (typeof window === "undefined") return;
 		const vv = window.visualViewport;
@@ -139,6 +151,28 @@ export function AppShell() {
 		detailsWidth = Math.max(0, viewportWidth - sidebarWidth - CENTER_MIN);
 		if (detailsWidth > 0 && detailsWidth < DETAILS_MIN) detailsWidth = 0;
 	}
+
+	useEffect(() => {
+		const wasOpen = previousDetailsOpen.current;
+		previousDetailsOpen.current = detailsOpen;
+		if (!canDockDetails || wasOpen === detailsOpen) return;
+		if (detailsOpen) {
+			if (isValidFocusTarget(document.activeElement)) {
+				detailsReturnFocus.current = document.activeElement;
+			}
+			window.requestAnimationFrame(() => {
+				dockedDetailsPanel.current
+					?.querySelector<HTMLButtonElement>('[data-details-collapse="true"]')
+					?.focus();
+			});
+			return;
+		}
+		window.requestAnimationFrame(() => {
+			const target = detailsReturnFocus.current;
+			if (isValidFocusTarget(target)) target.focus();
+			else dockedDetailsTrigger.current?.focus();
+		});
+	}, [canDockDetails, detailsOpen]);
 
 	const startDrag = (which: "sidebar" | "details") => (event: React.PointerEvent) => {
 		dragging.current = which;
@@ -202,10 +236,14 @@ export function AppShell() {
 				<Tooltip>
 					<TooltipTrigger asChild>
 						<button
+							ref={dockedDetailsTrigger}
 							type="button"
 							aria-label={tt("details.expandPanel")}
 							className="flex w-10 shrink-0 items-start justify-center border-l border-border pt-3 text-ink-3 transition-[color,background-color,scale] hover:bg-hover hover:text-ink active:scale-95 focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
-							onClick={() => setDetailsOpen(true)}
+							onClick={(event) => {
+								detailsReturnFocus.current = event.currentTarget;
+								setDetailsOpen(true);
+							}}
 						>
 							<PanelRightOpen className="size-4" />
 						</button>
@@ -235,6 +273,7 @@ export function AppShell() {
 
 			{/* A docked panel stays mounted at zero width so close/open preserves local state. */}
 			<div
+				ref={dockedDetailsPanel}
 				className={cn(
 					"min-w-0 shrink-0 overflow-hidden border-l border-border bg-base",
 					detailsWidth === 0 && "hidden",

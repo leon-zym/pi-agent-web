@@ -5,7 +5,7 @@ import type { AuthStatusEntry } from "@pi-agent-web/protocol";
 import lockfile from "proper-lockfile";
 
 /**
- * auth.json read/write (see docs/protocol.md for the storage layout).
+ * Pi auth.json read/write.
  * - File mode 0o600; parent dir 0o700.
  * - Writes use proper-lockfile (same lock semantics as pi's auth-storage.ts)
  *   to avoid corrupting auth.json when a pi process writes concurrently.

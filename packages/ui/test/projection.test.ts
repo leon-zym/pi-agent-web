@@ -1,4 +1,4 @@
-import type { SessionEventDto } from "@pi-agent-web/protocol";
+import type { PiSessionEventDto } from "@pi-agent-web/protocol";
 import { beforeEach, describe, expect, it } from "vitest";
 import { useProjectionStore } from "../src/stores/projection";
 
@@ -122,7 +122,7 @@ describe("projection cache", () => {
 					type: "message_update",
 					usage,
 					assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x" },
-				}) as SessionEventDto,
+				}) as PiSessionEventDto,
 		);
 		let commits = 0;
 		const unsubscribe = useProjectionStore.subscribe(() => {
@@ -142,7 +142,7 @@ describe("projection cache", () => {
 	});
 
 	it("restores a running tool and its partial output from one authoritative snapshot", () => {
-		const events: SessionEventDto[] = [
+		const events: PiSessionEventDto[] = [
 			{ type: "agent_start" },
 			{ type: "turn_start" },
 			{

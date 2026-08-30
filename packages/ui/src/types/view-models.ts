@@ -1,8 +1,5 @@
 import type { SessionImageContentDto } from "@pi-agent-web/protocol";
-import type {
-	FutureSessionJsonRootProjection,
-	FutureSessionTextPayloadProjection,
-} from "../lib/future-session-content-adapter";
+import type { SessionJsonRootProjection, SessionTextPayloadProjection } from "../lib/session-content-adapter";
 
 /**
  * View models for the conversation projection.
@@ -38,15 +35,15 @@ export type ContentBlock =
 			/** Raw JSON argument text while streaming; parsed object after toolcall_end. */
 			argsText: string;
 			args: unknown;
-			/** Future typed JSON root; inline_json is unwrapped into args. */
-			argsPayload?: FutureSessionJsonRootProjection;
+			/**  typed JSON root; inline_json is unwrapped into args. */
+			argsPayload?: SessionJsonRootProjection;
 			status: ToolCallStatus;
 			/** Cumulative partial result snapshot from tool_execution_update. */
 			partialOutput?: string;
-			partialResultPayload?: FutureSessionJsonRootProjection;
+			partialResultPayload?: SessionJsonRootProjection;
 			/** Final result payload from tool_execution_end. */
 			result?: unknown;
-			resultPayload?: FutureSessionJsonRootProjection;
+			resultPayload?: SessionJsonRootProjection;
 	  };
 
 export interface UiToolResult {
@@ -54,11 +51,11 @@ export interface UiToolResult {
 	toolName: string;
 	/** Flattened text content shown to the user. */
 	content: string;
-	/** Ordered future text roots retained without eagerly fetching external values. */
-	textPayloads?: FutureSessionTextPayloadProjection[];
+	/** Ordered external text roots retained without eagerly fetching their values. */
+	textPayloads?: SessionTextPayloadProjection[];
 	isError: boolean;
 	details?: unknown;
-	detailsPayload?: FutureSessionJsonRootProjection;
+	detailsPayload?: SessionJsonRootProjection;
 }
 
 export interface AssistantStep {

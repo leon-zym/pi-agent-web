@@ -4,22 +4,21 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
 	expectData,
-	FUTURE_SESSION_CONTENT_REF_BUDGET,
 	type ProductSessionEventDto,
+	SESSION_CONTENT_REF_BUDGET,
 	SESSION_PAYLOAD_BUDGET,
 	type SessionAttachmentRefDto,
-	type SessionCommandResponseDto,
 	type SessionContentRefDto,
 } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { EpochContentHold, EpochStoredContentRef } from "../src/epoch-content-store.js";
 import { GenerationContentOwner } from "../src/generation-content-owner.js";
-import { MAX_JSONL_FUTURE_CONTENT_LINE_BYTES, MAX_JSONL_LINE_BYTES } from "../src/jsonl.js";
-import { legacyRpcV1Adapter } from "../src/legacy-rpc-v1.js";
+import { MAX_JSONL_CONTENT_REF_LINE_BYTES, MAX_JSONL_LINE_BYTES } from "../src/jsonl.js";
 import {
 	type PiHostAdapter,
 	type PiHostDecodeContext,
-	type PiHostFutureDecodeContext,
+	type PiHostOrphanDecodeContext,
+	type PiHostRawUnsolicitedFrame,
 	PiHostResponseExternalizationError,
 	type PiHostUnsolicitedFrame,
 	PiProtocolIncompatibleError,
@@ -31,6 +30,7 @@ import {
 	type PiPayloadLeaseTransfer,
 } from "../src/pi-payload-externalizer.js";
 import { type PiDecodedDeliveryConsumer, PiProcess, type PiProcessOptions } from "../src/pi-process.js";
+import { piRpcAdapter } from "../src/pi-rpc-adapter.js";
 
 const fakePiPath = path.join(import.meta.dirname, "fixtures", "fake-pi.mjs");
 const processGroupPiPath = path.join(import.meta.dirname, "fixtures", "process-group-pi.mjs");
@@ -54,7 +54,7 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 }
 
 function fakeLease(options: { rejectRelease?: boolean } = {}): {
-	lease: PiPayloadLease;
+	lease: PiPayloadLease<EpochStoredContentRef>;
 	release: ReturnType<typeof vi.fn>;
 	adopt: ReturnType<typeof vi.fn>;
 } {
@@ -65,15 +65,15 @@ function fakeLease(options: { rejectRelease?: boolean } = {}): {
 		mediaType: "image/png",
 		byteLength: 1,
 	};
-	const hold = Object.freeze({ ref });
+	const hold: EpochContentHold<EpochStoredContentRef> = Object.freeze({ ref });
 	let transferred = false;
 	const release = vi.fn(async () => {
 		if (options.rejectRelease) throw new Error("injected lease release failure");
 	});
-	const adopt = vi.fn((accept: (holds: readonly EpochContentHold[]) => true) => {
+	const adopt = vi.fn((accept: (holds: readonly EpochContentHold<EpochStoredContentRef>[]) => true) => {
 		if (accept([hold]) !== true) throw new Error("lease was not adopted");
 	});
-	const lease: PiPayloadLease = Object.freeze({
+	const lease: PiPayloadLease<EpochStoredContentRef> = Object.freeze({
 		refs: Object.freeze([ref]),
 		transfer() {
 			if (transferred) throw new Error("already transferred");
@@ -85,7 +85,7 @@ function fakeLease(options: { rejectRelease?: boolean } = {}): {
 	return { lease, release, adopt };
 }
 
-function fakeFutureLease(): {
+function fakeCanonicalLease(): {
 	lease: PiPayloadLease<EpochStoredContentRef>;
 	release: ReturnType<typeof vi.fn>;
 } {
@@ -94,7 +94,7 @@ function fakeFutureLease(): {
 		serverEpoch: "process-test-epoch",
 		sha256: "b".repeat(64),
 		encoding: "utf-8",
-		byteLength: FUTURE_SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes,
+		byteLength: SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes,
 	};
 	const hold: EpochContentHold<SessionContentRefDto> = Object.freeze({ ref });
 	const release = vi.fn(async () => {});
@@ -117,7 +117,7 @@ function fakeFutureLease(): {
 	return { lease, release };
 }
 
-function fakeMixedFutureLease(): {
+function fakeMixedCanonicalLease(): {
 	lease: PiPayloadLease<EpochStoredContentRef>;
 	release: ReturnType<typeof vi.fn>;
 } {
@@ -133,7 +133,7 @@ function fakeMixedFutureLease(): {
 		serverEpoch: "process-test-epoch",
 		sha256: "b".repeat(64),
 		encoding: "utf-8",
-		byteLength: FUTURE_SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes,
+		byteLength: SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes,
 	};
 	const attachmentHold: EpochContentHold<SessionAttachmentRefDto> = Object.freeze({ ref: attachmentRef });
 	const contentHold: EpochContentHold<SessionContentRefDto> = Object.freeze({ ref: contentRef });
@@ -158,18 +158,24 @@ function fakeMixedFutureLease(): {
 }
 
 const futurePayloadExternalizer = {
-	mode: "future_content",
+	mode: "content_ref",
 	context: {
 		serverEpoch: "process-test-epoch",
 		payloadBudget: SESSION_PAYLOAD_BUDGET,
-		contentRefBudget: FUTURE_SESSION_CONTENT_REF_BUDGET,
+		contentRefBudget: SESSION_CONTENT_REF_BUDGET,
 	},
 	externalize: vi.fn(async (input: { value: unknown }) => ({
 		value: input.value,
 		lease: {
 			refs: [] as readonly EpochStoredContentRef[],
 			transfer() {
-				throw new Error("empty future lease is not transferable");
+				return {
+					refs: [] as readonly EpochStoredContentRef[],
+					adopt(accept: (holds: readonly EpochContentHold<EpochStoredContentRef>[]) => true) {
+						if (accept([]) !== true) throw new Error("empty canonical lease adoption was rejected");
+					},
+					release: async () => {},
+				};
 			},
 			release: async () => {},
 		},
@@ -179,25 +185,36 @@ const futurePayloadExternalizer = {
 type DecodedFrame =
 	| { kind: "response"; command: string }
 	| { kind: "orphaned_response" }
-	| PiHostUnsolicitedFrame;
+	| PiHostUnsolicitedFrame
+	| PiHostRawUnsolicitedFrame;
 
 function withAsyncDecodeGate(
 	gate: (frame: DecodedFrame, signal: AbortSignal | undefined) => Promise<void>,
 ): PiHostAdapter {
 	return {
-		...legacyRpcV1Adapter,
-		async decodeResponse(value, expectedCommand, context?: PiHostDecodeContext) {
-			const decoded = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand);
+		...piRpcAdapter,
+		async decodePiResponse(value, expectedCommand) {
+			const decoded = await piRpcAdapter.decodePiResponse(value, expectedCommand);
+			await gate({ kind: "response", command: expectedCommand }, undefined);
+			return decoded;
+		},
+		async decodePiUnsolicited(value) {
+			const decoded = await piRpcAdapter.decodePiUnsolicited(value);
+			await gate(decoded.value, undefined);
+			return decoded;
+		},
+		async decodeResponse(value, expectedCommand, context: PiHostDecodeContext) {
+			const decoded = await piRpcAdapter.decodeResponse(value, expectedCommand, context);
 			await gate({ kind: "response", command: expectedCommand }, context?.signal);
 			return decoded;
 		},
-		async decodeOrphanedResponse(value, context?: PiHostDecodeContext) {
-			const decoded = await legacyRpcV1Adapter.decodeOrphanedResponse(value);
+		async decodeOrphanedResponse(value, context?: PiHostOrphanDecodeContext) {
+			const decoded = await piRpcAdapter.decodeOrphanedResponse(value);
 			await gate({ kind: "orphaned_response" }, context?.signal);
 			return decoded;
 		},
-		async decodeUnsolicited(value, context?: PiHostDecodeContext) {
-			const decoded = await legacyRpcV1Adapter.decodeUnsolicited(value);
+		async decodeUnsolicited(value, context: PiHostDecodeContext) {
+			const decoded = await piRpcAdapter.decodeUnsolicited(value, context);
 			await gate(decoded.value, context?.signal);
 			return decoded;
 		},
@@ -268,10 +285,10 @@ describe("PiProcess response correlation", () => {
 	it("reuses a settled public id with a fresh wire id without correlating the late old response", async () => {
 		const encodedIds: string[] = [];
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			encodeCommand(command) {
 				encodedIds.push(command.id);
-				return legacyRpcV1Adapter.encodeCommand(command);
+				return piRpcAdapter.encodeCommand(command);
 			},
 		};
 		proc = new PiProcess({
@@ -311,16 +328,13 @@ describe("PiProcess response correlation", () => {
 	});
 
 	it("never exposes the payload externalizer to an unknown-id orphan response", async () => {
-		const orphanContexts: Array<PiHostDecodeContext | undefined> = [];
+		const orphanContexts: Array<PiHostOrphanDecodeContext | undefined> = [];
 		const externalize = vi.fn();
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
-			decodeResponse(value, expectedCommand) {
-				return legacyRpcV1Adapter.decodeResponse(value, expectedCommand);
-			},
+			...piRpcAdapter,
 			decodeOrphanedResponse(value, context) {
 				orphanContexts.push(context);
-				return legacyRpcV1Adapter.decodeOrphanedResponse(value, context);
+				return piRpcAdapter.decodeOrphanedResponse(value, context);
 			},
 		};
 		proc = new PiProcess({
@@ -328,7 +342,12 @@ describe("PiProcess response correlation", () => {
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
 			payloadExternalizer: {
-				context: { serverEpoch: "orphan-test-epoch", payloadBudget: SESSION_PAYLOAD_BUDGET },
+				mode: "content_ref",
+				context: {
+					serverEpoch: "orphan-test-epoch",
+					payloadBudget: SESSION_PAYLOAD_BUDGET,
+					contentRefBudget: SESSION_CONTENT_REF_BUDGET,
+				},
 				externalize,
 			},
 		});
@@ -541,7 +560,9 @@ describe("PiProcess response correlation", () => {
 				cwd: process.cwd(),
 				resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 				adapter,
+				payloadExternalizer: futurePayloadExternalizer,
 				decodeTimeoutMs: 20,
+				onDecodedEvent: (delivery) => delivery.prepare(() => true),
 				onExit: (info) => exits.push(info),
 			});
 			await proc.start();
@@ -577,9 +598,9 @@ describe("PiProcess response correlation", () => {
 		const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
 		process.on("unhandledRejection", onUnhandledRejection);
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				if (outcome.value.kind !== "event" || outcome.value.event.type !== "agent_start") return outcome;
 				decodeStarted.resolve();
 				await releaseDecode.promise;
@@ -596,6 +617,7 @@ describe("PiProcess response correlation", () => {
 					label: "fake Pi",
 				},
 				adapter,
+				payloadExternalizer: futurePayloadExternalizer,
 				decodeTimeoutMs: 20,
 				onExit: (info) => exits.push(info),
 			});
@@ -625,13 +647,12 @@ describe("PiProcess response correlation", () => {
 		void options;
 	});
 
-	it("releases and fails closed when the inline-only event callback receives a lease", async () => {
+	it("releases and fails closed when canonical event delivery has no decoded consumer", async () => {
 		const leased = fakeLease();
-		const delivered: string[] = [];
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
 					? { value: outcome.value, lease: leased.lease }
 					: outcome;
@@ -641,26 +662,25 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
-			onEvent: (event) => delivered.push(event.type),
+			payloadExternalizer: futurePayloadExternalizer,
 		});
 		await proc.start();
 
 		await expect(proc.send({ type: "prompt", message: "ordered-async" })).rejects.toThrow(
-			"inline-only Pi event delivery cannot carry attachment holds",
+			"Pi event delivery requires a decoded consumer",
 		);
 		expect(leased.release).toHaveBeenCalledOnce();
-		expect(delivered).toEqual([]);
 	});
 
 	it("hands a leased event transfer to the decoded callback without releasing it", async () => {
 		const leased = fakeLease();
 		const order: string[] = [];
-		let claimed: PiPayloadLeaseTransfer | null | undefined;
+		let claimed: PiPayloadLeaseTransfer<EpochStoredContentRef> | null | undefined;
 		let consumerReturned = false;
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
 					? { value: outcome.value, lease: leased.lease }
 					: outcome;
@@ -670,6 +690,7 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 			onDecodedEvent: (delivery) => {
 				expect(delivery.value.type).toBe("agent_start");
 				const plan = delivery.prepare((transfer) => {
@@ -696,9 +717,9 @@ describe("PiProcess response correlation", () => {
 	it("returns a leased response transfer from sendDecoded without releasing it", async () => {
 		const leased = fakeLease();
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeResponse(value, expectedCommand, context) {
-				const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, context);
+				const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, context);
 				return expectedCommand === "prompt" ? { value: outcome.value, lease: leased.lease } : outcome;
 			},
 		};
@@ -706,10 +727,11 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 		});
 		await proc.start();
 
-		let claimed: PiPayloadLeaseTransfer | null | undefined;
+		let claimed: PiPayloadLeaseTransfer<EpochStoredContentRef> | null | undefined;
 		const response = await proc.sendDecoded(
 			{ id: "public-response", type: "prompt", message: "response" },
 			(delivery) => {
@@ -728,11 +750,11 @@ describe("PiProcess response correlation", () => {
 	});
 
 	it("delivers a future content lease as an EpochStoredContentRef transfer", async () => {
-		const leased = fakeMixedFutureLease();
+		const leased = fakeMixedCanonicalLease();
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
-			async decodeFutureResponse(value, expectedCommand, context: PiHostFutureDecodeContext) {
-				const outcome = await legacyRpcV1Adapter.decodeFutureResponse(value, expectedCommand, context);
+			...piRpcAdapter,
+			async decodeResponse(value, expectedCommand, context: PiHostDecodeContext) {
+				const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, context);
 				return expectedCommand === "prompt" ? { value: outcome.value, lease: leased.lease } : outcome;
 			},
 		};
@@ -745,7 +767,7 @@ describe("PiProcess response correlation", () => {
 		await proc.start();
 
 		let claimed: PiPayloadLeaseTransfer<EpochStoredContentRef> | null | undefined;
-		const response = await proc.sendFutureDecoded(
+		const response = await proc.sendDecoded(
 			{ id: "future-public-response", type: "prompt", message: "response" },
 			(delivery) =>
 				delivery.prepare((transfer) => {
@@ -761,81 +783,14 @@ describe("PiProcess response correlation", () => {
 		expect(leased.release).toHaveBeenCalledOnce();
 	});
 
-	it("rejects the current decoded-delivery API in future mode without skipping its consumer", async () => {
-		const consume: PiDecodedDeliveryConsumer<SessionCommandResponseDto> = vi.fn((delivery) =>
-			delivery.prepare(() => true),
-		);
-		proc = new PiProcess({
-			cwd: process.cwd(),
-			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
-			payloadExternalizer: futurePayloadExternalizer,
-		});
-		await proc.start();
-
-		await expect(proc.sendDecoded({ type: "get_state" }, consume)).rejects.toThrow(
-			"current decoded delivery is not available in future content mode",
-		);
-		expect(consume).not.toHaveBeenCalled();
-		expect(proc.running).toBe(true);
-	});
-
-	it.each([
-		["inline wrapper without a lease", false],
-		["leased wrapper", true],
-	] as const)("never leaks a future history %s through current send", async (_name, withLease) => {
-		const leased = fakeFutureLease();
-		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
-			async decodeFutureResponse(value, expectedCommand, context) {
-				const outcome = await legacyRpcV1Adapter.decodeFutureResponse(value, expectedCommand, context);
-				if (expectedCommand !== "get_messages") return outcome;
-				return {
-					value: {
-						type: "response",
-						id: outcome.value.id,
-						command: "get_messages",
-						success: true,
-						data: {
-							messages: [
-								{
-									role: "toolResult",
-									toolCallId: "tool-1",
-									toolName: "read",
-									content: [{ type: "text", text: "small" }],
-									details: { type: "inline_json", value: { ok: true } },
-									isError: false,
-									timestamp: 1,
-								},
-							],
-						},
-					},
-					lease: withLease ? leased.lease : null,
-				};
-			},
-		};
-		proc = new PiProcess({
-			cwd: process.cwd(),
-			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
-			adapter,
-			payloadExternalizer: futurePayloadExternalizer,
-		});
-		await proc.start();
-
-		await expect(proc.send({ type: "get_messages" })).rejects.toThrow(
-			"future content history responses require a decoded consumer",
-		);
-		if (withLease) expect(leased.release).toHaveBeenCalledOnce();
-		else expect(leased.release).not.toHaveBeenCalled();
-	});
-
 	it("releases a future content lease when its pending command times out during decode", async () => {
 		const responseStarted = deferred();
 		const releaseResponse = deferred();
-		const leased = fakeFutureLease();
+		const leased = fakeCanonicalLease();
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
-			async decodeFutureResponse(value, expectedCommand, context) {
-				const outcome = await legacyRpcV1Adapter.decodeFutureResponse(value, expectedCommand, context);
+			...piRpcAdapter,
+			async decodeResponse(value, expectedCommand, context) {
+				const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, context);
 				if (expectedCommand !== "prompt") return outcome;
 				responseStarted.resolve();
 				await releaseResponse.promise;
@@ -850,7 +805,7 @@ describe("PiProcess response correlation", () => {
 		});
 		await proc.start();
 
-		const command = proc.sendFutureDecoded(
+		const command = proc.sendDecoded(
 			{ type: "prompt", message: "response" },
 			(delivery) => delivery.prepare(() => true),
 			20,
@@ -866,11 +821,11 @@ describe("PiProcess response correlation", () => {
 	it("keeps a future response decode deadline local and releases its late union lease", async () => {
 		const responseStarted = deferred();
 		const releaseResponse = deferred();
-		const leased = fakeFutureLease();
+		const leased = fakeCanonicalLease();
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
-			async decodeFutureResponse(value, expectedCommand, context) {
-				const outcome = await legacyRpcV1Adapter.decodeFutureResponse(value, expectedCommand, context);
+			...piRpcAdapter,
+			async decodeResponse(value, expectedCommand, context) {
+				const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, context);
 				if (expectedCommand !== "prompt") return outcome;
 				responseStarted.resolve();
 				await releaseResponse.promise;
@@ -886,7 +841,7 @@ describe("PiProcess response correlation", () => {
 		});
 		await proc.start();
 
-		const command = proc.sendFutureDecoded({ type: "prompt", message: "response" }, (delivery) =>
+		const command = proc.sendDecoded({ type: "prompt", message: "response" }, (delivery) =>
 			delivery.prepare(() => true),
 		);
 		await responseStarted.promise;
@@ -917,13 +872,13 @@ describe("PiProcess response correlation", () => {
 	});
 
 	it("delivers future Extension UI through PreparedDecodedDelivery and transfers its lease", async () => {
-		const leased = fakeFutureLease();
+		const leased = fakeCanonicalLease();
 		const delivered: string[] = [];
 		let claimed: PiPayloadLeaseTransfer<EpochStoredContentRef> | null | undefined;
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
-			async decodeFutureUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeFutureUnsolicited(value, context);
+			...piRpcAdapter,
+			async decodeUnsolicited(value, context) {
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				return outcome.value.kind === "extension_ui_request"
 					? { value: outcome.value, lease: leased.lease }
 					: outcome;
@@ -934,7 +889,7 @@ describe("PiProcess response correlation", () => {
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
 			payloadExternalizer: futurePayloadExternalizer,
-			onFutureDecodedExtensionUiRequest: (delivery) => {
+			onDecodedExtensionUiRequest: (delivery) => {
 				delivered.push(delivery.value.id);
 				return delivery.prepare((transfer) => {
 					claimed = transfer;
@@ -955,12 +910,12 @@ describe("PiProcess response correlation", () => {
 	});
 
 	it("terminally releases a future Extension lease when its prepared consumer is missing", async () => {
-		const leased = fakeFutureLease();
+		const leased = fakeCanonicalLease();
 		const exits: Array<{ stderrTail: string }> = [];
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
-			async decodeFutureUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeFutureUnsolicited(value, context);
+			...piRpcAdapter,
+			async decodeUnsolicited(value, context) {
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				return outcome.value.kind === "extension_ui_request"
 					? { value: outcome.value, lease: leased.lease }
 					: outcome;
@@ -976,7 +931,7 @@ describe("PiProcess response correlation", () => {
 		await proc.start();
 
 		await expect(proc.send({ type: "prompt", message: "open-dialog" })).rejects.toThrow(
-			"future Pi Extension UI delivery requires a decoded consumer",
+			"Pi Extension UI delivery requires a decoded consumer",
 		);
 		await waitFor(() => exits.length === 1);
 		expect(leased.release).toHaveBeenCalledOnce();
@@ -986,13 +941,13 @@ describe("PiProcess response correlation", () => {
 	it("releases a stopped future Extension decode without delivering into the restarted spawn", async () => {
 		const extensionStarted = deferred();
 		const releaseExtension = deferred();
-		const leased = fakeFutureLease();
+		const leased = fakeCanonicalLease();
 		const delivered: string[] = [];
 		let extensionSignal: AbortSignal | undefined;
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
-			async decodeFutureUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeFutureUnsolicited(value, context);
+			...piRpcAdapter,
+			async decodeUnsolicited(value, context) {
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				if (outcome.value.kind !== "extension_ui_request") return outcome;
 				extensionSignal = context.signal;
 				extensionStarted.resolve();
@@ -1005,7 +960,7 @@ describe("PiProcess response correlation", () => {
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
 			payloadExternalizer: futurePayloadExternalizer,
-			onFutureDecodedExtensionUiRequest: (delivery) => {
+			onDecodedExtensionUiRequest: (delivery) => {
 				delivered.push(delivery.value.id);
 				return delivery.prepare(() => true);
 			},
@@ -1033,13 +988,13 @@ describe("PiProcess response correlation", () => {
 	it("keeps a future authoritative-event deadline terminal and releases its late union lease", async () => {
 		const eventStarted = deferred();
 		const releaseEvent = deferred();
-		const leased = fakeFutureLease();
+		const leased = fakeCanonicalLease();
 		const exits: Array<{ stderrTail: string }> = [];
 		let eventSignal: AbortSignal | undefined;
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
-			async decodeFutureUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeFutureUnsolicited(value, context);
+			...piRpcAdapter,
+			async decodeUnsolicited(value, context) {
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				if (outcome.value.kind !== "event" || outcome.value.event.type !== "agent_start") return outcome;
 				eventSignal = context.signal;
 				eventStarted.resolve();
@@ -1053,7 +1008,7 @@ describe("PiProcess response correlation", () => {
 			adapter,
 			payloadExternalizer: futurePayloadExternalizer,
 			decodeTimeoutMs: 20,
-			onFutureDecodedEvent: (delivery) => delivery.prepare(() => true),
+			onDecodedEvent: (delivery) => delivery.prepare(() => true),
 			onExit: (info) => exits.push(info),
 		});
 		await proc.start();
@@ -1072,13 +1027,13 @@ describe("PiProcess response correlation", () => {
 	it("releases a stopped future decode after restart without delivering into the new spawn", async () => {
 		const eventStarted = deferred();
 		const releaseEvent = deferred();
-		const leased = fakeFutureLease();
+		const leased = fakeCanonicalLease();
 		const delivered: string[] = [];
 		let eventSignal: AbortSignal | undefined;
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
-			async decodeFutureUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeFutureUnsolicited(value, context);
+			...piRpcAdapter,
+			async decodeUnsolicited(value, context) {
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				if (outcome.value.kind !== "event" || outcome.value.event.type !== "agent_start") return outcome;
 				eventSignal = context.signal;
 				eventStarted.resolve();
@@ -1091,7 +1046,7 @@ describe("PiProcess response correlation", () => {
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
 			payloadExternalizer: futurePayloadExternalizer,
-			onFutureDecodedEvent: (delivery) => {
+			onDecodedEvent: (delivery) => {
 				delivered.push(delivery.value.type);
 				return delivery.prepare(() => true);
 			},
@@ -1119,9 +1074,9 @@ describe("PiProcess response correlation", () => {
 	it("releases and rejects a decoded callback that returns true without claiming ownership", async () => {
 		const leased = fakeLease();
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
 					? { value: outcome.value, lease: leased.lease }
 					: outcome;
@@ -1131,34 +1086,13 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 			onDecodedEvent: (() => true) as unknown as PiDecodedDeliveryConsumer<ProductSessionEventDto>,
 		});
 		await proc.start();
 
 		await expect(proc.send({ type: "prompt", message: "ordered-async" })).rejects.toThrow(
 			"did not prepare its exact delivery",
-		);
-		expect(leased.release).toHaveBeenCalledOnce();
-	});
-
-	it("releases and fails closed when inline-only send receives a leased response", async () => {
-		const leased = fakeLease();
-		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
-			async decodeResponse(value, expectedCommand, context) {
-				const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, context);
-				return expectedCommand === "prompt" ? { value: outcome.value, lease: leased.lease } : outcome;
-			},
-		};
-		proc = new PiProcess({
-			cwd: process.cwd(),
-			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
-			adapter,
-		});
-		await proc.start();
-
-		await expect(proc.send({ type: "prompt", message: "leased-inline-response" })).rejects.toThrow(
-			"inline-only Pi response delivery cannot carry attachment holds",
 		);
 		expect(leased.release).toHaveBeenCalledOnce();
 	});
@@ -1176,9 +1110,9 @@ describe("PiProcess response correlation", () => {
 	] as const)("releases a leased event when the decoded callback returns %s", async (_name, callback) => {
 		const leased = fakeLease();
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
 					? { value: outcome.value, lease: leased.lease }
 					: outcome;
@@ -1188,6 +1122,7 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 			onDecodedEvent: callback as unknown as PiDecodedDeliveryConsumer<ProductSessionEventDto>,
 		});
 		await proc.start();
@@ -1212,9 +1147,9 @@ describe("PiProcess response correlation", () => {
 		const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
 		process.on("unhandledRejection", onUnhandledRejection);
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
 					? { value: outcome.value, lease: leased.lease }
 					: outcome;
@@ -1225,8 +1160,11 @@ describe("PiProcess response correlation", () => {
 				cwd: process.cwd(),
 				resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 				adapter,
+				payloadExternalizer: futurePayloadExternalizer,
 				onDecodedEvent: (delivery) =>
-					delivery.prepare(result as unknown as (transfer: PiPayloadLeaseTransfer | null) => true),
+					delivery.prepare(
+						result as unknown as (transfer: PiPayloadLeaseTransfer<EpochStoredContentRef> | null) => true,
+					),
 			});
 			await proc.start();
 
@@ -1243,9 +1181,9 @@ describe("PiProcess response correlation", () => {
 		const leased = fakeLease();
 		let commitCalled = false;
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
 					? { value: outcome.value, lease: leased.lease }
 					: outcome;
@@ -1255,6 +1193,7 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 			onDecodedEvent: (delivery) => {
 				const plan = delivery.prepare(() => {
 					commitCalled = true;
@@ -1274,11 +1213,11 @@ describe("PiProcess response correlation", () => {
 
 	it("does not release custody after a literal-true commit even when that commit stops the spawn", async () => {
 		const leased = fakeLease();
-		let ownedTransfer: PiPayloadLeaseTransfer | null | undefined;
+		let ownedTransfer: PiPayloadLeaseTransfer<EpochStoredContentRef> | null | undefined;
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
 					? { value: outcome.value, lease: leased.lease }
 					: outcome;
@@ -1288,6 +1227,7 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 			onDecodedEvent: (delivery) =>
 				delivery.prepare((transfer) => {
 					ownedTransfer = transfer;
@@ -1313,7 +1253,7 @@ describe("PiProcess response correlation", () => {
 			byteLength: 1,
 		};
 		const exactHold = Object.freeze({ ref: exactRef });
-		const releaseOwnedHold = vi.fn(async (_hold: EpochContentHold) => {});
+		const releaseOwnedHold = vi.fn(async (_hold: EpochContentHold<EpochStoredContentRef>) => {});
 		const owner = new GenerationContentOwner({
 			serverEpoch: exactRef.serverEpoch,
 			generation: 3,
@@ -1325,7 +1265,7 @@ describe("PiProcess response correlation", () => {
 			transferState = "released";
 			await releaseOwnedHold(exactHold);
 		});
-		const transfer: PiPayloadLeaseTransfer = {
+		const transfer: PiPayloadLeaseTransfer<EpochStoredContentRef> = {
 			refs: [exactRef],
 			adopt(accept) {
 				if (transferState !== "pending") throw new Error("transfer is not pending");
@@ -1334,7 +1274,7 @@ describe("PiProcess response correlation", () => {
 			},
 			release: transferRelease,
 		};
-		const lease: PiPayloadLease = {
+		const lease: PiPayloadLease<EpochStoredContentRef> = {
 			refs: [exactRef],
 			transfer: () => transfer,
 			release: async () => {
@@ -1343,9 +1283,9 @@ describe("PiProcess response correlation", () => {
 		};
 		const exits: Array<{ stderrTail: string }> = [];
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
 					? { value: outcome.value, lease }
 					: outcome;
@@ -1355,6 +1295,7 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 			onDecodedEvent: (delivery) =>
 				delivery.prepare((transfer) => {
 					if (!transfer) throw new Error("missing transfer");
@@ -1380,9 +1321,9 @@ describe("PiProcess response correlation", () => {
 	it("releases a leased event when no event callback is installed", async () => {
 		const leased = fakeLease();
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
 					? { value: outcome.value, lease: leased.lease }
 					: outcome;
@@ -1392,12 +1333,13 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 		});
 		await proc.start();
 
-		await expect(proc.send({ type: "prompt", message: "ordered-async" })).resolves.toMatchObject({
-			success: true,
-		});
+		await expect(proc.send({ type: "prompt", message: "ordered-async" })).rejects.toThrow(
+			"Pi event delivery requires a decoded consumer",
+		);
 		expect(leased.release).toHaveBeenCalledOnce();
 	});
 
@@ -1425,9 +1367,9 @@ describe("PiProcess response correlation", () => {
 		process.on("unhandledRejection", onUnhandledRejection);
 		try {
 			const adapter: PiHostAdapter = {
-				...legacyRpcV1Adapter,
+				...piRpcAdapter,
 				async decodeUnsolicited(value, context) {
-					const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+					const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 					return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
 						? { value: outcome.value, lease }
 						: outcome;
@@ -1442,6 +1384,7 @@ describe("PiProcess response correlation", () => {
 					label: "fake Pi",
 				},
 				adapter,
+				payloadExternalizer: futurePayloadExternalizer,
 				onDecodedEvent: (delivery) => delivery.prepare(() => true),
 				onExit: (info) => exits.push(info),
 			});
@@ -1465,9 +1408,9 @@ describe("PiProcess response correlation", () => {
 		const releaseResponse = deferred();
 		const leased = fakeLease();
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeResponse(value, expectedCommand, context) {
-				const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, context);
+				const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, context);
 				if (expectedCommand !== "prompt") return outcome;
 				responseStarted.resolve();
 				await releaseResponse.promise;
@@ -1478,10 +1421,16 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
+			onDecodedEvent: (delivery) => delivery.prepare(() => true),
 		});
 		await proc.start();
 
-		const command = proc.send({ type: "prompt", message: "ordered-async" }, 20);
+		const command = proc.sendDecoded(
+			{ type: "prompt", message: "ordered-async" },
+			(delivery) => delivery.prepare(() => true),
+			20,
+		);
 		await responseStarted.promise;
 		await expect(command).rejects.toThrow("command timed out");
 		releaseResponse.resolve();
@@ -1491,24 +1440,27 @@ describe("PiProcess response correlation", () => {
 
 	it("rejects a response-local delivery failure without terminating the Pi process", async () => {
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			decodeResponse(value, expectedCommand, context) {
 				if (expectedCommand === "prompt") {
 					throw new PiHostResponseExternalizationError("prompt", "cache_bytes_exhausted");
 				}
-				return legacyRpcV1Adapter.decodeResponse(value, expectedCommand, context);
+				return piRpcAdapter.decodeResponse(value, expectedCommand, context);
 			},
 		};
 		proc = new PiProcess({
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 		});
 		await proc.start();
 
-		await expect(proc.send({ type: "prompt", message: "response-local" })).rejects.toThrow(
-			"Gateway failed to deliver the Pi prompt response",
-		);
+		await expect(
+			proc.sendDecoded({ type: "prompt", message: "response-local" }, (delivery) =>
+				delivery.prepare(() => true),
+			),
+		).rejects.toThrow("Gateway failed to deliver the Pi prompt response");
 		await expect(proc.send({ type: "get_state" })).resolves.toMatchObject({
 			command: "get_state",
 			success: true,
@@ -1521,9 +1473,9 @@ describe("PiProcess response correlation", () => {
 		let responseSignal: AbortSignal | undefined;
 		const never = new Promise<void>(() => {});
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeResponse(value, expectedCommand, context) {
-				const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, context);
+				const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, context);
 				if (expectedCommand !== "prompt") return outcome;
 				responseSignal = context?.signal;
 				responseStarted.resolve();
@@ -1535,11 +1487,14 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 			decodeTimeoutMs: 20,
 		});
 		await proc.start();
 
-		const response = proc.send({ type: "prompt", message: "response-deadline" });
+		const response = proc.sendDecoded({ type: "prompt", message: "response-deadline" }, (delivery) =>
+			delivery.prepare(() => true),
+		);
 		await responseStarted.promise;
 		await expect(response).rejects.toMatchObject({
 			name: "PiHostResponseExternalizationError",
@@ -1553,9 +1508,9 @@ describe("PiProcess response correlation", () => {
 	it("uses its own deadline provenance when the adapter rejects from the operation abort signal", async () => {
 		const responseStarted = deferred();
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeResponse(value, expectedCommand, context) {
-				const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, context);
+				const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, context);
 				if (expectedCommand !== "prompt") return outcome;
 				responseStarted.resolve();
 				await new Promise<never>((_resolve, reject) => {
@@ -1571,11 +1526,14 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 			decodeTimeoutMs: 20,
 		});
 		await proc.start();
 
-		const response = proc.send({ type: "prompt", message: "deadline-abort-race" });
+		const response = proc.sendDecoded({ type: "prompt", message: "deadline-abort-race" }, (delivery) =>
+			delivery.prepare(() => true),
+		);
 		await responseStarted.promise;
 		await expect(response).rejects.toMatchObject({
 			name: "PiHostResponseExternalizationError",
@@ -1588,18 +1546,20 @@ describe("PiProcess response correlation", () => {
 	it("treats a typed response-local error from an authoritative event as terminal", async () => {
 		const exits: Array<{ stderrTail: string }> = [];
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			decodeUnsolicited(value, context) {
 				if ((value as { type?: string }).type === "agent_start") {
 					throw new PiHostResponseExternalizationError("get_messages", "cache_bytes_exhausted");
 				}
-				return legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				return piRpcAdapter.decodeUnsolicited(value, context);
 			},
 		};
 		proc = new PiProcess({
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
+			onDecodedEvent: (delivery) => delivery.prepare(() => true),
 			onExit: (info) => exits.push(info),
 		});
 		await proc.start();
@@ -1623,7 +1583,7 @@ describe("PiProcess response correlation", () => {
 			await releaseDecode.promise;
 			throw new PiProtocolIncompatibleError({
 				code: "protocol_incompatible",
-				adapterId: legacyRpcV1Adapter.id,
+				adapterId: piRpcAdapter.id,
 				frameKind: "event",
 				reason: "malformed_event",
 				frameType: "agent_start",
@@ -1633,7 +1593,9 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 			decodeTimeoutMs: 1_000,
+			onDecodedEvent: (delivery) => delivery.prepare(() => true),
 			onExit: (info) => exits.push(info),
 		});
 		await proc.start();
@@ -1665,7 +1627,7 @@ describe("PiProcess response correlation", () => {
 			await releaseDecode.promise;
 			throw new PiProtocolIncompatibleError({
 				code: "protocol_incompatible",
-				adapterId: legacyRpcV1Adapter.id,
+				adapterId: piRpcAdapter.id,
 				frameKind: "event",
 				reason: "malformed_event",
 				frameType: "agent_start",
@@ -2009,7 +1971,7 @@ describe("PiProcess response correlation", () => {
 	});
 
 	it("admits only a closed future event above 8 MiB and transfers its union lease", async () => {
-		const leased = fakeFutureLease();
+		const leased = fakeCanonicalLease();
 		const ref = leased.lease.refs[0];
 		const emptyLease: PiPayloadLease<EpochStoredContentRef> = {
 			refs: [],
@@ -2032,7 +1994,7 @@ describe("PiProcess response correlation", () => {
 				...futurePayloadExternalizer,
 				externalize,
 			},
-			onFutureDecodedEvent: (delivery) =>
+			onDecodedEvent: (delivery) =>
 				delivery.prepare((transfer) => {
 					claimed = transfer;
 					return true;
@@ -2042,9 +2004,9 @@ describe("PiProcess response correlation", () => {
 		externalize.mockClear();
 		const internals = proc as unknown as {
 			handleLine(line: string): Promise<void>;
-			currentJsonlLineBudget(): number;
+			jsonlLineBudget(): number;
 		};
-		expect(internals.currentJsonlLineBudget()).toBe(MAX_JSONL_FUTURE_CONTENT_LINE_BYTES);
+		expect(internals.jsonlLineBudget()).toBe(MAX_JSONL_CONTENT_REF_LINE_BYTES);
 
 		await internals.handleLine(
 			JSON.stringify({
@@ -2062,7 +2024,7 @@ describe("PiProcess response correlation", () => {
 	});
 
 	it("admits an exact future Extension root above 8 MiB and transfers its lease", async () => {
-		const leased = fakeFutureLease();
+		const leased = fakeCanonicalLease();
 		const ref = leased.lease.refs[0];
 		const externalize = vi.fn(async (input: PiPayloadExternalizerInput) => {
 			if (input.kind !== "extension_ui_request") return futurePayloadExternalizer.externalize(input);
@@ -2081,7 +2043,7 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			payloadExternalizer: { ...futurePayloadExternalizer, externalize },
-			onFutureDecodedExtensionUiRequest: (delivery) =>
+			onDecodedExtensionUiRequest: (delivery) =>
 				delivery.prepare((transfer) => {
 					claimed = transfer;
 					return true;
@@ -2210,7 +2172,7 @@ describe("PiProcess response correlation", () => {
 					type: "tool_execution_start",
 					toolCallId: "tool-1",
 					toolName: "tool",
-					args: "x".repeat(MAX_JSONL_FUTURE_CONTENT_LINE_BYTES),
+					args: "x".repeat(MAX_JSONL_CONTENT_REF_LINE_BYTES),
 				}),
 			),
 		).rejects.toMatchObject({

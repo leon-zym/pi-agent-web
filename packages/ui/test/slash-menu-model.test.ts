@@ -11,7 +11,16 @@ import {
 } from "../src/features/composer/slash-menu-model";
 
 function command(name: string, source: SlashCommandDto["source"]): SlashCommandDto {
-	return { name, source, sourceInfo: {} };
+	return {
+		name,
+		source,
+		sourceInfo: {
+			path: `/tmp/${name}.md`,
+			source: "test",
+			scope: "temporary",
+			origin: "top-level",
+		},
+	};
 }
 
 describe("slash menu model", () => {

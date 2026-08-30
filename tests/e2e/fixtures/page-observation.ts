@@ -40,6 +40,14 @@ export async function installWebSocketDropControl(page: Page): Promise<void> {
 				}
 			},
 		});
+		Object.defineProperty(window, "__piwebSendSocketFrameForE2e", {
+			configurable: true,
+			value: (frame: unknown) => {
+				const socket = sockets.findLast((candidate) => candidate.readyState === WebSocket.OPEN);
+				if (!socket) throw new Error("No open controlled WebSocket is available");
+				socket.send(JSON.stringify(frame));
+			},
+		});
 	});
 }
 
@@ -51,6 +59,16 @@ export async function dropControlledWebSockets(page: Page): Promise<void> {
 			}
 		).__piwebDropSocketsForE2e();
 	});
+}
+
+export async function sendControlledWebSocketFrame(page: Page, frame: unknown): Promise<void> {
+	await page.evaluate((value) => {
+		(
+			window as typeof window & {
+				__piwebSendSocketFrameForE2e: (frame: unknown) => void;
+			}
+		).__piwebSendSocketFrameForE2e(value);
+	}, frame);
 }
 
 export async function bootstrapBrowserSession(page: Page, origin: string): Promise<number> {

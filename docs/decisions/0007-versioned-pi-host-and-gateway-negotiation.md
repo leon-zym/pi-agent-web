@@ -1,7 +1,11 @@
 # ADR 0007: Versioned Pi host and Gateway negotiation
 
-- Status: Accepted
+- Status: Accepted; Browser/Gateway compatibility policy amended by ADR 0013
 - Date: 2026-08-25
+
+The Pi host and runtime-resolution decisions remain active. The Browser/Gateway minor-negotiation
+details below are historical pre-activation rationale; ADR 0013 and `docs/protocol.md` define the
+current single-version 1.3 contract and the terminal mismatch behavior.
 
 ## Context
 
@@ -11,7 +15,7 @@ protocol. A changed nested response could therefore fail inside UI projection, w
 event could put a persisted Session into a restart loop. Runtime resolution failure was also hidden
 behind a speculative `pi --mode rpc` fallback and an always-healthy endpoint.
 
-The Pi legacy RPC stream has no protocol version or capability discovery command. Browser and
+The documented Pi RPC stream has no protocol version or capability discovery command. Browser and
 Gateway builds can also update independently, so WebSocket compatibility cannot be inferred from
 the application package version.
 
@@ -24,9 +28,10 @@ the application package version.
    version-to-adapter capability matrix records the current distribution version and reviewed
    candidates. Missing, failed, mismatched, unsupported, and capability-deficient runtimes use
    stable redacted diagnostics.
-3. `PiHostAdapter` owns legacy command encoding and complete response, event, and Extension UI
-   decoding. The current `legacy-rpc-v1` adapter remains available while a future versioned Pi
-   protocol can implement the same product boundary.
+3. `PiHostAdapter` owns the upstream boundary, and `PiRpcAdapter` implements Pi's documented RPC
+   command encoding plus complete response, event, and Extension UI decoding. Its stable diagnostic
+   id is `pi-rpc`; a second adapter is introduced only if upstream publishes an evidenced,
+   incompatible protocol contract.
 4. Browser-facing commands, responses, events, messages, models, stats, trees, and Extension UI are
    product-owned DTOs with runtime guards and byte/item/depth limits. Provider routing data,
    response tokens, deferred handles, and diagnostic stacks are validated and removed at the
@@ -38,7 +43,8 @@ the application package version.
    negotiated Gateway protocol major/minor, server build and epoch, selected Pi version and adapter,
    capability
    intersection, and limits. Major mismatch and protocol errors are terminal and do not reconnect.
-   The same server epoch will later be carried by replay cursors under issue #17.
+   The current implementation carries the same server epoch in replay cursors and validates it
+   before replay or resync.
 7. `/api/v1/health/live` reports only Gateway process liveness. `/api/v1/health/ready` and the legacy
    `/health` alias report whether a validated Pi runtime is available; startup fails fast when the
    runtime cannot be validated.
@@ -57,7 +63,7 @@ the application package version.
 
 - **PATH-first resolution**: convenient but makes the installed product depend on unrelated local
   state.
-- **Semver-range acceptance without fixtures**: legacy RPC exposes no capability negotiation, so a
+- **Semver-range acceptance without fixtures**: Pi RPC exposes no capability negotiation, so a
   version range would claim compatibility that was not tested.
 - **Shallow envelope validation**: defers failures into Session projections and cannot distinguish
   malformed authoritative data from safe side channels.

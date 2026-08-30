@@ -1,11 +1,15 @@
 # ADR 0011: Epoch-scoped typed content references
 
-- Status: Accepted and activated
+- Status: Accepted and activated; compatibility wording amended by ADR 0013
 - Date: 2026-08-28
 
 Protocol 1.3 activation is part of the same release change as this document update. The accepted
 design below is unchanged; the activation state records the production contract after the atomic
 Main, Supervisor, Bridge, route, Browser, and documentation switch.
+
+The detailed decision below is historical rationale. ADR 0013 and `docs/protocol.md` define the
+current single-version Gateway contract; references to a 1.2 compatibility surface describe the
+pre-activation state and the explicit mismatch fixtures only.
 
 ## Context
 

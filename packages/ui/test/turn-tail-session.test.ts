@@ -1,4 +1,4 @@
-import type { SessionCommandDto, SessionCommandResponseDto } from "@pi-agent-web/protocol";
+import type { PiSessionCommandResponseDto, SessionCommandDto } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { forkFromEntry } from "../src/lib/session-controller";
 import { sessionTransport } from "../src/stores/session-transport";
@@ -25,7 +25,7 @@ describe("TurnTail Session targeting", () => {
 				sessionHandle: string,
 				command: SessionCommandDto,
 				_timeoutMs?: number,
-			): Promise<SessionCommandResponseDto> => {
+			): Promise<PiSessionCommandResponseDto> => {
 				expect(sessionHandle).toBe("session-turn");
 				expect(command).toEqual({ type: "fork", entryId: "entry-1" });
 				return {

@@ -34,7 +34,9 @@ test("settled complex turn renders rich content and restores tool context", asyn
 	);
 	expect(unsolicitedImageRequests).toEqual([]);
 	await expect(main.getByRole("button", { name: /edit.*src\/demo\.ts/i })).toBeVisible();
-	await expect(main.getByText("Inspecting synthetic workspace", { exact: true })).toBeVisible();
+	await expect(
+		main.getByText("Comparing the implementation with the requested behavior.", { exact: true }),
+	).toBeVisible();
 	await capture(page, "pi-agent-web-demo-desktop");
 
 	const visibleText = await page.locator("body").innerText();

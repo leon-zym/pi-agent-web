@@ -1,19 +1,16 @@
 import {
-	type FutureProductSessionEventDto,
-	type FutureSessionMessageDto,
 	isSessionContentRefDto,
-	type SessionEventDto,
+	type PiSessionEventDto,
+	type PiSessionMessageDto,
+	type ProductSessionEventDto,
 	type SessionExternalJsonDto,
 	type SessionExternalTextDto,
 	type SessionImageContentDto,
 	type SessionJsonValueDto,
 	type SessionMessageDto,
 } from "@pi-agent-web/protocol";
-import type {
-	FutureSessionJsonRootProjection,
-	FutureSessionTextPayloadProjection,
-} from "../lib/future-session-content-adapter";
 import { tt } from "../lib/i18n";
+import type { SessionJsonRootProjection, SessionTextPayloadProjection } from "../lib/session-content-adapter";
 import { presentUserMessage, serializePresentedUserMessage } from "../lib/user-message-presentation";
 import type {
 	AssistantStep,
@@ -23,7 +20,7 @@ import type {
 	StatusRow,
 	UiUserMessageSource,
 } from "../types/view-models";
-import type { SessionFrameProductMode } from "./session-frame-bus";
+import type { SessionFrameRepresentation } from "./session-frame-bus";
 
 /**
  * Pure stream assembler reducer.
@@ -41,7 +38,7 @@ import type { SessionFrameProductMode } from "./session-frame-bus";
 
 export interface ReducerContext {
 	now: number;
-	productMode?: SessionFrameProductMode;
+	representation?: SessionFrameRepresentation;
 	/** Map recently queued texts to their delivery mode (steer vs follow_up). */
 	resolveInjectionSource?: (text: string) => UiUserMessageSource | undefined;
 }
@@ -62,14 +59,14 @@ type ContentBlockLite = {
 	redacted?: boolean;
 };
 
-export type ProjectionSessionEvent = SessionEventDto | FutureProductSessionEventDto;
+export type ProjectionSessionEvent = PiSessionEventDto | ProductSessionEventDto;
 type ProjectionMessageStartEvent = {
 	type: "message_start";
-	message: SessionMessageDto | FutureSessionMessageDto;
+	message: PiSessionMessageDto | SessionMessageDto;
 };
 type ProjectionMessageEndEvent = {
 	type: "message_end";
-	message: SessionMessageDto | FutureSessionMessageDto;
+	message: PiSessionMessageDto | SessionMessageDto;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -107,13 +104,13 @@ function isExternalJson(value: unknown): value is SessionExternalJsonDto {
 	);
 }
 
-function projectFutureTextPayload(value: unknown): FutureSessionTextPayloadProjection {
+function projectTextPayload(value: unknown): SessionTextPayloadProjection {
 	if (typeof value === "string") return { kind: "inline", value };
 	if (isExternalText(value)) return { kind: "external", value };
-	throw new Error("Future Session text payload lost its trusted root shape");
+	throw new Error("Session text payload lost its trusted root shape");
 }
 
-function projectFutureJsonRoot(value: unknown): FutureSessionJsonRootProjection {
+function projectJsonRoot(value: unknown): SessionJsonRootProjection {
 	if (
 		isRecord(value) &&
 		value.type === "inline_json" &&
@@ -123,38 +120,38 @@ function projectFutureJsonRoot(value: unknown): FutureSessionJsonRootProjection 
 		return { kind: "inline", value: value.value };
 	}
 	if (isExternalJson(value)) return { kind: "external", value };
-	throw new Error("Future Session JSON payload lost its trusted root shape");
+	throw new Error("Session JSON payload lost its trusted root shape");
 }
 
 export function projectProjectionJsonValue(
 	value: unknown,
-	productMode: SessionFrameProductMode | undefined,
-): { value: unknown; payload?: FutureSessionJsonRootProjection } {
-	if (productMode !== "future") return { value };
-	const payload = projectFutureJsonRoot(value);
+	representation: SessionFrameRepresentation | undefined,
+): { value: unknown; payload?: SessionJsonRootProjection } {
+	if (representation !== "projected") return { value };
+	const payload = projectJsonRoot(value);
 	return { value: payload.kind === "inline" ? payload.value : undefined, payload };
 }
 
 export function projectProjectionTextValue(
 	value: unknown,
-	productMode: SessionFrameProductMode | undefined,
-): { text: string; payload?: FutureSessionTextPayloadProjection } {
-	if (productMode !== "future") return { text: typeof value === "string" ? value : "" };
-	const payload = projectFutureTextPayload(value);
+	representation: SessionFrameRepresentation | undefined,
+): { text: string; payload?: SessionTextPayloadProjection } {
+	if (representation !== "projected") return { text: typeof value === "string" ? value : "" };
+	const payload = projectTextPayload(value);
 	return { text: payload.kind === "inline" ? payload.value : "", payload };
 }
 
 export function projectProjectionTextSequence(
 	content: unknown,
-	productMode: SessionFrameProductMode | undefined,
-): { text: string; payloads?: FutureSessionTextPayloadProjection[] } {
+	representation: SessionFrameRepresentation | undefined,
+): { text: string; payloads?: SessionTextPayloadProjection[] } {
 	if (typeof content === "string") return { text: content };
 	if (!Array.isArray(content)) return { text: "" };
 	const text: string[] = [];
-	const payloads: FutureSessionTextPayloadProjection[] = [];
+	const payloads: SessionTextPayloadProjection[] = [];
 	for (const block of content) {
 		if (!isRecord(block) || block.type !== "text") continue;
-		const projected = projectProjectionTextValue(block.text, productMode);
+		const projected = projectProjectionTextValue(block.text, representation);
 		text.push(projected.text);
 		if (projected.payload) payloads.push(projected.payload);
 	}
@@ -469,12 +466,12 @@ function handleMessageUpdate(
 		case "toolcall_end": {
 			const res = ensureBlock(finalStep, inner.contentIndex, "tool_call");
 			if (res.block.type === "tool_call") {
-				const args = projectProjectionJsonValue(inner.toolCall.arguments, ctx.productMode);
+				const args = projectProjectionJsonValue(inner.toolCall.arguments, ctx.representation);
 				finalStep = replaceBlock(res.step, inner.contentIndex, {
 					...res.block,
 					toolCallId: inner.toolCall.id,
 					toolName: inner.toolCall.name,
-					...(ctx.productMode === "future"
+					...(ctx.representation === "projected"
 						? {
 								argsText:
 									args.payload?.kind === "external"
@@ -562,14 +559,14 @@ function handleMessageStart(
 				};
 			}
 			if (block.type === "toolCall") {
-				const args = projectProjectionJsonValue(block.arguments, ctx.productMode);
+				const args = projectProjectionJsonValue(block.arguments, ctx.representation);
 				return {
 					type: "tool_call" as const,
 					key,
 					toolCallId: block.id ?? "",
 					toolName: block.name ?? "",
 					argsText:
-						ctx.productMode === "future"
+						ctx.representation === "projected"
 							? args.payload?.kind === "external"
 								? ""
 								: (JSON.stringify(args.value) ?? "")
@@ -596,10 +593,10 @@ function handleMessageStart(
 		};
 		const last = ensured.turn.steps[ensured.turn.steps.length - 1];
 		if (!last) return state;
-		const content = projectProjectionTextSequence(toolResult.content, ctx.productMode);
+		const content = projectProjectionTextSequence(toolResult.content, ctx.representation);
 		const details =
-			ctx.productMode === "future" && toolResult.details !== undefined
-				? projectProjectionJsonValue(toolResult.details, ctx.productMode)
+			ctx.representation === "projected" && toolResult.details !== undefined
+				? projectProjectionJsonValue(toolResult.details, ctx.representation)
 				: { value: toolResult.details };
 		return withTurn(
 			ensured.state,
@@ -684,14 +681,14 @@ function handleMessageEnd(
 			const historicalError = markedLast.toolResults.some(
 				(result) => result.toolCallId === (block.id ?? "") && result.isError,
 			);
-			const args = projectProjectionJsonValue(block.arguments, ctx.productMode);
+			const args = projectProjectionJsonValue(block.arguments, ctx.representation);
 			return {
 				type: "tool_call" as const,
 				key,
 				toolCallId: block.id ?? "",
 				toolName: block.name ?? "",
 				argsText:
-					ctx.productMode === "future"
+					ctx.representation === "projected"
 						? args.payload?.kind === "external"
 							? ""
 							: (JSON.stringify(args.value) ?? "")
@@ -791,13 +788,13 @@ export function reduceProjection(
 
 		case "tool_execution_start": {
 			const ensured = ensureTurn(state, ctx);
-			const args = projectProjectionJsonValue(event.args, ctx.productMode);
+			const args = projectProjectionJsonValue(event.args, ctx.representation);
 			const updated = updateToolBlock(ensured.turn, event.toolCallId, (block) => ({
 				...block,
 				// A skipped block (stopReason length) must never flip back to running.
 				status: block.status === "skipped" ? "skipped" : "running",
 				args: args.value,
-				...(ctx.productMode === "future"
+				...(ctx.representation === "projected"
 					? {
 							argsText: args.payload?.kind === "external" ? "" : (JSON.stringify(args.value) ?? ""),
 						}
@@ -809,7 +806,7 @@ export function reduceProjection(
 
 		case "tool_execution_update": {
 			const ensured = ensureTurn(state, ctx);
-			const partialResult = projectProjectionJsonValue(event.partialResult, ctx.productMode);
+			const partialResult = projectProjectionJsonValue(event.partialResult, ctx.representation);
 			const partial = flattenPartialResult(partialResult.value);
 			const updated = updateToolBlock(ensured.turn, event.toolCallId, (block) => ({
 				...block,
@@ -821,7 +818,7 @@ export function reduceProjection(
 
 		case "tool_execution_end": {
 			const ensured = ensureTurn(state, ctx);
-			const result = projectProjectionJsonValue(event.result, ctx.productMode);
+			const result = projectProjectionJsonValue(event.result, ctx.representation);
 			const updated = updateToolBlock(ensured.turn, event.toolCallId, (block) => ({
 				...block,
 				status: block.status === "skipped" ? "skipped" : event.isError ? "error" : "done",

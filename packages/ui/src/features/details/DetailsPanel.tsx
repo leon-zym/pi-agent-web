@@ -1,6 +1,6 @@
 import {
 	expectCommandData,
-	type SessionEntryDto,
+	type PiSessionEntryDto,
 	type SessionRuntimeIdentityDto,
 } from "@pi-agent-web/protocol";
 import {
@@ -233,7 +233,7 @@ export function InspectorCodeSections({
 	);
 }
 
-function entryLabel(entry: SessionEntryDto): string {
+function entryLabel(entry: PiSessionEntryDto): string {
 	switch (entry.type) {
 		case "message": {
 			const message = entry.message;
@@ -284,7 +284,7 @@ function entryLabel(entry: SessionEntryDto): string {
 	}
 }
 
-function entryIcon(entry: SessionEntryDto) {
+function entryIcon(entry: PiSessionEntryDto) {
 	if (entry.type === "message" && entry.message.role === "user") return MessageSquare;
 	if (entry.type === "message" && entry.message.role === "assistant") return Bot;
 	if (entry.type === "model_change" || entry.type === "thinking_level_change") return ListTree;
@@ -676,7 +676,7 @@ export function DebugEventsRegion({
 }
 
 /**
- * Right details panel (DESIGN.md): inspector / conversation tree / debug drawer.
+ * Right details panel with inspector, conversation tree, and debug drawer.
  * The column width is owned by AppShell; closing keeps this subtree mounted.
  */
 export function DetailsPanel({ open, onToggle }: { open: boolean; onToggle: () => void }) {

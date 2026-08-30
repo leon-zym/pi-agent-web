@@ -1,14 +1,14 @@
 import type {
-	SessionMessageDto,
+	InlineSessionWsServerMessage,
+	PiSessionMessageDto,
 	SessionRuntimeIdentityDto,
-	SessionWsServerMessage,
 } from "@pi-agent-web/protocol";
-import type { ProjectedFutureSessionFrameMessage } from "../lib/future-session-content-adapter";
+import type { ProjectedSessionFrameMessage } from "../lib/session-content-adapter";
 
-export type SessionFrameProductMode = "current" | "future";
+export type SessionFrameRepresentation = "wire" | "projected";
 
-export type CurrentSessionFrameBusMessage = Exclude<
-	SessionWsServerMessage,
+export type WireSessionFrameBusMessage = Exclude<
+	InlineSessionWsServerMessage,
 	{ type: "response" } | { type: "session_directory_changed" } | { type: "auth_changed" }
 >;
 
@@ -18,13 +18,13 @@ export interface SessionHistoryPageLoadedFrame extends SessionRuntimeIdentityDto
 	requestId: string;
 	snapshotId: string;
 	asOfSeq: number;
-	messages: SessionMessageDto[];
+	messages: PiSessionMessageDto[];
 }
 
 export type SessionFrameBusMessage =
-	| CurrentSessionFrameBusMessage
+	| WireSessionFrameBusMessage
 	| SessionHistoryPageLoadedFrame
-	| ProjectedFutureSessionFrameMessage;
+	| ProjectedSessionFrameMessage;
 
 interface OrderedSessionFrameEnvelope {
 	order: number;
@@ -34,8 +34,8 @@ interface OrderedSessionFrameEnvelope {
 
 export type OrderedSessionFrame = OrderedSessionFrameEnvelope &
 	(
-		| { productMode: "current"; message: CurrentSessionFrameBusMessage | SessionHistoryPageLoadedFrame }
-		| { productMode: "future"; message: ProjectedFutureSessionFrameMessage }
+		| { representation: "wire"; message: WireSessionFrameBusMessage | SessionHistoryPageLoadedFrame }
+		| { representation: "projected"; message: ProjectedSessionFrameMessage }
 	);
 
 /** A listener may retain a frame for bounded asynchronous projection work. */
@@ -80,7 +80,7 @@ export class OrderedSessionFrameBus {
 
 	emit(
 		sessionHandle: string,
-		message: CurrentSessionFrameBusMessage,
+		message: WireSessionFrameBusMessage,
 		receivedAt: number,
 	): SessionFrameDeliveryResult;
 	emit(
@@ -90,16 +90,16 @@ export class OrderedSessionFrameBus {
 	): SessionFrameDeliveryResult;
 	emit(
 		sessionHandle: string,
-		message: ProjectedFutureSessionFrameMessage,
+		message: ProjectedSessionFrameMessage,
 		receivedAt: number,
-		productMode: "future",
+		representation: "projected",
 	): SessionFrameDeliveryResult;
 	emit(
 		sessionHandle: string,
 		...args:
-			| [message: CurrentSessionFrameBusMessage, receivedAt: number]
+			| [message: WireSessionFrameBusMessage, receivedAt: number]
 			| [message: SessionHistoryPageLoadedFrame, receivedAt: number]
-			| [message: ProjectedFutureSessionFrameMessage, receivedAt: number, productMode: "future"]
+			| [message: ProjectedSessionFrameMessage, receivedAt: number, representation: "projected"]
 	): SessionFrameDeliveryResult {
 		const order = (this.orderBySession.get(sessionHandle) ?? 0) + 1;
 		this.orderBySession.set(sessionHandle, order);
@@ -109,15 +109,15 @@ export class OrderedSessionFrameBus {
 						order,
 						receivedAt: args[1],
 						sessionHandle,
-						productMode: "current",
-						message: args[0] as CurrentSessionFrameBusMessage | SessionHistoryPageLoadedFrame,
+						representation: "wire",
+						message: args[0] as WireSessionFrameBusMessage | SessionHistoryPageLoadedFrame,
 					}
 				: {
 						order,
 						receivedAt: args[1],
 						sessionHandle,
-						productMode: "future",
-						message: args[0] as ProjectedFutureSessionFrameMessage,
+						representation: "projected",
+						message: args[0] as ProjectedSessionFrameMessage,
 					};
 		const result: SessionFrameDeliveryResult = { deferred: false, errors: [] };
 		for (const listener of this.listeners.get(sessionHandle) ?? []) this.deliver(listener, frame, result);
@@ -164,7 +164,7 @@ export class OrderedSessionFrameBus {
 }
 
 export type GlobalSessionTransportMessage = Extract<
-	SessionWsServerMessage,
+	InlineSessionWsServerMessage,
 	{ type: "session_directory_changed" } | { type: "auth_changed" } | { type: "hot_runtime_inventory" }
 >;
 

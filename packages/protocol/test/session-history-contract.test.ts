@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+	isInlineSessionWsServerMessage,
 	isSessionWsClientMessage,
-	isSessionWsServerMessage,
 	sessionHistoryChecksum,
 	sessionHistoryMessagesBytes,
 } from "../src/index.js";
@@ -98,23 +98,23 @@ function snapshotFrames() {
 describe("chunked Session history protocol", () => {
 	it("accepts a fenced snapshot stream and rejects payload corruption", () => {
 		const frames = snapshotFrames();
-		expect(isSessionWsServerMessage(frames.begin)).toBe(true);
-		expect(isSessionWsServerMessage(frames.chunk)).toBe(true);
-		expect(isSessionWsServerMessage(frames.end)).toBe(true);
+		expect(isInlineSessionWsServerMessage(frames.begin)).toBe(true);
+		expect(isInlineSessionWsServerMessage(frames.chunk)).toBe(true);
+		expect(isInlineSessionWsServerMessage(frames.end)).toBe(true);
 		expect(
-			isSessionWsServerMessage({
+			isInlineSessionWsServerMessage({
 				...frames.chunk,
 				checksum: "00000000",
 			}),
 		).toBe(false);
 		expect(
-			isSessionWsServerMessage({
+			isInlineSessionWsServerMessage({
 				...frames.chunk,
 				itemCount: frames.chunk.itemCount + 1,
 			}),
 		).toBe(false);
 		expect(
-			isSessionWsServerMessage({
+			isInlineSessionWsServerMessage({
 				...frames.begin,
 				history: {
 					...frames.begin.history,

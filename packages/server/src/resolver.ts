@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createLegacyRpcV1Adapter, legacyRpcV1Adapter } from "./legacy-rpc-v1.js";
 import { type PiCapability, type PiHostAdapter, PiHostProbeError } from "./pi-host-adapter.js";
+import { createPiRpcAdapter, piRpcAdapter } from "./pi-rpc-adapter.js";
 
 export type { PiCapability } from "./pi-host-adapter.js";
 
@@ -39,11 +39,11 @@ export class PiRuntimeDiagnosticError extends Error {
 export interface PiCompatibility {
 	version: string;
 	status: "current" | "candidate";
-	adapterId: "legacy-rpc-v1";
+	adapterId: "pi-rpc";
 	capabilities: readonly PiCapability[];
 }
 
-const LEGACY_RPC_CAPABILITIES = [
+const PI_RPC_CAPABILITIES = [
 	"session.create",
 	"session.open",
 	"session.fork",
@@ -62,14 +62,14 @@ export const PI_COMPATIBILITY_MATRIX: Readonly<Record<string, PiCompatibility>> 
 	"0.84.2": Object.freeze({
 		version: "0.84.2",
 		status: "current",
-		adapterId: "legacy-rpc-v1",
-		capabilities: Object.freeze([...LEGACY_RPC_CAPABILITIES]),
+		adapterId: "pi-rpc",
+		capabilities: Object.freeze([...PI_RPC_CAPABILITIES]),
 	}),
 	"0.84.3": Object.freeze({
 		version: "0.84.3",
 		status: "candidate",
-		adapterId: "legacy-rpc-v1",
-		capabilities: Object.freeze([...LEGACY_RPC_CAPABILITIES, "rpc.toolcall_identity"] as const),
+		adapterId: "pi-rpc",
+		capabilities: Object.freeze([...PI_RPC_CAPABILITIES, "rpc.toolcall_identity"] as const),
 	}),
 });
 
@@ -246,7 +246,7 @@ function resolveBundledCandidate(options: ResolveOptions): RuntimeCandidate {
 		args: [entry],
 		versionArgs: [packageInfo.cliEntry, "--version"],
 		packageVersion: packageInfo.version,
-		adapter: legacyRpcV1Adapter,
+		adapter: piRpcAdapter,
 		source: "bundled",
 		label: `bundled runtime (${entry})`,
 	};
@@ -286,7 +286,7 @@ function resolveExplicitPath(piPath: string, env: NodeJS.ProcessEnv): RuntimeCan
 				args: [entry],
 				versionArgs: [packageInfo.cliEntry, "--version"],
 				packageVersion: packageInfo.version,
-				adapter: legacyRpcV1Adapter,
+				adapter: piRpcAdapter,
 				source: "pi-path",
 				label: `PI_PATH (${entry})`,
 			};
@@ -305,7 +305,7 @@ function resolveExplicitPath(piPath: string, env: NodeJS.ProcessEnv): RuntimeCan
 			args: [resolved],
 			versionArgs: [packageInfo?.cliEntry ?? resolved, "--version"],
 			...(packageInfo ? { packageVersion: packageInfo.version } : {}),
-			adapter: legacyRpcV1Adapter,
+			adapter: piRpcAdapter,
 			source: "pi-path",
 			label: `PI_PATH (${resolved})`,
 		};
@@ -315,7 +315,7 @@ function resolveExplicitPath(piPath: string, env: NodeJS.ProcessEnv): RuntimeCan
 		command: resolved,
 		args: ["--mode", "rpc"],
 		versionArgs: ["--version"],
-		adapter: legacyRpcV1Adapter,
+		adapter: piRpcAdapter,
 		source: "pi-path",
 		label: `PI_PATH (${resolved})`,
 	};
@@ -397,7 +397,7 @@ export async function probePiRuntime(
 		);
 	}
 	assertRequiredPiCapabilities(compatibility, options.requiredCapabilities);
-	const adapter = createLegacyRpcV1Adapter(version, compatibility.capabilities);
+	const adapter = createPiRpcAdapter(version, compatibility.capabilities);
 	return {
 		command: candidate.command,
 		args: candidate.args,

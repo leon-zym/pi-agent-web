@@ -1,4 +1,4 @@
-import type { ProductSessionEventDto, SessionTreeNodeDto } from "@pi-agent-web/protocol";
+import type { PiProductSessionEventDto, PiSessionTreeNodeDto } from "@pi-agent-web/protocol";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import {
@@ -18,7 +18,7 @@ const event = {
 	generation: 7,
 	seq: 42,
 	eventType: "agent_start",
-	payload: { type: "agent_start", privateMarker: "only-in-payload" } as ProductSessionEventDto,
+	payload: { type: "agent_start", privateMarker: "only-in-payload" } as PiProductSessionEventDto,
 } satisfies SessionRawEventRecord;
 
 describe("details panel presenters", () => {
@@ -68,7 +68,7 @@ describe("details panel presenters", () => {
 	});
 
 	it("keeps branch folding and Fork as keyboard-focusable native controls", () => {
-		const child: SessionTreeNodeDto = {
+		const child: PiSessionTreeNodeDto = {
 			entry: {
 				type: "message",
 				id: "child",
@@ -78,7 +78,7 @@ describe("details panel presenters", () => {
 			},
 			children: [],
 		};
-		const root: SessionTreeNodeDto = {
+		const root: PiSessionTreeNodeDto = {
 			entry: {
 				type: "message",
 				id: "root",
@@ -105,7 +105,7 @@ describe("details panel presenters", () => {
 	});
 
 	it("uses a hidden layout spacer instead of an unnamed disabled control for a leaf", () => {
-		const leaf: SessionTreeNodeDto = {
+		const leaf: PiSessionTreeNodeDto = {
 			entry: {
 				type: "message",
 				id: "leaf",

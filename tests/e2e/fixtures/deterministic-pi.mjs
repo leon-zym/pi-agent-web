@@ -33,8 +33,9 @@ const deferNewSessionFile =
 	(process.env.PI_WEB_E2E_DEFER_NEW_SESSION_FILE === "1" ||
 		countRecordedStarts(markerPath) >= deferNewSessionFileAfterStarts);
 const recoveryFeatures = process.env.PI_WEB_E2E_RECOVERY_FEATURES === "1";
-// This branch is inert unless the explicitly opt-in private Browser fixture asks for it.
-const futureContentRefFixture = process.env.PI_WEB_E2E_CONTENT_REF_FIXTURE === "1";
+const longContextCost = process.env.PI_WEB_E2E_LONG_CONTEXT_COST === "1";
+// This branch is inert unless the default Browser content-reference fixture asks for it.
+const contentReferenceFixture = process.env.PI_WEB_E2E_CONTENT_REF_FIXTURE === "1";
 let delayedExistingState = false;
 
 let sessionId = requestedId ?? `browser-e2e-${String(process.pid)}`;
@@ -341,19 +342,19 @@ function scheduleSlowFinish(run, text, callback) {
 	check();
 }
 
-function scheduleConsumedRelease(run, text, eventType, callback) {
+function scheduleConsumedSignal(run, text, signal, eventType, callback) {
 	if (!controlDir) {
-		schedule(run, slowDelayMs, callback);
+		schedule(run, signal === "release" ? slowDelayMs : 0, callback);
 		return;
 	}
-	const releaseFile = path.join(controlDir, `${encodeURIComponent(text)}.release`);
+	const signalFile = path.join(controlDir, `${encodeURIComponent(text)}.${signal}`);
 	const check = () => {
 		schedule(run, 25, () => {
-			if (!fs.existsSync(releaseFile)) {
+			if (!fs.existsSync(signalFile)) {
 				check();
 				return;
 			}
-			fs.unlinkSync(releaseFile);
+			fs.unlinkSync(signalFile);
 			record(eventType, { commandId: run.command.id, text });
 			callback();
 		});
@@ -361,12 +362,19 @@ function scheduleConsumedRelease(run, text, eventType, callback) {
 	check();
 }
 
+function scheduleConsumedRelease(run, text, eventType, callback) {
+	scheduleConsumedSignal(run, text, "release", eventType, callback);
+}
+
 function streamComplexPrompt(command, text, user, userEntryId) {
+	const longUiFixture = text === "E2E_COMPLEX_LONG_FILE";
 	const thinking =
 		"\u001b[36mInspecting synthetic workspace\u001b[0m\nComparing the implementation with the requested behavior.";
 	const toolCallId = `${sessionId}-complex-edit`;
 	const toolArgs = {
-		file_path: "src/demo.ts",
+		file_path: longUiFixture
+			? "src/非常长的目录名称/更长的子目录/用于验证本地化布局不会挤压的文件名.tsx"
+			: "src/demo.ts",
 		description: "Normalize status labels",
 	};
 	const toolCall = { type: "toolCall", id: toolCallId, name: "edit", arguments: toolArgs };
@@ -377,6 +385,7 @@ function streamComplexPrompt(command, text, user, userEntryId) {
 		" export function formatStatus(status: string) {",
 		"-  return status;",
 		"+  return status.toUpperCase();",
+		...(longUiFixture ? [`+  const uiCollisionSentinel = "${"W".repeat(240)}";`] : []),
 		" }",
 	].join("\n");
 	const markdown = [
@@ -909,7 +918,14 @@ function budgetMarkdown(targetBytes) {
 	return `${body.slice(0, low)}${suffix}`;
 }
 
-function streamBudgetPrompt(command, text, user, userEntryId, targetBytes) {
+function streamBudgetPrompt(
+	command,
+	text,
+	user,
+	userEntryId,
+	targetBytes,
+	{ chunkSize = 4 * 1024, firstChunkDelayMs = 500, chunkDelayMs = 10, waitForBenchmarkStart = false } = {},
+) {
 	const markdown = budgetMarkdown(targetBytes);
 	const run = {
 		kind: "stream-budget",
@@ -946,10 +962,15 @@ function streamBudgetPrompt(command, text, user, userEntryId, targetBytes) {
 		assistantMessageEvent: { type: "text_start", contentIndex: 0 },
 	});
 
-	const chunkSize = 4 * 1024;
 	const finishRun = () => {
 		if (activeRun !== run) return;
-		record("stream_end", { commandId: command.id, text, targetBytes, markdownChars: markdown.length });
+		record("stream_end", {
+			commandId: command.id,
+			text,
+			targetBytes,
+			markdownChars: markdown.length,
+			deltaCount: run.deltaIndex,
+		});
 		// Let the browser acknowledge the final delta before the structural text_end
 		// commit is released, keeping the performance fixture's phases deterministic.
 		const finishAfterStreamEnd = () => {
@@ -1020,13 +1041,18 @@ function streamBudgetPrompt(command, text, user, userEntryId, targetBytes) {
 			if (run.deltaIndex === 1 || run.deltaIndex % 16 === 0) {
 				record("delta", { commandId: command.id, text, deltaIndex: run.deltaIndex, targetBytes });
 			}
-			schedule(run, run.deltaIndex === 1 ? 500 : 10, emitChunk);
+			schedule(run, run.deltaIndex === 1 ? firstChunkDelayMs : chunkDelayMs, emitChunk);
 			return;
 		}
 		finishRun();
 	};
 
-	schedule(run, 250, emitChunk);
+	const beginStreaming = () => schedule(run, 250, emitChunk);
+	if (waitForBenchmarkStart) {
+		scheduleConsumedSignal(run, text, "start", "benchmark_start_observed", beginStreaming);
+	} else {
+		beginStreaming();
+	}
 }
 
 function startUnpersistedHotRuntime() {
@@ -1375,7 +1401,7 @@ function finishExtensionPrompt(response) {
 	if (finishExtensionUiCompatPrompt(response)) return;
 	if (finishExtensionUiScopedPrompt(response)) return;
 	const run = activeRun;
-	if (run?.kind === "future-content" && response.id === run.requestId) {
+	if (run?.kind === "content-reference" && response.id === run.requestId) {
 		run.extensionResponse = response;
 		record("extension_response", {
 			commandId: run.command.id,
@@ -1383,7 +1409,7 @@ function finishExtensionPrompt(response) {
 			confirmed: response.confirmed === true,
 			cancelled: response.cancelled === true,
 		});
-		finishFutureContentPrompt(run);
+		finishContentReferencePrompt(run);
 		return;
 	}
 	if (run?.kind === "reload-checkpoint" && response.id === run.requestId) {
@@ -1584,7 +1610,7 @@ function streamReloadCheckpointPrompt(command, text, user, userEntryId) {
 	});
 }
 
-function futureText(label, targetBytes = 320 * 1024) {
+function contentReferenceText(label, targetBytes = 320 * 1024) {
 	const prefix = `${label}:START\n`;
 	const suffix = `\n${label}:END`;
 	const available = targetBytes - Buffer.byteLength(prefix + suffix);
@@ -1597,19 +1623,19 @@ function futureText(label, targetBytes = 320 * 1024) {
 	return `${prefix}${body.slice(0, available)}${suffix}`;
 }
 
-function futureJson(label) {
+function contentReferenceJson(label) {
 	return {
-		fixture: "private-content-ref-l3",
+		fixture: "content-reference",
 		root: label,
 		markerStart: `${label}:JSON_START`,
-		body: futureText(`${label}:BODY`),
+		body: contentReferenceText(`${label}:BODY`),
 		markerEnd: `${label}:JSON_END`,
 	};
 }
 
-function finishFutureContentPrompt(run) {
+function finishContentReferencePrompt(run) {
 	if (activeRun !== run || !run.extensionResponse) return;
-	const final = assistantMessage("E2E_FUTURE_CONTENT_REFS_READY");
+	const final = assistantMessage("E2E_CONTENT_REFERENCES_READY");
 	send({ type: "message_start", message: final });
 	send({ type: "message_end", message: final });
 	send({ type: "turn_end", message: final, toolResults: [run.toolResult] });
@@ -1620,31 +1646,31 @@ function finishFutureContentPrompt(run) {
 	record("settled", {
 		commandId: run.command.id,
 		text: run.text,
-		label: "future-content-refs",
+		label: "content-references",
 		extensionConfirmed: run.extensionResponse.confirmed === true,
 	});
 	activeRun = null;
 }
 
-function streamFutureContentPrompt(command, text, user, userEntryId) {
-	const toolCallId = `${sessionId}-future-content-tool`;
-	const requestId = `${sessionId}-future-editor`;
-	const toolArgs = futureJson("FUTURE_TOOL_ARGS");
-	const partialResult = futureJson("FUTURE_PARTIAL_RESULT");
-	const result = futureJson("FUTURE_TOOL_RESULT");
-	const toolDetails = futureJson("FUTURE_TOOL_DETAILS");
-	const toolCall = { type: "toolCall", id: toolCallId, name: "future-edit", arguments: toolArgs };
+function streamContentReferencePrompt(command, text, user, userEntryId) {
+	const toolCallId = `${sessionId}-content-reference-tool`;
+	const requestId = `${sessionId}-content-reference-editor`;
+	const toolArgs = contentReferenceJson("CONTENT_REFERENCE_TOOL_ARGS");
+	const partialResult = contentReferenceJson("CONTENT_REFERENCE_PARTIAL_RESULT");
+	const result = contentReferenceJson("CONTENT_REFERENCE_TOOL_RESULT");
+	const toolDetails = contentReferenceJson("CONTENT_REFERENCE_TOOL_DETAILS");
+	const toolCall = { type: "toolCall", id: toolCallId, name: "content-ref-edit", arguments: toolArgs };
 	const toolResult = toolResultMessage(
 		toolCallId,
 		toolDetails,
 		Date.now(),
-		"future-edit",
-		futureText("FUTURE_TOOL_TEXT"),
+		"content-ref-edit",
+		contentReferenceText("CONTENT_REFERENCE_TOOL_TEXT"),
 	);
 	const run = {
-		kind: "future-content",
+		kind: "content-reference",
 		command,
-		label: "future-content-refs",
+		label: "content-references",
 		timers: [],
 		assembled: "",
 		user,
@@ -1670,7 +1696,7 @@ function streamFutureContentPrompt(command, text, user, userEntryId) {
 		imageMimeTypes: [],
 		imageChars: 0,
 		slow: false,
-		futureContentRefs: true,
+		contentReferences: true,
 	});
 
 	send({ type: "agent_start" });
@@ -1708,18 +1734,18 @@ function streamFutureContentPrompt(command, text, user, userEntryId) {
 		messages.push(toolUse);
 		const toolUseEntryId = persistMessage(toolUse, userEntryId);
 
-		send({ type: "tool_execution_start", toolCallId, toolName: "future-edit", args: toolArgs });
+		send({ type: "tool_execution_start", toolCallId, toolName: "content-ref-edit", args: toolArgs });
 		send({
 			type: "tool_execution_update",
 			toolCallId,
-			toolName: "future-edit",
+			toolName: "content-ref-edit",
 			args: toolArgs,
 			partialResult,
 		});
 		send({
 			type: "tool_execution_end",
 			toolCallId,
-			toolName: "future-edit",
+			toolName: "content-ref-edit",
 			result,
 			isError: false,
 		});
@@ -1730,26 +1756,29 @@ function streamFutureContentPrompt(command, text, user, userEntryId) {
 
 		send({
 			type: "extension_ui_request",
-			id: `${sessionId}-future-editor-text`,
+			id: `${sessionId}-content-reference-editor-text`,
 			method: "set_editor_text",
-			text: futureText("FUTURE_SET_EDITOR_TEXT"),
+			text: contentReferenceText("CONTENT_REFERENCE_SET_EDITOR_TEXT"),
 		});
 		send({
 			type: "extension_ui_request",
-			id: `${sessionId}-future-widget`,
+			id: `${sessionId}-content-reference-widget`,
 			method: "setWidget",
-			widgetKey: "future-content",
-			widgetLines: [futureText("FUTURE_WIDGET_LINE_1"), futureText("FUTURE_WIDGET_LINE_2")],
+			widgetKey: "content-reference",
+			widgetLines: [
+				contentReferenceText("CONTENT_REFERENCE_WIDGET_LINE_1"),
+				contentReferenceText("CONTENT_REFERENCE_WIDGET_LINE_2"),
+			],
 			widgetPlacement: "belowEditor",
 		});
 		send({
 			type: "extension_ui_request",
 			id: requestId,
 			method: "editor",
-			title: "Future content reference editor",
-			prefill: futureText("FUTURE_EDITOR_PREFILL"),
+			title: "Content reference editor",
+			prefill: contentReferenceText("CONTENT_REFERENCE_EDITOR_PREFILL"),
 		});
-		record("future_content_checkpoint", {
+		record("content_reference_checkpoint", {
 			commandId: command.id,
 			text,
 			toolCallId,
@@ -1784,11 +1813,24 @@ function streamPrompt(command) {
 	const user = { role: "user", content: userContent, timestamp: Date.now() };
 	const userEntryId = persistMessage(user, null);
 	messages.push(user);
-	if (futureContentRefFixture && text === "E2E_FUTURE_CONTENT_REFS" && images.length === 0) {
-		streamFutureContentPrompt(command, text, user, userEntryId);
+	if (text.startsWith("E2E_BENCH_CRASH:") && images.length === 0) {
+		record("prompt", {
+			commandId: command.id,
+			text,
+			imageCount: 0,
+			imageMimeTypes: [],
+			imageChars: 0,
+			slow: false,
+		});
+		record("crash_requested", { commandId: command.id, text });
+		setTimeout(() => process.exit(42), 25);
 		return;
 	}
-	if (text === "E2E_COMPLEX_DEMO" && images.length === 0) {
+	if (contentReferenceFixture && text === "E2E_CONTENT_REFERENCES" && images.length === 0) {
+		streamContentReferencePrompt(command, text, user, userEntryId);
+		return;
+	}
+	if ((text === "E2E_COMPLEX_DEMO" || text === "E2E_COMPLEX_LONG_FILE") && images.length === 0) {
 		streamComplexPrompt(command, text, user, userEntryId);
 		return;
 	}
@@ -1809,6 +1851,31 @@ function streamPrompt(command) {
 		}[text];
 		if (targetBytes) {
 			streamBudgetPrompt(command, text, user, userEntryId, targetBytes);
+			return;
+		}
+	}
+	if (text.startsWith("E2E_BENCH_STREAM:") && images.length === 0) {
+		const [, rawTargetBytes, rawChunkSize, rawChunkDelayMs, benchmarkLabel] = text.split(":", 5);
+		const targetBytes = Number(rawTargetBytes);
+		const chunkSize = Number(rawChunkSize);
+		const chunkDelayMs = Number(rawChunkDelayMs);
+		if (
+			Number.isSafeInteger(targetBytes) &&
+			targetBytes >= 10 * 1024 &&
+			targetBytes <= 1024 * 1024 &&
+			Number.isSafeInteger(chunkSize) &&
+			chunkSize >= 64 &&
+			chunkSize <= 4 * 1024 &&
+			Number.isSafeInteger(chunkDelayMs) &&
+			chunkDelayMs >= 0 &&
+			chunkDelayMs <= 100
+		) {
+			streamBudgetPrompt(command, text, user, userEntryId, targetBytes, {
+				chunkSize,
+				firstChunkDelayMs: 50,
+				chunkDelayMs,
+				waitForBenchmarkStart: benchmarkLabel?.startsWith("g") ?? false,
+			});
 			return;
 		}
 	}
@@ -1838,6 +1905,7 @@ function streamPrompt(command) {
 		images.length > 0 && !text
 			? `E2E_IMAGE_OK:${String(images.length)}:${images[0]?.mimeType ?? "unknown"}`
 			: `E2E_REPLY:${text}`;
+	const benchmarkGap = text.startsWith("E2E_BENCH_GAP:");
 	const slow = text.includes("E2E_A_SLOW");
 	const firstDelay = slow ? Math.min(500, Math.floor(slowDelayMs / 3)) : 25;
 	const finishDelay = 90;
@@ -1861,7 +1929,7 @@ function streamPrompt(command) {
 	send({ type: "message_start", message: user });
 	send({ type: "message_end", message: user });
 	send({ type: "session_info_changed" });
-	send({ type: "message_start", message: assistantMessage("") });
+	send({ type: "message_start", message: assistantMessageWithContent([], "pending") });
 	respond(command);
 
 	schedule(run, firstDelay, () => {
@@ -1893,7 +1961,19 @@ function streamPrompt(command) {
 		record("settled", { commandId: command.id, text, label });
 		activeRun = null;
 	};
-	if (slow) scheduleSlowFinish(run, text, finish);
+	if (benchmarkGap) {
+		scheduleConsumedSignal(run, text, "gap", "benchmark_gap_observed", () => {
+			send({
+				type: "extension_ui_request",
+				id: `${sessionId}-benchmark-gap-${command.id}`,
+				method: "notify",
+				message: "E2E_BENCHMARK_TRANSIENT_GAP",
+				notifyType: "info",
+			});
+			record("benchmark_gap_emitted", { commandId: command.id, text });
+			schedule(run, 25, finish);
+		});
+	} else if (slow) scheduleSlowFinish(run, text, finish);
 	else schedule(run, finishDelay, finish);
 }
 
@@ -1960,13 +2040,23 @@ function handleLine(line) {
 								name: "review",
 								description: "Review the current implementation",
 								source: "prompt",
-								sourceInfo: { path: "/synthetic/review.md" },
+								sourceInfo: {
+									path: "/synthetic/review.md",
+									source: "synthetic",
+									scope: "temporary",
+									origin: "top-level",
+								},
 							},
 							{
 								name: "skill:e2e",
 								description: "Synthetic acceptance skill",
 								source: "skill",
-								sourceInfo: { path: "/synthetic/e2e/SKILL.md" },
+								sourceInfo: {
+									path: "/synthetic/e2e/SKILL.md",
+									source: "synthetic",
+									scope: "temporary",
+									origin: "top-level",
+								},
 							},
 						]
 					: [],
@@ -2019,7 +2109,7 @@ function handleLine(line) {
 				tokens: recoveryFeatures
 					? { input: 32_000, output: 12_000, cacheRead: 0, cacheWrite: 0, total: 44_000 }
 					: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 },
-				cost: 0,
+				cost: longContextCost ? 1_234_567.89 : 0,
 				contextUsage: recoveryFeatures
 					? { tokens: 44_000, contextWindow: 128_000, percent: 34.375 }
 					: { tokens: null, contextWindow: 128_000, percent: null },

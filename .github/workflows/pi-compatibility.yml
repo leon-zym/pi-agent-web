@@ -6,7 +6,7 @@ on:
     paths:
       - "packages/protocol/**"
       - "packages/server/package.json"
-      - "packages/server/src/legacy-rpc-v1*.ts"
+      - "packages/server/src/pi-rpc*.ts"
       - "packages/server/src/pi-host-adapter.ts"
       - "packages/server/src/resolver.ts"
       - "packages/server/test/fixtures/pi-compatibility/**"
@@ -39,4 +39,3 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm test:compat
-      - run: pnpm --filter @pi-agent-web/protocol bench:schema

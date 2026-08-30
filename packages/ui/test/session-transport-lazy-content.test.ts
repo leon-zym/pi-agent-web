@@ -1,26 +1,25 @@
 import {
-	FUTURE_SESSION_CONTENT_REF_BUDGET,
-	type FutureSessionContentRefGuardContext,
-	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
-	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
 	type GatewayClientHelloDto,
 	type GatewayServerHelloDto,
+	type InlineSessionWsServerMessage,
+	SESSION_CONTENT_REF_BUDGET,
 	SESSION_PAYLOAD_BUDGET,
+	type SessionContentRefGuardContext,
 	type SessionJsonRootDto,
 	type SessionRuntimeDto,
 	type SessionRuntimeIdentityDto,
 	type SessionWsClientMessage,
-	type SessionWsServerMessage,
 } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-	createFutureSessionContentAdapter,
-	type FutureSessionContentAdapter,
-	type FutureSessionExtensionMaterializer,
-	type FutureSessionJsonFieldGuard,
-	type FutureSessionJsonRootProjection,
-	type FutureSessionTextPayloadProjection,
-} from "../src/lib/future-session-content-adapter";
+	createSessionContentAdapter,
+	type SessionContentAdapter,
+	type SessionExtensionMaterializer,
+	type SessionJsonFieldGuard,
+	type SessionJsonRootProjection,
+	type SessionTextPayloadProjection,
+} from "../src/lib/session-content-adapter";
 import {
 	createSessionTransport,
 	type SessionTransportController,
@@ -29,12 +28,12 @@ import {
 
 const EPOCH = "lazy-content-epoch";
 const WORKSPACE = "lazy-content-workspace";
-const CONTENT_BYTES = FUTURE_SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes;
+const CONTENT_BYTES = SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes;
 
-const trustedContext: FutureSessionContentRefGuardContext = Object.freeze({
+const trustedContext: SessionContentRefGuardContext = Object.freeze({
 	serverEpoch: EPOCH,
 	payloadBudget: SESSION_PAYLOAD_BUDGET,
-	contentRefBudget: FUTURE_SESSION_CONTENT_REF_BUDGET,
+	contentRefBudget: SESSION_CONTENT_REF_BUDGET,
 });
 
 class FakeSocket implements SessionWebSocket {
@@ -62,7 +61,7 @@ class FakeSocket implements SessionWebSocket {
 		});
 	}
 
-	serverMessage(message: SessionWsServerMessage | GatewayServerHelloDto): void {
+	serverMessage(message: InlineSessionWsServerMessage | GatewayServerHelloDto): void {
 		this.onmessage?.({ data: JSON.stringify(message) });
 	}
 
@@ -87,25 +86,19 @@ const controllers: SessionTransportController[] = [];
 function serverHello(serverEpoch: string): GatewayServerHelloDto {
 	return {
 		type: "server_hello",
-		protocol: { major: 1, minor: 2 },
+		protocol: { major: 1, minor: 3 },
 		serverBuild: "lazy-content-test-server",
 		serverEpoch,
 		piVersion: "0.84.2",
 		adapterId: "lazy-content-test-adapter",
-		capabilities: [
-			"rpc.commands",
-			"rpc.events",
-			"rpc.extension_ui",
-			"session.multiplex",
-			GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
-			GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
-		],
+		capabilities: [...GATEWAY_SERVER_REQUIRED_CAPABILITIES],
 		limits: {
 			maxClientFrameBytes: 8 * 1024 * 1024,
 			maxSnapshotFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes,
 			maxExtensionRequests: 256,
 		},
 		payloadBudget: SESSION_PAYLOAD_BUDGET,
+		contentRefBudget: SESSION_CONTENT_REF_BUDGET,
 	};
 }
 
@@ -150,21 +143,21 @@ function contentRef(digest: string, serverEpoch = EPOCH) {
 	};
 }
 
-function externalText(digest = "a"): FutureSessionTextPayloadProjection {
+function externalText(digest = "a"): SessionTextPayloadProjection {
 	return { kind: "external", value: { type: "external_text", ref: contentRef(digest) } };
 }
 
-function externalJson(digest = "b"): FutureSessionJsonRootProjection {
+function externalJson(digest = "b"): SessionJsonRootProjection {
 	return { kind: "external", value: { type: "external_json", ref: contentRef(digest) } };
 }
 
 function adapter(
 	options: {
-		resolveText?: NonNullable<FutureSessionExtensionMaterializer["resolveText"]>;
-		resolveJson?: NonNullable<FutureSessionExtensionMaterializer["resolveJson"]>;
+		resolveText?: NonNullable<SessionExtensionMaterializer["resolveText"]>;
+		resolveJson?: NonNullable<SessionExtensionMaterializer["resolveJson"]>;
 	} = {},
-): FutureSessionContentAdapter {
-	return createFutureSessionContentAdapter({
+): SessionContentAdapter {
+	return createSessionContentAdapter({
 		trustedContext,
 		resolver: {
 			materializeExtensionRequest: async (request) => request,
@@ -174,8 +167,8 @@ function adapter(
 }
 
 function harness(
-	futureContentAdapter?: FutureSessionContentAdapter,
-	onResyncRequired?: (message: Extract<SessionWsServerMessage, { type: "resync_required" }>) => void,
+	contentAdapter?: SessionContentAdapter,
+	onResyncRequired?: (message: Extract<InlineSessionWsServerMessage, { type: "resync_required" }>) => void,
 ): Harness {
 	const sockets: FakeSocket[] = [];
 	const controller = createSessionTransport({
@@ -186,8 +179,8 @@ function harness(
 		},
 		url: () => "ws://lazy-content.test/api/v1/ws",
 		reconnectBaseMs: 0,
-		protocolVersion: { major: 1, minor: 2 },
-		futureContentAdapter,
+		protocolVersion: { major: 1, minor: 3 },
+		contentAdapter,
 		onResyncRequired,
 	});
 	controllers.push(controller);
@@ -266,15 +259,15 @@ afterEach(() => {
 	for (const controller of controllers.splice(0)) controller.dispose();
 });
 
-describe("Session transport lazy future content facade", () => {
+describe("Session transport lazy projected content facade", () => {
 	it("resolves frozen four-field identities without putting runtime data in the facade", async () => {
-		const resolveText: NonNullable<FutureSessionExtensionMaterializer["resolveText"]> = vi.fn(
+		const resolveText: NonNullable<SessionExtensionMaterializer["resolveText"]> = vi.fn(
 			async (_value, signal) => {
 				expect(signal).toBeDefined();
 				return "resolved text";
 			},
 		);
-		const resolveJson: NonNullable<FutureSessionExtensionMaterializer["resolveJson"]> = async (
+		const resolveJson: NonNullable<SessionExtensionMaterializer["resolveJson"]> = async (
 			_value,
 			guard,
 			signal,
@@ -289,8 +282,8 @@ describe("Session transport lazy future content facade", () => {
 		const captured = identity();
 		await prepareBaseline(h, captured);
 
-		await expect(h.controller.resolveFutureText(captured, externalText())).resolves.toBe("resolved text");
-		await expect(h.controller.resolveFutureJson(captured, externalJson(), isAnswer)).resolves.toEqual({
+		await expect(h.controller.resolveText(captured, externalText())).resolves.toBe("resolved text");
+		await expect(h.controller.resolveJson(captured, externalJson(), isAnswer)).resolves.toEqual({
 			answer: "resolved json",
 		});
 		expect(resolveText).toHaveBeenCalledTimes(1);
@@ -299,12 +292,12 @@ describe("Session transport lazy future content facade", () => {
 	it("preserves authoritative 404/guard failures, reports once per captured identity, and isolates Sessions", async () => {
 		const notFound = new Error("content GET returned 404");
 		const guardFailure = new Error("content JSON field guard failed");
-		const resolveText: NonNullable<FutureSessionExtensionMaterializer["resolveText"]> = vi.fn(async () => {
+		const resolveText: NonNullable<SessionExtensionMaterializer["resolveText"]> = vi.fn(async () => {
 			throw notFound;
 		});
-		const resolveJson: NonNullable<FutureSessionExtensionMaterializer["resolveJson"]> = async <T>(
+		const resolveJson: NonNullable<SessionExtensionMaterializer["resolveJson"]> = async <T>(
 			_value: SessionJsonRootDto,
-			guard: FutureSessionJsonFieldGuard<T>,
+			guard: SessionJsonFieldGuard<T>,
 		) => {
 			const value: unknown = { answer: 42 };
 			if (!guard(value)) throw guardFailure;
@@ -323,11 +316,9 @@ describe("Session transport lazy future content facade", () => {
 		await prepareBaseline(h, untouched);
 		notices.length = 0;
 
-		await expect(h.controller.resolveFutureText(first, externalText("a"))).rejects.toBe(notFound);
-		await expect(h.controller.resolveFutureJson(second, externalJson("b"), isAnswer)).rejects.toBe(
-			guardFailure,
-		);
-		await expect(h.controller.resolveFutureText(first, externalText("c"))).rejects.toMatchObject({
+		await expect(h.controller.resolveText(first, externalText("a"))).rejects.toBe(notFound);
+		await expect(h.controller.resolveJson(second, externalJson("b"), isAnswer)).rejects.toBe(guardFailure);
+		await expect(h.controller.resolveText(first, externalText("c"))).rejects.toMatchObject({
 			name: "AbortError",
 		});
 		await vi.waitFor(() =>
@@ -352,13 +343,13 @@ describe("Session transport lazy future content facade", () => {
 		const value = identity();
 		subscribeWithRuntime(h, value);
 
-		await expect(h.controller.resolveFutureText(value, externalText())).rejects.toMatchObject({
+		await expect(h.controller.resolveText(value, externalText())).rejects.toMatchObject({
 			name: "AbortError",
 		});
 		expect(materializeText).not.toHaveBeenCalled();
 
 		await prepareBaseline(h, value);
-		const pending = h.controller.resolveFutureText(value, externalText());
+		const pending = h.controller.resolveText(value, externalText());
 		h.controller.ingestServerMessage({
 			type: "runtime_state",
 			runtime: runtimeFor(identity("session-a", 2)),
@@ -376,7 +367,7 @@ describe("Session transport lazy future content facade", () => {
 			const gate = new Promise<string>((resolve) => {
 				release = () => resolve("late value");
 			});
-			const resolveText: NonNullable<FutureSessionExtensionMaterializer["resolveText"]> = async (
+			const resolveText: NonNullable<SessionExtensionMaterializer["resolveText"]> = async (
 				_value,
 				callerSignal,
 			) => {
@@ -388,7 +379,7 @@ describe("Session transport lazy future content facade", () => {
 			const socket = connect(h);
 			const value = identity();
 			await prepareBaseline(h, value);
-			const pending = h.controller.resolveFutureText(value, externalText());
+			const pending = h.controller.resolveText(value, externalText());
 			await vi.waitFor(() => expect(signal).toBeDefined());
 
 			if (transition === "disconnect") {
@@ -424,10 +415,7 @@ describe("Session transport lazy future content facade", () => {
 
 	it("lets one caller group abort multiple roots and prevents sibling recovery", async () => {
 		const signals: AbortSignal[] = [];
-		const resolveText: NonNullable<FutureSessionExtensionMaterializer["resolveText"]> = async (
-			_value,
-			signal,
-		) => {
+		const resolveText: NonNullable<SessionExtensionMaterializer["resolveText"]> = async (_value, signal) => {
 			if (signal === undefined) throw new Error("missing operation signal");
 			signals.push(signal);
 			return new Promise<string>((_resolve, reject) => {
@@ -443,26 +431,13 @@ describe("Session transport lazy future content facade", () => {
 		const value = identity();
 		await prepareBaseline(h, value);
 		const group = new AbortController();
-		const first = h.controller.resolveFutureText(value, externalText("a"), group.signal);
-		const second = h.controller.resolveFutureText(value, externalText("b"), group.signal);
+		const first = h.controller.resolveText(value, externalText("a"), group.signal);
+		const second = h.controller.resolveText(value, externalText("b"), group.signal);
 		await vi.waitFor(() => expect(signals).toHaveLength(2));
 
 		group.abort();
 		await expect(first).rejects.toMatchObject({ name: "AbortError" });
 		await expect(second).rejects.toMatchObject({ name: "AbortError" });
 		expect(h.controller.store.getState().sessions[value.sessionHandle]?.recovery).toBeNull();
-	});
-
-	it("is default-off without an adapter", async () => {
-		const h = harness();
-		connect(h);
-		const value = identity();
-		await prepareBaseline(h, value);
-
-		await expect(
-			h.controller.resolveFutureText(value, { kind: "inline", value: "inline" }),
-		).rejects.toMatchObject({
-			code: "unavailable",
-		});
 	});
 });

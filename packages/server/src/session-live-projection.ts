@@ -1,9 +1,10 @@
 import {
 	type ExtensionUiRequestDto,
-	isExtensionUiRequestDto,
-	isProductSessionEventDto,
+	type InlineSessionProjectionEventDto,
+	isPiExtensionUiRequestDto,
+	isPiProductSessionEventDto,
+	isPiSessionMessageDto,
 	isSessionAttachmentGuardContext,
-	isSessionMessageDto,
 	type ProductSessionEventDto,
 	SESSION_SNAPSHOT_MAX_BYTES,
 	SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS,
@@ -12,7 +13,6 @@ import {
 	SESSION_SNAPSHOT_MAX_QUEUE_ITEMS,
 	type SessionAttachmentGuardContext,
 	type SessionMessageDto,
-	type SessionProjectionEventDto,
 } from "@pi-agent-web/protocol";
 import {
 	SessionProductSchemaLogicalError,
@@ -65,7 +65,7 @@ export interface SessionLiveProjectionOptions<
 	runtimePhase?: SessionLiveRuntimePhase;
 	limits?: Partial<SessionLiveProjectionLimits>;
 	attachmentGuardContext?: SessionAttachmentGuardContext;
-	/** Explicit future schema; omission preserves the protocol 1.2 projection path. */
+	/** Optional schema seam for focused in-memory tests; production always supplies the product schema. */
 	schema?: SessionProjectionProductSchema<TMessage, TEvent, TExtensionRequest>;
 }
 
@@ -82,7 +82,7 @@ export type SessionLiveProjectionInput<
 	  };
 
 export type SessionLiveProjectionEventFrame<TEvent = ProductSessionEventDto> = Omit<
-	SessionProjectionEventDto,
+	InlineSessionProjectionEventDto,
 	"event"
 > & { event: TEvent };
 
@@ -297,13 +297,13 @@ export class SessionLiveProjection<
 		return this.commitPreparedBatchCore(token);
 	}
 
-	/** Legacy inline-only compatibility seam; future mode uses prepare/adopt/commit. */
+	/** Direct-commit seam for callers that do not transfer externalized payload ownership. */
 	commitInlineOnly(
 		identity: SessionLiveProjectionIdentity,
 		input: SessionLiveProjectionInput<TEvent, TExtensionRequest>,
 		runtimePhase?: SessionLiveRuntimePhase,
 	): number {
-		if (input.type === "event" && !isProductSessionEventDto(input.event)) {
+		if (input.type === "event" && !isPiProductSessionEventDto(input.event)) {
 			throw new SessionLiveProjectionPayloadError();
 		}
 		const committed = this.commitPrepared(this.prepareCommit(identity, input, runtimePhase));
@@ -411,12 +411,12 @@ export class SessionLiveProjection<
 		);
 	}
 
-	/** Legacy inline-only compatibility seam; future mode uses prepare/adopt/commit. */
+	/** Direct compaction seam for callers that do not transfer externalized payload ownership. */
 	commitIdleBaseCompactionInlineOnly(
 		token: SessionLiveProjectionCompactionToken,
 		settledMessages: readonly TMessage[],
 	): boolean {
-		if (!settledMessages.every((message) => isSessionMessageDto(message))) {
+		if (!settledMessages.every((message) => isPiSessionMessageDto(message))) {
 			this.compactionTokens.delete(token);
 			throw new SessionLiveProjectionPayloadError();
 		}
@@ -571,7 +571,7 @@ export class SessionLiveProjection<
 				throw error;
 			}
 			const frameBytes = jsonBytes(nextFrame, "live_events");
-			if (this.schema?.mode === "future_content" && frameBytes > this.schema.maxNormalizedEventWireBytes) {
+			if (this.schema && frameBytes > this.schema.maxNormalizedEventWireBytes) {
 				throw new SessionLiveProjectionLimitError("live_events");
 			}
 			const merging = mergedEvent !== null;
@@ -695,7 +695,7 @@ export class SessionLiveProjection<
 	}
 
 	private maxLiveEventWireBytes(): number {
-		return this.schema?.mode === "future_content"
+		return this.schema
 			? Math.min(this.limits.maxLiveEventBytes, this.schema.maxProjectionSuffixWireBytes)
 			: this.limits.maxLiveEventBytes;
 	}
@@ -722,17 +722,17 @@ export class SessionLiveProjection<
 	private guardMessage(value: unknown): boolean {
 		return this.schema
 			? this.schema.guardMessage(value)
-			: isSessionMessageDto(value, this.attachmentGuardContext);
+			: isPiSessionMessageDto(value, this.attachmentGuardContext);
 	}
 
 	private guardEvent(value: unknown): value is TEvent {
 		if (this.schema) return this.schema.guardEvent(value);
-		return isProductSessionEventDto(value, this.attachmentGuardContext);
+		return isPiProductSessionEventDto(value, this.attachmentGuardContext);
 	}
 
 	private guardExtensionRequest(value: unknown): value is TExtensionRequest {
 		if (this.schema) return this.schema.guardExtensionRequest(value);
-		return isExtensionUiRequestDto(value);
+		return isPiExtensionUiRequestDto(value);
 	}
 
 	private assertSnapshotFits(
@@ -776,7 +776,7 @@ export class SessionLiveProjection<
 	}
 
 	private maxSnapshotWireBytes(): number {
-		return this.schema?.mode === "future_content"
+		return this.schema
 			? Math.min(this.limits.maxSnapshotBytes, this.schema.maxSnapshotCanonicalWireBytes)
 			: this.limits.maxSnapshotBytes;
 	}
