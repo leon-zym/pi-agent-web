@@ -117,13 +117,16 @@ Pi 依赖，不会被 `PATH` 中无关的 `pi` 覆盖。`--pi-path` / `PI_PATH` 
 pnpm verify                                      # lint、类型、确定性测试、构建
 pnpm test:smoke                                  # fake Pi 驱动的已认证 REST/WebSocket
 pnpm test:e2e                                    # fake Pi 驱动的打包产物浏览器 E2E
+pnpm bench:representative                        # 可复现的 production Chromium 性能矩阵
+pnpm bench:stress                                # 显式运行的长耗时压力矩阵
 pnpm test:pack                                   # 打包安装四包、验证 help，并由 bin 启动工作台
 PI_WEB_RUN_E2E=1 pnpm test:e2e:real              # 显式运行真实 Pi/Provider 兼容性测试
 ```
 
 `pnpm test:e2e` 是 `pnpm test:browser` 的别名。CI 不使用 Provider 凭据，会运行 `verify`、
-`test:smoke`、`test:pack` 和打包产物 Chromium 测试套件。真实 Pi 检查会使用开发者已经配置的 Provider，
-因此必须显式运行。
+`test:smoke`、`test:pack`、打包产物 Chromium 测试套件和 representative benchmark。Benchmark JSON
+与 Markdown 写入 `test-results/performance`；stress matrix 保持显式运行。真实 Pi 检查会使用开发者
+已经配置的 Provider，因此必须显式运行。
 
 真实 Pi 测试套件覆盖同一 WebSocket 上的多 Session 并发、纯图片输入、内容隔离、流式阶段的
 follow-up 与 abort、clone rekey、父子历史隔离和 RPC 元数据。它使用隔离的临时 Workspace 与

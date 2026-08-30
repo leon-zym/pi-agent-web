@@ -128,13 +128,17 @@ The naming boundary is intentional: `pi-agent-web` is the repository, service, a
 pnpm verify                                      # lint, types, deterministic tests, build
 pnpm test:smoke                                  # authenticated REST/WebSocket with fake Pi
 pnpm test:e2e                                    # packaged browser E2E with fake Pi
+pnpm bench:representative                        # reproducible production-Chromium performance matrix
+pnpm bench:stress                                # explicit long-running stress matrix
 pnpm test:pack                                   # pack/install four packages; verify help; launch via the bin
 PI_WEB_RUN_E2E=1 pnpm test:e2e:real              # explicit real Pi/provider compatibility
 ```
 
 `pnpm test:e2e` is an alias for `pnpm test:browser`. CI runs `verify`, `test:smoke`,
-`test:pack`, and the packaged Chromium suite without provider credentials. Real Pi checks remain
-explicit because they use the developer's configured provider.
+`test:pack`, the packaged Chromium suite, and the representative benchmark without provider
+credentials. Benchmark JSON and Markdown are written below `test-results/performance`; the stress
+matrix remains explicit. Real Pi checks remain explicit because they use the developer's configured
+provider.
 
 The real Pi suite covers concurrent Sessions on one WebSocket, image-only input, content
 isolation, follow-up and abort while streaming, clone rekeying, parent/child history isolation,

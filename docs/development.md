@@ -41,6 +41,8 @@ CLI 只接受 `127.0.0.1`、`localhost` 或 `::1`。
 | `pnpm test:pack` | 四 tarball → install → bin/npx help + bin 启动工作台 | 无 |
 | `pnpm test:compat` | 锁定 Pi 版本的 current/candidate fixture、resolver、adapter 与 upstream conformance | 无 |
 | `pnpm test:e2e:real` | 默认明确 skip；显式运行真实 Pi/provider compatibility | 有，release only |
+| `pnpm bench:representative` | production Chromium 代表性性能/正确性矩阵与 JSON/Markdown 产物 | 无 |
+| `pnpm bench:stress` | 手动压力矩阵；64 MiB 边界、8 Session、100 次恢复试验 | 无 |
 | `pnpm --filter @pi-agent-web/ui bench:conversation` | scheduler 与 Markdown benchmark | 无 |
 | `pnpm --filter @pi-agent-web/protocol bench:schema` | 产品/Pi wire 边界 schema 与 decoder benchmark | 无 |
 
@@ -217,6 +219,41 @@ Protocol schema benchmark 是兼容性升级 lane 的性能证据，不把跨机
 只做浅层 envelope 形状检查，UTF-8、item、depth、identity、resource budget 与脱敏仍由边界 guard 和
 PiHostAdapter 负责。
 
+### 可复现 performance matrix
+
+根命令从 clean checkout 构建 production 产物，启动隔离 Gateway/fake Pi/Chromium，最后严格校验每个
+预期场景都产生非空结果：
+
+```bash
+pnpm bench:representative
+pnpm bench:stress
+```
+
+产物写入 gitignored `test-results/performance/<tier>/`：
+
+- `benchmark.json`：schema version、commit/dirty state、OS/CPU/memory、Node/Playwright/Chromium、完整
+  workload 参数、warmup/sample、raw metrics、median/p95/max、门禁和已知 coverage gap；
+- `benchmark.md`：便于人工读取的短表，不是另一份事实来源；
+- `raw/*.json`：逐场景原始样本；Playwright failure 另保留 screenshot/trace。
+
+Runner 会拒绝 skip、空样本、缺场景、重复/额外场景、schema 错误和 hard gate failure。CI 已经完成同
+一 commit 的 production build 时，可以直接调用
+`node scripts/run-performance-benchmarks.mjs representative --skip-build`；日常与 clean checkout
+不得用这个内部加速参数跳过 build。
+
+`representative` 是可在 PR CI 承受的 120 KiB/1 MiB streaming、1/4 Session、65 MiB native
+history、disconnect/gap、Pi crash/restart 和近上限 Browser image→typed attachment ref round trip。
+`stress` 扩展为 10/64/120 KiB/1 MiB、1/4/8 Session、below/at/above 64 MiB、恢复各 100 次和更多
+样本；它由手动 workflow 运行，不属于每次 PR 的隐式成本。
+
+门禁分两类：correctness、结构边界、coalescing、饥饿、DOM 上限和有重复样本的宽松 p95 是 hard；
+单次 64 MiB history latency/heap 等受 runner hardware/GC 明显影响的指标只记录为 observe。1 MiB
+重复 turn 当前使用的较宽 first-paint/long-task 上限是已检查的 regression ceiling，不是 UX 目标；真实
+数值必须从同次产物读取。`matrix.json` 中声明的 coverage gap 不得从 Markdown 汇总中省略。
+
+三类性能证据不可互换：Vitest microbenchmark 用于定位 reducer/schema 热点；reference-host 数值用于
+同机候选对比；portable hard gate 只用于确定性 correctness 和有足够抗噪样本的宽松预算。
+
 ## 视觉验收
 
 使用 production build 与隔离 deterministic fixture；不要把开发者的真实 Session 当 demo 数据。
@@ -238,7 +275,10 @@ GitHub Actions 使用 Node 22、pnpm 11.21.0，不读取 Pi credential 或用户
 1. `pnpm install --frozen-lockfile`；
 2. `pnpm verify`、`pnpm test:smoke`、`pnpm test:pack`；
 3. 独立 browser job 安装 Chromium 并运行 `pnpm test:browser`；
-4. 同一 ref 的旧 run 会被取消；browser failure 上传 trace/screenshot。
+4. 独立 performance job 运行 `pnpm bench:representative` 并始终上传 JSON/Markdown/raw 产物；
+5. 手动 `Performance stress` workflow 运行 `pnpm bench:stress`；在 reference host 建立稳定耗时与预算前
+   不启用定时压力任务；
+6. 同一 ref 的旧 run 会被取消；browser failure 上传 trace/screenshot。
 
 Real Pi/provider 与人工视觉检查只在本地 release 执行，不能成为隐式 CI dependency。
 

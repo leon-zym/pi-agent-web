@@ -1,0 +1,37 @@
+name: Performance stress
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: performance-stress-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  stress:
+    name: Manual stress matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.21.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm bench:stress
+      - name: Upload stress benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-stress
+          path: test-results/performance/stress
+          if-no-files-found: error
+          retention-days: 30
