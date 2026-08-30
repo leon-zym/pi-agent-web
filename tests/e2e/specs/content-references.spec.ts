@@ -1,43 +1,38 @@
 import type { Page } from "@playwright/test";
 import {
+	CANONICAL_CAPABILITIES,
+	CANONICAL_CONTENT_REF_BUDGET,
+	CANONICAL_PAYLOAD_BUDGET,
+	CANONICAL_PROTOCOL_VERSION,
+	CONTENT_REFERENCE_PROMPT,
+	CONTENT_REFERENCE_READY_TEXT,
 	collectContentRefs,
+	contentReferenceHarnessOptions,
 	contentRefFrames,
 	contentRefUrl,
-	FUTURE_CAPABILITIES,
-	FUTURE_CONTENT_PROMPT,
-	FUTURE_CONTENT_REF_BUDGET,
-	FUTURE_PAYLOAD_BUDGET,
-	FUTURE_PROTOCOL_MINOR,
-	FUTURE_READY_TEXT,
-	futureFixtureHarnessOptions,
-	futureHello,
-	observeFutureWire,
-	privateL3Enabled,
+	observeWire,
 	receivedWireFrames,
 	sentWireFrames,
-} from "../fixtures/future-content-ref";
+	serverHello,
+} from "../fixtures/content-reference";
 import { observePageErrors } from "../fixtures/page-observation";
 import type { ProductionHarness } from "../fixtures/production-harness";
 import { expect, test } from "../fixtures/test";
 
 const LARGE_MARKERS = [
-	"FUTURE_TOOL_ARGS:BODY:START",
-	"FUTURE_PARTIAL_RESULT:BODY:START",
-	"FUTURE_TOOL_RESULT:BODY:START",
-	"FUTURE_TOOL_DETAILS:BODY:START",
-	"FUTURE_TOOL_TEXT:START",
-	"FUTURE_SET_EDITOR_TEXT:START",
-	"FUTURE_WIDGET_LINE_1:START",
-	"FUTURE_WIDGET_LINE_2:START",
-	"FUTURE_EDITOR_PREFILL:START",
+	"CONTENT_REFERENCE_TOOL_ARGS:BODY:START",
+	"CONTENT_REFERENCE_PARTIAL_RESULT:BODY:START",
+	"CONTENT_REFERENCE_TOOL_RESULT:BODY:START",
+	"CONTENT_REFERENCE_TOOL_DETAILS:BODY:START",
+	"CONTENT_REFERENCE_TOOL_TEXT:START",
+	"CONTENT_REFERENCE_SET_EDITOR_TEXT:START",
+	"CONTENT_REFERENCE_WIDGET_LINE_1:START",
+	"CONTENT_REFERENCE_WIDGET_LINE_2:START",
+	"CONTENT_REFERENCE_EDITOR_PREFILL:START",
 ];
 
-test.describe("private protocol 1.3/L3 content references", () => {
-	test.skip(
-		!privateL3Enabled(),
-		"Private L3 is disabled. Run only against a 7E-activated Gateway with PI_WEB_E2E_PRIVATE_L3=1.",
-	);
-	test.use({ harnessOptions: futureFixtureHarnessOptions() });
+test.describe("canonical content references", () => {
+	test.use({ harnessOptions: contentReferenceHarnessOptions() });
 
 	async function openWorkbench(page: Page, harness: ProductionHarness): Promise<void> {
 		await page.goto(harness.origin, { waitUntil: "domcontentloaded" });
@@ -45,19 +40,19 @@ test.describe("private protocol 1.3/L3 content references", () => {
 		await expect(page.locator("textarea")).toBeEnabled();
 	}
 
-	async function sendFuturePrompt(page: Page): Promise<void> {
-		await page.locator("textarea").fill(FUTURE_CONTENT_PROMPT);
+	async function sendContentReferencePrompt(page: Page): Promise<void> {
+		await page.locator("textarea").fill(CONTENT_REFERENCE_PROMPT);
 		await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
 	}
 
 	async function dismissEditorDialog(page: Page): Promise<void> {
 		const dialog = page.getByRole("dialog");
 		await expect(dialog).toBeVisible();
-		await expect(dialog.locator("textarea")).toHaveValue(/^FUTURE_EDITOR_PREFILL:START/);
+		await expect(dialog.locator("textarea")).toHaveValue(/^CONTENT_REFERENCE_EDITOR_PREFILL:START/);
 		await dialog.getByRole("button", { name: /^(Cancel|取消)$/ }).click();
-		await expect(page.getByText(FUTURE_READY_TEXT, { exact: true })).toBeVisible();
-		await expect(page.locator("textarea")).toHaveValue(/^FUTURE_SET_EDITOR_TEXT:START/);
-		await expect(page.getByText("FUTURE_WIDGET_LINE_1:START", { exact: false })).toBeVisible();
+		await expect(page.getByText(CONTENT_REFERENCE_READY_TEXT, { exact: true })).toBeVisible();
+		await expect(page.locator("textarea")).toHaveValue(/^CONTENT_REFERENCE_SET_EDITOR_TEXT:START/);
+		await expect(page.getByText("CONTENT_REFERENCE_WIDGET_LINE_1:START", { exact: false })).toBeVisible();
 	}
 
 	function contentRequestUrls(requests: string[]): Set<string> {
@@ -69,7 +64,7 @@ test.describe("private protocol 1.3/L3 content references", () => {
 		harness,
 	}) => {
 		const errors = observePageErrors(page);
-		const wire = observeFutureWire(page);
+		const wire = observeWire(page);
 		const contentRequests: Array<{ url: string; headers: Record<string, string> }> = [];
 		page.on("request", (request) => {
 			if (new URL(request.url()).pathname.startsWith("/api/v1/content/")) {
@@ -79,21 +74,21 @@ test.describe("private protocol 1.3/L3 content references", () => {
 
 		await openWorkbench(page, harness);
 		await expect
-			.poll(() => futureHello(wire))
+			.poll(() => serverHello(wire))
 			.toMatchObject({
-				protocol: { major: 1, minor: FUTURE_PROTOCOL_MINOR },
-				capabilities: FUTURE_CAPABILITIES,
-				payloadBudget: FUTURE_PAYLOAD_BUDGET,
-				contentRefBudget: FUTURE_CONTENT_REF_BUDGET,
+				protocol: CANONICAL_PROTOCOL_VERSION,
+				capabilities: expect.arrayContaining([...CANONICAL_CAPABILITIES]),
+				payloadBudget: CANONICAL_PAYLOAD_BUDGET,
+				contentRefBudget: CANONICAL_CONTENT_REF_BUDGET,
 			});
-		const hello = futureHello(wire);
-		expect(hello?.capabilities).toEqual(FUTURE_CAPABILITIES);
+		const hello = serverHello(wire);
+		expect(new Set(hello?.capabilities as string[])).toEqual(new Set(CANONICAL_CAPABILITIES));
 		expect(sentWireFrames(wire).find((frame) => frame.type === "client_hello")).toMatchObject({
-			protocol: { major: 1, minor: FUTURE_PROTOCOL_MINOR },
-			capabilities: FUTURE_CAPABILITIES,
+			protocol: CANONICAL_PROTOCOL_VERSION,
+			capabilities: CANONICAL_CAPABILITIES,
 		});
 
-		await sendFuturePrompt(page);
+		await sendContentReferencePrompt(page);
 		await expect.poll(() => contentRefFrames(wire).length).toBeGreaterThanOrEqual(1);
 		await dismissEditorDialog(page);
 
@@ -116,18 +111,18 @@ test.describe("private protocol 1.3/L3 content references", () => {
 			expect(uniqueRefs.some((ref) => contentRefUrl(harness.origin, ref) === url)).toBe(true);
 			expect(request.headers.accept).toBe("application/octet-stream");
 		}
-		const tool = page.getByRole("button", { name: /future-edit/ }).first();
+		const tool = page.getByRole("button", { name: /content-ref-edit/ }).first();
 		await expect(tool).toBeVisible();
 		await tool.click();
-		await expect(page.locator("main")).toContainText("FUTURE_TOOL_ARGS:BODY:START");
-		await expect(page.locator("main")).toContainText("FUTURE_TOOL_RESULT:BODY:START");
+		await expect(page.locator("main")).toContainText("CONTENT_REFERENCE_TOOL_ARGS:BODY:START");
+		await expect(page.locator("main")).toContainText("CONTENT_REFERENCE_TOOL_RESULT:BODY:START");
 		await expect
 			.poll(() => contentRequestUrls(contentRequests.map((request) => request.url)).size)
 			.toBeGreaterThan(eagerUrls.size);
 
 		await page.getByRole("button", { name: /^(Open in details panel|在详情面板中查看)$/ }).click();
 		await expect(page.locator('[data-details-output-region="true"]').last()).toContainText(
-			"FUTURE_TOOL_TEXT:START",
+			"CONTENT_REFERENCE_TOOL_TEXT:START",
 		);
 		expect(wire.sockets).toHaveLength(1);
 		expect(wire.closed).toEqual([]);
@@ -135,18 +130,18 @@ test.describe("private protocol 1.3/L3 content references", () => {
 		expect(errors.page).toEqual([]);
 	});
 
-	test("replays future refs and performs one exact cursorless recovery per failed lazy GET", async ({
+	test("replays refs and performs one exact cursorless recovery per failed lazy GET", async ({
 		page,
 		harness,
 	}) => {
-		const wire = observeFutureWire(page);
+		const wire = observeWire(page);
 		const contentRequests: string[] = [];
 		await page.route("**/api/v1/content/**", async (route) => {
 			contentRequests.push(route.request().url());
 			await route.continue();
 		});
 		await openWorkbench(page, harness);
-		await sendFuturePrompt(page);
+		await sendContentReferencePrompt(page);
 		await expect.poll(() => contentRefFrames(wire).length).toBeGreaterThanOrEqual(1);
 		await dismissEditorDialog(page);
 		const readyRequestCount = contentRequests.length;
@@ -155,27 +150,29 @@ test.describe("private protocol 1.3/L3 content references", () => {
 		await expect(page.locator("textarea")).toBeEnabled();
 		const replaySession = page
 			.locator("[data-session-row]")
-			.filter({ hasText: FUTURE_CONTENT_PROMPT })
+			.filter({ hasText: CONTENT_REFERENCE_PROMPT })
 			.first();
 		await expect(replaySession).toBeVisible();
 		await replaySession.getByRole("button").first().click();
-		const replayTool = page.getByRole("button", { name: /future-edit/ }).first();
+		const replayTool = page.getByRole("button", { name: /content-ref-edit/ }).first();
 		await expect(replayTool).toBeVisible();
 		// A reload must not turn a collapsed historical tool into an eager content download.
 		const beforeExpand = contentRequests.length;
 		expect(beforeExpand).toBeGreaterThanOrEqual(readyRequestCount);
 
-		let failed = false;
+		let failureEnabled = false;
+		let failureInjected = false;
 		await page.unrouteAll({ behavior: "ignoreErrors" });
 		await page.route("**/api/v1/content/**", async (route) => {
 			contentRequests.push(route.request().url());
-			if (failed) {
-				await route.fulfill({ status: 410, contentType: "text/plain", body: "expired future content" });
+			if (failureEnabled && !failureInjected) {
+				failureInjected = true;
+				await route.fulfill({ status: 410, contentType: "text/plain", body: "expired content" });
 				return;
 			}
 			await route.continue();
 		});
-		failed = true;
+		failureEnabled = true;
 		const eventStart = wire.events.length;
 		await replayTool.click();
 		await expect.poll(() => contentRequests.length).toBeGreaterThan(beforeExpand);
@@ -184,31 +181,45 @@ test.describe("private protocol 1.3/L3 content references", () => {
 				() =>
 					wire.events
 						.slice(eventStart)
-						.filter((event) => event.direction === "sent" && event.frame.type === "session_subscribe").length,
+						.filter(
+							(event) =>
+								event.direction === "sent" &&
+								event.frame.type === "session_subscribe" &&
+								!Object.hasOwn(event.frame, "cursor"),
+						).length,
 			)
 			.toBe(1);
 		const recoverySubscriptions = wire.events
 			.slice(eventStart)
-			.filter((event) => event.direction === "sent" && event.frame.type === "session_subscribe");
-		expect(recoverySubscriptions[0]?.frame).not.toHaveProperty("cursor");
+			.filter(
+				(event) =>
+					event.direction === "sent" &&
+					event.frame.type === "session_subscribe" &&
+					!Object.hasOwn(event.frame, "cursor"),
+			);
 		await expect
 			.poll(() =>
 				wire.events
 					.slice(eventStart)
-					.some((event) => event.direction === "received" && event.frame.type === "session_snapshot"),
+					.some((event) => event.direction === "received" && event.frame.type === "session_snapshot_end"),
 			)
 			.toBe(true);
 		await page.waitForTimeout(250);
 		expect(
 			wire.events
 				.slice(eventStart)
-				.filter((event) => event.direction === "sent" && event.frame.type === "session_subscribe"),
+				.filter(
+					(event) =>
+						event.direction === "sent" &&
+						event.frame.type === "session_subscribe" &&
+						!Object.hasOwn(event.frame, "cursor"),
+				),
 		).toHaveLength(1);
 	});
 
 	for (const failure of ["gone", "metadata", "utf8", "json-field"] as const) {
 		test(`rejects a ${failure} content response without an inline fallback`, async ({ page, harness }) => {
-			const wire = observeFutureWire(page);
+			const wire = observeWire(page);
 			let lazyRequest: string | undefined;
 			let failureEnabled = false;
 			await page.route("**/api/v1/content/**", async (route) => {
@@ -244,20 +255,20 @@ test.describe("private protocol 1.3/L3 content references", () => {
 				await route.fulfill({ status: 200, headers: validContentHeaders(ref.byteLength), body: json });
 			});
 			await openWorkbench(page, harness);
-			await sendFuturePrompt(page);
+			await sendContentReferencePrompt(page);
 			await expect.poll(() => contentRefFrames(wire).length).toBeGreaterThanOrEqual(1);
 			await dismissEditorDialog(page);
 			failureEnabled = true;
-			const tool = page.getByRole("button", { name: /future-edit/ }).first();
+			const tool = page.getByRole("button", { name: /content-ref-edit/ }).first();
 			await tool.click();
 			await expect.poll(() => lazyRequest).toBeDefined();
 			const body = page.locator("main");
-			expect(await body.innerText()).not.toContain("FUTURE_TOOL_ARGS:BODY:START");
+			expect(await body.innerText()).not.toContain("CONTENT_REFERENCE_TOOL_ARGS:BODY:START");
 		});
 	}
 
 	test("aborts a hung lazy GET when the captured Session is no longer visible", async ({ page, harness }) => {
-		const wire = observeFutureWire(page);
+		const wire = observeWire(page);
 		let hold = false;
 		let heldRequest: string | undefined;
 		const failedRequests: string[] = [];
@@ -273,7 +284,7 @@ test.describe("private protocol 1.3/L3 content references", () => {
 			await new Promise<void>(() => {});
 		});
 		await openWorkbench(page, harness);
-		await sendFuturePrompt(page);
+		await sendContentReferencePrompt(page);
 		await expect.poll(() => contentRefFrames(wire).length).toBeGreaterThanOrEqual(1);
 		await dismissEditorDialog(page);
 		hold = true;
@@ -283,7 +294,7 @@ test.describe("private protocol 1.3/L3 content references", () => {
 		)?.sessionHandle;
 		expect(oldSessionHandle).toEqual(expect.any(String));
 		await page
-			.getByRole("button", { name: /future-edit/ })
+			.getByRole("button", { name: /content-ref-edit/ })
 			.first()
 			.click();
 		await expect.poll(() => heldRequest).toBeDefined();

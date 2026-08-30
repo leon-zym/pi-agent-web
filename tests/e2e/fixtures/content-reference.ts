@@ -1,46 +1,24 @@
 import type { Page, WebSocket } from "@playwright/test";
+import {
+	GATEWAY_PROTOCOL_VERSION,
+	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
+	GATEWAY_SESSION_HISTORY_CAPABILITY,
+	SESSION_CONTENT_REF_BUDGET,
+	SESSION_PAYLOAD_BUDGET,
+} from "../../../packages/protocol/dist/index.js";
 import type { StartHarnessOptions } from "./production-harness";
 
-/** Explicit opt-in for the post-7E private Browser lane. It is never set by CI. */
-export const PRIVATE_L3_ENV = "PI_WEB_E2E_PRIVATE_L3";
-/** Passed only to the deterministic Pi fixture; it does not activate the Gateway. */
-export const FUTURE_FIXTURE_ENV = "PI_WEB_E2E_CONTENT_REF_FIXTURE";
-export const FUTURE_CONTENT_PROMPT = "E2E_FUTURE_CONTENT_REFS";
-export const FUTURE_READY_TEXT = "E2E_FUTURE_CONTENT_REFS_READY";
-
-export const FUTURE_PROTOCOL_MINOR = 3;
-export const FUTURE_CAPABILITIES = [
-	"rpc.commands",
-	"rpc.events",
-	"rpc.extension_ui",
-	"session.multiplex",
-	"session.hot_runtime_inventory",
-	"payload.epoch_attachment_refs",
-	"payload.epoch_content_refs",
+/** Passed only to the deterministic Pi fixture; the Gateway always uses the canonical protocol. */
+export const CONTENT_REFERENCE_FIXTURE_ENV = "PI_WEB_E2E_CONTENT_REF_FIXTURE";
+export const CONTENT_REFERENCE_PROMPT = "E2E_CONTENT_REFERENCES";
+export const CONTENT_REFERENCE_READY_TEXT = "E2E_CONTENT_REFERENCES_READY";
+export const CANONICAL_PROTOCOL_VERSION = GATEWAY_PROTOCOL_VERSION;
+export const CANONICAL_CAPABILITIES = [
+	...GATEWAY_SERVER_REQUIRED_CAPABILITIES,
+	GATEWAY_SESSION_HISTORY_CAPABILITY,
 ] as const;
-export const FUTURE_PAYLOAD_BUDGET = {
-	maxCommandFrameBytes: 8 * 1024 * 1024,
-	maxCommandTextBytes: 1024 * 1024,
-	maxInlineImageBase64Bytes: 2 * 1024 * 1024,
-	maxInlineImagesBase64Bytes: 6 * 1024 * 1024,
-	maxImageCount: 16,
-	maxPiJsonlFrameBytes: 8 * 1024 * 1024,
-	maxPiSnapshotJsonlFrameBytes: 64 * 1024 * 1024,
-	maxNormalizedEventFrameBytes: 8 * 1024 * 1024 + 4 * 1024,
-	maxReplayFrameBytes: 8 * 1024 * 1024 + 4 * 1024,
-	maxReplayBytes: 16 * 1024 * 1024,
-	maxSnapshotCanonicalBytes: 64 * 1024 * 1024,
-	maxServerFrameBytes: 65 * 1024 * 1024,
-	maxQueuedBacklogBytes: 1024 * 1024,
-	maxCatchUpBacklogBytes: 1024 * 1024,
-	maxAttachmentBlobBytes: 8 * 1024 * 1024,
-	maxAttachmentCacheBytes: 64 * 1024 * 1024,
-	maxAttachmentCacheItems: 256,
-} as const;
-export const FUTURE_CONTENT_REF_BUDGET = {
-	maxContentBlobBytes: 48 * 1024 * 1024,
-	inlineContentThresholdBytes: 256 * 1024,
-} as const;
+export const CANONICAL_PAYLOAD_BUDGET = SESSION_PAYLOAD_BUDGET;
+export const CANONICAL_CONTENT_REF_BUDGET = SESSION_CONTENT_REF_BUDGET;
 
 export interface ObservedWireFrame {
 	direction: "sent" | "received";
@@ -48,7 +26,7 @@ export interface ObservedWireFrame {
 	raw: string;
 }
 
-export interface FutureWireObservation {
+export interface WireObservation {
 	sockets: WebSocket[];
 	closed: WebSocket[];
 	events: ObservedWireFrame[];
@@ -62,16 +40,9 @@ export interface ObservedContentRef {
 	byteLength: number;
 }
 
-export function privateL3Enabled(): boolean {
-	return process.env[PRIVATE_L3_ENV] === "1";
-}
-
-/**
- * This option selects only the future Pi input fixture. A 1.2 Gateway ignores it;
- * the private spec still fails closed on the negotiated hello before using it.
- */
-export function futureFixtureHarnessOptions(): StartHarnessOptions {
-	return { extraEnv: { [FUTURE_FIXTURE_ENV]: "1" } };
+/** Selects the deterministic Pi input that exercises large content roots. */
+export function contentReferenceHarnessOptions(): StartHarnessOptions {
+	return { extraEnv: { [CONTENT_REFERENCE_FIXTURE_ENV]: "1" } };
 }
 
 export function contentRefUrl(
@@ -95,8 +66,8 @@ function parseWireFrame(
 	}
 }
 
-export function observeFutureWire(page: Page): FutureWireObservation {
-	const observation: FutureWireObservation = { sockets: [], closed: [], events: [] };
+export function observeWire(page: Page): WireObservation {
+	const observation: WireObservation = { sockets: [], closed: [], events: [] };
 	page.on("websocket", (socket) => {
 		observation.sockets.push(socket);
 		socket.on("framesent", ({ payload }) => {
@@ -112,15 +83,15 @@ export function observeFutureWire(page: Page): FutureWireObservation {
 	return observation;
 }
 
-export function receivedWireFrames(observation: FutureWireObservation): Record<string, unknown>[] {
+export function receivedWireFrames(observation: WireObservation): Record<string, unknown>[] {
 	return observation.events.filter((event) => event.direction === "received").map((event) => event.frame);
 }
 
-export function sentWireFrames(observation: FutureWireObservation): Record<string, unknown>[] {
+export function sentWireFrames(observation: WireObservation): Record<string, unknown>[] {
 	return observation.events.filter((event) => event.direction === "sent").map((event) => event.frame);
 }
 
-export function collectContentRefs(observation: FutureWireObservation): ObservedContentRef[] {
+export function collectContentRefs(observation: WireObservation): ObservedContentRef[] {
 	const refs: ObservedContentRef[] = [];
 	const visit = (value: unknown): void => {
 		if (Array.isArray(value)) {
@@ -146,12 +117,12 @@ export function collectContentRefs(observation: FutureWireObservation): Observed
 	return refs;
 }
 
-export function contentRefFrames(observation: FutureWireObservation): ObservedWireFrame[] {
+export function contentRefFrames(observation: WireObservation): ObservedWireFrame[] {
 	return observation.events.filter(
 		(event) => event.direction === "received" && event.raw.includes('"content_ref"'),
 	);
 }
 
-export function futureHello(observation: FutureWireObservation): Record<string, unknown> | undefined {
+export function serverHello(observation: WireObservation): Record<string, unknown> | undefined {
 	return receivedWireFrames(observation).find((frame) => frame.type === "server_hello");
 }
