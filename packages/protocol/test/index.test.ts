@@ -15,10 +15,12 @@ import {
 	SESSION_MODEL_LIST_RESPONSE_GUARD_MAX_BYTES,
 	SESSION_MODEL_LIST_RESPONSE_RESERVATION_BYTES,
 	SESSION_PRODUCT_IDENTIFIER_MAX_CHARS,
+	SESSION_SLASH_COMMAND_LIST_MAX_ITEMS,
 	SESSION_TEXT_MAX_BYTES,
 	SESSION_WS_CLIENT_MAX_BYTES,
 	SESSION_WS_SERVER_MAX_BYTES,
 	type SessionCommandResponseDto,
+	type SessionCommandTypeDto,
 	sessionWsClientMessageBytes,
 } from "../src/index.js";
 
@@ -80,9 +82,103 @@ describe("gateway command deadlines", () => {
 });
 
 describe("gateway command response reservations", () => {
-	it("reserves the full legal wire ceiling for large and unknown responses", () => {
-		expect(commandResponseReservationBytes("bash")).toBe(SESSION_WS_SERVER_MAX_BYTES);
-		expect(commandResponseReservationBytes("get_commands")).toBe(SESSION_WS_SERVER_MAX_BYTES);
+	const noData = Symbol("no-data");
+	const successData = {
+		prompt: noData,
+		steer: noData,
+		follow_up: noData,
+		abort: noData,
+		new_session: { cancelled: false },
+		get_state: {
+			thinkingLevel: "off",
+			isStreaming: false,
+			isCompacting: false,
+			steeringMode: "all",
+			followUpMode: "all",
+			sessionId: "session-a",
+			autoCompactionEnabled: true,
+			messageCount: 0,
+			pendingMessageCount: 0,
+		},
+		set_model: { id: "model", name: "Model", provider: "provider" },
+		cycle_model: null,
+		get_available_models: { models: [] },
+		set_thinking_level: noData,
+		cycle_thinking_level: null,
+		get_available_thinking_levels: { levels: ["off"] },
+		set_steering_mode: noData,
+		set_follow_up_mode: noData,
+		compact: { summary: "done", firstKeptEntryId: "entry", tokensBefore: 0 },
+		set_auto_compaction: noData,
+		set_auto_retry: noData,
+		abort_retry: noData,
+		bash: { output: "", cancelled: false, truncated: false },
+		abort_bash: noData,
+		get_session_stats: {
+			sessionId: "session-a",
+			userMessages: 0,
+			assistantMessages: 0,
+			toolCalls: 0,
+			toolResults: 0,
+			totalMessages: 0,
+			tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			cost: 0,
+		},
+		export_html: { path: "/tmp/export.html" },
+		switch_session: { cancelled: false },
+		fork: { text: "", cancelled: false },
+		clone: { cancelled: false },
+		get_fork_messages: { messages: [] },
+		get_entries: { entries: [], leafId: null },
+		get_tree: { tree: [], leafId: null },
+		get_last_assistant_text: { text: null },
+		set_session_name: noData,
+		get_messages: { messages: [] },
+		get_commands: { commands: [] },
+	} as const satisfies Readonly<Record<SessionCommandTypeDto, unknown>>;
+
+	function responseFrame(command: SessionCommandTypeDto, response: Record<string, unknown>) {
+		return {
+			type: "response",
+			serverEpoch: "epoch-a",
+			sessionHandle: "session-a",
+			generation: 1,
+			barrierSeq: 0,
+			response: { type: "response", id: "request-a", command, ...response },
+		};
+	}
+
+	it("covers every command's complete success frame and maximal shared failure", () => {
+		for (const [command, data] of Object.entries(successData) as Array<[SessionCommandTypeDto, unknown]>) {
+			const success = responseFrame(command, {
+				success: true,
+				...(data === noData ? {} : { data }),
+			});
+			expect(isSessionWsServerMessage(success), command).toBe(true);
+			expect(new TextEncoder().encode(JSON.stringify(success)).byteLength, command).toBeLessThanOrEqual(
+				commandResponseReservationBytes(command),
+			);
+
+			const failure = responseFrame(command, {
+				success: false,
+				error: "\u0000".repeat(64 * 1024),
+			});
+			expect(isSessionWsServerMessage(failure), `${command} failure`).toBe(true);
+			expect(
+				new TextEncoder().encode(JSON.stringify(failure)).byteLength,
+				`${command} failure`,
+			).toBeLessThanOrEqual(commandResponseReservationBytes(command));
+		}
+	});
+
+	it("reserves the full legal wire ceiling only for oversized history and unknown responses", () => {
+		expect(commandResponseReservationBytes("bash")).toBeLessThan(SESSION_WS_SERVER_MAX_BYTES);
+		expect(commandResponseReservationBytes("get_commands")).toBe(8 * SESSION_TEXT_MAX_BYTES);
+		expect(commandResponseReservationBytes("get_fork_messages")).toBe(8 * SESSION_TEXT_MAX_BYTES);
+		expect(commandResponseReservationBytes("get_last_assistant_text")).toBe(8 * SESSION_TEXT_MAX_BYTES);
+		expect(commandResponseReservationBytes("get_messages")).toBe(SESSION_WS_SERVER_MAX_BYTES);
+		expect(commandResponseReservationBytes("get_entries")).toBe(SESSION_WS_SERVER_MAX_BYTES);
+		expect(commandResponseReservationBytes("get_tree")).toBe(SESSION_WS_SERVER_MAX_BYTES);
 		expect(commandResponseReservationBytes("unknown_future_command")).toBe(SESSION_WS_SERVER_MAX_BYTES);
 	});
 
@@ -126,6 +222,33 @@ describe("gateway command response reservations", () => {
 				data: { models: [...response.data.models, maximalModel] },
 			}),
 		).toBe(false);
+	});
+
+	it("keeps a maximal escaped command list inside its complete-frame reservation", () => {
+		const escapedIdentifier = "\u0000".repeat(SESSION_PRODUCT_IDENTIFIER_MAX_CHARS);
+		const escapedPath = "\u0000".repeat(4_096);
+		const command = {
+			name: escapedIdentifier,
+			description: "\u0000".repeat(1_024),
+			source: "extension",
+			sourceInfo: {
+				path: escapedPath,
+				source: escapedPath,
+				scope: "temporary",
+				origin: "top-level",
+				baseDir: escapedPath,
+			},
+		} as const;
+		const frame = responseFrame("get_commands", {
+			success: true,
+			data: {
+				commands: Array.from({ length: SESSION_SLASH_COMMAND_LIST_MAX_ITEMS }, () => command),
+			},
+		});
+		expect(isSessionWsServerMessage(frame)).toBe(true);
+		expect(new TextEncoder().encode(JSON.stringify(frame)).byteLength).toBeLessThanOrEqual(
+			commandResponseReservationBytes("get_commands"),
+		);
 	});
 });
 
@@ -276,6 +399,13 @@ describe("Session runtime browser frame guard", () => {
 				fencingToken: "lease-a",
 			}),
 		).toBe(true);
+		expect(
+			isSessionWsClientMessage({
+				type: "session_restart",
+				sessionHandle: "session-a",
+				expectedGeneration: 3,
+			}),
+		).toBe(false);
 		expect(
 			isSessionWsClientMessage({
 				type: "session_restart",

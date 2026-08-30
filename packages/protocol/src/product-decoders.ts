@@ -40,9 +40,20 @@ import type {
 
 export const SESSION_PRODUCT_IDENTIFIER_MAX_CHARS = 256;
 export const SESSION_MODEL_LIST_MAX_ITEMS = 1_000;
+export const SESSION_SLASH_COMMAND_LIST_MAX_ITEMS = 96;
+export const SESSION_COMMAND_FAILURE_ERROR_MAX_BYTES = 64 * 1024;
+export const SESSION_COMMAND_FAILURE_RESPONSE_MAX_BYTES = 496 * 1024;
+export const SESSION_STATE_RESPONSE_MAX_BYTES = 496 * 1024;
+export const SESSION_STATS_RESPONSE_MAX_BYTES = 112 * 1024;
+export const SESSION_THINKING_RESPONSE_MAX_BYTES = 3 * 1024;
+export const SESSION_LARGE_ORDINARY_RESPONSE_MAX_BYTES = 8 * 1024 * 1024 - 16 * 1024;
 const MAX_IDENTIFIER_CHARS = SESSION_PRODUCT_IDENTIFIER_MAX_CHARS;
 const MAX_PATH_CHARS = 8192;
 const MAX_TEXT_BYTES = 1024 * 1024;
+const MAX_STATE_NAME_BYTES = 64 * 1024;
+const MAX_BASH_OUTPUT_BYTES = 50 * 1024;
+const MAX_SOURCE_PATH_CHARS = 4096;
+const MAX_COMMAND_DESCRIPTION_BYTES = 1024;
 // get_messages is admitted behind a 64 MiB JSONL snapshot ceiling. A single
 // historical assistant block may therefore exceed the ordinary frame budget.
 const MAX_SNAPSHOT_TEXT_BYTES = 48 * 1024 * 1024;
@@ -242,6 +253,14 @@ function isBoundedJsonEncodedBytesBelow(
 		{ encodedBytes: 0, stringBytes: 0, items: 0, exclusiveLimit, seen: new Set<object>() },
 		0,
 	);
+}
+
+function isSerializedJsonBytesAtMost(value: unknown, maxBytes: number): boolean {
+	try {
+		return UTF8_ENCODER.encode(JSON.stringify(value)).byteLength <= maxBytes;
+	} catch {
+		return false;
+	}
 }
 
 export function isBoundedJsonValue(value: unknown): value is SessionJsonValueDto {
@@ -682,7 +701,7 @@ export function isSessionStateDto(value: unknown): value is SessionStateDto {
 		isOneOf(value.followUpMode, ["all", "one-at-a-time"]) &&
 		(value.sessionFile === undefined || isString(value.sessionFile, MAX_PATH_CHARS)) &&
 		isString(value.sessionId) &&
-		(value.sessionName === undefined || isText(value.sessionName)) &&
+		(value.sessionName === undefined || isText(value.sessionName, MAX_STATE_NAME_BYTES)) &&
 		typeof value.autoCompactionEnabled === "boolean" &&
 		isCount(value.messageCount) &&
 		isCount(value.pendingMessageCount)
@@ -876,10 +895,15 @@ function isSlashCommand(value: unknown): value is SlashCommandDto {
 		isRecord(value) &&
 		hasOnlyKeys(value, ["name", "description", "source", "sourceInfo"]) &&
 		isString(value.name) &&
-		isOptionalText(value.description) &&
+		isOptionalText(value.description, MAX_COMMAND_DESCRIPTION_BYTES) &&
 		isOneOf(value.source, ["extension", "prompt", "skill"]) &&
 		isRecord(value.sourceInfo) &&
-		isBoundedJsonValue(value.sourceInfo)
+		hasOnlyKeys(value.sourceInfo, ["path", "source", "scope", "origin", "baseDir"]) &&
+		isString(value.sourceInfo.path, MAX_SOURCE_PATH_CHARS) &&
+		isString(value.sourceInfo.source, MAX_SOURCE_PATH_CHARS) &&
+		isOneOf(value.sourceInfo.scope, ["user", "project", "temporary"]) &&
+		isOneOf(value.sourceInfo.origin, ["package", "top-level"]) &&
+		(value.sourceInfo.baseDir === undefined || isString(value.sourceInfo.baseDir, MAX_SOURCE_PATH_CHARS))
 	);
 }
 
@@ -1185,7 +1209,7 @@ function isBashResult(value: unknown): value is BashResultDto {
 	return (
 		isRecord(value) &&
 		hasOnlyKeys(value, ["output", "exitCode", "cancelled", "truncated", "fullOutputPath"]) &&
-		isText(value.output, MAX_SNAPSHOT_TEXT_BYTES) &&
+		isText(value.output, MAX_BASH_OUTPUT_BYTES) &&
 		(value.exitCode === undefined ||
 			(isFiniteNumber(value.exitCode) && Number.isSafeInteger(value.exitCode))) &&
 		typeof value.cancelled === "boolean" &&
@@ -1294,7 +1318,7 @@ function isCommandData<K extends SessionCommandTypeDto>(
 			return (
 				isRecord(value) &&
 				hasOnlyKeys(value, ["commands"]) &&
-				isArrayOf(value.commands, isSlashCommand, 1_000)
+				isArrayOf(value.commands, isSlashCommand, SESSION_SLASH_COMMAND_LIST_MAX_ITEMS)
 			);
 		default:
 			return false;
@@ -1347,10 +1371,38 @@ export function isSessionCommandResponseDto(
 	if (value.success === false) {
 		return (
 			hasOnlyKeys(value, ["type", "id", "command", "success", "error", "admissionError"]) &&
-			isText(value.error) &&
-			(value.admissionError === undefined || isSessionPayloadAdmissionErrorDto(value.admissionError))
+			isText(value.error, SESSION_COMMAND_FAILURE_ERROR_MAX_BYTES) &&
+			(value.admissionError === undefined || isSessionPayloadAdmissionErrorDto(value.admissionError)) &&
+			isSerializedJsonBytesAtMost(value, SESSION_COMMAND_FAILURE_RESPONSE_MAX_BYTES)
 		);
 	}
 	if (!hasOnlyKeys(value, ["type", "id", "command", "success", "data"])) return false;
-	return isCommandData(value.command, value.data, context);
+	if (!isCommandData(value.command, value.data, context)) return false;
+	const maxBytes = commandSuccessResponseMaxBytes(value.command);
+	return isSerializedJsonBytesAtMost(value, maxBytes);
+}
+
+function commandSuccessResponseMaxBytes(command: SessionCommandTypeDto): number {
+	switch (command) {
+		case "get_state":
+			return SESSION_STATE_RESPONSE_MAX_BYTES;
+		case "get_session_stats":
+			return SESSION_STATS_RESPONSE_MAX_BYTES;
+		case "get_available_thinking_levels":
+		case "cycle_thinking_level":
+			return SESSION_THINKING_RESPONSE_MAX_BYTES;
+		case "get_available_models":
+		case "compact":
+		case "fork":
+		case "get_fork_messages":
+		case "get_last_assistant_text":
+		case "get_commands":
+			return SESSION_LARGE_ORDINARY_RESPONSE_MAX_BYTES;
+		case "get_messages":
+		case "get_entries":
+		case "get_tree":
+			return 64 * 1024 * 1024;
+		default:
+			return SESSION_COMMAND_FAILURE_RESPONSE_MAX_BYTES;
+	}
 }

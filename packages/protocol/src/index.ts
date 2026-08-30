@@ -339,7 +339,7 @@ export type SessionWsClientMessage =
 			type: "session_restart";
 			sessionHandle: string;
 			expectedGeneration: number;
-			fencingToken?: string;
+			fencingToken: string;
 	  };
 
 function isGeneration(value: unknown): value is number {
@@ -421,7 +421,7 @@ export function isSessionWsClientMessage(value: unknown): value is SessionWsClie
 			return (
 				hasOnlyKeys(value, ["type", "sessionHandle", "expectedGeneration", "fencingToken"]) &&
 				isGeneration(value.expectedGeneration) &&
-				isOptionalString(value.fencingToken)
+				isString(value.fencingToken)
 			);
 		default:
 			return false;
@@ -478,7 +478,9 @@ export function commandTimeoutMs(commandType: string): number {
 	}
 }
 
-const SMALL_COMMAND_RESPONSE_RESERVATION_BYTES = 2 * SESSION_TEXT_MAX_BYTES;
+/** Common failures may contain a 64 KiB raw error that expands sixfold in JSON. */
+const SMALL_COMMAND_RESPONSE_RESERVATION_BYTES = 512 * 1024;
+const LARGE_ORDINARY_COMMAND_RESPONSE_RESERVATION_BYTES = 8 * SESSION_TEXT_MAX_BYTES;
 const JSON_STRINGIFIED_MAX_BYTES_PER_CODE_UNIT = 6;
 const MODEL_IDENTIFIER_FIELDS = 3;
 // A maximal model's keys, booleans, six bounded numbers, punctuation, and cost
@@ -517,24 +519,24 @@ export const COMMAND_RESPONSE_RESERVATION_BYTES = {
 	get_available_thinking_levels: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
 	set_steering_mode: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
 	set_follow_up_mode: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
-	compact: SESSION_WS_SERVER_MAX_BYTES,
+	compact: LARGE_ORDINARY_COMMAND_RESPONSE_RESERVATION_BYTES,
 	set_auto_compaction: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
 	set_auto_retry: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
 	abort_retry: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
-	bash: SESSION_WS_SERVER_MAX_BYTES,
+	bash: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
 	abort_bash: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
 	get_session_stats: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
 	export_html: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
 	switch_session: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
-	fork: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	fork: LARGE_ORDINARY_COMMAND_RESPONSE_RESERVATION_BYTES,
 	clone: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
-	get_fork_messages: SESSION_WS_SERVER_MAX_BYTES,
+	get_fork_messages: LARGE_ORDINARY_COMMAND_RESPONSE_RESERVATION_BYTES,
 	get_entries: SESSION_WS_SERVER_MAX_BYTES,
 	get_tree: SESSION_WS_SERVER_MAX_BYTES,
-	get_last_assistant_text: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	get_last_assistant_text: LARGE_ORDINARY_COMMAND_RESPONSE_RESERVATION_BYTES,
 	set_session_name: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
 	get_messages: SESSION_WS_SERVER_MAX_BYTES,
-	get_commands: SESSION_WS_SERVER_MAX_BYTES,
+	get_commands: LARGE_ORDINARY_COMMAND_RESPONSE_RESERVATION_BYTES,
 } as const satisfies Readonly<Record<SessionCommandTypeDto, number>>;
 
 export function commandResponseReservationBytes(commandType: string): number {
@@ -1761,7 +1763,9 @@ export function isSessionWsServerMessage(
 				isString(value.sessionHandle) &&
 				isGeneration(value.generation) &&
 				isGeneration(value.barrierSeq) &&
-				isSessionCommandResponseDto(value.response, context)
+				(value.previousSessionHandle === undefined || isString(value.previousSessionHandle)) &&
+				isSessionCommandResponseDto(value.response, context) &&
+				sessionWsServerMessageBytes(value) <= commandResponseReservationBytes(value.response.command)
 			);
 		case "lease_status":
 			return (
@@ -2195,7 +2199,8 @@ export function isFutureSessionWsServerMessage(
 			isGeneration(value.generation) &&
 			isGeneration(value.barrierSeq) &&
 			(value.previousSessionHandle === undefined || isString(value.previousSessionHandle)) &&
-			isFutureSessionCommandResponseDto(value.response, context)
+			isFutureSessionCommandResponseDto(value.response, context) &&
+			sessionWsServerMessageBytes(value) <= commandResponseReservationBytes(value.response.command)
 		);
 	}
 	return isSessionWsServerMessage(value, futureAttachmentContext(context));

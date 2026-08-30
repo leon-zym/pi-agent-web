@@ -157,7 +157,7 @@ unpersisted、无 command/dialog/transition reservation。停止进程后若目�
 | `session_unsubscribe` | `sessionHandle` | 停止该连接的事件消费；不停止 Pi |
 | `session_claim` | `sessionHandle` | 尝试取得该 Session 的 controller lease |
 | `session_release` | `sessionHandle` | 释放该连接持有的 Session lease |
-| `session_restart` | `sessionHandle`, `expectedGeneration`, optional `fencingToken` | 只恢复已显式暴露给该连接的 `session_snapshot_overflow`；generation 必须精确，已有 lease 时 token 与连接也必须精确 |
+| `session_restart` | `sessionHandle`, `expectedGeneration`, `fencingToken` | 只恢复已显式暴露给该连接的 `session_snapshot_overflow`；客户端须先显式 claim，generation、token 与连接必须精确 |
 | `command` | `sessionHandle`, `expectedGeneration`, optional `fencingToken`, `command` | 只读命令无需 token；mutation 必须精确匹配 token 与 generation |
 | `extension_ui_response` | `sessionHandle`, `expectedGeneration`, `fencingToken`, `response` | 回应当前 generation 的待处理 dialog |
 

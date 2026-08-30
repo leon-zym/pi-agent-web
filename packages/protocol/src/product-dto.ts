@@ -305,7 +305,16 @@ export interface SlashCommandDto {
 	name: string;
 	description?: string;
 	source: "extension" | "prompt" | "skill";
-	sourceInfo: Record<string, unknown>;
+	sourceInfo: SlashCommandSourceInfoDto;
+}
+
+/** Exact fields forwarded by Pi's SourceInfo contract. */
+export interface SlashCommandSourceInfoDto {
+	path: string;
+	source: string;
+	scope: "user" | "project" | "temporary";
+	origin: "package" | "top-level";
+	baseDir?: string;
 }
 
 export type SessionCommandDto =

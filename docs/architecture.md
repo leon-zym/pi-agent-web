@@ -352,10 +352,10 @@ Snapshot 有 item、byte 与 depth 上限。无法生成合法 snapshot 的 Runt
 显式 Runtime restart 会替换旧 overflow Runtime，以旧 generation 为 seed 启动下一 generation；不会
 复用已锁存 overflow 的实例。订阅失败仍为该连接保留一个只读 degraded channel，并记录精确 overflow
 generation；UI 的恢复状态机使用有界次数、退避与 jitter。预算耗尽后，普通错误的 manual retry 开始
-新的 cursorless 尝试；`session_snapshot_overflow` 的 manual retry 则发送显式 `session_restart`。Supervisor
-只接受该 degraded connection 暴露的精确 generation；已有 lease 时还要求原 connection/fencing token，
-没有 lease 时在同一 pool lock 内原子授予新 fence。恢复完成前所有 mutation 与 Extension response 都
-fail closed。已知 Session 的 hard reload 使用同一 snapshot 路径；新 Browser 连接发现并
+新的 cursorless 尝试；`session_snapshot_overflow` 的 manual retry 则先显式 `session_claim`，再使用取得的
+generation 与 fencing token 发送 `session_restart`。Supervisor 只接受该 degraded connection 暴露的精确
+generation、原 connection 和当前 fencing token；恢复完成前所有 mutation 与 Extension response 都 fail
+closed。已知 Session 的 hard reload 使用同一 snapshot 路径；新 Browser 连接发现并
 恢复所有 hot Runtime 的 inventory 属于独立的 hot-runtime reconciliation 契约。
 
 ## Authoritative hot Runtime inventory and Browser reconciliation

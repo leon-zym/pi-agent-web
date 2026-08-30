@@ -636,6 +636,87 @@ describe("product-owned protocol decoders", () => {
 		).toBe(true);
 	});
 
+	it("bounds the shared failure envelope to a 64 KiB raw error", () => {
+		expect(
+			isSessionCommandResponseDto({
+				type: "response",
+				command: "get_state",
+				success: false,
+				error: "\u0000".repeat(64 * 1024),
+			}),
+		).toBe(true);
+		expect(
+			isSessionCommandResponseDto({
+				type: "response",
+				command: "get_state",
+				success: false,
+				error: "x".repeat(64 * 1024 + 1),
+			}),
+		).toBe(false);
+	});
+
+	it("bounds ordinary-line response products before Gateway serialization", () => {
+		expect(
+			isSessionCommandResponseDto({
+				type: "response",
+				command: "bash",
+				success: true,
+				data: {
+					output: "x".repeat(64 * 1024),
+					cancelled: false,
+					truncated: false,
+				},
+			}),
+		).toBe(false);
+		expect(
+			isSessionCommandResponseDto({
+				type: "response",
+				command: "get_state",
+				success: true,
+				data: {
+					thinkingLevel: "off",
+					isStreaming: false,
+					isCompacting: false,
+					steeringMode: "all",
+					followUpMode: "all",
+					sessionId: "session-a",
+					sessionName: "\u0000".repeat(96 * 1024),
+					autoCompactionEnabled: true,
+					messageCount: 0,
+					pendingMessageCount: 0,
+				},
+			}),
+		).toBe(false);
+	});
+
+	it("accepts only the upstream Pi SourceInfo fields", () => {
+		const command = {
+			name: "review",
+			source: "skill",
+			sourceInfo: {
+				path: "/tmp/review/SKILL.md",
+				source: "review",
+				scope: "user",
+				origin: "top-level",
+			},
+		} as const;
+		const response = {
+			type: "response",
+			command: "get_commands",
+			success: true,
+			data: { commands: [command] },
+		} as const;
+		expect(isSessionCommandResponseDto(response)).toBe(true);
+		expect(
+			isSessionCommandResponseDto({
+				...response,
+				data: {
+					commands: [{ ...command, sourceInfo: { ...command.sourceInfo, unexpected: true } }],
+				},
+			}),
+		).toBe(false);
+	});
+
 	it("fully validates command-specific response data", () => {
 		expect(isSessionCommandResponseDto(response(state).response)).toBe(true);
 		expect(isSessionWsServerMessage(response(state))).toBe(true);
