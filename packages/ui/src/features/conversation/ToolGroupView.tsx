@@ -71,7 +71,7 @@ export function ToolGroupView({
 				aria-expanded={expanded}
 				onClick={() => setExpanded(!expanded)}
 				className={cn(
-					"group flex h-6 min-w-0 items-center gap-1.5 rounded-sm px-1 text-left outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-primary/40",
+					"group flex min-h-6 min-w-0 items-center gap-1.5 rounded-sm px-1 text-left outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-primary/40 max-lg:min-h-10",
 				)}
 			>
 				<ChevronRight

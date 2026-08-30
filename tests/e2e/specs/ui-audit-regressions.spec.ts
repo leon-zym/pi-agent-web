@@ -65,9 +65,7 @@ test("localized long Diff toolbar wraps without clipping", async ({ page, harnes
 	await page.getByRole("button", { name: "发送" }).click();
 	await expect(page.getByRole("heading", { name: "Synthetic change review", level: 2 })).toBeVisible();
 
-	const toolToggle = page
-		.locator('main button[aria-expanded="false"]')
-		.filter({ hasText: "非常长的目录名称" });
+	const toolToggle = page.locator("main button[aria-expanded]").filter({ hasText: "非常长的目录名称" });
 	await toolToggle.click();
 	const diff = page.locator('[data-diff-block="true"]');
 	await expect(diff).toBeVisible();
@@ -85,4 +83,73 @@ test("localized long Diff toolbar wraps without clipping", async ({ page, harnes
 	for (const button of await diff.getByRole("button").all()) await minimumTarget(button);
 	await fileName.scrollIntoViewIfNeeded();
 	await capture(page, "diff-toolbar-375-zh-light");
+});
+
+test("conversation controls keep touch targets and complete reasoning access", async ({ page, harness }) => {
+	await page.setViewportSize({ width: 375, height: 812 });
+	await openWorkbench(page, harness.origin, "en");
+	await page.locator("textarea").fill("E2E_COMPLEX_DEMO");
+	await page.getByRole("button", { name: "Send" }).click();
+	await expect(page.getByRole("heading", { name: "Synthetic change review", level: 2 })).toBeVisible();
+
+	const reasoningToggle = page
+		.locator("main button[aria-expanded]")
+		.filter({ hasText: "Comparing the implementation with the requested behavior." });
+	const reasoningInspect = page.getByRole("button", { name: "Open reasoning in details panel" });
+	const toolToggle = page.locator("main button[aria-expanded]").filter({ hasText: "src/demo.ts" });
+	const toolInspect = page.getByRole("button", { name: "Open in details panel" });
+	const turnCopy = page.getByRole("button", { name: "Copy" }).last();
+	const turnFork = page.getByRole("button", { name: "Fork" }).last();
+	const userCopy = page.getByRole("button", { name: "Copy message" });
+	const controls = [reasoningToggle, reasoningInspect, toolToggle, toolInspect, turnCopy, turnFork, userCopy];
+
+	for (const control of controls) await minimumTarget(control);
+	await reasoningToggle.focus();
+	await page.keyboard.press("Tab");
+	await expect(reasoningInspect).toBeFocused();
+	const focusedStyle = await reasoningInspect.evaluate((element) => {
+		const style = getComputedStyle(element);
+		return { boxShadow: style.boxShadow, opacity: style.opacity };
+	});
+	expect(focusedStyle.opacity).toBe("1");
+	expect(focusedStyle.boxShadow).not.toBe("none");
+
+	await reasoningToggle.click();
+	const fullReasoning = page
+		.locator("p")
+		.filter({ hasText: "Comparing the implementation with the requested behavior." });
+	await expect(fullReasoning).toBeVisible();
+	await expect(fullReasoning).toContainText("Inspecting synthetic workspace");
+
+	await page.setViewportSize({ width: 768, height: 900 });
+	for (const control of [reasoningInspect, toolToggle, toolInspect, turnCopy, turnFork, userCopy]) {
+		await minimumTarget(control);
+	}
+	await page.setViewportSize({ width: 375, height: 812 });
+	await reasoningToggle.scrollIntoViewIfNeeded();
+	await capture(page, "conversation-controls-375-en-light");
+});
+
+test("wide conversation content hides the TOC from sight and focus", async ({ page, harness }) => {
+	await page.setViewportSize({ width: 1600, height: 900 });
+	await openWorkbench(page, harness.origin, "en");
+	await page.locator("textarea").fill("E2E_COMPLEX_LONG_FILE");
+	await page.getByRole("button", { name: "Send" }).click();
+	await expect(page.getByRole("heading", { name: "Synthetic change review", level: 2 })).toBeVisible();
+
+	const toc = page.locator('[data-conversation-toc="true"]');
+	await expect(toc).toBeVisible();
+	await expect(toc).toHaveAttribute("aria-hidden", "false");
+	const toolToggle = page.locator("main button[aria-expanded]").filter({ hasText: "非常长的目录名称" });
+	await toolToggle.click();
+	await expect(page.locator('[data-diff-block="true"]')).toBeVisible();
+	await expect(toc).toHaveAttribute("data-toc-wide-content", "true");
+	await expect(toc).toHaveAttribute("aria-hidden", "true");
+	await expect(toc).toBeHidden();
+	await capture(page, "toc-hidden-for-wide-content-1600-en-light");
+
+	await toolToggle.click();
+	await expect(toc).toHaveAttribute("data-toc-wide-content", "false");
+	await expect(toc).toHaveAttribute("aria-hidden", "false");
+	await expect(toc).toBeVisible();
 });

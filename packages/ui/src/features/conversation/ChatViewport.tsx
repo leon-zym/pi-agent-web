@@ -240,6 +240,7 @@ export function ChatViewport() {
 		>
 			<div
 				ref={contentRef}
+				data-conversation-content="true"
 				className="mx-auto flex min-h-full min-w-0 w-full max-w-[748px] flex-col px-6 py-6"
 			>
 				{recovery && (

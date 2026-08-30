@@ -8,11 +8,27 @@ export interface ConversationTocProps {
 	activeTurnId?: string | null;
 	hoveredTurnId?: string | null;
 	rightMargin?: number;
+	wideContent?: boolean;
 	className?: string;
 	onTurnSelect?: (turnId: string) => void;
 }
 
 const MIN_RIGHT_MARGIN = 240;
+
+function hasWideConversationContent(): boolean {
+	if (typeof document === "undefined") return false;
+	const viewport = document.querySelector<HTMLElement>("[data-chat-viewport]");
+	const content = viewport?.querySelector<HTMLElement>("[data-conversation-content]");
+	if (!viewport || !content) return false;
+	const contentWidth = content.clientWidth;
+	return Array.from(
+		content.querySelectorAll<HTMLElement>('pre, table, [data-diff-block="true"] .scroll-slim'),
+	).some(
+		(element) =>
+			element.scrollWidth > element.clientWidth + 1 ||
+			element.getBoundingClientRect().width > contentWidth + 1,
+	);
+}
 
 function calculateRightMargin(): number {
 	if (typeof window === "undefined") return 300;
@@ -45,6 +61,7 @@ export const ConversationToc = memo(function ConversationToc({
 	activeTurnId: controlledActiveTurnId,
 	hoveredTurnId: controlledHoveredTurnId,
 	rightMargin: controlledRightMargin,
+	wideContent: controlledWideContent,
 	className,
 	onTurnSelect,
 }: ConversationTocProps) {
@@ -52,35 +69,53 @@ export const ConversationToc = memo(function ConversationToc({
 	void t;
 	const [observedActiveTurnId, setObservedActiveTurnId] = useState<string | null>(null);
 	const [measuredMargin, setMeasuredMargin] = useState<number>(calculateRightMargin);
+	const [measuredWideContent, setMeasuredWideContent] = useState<boolean>(hasWideConversationContent);
 	const [internalHoveredTurnId, setInternalHoveredTurnId] = useState<string | null>(null);
 
 	const activeTurnId = controlledActiveTurnId ?? observedActiveTurnId;
 	const hoveredTurnId =
 		controlledHoveredTurnId !== undefined ? controlledHoveredTurnId : internalHoveredTurnId;
 	const rightMargin = controlledRightMargin ?? measuredMargin;
-	const isVisible = rightMargin >= MIN_RIGHT_MARGIN;
+	const wideContent = controlledWideContent ?? measuredWideContent;
+	const isVisible = rightMargin >= MIN_RIGHT_MARGIN && !wideContent;
 
-	// Monitor right margin on window resize / viewport resize if not explicitly controlled
+	// Re-measure only the uncontrolled collision inputs.
 	useEffect(() => {
-		if (controlledRightMargin !== undefined) return;
-		const updateMargin = () => {
-			setMeasuredMargin(calculateRightMargin());
+		if (controlledRightMargin !== undefined && controlledWideContent !== undefined) return;
+		let scheduledFrame: number | null = null;
+		const updateMeasurements = () => {
+			if (controlledRightMargin === undefined) setMeasuredMargin(calculateRightMargin());
+			if (controlledWideContent === undefined) setMeasuredWideContent(hasWideConversationContent());
 		};
-		updateMargin();
-		window.addEventListener("resize", updateMargin);
+		const scheduleUpdate = () => {
+			if (scheduledFrame !== null) cancelAnimationFrame(scheduledFrame);
+			scheduledFrame = requestAnimationFrame(() => {
+				scheduledFrame = null;
+				updateMeasurements();
+			});
+		};
+		updateMeasurements();
+		window.addEventListener("resize", scheduleUpdate);
 
 		const viewport = document.querySelector("[data-chat-viewport]");
+		const content = viewport?.querySelector("[data-conversation-content]");
 		let resizeObserver: ResizeObserver | null = null;
 		if (viewport && typeof ResizeObserver !== "undefined") {
-			resizeObserver = new ResizeObserver(updateMargin);
+			resizeObserver = new ResizeObserver(scheduleUpdate);
 			resizeObserver.observe(viewport);
+			if (content) resizeObserver.observe(content);
 		}
+		const mutationObserver =
+			content && typeof MutationObserver !== "undefined" ? new MutationObserver(scheduleUpdate) : null;
+		mutationObserver?.observe(content, { childList: true, characterData: true, subtree: true });
 
 		return () => {
-			window.removeEventListener("resize", updateMargin);
+			window.removeEventListener("resize", scheduleUpdate);
+			if (scheduledFrame !== null) cancelAnimationFrame(scheduledFrame);
 			resizeObserver?.disconnect();
+			mutationObserver?.disconnect();
 		};
-	}, [controlledRightMargin]);
+	}, [controlledRightMargin, controlledWideContent]);
 
 	// Track active visible turn using IntersectionObserver
 	useEffect(() => {
@@ -171,10 +206,12 @@ export const ConversationToc = memo(function ConversationToc({
 	return (
 		<nav
 			aria-label={tt("toc.title")}
+			aria-hidden={!isVisible}
 			data-conversation-toc="true"
+			data-toc-wide-content={wideContent ? "true" : "false"}
 			className={cn(
 				"fixed top-20 right-3 z-20 flex flex-col items-center gap-2 py-4 transition-opacity duration-200 select-none",
-				!isVisible && "pointer-events-none opacity-0",
+				!isVisible && "invisible pointer-events-none opacity-0",
 				className,
 			)}
 		>

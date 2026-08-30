@@ -27,12 +27,16 @@ describe("ReasoningDisclosure component", () => {
 	it("renders settled state showing tail teaser summary by default and uses CSS grid for fold", () => {
 		const text = "First thought.\nSecond thought.\nThis is the tail conclusion paragraph.";
 		const html = renderToStaticMarkup(<ReasoningDisclosure text={text} status="settled" isTail={false} />);
+		const collapsedHeader = html.match(/<button[^>]*aria-expanded="false"[\s\S]*?<\/button>/)?.[0];
 
 		// Collapsed by default
 		expect(html).toContain('aria-expanded="false"');
 
-		// Header displays the tail teaser summary
-		expect(html).toContain("This is the tail conclusion paragraph.");
+		// Header displays the tail teaser, not the hidden full text's first line.
+		expect(collapsedHeader).toContain("This is the tail conclusion paragraph.");
+		expect(collapsedHeader).not.toContain("First thought.");
+		expect(html).toContain("max-lg:min-h-10");
+		expect(html).toContain("max-lg:size-10");
 
 		// Grid collapse structure
 		expect(html).toContain("grid-rows-[0fr]");

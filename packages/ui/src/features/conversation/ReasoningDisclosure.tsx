@@ -1,6 +1,6 @@
 import { Brain, ChevronRight, ExternalLink } from "lucide-react";
 import { type MouseEvent, useEffect, useRef, useState } from "react";
-import { firstLine, stripAnsi, tailTeaser } from "../../lib/format";
+import { stripAnsi, tailTeaser } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import { useProjectionStore } from "../../stores/projection";
@@ -69,7 +69,7 @@ export function ReasoningDisclosure({
 		}
 	};
 
-	const summary = firstLine(displayText) || tailTeaser(displayText);
+	const summary = tailTeaser(displayText);
 	const isStreaming = status === "streaming";
 	const showSweep = isStreaming && isTail && !expanded;
 
@@ -77,7 +77,7 @@ export function ReasoningDisclosure({
 		<div className="flex min-w-0 max-w-full flex-col">
 			<div
 				className={cn(
-					"group flex h-6 items-center gap-1.5 rounded-sm hover:bg-hover",
+					"group flex min-h-6 items-center gap-1.5 rounded-sm hover:bg-hover max-lg:min-h-10",
 					showSweep && "thinking-sweep",
 				)}
 			>
@@ -85,7 +85,7 @@ export function ReasoningDisclosure({
 					type="button"
 					aria-expanded={expanded}
 					onClick={toggle}
-					className="flex min-w-0 flex-1 items-center gap-1.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+					className="flex min-w-0 flex-1 items-center gap-1.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-primary/40 max-lg:min-h-10"
 				>
 					<ChevronRight
 						className={cn(
@@ -105,7 +105,7 @@ export function ReasoningDisclosure({
 					type="button"
 					aria-label={tt("reasoning.inspectAria")}
 					onClick={handleInspect}
-					className="flex size-6 shrink-0 items-center justify-center rounded-sm text-ink-3 opacity-0 transition-opacity hover:bg-hover hover:text-ink group-hover:opacity-100 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-primary/40"
+					className="flex size-6 shrink-0 items-center justify-center rounded-sm text-ink-3 opacity-0 transition-opacity hover:bg-hover hover:text-ink group-hover:opacity-100 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-primary/40 max-lg:size-10 max-lg:opacity-100"
 				>
 					<ExternalLink className="size-3.5" />
 				</button>
