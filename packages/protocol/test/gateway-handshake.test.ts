@@ -8,6 +8,7 @@ import {
 	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
 	type GatewayClientHelloDto,
 	type GatewayServerHelloDto,
+	hasUnsupportedGatewayProtocolMajor,
 	isGatewayClientHello,
 	isGatewayProtocolError,
 	isGatewayServerHello,
@@ -61,6 +62,12 @@ describe("Gateway hello DTOs", () => {
 		expect(isGatewayServerHello(serverHello())).toBe(true);
 		expect(isGatewayClientHello({ ...clientHello(), protocol: { major: 1, minor: 2 } })).toBe(false);
 		expect(isGatewayServerHello({ ...serverHello(), protocol: { major: 1, minor: 2 } })).toBe(false);
+		expect(hasUnsupportedGatewayProtocolMajor({ ...clientHello(), protocol: { major: 99, minor: 3 } })).toBe(
+			true,
+		);
+		expect(hasUnsupportedGatewayProtocolMajor({ ...clientHello(), protocol: { major: 1, minor: 2 } })).toBe(
+			false,
+		);
 	});
 
 	it("rejects missing capabilities, budgets, duplicate values, and extra properties", () => {

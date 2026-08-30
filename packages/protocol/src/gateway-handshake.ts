@@ -263,6 +263,12 @@ function protocolSelection(value: unknown): { major: number; minor: number } | n
 	}
 }
 
+/** Identify a well-formed but unsupported protocol major before applying the exact hello guard. */
+export function hasUnsupportedGatewayProtocolMajor(value: unknown): boolean {
+	const selection = protocolSelection(value);
+	return selection !== null && selection.major !== GATEWAY_PROTOCOL_VERSION.major;
+}
+
 export function negotiateGatewayHello(clientHello: unknown, serverHello: unknown): GatewayNegotiation {
 	const clientProtocol = protocolSelection(clientHello);
 	const serverProtocol = protocolSelection(serverHello);

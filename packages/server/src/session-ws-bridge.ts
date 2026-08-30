@@ -14,6 +14,7 @@ import {
 	type GatewayProtocolErrorDto,
 	type GatewayServerHelloDto,
 	type HotRuntimeInventoryDto,
+	hasUnsupportedGatewayProtocolMajor,
 	isGatewayClientHello,
 	isSessionContentRefGuardContext,
 	isSessionWsClientMessage,
@@ -617,8 +618,9 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 
 	private handleClientHello(connection: ConnectionState<M>, value: unknown): void {
 		if (!isGatewayClientHello(value)) {
-			const code =
-				typeof value === "object" && value !== null && "type" in value && value.type === "client_hello"
+			const code = hasUnsupportedGatewayProtocolMajor(value)
+				? "protocol_major_unsupported"
+				: typeof value === "object" && value !== null && "type" in value && value.type === "client_hello"
 					? "invalid_hello"
 					: "hello_required";
 			this.sendProtocolErrorAndClose(connection, code);

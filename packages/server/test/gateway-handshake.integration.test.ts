@@ -138,7 +138,7 @@ describe("Gateway WebSocket hello negotiation", () => {
 		sendHello(ws, { protocol: { major: 99, minor: 3 } });
 		await expect(frame).resolves.toMatchObject({
 			type: "protocol_error",
-			code: "invalid_hello",
+			code: "protocol_major_unsupported",
 			supported: { major: 1, minMinor: 3, maxMinor: 3 },
 		});
 	});
