@@ -110,7 +110,7 @@ test("a real browser negotiates an independently versioned client hello", async 
 			protocol: { major: 1, minor: CONTENT_REF_PROTOCOL_MINOR },
 			serverBuild: "0.1.0",
 			piVersion: "0.84.2",
-			adapterId: "legacy-rpc-v1",
+			adapterId: "pi-rpc",
 			capabilities: [
 				"rpc.commands",
 				"rpc.events",

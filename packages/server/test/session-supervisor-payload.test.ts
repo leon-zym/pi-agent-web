@@ -987,7 +987,7 @@ describe("future Session Supervisor payload mode", () => {
 		expect(counters).toEqual({ transfer: 1, adopt: 1, transferRelease: 0, leaseRelease: 1 });
 	});
 
-	it("terminalizes an awaiting-response leased future blocking request without adoption or restart", async () => {
+	it("retains an awaiting-response leased blocking request through the identity transition", async () => {
 		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-future-runtime-"));
 		const target = createTarget(root);
 		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
@@ -1012,35 +1012,35 @@ describe("future Session Supervisor payload mode", () => {
 		const lease = await supervisor.claim(target.sessionHandle, "future-controller");
 		const before = supervisor.getRuntime(target.sessionHandle);
 		if (!before) throw new Error("future runtime was not activated");
-		await expect(
-			supervisor.sendCommand(
-				target.sessionHandle,
-				{ type: "clone" },
-				{
-					connectionId: "future-controller",
-					expectedGeneration: before.generation,
-					fencingToken: lease.fencingToken,
-				},
-			),
-		).rejects.toThrow("content_ref_extension_delivery_phase_unsupported");
-		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "dormant");
-		await waitFor(() => counters.transferRelease === 1);
-		expect(messages.filter((message) => message.type === "extension_ui_request")).toEqual([]);
-		expect(counters).toEqual({ transfer: 1, adopt: 0, transferRelease: 1, leaseRelease: 0 });
-		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({
-			state: "dormant",
-			generation: before.generation,
-			lastSeq: before.lastSeq,
-		});
-		await new Promise<void>((resolve) => setTimeout(resolve, 750));
-		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({
-			state: "dormant",
-			generation: before.generation,
-			lastSeq: before.lastSeq,
-		});
+		const result = await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "clone" },
+			{
+				connectionId: "future-controller",
+				expectedGeneration: before.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		expect(result.sessionHandle).not.toBe(target.sessionHandle);
+		expect(supervisor.getRuntime(result.sessionHandle)).toMatchObject({ state: "waiting_ui" });
+		expect(supervisor.getPendingExtensionRequests(result.sessionHandle)).toContainEqual(
+			expect.objectContaining({
+				id: `transition-future-editor-${target.nativeSessionId}`,
+				method: "editor",
+				prefill: expect.objectContaining({ type: "external_text" }),
+			}),
+		);
+		expect(messages).toContainEqual(
+			expect.objectContaining({
+				type: "extension_ui_request",
+				request: expect.objectContaining({ id: `transition-future-editor-${target.nativeSessionId}` }),
+			}),
+		);
+		expect(counters.adopt).toBe(1);
+		expect(counters.transferRelease).toBe(0);
 	});
 
-	it("fails closed for a leased future editor delivered during transition verification", async () => {
+	it("retains a leased editor delivered during transition verification", async () => {
 		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-web-future-runtime-"));
 		const target = createTarget(root);
 		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
@@ -1065,30 +1065,26 @@ describe("future Session Supervisor payload mode", () => {
 		const lease = await supervisor.claim(target.sessionHandle, "future-controller");
 		const before = supervisor.getRuntime(target.sessionHandle);
 		if (!before) throw new Error("future runtime was not activated");
-		await expect(
-			supervisor.sendCommand(
-				target.sessionHandle,
-				{ type: "clone" },
-				{
-					connectionId: "future-controller",
-					expectedGeneration: before.generation,
-					fencingToken: lease.fencingToken,
-				},
-			),
-		).rejects.toThrow("content_ref_extension_delivery_phase_unsupported");
-		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "dormant");
-		await waitFor(() => counters.transferRelease === 1);
-		expect(messages.filter((message) => message.type === "session_rekeyed")).toEqual([]);
-		expect(messages.filter((message) => message.type === "extension_ui_request")).toEqual([]);
-		expect(supervisor.getPendingExtensionRequests(target.sessionHandle)).toEqual([]);
-		expect(counters).toEqual({ transfer: 1, adopt: 0, transferRelease: 1, leaseRelease: 0 });
-		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({
-			state: "dormant",
-			generation: before.generation,
-			lastSeq: before.lastSeq,
-		});
-		await new Promise<void>((resolve) => setTimeout(resolve, 750));
-		expect(supervisor.getRuntime(target.sessionHandle)?.generation).toBe(before.generation);
+		const result = await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "clone" },
+			{
+				connectionId: "future-controller",
+				expectedGeneration: before.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		expect(result.sessionHandle).not.toBe(target.sessionHandle);
+		expect(messages.filter((message) => message.type === "session_rekeyed")).toHaveLength(1);
+		expect(supervisor.getPendingExtensionRequests(result.sessionHandle)).toContainEqual(
+			expect.objectContaining({
+				id: `transition-verifying-future-editor-${target.nativeSessionId}-clone`,
+				method: "editor",
+				prefill: expect.objectContaining({ type: "external_text" }),
+			}),
+		);
+		expect(counters.adopt).toBe(1);
+		expect(counters.transferRelease).toBe(0);
 	});
 
 	it("keeps startup history, ordinary responses, replay, and snapshots in the private future family", async () => {

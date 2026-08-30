@@ -9,19 +9,14 @@ import type {
 	SessionCommandResponseDto,
 	SessionRuntimeIdentityDto,
 } from "@pi-agent-web/protocol";
-import {
-	SESSION_CONTENT_REF_BUDGET,
-	SESSION_PAYLOAD_BUDGET,
-	SESSION_SNAPSHOT_MAX_BYTES,
-} from "@pi-agent-web/protocol";
+import { SESSION_SNAPSHOT_MAX_BYTES } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { EpochContentHold, EpochStoredContentRef } from "../src/epoch-content-store.js";
 import { canonicalizeSessionFile, sessionHandleForFile } from "../src/native-session-catalog.js";
 import type { PiHostAdapter, PiHostDecodeOutcome } from "../src/pi-host-adapter.js";
-import type { PiPayloadLease } from "../src/pi-payload-externalizer.js";
+import type { PiPayloadLease, PiPayloadLeaseTransfer } from "../src/pi-payload-externalizer.js";
 import { piRpcAdapter } from "../src/pi-rpc-adapter.js";
 import { SessionLiveProjection, type SessionLiveProjectionLimits } from "../src/session-live-projection.js";
-import { createSessionProductSchema } from "../src/session-product-schema.js";
 import type {
 	SessionIdentityTransitionCommit,
 	SessionRuntime,
@@ -209,11 +204,36 @@ function exactRuntimeObject(supervisor: SessionSupervisor, sessionHandle: string
 
 function deliverExtension(runtime: object, request: ExtensionUiRequestDto): void {
 	const processToken: unknown = Reflect.get(runtime, "processToken");
-	const handler: unknown = Reflect.get(runtime, "handleExtensionRequest");
-	if (typeof processToken !== "number" || typeof handler !== "function") {
+	const proc: unknown = Reflect.get(runtime, "proc");
+	const handler: unknown = Reflect.get(runtime, "prepareDecodedExtensionRequest");
+	if (
+		typeof processToken !== "number" ||
+		typeof proc !== "object" ||
+		proc === null ||
+		typeof handler !== "function"
+	) {
 		throw new Error("Runtime Extension delivery seam is unavailable");
 	}
-	Reflect.apply(handler, runtime, [processToken, request]);
+	const exactPlan = Object.freeze({ kind: "pi_decoded_delivery_plan" as const });
+	let commitPrepared: ((transfer: PiPayloadLeaseTransfer<EpochStoredContentRef> | null) => true) | undefined;
+	const delivery = {
+		value: request,
+		prepare(commit: (transfer: PiPayloadLeaseTransfer<EpochStoredContentRef> | null) => true) {
+			commitPrepared = commit;
+			return exactPlan;
+		},
+	};
+	if (Reflect.apply(handler, runtime, [processToken, proc, delivery]) !== exactPlan || !commitPrepared) {
+		throw new Error("Runtime Extension delivery was not prepared exactly");
+	}
+	const transfer: PiPayloadLeaseTransfer<EpochStoredContentRef> = Object.freeze({
+		refs: Object.freeze([]),
+		adopt(accept: Parameters<PiPayloadLeaseTransfer<EpochStoredContentRef>["adopt"]>[0]) {
+			if (accept(Object.freeze([])) !== true) throw new Error("Empty Extension transfer adoption failed");
+		},
+		async release() {},
+	});
+	commitPrepared(transfer);
 }
 
 function runtimeMap(runtime: object, key: "pendingDialogs" | "stickyExtension"): Map<unknown, unknown> {
@@ -340,20 +360,10 @@ function rejectingTransferLease(
 function testPayloadServices(
 	released: EpochContentHold<EpochStoredContentRef>[],
 ): SessionRuntimePiPayloadServices {
-	const context = {
-		serverEpoch: "session-supervisor-test-epoch",
-		payloadBudget: SESSION_PAYLOAD_BUDGET,
-		contentRefBudget: SESSION_CONTENT_REF_BUDGET,
-	};
+	const fixture = createCanonicalPayloadFixture("session-supervisor-test-epoch");
 	return createSessionRuntimePiPayloadServices({
-		externalizer: {
-			mode: "content_ref",
-			context,
-			externalize: async () => {
-				throw new Error("the carrier fixture owns decoded outcomes");
-			},
-		},
-		productSchema: createSessionProductSchema(context),
+		externalizer: fixture.externalizer,
+		productSchema: fixture.supervisorServices.productSchema,
 		releaseHold: async (entry) => {
 			released.push(entry);
 		},
@@ -872,8 +882,9 @@ describe("SessionSupervisor", () => {
 		const runtime = internal.runtimes.get(target.sessionHandle)!;
 		const originalReplay = runtime.getReplay.bind(runtime);
 		runtime.getReplay = (...args) => {
+			const baseline = originalReplay(...args);
 			void runtime.stop();
-			return originalReplay(...args);
+			return baseline;
 		};
 
 		await expect(supervisor.subscribeHotExact(hot)).rejects.toThrow("hot_runtime_identity_changed");
@@ -1320,7 +1331,7 @@ describe("SessionSupervisor", () => {
 		);
 	});
 
-	it("keeps default-off crash recoverability dynamic when an unpersisted Session materializes", async () => {
+	it("keeps a post-crash unverified Session nonrecoverable after its candidate file materializes", async () => {
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace");
 		fs.mkdirSync(cwd);
@@ -1364,10 +1375,13 @@ describe("SessionSupervisor", () => {
 			})}\n`,
 		);
 
-		await expect(supervisor.restart(created.sessionHandle)).resolves.toMatchObject({
-			state: "idle",
-			recoverable: true,
-			generation: created.generation + 1,
+		await expect(supervisor.restart(created.sessionHandle)).rejects.toThrow(
+			"unpersisted_session_cannot_be_recovered",
+		);
+		expect(supervisor.getRuntime(created.sessionHandle)).toMatchObject({
+			state: "crashed",
+			recoverable: false,
+			generation: created.generation,
 		});
 	});
 
@@ -2111,23 +2125,19 @@ describe("SessionSupervisor", () => {
 		await expect(supervisor.activate(healthy.sessionHandle)).resolves.toMatchObject({ state: "idle" });
 	});
 
-	it("synchronously terminalizes a live aggregate overflow and cancels owned dialog callbacks", async () => {
+	it("externalizes live aggregate details while preserving owned dialog callbacks", async () => {
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace");
-		const healthyCwd = path.join(root, "healthy-workspace");
 		fs.mkdirSync(cwd);
-		fs.mkdirSync(healthyCwd);
-		const overflowed = createNativeSession(root, cwd, "live-aggregate-overflow");
-		const healthy = createNativeSession(root, healthyCwd, "live-aggregate-healthy");
+		const target = createNativeSession(root, cwd, "live-aggregate-content-refs");
 		const { supervisor, messages } = createHarness({
-			targets: [overflowed, healthy],
-			maxHotRuntimes: 1,
+			targets: [target],
 			maxAutoRestarts: 0,
 		});
-		const lease = await supervisor.claim(overflowed.sessionHandle, "controller");
-		const before = supervisor.getRuntime(overflowed.sessionHandle)!;
+		const lease = await supervisor.claim(target.sessionHandle, "controller");
+		const before = supervisor.getRuntime(target.sessionHandle)!;
 		await supervisor.sendCommand(
-			overflowed.sessionHandle,
+			target.sessionHandle,
 			{ type: "prompt", message: "live-aggregate-overflow" },
 			{
 				connectionId: "controller",
@@ -2135,36 +2145,26 @@ describe("SessionSupervisor", () => {
 				fencingToken: lease.fencingToken,
 			},
 		);
-		await waitFor(() => (supervisor.getRuntime(overflowed.sessionHandle)?.lastSeq ?? 0) >= 8);
+		await waitFor(() => (supervisor.getRuntime(target.sessionHandle)?.lastSeq ?? 0) >= 8);
 
-		const uncaught: unknown[] = [];
-		const unhandled: unknown[] = [];
-		const onUncaught = (error: unknown) => uncaught.push(error);
-		const onUnhandled = (error: unknown) => unhandled.push(error);
-		process.on("uncaughtException", onUncaught);
-		process.on("unhandledRejection", onUnhandled);
-		try {
-			await expect(supervisor.subscribe(overflowed.sessionHandle)).rejects.toThrow(
-				"session_snapshot_overflow",
-			);
-			const terminal = supervisor.getRuntime(overflowed.sessionHandle)!;
-			expect(terminal).toMatchObject({ state: "crashed", error: "session_snapshot_overflow" });
-			expect(supervisor.getPendingExtensionRequests(overflowed.sessionHandle)).toEqual([]);
-			const terminalSeq = terminal.lastSeq;
-			const terminalMessageCount = messages.length;
-			await new Promise<void>((resolve) => setTimeout(resolve, 350));
-			expect(supervisor.getRuntime(overflowed.sessionHandle)?.lastSeq).toBe(terminalSeq);
-			expect(
-				messages.slice(terminalMessageCount).some((message) => message.type === "extension_ui_closed"),
-			).toBe(false);
-			expect(uncaught).toEqual([]);
-			expect(unhandled).toEqual([]);
-			await waitFor(() => !supervisor.isActive(overflowed.sessionHandle));
-			await expect(supervisor.activate(healthy.sessionHandle)).resolves.toMatchObject({ state: "idle" });
-		} finally {
-			process.off("uncaughtException", onUncaught);
-			process.off("unhandledRejection", onUnhandled);
-		}
+		const initial = await supervisor.subscribe(target.sessionHandle);
+		if (initial.type !== "resync_required") throw new Error("initial subscription did not resync");
+		const externalizedDetails = initial.snapshot.projectionEvents.filter(
+			(frame) =>
+				frame.event.type === "message_end" &&
+				frame.event.message.role === "toolResult" &&
+				frame.event.message.details?.type === "external_json",
+		);
+		expect(externalizedDetails).toHaveLength(6);
+		expect(initial.snapshot.pendingExtensionRequests).toEqual([
+			expect.objectContaining({ method: "confirm", message: "must be synchronously cleared" }),
+		]);
+
+		await waitFor(() => supervisor.getPendingExtensionRequests(target.sessionHandle)?.length === 0);
+		expect(messages).toContainEqual(
+			expect.objectContaining({ type: "extension_ui_closed", reason: "expired" }),
+		);
+		expect(supervisor.getRuntime(target.sessionHandle)?.state).not.toBe("crashed");
 	});
 
 	it("compacts settled projection suffixes so normal turns can cross 4096 structural events", async () => {
@@ -3380,18 +3380,23 @@ describe("SessionSupervisor", () => {
 			Reflect.apply(originalEmit, undefined, [message]);
 		});
 
-		deliverExtension(runtime, {
-			type: "extension_ui_request",
-			id: "waterline-dialog",
-			method: "confirm",
-			title: "Waterline",
-			message: "Observe the committed state",
-		});
+		try {
+			deliverExtension(runtime, {
+				type: "extension_ui_request",
+				id: "waterline-dialog",
+				method: "confirm",
+				title: "Waterline",
+				message: "Observe the committed state",
+			});
 
-		expect(observations).toEqual([
-			{ source: "hot_set", projectionAsOfSeq: 1, runtimeLastSeq: 1, replayLastSeq: 1 },
-			{ source: "message", projectionAsOfSeq: 1, runtimeLastSeq: 1, replayLastSeq: 1 },
-		]);
+			expect(observations).toEqual([
+				{ source: "hot_set", projectionAsOfSeq: 1, runtimeLastSeq: 1, replayLastSeq: 1 },
+				{ source: "message", projectionAsOfSeq: 1, runtimeLastSeq: 1, replayLastSeq: 1 },
+			]);
+		} finally {
+			Reflect.set(options, "onHotSetChanged", originalHotSetChanged);
+			Reflect.set(options, "emit", originalEmit);
+		}
 	});
 
 	it("keeps committed Extension state coherent when the first publish and its logger throw", async () => {

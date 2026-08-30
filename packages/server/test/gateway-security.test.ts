@@ -4,7 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import {
 	GATEWAY_CONTENT_REF_CAPABILITY,
-	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+	GATEWAY_PROTOCOL_VERSION,
+	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
 	SESSION_PAYLOAD_BUDGET,
 } from "@pi-agent-web/protocol";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -52,15 +53,9 @@ async function openSocket(headers: Record<string, string>): Promise<import("ws")
 	ws.send(
 		JSON.stringify({
 			type: "client_hello",
-			protocol: { major: 1, minor: 2 },
+			protocol: GATEWAY_PROTOCOL_VERSION,
 			clientBuild: "gateway-security-test",
-			capabilities: [
-				"rpc.commands",
-				"rpc.events",
-				"rpc.extension_ui",
-				"session.multiplex",
-				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
-			],
+			capabilities: [...GATEWAY_SERVER_REQUIRED_CAPABILITIES],
 			limits: { maxServerFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes },
 		}),
 	);
@@ -163,7 +158,7 @@ describe("gateway access control", () => {
 		expect((await fetch(`${base}/api/v1/bootstrap`, { headers: { Origin: viteOrigin } })).status).toBe(403);
 	});
 
-	it("keeps the generic content capability unavailable in the production 1.2 hello", async () => {
+	it("advertises the canonical content-reference contract in the production hello", async () => {
 		const WebSocketCtor = (await import("ws")).default;
 		const ws = new WebSocketCtor(`${base.replace("http", "ws")}/api/v1/ws`, {
 			headers: authenticatedHeaders(),
@@ -186,21 +181,15 @@ describe("gateway access control", () => {
 			ws.send(
 				JSON.stringify({
 					type: "client_hello",
-					protocol: { major: 1, minor: 2 },
+					protocol: GATEWAY_PROTOCOL_VERSION,
 					clientBuild: "generic-content-inert-test",
-					capabilities: [
-						"rpc.commands",
-						"rpc.events",
-						"rpc.extension_ui",
-						"session.multiplex",
-						GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
-					],
+					capabilities: [...GATEWAY_SERVER_REQUIRED_CAPABILITIES],
 					limits: { maxServerFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes },
 				}),
 			);
 			const serverHello = await hello;
-			expect(serverHello.protocol).toEqual({ major: 1, minor: 2 });
-			expect(serverHello.capabilities).not.toContain(GATEWAY_CONTENT_REF_CAPABILITY);
+			expect(serverHello.protocol).toEqual(GATEWAY_PROTOCOL_VERSION);
+			expect(serverHello.capabilities).toContain(GATEWAY_CONTENT_REF_CAPABILITY);
 		} finally {
 			ws.close();
 		}

@@ -18,6 +18,7 @@ import {
 	type PiHostAdapter,
 	type PiHostDecodeContext,
 	type PiHostOrphanDecodeContext,
+	type PiHostRawUnsolicitedFrame,
 	PiHostResponseExternalizationError,
 	type PiHostUnsolicitedFrame,
 	PiProtocolIncompatibleError,
@@ -168,7 +169,13 @@ const futurePayloadExternalizer = {
 		lease: {
 			refs: [] as readonly EpochStoredContentRef[],
 			transfer() {
-				throw new Error("empty future lease is not transferable");
+				return {
+					refs: [] as readonly EpochStoredContentRef[],
+					adopt(accept: (holds: readonly EpochContentHold<EpochStoredContentRef>[]) => true) {
+						if (accept([]) !== true) throw new Error("empty canonical lease adoption was rejected");
+					},
+					release: async () => {},
+				};
 			},
 			release: async () => {},
 		},
@@ -178,13 +185,24 @@ const futurePayloadExternalizer = {
 type DecodedFrame =
 	| { kind: "response"; command: string }
 	| { kind: "orphaned_response" }
-	| PiHostUnsolicitedFrame;
+	| PiHostUnsolicitedFrame
+	| PiHostRawUnsolicitedFrame;
 
 function withAsyncDecodeGate(
 	gate: (frame: DecodedFrame, signal: AbortSignal | undefined) => Promise<void>,
 ): PiHostAdapter {
 	return {
 		...piRpcAdapter,
+		async decodePiResponse(value, expectedCommand) {
+			const decoded = await piRpcAdapter.decodePiResponse(value, expectedCommand);
+			await gate({ kind: "response", command: expectedCommand }, undefined);
+			return decoded;
+		},
+		async decodePiUnsolicited(value) {
+			const decoded = await piRpcAdapter.decodePiUnsolicited(value);
+			await gate(decoded.value, undefined);
+			return decoded;
+		},
 		async decodeResponse(value, expectedCommand, context: PiHostDecodeContext) {
 			const decoded = await piRpcAdapter.decodeResponse(value, expectedCommand, context);
 			await gate({ kind: "response", command: expectedCommand }, context?.signal);
@@ -542,7 +560,9 @@ describe("PiProcess response correlation", () => {
 				cwd: process.cwd(),
 				resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 				adapter,
+				payloadExternalizer: futurePayloadExternalizer,
 				decodeTimeoutMs: 20,
+				onDecodedEvent: (delivery) => delivery.prepare(() => true),
 				onExit: (info) => exits.push(info),
 			});
 			await proc.start();
@@ -597,6 +617,7 @@ describe("PiProcess response correlation", () => {
 					label: "fake Pi",
 				},
 				adapter,
+				payloadExternalizer: futurePayloadExternalizer,
 				decodeTimeoutMs: 20,
 				onExit: (info) => exits.push(info),
 			});
@@ -626,9 +647,8 @@ describe("PiProcess response correlation", () => {
 		void options;
 	});
 
-	it("releases and fails closed when the inline-only event callback receives a lease", async () => {
+	it("releases and fails closed when canonical event delivery has no decoded consumer", async () => {
 		const leased = fakeLease();
-		const delivered: string[] = [];
 		const adapter: PiHostAdapter = {
 			...piRpcAdapter,
 			async decodeUnsolicited(value, context) {
@@ -642,15 +662,14 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
-			onEvent: (event) => delivered.push(event.type),
+			payloadExternalizer: futurePayloadExternalizer,
 		});
 		await proc.start();
 
 		await expect(proc.send({ type: "prompt", message: "ordered-async" })).rejects.toThrow(
-			"inline-only Pi event delivery cannot carry attachment holds",
+			"Pi event delivery requires a decoded consumer",
 		);
 		expect(leased.release).toHaveBeenCalledOnce();
-		expect(delivered).toEqual([]);
 	});
 
 	it("hands a leased event transfer to the decoded callback without releasing it", async () => {
@@ -671,6 +690,7 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 			onDecodedEvent: (delivery) => {
 				expect(delivery.value.type).toBe("agent_start");
 				const plan = delivery.prepare((transfer) => {
@@ -707,6 +727,7 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 		});
 		await proc.start();
 
@@ -910,7 +931,7 @@ describe("PiProcess response correlation", () => {
 		await proc.start();
 
 		await expect(proc.send({ type: "prompt", message: "open-dialog" })).rejects.toThrow(
-			"future Pi Extension UI delivery requires a decoded consumer",
+			"Pi Extension UI delivery requires a decoded consumer",
 		);
 		await waitFor(() => exits.length === 1);
 		expect(leased.release).toHaveBeenCalledOnce();
@@ -1065,34 +1086,13 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 			onDecodedEvent: (() => true) as unknown as PiDecodedDeliveryConsumer<ProductSessionEventDto>,
 		});
 		await proc.start();
 
 		await expect(proc.send({ type: "prompt", message: "ordered-async" })).rejects.toThrow(
 			"did not prepare its exact delivery",
-		);
-		expect(leased.release).toHaveBeenCalledOnce();
-	});
-
-	it("releases and fails closed when inline-only send receives a leased response", async () => {
-		const leased = fakeLease();
-		const adapter: PiHostAdapter = {
-			...piRpcAdapter,
-			async decodeResponse(value, expectedCommand, context) {
-				const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, context);
-				return expectedCommand === "prompt" ? { value: outcome.value, lease: leased.lease } : outcome;
-			},
-		};
-		proc = new PiProcess({
-			cwd: process.cwd(),
-			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
-			adapter,
-		});
-		await proc.start();
-
-		await expect(proc.send({ type: "prompt", message: "leased-inline-response" })).rejects.toThrow(
-			"inline-only Pi response delivery cannot carry attachment holds",
 		);
 		expect(leased.release).toHaveBeenCalledOnce();
 	});
@@ -1122,6 +1122,7 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 			onDecodedEvent: callback as unknown as PiDecodedDeliveryConsumer<ProductSessionEventDto>,
 		});
 		await proc.start();
@@ -1159,6 +1160,7 @@ describe("PiProcess response correlation", () => {
 				cwd: process.cwd(),
 				resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 				adapter,
+				payloadExternalizer: futurePayloadExternalizer,
 				onDecodedEvent: (delivery) =>
 					delivery.prepare(
 						result as unknown as (transfer: PiPayloadLeaseTransfer<EpochStoredContentRef> | null) => true,
@@ -1191,6 +1193,7 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 			onDecodedEvent: (delivery) => {
 				const plan = delivery.prepare(() => {
 					commitCalled = true;
@@ -1224,6 +1227,7 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 			onDecodedEvent: (delivery) =>
 				delivery.prepare((transfer) => {
 					ownedTransfer = transfer;
@@ -1291,6 +1295,7 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 			onDecodedEvent: (delivery) =>
 				delivery.prepare((transfer) => {
 					if (!transfer) throw new Error("missing transfer");
@@ -1328,12 +1333,13 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 		});
 		await proc.start();
 
-		await expect(proc.send({ type: "prompt", message: "ordered-async" })).resolves.toMatchObject({
-			success: true,
-		});
+		await expect(proc.send({ type: "prompt", message: "ordered-async" })).rejects.toThrow(
+			"Pi event delivery requires a decoded consumer",
+		);
 		expect(leased.release).toHaveBeenCalledOnce();
 	});
 
@@ -1378,6 +1384,7 @@ describe("PiProcess response correlation", () => {
 					label: "fake Pi",
 				},
 				adapter,
+				payloadExternalizer: futurePayloadExternalizer,
 				onDecodedEvent: (delivery) => delivery.prepare(() => true),
 				onExit: (info) => exits.push(info),
 			});
@@ -1414,10 +1421,16 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
+			onDecodedEvent: (delivery) => delivery.prepare(() => true),
 		});
 		await proc.start();
 
-		const command = proc.send({ type: "prompt", message: "ordered-async" }, 20);
+		const command = proc.sendDecoded(
+			{ type: "prompt", message: "ordered-async" },
+			(delivery) => delivery.prepare(() => true),
+			20,
+		);
 		await responseStarted.promise;
 		await expect(command).rejects.toThrow("command timed out");
 		releaseResponse.resolve();
@@ -1439,12 +1452,15 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 		});
 		await proc.start();
 
-		await expect(proc.send({ type: "prompt", message: "response-local" })).rejects.toThrow(
-			"Gateway failed to deliver the Pi prompt response",
-		);
+		await expect(
+			proc.sendDecoded({ type: "prompt", message: "response-local" }, (delivery) =>
+				delivery.prepare(() => true),
+			),
+		).rejects.toThrow("Gateway failed to deliver the Pi prompt response");
 		await expect(proc.send({ type: "get_state" })).resolves.toMatchObject({
 			command: "get_state",
 			success: true,
@@ -1471,11 +1487,14 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 			decodeTimeoutMs: 20,
 		});
 		await proc.start();
 
-		const response = proc.send({ type: "prompt", message: "response-deadline" });
+		const response = proc.sendDecoded({ type: "prompt", message: "response-deadline" }, (delivery) =>
+			delivery.prepare(() => true),
+		);
 		await responseStarted.promise;
 		await expect(response).rejects.toMatchObject({
 			name: "PiHostResponseExternalizationError",
@@ -1507,11 +1526,14 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 			decodeTimeoutMs: 20,
 		});
 		await proc.start();
 
-		const response = proc.send({ type: "prompt", message: "deadline-abort-race" });
+		const response = proc.sendDecoded({ type: "prompt", message: "deadline-abort-race" }, (delivery) =>
+			delivery.prepare(() => true),
+		);
 		await responseStarted.promise;
 		await expect(response).rejects.toMatchObject({
 			name: "PiHostResponseExternalizationError",
@@ -1536,6 +1558,8 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
+			onDecodedEvent: (delivery) => delivery.prepare(() => true),
 			onExit: (info) => exits.push(info),
 		});
 		await proc.start();
@@ -1569,7 +1593,9 @@ describe("PiProcess response correlation", () => {
 			cwd: process.cwd(),
 			resolved: { command: process.execPath, args: [fakePiPath], source: "pi-path", label: "fake Pi" },
 			adapter,
+			payloadExternalizer: futurePayloadExternalizer,
 			decodeTimeoutMs: 1_000,
+			onDecodedEvent: (delivery) => delivery.prepare(() => true),
 			onExit: (info) => exits.push(info),
 		});
 		await proc.start();
@@ -1978,9 +2004,9 @@ describe("PiProcess response correlation", () => {
 		externalize.mockClear();
 		const internals = proc as unknown as {
 			handleLine(line: string): Promise<void>;
-			currentJsonlLineBudget(): number;
+			jsonlLineBudget(): number;
 		};
-		expect(internals.currentJsonlLineBudget()).toBe(MAX_JSONL_CONTENT_REF_LINE_BYTES);
+		expect(internals.jsonlLineBudget()).toBe(MAX_JSONL_CONTENT_REF_LINE_BYTES);
 
 		await internals.handleLine(
 			JSON.stringify({

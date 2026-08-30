@@ -798,6 +798,16 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 			this.flushPreparedContentRefStartupFrames(this.startupFrames);
 			this.startupFrames = [];
 			this.startupFrameBytes = 0;
+			this.setState(
+				this.pendingDialogs.size > 0
+					? "waiting_ui"
+					: this.agentBusy ||
+							this.compactionBusy ||
+							this.idleBaseCompactionBusy ||
+							this.pendingTurnReservations.size > 0
+						? "running"
+						: "idle",
+			);
 			this.assertWireSnapshotFits();
 			this.startupReady = true;
 			const startupEmits = this.deferredStartupEmits ?? [];
@@ -2488,7 +2498,10 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 		}
 		if (this.transitionStage !== null) {
 			const transitionStage = this.transitionStage;
-			if (transitionStage.phase !== "applying" && contentRefExtensionStagesDuringTransition(delivery.value)) {
+			if (
+				transitionStage.phase !== "applying" &&
+				contentRefExtensionStagesDuringTransition(delivery.value, transitionStage.phase)
+			) {
 				if (
 					!transitionStage.payloadLedger ||
 					!this.isCurrentPayloadTransition(processToken, proc, transitionStage)
@@ -2520,6 +2533,9 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 						throw new RpcError("extension_ui_request", "content_ref_extension_payload_ref_mismatch");
 					}
 					transitionStage.payloadLedger.admit({ transfer, logicalBytes });
+					if (BLOCKING_DIALOG_METHODS.has(delivery.value.method)) {
+						this.trackDialog(delivery.value, processToken, false);
+					}
 					transitionStage.frames = nextFrames;
 					transitionStage.bytes = nextBytes;
 					this.touch();
@@ -2539,9 +2555,9 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 						this.transitionStage === transitionStage &&
 						transitionStage?.phase === "awaiting_response" &&
 						BLOCKING_DIALOG_METHODS.has(delivery.value.method) &&
-						contentRefExtensionRequestRefs(delivery.value).length === 0 &&
-						transfer === null
+						contentRefExtensionTransferMatches(delivery.value, transfer)
 					) {
+						if (transfer) owner.adopt(transfer);
 						this.handleExtensionRequest(processToken, delivery.value);
 						return true;
 					}
@@ -3246,6 +3262,11 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 					if (!stage) throw new RpcError("session_transition", "session_generation_stale");
 					if (stage.frames.length === 0) return this.deferredTransitionEmits;
 					const plan = this.expandContentRefTransitionSemanticPlan(stage);
+					if (plan.frames.length === 0) {
+						stage.frames = [];
+						stage.bytes = 0;
+						return this.deferredTransitionEmits;
+					}
 					const turnBudget = this.prepareTransitionTurnBudget(plan.frames);
 					const prepared = this.prepareExtensionSemanticOperation({
 						processToken: stage.processToken,
@@ -3284,6 +3305,17 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 		let bytes = 0;
 		for (const frame of stage.frames) {
 			if (frame.type === "extension_ui_request") {
+				if (BLOCKING_DIALOG_METHODS.has(frame.request.method)) {
+					if (this.pendingDialogs.get(frame.request.id)?.request === frame.request) {
+						const frameBytes = bufferedFrameBytes(frame);
+						if (frameBytes > this.opts.transientBufferMaxBytes - bytes) {
+							throw new RpcError("session_transition", "transition_frame_buffer_limit_exceeded");
+						}
+						bytes += frameBytes;
+						frames.push(frame);
+					}
+					continue;
+				}
 				const plan = this.planExtensionRequestSemanticMutation(frame.request, true, {
 					pendingDialogs,
 					stickyExtension,
@@ -4097,8 +4129,11 @@ function contentRefExtensionRequestRefs(request: ExtensionUiRequestDto): readonl
 	return [];
 }
 
-function contentRefExtensionStagesDuringTransition(request: ExtensionUiRequestDto): boolean {
-	return !BLOCKING_DIALOG_METHODS.has(request.method);
+function contentRefExtensionStagesDuringTransition(
+	request: ExtensionUiRequestDto,
+	phase: TransitionStage["phase"],
+): boolean {
+	return !BLOCKING_DIALOG_METHODS.has(request.method) || phase === "verifying";
 }
 
 function contentRefExtensionTransferMatches(

@@ -194,6 +194,7 @@ describe("stream pipeline snapshot suffix delivery", () => {
 		expect(isInlineSessionSnapshotDto(snapshot())).toBe(true);
 		socket.receive(delta);
 		socket.receive(snapshot());
+		await vi.advanceTimersByTimeAsync(0);
 
 		expect(controller.store.getState().sessions[SESSION_HANDLE]).toMatchObject({
 			baselineAuthoritative: false,
@@ -227,6 +228,9 @@ describe("stream pipeline snapshot suffix delivery", () => {
 		socket.receive(delta);
 		socket.receive(frame(4, { type: "agent_settled" }));
 		socket.receive(snapshot());
+		await vi.waitFor(() =>
+			expect(controller.store.getState().sessions[SESSION_HANDLE]?.baselineAuthoritative).toBe(true),
+		);
 
 		expect(controller.store.getState().sessions[SESSION_HANDLE]).toMatchObject({
 			baselineAuthoritative: true,
@@ -279,6 +283,7 @@ describe("stream pipeline snapshot suffix delivery", () => {
 			outcome: "accepted",
 		});
 		socket.receive(snapshot([request]));
+		await vi.advanceTimersByTimeAsync(0);
 
 		expect(controller.store.getState().sessions[SESSION_HANDLE]).toMatchObject({
 			baselineAuthoritative: false,

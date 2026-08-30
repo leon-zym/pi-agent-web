@@ -9,7 +9,7 @@ import {
 	type SessionRuntimeDto,
 	type SessionWsClientMessage,
 } from "@pi-agent-web/protocol";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	createSessionTransport,
 	type SessionTransportController,
@@ -140,7 +140,7 @@ afterEach(() => {
 });
 
 describe("authoritative Session snapshot transport", () => {
-	it("commits one guarded snapshot before releasing only its contiguous suffix", () => {
+	it("commits one guarded snapshot before releasing only its contiguous suffix", async () => {
 		const { controller, socket } = setup();
 		const delivered: Array<string | number> = [];
 		controller.frameBus.subscribe("session-a", ({ message }) => {
@@ -156,6 +156,7 @@ describe("authoritative Session snapshot transport", () => {
 		});
 		socket.receive(event(1));
 		socket.receive(snapshot(0));
+		await vi.waitFor(() => expect(delivered).toHaveLength(4));
 
 		expect(delivered).toEqual(["runtime_state", "resync_required", "session_snapshot", 1]);
 		expect(controller.store.getState().sessions["session-a"]).toMatchObject({
@@ -190,7 +191,7 @@ describe("authoritative Session snapshot transport", () => {
 		).toBe(false);
 	});
 
-	it("retains an old-epoch cursor until the server explicitly fences it", () => {
+	it("retains an old-epoch cursor until the server explicitly fences it", async () => {
 		const { controller, socket, sockets } = setup();
 		socket.receive({ type: "runtime_state", runtime: runtime(2) });
 		socket.receive({
@@ -201,6 +202,9 @@ describe("authoritative Session snapshot transport", () => {
 			reason: "initial",
 		});
 		socket.receive(snapshot(2));
+		await vi.waitFor(() =>
+			expect(controller.store.getState().sessions["session-a"]?.baselineAuthoritative).toBe(true),
+		);
 		controller.store.getState().disconnect();
 		controller.store.getState().connect();
 		const second = sockets[1];

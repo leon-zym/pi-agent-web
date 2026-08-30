@@ -189,14 +189,6 @@ test.describe("canonical content references", () => {
 						).length,
 			)
 			.toBe(1);
-		const recoverySubscriptions = wire.events
-			.slice(eventStart)
-			.filter(
-				(event) =>
-					event.direction === "sent" &&
-					event.frame.type === "session_subscribe" &&
-					!Object.hasOwn(event.frame, "cursor"),
-			);
 		await expect
 			.poll(() =>
 				wire.events
