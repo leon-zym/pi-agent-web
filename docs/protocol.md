@@ -157,6 +157,7 @@ unpersisted、无 command/dialog/transition reservation。停止进程后若目�
 | `session_unsubscribe` | `sessionHandle` | 停止该连接的事件消费；不停止 Pi |
 | `session_claim` | `sessionHandle` | 尝试取得该 Session 的 controller lease |
 | `session_release` | `sessionHandle` | 释放该连接持有的 Session lease |
+| `session_restart` | `sessionHandle`, `expectedGeneration`, optional `fencingToken` | 只恢复已显式暴露给该连接的 `session_snapshot_overflow`；generation 必须精确，已有 lease 时 token 与连接也必须精确 |
 | `command` | `sessionHandle`, `expectedGeneration`, optional `fencingToken`, `command` | 只读命令无需 token；mutation 必须精确匹配 token 与 generation |
 | `extension_ui_response` | `sessionHandle`, `expectedGeneration`, `fencingToken`, `response` | 回应当前 generation 的待处理 dialog |
 
@@ -520,7 +521,11 @@ does not change the ordinary replay-gap rule above.
   Pi 命令前拒绝。Reservation 在 Agent 启动时转为 active，并在失败、取消、结算、stop 或 rekey 时
   释放。单个 Turn 超过 half-ceiling 时稳定 overflow，协议不承诺容纳任意 Turn，也不在本层合成
   chunk 或 rollover。
-- Catch-up 与每连接应用层 outbound queue 分别限制积压。非分块的合法 `session_snapshot` 可以成为唯一
+- Catch-up 与每连接应用层 outbound queue 分别限制积压。Command pending-response reservation 同时受
+  per-connection、Gateway 聚合与 per-canonical-Session Runtime 上限约束；断线不会提前释放仍在 Pi
+  执行的 command reservation。History page 在同一 canonical Session 上只允许一个 read，不同 Session
+  可并行但受 Gateway 总并发上限约束；替换、取消、断线和 Session identity 变化会 Abort 并释放 read。
+  非分块的合法 `session_snapshot` 可以成为唯一
   oversized send/queue item；其前后的普通 queued backlog 仍不得超过 1 MiB。分块 history 则受独立的
   stream queue ceiling 约束，不能借由拆 chunk 无限增加 backlog。已有 socket backlog 超过上限、出现
   第二个 oversized item 或追加 backlog 越界时才断开。非 history 的 snapshot overflow 使用稳定

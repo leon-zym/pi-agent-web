@@ -210,6 +210,31 @@ describe("Session runtime browser frame guard", () => {
 		).toBe(false);
 	});
 
+	it("accepts only generation-fenced Session restart requests", () => {
+		expect(
+			isSessionWsClientMessage({
+				type: "session_restart",
+				sessionHandle: "session-a",
+				expectedGeneration: 3,
+				fencingToken: "lease-a",
+			}),
+		).toBe(true);
+		expect(
+			isSessionWsClientMessage({
+				type: "session_restart",
+				sessionHandle: "session-a",
+			}),
+		).toBe(false);
+		expect(
+			isSessionWsClientMessage({
+				type: "session_restart",
+				sessionHandle: "session-a",
+				expectedGeneration: 3,
+				unexpected: true,
+			}),
+		).toBe(false);
+	});
+
 	it("accepts an intentionally empty input or editor response", () => {
 		expect(
 			isSessionWsClientMessage({

@@ -73,6 +73,7 @@ interface ConnectionState<M extends SessionRuntimeProductMode = "current"> {
 	catchUpLargeItems: number;
 	nextCatchUpOrder: number;
 	controlledSessions: Set<string>;
+	controlIntents: Map<string, ControlIntent>;
 	pendingCommands: Set<string>;
 	pendingCommandResponseBytes: number;
 	outboundQueue: OutboundPayload[];
@@ -88,6 +89,7 @@ interface ConnectionState<M extends SessionRuntimeProductMode = "current"> {
 	historyNegotiated: boolean;
 	historySnapshots: Map<string, HistorySnapshot<M>>;
 	historyPages: Map<string, HistoryPageOperation>;
+	restartableOverflows: Map<string, number>;
 	hotInventoryRevision: number;
 	deferredHotInventory?: HotRuntimeInventoryDto;
 	admittedExactOperations: number;
@@ -152,7 +154,13 @@ interface HistorySnapshot<M extends SessionRuntimeProductMode> {
 interface HistoryPageOperation {
 	sessionHandle: string;
 	requestId: string;
+	connectionId: string;
 	controller: AbortController;
+}
+
+interface ControlIntent {
+	revision: number;
+	wantsControl: boolean;
 }
 
 interface BashCommandIdMapping {
@@ -172,6 +180,7 @@ type SessionWsBridgeSupervisor<M extends SessionRuntimeProductMode> = Pick<
 	| "release"
 	| "releaseConnection"
 	| "leaseFor"
+	| "restart"
 	| "sendCommand"
 	| "sendExtensionUiResponse"
 >;
@@ -196,6 +205,10 @@ interface SessionWsBridgeOptionsBase<M extends SessionRuntimeProductMode> {
 	maxSubscriptionAliases?: number;
 	/** Weighted cap for command responses retained while their RPC is pending. */
 	maxPendingCommandResponseBytes?: number;
+	/** Gateway-wide weighted cap for command responses pending across all sockets. */
+	maxGatewayPendingCommandResponseBytes?: number;
+	/** Gateway-wide cap for concurrent historical page reads. */
+	maxConcurrentHistoryPages?: number;
 	log?: (level: "info" | "warn" | "error", message: string) => void;
 }
 
@@ -223,11 +236,14 @@ export const MAX_SESSION_WS_SUBSCRIBED_CHANNELS = 1024;
 export const MAX_SESSION_WS_CONCURRENT_CATCHUPS = 256;
 export const MAX_SESSION_WS_SUBSCRIPTION_ALIASES = 1024;
 export const MAX_SESSION_WS_PENDING_COMMAND_RESPONSE_BYTES = SESSION_WS_SERVER_MAX_BYTES;
+export const MAX_SESSION_WS_GATEWAY_PENDING_COMMAND_RESPONSE_BYTES = SESSION_WS_SERVER_MAX_BYTES * 2;
+export const MAX_SESSION_WS_CONCURRENT_HISTORY_PAGES = 16;
 const MAX_SESSION_WS_FRAME_BYTES = SESSION_WS_SERVER_MAX_BYTES;
 const MAX_SESSION_WS_SMALL_COMMAND_RESPONSE_BYTES = 64 * 1024;
 const DEFAULT_SESSION_HISTORY_CHUNK_TARGET_BYTES = 4 * 1024 * 1024;
 const LEGACY_GATEWAY_PROTOCOL_MINOR = 2;
 const RETRYABLE_SESSION_ERROR_CODES = new Set<string>(SESSION_SUBSCRIPTION_RETRYABLE_ERROR_CODES);
+const RETRYABLE_HISTORY_ERROR_CODES = new Set(["session_history_busy", "session_history_capacity"]);
 const LEGACY_GATEWAY_CLIENT_REQUIRED_CAPABILITIES = [
 	"rpc.commands",
 	"rpc.events",
@@ -254,6 +270,10 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 	private readonly maxConcurrentCatchUps: number;
 	private readonly maxSubscriptionAliases: number;
 	private readonly maxPendingCommandResponseBytes: number;
+	private readonly maxGatewayPendingCommandResponseBytes: number;
+	private readonly maxConcurrentHistoryPages: number;
+	private gatewayPendingCommandResponseBytes = 0;
+	private readonly historyPageOperations = new Map<string, HistoryPageOperation>();
 	private requestCounter = 0;
 	private closePromise: Promise<void> | null = null;
 	private readonly bashCommandIds = new Map<string, BashCommandIdMapping>();
@@ -312,6 +332,14 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		this.maxPendingCommandResponseBytes = positiveLimit(
 			opts.maxPendingCommandResponseBytes,
 			MAX_SESSION_WS_PENDING_COMMAND_RESPONSE_BYTES,
+		);
+		this.maxGatewayPendingCommandResponseBytes = positiveLimit(
+			opts.maxGatewayPendingCommandResponseBytes,
+			MAX_SESSION_WS_GATEWAY_PENDING_COMMAND_RESPONSE_BYTES,
+		);
+		this.maxConcurrentHistoryPages = positiveLimit(
+			opts.maxConcurrentHistoryPages,
+			MAX_SESSION_WS_CONCURRENT_HISTORY_PAGES,
 		);
 		this.wss = new WebSocketServer({ noServer: true, maxPayload: SESSION_WS_CLIENT_MAX_BYTES });
 		this.wss.on("connection", (ws) => this.handleConnection(ws));
@@ -437,6 +465,16 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			if (connection.controlledSessions.delete(message.previousSessionHandle)) {
 				connection.controlledSessions.add(message.runtime.sessionHandle);
 			}
+			const restartGeneration = connection.restartableOverflows.get(message.previousSessionHandle);
+			if (restartGeneration !== undefined) {
+				connection.restartableOverflows.delete(message.previousSessionHandle);
+				connection.restartableOverflows.set(message.runtime.sessionHandle, restartGeneration);
+			}
+			const controlIntent = connection.controlIntents.get(message.previousSessionHandle);
+			if (controlIntent) {
+				connection.controlIntents.delete(message.previousSessionHandle);
+				connection.controlIntents.set(message.runtime.sessionHandle, controlIntent);
+			}
 			if (wasSubscribed && catchUps.length === 0) this.sendPayload(connection, payload);
 		}
 	}
@@ -465,6 +503,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			catchUpLargeItems: 0,
 			nextCatchUpOrder: 0,
 			controlledSessions: new Set(),
+			controlIntents: new Map(),
 			pendingCommands: new Set(),
 			pendingCommandResponseBytes: 0,
 			outboundQueue: [],
@@ -480,6 +519,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			historyNegotiated: false,
 			historySnapshots: new Map(),
 			historyPages: new Map(),
+			restartableOverflows: new Map(),
 			hotInventoryRevision: -1,
 			admittedExactOperations: 0,
 			negotiatedMaxServerFrameBytes: MAX_SESSION_WS_FRAME_BYTES,
@@ -548,6 +588,9 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				return;
 			case "session_release":
 				this.release(connection, message.sessionHandle);
+				return;
+			case "session_restart":
+				await this.handleRestart(connection, message);
 				return;
 			case "command":
 				await this.handleCommand(connection, message);
@@ -898,6 +941,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				for (const frame of result.frames) this.send(connection, frame as BridgeServerMessage<M>);
 			}
 			this.sendLease(connection, this.supervisor.leaseFor(resolvedHandle, connection.connectionId));
+			connection.restartableOverflows.delete(resolvedHandle);
 
 			if (!this.isCurrentCatchUp(connection, catchUp, lifecycleEpoch)) return;
 			const buffered = [...catchUp.buffered];
@@ -915,8 +959,9 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			this.flushDeferredHotInventory(connection);
 		} catch (error) {
 			if (!this.isCurrentCatchUp(connection, catchUp, lifecycleEpoch)) return;
-			if (catchUp.exactTransactional) this.rollbackExactCatchUp(connection, catchUp);
-			else {
+			const retainedOverflow = this.establishOverflowRecoverySubscription(connection, catchUp, error);
+			if (!retainedOverflow && catchUp.exactTransactional) this.rollbackExactCatchUp(connection, catchUp);
+			else if (!retainedOverflow) {
 				this.enqueueBufferedRekeys(connection, catchUp);
 				this.cancelCatchUp(connection, catchUp);
 			}
@@ -927,6 +972,46 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				connection.admittedExactOperations = Math.max(0, connection.admittedExactOperations - 1);
 			}
 		}
+	}
+
+	private establishOverflowRecoverySubscription(
+		connection: ConnectionState<M>,
+		catchUp: SessionCatchUp<M>,
+		error: unknown,
+	): boolean {
+		if (
+			catchUp.exactTransactional ||
+			sessionErrorCode(this.errorText(error)) !== "session_snapshot_overflow"
+		) {
+			return false;
+		}
+		const runtime = this.supervisor.getRuntime(catchUp.currentHandle);
+		if (runtime?.error !== "session_snapshot_overflow") return false;
+		if (!this.adoptCatchUpHandle(connection, catchUp, runtime.sessionHandle, catchUp.rekeyVersion)) {
+			return false;
+		}
+		this.send(connection, { type: "runtime_state", runtime });
+		this.send(connection, {
+			type: "resync_required",
+			serverEpoch: this.serverEpoch,
+			sessionHandle: runtime.sessionHandle,
+			runtime,
+			reason: "gap",
+		});
+		this.sendLease(connection, this.supervisor.leaseFor(runtime.sessionHandle, connection.connectionId));
+		const buffered = [...catchUp.buffered];
+		const baselineMarker = this.findBaselineMarker(buffered, runtime);
+		this.establishLiveSubscription(connection, catchUp, runtime.sessionHandle);
+		connection.restartableOverflows.set(runtime.sessionHandle, runtime.generation);
+		for (const [index, entry] of buffered.entries()) {
+			if (
+				this.isNonReplayableCatchUpMessage(entry.message) ||
+				this.isNewerThanBaseline(entry.message, runtime, index, baselineMarker)
+			) {
+				this.sendPayload(connection, entry.payload, entry.message.type === "event");
+			}
+		}
+		return true;
 	}
 
 	private sendChunkedSnapshot(
@@ -1011,15 +1096,29 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		}
 		const existing = connection.historyPages.get(message.id);
 		if (existing) {
-			existing.controller.abort();
-			connection.historyPages.delete(message.id);
+			this.releaseHistoryPage(connection, existing, true);
+		}
+		const currentSessionOperation = this.historyPageOperations.get(sessionHandle);
+		if (currentSessionOperation) {
+			if (currentSessionOperation.connectionId === connection.connectionId) {
+				this.releaseHistoryPage(connection, currentSessionOperation, true);
+			} else {
+				this.sendSessionError(connection, message.sessionHandle, "history_page", "session_history_busy");
+				return;
+			}
+		}
+		if (this.historyPageOperations.size >= this.maxConcurrentHistoryPages) {
+			this.sendSessionError(connection, message.sessionHandle, "history_page", "session_history_capacity");
+			return;
 		}
 		const operation: HistoryPageOperation = {
 			sessionHandle,
 			requestId: message.id,
+			connectionId: connection.connectionId,
 			controller: new AbortController(),
 		};
 		connection.historyPages.set(message.id, operation);
+		this.historyPageOperations.set(sessionHandle, operation);
 		try {
 			const page = await history.chunked.readPage(message.cursor, message.limit, operation.controller.signal);
 			if (!this.isCurrentHistoryPage(connection, operation, history)) return;
@@ -1082,7 +1181,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				this.sendSessionError(connection, message.sessionHandle, "history_page", error);
 			}
 		} finally {
-			if (connection.historyPages.get(message.id) === operation) connection.historyPages.delete(message.id);
+			this.releaseHistoryPage(connection, operation, false);
 		}
 	}
 
@@ -1099,8 +1198,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			history?.snapshotId === message.snapshotId &&
 			history.generation === message.expectedGeneration
 		) {
-			connection.historyPages.delete(message.id);
-			operation.controller.abort();
+			this.releaseHistoryPage(connection, operation, true);
 		}
 	}
 
@@ -1120,11 +1218,24 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 
 	private clearHistorySnapshot(connection: ConnectionState<M>, sessionHandle: string): void {
 		connection.historySnapshots.delete(sessionHandle);
-		for (const [requestId, operation] of connection.historyPages) {
+		for (const operation of [...connection.historyPages.values()]) {
 			if (operation.sessionHandle !== sessionHandle) continue;
-			connection.historyPages.delete(requestId);
-			operation.controller.abort();
+			this.releaseHistoryPage(connection, operation, true);
 		}
+	}
+
+	private releaseHistoryPage(
+		connection: ConnectionState<M>,
+		operation: HistoryPageOperation,
+		abort: boolean,
+	): void {
+		if (connection.historyPages.get(operation.requestId) === operation) {
+			connection.historyPages.delete(operation.requestId);
+		}
+		if (this.historyPageOperations.get(operation.sessionHandle) === operation) {
+			this.historyPageOperations.delete(operation.sessionHandle);
+		}
+		if (abort && !operation.controller.signal.aborted) operation.controller.abort();
 	}
 
 	private maxHistoryChunkBytes(connection: ConnectionState<M>): number {
@@ -1230,6 +1341,9 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 
 	private unsubscribe(connection: ConnectionState<M>, sessionHandle: string): void {
 		const canonicalHandle = this.connectionSessionHandle(connection, sessionHandle);
+		this.recordControlIntent(connection, canonicalHandle, false);
+		connection.restartableOverflows.delete(sessionHandle);
+		connection.restartableOverflows.delete(canonicalHandle);
 		for (const catchUp of [...connection.catchUps]) {
 			if (
 				catchUp.requestedHandle === sessionHandle ||
@@ -1468,12 +1582,18 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			this.sendSessionError(connection, sessionHandle, "claim", "session_not_subscribed");
 			return;
 		}
+		const intent = this.recordControlIntent(connection, sessionHandle, true);
+		const intentRevision = intent.revision;
 		const lifecycleEpoch = connection.epoch;
 		try {
 			const lease = await this.supervisor.claim(sessionHandle, connection.connectionId);
+			const currentIntent =
+				connection.controlIntents.get(lease.sessionHandle) ?? connection.controlIntents.get(sessionHandle);
 			const connectionExpired =
 				connection.closed || connection.epoch !== lifecycleEpoch || !this.connections.has(connection);
-			if (connectionExpired || !this.isSubscribed(connection, lease.sessionHandle)) {
+			const intentExpired =
+				currentIntent !== intent || currentIntent.revision !== intentRevision || !currentIntent.wantsControl;
+			if (connectionExpired || intentExpired || !this.isSubscribed(connection, lease.sessionHandle)) {
 				if (lease.isController) {
 					if (connectionExpired) {
 						this.supervisor.releaseConnection(connection.connectionId);
@@ -1496,12 +1616,64 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 	private release(connection: ConnectionState<M>, sessionHandle: string): void {
 		try {
 			const canonicalHandle = this.connectionSessionHandle(connection, sessionHandle);
+			this.recordControlIntent(connection, canonicalHandle, false);
 			this.supervisor.release(canonicalHandle, connection.connectionId);
 			connection.controlledSessions.delete(sessionHandle);
 			connection.controlledSessions.delete(canonicalHandle);
 			this.sendLease(connection, this.supervisor.leaseFor(canonicalHandle, connection.connectionId));
 		} catch (error) {
 			this.sendSessionError(connection, sessionHandle, "release", error);
+		}
+	}
+
+	private recordControlIntent(
+		connection: ConnectionState<M>,
+		sessionHandle: string,
+		wantsControl: boolean,
+	): ControlIntent {
+		const canonicalHandle = this.connectionSessionHandle(connection, sessionHandle);
+		const existing =
+			connection.controlIntents.get(canonicalHandle) ?? connection.controlIntents.get(sessionHandle);
+		if (existing?.wantsControl === wantsControl) return existing;
+		const intent: ControlIntent = {
+			revision: (existing?.revision ?? 0) + 1,
+			wantsControl,
+		};
+		connection.controlIntents.set(canonicalHandle, intent);
+		if (sessionHandle !== canonicalHandle) connection.controlIntents.delete(sessionHandle);
+		return intent;
+	}
+
+	private async handleRestart(
+		connection: ConnectionState<M>,
+		message: Extract<SessionWsClientMessage, { type: "session_restart" }>,
+	): Promise<void> {
+		const runtime = this.supervisor.getRuntime(message.sessionHandle);
+		const sessionHandle =
+			runtime?.sessionHandle ?? this.connectionSessionHandle(connection, message.sessionHandle);
+		if (connection.restartableOverflows.get(sessionHandle) !== message.expectedGeneration) {
+			this.sendSessionError(connection, message.sessionHandle, "restart", "session_restart_not_available");
+			return;
+		}
+		connection.restartableOverflows.delete(sessionHandle);
+		try {
+			const restarted = await this.supervisor.restart(sessionHandle, {
+				connectionId: connection.connectionId,
+				expectedGeneration: message.expectedGeneration,
+				fencingToken: message.fencingToken,
+			});
+			if (connection.closed || !this.connections.has(connection)) return;
+			await this.subscribe(connection, restarted.sessionHandle);
+		} catch (error) {
+			const current = this.supervisor.getRuntime(sessionHandle);
+			if (
+				!connection.closed &&
+				current?.generation === message.expectedGeneration &&
+				current.error === "session_snapshot_overflow"
+			) {
+				connection.restartableOverflows.set(current.sessionHandle, current.generation);
+			}
+			this.sendSessionError(connection, message.sessionHandle, "restart", error);
 		}
 	}
 
@@ -1522,11 +1694,19 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			this.sendCommandError(connection, message, "pending_command_response_capacity");
 			return;
 		}
+		if (
+			this.gatewayPendingCommandResponseBytes + responseWeight >
+			this.maxGatewayPendingCommandResponseBytes
+		) {
+			this.sendCommandError(connection, message, "gateway_pending_command_response_capacity");
+			return;
+		}
 
 		const internalId = this.nextInternalId(connection);
 		const clientId = message.command.id;
 		connection.pendingCommands.add(internalId);
 		connection.pendingCommandResponseBytes += responseWeight;
+		this.gatewayPendingCommandResponseBytes += responseWeight;
 		const command = { ...message.command, id: internalId } as SessionCommandDto;
 		if (command.type === "bash" && clientId) {
 			this.bashCommandIds.set(internalId, { connectionId: connection.connectionId, clientId });
@@ -1556,6 +1736,10 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			connection.pendingCommandResponseBytes = Math.max(
 				0,
 				connection.pendingCommandResponseBytes - responseWeight,
+			);
+			this.gatewayPendingCommandResponseBytes = Math.max(
+				0,
+				this.gatewayPendingCommandResponseBytes - responseWeight,
 			);
 		}
 	}
@@ -1631,7 +1815,9 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			operation,
 			error: errorText,
 			code,
-			retryable: operation === "subscribe" && RETRYABLE_SESSION_ERROR_CODES.has(code),
+			retryable:
+				(operation === "subscribe" && RETRYABLE_SESSION_ERROR_CODES.has(code)) ||
+				(operation === "history_page" && RETRYABLE_HISTORY_ERROR_CODES.has(code)),
 		});
 	}
 
@@ -1656,13 +1842,16 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		connection.epoch += 1;
 		this.connections.delete(connection);
 		for (const catchUp of [...connection.catchUps]) this.cancelCatchUp(connection, catchUp);
-		for (const operation of connection.historyPages.values()) operation.controller.abort();
-		connection.historyPages.clear();
+		for (const operation of [...connection.historyPages.values()]) {
+			this.releaseHistoryPage(connection, operation, true);
+		}
 		connection.historySnapshots.clear();
+		connection.restartableOverflows.clear();
 		this.supervisor.releaseConnection(connection.connectionId);
 		connection.subscriptions.clear();
 		connection.subscriptionAliases.clear();
 		connection.controlledSessions.clear();
+		connection.controlIntents.clear();
 		connection.pendingCommands.clear();
 		connection.pendingCommandResponseBytes = 0;
 		connection.outboundQueue = [];

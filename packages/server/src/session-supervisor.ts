@@ -524,17 +524,24 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "curren
 		return this.runtimes.get(this.resolveAlias(sessionHandle))?.getPendingExtensionRequests();
 	}
 
-	async restart(sessionHandle: string): Promise<SessionRuntimeSnapshot> {
+	async restart(sessionHandle: string, context?: SessionCommandContext): Promise<SessionRuntimeSnapshot> {
 		this.assertOpen();
 		const handle = this.resolveAlias(sessionHandle);
 		const existing = this.runtimes.get(handle);
-		if (!existing) return this.activate(handle);
+		if (!existing) {
+			if (context) throw new RpcError("restart", "session_runtime_not_tracked");
+			return this.activate(handle);
+		}
 
 		let runtime = existing;
 		let release: (() => void) | undefined;
 		let starting: Promise<void> | undefined;
 		await this.withPoolLock(async () => {
 			this.assertOpen();
+			if (this.runtimes.get(handle) !== existing) {
+				throw new RpcError("restart", "session_runtime_not_tracked");
+			}
+			if (context) this.assertGeneration(existing, "restart", context.expectedGeneration);
 			if (this.deletionReservations.has(handle)) throw new RpcError("restart", "session_deleting");
 			if (!existing.recoverable) {
 				throw new RpcError("restart", "unpersisted_session_cannot_be_recovered");
@@ -544,6 +551,22 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "curren
 			}
 			if (existing.state !== "crashed" && existing.state !== "dormant") {
 				throw new RpcError("restart", "session_restart_requires_inactive_runtime");
+			}
+			if (context) {
+				const lease = this.leases.get(handle);
+				if (lease) {
+					if (lease.connectionId !== context.connectionId || lease.fencingToken !== context.fencingToken) {
+						throw new RpcError("restart", "session_read_only");
+					}
+				} else {
+					if (context.fencingToken !== undefined) {
+						throw new RpcError("restart", "session_read_only");
+					}
+					this.leases.set(handle, {
+						connectionId: context.connectionId,
+						fencingToken: randomUUID(),
+					});
+				}
 			}
 			this.clearRestart(existing.sessionHandle);
 			this.crashTimes.delete(existing.sessionHandle);

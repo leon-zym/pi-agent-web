@@ -332,7 +332,13 @@ export type SessionWsClientMessage =
 	  }
 	| { type: "session_unsubscribe"; sessionHandle: string }
 	| { type: "session_claim"; sessionHandle: string }
-	| { type: "session_release"; sessionHandle: string };
+	| { type: "session_release"; sessionHandle: string }
+	| {
+			type: "session_restart";
+			sessionHandle: string;
+			expectedGeneration: number;
+			fencingToken?: string;
+	  };
 
 function isGeneration(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
@@ -409,6 +415,12 @@ export function isSessionWsClientMessage(value: unknown): value is SessionWsClie
 		case "session_claim":
 		case "session_release":
 			return hasOnlyKeys(value, ["type", "sessionHandle"]);
+		case "session_restart":
+			return (
+				hasOnlyKeys(value, ["type", "sessionHandle", "expectedGeneration", "fencingToken"]) &&
+				isGeneration(value.expectedGeneration) &&
+				isOptionalString(value.fencingToken)
+			);
 		default:
 			return false;
 	}
@@ -750,7 +762,7 @@ export interface SessionErrorDto {
 	type: "session_error";
 	serverEpoch: string;
 	sessionHandle: string;
-	operation: "subscribe" | "claim" | "release" | "extension_ui_response" | "history_page";
+	operation: "subscribe" | "claim" | "release" | "restart" | "extension_ui_response" | "history_page";
 	error: string;
 	/** Stable machine-readable code; optional for backwards-compatible peers. */
 	code?: string;
@@ -1744,7 +1756,7 @@ export function isSessionWsServerMessage(
 				]) ||
 				!isString(value.serverEpoch, 128) ||
 				!isString(value.sessionHandle) ||
-				!["subscribe", "claim", "release", "extension_ui_response", "history_page"].includes(
+				!["subscribe", "claim", "release", "restart", "extension_ui_response", "history_page"].includes(
 					String(value.operation),
 				) ||
 				!isBoundedString(value.error, SESSION_TEXT_MAX_BYTES)

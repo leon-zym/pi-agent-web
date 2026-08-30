@@ -2964,6 +2964,61 @@ describe("session transport replay and recovery", () => {
 		expect(socket.sent).toContainEqual({ type: "session_subscribe", sessionHandle: "session-a" });
 	});
 
+	it("uses explicit fenced restart for a degraded snapshot-overflow runtime", async () => {
+		const clock = new ResyncClock();
+		const h = harness({ resyncClock: clock, resyncRandom: () => 0.5 });
+		const socket = connect(h);
+		h.controller.store.getState().subscribeSession("session-a");
+		const overflowed = {
+			...runtime("session-a", 3, 9),
+			state: "crashed" as const,
+			error: "session_snapshot_overflow",
+		};
+		socket.serverMessage({ type: "runtime_state", runtime: overflowed });
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: overflowed.serverEpoch,
+			sessionHandle: overflowed.sessionHandle,
+			generation: overflowed.generation,
+			isController: true,
+			fencingToken: "overflow-fence",
+		});
+		socket.serverMessage({
+			type: "resync_required",
+			serverEpoch: overflowed.serverEpoch,
+			sessionHandle: overflowed.sessionHandle,
+			runtime: overflowed,
+			reason: "gap",
+		});
+		const failAttempt = () =>
+			socket.serverMessage({
+				type: "session_error",
+				serverEpoch: overflowed.serverEpoch,
+				sessionHandle: overflowed.sessionHandle,
+				operation: "subscribe",
+				error: "session_snapshot_overflow",
+				code: "session_snapshot_overflow",
+				retryable: true,
+			});
+		for (const delay of [500, 1_000, 2_000]) {
+			failAttempt();
+			await flushPromises();
+			clock.advanceBy(delay);
+			await flushPromises();
+		}
+		failAttempt();
+		await flushPromises();
+		expect(h.controller.store.getState().sessions["session-a"]?.recovery?.phase).toBe("degraded");
+
+		expect(h.controller.store.getState().manualRetryResync("session-a")).toBe(true);
+		expect(socket.sent.at(-1)).toEqual({
+			type: "session_restart",
+			sessionHandle: "session-a",
+			expectedGeneration: 3,
+			fencingToken: "overflow-fence",
+		});
+	});
+
 	it("fences a failed snapshot waiter before creating its immediate replacement", async () => {
 		const h = harness();
 		connect(h);
@@ -3550,6 +3605,31 @@ describe("session transport commands and identity", () => {
 			h.controller.store.getState().sessions["session-a"]?.pendingExtensionRequests.map(({ id }) => id),
 		).toEqual(["dialog-one"]);
 		expect(socket.sent).toContainEqual({ type: "session_release", sessionHandle: "session-a" });
+	});
+
+	it("rejects a late controller acknowledgement after the release intent changed", () => {
+		const h = harness();
+		const socket = connect(h);
+		subscribeAndPrime(h, "session-a");
+		expect(h.controller.store.getState().claimSession("session-a")).toBe(true);
+		expect(h.controller.store.getState().releaseSession("session-a")).toBe(true);
+
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "session-a",
+			generation: 1,
+			isController: true,
+			fencingToken: "late-token",
+		});
+
+		expect(h.controller.store.getState().sessions["session-a"]?.lease).toEqual({
+			isController: false,
+		});
+		expect(socket.sent.filter(({ type }) => type === "session_release")).toEqual([
+			{ type: "session_release", sessionHandle: "session-a" },
+			{ type: "session_release", sessionHandle: "session-a" },
+		]);
 	});
 
 	it("adds fencing only to mutations and never shares a lease across Sessions", async () => {

@@ -615,6 +615,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	const deliveredNotifyKeys = new Map<string, DeliveredNotifyKeys>();
 	let deliveredNotifyIdentityOrder: string[] = [];
 	const claimAttempts = new Set<string>();
+	const releasedControlIntents = new Set<string>();
 	const baselineRefreshes = new Set<string>();
 	const subscriptionBaselines = new Map<string, string | null>();
 	let subscribedLruOrder: string[] = [];
@@ -672,7 +673,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		releaseSession,
 		sendCommand,
 		sendExtensionUiResponse,
-		manualRetryResync: (sessionHandle) => resyncCoordinator.manualRetry(sessionHandle),
+		manualRetryResync,
 		retrySessionSubscription,
 	}));
 
@@ -1232,6 +1233,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		attachmentGuardContext = null;
 		hotRuntimeRevision = -1;
 		claimAttempts.clear();
+		releasedControlIntents.clear();
 		baselineRefreshes.clear();
 		subscriptionBaselines.clear();
 		activeExactHotRecovery = null;
@@ -1498,6 +1500,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			subscriptionAdmission: null,
 		}));
 		claimAttempts.delete(sessionHandle);
+		releasedControlIntents.delete(sessionHandle);
 		baselineRefreshes.delete(sessionHandle);
 		subscriptionBaselines.delete(sessionHandle);
 		connectionObservations.delete(sessionHandle);
@@ -1538,6 +1541,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	function claimSession(sessionHandle: string): boolean {
 		const channel = store.getState().sessions[sessionHandle];
 		if (!channel?.subscribed) return false;
+		releasedControlIntents.delete(sessionHandle);
 		setChannel(sessionHandle, (channel) => ({ ...channel, controllerIntent: true }));
 		claimSessionIfReady(sessionHandle);
 		return true;
@@ -1567,6 +1571,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		const channel = store.getState().sessions[sessionHandle];
 		if (!channel?.subscribed) return false;
 		claimAttempts.delete(sessionHandle);
+		releasedControlIntents.add(sessionHandle);
 		setChannel(sessionHandle, (current) => ({
 			...current,
 			controllerIntent: false,
@@ -1588,6 +1593,28 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		}
 		if (store.getState().connectionState !== "online") return false;
 		return sendWire({ type: "session_release", sessionHandle }) === "sent";
+	}
+
+	function manualRetryResync(sessionHandle: string): boolean {
+		const channel = store.getState().sessions[sessionHandle];
+		const recovery = resyncCoordinator.getState(sessionHandle);
+		if (
+			channel?.runtime?.error === "session_snapshot_overflow" &&
+			channel.generation !== null &&
+			recovery?.phase === "degraded"
+		) {
+			const sent = sendWire({
+				type: "session_restart",
+				sessionHandle,
+				expectedGeneration: channel.generation,
+				...(channel.lease.fencingToken ? { fencingToken: channel.lease.fencingToken } : {}),
+			});
+			if (sent !== "sent") return false;
+			releasedControlIntents.delete(sessionHandle);
+			setChannel(sessionHandle, (current) => ({ ...current, controllerIntent: true }));
+			return true;
+		}
+		return resyncCoordinator.manualRetry(sessionHandle);
 	}
 
 	function sendCommand(
@@ -3619,6 +3646,17 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		) {
 			return;
 		}
+		let effectiveMessage = message;
+		if (message.isController && releasedControlIntents.has(message.sessionHandle)) {
+			sendWire({ type: "session_release", sessionHandle: message.sessionHandle });
+			effectiveMessage = {
+				type: "lease_status",
+				serverEpoch: message.serverEpoch,
+				sessionHandle: message.sessionHandle,
+				generation: message.generation,
+				isController: false,
+			};
+		}
 		if (subscriptionBaselines.get(message.sessionHandle) === identityKey(current.runtime)) {
 			subscriptionBaselines.delete(message.sessionHandle);
 		}
@@ -3627,16 +3665,16 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			freshLeaseBaseline: channel.runtime,
 			subscriptionAdmission:
 				channel.subscriptionAdmission?.kind === "rejected" ? null : channel.subscriptionAdmission,
-			lease: message.isController
+			lease: effectiveMessage.isController
 				? {
 						isController: true,
-						...(message.fencingToken ? { fencingToken: message.fencingToken } : {}),
+						...(effectiveMessage.fencingToken ? { fencingToken: effectiveMessage.fencingToken } : {}),
 					}
 				: { isController: false },
 		}));
-		frameBus.emit(message.sessionHandle, message, now());
+		frameBus.emit(message.sessionHandle, effectiveMessage, now());
 		if (current.runtime) advanceExactHotRecovery(current.runtime, "lease");
-		if (!message.isController) claimSessionIfReady(message.sessionHandle);
+		if (!effectiveMessage.isController) claimSessionIfReady(message.sessionHandle);
 	}
 
 	function handleResyncRequired(
@@ -4143,6 +4181,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		discardRawEvents(sessionHandle, false);
 		claimAttempts.delete(previousSessionHandle);
 		claimAttempts.delete(sessionHandle);
+		if (releasedControlIntents.delete(previousSessionHandle)) {
+			releasedControlIntents.add(sessionHandle);
+		}
 		const prevIdx = subscribedLruOrder.indexOf(previousSessionHandle);
 		if (prevIdx !== -1) subscribedLruOrder.splice(prevIdx, 1);
 		touchSubscriptionLru(sessionHandle);
@@ -4199,6 +4240,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		deliveredNotifyKeys.clear();
 		deliveredNotifyIdentityOrder = [];
 		claimAttempts.clear();
+		releasedControlIntents.clear();
 		baselineRefreshes.clear();
 		subscriptionBaselines.clear();
 		subscribedLruOrder = [];

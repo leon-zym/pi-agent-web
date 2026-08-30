@@ -153,8 +153,10 @@ interface BridgeTestLimits {
 	maxConnections?: number;
 	maxSubscribedChannels?: number;
 	maxConcurrentCatchUps?: number;
+	maxConcurrentHistoryPages?: number;
 	maxSubscriptionAliases?: number;
 	maxPendingCommandResponseBytes?: number;
+	maxGatewayPendingCommandResponseBytes?: number;
 }
 
 function temporaryRoot(): string {
@@ -344,6 +346,8 @@ async function createHarness(
 		replayLimit?: number;
 		serverEpoch?: string;
 		env?: Record<string, string>;
+		projectionLimits?: { maxLiveEventItems?: number };
+		maxAutoRestarts?: number;
 		historyCapability?: boolean;
 		bridge?: BridgeTestLimits;
 	} = {},
@@ -369,6 +373,8 @@ async function createHarness(
 		broadcast: (message) => bridge.broadcast(message),
 		onHotRuntimeInventory: (inventory) => bridge.broadcastHotRuntimeInventory(inventory),
 		replayLimit: options.replayLimit ?? 32,
+		projectionLimits: options.projectionLimits,
+		maxAutoRestarts: options.maxAutoRestarts,
 		readyTimeoutMs: 2_000,
 		idleTtlMs: 60_000,
 	});
@@ -652,6 +658,223 @@ describe("SessionWsBridge", () => {
 		expect(pageEnd).toMatchObject({ chunkCount: pageChunks.length, itemCount: 8 });
 	});
 
+	it("single-flights history reads per canonical Session and releases them on disconnect", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "history-single-flight");
+		appendLargeNativeHistory(target, 110, 600 * 1024);
+		const harness = await createHarness([target], {
+			historyCapability: true,
+			bridge: { maxConcurrentHistoryPages: 2 },
+		});
+		const first = await openClient(harness, { historyCapability: true });
+		const subscription = await subscribe(first, target.sessionHandle, undefined, 15_000);
+		const begin = subscription.frames.find(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_snapshot_begin" }> =>
+				frame.type === "session_snapshot_begin",
+		);
+		if (!begin?.history.nextCursor) throw new Error("history fixture did not expose an older page");
+		const second = await openClient(harness, { historyCapability: true });
+		const internals = harness.bridge as unknown as {
+			connections: Set<{
+				ws: WebSocket;
+				subscriptions: Set<string>;
+				historyNegotiated: boolean;
+				historySnapshots: Map<
+					string,
+					{
+						snapshotId: string;
+						workspaceId: string;
+						generation: number;
+						asOfSeq: number;
+						chunked: {
+							readPage: (...args: unknown[]) => Promise<unknown>;
+						};
+					}
+				>;
+			}>;
+		};
+		const connections = [...internals.connections];
+		const [firstState, secondState] = connections;
+		const history = firstState?.historySnapshots.get(target.sessionHandle);
+		if (!firstState || !secondState || !history) throw new Error("history Bridge state was unavailable");
+		secondState.subscriptions.add(target.sessionHandle);
+		secondState.historyNegotiated = true;
+		secondState.historySnapshots.set(target.sessionHandle, history);
+		const originalReadPage = history.chunked.readPage.bind(history.chunked);
+		let readCalls = 0;
+		let firstReadStarted: (() => void) | undefined;
+		const firstReadEntered = new Promise<void>((resolve) => {
+			firstReadStarted = resolve;
+		});
+		history.chunked.readPage = async (...args: unknown[]) => {
+			readCalls += 1;
+			if (readCalls === 1) {
+				firstReadStarted?.();
+				const signal = args[2] as AbortSignal;
+				await new Promise<void>((_resolve, reject) => {
+					signal.addEventListener("abort", () => reject(new Error("history read aborted")), {
+						once: true,
+					});
+				});
+			}
+			return originalReadPage(...args);
+		};
+		const pageRequest = (id: string): SessionWsClientMessage => ({
+			type: "session_history_page",
+			id,
+			sessionHandle: target.sessionHandle,
+			expectedGeneration: begin.generation,
+			snapshotId: begin.snapshotId,
+			asOfSeq: begin.asOfSeq,
+			cursor: begin.history.nextCursor!,
+			limit: 2,
+		});
+
+		first.send(pageRequest("history-held"));
+		await firstReadEntered;
+		const secondMark = second.mark();
+		second.send(pageRequest("history-busy"));
+		const busy = await second.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+				frame.type === "session_error" && frame.operation === "history_page",
+			secondMark,
+		);
+		expect(busy.code).toBe("session_history_busy");
+		expect(busy.retryable).toBe(true);
+		expect(readCalls).toBe(1);
+		const otherSessionHandle = "history-independent-session";
+		secondState.subscriptions.add(otherSessionHandle);
+		secondState.historySnapshots.set(otherSessionHandle, {
+			...history,
+			snapshotId: "history-independent-snapshot",
+		});
+		const independentMark = second.mark();
+		second.send({
+			type: "session_history_page",
+			id: "history-independent",
+			sessionHandle: otherSessionHandle,
+			expectedGeneration: begin.generation,
+			snapshotId: "history-independent-snapshot",
+			asOfSeq: begin.asOfSeq,
+			cursor: begin.history.nextCursor,
+			limit: 2,
+		});
+		await second.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_history_page_end" }> =>
+				frame.type === "session_history_page_end" && frame.requestId === "history-independent",
+			independentMark,
+		);
+		expect(readCalls).toBe(2);
+
+		await first.close();
+		await eventually(
+			() =>
+				(harness.bridge as unknown as { historyPageOperations: Map<string, unknown> }).historyPageOperations
+					.size === 0,
+		);
+		const retryMark = second.mark();
+		second.send(pageRequest("history-retry"));
+		await second.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_history_page_end" }> =>
+				frame.type === "session_history_page_end" && frame.requestId === "history-retry",
+			retryMark,
+		);
+		expect(readCalls).toBe(3);
+	});
+
+	it("recovers snapshot overflow through an explicit generation-and-lease-fenced restart", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "overflow-bridge-restart");
+		const harness = await createHarness([target], {
+			projectionLimits: { maxLiveEventItems: 8 },
+			maxAutoRestarts: 0,
+			env: { PI_WEB_FIXTURE_OVERFLOW_MARKER: path.join(root, "overflow-once.marker") },
+		});
+		const client = await openClient(harness);
+		const initial = await subscribe(client, target.sessionHandle);
+		const lease = await claim(client, target.sessionHandle);
+		if (!lease.fencingToken) throw new Error("overflow fixture did not acquire a controller lease");
+
+		client.send({
+			type: "command",
+			sessionHandle: target.sessionHandle,
+			expectedGeneration: initial.runtime.generation,
+			fencingToken: lease.fencingToken,
+			command: { type: "prompt", id: "overflow-command", message: "overflow-once" },
+		});
+		await eventually(() => harness.supervisor.getRuntime(target.sessionHandle)?.state === "crashed");
+		const overflowed = harness.supervisor.getRuntime(target.sessionHandle)!;
+		expect(overflowed.error).toBe("session_snapshot_overflow");
+
+		const failedMark = client.mark();
+		client.send({ type: "session_subscribe", sessionHandle: target.sessionHandle });
+		await client.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+				frame.type === "session_error" &&
+				frame.operation === "subscribe" &&
+				frame.code === "session_snapshot_overflow",
+			failedMark,
+		);
+		expect(
+			client.frames
+				.slice(failedMark)
+				.some(
+					(frame) => frame.type === "resync_required" && frame.runtime.generation === overflowed.generation,
+				),
+		).toBe(true);
+		const observer = await openClient(harness);
+		const observerMark = observer.mark();
+		observer.send({ type: "session_subscribe", sessionHandle: target.sessionHandle });
+		await observer.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+				frame.type === "session_error" &&
+				frame.operation === "subscribe" &&
+				frame.code === "session_snapshot_overflow",
+			observerMark,
+		);
+		const rejectedRestartMark = observer.mark();
+		observer.send({
+			type: "session_restart",
+			sessionHandle: target.sessionHandle,
+			expectedGeneration: overflowed.generation,
+		});
+		const rejectedRestart = await observer.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+				frame.type === "session_error" && frame.operation === "restart",
+			rejectedRestartMark,
+		);
+		expect(rejectedRestart.code).toBe("session_read_only");
+		expect(harness.supervisor.getRuntime(target.sessionHandle)?.generation).toBe(overflowed.generation);
+
+		const restartMark = client.mark();
+		client.send({
+			type: "session_restart",
+			sessionHandle: target.sessionHandle,
+			expectedGeneration: overflowed.generation,
+			fencingToken: lease.fencingToken,
+		});
+		const restarted = await client.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "runtime_state" }> =>
+				frame.type === "runtime_state" &&
+				frame.runtime.generation === overflowed.generation + 1 &&
+				frame.runtime.state === "idle",
+			restartMark,
+			5_000,
+		);
+		expect(restarted.runtime).toMatchObject({ state: "idle" });
+		expect(restarted.runtime.error).toBeUndefined();
+		await client.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_snapshot" }> =>
+				frame.type === "session_snapshot" && frame.generation === restarted.runtime.generation,
+			restartMark,
+			5_000,
+		);
+	});
+
 	it("rejects a subscription above the shared channel budget without disturbing existing channels", async () => {
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace");
@@ -820,6 +1043,69 @@ describe("SessionWsBridge", () => {
 		expect(largeRejected.response).toMatchObject({
 			success: false,
 			error: "pending_command_response_capacity",
+		});
+	});
+
+	it("holds the Gateway command reservation across sockets and disconnect", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "gateway-pending-response-capacity");
+		const harness = await createHarness([target], {
+			bridge: {
+				maxPendingCommandResponseBytes: 128 * 1024,
+				maxGatewayPendingCommandResponseBytes: 64 * 1024,
+			},
+		});
+		const first = await openClient(harness);
+		const second = await openClient(harness);
+		const firstSubscription = await subscribe(first, target.sessionHandle);
+		const secondSubscription = await subscribe(second, target.sessionHandle);
+		const originalSendCommand = harness.supervisor.sendCommand.bind(harness.supervisor);
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let entered: (() => void) | undefined;
+		const enteredPromise = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		harness.supervisor.sendCommand = async (...args) => {
+			entered?.();
+			await gate;
+			return originalSendCommand(...args);
+		};
+
+		first.send({
+			type: "command",
+			sessionHandle: target.sessionHandle,
+			expectedGeneration: firstSubscription.runtime.generation,
+			command: { type: "get_state", id: "gateway-pending-first" },
+		});
+		await enteredPromise;
+		await first.close();
+
+		const mark = second.mark();
+		second.send({
+			type: "command",
+			sessionHandle: target.sessionHandle,
+			expectedGeneration: secondSubscription.runtime.generation,
+			command: { type: "get_state", id: "gateway-pending-second" },
+		});
+		const rejected = await second.waitForFrame(
+			(frame): frame is ResponseFrame =>
+				frame.type === "response" && frame.response.id === "gateway-pending-second",
+			mark,
+		);
+		expect(rejected.response).toMatchObject({
+			success: false,
+			error: "gateway_pending_command_response_capacity",
+		});
+
+		release?.();
+		await eventually(() => {
+			const bridge = harness.bridge as unknown as { gatewayPendingCommandResponseBytes: number };
+			return bridge.gatewayPendingCommandResponseBytes === 0;
 		});
 	});
 
@@ -2894,6 +3180,60 @@ describe("SessionWsBridge", () => {
 		await subscribe(successor, child.sessionHandle);
 		const successorLease = await claim(successor, child.sessionHandle);
 		expect(successorLease.isController).toBe(true);
+	});
+
+	it("does not resurrect a controller lease when release overtakes a delayed claim", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "claim-release-intent-order");
+		const harness = await createHarness([target]);
+		const client = await openClient(harness);
+		await subscribe(client, target.sessionHandle);
+		const originalClaim = harness.supervisor.claim.bind(harness.supervisor);
+		let acquired: (() => void) | undefined;
+		const acquiredPromise = new Promise<void>((resolve) => {
+			acquired = resolve;
+		});
+		let returnClaim: (() => void) | undefined;
+		const returnGate = new Promise<void>((resolve) => {
+			returnClaim = resolve;
+		});
+		harness.supervisor.claim = async (...args) => {
+			const lease = await originalClaim(...args);
+			acquired?.();
+			await returnGate;
+			return lease;
+		};
+
+		const mark = client.mark();
+		client.send({ type: "session_claim", sessionHandle: target.sessionHandle });
+		await acquiredPromise;
+		client.send({ type: "session_release", sessionHandle: target.sessionHandle });
+		const released = await client.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "lease_status" }> =>
+				frame.type === "lease_status" &&
+				frame.sessionHandle === target.sessionHandle &&
+				frame.isController === false,
+			mark,
+		);
+		expect(released.isController).toBe(false);
+		returnClaim?.();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		const connectionId = (bridgeConnection(harness.bridge).connection as { connectionId: string })
+			.connectionId;
+		expect(harness.supervisor.leaseFor(target.sessionHandle, connectionId).isController).toBe(false);
+		expect(
+			client.frames
+				.slice(mark)
+				.filter(
+					(frame) =>
+						frame.type === "lease_status" &&
+						frame.sessionHandle === target.sessionHandle &&
+						frame.isController,
+				),
+		).toEqual([]);
 	});
 
 	it("releases a canonical lease acquired after its socket already closed", async () => {

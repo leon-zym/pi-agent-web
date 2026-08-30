@@ -125,6 +125,7 @@ function futureSupervisor(): FutureSessionWsBridgeOptions["supervisor"] {
 			generation: currentRuntime.generation,
 			isController: false,
 		}),
+		restart: async () => currentRuntime,
 		sendCommand: async () => ({
 			serverEpoch: SERVER_EPOCH,
 			sessionHandle: currentRuntime.sessionHandle,
