@@ -14,6 +14,7 @@ const scenario = {
 
 const matrix = {
 	schemaVersion: 1,
+	scope: { issue: 28, phase: 1, status: "incomplete", label: "#28 Phase 1 / incomplete" },
 	tiers: {
 		representative: { scenarios: [scenario] },
 		stress: { scenarios: [] },
@@ -79,6 +80,12 @@ function errorText(outcome) {
 
 test("accepts one complete internally consistent artifact", () => {
 	assert.deepEqual(validate().errors, []);
+});
+
+test("rejects a matrix that overclaims Issue #28 completion", () => {
+	const completedMatrix = structuredClone(matrix);
+	completedMatrix.scope.status = "complete";
+	assert.match(errorText(validate(validResult(), { matrix: completedMatrix })), /#28 Phase 1 \/ incomplete/);
 });
 
 test("rejects duplicate matrix ids before lookup can overwrite them", () => {

@@ -136,9 +136,12 @@ PI_WEB_RUN_E2E=1 pnpm test:e2e:real              # explicit real Pi/provider com
 
 `pnpm test:e2e` is an alias for `pnpm test:browser`. CI runs `verify`, `test:smoke`,
 `test:pack`, the packaged Chromium suite, and the representative benchmark without provider
-credentials. Benchmark JSON and Markdown are written below `test-results/performance`; the stress
-matrix remains explicit. Real Pi checks remain explicit because they use the developer's configured
-provider.
+credentials. The benchmark is **Issue #28 Phase 1 / incomplete**: a passing matrix proves only its
+declared scenarios and does not close Issue #28. Deterministic correctness and structural properties
+are hard-gated; hardware-sensitive latency, throughput, long-task, and heap measurements remain
+observational until a reference baseline exists. JSON and Markdown are written below
+`test-results/performance`; the stress matrix and the remaining coverage gaps stay explicit. Real Pi
+checks remain explicit because they use the developer's configured provider.
 
 The real Pi suite covers concurrent Sessions on one WebSocket, image-only input, content
 isolation, follow-up and abort while streaming, clone rekeying, parent/child history isolation,

@@ -19,6 +19,7 @@ const RESULT_KEYS = [
 const TRIAL_KEYS = ["correctness", "index", "metrics", "warmup"];
 const SUMMARY_KEYS = ["count", "max", "median", "min", "p95"];
 const GATE_KEYS = ["actual", "comparison", "metric", "mode", "passed", "rationale", "statistic", "threshold"];
+const MATRIX_SCOPE_KEYS = ["issue", "label", "phase", "status"];
 const SUMMARY_STATISTICS = new Set(["median", "p95", "max"]);
 const COMPARISONS = new Set(["lte", "gte", "eq"]);
 const GATE_MODES = new Set(["hard", "observe"]);
@@ -65,6 +66,16 @@ function matrixScenarios(matrix, tier, errors) {
 	if (!isRecord(matrix) || matrix.schemaVersion !== 1) {
 		errors.push("matrix: schemaVersion must be 1");
 		return [];
+	}
+	if (!exactKeys(matrix.scope, MATRIX_SCOPE_KEYS)) {
+		errors.push(`matrix: scope must contain exactly ${MATRIX_SCOPE_KEYS.join(", ")}`);
+	} else if (
+		matrix.scope.issue !== 28 ||
+		matrix.scope.phase !== 1 ||
+		matrix.scope.status !== "incomplete" ||
+		matrix.scope.label !== "#28 Phase 1 / incomplete"
+	) {
+		errors.push("matrix: scope must declare #28 Phase 1 / incomplete");
 	}
 	const tiers = matrix.tiers;
 	const selected = isRecord(tiers) ? tiers[tier] : undefined;

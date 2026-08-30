@@ -219,10 +219,10 @@ Protocol schema benchmark 是兼容性升级 lane 的性能证据，不把跨机
 只做浅层 envelope 形状检查，UTF-8、item、depth、identity、resource budget 与脱敏仍由边界 guard 和
 PiHostAdapter 负责。
 
-### 可复现 performance matrix
+### Issue #28 Phase 1 / incomplete：可复现 performance matrix
 
 根命令从 clean checkout 构建 production 产物，启动隔离 Gateway/fake Pi/Chromium，最后严格校验每个
-预期场景都产生非空结果：
+预期场景都产生非空结果。Phase 1 matrix 通过只证明其中声明的场景，不代表 #28 已完成：
 
 ```bash
 pnpm bench:representative
@@ -236,23 +236,29 @@ pnpm bench:stress
 - `benchmark.md`：便于人工读取的短表，不是另一份事实来源；
 - `raw/*.json`：逐场景原始样本；Playwright failure 另保留 screenshot/trace。
 
-Runner 会拒绝 skip、空样本、缺场景、重复/额外场景、schema 错误和 hard gate failure。CI 已经完成同
-一 commit 的 production build 时，可以直接调用
-`node scripts/run-performance-benchmarks.mjs representative --skip-build`；日常与 clean checkout
-不得用这个内部加速参数跳过 build。
+Runner 会拒绝 skip、空样本、缺场景、重复/额外场景、schema 错误、非有限 gated sample、汇总不一致和
+hard gate failure。每次运行都重新构建 production 产物；不存在把 stale `dist` 标记为当前 commit 的
+skip-build 路径。
 
 `representative` 是可在 PR CI 承受的 120 KiB/1 MiB streaming、1/4 Session、65 MiB native
 history、disconnect/gap、Pi crash/restart 和近上限 Browser image→typed attachment ref round trip。
-`stress` 扩展为 10/64/120 KiB/1 MiB、1/4/8 Session、below/at/above 64 MiB、恢复各 100 次和更多
-样本；它由手动 workflow 运行，不属于每次 PR 的隐式成本。
+`stress` 扩展为 10/64/120 KiB/1 MiB、1/4/8 Session、small/below/at/above 64 MiB、恢复各 100 次和
+更多样本；它由手动 workflow 运行，不属于每次 PR 的隐式成本。
 
-门禁分两类：correctness、结构边界、coalescing、饥饿、DOM 上限和有重复样本的宽松 p95 是 hard；
-单次 64 MiB history latency/heap 等受 runner hardware/GC 明显影响的指标只记录为 observe。1 MiB
-重复 turn 当前使用的较宽 first-paint/long-task 上限是已检查的 regression ceiling，不是 UX 目标；真实
-数值必须从同次产物读取。`matrix.json` 中声明的 coverage gap 不得从 Markdown 汇总中省略。
+只有确定性 correctness 与结构性质作为 portable hard gate，例如 Browser 实际 frame 到达与投影、
+streaming→settled DOM 边界、分页内容、post-crash command barrier、旧 generation/fence 拒绝、并发
+Session 持续 ingest，以及 DOM/socket/process 数量边界。first-paint、absolute latency、throughput、
+long-task 和 heap 等对硬件、调度与 GC 敏感的样本，在建立同机 reference baseline、容差与足够重复数前
+只记录为 observe；不得作为共享 CI 的 release hard failure。真实数值必须从同次产物读取。
+`matrix.json` 中声明的 coverage gap 不得从 Markdown 汇总中省略。
 
 三类性能证据不可互换：Vitest microbenchmark 用于定位 reducer/schema 热点；reference-host 数值用于
-同机候选对比；portable hard gate 只用于确定性 correctness 和有足够抗噪样本的宽松预算。
+同机候选对比；portable hard gate 只用于确定性 correctness 和结构边界。
+
+Phase 1 尚未覆盖的主要类别包括 Gateway restart、慢 raw client 与 history/command 并发公平性、future
+private content refs、Browser 发起的 history cancellation 及释放观测、持续 60 秒的 1,000 delta/s、
+真实 provider/reference host，以及多 Browser/adversarial backpressure。在这些证据补齐并重新验收前，
+#28 保持 open；即便产物显示 `8/8`，也只能解释为 Phase 1 声明的八个场景通过。
 
 ## 视觉验收
 
