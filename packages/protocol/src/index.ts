@@ -476,6 +476,55 @@ export function commandTimeoutMs(commandType: string): number {
 	}
 }
 
+const SMALL_COMMAND_RESPONSE_RESERVATION_BYTES = 2 * SESSION_TEXT_MAX_BYTES;
+
+/**
+ * Conservative upper bounds for one legal command response retained by the Gateway.
+ * Keep this exhaustive table beside the response guards so admission cannot drift
+ * below a newly widened DTO. Commands with collection, snapshot, or arbitrary JSON
+ * output reserve the negotiated wire ceiling.
+ */
+export const COMMAND_RESPONSE_RESERVATION_BYTES = {
+	prompt: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	steer: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	follow_up: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	abort: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	new_session: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	get_state: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	set_model: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	cycle_model: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	get_available_models: SESSION_WS_SERVER_MAX_BYTES,
+	set_thinking_level: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	cycle_thinking_level: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	get_available_thinking_levels: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	set_steering_mode: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	set_follow_up_mode: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	compact: SESSION_WS_SERVER_MAX_BYTES,
+	set_auto_compaction: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	set_auto_retry: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	abort_retry: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	bash: SESSION_WS_SERVER_MAX_BYTES,
+	abort_bash: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	get_session_stats: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	export_html: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	switch_session: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	fork: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	clone: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	get_fork_messages: SESSION_WS_SERVER_MAX_BYTES,
+	get_entries: SESSION_WS_SERVER_MAX_BYTES,
+	get_tree: SESSION_WS_SERVER_MAX_BYTES,
+	get_last_assistant_text: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	set_session_name: SMALL_COMMAND_RESPONSE_RESERVATION_BYTES,
+	get_messages: SESSION_WS_SERVER_MAX_BYTES,
+	get_commands: SESSION_WS_SERVER_MAX_BYTES,
+} as const satisfies Readonly<Record<SessionCommandTypeDto, number>>;
+
+export function commandResponseReservationBytes(commandType: string): number {
+	return Object.hasOwn(COMMAND_RESPONSE_RESERVATION_BYTES, commandType)
+		? COMMAND_RESPONSE_RESERVATION_BYTES[commandType as keyof typeof COMMAND_RESPONSE_RESERVATION_BYTES]
+		: SESSION_WS_SERVER_MAX_BYTES;
+}
+
 /** RPC reads that never require a controller lease. Keep this policy shared by gateway and browser. */
 export const READ_ONLY_RPC_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_available_models",

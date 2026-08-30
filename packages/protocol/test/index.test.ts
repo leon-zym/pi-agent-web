@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+	commandResponseReservationBytes,
 	commandTimeoutMs,
 	expectCommandData,
 	expectData,
@@ -11,6 +12,7 @@ import {
 	SESSION_IMAGE_MAX_BASE64_CHARS,
 	SESSION_TEXT_MAX_BYTES,
 	SESSION_WS_CLIENT_MAX_BYTES,
+	SESSION_WS_SERVER_MAX_BYTES,
 	type SessionCommandResponseDto,
 	sessionWsClientMessageBytes,
 } from "../src/index.js";
@@ -69,6 +71,14 @@ describe("gateway command deadlines", () => {
 		expect(commandTimeoutMs("abort")).toBe(90_000);
 		expect(commandTimeoutMs("compact")).toBe(120_000);
 		expect(commandTimeoutMs("export_html")).toBe(120_000);
+	});
+});
+
+describe("gateway command response reservations", () => {
+	it("reserves the full legal wire ceiling for large and unknown responses", () => {
+		expect(commandResponseReservationBytes("bash")).toBe(SESSION_WS_SERVER_MAX_BYTES);
+		expect(commandResponseReservationBytes("get_commands")).toBe(SESSION_WS_SERVER_MAX_BYTES);
+		expect(commandResponseReservationBytes("unknown_future_command")).toBe(SESSION_WS_SERVER_MAX_BYTES);
 	});
 });
 
