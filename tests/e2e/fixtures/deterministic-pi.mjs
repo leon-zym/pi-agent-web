@@ -342,24 +342,28 @@ function scheduleSlowFinish(run, text, callback) {
 	check();
 }
 
-function scheduleConsumedRelease(run, text, eventType, callback) {
+function scheduleConsumedSignal(run, text, signal, eventType, callback) {
 	if (!controlDir) {
-		schedule(run, slowDelayMs, callback);
+		schedule(run, signal === "release" ? slowDelayMs : 0, callback);
 		return;
 	}
-	const releaseFile = path.join(controlDir, `${encodeURIComponent(text)}.release`);
+	const signalFile = path.join(controlDir, `${encodeURIComponent(text)}.${signal}`);
 	const check = () => {
 		schedule(run, 25, () => {
-			if (!fs.existsSync(releaseFile)) {
+			if (!fs.existsSync(signalFile)) {
 				check();
 				return;
 			}
-			fs.unlinkSync(releaseFile);
+			fs.unlinkSync(signalFile);
 			record(eventType, { commandId: run.command.id, text });
 			callback();
 		});
 	};
 	check();
+}
+
+function scheduleConsumedRelease(run, text, eventType, callback) {
+	scheduleConsumedSignal(run, text, "release", eventType, callback);
 }
 
 function streamComplexPrompt(command, text, user, userEntryId) {
@@ -920,7 +924,7 @@ function streamBudgetPrompt(
 	user,
 	userEntryId,
 	targetBytes,
-	{ chunkSize = 4 * 1024, firstChunkDelayMs = 500, chunkDelayMs = 10 } = {},
+	{ chunkSize = 4 * 1024, firstChunkDelayMs = 500, chunkDelayMs = 10, waitForBenchmarkStart = false } = {},
 ) {
 	const markdown = budgetMarkdown(targetBytes);
 	const run = {
@@ -1043,7 +1047,12 @@ function streamBudgetPrompt(
 		finishRun();
 	};
 
-	schedule(run, 250, emitChunk);
+	const beginStreaming = () => schedule(run, 250, emitChunk);
+	if (waitForBenchmarkStart) {
+		scheduleConsumedSignal(run, text, "start", "benchmark_start_observed", beginStreaming);
+	} else {
+		beginStreaming();
+	}
 }
 
 function startUnpersistedHotRuntime() {
@@ -1843,7 +1852,7 @@ function streamPrompt(command) {
 		}
 	}
 	if (text.startsWith("E2E_BENCH_STREAM:") && images.length === 0) {
-		const [, rawTargetBytes, rawChunkSize, rawChunkDelayMs] = text.split(":", 5);
+		const [, rawTargetBytes, rawChunkSize, rawChunkDelayMs, benchmarkLabel] = text.split(":", 5);
 		const targetBytes = Number(rawTargetBytes);
 		const chunkSize = Number(rawChunkSize);
 		const chunkDelayMs = Number(rawChunkDelayMs);
@@ -1862,6 +1871,7 @@ function streamPrompt(command) {
 				chunkSize,
 				firstChunkDelayMs: 50,
 				chunkDelayMs,
+				waitForBenchmarkStart: benchmarkLabel?.startsWith("g") ?? false,
 			});
 			return;
 		}

@@ -189,6 +189,6 @@
 		"A deliberately slow raw WebSocket client and concurrent history/command fairness are not yet benchmarked.",
 		"Future protocol content-root references remain an explicit private L3 lane; this suite covers production attachment refs only.",
 		"History cancellation and post-cancel process/heap release are not yet measured.",
-		"Stress concurrency approximates the 60 second aggregate-delta load with repeated finite 1 MiB turns; it does not yet certify an exact 1000 delta/s arrival rate."
+		"Stress concurrency uses synchronized repeated finite 1 MiB turns and reports actual arrival rate; it does not yet certify an uninterrupted 60 second 1000 delta/s arrival rate."
 	]
 }
