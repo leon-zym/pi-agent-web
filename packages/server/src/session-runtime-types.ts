@@ -85,6 +85,7 @@ export interface SessionHistoryPageResult<TMessage> {
 
 export interface SessionChunkedSnapshot<TMessage> {
 	history: SessionHistoryMetadataDto;
+	pageTargetBytes: (cursor: string, limit: number | undefined) => number;
 	readPage: (
 		cursor: string,
 		limit: number | undefined,

@@ -131,6 +131,8 @@ type BridgeServerMessage<M extends SessionRuntimeProductMode> = M extends "futur
 interface BufferedCatchUpMessage<M extends SessionRuntimeProductMode = "current"> {
 	message: BridgeSupervisorMessage<M>;
 	payload: string;
+	bytes: number;
+	retained: boolean;
 }
 
 interface SessionCatchUp<M extends SessionRuntimeProductMode = "current"> {
@@ -162,6 +164,8 @@ interface HistoryPageOperation {
 	requestId: string;
 	connectionId: string;
 	controller: AbortController;
+	retainedBytes: number;
+	retained: boolean;
 }
 
 interface ControlIntent {
@@ -243,17 +247,21 @@ export const MAX_SESSION_WS_CONNECTIONS = 64;
 export const MAX_SESSION_WS_SUBSCRIBED_CHANNELS = 1024;
 export const MAX_SESSION_WS_CONCURRENT_CATCHUPS = 256;
 export const MAX_SESSION_WS_SUBSCRIPTION_ALIASES = 1024;
-// Keep room for one wire-sized read plus the bounded metadata refresh that the
-// browser starts after a snapshot. The Gateway-wide ceiling remains authoritative.
+export const MAX_SESSION_WS_METADATA_BURST_SESSIONS = 6;
+// One Session snapshot refresh starts these five reads together. Six independent
+// Sessions retain 105 MiB; one additional 8 MiB ordinary read brings the proven
+// per-connection maximum to 113 MiB. A seventh complete burst would exceed it.
 export const MAX_SESSION_WS_METADATA_RESPONSE_HEADROOM_BYTES =
+	COMMAND_RESPONSE_RESERVATION_BYTES.get_commands +
 	COMMAND_RESPONSE_RESERVATION_BYTES.get_available_models +
 	COMMAND_RESPONSE_RESERVATION_BYTES.get_state +
 	COMMAND_RESPONSE_RESERVATION_BYTES.get_available_thinking_levels +
-	COMMAND_RESPONSE_RESERVATION_BYTES.get_session_stats +
-	// One ordinary read may race the snapshot-triggered four-command refresh.
-	COMMAND_RESPONSE_RESERVATION_BYTES.get_state;
+	COMMAND_RESPONSE_RESERVATION_BYTES.get_session_stats;
+export const MAX_SESSION_WS_ORDINARY_READ_RESPONSE_BYTES =
+	COMMAND_RESPONSE_RESERVATION_BYTES.get_last_assistant_text;
 export const MAX_SESSION_WS_PENDING_COMMAND_RESPONSE_BYTES =
-	COMMAND_RESPONSE_RESERVATION_BYTES.get_commands + MAX_SESSION_WS_METADATA_RESPONSE_HEADROOM_BYTES;
+	MAX_SESSION_WS_METADATA_BURST_SESSIONS * MAX_SESSION_WS_METADATA_RESPONSE_HEADROOM_BYTES +
+	MAX_SESSION_WS_ORDINARY_READ_RESPONSE_BYTES;
 export const MAX_SESSION_WS_GATEWAY_PENDING_COMMAND_RESPONSE_BYTES = SESSION_WS_SERVER_MAX_BYTES * 2;
 export const MAX_SESSION_WS_GATEWAY_OUTBOUND_BYTES = SESSION_WS_SERVER_MAX_BYTES * 2;
 export const MAX_SESSION_WS_CONCURRENT_HISTORY_PAGES = 16;
@@ -451,8 +459,12 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 	}
 
 	private establishLiveOverflowRecovery(connection: ConnectionState<M>, runtime: SessionRuntimeDto): void {
+		const current = this.supervisor.getRuntime(runtime.sessionHandle);
 		if (
 			runtime.error !== "session_snapshot_overflow" ||
+			current?.generation !== runtime.generation ||
+			current.error !== runtime.error ||
+			current.state !== runtime.state ||
 			connection.restartableOverflows.get(runtime.sessionHandle) === runtime.generation
 		) {
 			return;
@@ -1000,6 +1012,9 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 					this.isNewerThanBaseline(entry.message, result.runtime, index, baselineMarker)
 				) {
 					this.sendPayload(connection, entry.payload, entry.message.type === "event");
+					if (entry.message.type === "runtime_state") {
+						this.establishLiveOverflowRecovery(connection, entry.message.runtime);
+					}
 				}
 			}
 			this.flushDeferredHotInventory(connection);
@@ -1055,6 +1070,9 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				this.isNewerThanBaseline(entry.message, runtime, index, baselineMarker)
 			) {
 				this.sendPayload(connection, entry.payload, entry.message.type === "event");
+				if (entry.message.type === "runtime_state") {
+					this.establishLiveOverflowRecovery(connection, entry.message.runtime);
+				}
 			}
 		}
 		return true;
@@ -1156,16 +1174,36 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			this.sendSessionError(connection, message.sessionHandle, "history_page", "session_history_capacity");
 			return;
 		}
+		let targetBytes: number;
+		try {
+			targetBytes = history.chunked.pageTargetBytes(message.cursor, message.limit);
+		} catch (error) {
+			this.sendSessionError(connection, message.sessionHandle, "history_page", error);
+			return;
+		}
+		if (
+			!Number.isSafeInteger(targetBytes) ||
+			targetBytes < 0 ||
+			this.gatewayOutboundBytes + targetBytes > this.maxGatewayOutboundBytes
+		) {
+			this.sendSessionError(connection, message.sessionHandle, "history_page", "session_history_capacity");
+			return;
+		}
 		const operation: HistoryPageOperation = {
 			sessionHandle,
 			requestId: message.id,
 			connectionId: connection.connectionId,
 			controller: new AbortController(),
+			retainedBytes: targetBytes,
+			retained: true,
 		};
+		this.gatewayOutboundBytes += targetBytes;
 		connection.historyPages.set(message.id, operation);
 		this.historyPageOperations.set(sessionHandle, operation);
 		try {
-			const page = await history.chunked.readPage(message.cursor, message.limit, operation.controller.signal);
+			const page = await history.chunked
+				.readPage(message.cursor, message.limit, operation.controller.signal)
+				.finally(() => this.releaseHistoryPageBytes(operation));
 			if (!this.isCurrentHistoryPage(connection, operation, history)) return;
 			const chunks = splitHistoryMessages(
 				page.messages,
@@ -1281,10 +1319,17 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 	}
 
 	private settleHistoryPage(connection: ConnectionState<M>, operation: HistoryPageOperation): void {
+		this.releaseHistoryPageBytes(operation);
 		this.releaseHistoryPage(connection, operation, false);
 		if (this.historyPageOperations.get(operation.sessionHandle) === operation) {
 			this.historyPageOperations.delete(operation.sessionHandle);
 		}
+	}
+
+	private releaseHistoryPageBytes(operation: HistoryPageOperation): void {
+		if (!operation.retained) return;
+		operation.retained = false;
+		this.gatewayOutboundBytes = Math.max(0, this.gatewayOutboundBytes - operation.retainedBytes);
 	}
 
 	private maxHistoryChunkBytes(connection: ConnectionState<M>): number {
@@ -1469,6 +1514,10 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		const bytes = Buffer.byteLength(payload);
 		const large = this.classifyPayload(connection, bytes, message.type === "event");
 		if (large === undefined) return;
+		if (this.gatewayOutboundBytes + bytes > this.maxGatewayOutboundBytes) {
+			this.closeForPolicyViolation(connection, "gateway outbound capacity");
+			return;
+		}
 		if (large) {
 			if (connection.catchUpLargeItems >= 1) {
 				this.closeForPolicyViolation(connection, "Session catch-up buffer exceeded its limit");
@@ -1484,7 +1533,8 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			catchUp.bufferedSmallBytes += bytes;
 			connection.catchUpSmallBufferedBytes += bytes;
 		}
-		catchUp.buffered.push({ message, payload });
+		this.gatewayOutboundBytes += bytes;
+		catchUp.buffered.push({ message, payload, bytes, retained: true });
 	}
 
 	private cancelCatchUp(connection: ConnectionState<M>, catchUp: SessionCatchUp<M>): void {
@@ -1494,6 +1544,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			connection.catchUpSmallBufferedBytes - catchUp.bufferedSmallBytes,
 		);
 		connection.catchUpLargeItems = Math.max(0, connection.catchUpLargeItems - catchUp.bufferedLargeItems);
+		for (const entry of catchUp.buffered) this.releaseBufferedCatchUpMessage(entry);
 		catchUp.buffered = [];
 		catchUp.bufferedSmallBytes = 0;
 		catchUp.bufferedLargeItems = 0;
@@ -1506,8 +1557,16 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 
 	private enqueueBufferedRekeys(connection: ConnectionState<M>, catchUp: SessionCatchUp<M>): void {
 		for (const entry of catchUp.buffered) {
-			if (entry.message.type === "session_rekeyed") this.sendPayload(connection, entry.payload);
+			if (entry.message.type !== "session_rekeyed") continue;
+			this.releaseBufferedCatchUpMessage(entry);
+			this.sendPayload(connection, entry.payload);
 		}
+	}
+
+	private releaseBufferedCatchUpMessage(entry: BufferedCatchUpMessage<M>): void {
+		if (!entry.retained) return;
+		entry.retained = false;
+		this.gatewayOutboundBytes = Math.max(0, this.gatewayOutboundBytes - entry.bytes);
 	}
 
 	private transferCatchUpJournalAndCancel(

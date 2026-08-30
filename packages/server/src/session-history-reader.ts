@@ -108,6 +108,16 @@ export class NativeSessionHistoryPlan {
 		signal?: AbortSignal,
 	): Promise<NativeSessionHistorySlice> {
 		throwIfAborted(signal);
+		const range = this.pageRange(cursor, limit);
+		return this.readRange(range.start, range.end, signal);
+	}
+
+	/** Exact persisted source bytes that the requested page may read. */
+	pageTargetBytes(cursor: string, limit = SESSION_HISTORY_MAX_CHUNK_MESSAGES): number {
+		return this.pageRange(cursor, limit).sourceBytes;
+	}
+
+	private pageRange(cursor: string, limit: number): { start: number; end: number; sourceBytes: number } {
 		if (!Number.isSafeInteger(limit) || limit <= 0 || limit > SESSION_HISTORY_MAX_CHUNK_MESSAGES) {
 			throw new SessionHistoryError("session_history_invalid_cursor", "history page limit is invalid");
 		}
@@ -136,7 +146,7 @@ export class NativeSessionHistoryPlan {
 			start -= 1;
 			sourceBytes += record.byteLength;
 		}
-		return this.readRange(start, end, signal);
+		return { start, end, sourceBytes };
 	}
 
 	/** Check the persisted source without retaining or reading its contents. */

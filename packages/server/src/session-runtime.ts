@@ -1991,6 +1991,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 				totalBytes: Math.max(plan.totalBytes, loadedBytes),
 				nextCursor: plan.initialCursor,
 			},
+			pageTargetBytes: (cursor, limit) => plan.pageTargetBytes(cursor, limit),
 			readPage: (cursor, limit, signal) =>
 				this.readNativeHistoryPage(processToken, proc, generation, snapshotId, cursor, limit, signal),
 		};
