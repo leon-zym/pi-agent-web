@@ -119,7 +119,18 @@ describe("Session-scoped UI stores", () => {
 					return response(command.type, { levels: ["off"] });
 				}
 				return response(command.type, {
-					commands: [{ name: sessionHandle, source: "prompt", sourceInfo: {} }],
+					commands: [
+						{
+							name: sessionHandle,
+							source: "prompt",
+							sourceInfo: {
+								path: `/tmp/${sessionHandle}.md`,
+								source: "test",
+								scope: "temporary",
+								origin: "top-level",
+							},
+						},
+					],
 				});
 			},
 		});
