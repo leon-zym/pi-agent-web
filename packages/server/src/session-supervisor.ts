@@ -108,6 +108,8 @@ export interface SessionSupervisorBaseOptions<M extends SessionRuntimeProductMod
 	extensionStateMaxBytes?: number;
 	extensionStateMaxItems?: number;
 	pendingDialogLimit?: number;
+	/** Per-canonical-Session cap for pending Pi command responses. */
+	maxPendingCommands?: number;
 	projectionLimits?: Partial<SessionLiveProjectionLimits>;
 	commandTimeoutFor?: (commandType: string) => number;
 	/** Hard cap for concurrently owned Pi processes. */
@@ -980,6 +982,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "curren
 			extensionStateMaxBytes: this.opts.extensionStateMaxBytes,
 			extensionStateMaxItems: this.opts.extensionStateMaxItems,
 			pendingDialogLimit: this.opts.pendingDialogLimit,
+			maxPendingCommands: this.opts.maxPendingCommands,
 			projectionLimits: this.opts.projectionLimits,
 			initialGeneration,
 			commandTimeoutFor: this.opts.commandTimeoutFor,
@@ -1215,9 +1218,12 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "curren
 			const hot = [...new Set(this.runtimes.values())].filter(
 				(runtime) => runtime.running || runtime.state === "starting",
 			);
+			const projectionOwners = [...new Set(this.runtimes.values())].filter(
+				(runtime) => runtime.running || runtime.state === "starting" || runtime.retainsProjectionReservation,
+			);
 			const processCapacityReached = hot.length >= this.opts.maxHotProcesses;
 			const projectionCapacityReached =
-				hot.length * this.projectionReservationBytes() + this.projectionReservationBytes() >
+				projectionOwners.length * this.projectionReservationBytes() + this.projectionReservationBytes() >
 				this.opts.maxRetainedProjectionBytes;
 			if (!processCapacityReached && !projectionCapacityReached) return;
 			const candidate = hot

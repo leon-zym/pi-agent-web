@@ -89,6 +89,7 @@ const DEFAULT_TRANSIENT_BUFFER_MAX_BYTES = 4 * 1024 * 1024;
 const DEFAULT_EXTENSION_STATE_MAX_BYTES = 512 * 1024;
 const DEFAULT_EXTENSION_STATE_MAX_ITEMS = SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS;
 const DEFAULT_PENDING_DIALOG_LIMIT = 32;
+const DEFAULT_MAX_PENDING_COMMANDS = 32;
 const NATIVE_HISTORY_DIRECT_THRESHOLD_BYTES = SESSION_SNAPSHOT_MAX_BYTES - 256 * 1024;
 
 function deepFreeze<T>(value: T): T {
@@ -292,6 +293,8 @@ export interface SessionRuntimeCoreOptions<M extends SessionRuntimeProductMode =
 	extensionStateMaxBytes?: number;
 	extensionStateMaxItems?: number;
 	pendingDialogLimit?: number;
+	/** Hard cap for RPC command responses pending on this canonical Session. */
+	maxPendingCommands?: number;
 	projectionLimits?: Partial<SessionLiveProjectionLimits>;
 	productAdapter: SessionRuntimeProductAdapter<M>;
 	payloadCustody?: SessionRuntimePayloadCustody<M>;
@@ -481,6 +484,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			| "extensionStateMaxBytes"
 			| "extensionStateMaxItems"
 			| "pendingDialogLimit"
+			| "maxPendingCommands"
 		>
 	> &
 		SessionRuntimeCoreOptions<M>;
@@ -589,6 +593,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 			extensionStateMaxBytes: Math.max(0, opts.extensionStateMaxBytes ?? DEFAULT_EXTENSION_STATE_MAX_BYTES),
 			extensionStateMaxItems: Math.max(0, opts.extensionStateMaxItems ?? DEFAULT_EXTENSION_STATE_MAX_ITEMS),
 			pendingDialogLimit: Math.max(0, opts.pendingDialogLimit ?? DEFAULT_PENDING_DIALOG_LIMIT),
+			maxPendingCommands: Math.max(1, Math.floor(opts.maxPendingCommands ?? DEFAULT_MAX_PENDING_COMMANDS)),
 		};
 		if (
 			opts.productAdapter.productSchema.serverEpoch !== undefined &&
@@ -670,6 +675,11 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 
 	get snapshotOverflowed(): boolean {
 		return this.snapshotOverflow;
+	}
+
+	/** True while this Runtime still owns its bounded in-memory projection. */
+	get retainsProjectionReservation(): boolean {
+		return this.state === "crashed" && this.liveProjection !== null;
 	}
 
 	rebuildTarget(): ExistingSessionTarget | null {
@@ -1494,6 +1504,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	): Promise<RuntimeResponse<M>> {
 		const admitted = await this.withCommandAdmission(async () => {
 			this.assertGeneration(command.type, expectedGeneration);
+			this.assertPendingCommandCapacity(command.type);
 			admit();
 			const expectsWork = commandMayStartWork(command.type);
 			const turnReleaseCutoff = commandReleasesQueuedWork(command.type)
@@ -1599,6 +1610,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 	): Promise<{ response: RuntimeResponse<M>; previousSessionHandle?: string }> {
 		return this.withCommandAdmission(async () => {
 			this.assertGeneration(command.type, expectedGeneration);
+			this.assertPendingCommandCapacity(command.type);
 			admit();
 			const blocker = this.identityTransitionBlocker();
 			if (blocker) throw new RpcError(command.type, `session_busy:${blocker}`);
@@ -1820,6 +1832,12 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "current">
 				this.refreshOperationalStateAndPublish(previousOperationalState);
 			}
 		});
+	}
+
+	private assertPendingCommandCapacity(commandType: string): void {
+		if (this.inFlight >= this.opts.maxPendingCommands) {
+			throw new RpcError(commandType, "session_runtime_command_capacity");
+		}
 	}
 
 	private timeoutFor(commandType: string): number {

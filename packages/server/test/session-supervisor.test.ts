@@ -120,6 +120,7 @@ function createHarness(options: {
 	extensionStateMaxBytes?: number;
 	extensionStateMaxItems?: number;
 	pendingDialogLimit?: number;
+	maxPendingCommands?: number;
 	projectionLimits?: Partial<SessionLiveProjectionLimits>;
 	restartBaseDelayMs?: number;
 	maxAutoRestarts?: number;
@@ -165,6 +166,7 @@ function createHarness(options: {
 		extensionStateMaxBytes: options.extensionStateMaxBytes,
 		extensionStateMaxItems: options.extensionStateMaxItems,
 		pendingDialogLimit: options.pendingDialogLimit,
+		maxPendingCommands: options.maxPendingCommands,
 		projectionLimits: options.projectionLimits,
 		piPayloadServices: options.piPayloadServices,
 		commandTimeoutFor: options.commandTimeoutFor,
@@ -1079,12 +1081,13 @@ describe("SessionSupervisor", () => {
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace");
 		fs.mkdirSync(cwd);
+		const other = createNativeSession(root, cwd, "retained-budget-other");
 		const exactRef = attachmentRef("c".repeat(64));
 		const adopted: EpochContentHold[][] = [];
 		const released: EpochContentHold[] = [];
 		const { hold, lease } = trackedLease(exactRef, { adopted, released });
 		const { supervisor } = createHarness({
-			targets: [],
+			targets: [other],
 			adapter: startupBaseAdapter(exactRef, lease),
 			piPayloadServices: testPayloadServices(released),
 			env: {
@@ -1092,6 +1095,7 @@ describe("SessionSupervisor", () => {
 				PI_WEB_FIXTURE_SKIP_PROMPT_PERSIST: "1",
 			},
 			maxAutoRestarts: 0,
+			maxRetainedProjectionBytes: SESSION_SNAPSHOT_MAX_BYTES,
 		});
 		const created = await supervisor.createSession({
 			workspaceId: "workspace",
@@ -1124,6 +1128,8 @@ describe("SessionSupervisor", () => {
 		expect(adopted).toEqual([[hold]]);
 		expect(released).toEqual([]);
 		expect(snapshotSpy).not.toHaveBeenCalled();
+		await expect(supervisor.activate(other.sessionHandle)).rejects.toThrow("session_projection_capacity");
+		expect(released).toEqual([]);
 		const retained = await supervisor.subscribe(created.sessionHandle);
 		if (retained.type !== "resync_required") throw new Error("retained crash did not resync");
 		expect(retained.snapshot).toMatchObject({
@@ -3612,6 +3618,48 @@ describe("SessionSupervisor", () => {
 
 		await supervisor.claim(first.sessionHandle, "projection-budget-connection");
 		await expect(supervisor.activate(second.sessionHandle)).rejects.toThrow("session_projection_capacity");
+	});
+
+	it("bounds pending commands per Session without coupling independent Sessions", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const first = createNativeSession(root, cwd, "command-capacity-first");
+		const second = createNativeSession(root, cwd, "command-capacity-second");
+		const { supervisor } = createHarness({
+			targets: [first, second],
+			maxPendingCommands: 1,
+			env: { PI_WEB_FIXTURE_COMPACTION_DELAY_MS: "200" },
+		});
+		const [firstRuntime, secondRuntime] = await Promise.all([
+			supervisor.activate(first.sessionHandle),
+			supervisor.activate(second.sessionHandle),
+		]);
+		const context = (runtime: SessionRuntimeSnapshot) => ({
+			connectionId: "observer",
+			expectedGeneration: runtime.generation,
+		});
+
+		const firstPending = supervisor.sendCommand(
+			first.sessionHandle,
+			{ type: "get_messages", id: "first-pending" },
+			context(firstRuntime),
+		);
+		const secondPending = supervisor.sendCommand(
+			second.sessionHandle,
+			{ type: "get_messages", id: "second-pending" },
+			context(secondRuntime),
+		);
+		await new Promise<void>((resolve) => setTimeout(resolve, 25));
+
+		await expect(
+			supervisor.sendCommand(
+				first.sessionHandle,
+				{ type: "get_state", id: "first-over-capacity" },
+				context(firstRuntime),
+			),
+		).rejects.toThrow("session_runtime_command_capacity");
+		await expect(Promise.all([firstPending, secondPending])).resolves.toHaveLength(2);
 	});
 
 	it("pins an idle controller lease against capacity eviction until release", async () => {
