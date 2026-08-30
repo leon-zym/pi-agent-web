@@ -50,6 +50,15 @@ function clamp(value: number, min: number, max: number): number {
 	return Math.min(max, Math.max(min, value));
 }
 
+function isValidFocusTarget(target: Element | null): target is HTMLElement {
+	return (
+		target instanceof HTMLElement &&
+		target.isConnected &&
+		target !== document.body &&
+		target !== document.documentElement
+	);
+}
+
 /**
  * Three-column app shell with the DSH squeeze policy (DESIGN.md):
  * details shrinks to 300, then moves into an overlay, and only then may the
@@ -76,6 +85,7 @@ export function AppShell() {
 	const navigationTrigger = useRef<HTMLButtonElement>(null);
 	const detailsReturnFocus = useRef<HTMLElement>(null);
 	const dockedDetailsTrigger = useRef<HTMLButtonElement>(null);
+	const dockedDetailsPanel = useRef<HTMLDivElement>(null);
 	const previousDetailsOpen = useRef(detailsOpen);
 
 	useEffect(() => {
@@ -147,14 +157,19 @@ export function AppShell() {
 		previousDetailsOpen.current = detailsOpen;
 		if (!canDockDetails || wasOpen === detailsOpen) return;
 		if (detailsOpen) {
-			if (document.activeElement instanceof HTMLElement) {
+			if (isValidFocusTarget(document.activeElement)) {
 				detailsReturnFocus.current = document.activeElement;
 			}
+			window.requestAnimationFrame(() => {
+				dockedDetailsPanel.current
+					?.querySelector<HTMLButtonElement>('[data-details-collapse="true"]')
+					?.focus();
+			});
 			return;
 		}
 		window.requestAnimationFrame(() => {
 			const target = detailsReturnFocus.current;
-			if (target?.isConnected) target.focus();
+			if (isValidFocusTarget(target)) target.focus();
 			else dockedDetailsTrigger.current?.focus();
 		});
 	}, [canDockDetails, detailsOpen]);
@@ -225,7 +240,10 @@ export function AppShell() {
 							type="button"
 							aria-label={tt("details.expandPanel")}
 							className="flex w-10 shrink-0 items-start justify-center border-l border-border pt-3 text-ink-3 transition-[color,background-color,scale] hover:bg-hover hover:text-ink active:scale-95 focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
-							onClick={() => setDetailsOpen(true)}
+							onClick={(event) => {
+								detailsReturnFocus.current = event.currentTarget;
+								setDetailsOpen(true);
+							}}
 						>
 							<PanelRightOpen className="size-4" />
 						</button>
@@ -255,6 +273,7 @@ export function AppShell() {
 
 			{/* A docked panel stays mounted at zero width so close/open preserves local state. */}
 			<div
+				ref={dockedDetailsPanel}
 				className={cn(
 					"min-w-0 shrink-0 overflow-hidden border-l border-border bg-base",
 					detailsWidth === 0 && "hidden",

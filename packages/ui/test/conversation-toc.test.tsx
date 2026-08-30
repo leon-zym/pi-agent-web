@@ -104,21 +104,6 @@ describe("ConversationToc outline rail", () => {
 		expect(html).toContain('aria-hidden="true"');
 	});
 
-	it("auto-hides when a wide content block owns the reading column", () => {
-		const html = renderToStaticMarkup(
-			createElement(ConversationToc, {
-				turns: mockTurns,
-				activeTurnId: "turn-1",
-				rightMargin: 300,
-				wideContent: true,
-			}),
-		);
-
-		expect(html).toContain('data-toc-wide-content="true"');
-		expect(html).toContain("invisible");
-		expect(html).toContain('aria-hidden="true"');
-	});
-
 	it("does not render when turns is empty", () => {
 		const html = renderToStaticMarkup(
 			createElement(ConversationToc, {

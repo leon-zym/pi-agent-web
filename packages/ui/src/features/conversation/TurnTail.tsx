@@ -85,7 +85,7 @@ export function TurnTail({ turn, sessionHandle }: { turn: ProductTurn; sessionHa
 			<span className="flex-1" />
 			<button
 				type="button"
-				className="inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-ink-3 transition-colors hover:bg-hover hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none max-lg:min-h-10 max-lg:px-2"
+				className="inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-ink-3 transition-colors hover:bg-hover hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none [@media(hover:none)]:min-h-10 [@media(hover:none)]:px-2"
 				onClick={() => void copyTurn()}
 			>
 				{copied ? <Check className="size-3" /> : <Copy className="size-3" />}
@@ -93,7 +93,7 @@ export function TurnTail({ turn, sessionHandle }: { turn: ProductTurn; sessionHa
 			</button>
 			<button
 				type="button"
-				className="inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-ink-3 transition-colors hover:bg-hover hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40 max-lg:min-h-10 max-lg:px-2"
+				className="inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-ink-3 transition-colors hover:bg-hover hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40 [@media(hover:none)]:min-h-10 [@media(hover:none)]:px-2"
 				onClick={() => void forkLast()}
 				disabled={!canControl}
 			>

@@ -235,6 +235,7 @@ export function ChatViewport() {
 		<div
 			ref={scrollRef}
 			onScroll={onScroll}
+			tabIndex={-1}
 			data-chat-viewport="true"
 			className="scroll-slim h-full overflow-x-hidden overflow-y-auto overscroll-contain"
 		>

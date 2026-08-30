@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { tt, useT } from "../../lib/i18n";
 import { cn } from "../../lib/utils";
 import type { ProductTurn } from "../../types/view-models";
@@ -8,33 +8,18 @@ export interface ConversationTocProps {
 	activeTurnId?: string | null;
 	hoveredTurnId?: string | null;
 	rightMargin?: number;
-	wideContent?: boolean;
 	className?: string;
 	onTurnSelect?: (turnId: string) => void;
 }
 
 const MIN_RIGHT_MARGIN = 240;
 
-function hasWideConversationContent(): boolean {
-	if (typeof document === "undefined") return false;
-	const viewport = document.querySelector<HTMLElement>("[data-chat-viewport]");
-	const content = viewport?.querySelector<HTMLElement>("[data-conversation-content]");
-	if (!viewport || !content) return false;
-	const contentWidth = content.clientWidth;
-	return Array.from(
-		content.querySelectorAll<HTMLElement>('pre, table, [data-diff-block="true"] .scroll-slim'),
-	).some(
-		(element) =>
-			element.scrollWidth > element.clientWidth + 1 ||
-			element.getBoundingClientRect().width > contentWidth + 1,
-	);
-}
-
 function calculateRightMargin(): number {
 	if (typeof window === "undefined") return 300;
-	const viewport = document.querySelector("[data-chat-viewport]");
-	if (viewport) {
-		return (viewport.clientWidth - 748) / 2;
+	const viewport = document.querySelector<HTMLElement>("[data-chat-viewport]");
+	const content = viewport?.querySelector<HTMLElement>("[data-conversation-content]");
+	if (viewport && content) {
+		return viewport.getBoundingClientRect().right - content.getBoundingClientRect().right;
 	}
 	return (window.innerWidth - 748) / 2;
 }
@@ -61,7 +46,6 @@ export const ConversationToc = memo(function ConversationToc({
 	activeTurnId: controlledActiveTurnId,
 	hoveredTurnId: controlledHoveredTurnId,
 	rightMargin: controlledRightMargin,
-	wideContent: controlledWideContent,
 	className,
 	onTurnSelect,
 }: ConversationTocProps) {
@@ -69,23 +53,21 @@ export const ConversationToc = memo(function ConversationToc({
 	void t;
 	const [observedActiveTurnId, setObservedActiveTurnId] = useState<string | null>(null);
 	const [measuredMargin, setMeasuredMargin] = useState<number>(calculateRightMargin);
-	const [measuredWideContent, setMeasuredWideContent] = useState<boolean>(hasWideConversationContent);
 	const [internalHoveredTurnId, setInternalHoveredTurnId] = useState<string | null>(null);
+	const tocRef = useRef<HTMLElement>(null);
 
 	const activeTurnId = controlledActiveTurnId ?? observedActiveTurnId;
 	const hoveredTurnId =
 		controlledHoveredTurnId !== undefined ? controlledHoveredTurnId : internalHoveredTurnId;
 	const rightMargin = controlledRightMargin ?? measuredMargin;
-	const wideContent = controlledWideContent ?? measuredWideContent;
-	const isVisible = rightMargin >= MIN_RIGHT_MARGIN && !wideContent;
+	const isVisible = rightMargin >= MIN_RIGHT_MARGIN;
 
-	// Re-measure only the uncontrolled collision inputs.
+	// Re-measure the actual reading-column gap without inspecting contained overflow.
 	useEffect(() => {
-		if (controlledRightMargin !== undefined && controlledWideContent !== undefined) return;
+		if (controlledRightMargin !== undefined) return;
 		let scheduledFrame: number | null = null;
 		const updateMeasurements = () => {
-			if (controlledRightMargin === undefined) setMeasuredMargin(calculateRightMargin());
-			if (controlledWideContent === undefined) setMeasuredWideContent(hasWideConversationContent());
+			setMeasuredMargin(calculateRightMargin());
 		};
 		const scheduleUpdate = () => {
 			if (scheduledFrame !== null) cancelAnimationFrame(scheduledFrame);
@@ -105,19 +87,19 @@ export const ConversationToc = memo(function ConversationToc({
 			resizeObserver.observe(viewport);
 			if (content) resizeObserver.observe(content);
 		}
-		const mutationObserver =
-			content && typeof MutationObserver !== "undefined" ? new MutationObserver(scheduleUpdate) : null;
-		if (mutationObserver && content) {
-			mutationObserver.observe(content, { childList: true, characterData: true, subtree: true });
-		}
-
 		return () => {
 			window.removeEventListener("resize", scheduleUpdate);
 			if (scheduledFrame !== null) cancelAnimationFrame(scheduledFrame);
 			resizeObserver?.disconnect();
-			mutationObserver?.disconnect();
 		};
-	}, [controlledRightMargin, controlledWideContent]);
+	}, [controlledRightMargin]);
+
+	useEffect(() => {
+		if (isVisible) return;
+		const activeElement = document.activeElement;
+		if (!(activeElement instanceof HTMLElement) || !tocRef.current?.contains(activeElement)) return;
+		document.querySelector<HTMLElement>('[data-chat-viewport="true"]')?.focus({ preventScroll: true });
+	}, [isVisible]);
 
 	// Track active visible turn using IntersectionObserver
 	useEffect(() => {
@@ -207,10 +189,10 @@ export const ConversationToc = memo(function ConversationToc({
 
 	return (
 		<nav
+			ref={tocRef}
 			aria-label={tt("toc.title")}
 			aria-hidden={!isVisible}
 			data-conversation-toc="true"
-			data-toc-wide-content={wideContent ? "true" : "false"}
 			className={cn(
 				"fixed top-20 right-3 z-20 flex flex-col items-center gap-2 py-4 transition-opacity duration-200 select-none",
 				!isVisible && "invisible pointer-events-none opacity-0",
@@ -225,7 +207,7 @@ export const ConversationToc = memo(function ConversationToc({
 					const statusLabel = turn.status === "running" ? tt("status.running") : tt("common.done");
 
 					return (
-						<div key={turn.id} className="group relative flex items-center justify-center">
+						<div key={turn.id} className="relative flex items-center justify-center">
 							<button
 								type="button"
 								data-toc-tick={turn.id}
@@ -236,13 +218,18 @@ export const ConversationToc = memo(function ConversationToc({
 								onMouseLeave={() => setInternalHoveredTurnId((cur) => (cur === turn.id ? null : cur))}
 								onFocus={() => setInternalHoveredTurnId(turn.id)}
 								onBlur={() => setInternalHoveredTurnId((cur) => (cur === turn.id ? null : cur))}
-								className={cn(
-									"h-1.5 rounded-full transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none",
-									isActive
-										? "w-4 bg-primary shadow-xs"
-										: "w-2 bg-border-strong hover:w-3 hover:bg-ink-3 group-focus-visible:w-3 group-focus-visible:bg-ink-3",
-								)}
-							/>
+								className="group flex h-1.5 w-4 items-center justify-center rounded-full transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none [@media(hover:none)]:size-10"
+							>
+								<span
+									aria-hidden="true"
+									className={cn(
+										"h-1.5 rounded-full transition-[width,background-color] duration-150",
+										isActive
+											? "w-4 bg-primary shadow-xs"
+											: "w-2 bg-border-strong group-hover:w-3 group-hover:bg-ink-3 group-focus-visible:w-3 group-focus-visible:bg-ink-3",
+									)}
+								/>
+							</button>
 
 							{/* 220px Preview Bubble */}
 							{isHovered && (

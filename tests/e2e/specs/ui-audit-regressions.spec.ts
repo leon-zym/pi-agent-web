@@ -45,7 +45,7 @@ test("context details stay inside the wide-screen meter", async ({ page, harness
 	await expect(meter).toHaveAttribute("data-state", "ready");
 	const detail = meter.locator(":scope > span");
 
-	for (const width of [375, 640, 768, 1023]) {
+	for (const width of [375, 640]) {
 		await page.setViewportSize({ width, height: 900 });
 		await expect(detail).toBeHidden();
 		const geometry = await meter.evaluate((element) => ({
@@ -57,85 +57,112 @@ test("context details stay inside the wide-screen meter", async ({ page, harness
 		);
 	}
 
-	await page.setViewportSize({ width: 1024, height: 900 });
-	await expect(detail).toBeVisible();
-	await expect(meter).toContainText("34%");
+	for (const width of [768, 1023, 1280]) {
+		await page.setViewportSize({ width, height: 900 });
+		await expect(detail).toBeVisible();
+		await expect(meter).toContainText("34%");
+		const geometry = await meter.evaluate((element) => ({
+			clientWidth: element.clientWidth,
+			scrollWidth: element.scrollWidth,
+		}));
+		expect(geometry.scrollWidth, `${String(width)}px context meter`).toBeLessThanOrEqual(
+			geometry.clientWidth,
+		);
+	}
 	await capture(page, "context-meter-1024-en-light");
 });
 
-test("localized long Diff toolbar wraps without clipping", async ({ page, harness }) => {
-	await page.setViewportSize({ width: 375, height: 812 });
-	await openWorkbench(page, harness.origin, "zh-CN");
-	await page.locator("textarea").fill("E2E_COMPLEX_LONG_FILE");
-	await page.getByRole("button", { name: "发送" }).click();
-	await expect(page.getByRole("heading", { name: "Synthetic change review", level: 2 })).toBeVisible();
+test.describe("small touch geometry", () => {
+	test.use({ hasTouch: true });
 
-	const toolToggle = page.locator("main button[aria-expanded]").filter({ hasText: "非常长的目录名称" });
-	await toolToggle.click();
-	const diff = page.locator('[data-diff-block="true"]');
-	await expect(diff).toBeVisible();
-	const fileName = diff.locator('[data-diff-file-name="true"]');
-	await expect(fileName).toHaveAttribute("title", /用于验证本地化布局不会挤压/);
-	const toolbar = diff.locator(":scope > div").first();
-	const geometry = await toolbar.evaluate((element) => ({
-		clientWidth: element.clientWidth,
-		scrollWidth: element.scrollWidth,
-		clientHeight: element.clientHeight,
-		scrollHeight: element.scrollHeight,
-	}));
-	expect(geometry.scrollWidth).toBeLessThanOrEqual(geometry.clientWidth);
-	expect(geometry.scrollHeight).toBeLessThanOrEqual(geometry.clientHeight);
-	for (const button of await diff.getByRole("button").all()) await minimumTarget(button);
-	await fileName.scrollIntoViewIfNeeded();
-	await capture(page, "diff-toolbar-375-zh-light");
-});
+	test("localized long Diff toolbar wraps without clipping", async ({ page, harness }) => {
+		await page.setViewportSize({ width: 375, height: 812 });
+		await openWorkbench(page, harness.origin, "zh-CN");
+		await page.locator("textarea").fill("E2E_COMPLEX_LONG_FILE");
+		await page.getByRole("button", { name: "发送" }).click();
+		await expect(page.getByRole("heading", { name: "Synthetic change review", level: 2 })).toBeVisible();
 
-test("conversation controls keep touch targets and complete reasoning access", async ({ page, harness }) => {
-	await page.setViewportSize({ width: 375, height: 812 });
-	await openWorkbench(page, harness.origin, "en");
-	await page.locator("textarea").fill("E2E_COMPLEX_DEMO");
-	await page.getByRole("button", { name: "Send" }).click();
-	await expect(page.getByRole("heading", { name: "Synthetic change review", level: 2 })).toBeVisible();
-
-	const reasoningToggle = page
-		.locator("main button[aria-expanded]")
-		.filter({ hasText: "Comparing the implementation with the requested behavior." });
-	const reasoningInspect = page.getByRole("button", { name: "Open reasoning in details panel" });
-	const toolToggle = page.locator("main button[aria-expanded]").filter({ hasText: "src/demo.ts" });
-	const toolInspect = page.getByRole("button", { name: "Open in details panel" });
-	const turnCopy = page.getByRole("button", { name: "Copy" }).last();
-	const turnFork = page.getByRole("button", { name: "Fork" }).last();
-	const userCopy = page.getByRole("button", { name: "Copy message" });
-	const controls = [reasoningToggle, reasoningInspect, toolToggle, toolInspect, turnCopy, turnFork, userCopy];
-
-	for (const control of controls) await minimumTarget(control);
-	await reasoningToggle.focus();
-	await page.keyboard.press("Tab");
-	await expect(reasoningInspect).toBeFocused();
-	const focusedStyle = await reasoningInspect.evaluate((element) => {
-		const style = getComputedStyle(element);
-		return { boxShadow: style.boxShadow, opacity: style.opacity };
+		const toolToggle = page.locator("main button[aria-expanded]").filter({ hasText: "非常长的目录名称" });
+		await toolToggle.click();
+		const diff = page.locator('[data-diff-block="true"]');
+		await expect(diff).toBeVisible();
+		const fileName = diff.locator('[data-diff-file-name="true"]');
+		await expect(fileName).toHaveAttribute("title", /用于验证本地化布局不会挤压/);
+		const toolbar = diff.locator(":scope > div").first();
+		const geometry = await toolbar.evaluate((element) => ({
+			clientWidth: element.clientWidth,
+			scrollWidth: element.scrollWidth,
+			clientHeight: element.clientHeight,
+			scrollHeight: element.scrollHeight,
+		}));
+		expect(geometry.scrollWidth).toBeLessThanOrEqual(geometry.clientWidth);
+		expect(geometry.scrollHeight).toBeLessThanOrEqual(geometry.clientHeight);
+		for (const button of await diff.getByRole("button").all()) await minimumTarget(button);
+		await fileName.scrollIntoViewIfNeeded();
+		await capture(page, "diff-toolbar-375-zh-light");
 	});
-	expect(focusedStyle.opacity).toBe("1");
-	expect(focusedStyle.boxShadow).not.toBe("none");
 
-	await reasoningToggle.click();
-	const fullReasoning = page
-		.locator("p")
-		.filter({ hasText: "Comparing the implementation with the requested behavior." });
-	await expect(fullReasoning).toBeVisible();
-	await expect(fullReasoning).toContainText("Inspecting synthetic workspace");
+	test("conversation controls keep touch targets and complete reasoning access", async ({
+		page,
+		harness,
+	}) => {
+		await page.setViewportSize({ width: 375, height: 812 });
+		await openWorkbench(page, harness.origin, "en");
+		await page.locator("textarea").fill("E2E_COMPLEX_DEMO");
+		await page.getByRole("button", { name: "Send" }).click();
+		await expect(page.getByRole("heading", { name: "Synthetic change review", level: 2 })).toBeVisible();
 
-	await page.setViewportSize({ width: 768, height: 900 });
-	for (const control of [reasoningInspect, toolToggle, toolInspect, turnCopy, turnFork, userCopy]) {
-		await minimumTarget(control);
-	}
-	await page.setViewportSize({ width: 375, height: 812 });
-	await reasoningToggle.scrollIntoViewIfNeeded();
-	await capture(page, "conversation-controls-375-en-light");
+		const reasoningToggle = page
+			.locator("main button[aria-expanded]")
+			.filter({ hasText: "Comparing the implementation with the requested behavior." });
+		const reasoningInspect = page.getByRole("button", { name: "Open reasoning in details panel" });
+		const toolToggle = page.locator("main button[aria-expanded]").filter({ hasText: "src/demo.ts" });
+		const toolInspect = page.getByRole("button", { name: "Open in details panel" });
+		const turnCopy = page.getByRole("button", { name: "Copy" }).last();
+		const turnFork = page.getByRole("button", { name: "Fork" }).last();
+		const userCopy = page.getByRole("button", { name: "Copy message" });
+		const controls = [
+			reasoningToggle,
+			reasoningInspect,
+			toolToggle,
+			toolInspect,
+			turnCopy,
+			turnFork,
+			userCopy,
+		];
+
+		for (const control of controls) await minimumTarget(control);
+		await reasoningToggle.focus();
+		await page.keyboard.press("Tab");
+		await expect(reasoningInspect).toBeFocused();
+		const focusedStyle = await reasoningInspect.evaluate((element) => {
+			const style = getComputedStyle(element);
+			return { boxShadow: style.boxShadow, opacity: style.opacity };
+		});
+		expect(focusedStyle.opacity).toBe("1");
+		expect(focusedStyle.boxShadow).not.toBe("none");
+
+		await reasoningToggle.click();
+		const fullReasoning = page
+			.locator("p")
+			.filter({ hasText: "Comparing the implementation with the requested behavior." });
+		await expect(fullReasoning).toBeVisible();
+		await expect(fullReasoning).toContainText("Inspecting synthetic workspace");
+
+		await page.setViewportSize({ width: 768, height: 900 });
+		for (const control of [reasoningInspect, toolToggle, toolInspect, turnCopy, turnFork, userCopy]) {
+			await minimumTarget(control);
+		}
+		await page.setViewportSize({ width: 375, height: 812 });
+		await reasoningToggle.scrollIntoViewIfNeeded();
+		await capture(page, "conversation-controls-375-en-light");
+	});
 });
 
-test("wide conversation content hides the TOC from sight and focus", async ({ page, harness }) => {
+test("contained Diff overflow keeps the TOC visible and collision focus returns to reading", async ({
+	page,
+	harness,
+}) => {
 	await page.setViewportSize({ width: 1600, height: 900 });
 	await openWorkbench(page, harness.origin, "en");
 	await page.locator("textarea").fill("E2E_COMPLEX_LONG_FILE");
@@ -147,16 +174,58 @@ test("wide conversation content hides the TOC from sight and focus", async ({ pa
 	await expect(toc).toHaveAttribute("aria-hidden", "false");
 	const toolToggle = page.locator("main button[aria-expanded]").filter({ hasText: "非常长的目录名称" });
 	await toolToggle.click();
-	await expect(page.locator('[data-diff-block="true"]')).toBeVisible();
-	await expect(toc).toHaveAttribute("data-toc-wide-content", "true");
-	await expect(toc).toHaveAttribute("aria-hidden", "true");
-	await expect(toc).toBeHidden();
-	await capture(page, "toc-hidden-for-wide-content-1600-en-light");
-
-	await toolToggle.click();
-	await expect(toc).toHaveAttribute("data-toc-wide-content", "false");
+	const diff = page.locator('[data-diff-block="true"]');
+	await expect(diff).toBeVisible();
+	const scroller = diff.locator(".scroll-slim");
+	expect(
+		await scroller.evaluate((element) => element.scrollWidth > element.clientWidth),
+		"fixture must exercise contained horizontal overflow",
+	).toBe(true);
 	await expect(toc).toHaveAttribute("aria-hidden", "false");
 	await expect(toc).toBeVisible();
+	await capture(page, "toc-with-contained-diff-1600-en-light");
+
+	const tick = toc.getByRole("button").first();
+	await tick.focus();
+	await expect(tick).toBeFocused();
+	await page.setViewportSize({ width: 1280, height: 900 });
+	await expect(toc).toHaveAttribute("aria-hidden", "true");
+	await expect(page.locator('[data-chat-viewport="true"]')).toBeFocused();
+	await page.setViewportSize({ width: 1600, height: 900 });
+	await expect(toc).toHaveAttribute("aria-hidden", "false");
+});
+
+test("docked details keeps deterministic focus when its opener unmounts", async ({ page, harness }) => {
+	await page.setViewportSize({ width: 1280, height: 900 });
+	await openWorkbench(page, harness.origin, "en");
+
+	let expand = page.getByRole("button", { name: "Expand details panel" });
+	await expand.focus();
+	await expand.click();
+	let collapse = page.getByRole("button", { name: "Collapse details panel" });
+	await expect(collapse).toBeFocused();
+	await collapse.click();
+	expand = page.getByRole("button", { name: "Expand details panel" });
+	await expect(expand).toBeFocused();
+
+	await expand.click();
+	collapse = page.getByRole("button", { name: "Collapse details panel" });
+	await expect(collapse).toBeFocused();
+	await collapse.click();
+	await expect(page.getByRole("button", { name: "Expand details panel" })).toBeFocused();
+
+	await page.locator("textarea").fill("E2E_COMPLEX_DEMO");
+	await page.getByRole("button", { name: "Send" }).click();
+	await expect(page.getByRole("heading", { name: "Synthetic change review", level: 2 })).toBeVisible();
+	const toolToggle = page.locator("main button[aria-expanded]").filter({ hasText: "src/demo.ts" });
+	await toolToggle.click();
+	const inspect = page.getByRole("button", { name: "Open in details panel" });
+	await inspect.click();
+	await expect(page.getByRole("button", { name: "Collapse details panel" })).toBeFocused();
+	await page.getByRole("button", { name: "New session" }).first().click();
+	await expect(inspect).toHaveCount(0);
+	await page.getByRole("button", { name: "Collapse details panel" }).click();
+	await expect(page.getByRole("button", { name: "Expand details panel" })).toBeFocused();
 });
 
 test("audio chime preference is discoverable and persists", async ({ page, harness }) => {
@@ -185,6 +254,77 @@ test("audio chime preference is discoverable and persists", async ({ page, harne
 			name: "Audio chime",
 		}),
 	).not.toBeChecked();
+});
+
+test.describe("coarse pointer production geometry", () => {
+	test.use({ hasTouch: true });
+
+	test("wide touch surfaces expose conversation, TOC, and audio controls", async ({ page, harness }) => {
+		await page.setViewportSize({ width: 1280, height: 900 });
+		await openWorkbench(page, harness.origin, "en");
+		expect(await page.evaluate(() => matchMedia("(hover: none)").matches)).toBe(true);
+		await page.locator("textarea").fill("E2E_COMPLEX_DEMO");
+		await page.getByRole("button", { name: "Send" }).click();
+		await expect(page.getByRole("heading", { name: "Synthetic change review", level: 2 })).toBeVisible();
+
+		const reasoningToggle = page
+			.locator("main button[aria-expanded]")
+			.filter({ hasText: "Comparing the implementation with the requested behavior." });
+		const reasoningInspect = page.getByRole("button", { name: "Open reasoning in details panel" });
+		const toolToggle = page.locator("main button[aria-expanded]").filter({ hasText: "src/demo.ts" });
+		const toolInspect = page.getByRole("button", { name: "Open in details panel" });
+		const turnCopy = page.getByRole("button", { name: "Copy" }).last();
+		const turnFork = page.getByRole("button", { name: "Fork" }).last();
+		const userCopy = page.getByRole("button", { name: "Copy message" });
+		for (const control of [
+			reasoningToggle,
+			reasoningInspect,
+			toolToggle,
+			toolInspect,
+			turnCopy,
+			turnFork,
+			userCopy,
+		]) {
+			await minimumTarget(control);
+		}
+		for (const control of [reasoningInspect, toolInspect, userCopy]) {
+			expect(await control.evaluate((element) => getComputedStyle(element).opacity)).toBe("1");
+		}
+		await capture(page, "conversation-controls-1280-touch-en-light");
+
+		await page.getByRole("button", { name: "Settings", exact: true }).click();
+		const audio = page.getByRole("dialog", { name: "Settings" }).getByRole("switch", {
+			name: "Audio chime",
+		});
+		await minimumTarget(audio);
+		await page
+			.getByRole("dialog", { name: "Settings" })
+			.getByRole("button", { name: "Close" })
+			.last()
+			.click();
+
+		await page.setViewportSize({ width: 1600, height: 900 });
+		const toc = page.locator('[data-conversation-toc="true"]');
+		await expect(toc).toBeVisible();
+		await minimumTarget(toc.getByRole("button").first());
+		await capture(page, "conversation-toc-1600-touch-en-light");
+	});
+
+	test("320px rail reaches drawer Settings and audio preference", async ({ page, harness }) => {
+		await page.setViewportSize({ width: 320, height: 720 });
+		await openWorkbench(page, harness.origin, "en");
+		await page.getByRole("button", { name: "Open sessions" }).click();
+		const drawer = page.getByRole("dialog", { name: "Sessions" });
+		await expect(drawer).toBeVisible();
+		await drawer.getByRole("button", { name: "Settings", exact: true }).click();
+		const settings = page.getByRole("dialog", { name: "Settings" });
+		const audio = settings.getByRole("switch", { name: "Audio chime" });
+		await expect(settings).toBeVisible();
+		await minimumTarget(audio);
+		await audio.click();
+		await expect.poll(() => page.evaluate(() => localStorage.getItem("piweb:audio-muted"))).toBe("true");
+		await capture(page, "settings-audio-320-touch-en-light");
+	});
 });
 
 test("audio chime preference keeps localized dark-mode context", async ({ page, harness }) => {
