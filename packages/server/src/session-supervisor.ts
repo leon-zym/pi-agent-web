@@ -18,7 +18,6 @@ import type { ProbedPiRuntime } from "./resolver.js";
 import { canonicalizePathAllowMissing } from "./session-layout-resolver.js";
 import type { SessionLiveProjectionLimits } from "./session-live-projection.js";
 import {
-	createFutureSessionRuntime,
 	type SessionHotRuntimeObservation,
 	type SessionIdentityTransitionCommit,
 	SessionRuntime,
@@ -71,7 +70,7 @@ export interface HotRuntimeSubscriptionToken {
 	readonly kind: "hot_runtime_subscription";
 }
 
-export type HotRuntimeSubscriptionResult<M extends SessionRuntimeProductMode = "current"> = ReplayResult<
+export type HotRuntimeSubscriptionResult<M extends SessionRuntimeProductMode = "content_ref"> = ReplayResult<
 	SessionRuntimeProductEvent<M>,
 	SessionRuntimeProductSnapshot<M>,
 	SessionRuntimeProductExtensionRequest<M>,
@@ -80,14 +79,14 @@ export type HotRuntimeSubscriptionResult<M extends SessionRuntimeProductMode = "
 	observationToken: HotRuntimeSubscriptionToken;
 };
 
-interface HotRuntimeSubscriptionObservation<M extends SessionRuntimeProductMode = "current"> {
+interface HotRuntimeSubscriptionObservation<M extends SessionRuntimeProductMode = "content_ref"> {
 	runtime: SessionRuntimeCore<M>;
 	expected: SessionRuntimeIdentityDto;
 	observation: SessionHotRuntimeObservation;
 }
 
-/** Shared constructor seam used by the private future Main activation. */
-export interface SessionSupervisorBaseOptions<M extends SessionRuntimeProductMode = "current"> {
+/** Shared constructor seam for the canonical Browser protocol. */
+export interface SessionSupervisorBaseOptions<M extends SessionRuntimeProductMode = "content_ref"> {
 	serverEpoch?: string;
 	resolved: ProbedPiRuntime;
 	env?: Record<string, string>;
@@ -126,13 +125,8 @@ export interface SessionSupervisorBaseOptions<M extends SessionRuntimeProductMod
 	restartBaseDelayMs?: number;
 }
 
-export interface SessionSupervisorOptions extends SessionSupervisorBaseOptions<"current"> {
-	/** Legacy current-mode payload services; production future mode installs the typed pipeline. */
-	piPayloadServices?: SessionRuntimePiPayloadServices<"current">;
-}
-
-export interface FutureSessionSupervisorOptions extends SessionSupervisorBaseOptions<"future_content"> {
-	piPayloadServices: SessionRuntimePiPayloadServices<"future_content">;
+export interface SessionSupervisorOptions extends SessionSupervisorBaseOptions<"content_ref"> {
+	piPayloadServices: SessionRuntimePiPayloadServices<"content_ref">;
 }
 
 type SupervisorRuntimeOptions<M extends SessionRuntimeProductMode> = Omit<
@@ -157,7 +151,7 @@ interface Alias {
  * most one hot runtime. Historical Sessions remain dormant. Control leases,
  * crash budgets, replay, and capacity are isolated per Session handle.
  */
-export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "current"> {
+export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "content_ref"> {
 	private readonly hotRuntimeSubscriptionObservations = new WeakMap<
 		HotRuntimeSubscriptionToken,
 		HotRuntimeSubscriptionObservation<M>
@@ -1454,95 +1448,12 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "curren
 	}
 }
 
-/** Current protocol wrapper retained as the public Supervisor API. */
-export class SessionSupervisor extends SessionSupervisorCore<"current"> {
+/** Canonical Browser protocol Supervisor API. */
+export class SessionSupervisor extends SessionSupervisorCore<"content_ref"> {
 	constructor(opts: SessionSupervisorOptions) {
 		const { piPayloadServices, ...coreOptions } = opts;
 		super(coreOptions, (runtimeOptions) => new SessionRuntime({ ...runtimeOptions, piPayloadServices }));
 	}
-}
-
-/**
- * Route-only compatibility view for the private future Main activation.
- * It owns no Session runtime; every REST operation delegates to the future
- * Supervisor, while the inherited current shell only supplies routes' legacy
- * nominal type and a disposable idle timer.
- */
-class FutureSessionSupervisorRouteFacade extends SessionSupervisor {
-	constructor(
-		private readonly delegate: SessionSupervisorCore<"future_content">,
-		resolved: ProbedPiRuntime,
-	) {
-		super({
-			serverEpoch: delegate.serverEpoch,
-			resolved,
-			resolveSession: async () => undefined,
-			broadcast: () => {},
-			maxHotRuntimes: 1,
-			idleTtlMs: 60_000,
-			transientIdleTtlMs: 60_000,
-		});
-	}
-
-	override listRuntimes(): SessionRuntimeSnapshot[] {
-		return this.delegate.listRuntimes();
-	}
-
-	override getRuntime(sessionHandle: string): SessionRuntimeSnapshot | undefined {
-		return this.delegate.getRuntime(sessionHandle);
-	}
-
-	override async createSession(request: CreateSessionRequest): Promise<SessionRuntimeSnapshot> {
-		return this.delegate.createSession(request);
-	}
-
-	override async abandonTransient(
-		workspaceId: string,
-		sessionHandle: string,
-		context: SessionManagementContext,
-	): Promise<void> {
-		return this.delegate.abandonTransient(workspaceId, sessionHandle, context);
-	}
-
-	override async withControlledSessionDeletion<T>(
-		workspaceId: string,
-		sessionHandle: string,
-		context: SessionManagementContext,
-		operation: () => Promise<T>,
-	): Promise<T> {
-		return this.delegate.withControlledSessionDeletion(workspaceId, sessionHandle, context, operation);
-	}
-
-	override async withSessionDeletion<T>(
-		workspaceId: string,
-		sessionHandle: string,
-		operation: () => Promise<T>,
-	): Promise<T> {
-		return this.delegate.withSessionDeletion(workspaceId, sessionHandle, operation);
-	}
-
-	override notifyAuthChanged(workspaceId?: string): void {
-		this.delegate.notifyAuthChanged(workspaceId);
-	}
-
-	override notifySessionDirectoryChanged(workspaceId: string): void {
-		this.delegate.notifySessionDirectoryChanged(workspaceId);
-	}
-}
-
-/** Build the route-only view without exposing it from the server package barrel. */
-export function createFutureSessionSupervisorRouteFacade(
-	delegate: SessionSupervisorCore<"future_content">,
-	resolved: ProbedPiRuntime,
-): SessionSupervisor {
-	return new FutureSessionSupervisorRouteFacade(delegate, resolved);
-}
-
-export function createFutureSessionSupervisor(opts: FutureSessionSupervisorOptions) {
-	const { piPayloadServices, ...coreOptions } = opts;
-	return new SessionSupervisorCore<"future_content">(coreOptions, (runtimeOptions) =>
-		createFutureSessionRuntime({ ...runtimeOptions, piPayloadServices }),
-	);
 }
 
 function sessionPathEntryExists(sessionFile: string): boolean {

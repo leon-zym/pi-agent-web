@@ -6,11 +6,11 @@ import type {
 import type { SessionCommandTypeDto } from "@pi-agent-web/protocol";
 import {
 	isBoundedJsonValue,
-	isExtensionUiRequestDto,
-	isProductSessionEventDto,
-	isSessionCommandResponseDto,
-	isSessionEntryDto,
-	isSessionMessageDto,
+	isPiExtensionUiRequestDto,
+	isPiProductSessionEventDto,
+	isPiSessionCommandResponseDto,
+	isPiSessionEntryDto,
+	isPiSessionMessageDto,
 	isUsageDto,
 } from "@pi-agent-web/protocol";
 
@@ -59,13 +59,13 @@ function isProductTextContent(value: unknown): boolean {
 	return (
 		isRecord(value) &&
 		value.type === "text" &&
-		isSessionMessageDto({ role: "user", content: [value], timestamp: 0 })
+		isPiSessionMessageDto({ role: "user", content: [value], timestamp: 0 })
 	);
 }
 
 function isRawPiMessageContent(value: unknown): boolean {
 	return (
-		(typeof value === "string" && isSessionMessageDto({ role: "user", content: value, timestamp: 0 })) ||
+		(typeof value === "string" && isPiSessionMessageDto({ role: "user", content: value, timestamp: 0 })) ||
 		isArrayOf(value, (block) => isProductTextContent(block) || isRawPiImageContent(block))
 	);
 }
@@ -115,7 +115,7 @@ function isRawPiMessage(value: unknown): boolean {
 				isCount(value.timestamp)
 			);
 		default:
-			return isSessionMessageDto(value);
+			return isPiSessionMessageDto(value);
 	}
 }
 
@@ -150,7 +150,7 @@ function isRawPiEntry(value: unknown): boolean {
 			typeof value.display === "boolean"
 		);
 	}
-	return isSessionEntryDto(value);
+	return isPiSessionEntryDto(value);
 }
 
 function isRawPiTree(value: unknown): boolean {
@@ -169,7 +169,7 @@ function isRawPiTree(value: unknown): boolean {
 			(current.node.label !== undefined &&
 				!(
 					typeof current.node.label === "string" &&
-					isSessionMessageDto({ role: "user", content: current.node.label, timestamp: 0 })
+					isPiSessionMessageDto({ role: "user", content: current.node.label, timestamp: 0 })
 				)) ||
 			(current.node.labelTimestamp !== undefined && !isString(current.node.labelTimestamp, 128))
 		)
@@ -205,7 +205,7 @@ function isWideImageResponse(value: UnknownRecord, command: SessionCommandTypeDt
 export function isPiRpcRawResponse(
 	value: unknown,
 	expectedCommand: SessionCommandTypeDto,
-	productGuard: (candidate: unknown) => boolean = isSessionCommandResponseDto,
+	productGuard: (candidate: unknown) => boolean = isPiSessionCommandResponseDto,
 ): value is PiRpcRawResponse {
 	if (
 		!isRecord(value) ||
@@ -255,7 +255,7 @@ function isWideImageEvent(value: UnknownRecord): boolean {
 
 export function isPiRpcRawEvent(
 	value: unknown,
-	productGuard: (candidate: unknown) => boolean = isProductSessionEventDto,
+	productGuard: (candidate: unknown) => boolean = isPiProductSessionEventDto,
 ): value is PiRpcRawEvent {
 	if (!isRecord(value)) return false;
 	if (
@@ -271,5 +271,5 @@ export function isPiRpcRawEvent(
 }
 
 export function isPiRpcRawExtensionUiRequest(value: unknown): value is PiRpcRawExtensionUiRequest {
-	return isExtensionUiRequestDto(value);
+	return isPiExtensionUiRequestDto(value);
 }

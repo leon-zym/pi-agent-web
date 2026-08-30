@@ -1,24 +1,22 @@
 import {
-	type AssistantMessageDto,
-	type FutureExtensionUiRequestDto,
-	type FutureProductSessionEventDto,
-	type FutureSessionCommandResponseDto,
-	type FutureSessionEntryDto,
-	type FutureSessionMessageDto,
-	type FutureSessionTreeNodeDto,
+	type ExtensionUiRequestDto,
 	isBoundedJsonValue,
 	isExtensionUiRequestDto,
 	isExtensionUiResponseDto,
-	isFutureExtensionUiRequestDto,
-	isFutureProductSessionEventDto,
-	isFutureSessionCommandResponseDto,
 	isModelDto,
+	isPiExtensionUiRequestDto,
+	isPiProductSessionEventDto,
+	isPiSessionCommandResponseDto,
 	isProductSessionEventDto,
 	isSessionCommandResponseDto,
 	isSessionCommandTypeDto,
+	type PiAssistantMessageDto,
+	type PiProductSessionEventDto,
+	type PiSessionCommandResponseDto,
+	type PiSessionEntryDto,
+	type PiSessionMessageDto,
+	type PiSessionTreeNodeDto,
 	type ProductSessionEventDto,
-	type SessionAttachmentRefDto,
-	type SessionCommandDto,
 	type SessionCommandResponseDto,
 	type SessionCommandTypeDto,
 	type SessionEntryDto,
@@ -31,8 +29,7 @@ import {
 	type PiHostAdapter,
 	type PiHostDecodeContext,
 	type PiHostDecodeOutcome,
-	type PiHostFutureDecodeContext,
-	type PiHostFutureUnsolicitedFrame,
+	type PiHostRawUnsolicitedFrame,
 	PiHostResponseExternalizationError,
 	type PiHostUnsolicitedFrame,
 	PiProtocolIncompatibleError,
@@ -92,7 +89,7 @@ const AUTHORITATIVE_EVENT_TYPES: ReadonlySet<string> = new Set([
 
 type UnknownRecord = Record<string, unknown>;
 
-function decoded<T, TRef extends EpochStoredContentRef = SessionAttachmentRefDto>(
+function decoded<T, TRef extends EpochStoredContentRef = EpochStoredContentRef>(
 	value: T,
 ): PiHostDecodeOutcome<T, TRef> {
 	return Object.freeze({ value, lease: null });
@@ -298,8 +295,84 @@ function hasGatewayOnlyResponseFields(value: UnknownRecord): boolean {
 	);
 }
 
-function redactAssistantMetadata(message: AssistantMessageDto): AssistantMessageDto;
-function redactAssistantMetadata(message: SessionMessageDto): SessionMessageDto;
+function redactPiAssistantMetadata(message: PiAssistantMessageDto): PiAssistantMessageDto;
+function redactPiAssistantMetadata(message: PiSessionMessageDto): PiSessionMessageDto;
+function redactPiAssistantMetadata(message: PiSessionMessageDto): PiSessionMessageDto {
+	if (message.role !== "assistant") return message;
+	const {
+		responseId: _responseId,
+		diagnostics: _diagnostics,
+		deferred: _deferred,
+		...productMessage
+	} = message;
+	return productMessage;
+}
+
+function redactPiEntry(entry: PiSessionEntryDto): PiSessionEntryDto {
+	return entry.type === "message" ? { ...entry, message: redactPiAssistantMetadata(entry.message) } : entry;
+}
+
+function redactPiTree(tree: PiSessionTreeNodeDto[]): PiSessionTreeNodeDto[] {
+	return tree.map((node) => ({
+		...node,
+		entry: redactPiEntry(node.entry),
+		children: redactPiTree(node.children),
+	}));
+}
+
+function redactPiResponse(
+	response: PiSessionCommandResponseDto & { id: string },
+): PiSessionCommandResponseDto & { id: string } {
+	if (!response.success) return response;
+	switch (response.command) {
+		case "get_messages":
+			return { ...response, data: { messages: response.data.messages.map(redactPiAssistantMetadata) } };
+		case "get_entries":
+			return { ...response, data: { ...response.data, entries: response.data.entries.map(redactPiEntry) } };
+		case "get_tree":
+			return { ...response, data: { ...response.data, tree: redactPiTree(response.data.tree) } };
+		default:
+			return response;
+	}
+}
+
+function redactPiEvent(event: PiProductSessionEventDto): PiProductSessionEventDto {
+	switch (event.type) {
+		case "agent_end":
+			return { ...event, messages: event.messages.map(redactPiAssistantMetadata) };
+		case "turn_end":
+		case "message_start":
+		case "message_end":
+			return { ...event, message: redactPiAssistantMetadata(event.message) };
+		case "entry_appended":
+			return { ...event, entry: redactPiEntry(event.entry) };
+		case "message_update": {
+			const streamEvent = event.assistantMessageEvent;
+			if (streamEvent.type === "done" && streamEvent.message) {
+				return {
+					...event,
+					assistantMessageEvent: {
+						...streamEvent,
+						message: redactPiAssistantMetadata(streamEvent.message),
+					},
+				};
+			}
+			if (streamEvent.type === "error" && streamEvent.error) {
+				return {
+					...event,
+					assistantMessageEvent: {
+						...streamEvent,
+						error: redactPiAssistantMetadata(streamEvent.error),
+					},
+				};
+			}
+			return event;
+		}
+		default:
+			return event;
+	}
+}
+
 function redactAssistantMetadata(message: SessionMessageDto): SessionMessageDto {
 	if (message.role !== "assistant") return message;
 	const {
@@ -321,53 +394,6 @@ function redactTree(tree: SessionTreeNodeDto[]): SessionTreeNodeDto[] {
 		entry: redactEntry(node.entry),
 		children: redactTree(node.children),
 	}));
-}
-
-function redactFutureAssistantMetadata(message: FutureSessionMessageDto): FutureSessionMessageDto {
-	if (message.role !== "assistant") return message;
-	const {
-		responseId: _responseId,
-		diagnostics: _diagnostics,
-		deferred: _deferred,
-		...productMessage
-	} = message;
-	return productMessage;
-}
-
-function redactFutureEntry(entry: FutureSessionEntryDto): FutureSessionEntryDto {
-	return entry.type === "message"
-		? { ...entry, message: redactFutureAssistantMetadata(entry.message) }
-		: entry;
-}
-
-function redactFutureTree(tree: FutureSessionTreeNodeDto[]): FutureSessionTreeNodeDto[] {
-	return tree.map((node) => ({
-		...node,
-		entry: redactFutureEntry(node.entry),
-		children: redactFutureTree(node.children),
-	}));
-}
-
-function redactFutureResponse(
-	response: FutureSessionCommandResponseDto & { id: string },
-): FutureSessionCommandResponseDto & { id: string } {
-	if (!response.success) return response;
-	switch (response.command) {
-		case "get_messages":
-			return {
-				...response,
-				data: { messages: response.data.messages.map(redactFutureAssistantMetadata) },
-			};
-		case "get_entries":
-			return {
-				...response,
-				data: { ...response.data, entries: response.data.entries.map(redactFutureEntry) },
-			};
-		case "get_tree":
-			return { ...response, data: { ...response.data, tree: redactFutureTree(response.data.tree) } };
-		default:
-			return response;
-	}
 }
 
 function redactResponse(
@@ -410,7 +436,7 @@ function redactEvent(event: ProductSessionEventDto): ProductSessionEventDto {
 					...event,
 					assistantMessageEvent: {
 						...streamEvent,
-						message: redactAssistantMetadata(streamEvent.message),
+						message: redactPiAssistantMetadata(streamEvent.message),
 					},
 				};
 			}
@@ -419,45 +445,7 @@ function redactEvent(event: ProductSessionEventDto): ProductSessionEventDto {
 					...event,
 					assistantMessageEvent: {
 						...streamEvent,
-						error: redactAssistantMetadata(streamEvent.error),
-					},
-				};
-			}
-			return event;
-		}
-		default:
-			return event;
-	}
-}
-
-function redactFutureEvent(event: FutureProductSessionEventDto): FutureProductSessionEventDto {
-	switch (event.type) {
-		case "agent_end":
-			return { ...event, messages: event.messages.map(redactFutureAssistantMetadata) };
-		case "turn_end":
-			return { ...event, message: redactFutureAssistantMetadata(event.message) };
-		case "message_start":
-		case "message_end":
-			return { ...event, message: redactFutureAssistantMetadata(event.message) };
-		case "entry_appended":
-			return { ...event, entry: redactFutureEntry(event.entry) };
-		case "message_update": {
-			const streamEvent = event.assistantMessageEvent;
-			if (streamEvent.type === "done" && streamEvent.message) {
-				return {
-					...event,
-					assistantMessageEvent: {
-						...streamEvent,
-						message: redactAssistantMetadata(streamEvent.message),
-					},
-				};
-			}
-			if (streamEvent.type === "error" && streamEvent.error) {
-				return {
-					...event,
-					assistantMessageEvent: {
-						...streamEvent,
-						error: redactAssistantMetadata(streamEvent.error),
+						error: redactPiAssistantMetadata(streamEvent.error),
 					},
 				};
 			}
@@ -471,49 +459,9 @@ function redactFutureEvent(event: FutureProductSessionEventDto): FutureProductSe
 async function externalizeResponse(
 	value: UnknownRecord,
 	expectedCommand: SessionCommandTypeDto,
-	context: PiHostDecodeContext & {
-		externalizer: NonNullable<PiHostDecodeContext["externalizer"]>;
-	},
+	context: PiHostDecodeContext,
 	frameType?: string,
-): Promise<PiHostDecodeOutcome<SessionCommandResponseDto & { id: string }>> {
-	let externalized: Externalized<unknown>;
-	try {
-		externalized = await context.externalizer.externalize(
-			{ kind: "response", expectedCommand, value },
-			context.signal,
-		);
-	} catch (error) {
-		const failure = responseLocalFailure(error);
-		if (failure) {
-			throw new PiHostResponseExternalizationError(expectedCommand, failure, { cause: error });
-		}
-		throw error;
-	}
-	let response: SessionCommandResponseDto & { id: string };
-	try {
-		if (
-			!isRecord(externalized.value) ||
-			externalized.value.type !== "response" ||
-			externalized.value.id !== value.id ||
-			externalized.value.command !== expectedCommand ||
-			hasGatewayOnlyResponseFields(externalized.value) ||
-			!isSessionCommandResponseDto(externalized.value, context.externalizer.context)
-		) {
-			return incompatible("response", "malformed_response", frameType);
-		}
-		response = redactResponse(externalized.value as SessionCommandResponseDto & { id: string });
-	} catch (error) {
-		return releaseAfterPostprocessFailure(externalized.lease, error);
-	}
-	return keepExternalizedLease(externalized, response);
-}
-
-async function externalizeFutureResponse(
-	value: UnknownRecord,
-	expectedCommand: SessionCommandTypeDto,
-	context: PiHostFutureDecodeContext,
-	frameType?: string,
-): Promise<PiHostDecodeOutcome<FutureSessionCommandResponseDto & { id: string }, EpochStoredContentRef>> {
+): Promise<PiHostDecodeOutcome<SessionCommandResponseDto & { id: string }, EpochStoredContentRef>> {
 	let externalized: Externalized<unknown, EpochStoredContentRef>;
 	try {
 		externalized = await context.externalizer.externalize(
@@ -527,7 +475,7 @@ async function externalizeFutureResponse(
 	}
 	try {
 		if (
-			!isFutureSessionCommandResponseDto(externalized.value, context.externalizer.context) ||
+			!isSessionCommandResponseDto(externalized.value, context.externalizer.context) ||
 			!isRecord(externalized.value) ||
 			externalized.value.type !== "response" ||
 			externalized.value.id !== value.id ||
@@ -539,8 +487,8 @@ async function externalizeFutureResponse(
 		if (typeof externalized.value.id !== "string") {
 			return incompatible("response", "malformed_response", frameType);
 		}
-		const futureResponse = { ...externalized.value, id: externalized.value.id };
-		const response = redactFutureResponse(futureResponse);
+		const responseWithId = { ...externalized.value, id: externalized.value.id };
+		const response = redactResponse(responseWithId);
 		if (typeof response.id !== "string") {
 			return incompatible("response", "malformed_response", frameType);
 		}
@@ -552,53 +500,20 @@ async function externalizeFutureResponse(
 
 async function externalizeEvent(
 	value: UnknownRecord,
-	context: PiHostDecodeContext & {
-		externalizer: NonNullable<PiHostDecodeContext["externalizer"]>;
-	},
+	context: PiHostDecodeContext,
 	requiresToolcallIdentity: boolean,
-): Promise<PiHostDecodeOutcome<PiHostUnsolicitedFrame>> {
-	const externalized = await context.externalizer.externalize({ kind: "event", value }, context.signal);
-	let event: ProductSessionEventDto;
-	try {
-		if (
-			!isRecord(externalized.value) ||
-			externalized.value.type !== value.type ||
-			!isProductSessionEventDto(externalized.value, context.externalizer.context)
-		) {
-			return incompatible("event", "malformed_event", boundedFrameType(value.type));
-		}
-		event = redactEvent(externalized.value);
-		if (
-			requiresToolcallIdentity &&
-			event.type === "message_update" &&
-			event.assistantMessageEvent.type === "toolcall_start" &&
-			(typeof event.assistantMessageEvent.id !== "string" ||
-				typeof event.assistantMessageEvent.toolName !== "string")
-		) {
-			return incompatible("event", "malformed_event", "toolcall_start");
-		}
-	} catch (error) {
-		return releaseAfterPostprocessFailure(externalized.lease, error);
-	}
-	return keepExternalizedLease(externalized, { kind: "event", event });
-}
-
-async function externalizeFutureEvent(
-	value: UnknownRecord,
-	context: PiHostFutureDecodeContext,
-	requiresToolcallIdentity: boolean,
-): Promise<PiHostDecodeOutcome<PiHostFutureUnsolicitedFrame, EpochStoredContentRef>> {
+): Promise<PiHostDecodeOutcome<PiHostUnsolicitedFrame, EpochStoredContentRef>> {
 	const externalized = await context.externalizer.externalize({ kind: "event", value }, context.signal);
 	try {
 		if (
-			!isFutureProductSessionEventDto(externalized.value, context.externalizer.context) ||
+			!isProductSessionEventDto(externalized.value, context.externalizer.context) ||
 			!isRecord(externalized.value) ||
 			externalized.value.type !== value.type ||
 			!boundedFrameType(externalized.value.type)
 		) {
 			return incompatible("event", "malformed_event", boundedFrameType(value.type));
 		}
-		const event = redactFutureEvent(externalized.value);
+		const event = redactEvent(externalized.value);
 		if (
 			requiresToolcallIdentity &&
 			event.type === "message_update" &&
@@ -614,10 +529,10 @@ async function externalizeFutureEvent(
 	}
 }
 
-async function externalizeFutureExtensionRequest(
+async function externalizeExtensionRequest(
 	value: UnknownRecord,
-	context: PiHostFutureDecodeContext,
-): Promise<PiHostDecodeOutcome<PiHostFutureUnsolicitedFrame, EpochStoredContentRef>> {
+	context: PiHostDecodeContext,
+): Promise<PiHostDecodeOutcome<PiHostUnsolicitedFrame, EpochStoredContentRef>> {
 	const externalized = await context.externalizer.externalize(
 		{ kind: "extension_ui_request", value },
 		context.signal,
@@ -628,11 +543,11 @@ async function externalizeFutureExtensionRequest(
 			externalized.value.type !== "extension_ui_request" ||
 			externalized.value.id !== value.id ||
 			externalized.value.method !== value.method ||
-			!isFutureExtensionUiRequestDto(externalized.value, context.externalizer.context)
+			!isExtensionUiRequestDto(externalized.value, context.externalizer.context)
 		) {
 			return incompatible("extension_ui_request", "malformed_extension_ui_request", "extension_ui_request");
 		}
-		const request: FutureExtensionUiRequestDto = externalized.value;
+		const request: ExtensionUiRequestDto = externalized.value;
 		return keepExternalizedLease(externalized, { kind: "extension_ui_request", request });
 	} catch (error) {
 		return releaseAfterPostprocessFailure(externalized.lease, error);
@@ -666,32 +581,29 @@ export function createPiRpcAdapter(version: string, capabilities: readonly PiCap
 			return response;
 		},
 
-		decodeResponse(value, expectedCommand, context) {
+		decodePiResponse(value, expectedCommand) {
 			const normalized = normalizePiResponse(value);
 			const frameType = isRecord(normalized) ? boundedFrameType(normalized.command) : undefined;
-			if (!isRecord(normalized) || normalized.type !== "response" || typeof normalized.id !== "string") {
-				return incompatible("response", "malformed_response", frameType);
+			const command = isRecord(normalized) ? normalized.command : undefined;
+			if (
+				!isRecord(normalized) ||
+				normalized.type !== "response" ||
+				typeof normalized.id !== "string" ||
+				normalized.command !== expectedCommand ||
+				hasGatewayOnlyResponseFields(normalized) ||
+				!isPiRpcRawResponse(normalized, expectedCommand) ||
+				!isPiSessionCommandResponseDto(normalized)
+			) {
+				return incompatible(
+					"response",
+					command === expectedCommand ? "malformed_response" : "response_command_mismatch",
+					frameType,
+				);
 			}
-			if (normalized.command !== expectedCommand) {
-				return incompatible("response", "response_command_mismatch", frameType);
-			}
-			if (hasGatewayOnlyResponseFields(normalized)) {
-				return incompatible("response", "malformed_response", frameType);
-			}
-			if (!isPiRpcRawResponse(normalized, expectedCommand)) {
-				return incompatible("response", "malformed_response", frameType);
-			}
-			const externalizer = context?.externalizer;
-			if (!externalizer) {
-				if (!isSessionCommandResponseDto(normalized)) {
-					return incompatible("response", "malformed_response", frameType);
-				}
-				return decoded(redactResponse(normalized as SessionCommandResponseDto & { id: string }));
-			}
-			return externalizeResponse(normalized, expectedCommand, { ...context, externalizer }, frameType);
+			return decoded(redactPiResponse(normalized as PiSessionCommandResponseDto & { id: string }));
 		},
 
-		decodeFutureResponse(value, expectedCommand, context) {
+		decodeResponse(value, expectedCommand, context) {
 			const normalized = normalizePiResponse(value);
 			const frameType = isRecord(normalized) ? boundedFrameType(normalized.command) : undefined;
 			if (!isRecord(normalized) || normalized.type !== "response" || typeof normalized.id !== "string") {
@@ -706,26 +618,10 @@ export function createPiRpcAdapter(version: string, capabilities: readonly PiCap
 			) {
 				return incompatible("response", "malformed_response", frameType);
 			}
-			return externalizeFutureResponse(normalized, expectedCommand, context, frameType);
+			return externalizeResponse(normalized, expectedCommand, context, frameType);
 		},
 
 		decodeOrphanedResponse(value) {
-			const normalized = normalizePiResponse(value);
-			const frameType = isRecord(normalized) ? boundedFrameType(normalized.command) : undefined;
-			if (
-				!isRecord(normalized) ||
-				normalized.type !== "response" ||
-				typeof normalized.id !== "string" ||
-				hasGatewayOnlyResponseFields(normalized) ||
-				!isSessionCommandTypeDto(normalized.command) ||
-				!isPiRpcRawResponse(normalized, normalized.command)
-			) {
-				return incompatible("response", "malformed_response", frameType);
-			}
-			return decoded(undefined);
-		},
-
-		decodeFutureOrphanedResponse(value) {
 			const normalized = normalizePiResponse(value);
 			const frameType = isRecord(normalized) ? boundedFrameType(normalized.command) : undefined;
 			if (
@@ -746,24 +642,49 @@ export function createPiRpcAdapter(version: string, capabilities: readonly PiCap
 				return incompatible("frame", "malformed_frame");
 			}
 			if (value.type === "extension_ui_request") {
-				if (!isPiRpcRawExtensionUiRequest(value) || !isExtensionUiRequestDto(value)) {
+				if (!isPiRpcContentRawExtensionUiRequest(value)) {
 					return incompatible(
 						"extension_ui_request",
 						"malformed_extension_ui_request",
 						"extension_ui_request",
 					);
 				}
-				return decoded({ kind: "extension_ui_request", request: value } satisfies PiHostUnsolicitedFrame);
+				return externalizeExtensionRequest(value, context);
+			}
+			if (isPiRpcContentRawEvent(value)) {
+				return externalizeEvent(value, context, requiresToolcallIdentity);
+			}
+			if (AUTHORITATIVE_EVENT_TYPES.has(value.type)) {
+				return incompatible("event", "malformed_event", boundedFrameType(value.type));
+			}
+			if (PI_RPC_IGNORABLE_FRAME_TYPES.has(value.type)) {
+				return decoded({
+					kind: "ignored",
+					frameType: value.type,
+				} satisfies PiHostUnsolicitedFrame);
+			}
+			return incompatible("event", "unknown_authoritative_event", boundedFrameType(value.type));
+		},
+
+		decodePiUnsolicited(value) {
+			if (!isRecord(value) || typeof value.type !== "string") {
+				return incompatible("frame", "malformed_frame");
+			}
+			if (value.type === "extension_ui_request") {
+				if (!isPiRpcRawExtensionUiRequest(value) || !isPiExtensionUiRequestDto(value)) {
+					return incompatible(
+						"extension_ui_request",
+						"malformed_extension_ui_request",
+						"extension_ui_request",
+					);
+				}
+				return decoded({ kind: "extension_ui_request", request: value } satisfies PiHostRawUnsolicitedFrame);
 			}
 			if (isPiRpcRawEvent(value)) {
-				const externalizer = context?.externalizer;
-				if (externalizer) {
-					return externalizeEvent(value, { ...context, externalizer }, requiresToolcallIdentity);
-				}
-				if (!isProductSessionEventDto(value)) {
+				if (!isPiProductSessionEventDto(value)) {
 					return incompatible("event", "malformed_event", boundedFrameType(value.type));
 				}
-				const event = redactEvent(value);
+				const event = redactPiEvent(value);
 				if (
 					requiresToolcallIdentity &&
 					event.type === "message_update" &&
@@ -773,42 +694,13 @@ export function createPiRpcAdapter(version: string, capabilities: readonly PiCap
 				) {
 					return incompatible("event", "malformed_event", "toolcall_start");
 				}
-				return decoded({ kind: "event", event } satisfies PiHostUnsolicitedFrame);
+				return decoded({ kind: "event", event } satisfies PiHostRawUnsolicitedFrame);
 			}
 			if (AUTHORITATIVE_EVENT_TYPES.has(value.type)) {
 				return incompatible("event", "malformed_event", boundedFrameType(value.type));
 			}
 			if (PI_RPC_IGNORABLE_FRAME_TYPES.has(value.type)) {
-				return decoded({ kind: "ignored", frameType: value.type } satisfies PiHostUnsolicitedFrame);
-			}
-			return incompatible("event", "unknown_authoritative_event", boundedFrameType(value.type));
-		},
-
-		decodeFutureUnsolicited(value, context) {
-			if (!isRecord(value) || typeof value.type !== "string") {
-				return incompatible("frame", "malformed_frame");
-			}
-			if (value.type === "extension_ui_request") {
-				if (!isPiRpcContentRawExtensionUiRequest(value)) {
-					return incompatible(
-						"extension_ui_request",
-						"malformed_extension_ui_request",
-						"extension_ui_request",
-					);
-				}
-				return externalizeFutureExtensionRequest(value, context);
-			}
-			if (isPiRpcContentRawEvent(value)) {
-				return externalizeFutureEvent(value, context, requiresToolcallIdentity);
-			}
-			if (AUTHORITATIVE_EVENT_TYPES.has(value.type)) {
-				return incompatible("event", "malformed_event", boundedFrameType(value.type));
-			}
-			if (PI_RPC_IGNORABLE_FRAME_TYPES.has(value.type)) {
-				return decoded({
-					kind: "ignored",
-					frameType: value.type,
-				} satisfies PiHostFutureUnsolicitedFrame);
+				return decoded({ kind: "ignored", frameType: value.type } satisfies PiHostRawUnsolicitedFrame);
 			}
 			return incompatible("event", "unknown_authoritative_event", boundedFrameType(value.type));
 		},
@@ -826,11 +718,3 @@ const PI_RPC_DEFAULT_CAPABILITIES = [
 ] as const satisfies readonly PiCapability[];
 
 export const piRpcAdapter = createPiRpcAdapter("0.84.2", PI_RPC_DEFAULT_CAPABILITIES);
-
-export function encodePiRpcCommand(command: SessionCommandDto & { id: string }): unknown {
-	return piRpcAdapter.encodeCommand(command);
-}
-
-export function decodePiRpcResponse(value: unknown, command: SessionCommandTypeDto) {
-	return piRpcAdapter.decodeResponse(value, command);
-}

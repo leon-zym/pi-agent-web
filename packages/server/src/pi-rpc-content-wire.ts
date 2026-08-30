@@ -6,9 +6,9 @@ import type {
 import type { SessionCommandTypeDto } from "@pi-agent-web/protocol";
 import {
 	isBoundedJsonValue,
-	isExtensionUiRequestDto,
-	isSessionEntryDto,
-	isSessionMessageDto,
+	isPiExtensionUiRequestDto,
+	isPiSessionEntryDto,
+	isPiSessionMessageDto,
 	isUsageDto,
 } from "@pi-agent-web/protocol";
 import { MAX_JSONL_SNAPSHOT_LINE_BYTES } from "./jsonl.js";
@@ -133,10 +133,10 @@ export function isPiRpcContentRawExtensionUiRequest(
 		case "editor":
 			return (
 				(value.prefill === undefined || isPiRpcUntrustedTextRoot(value.prefill)) &&
-				isExtensionUiRequestDto({ ...value, prefill: value.prefill === undefined ? undefined : "" })
+				isPiExtensionUiRequestDto({ ...value, prefill: value.prefill === undefined ? undefined : "" })
 			);
 		case "set_editor_text":
-			return isPiRpcUntrustedTextRoot(value.text) && isExtensionUiRequestDto({ ...value, text: "" });
+			return isPiRpcUntrustedTextRoot(value.text) && isPiExtensionUiRequestDto({ ...value, text: "" });
 		case "setWidget":
 			return (
 				(value.widgetLines === undefined ||
@@ -144,13 +144,13 @@ export function isPiRpcContentRawExtensionUiRequest(
 						value.widgetLines.length <= 1_000 &&
 						value.widgetLines.every((line) => typeof line === "string") &&
 						isPiRpcUntrustedJsonRoot(value.widgetLines))) &&
-				isExtensionUiRequestDto({
+				isPiExtensionUiRequestDto({
 					...value,
 					widgetLines: value.widgetLines === undefined ? undefined : [],
 				})
 			);
 		default:
-			return isExtensionUiRequestDto(value);
+			return isPiExtensionUiRequestDto(value);
 	}
 }
 
@@ -174,7 +174,7 @@ function isProductTextContent(value: unknown): boolean {
 	);
 }
 
-function isFutureRawTextContent(value: unknown): boolean {
+function isContentRefRawTextContent(value: unknown): boolean {
 	return (
 		isRecord(value) &&
 		hasOnlyKeys(value, ["type", "text", "textSignature"]) &&
@@ -195,7 +195,7 @@ function isThinkingContent(value: unknown): boolean {
 	);
 }
 
-function isFutureRawToolCallContent(value: unknown): boolean {
+function isContentRefRawToolCallContent(value: unknown): boolean {
 	return (
 		isRecord(value) &&
 		hasOnlyKeys(value, ["type", "id", "name", "arguments", "thoughtSignature", "namespace"]) &&
@@ -244,7 +244,7 @@ function isDeferredHandle(value: unknown): boolean {
 	);
 }
 
-function isFutureRawAssistantMessage(value: UnknownRecord): boolean {
+function isContentRefRawAssistantMessage(value: UnknownRecord): boolean {
 	return (
 		hasOnlyKeys(value, [
 			"role",
@@ -265,7 +265,8 @@ function isFutureRawAssistantMessage(value: UnknownRecord): boolean {
 		]) &&
 		isArrayOf(
 			value.content,
-			(block) => isProductTextContent(block) || isThinkingContent(block) || isFutureRawToolCallContent(block),
+			(block) =>
+				isProductTextContent(block) || isThinkingContent(block) || isContentRefRawToolCallContent(block),
 		) &&
 		isUsageDto(value.usage) &&
 		["pending", "stop", "length", "toolUse", "error", "aborted", "deferred"].includes(
@@ -292,15 +293,15 @@ function isExistingRawMessageContent(value: unknown): boolean {
 	);
 }
 
-function isFutureRawContentBlocks(value: unknown): boolean {
-	return isArrayOf(value, (block) => isFutureRawTextContent(block) || isRawPiImageContent(block));
+function isContentRefRawContentBlocks(value: unknown): boolean {
+	return isArrayOf(value, (block) => isContentRefRawTextContent(block) || isRawPiImageContent(block));
 }
 
-function isFutureRawMessage(value: unknown): boolean {
+function isContentRefRawMessage(value: unknown): boolean {
 	if (!isRecord(value) || typeof value.role !== "string") return false;
 	switch (value.role) {
 		case "assistant":
-			return isFutureRawAssistantMessage(value);
+			return isContentRefRawAssistantMessage(value);
 		case "toolResult":
 			return (
 				hasOnlyKeys(value, [
@@ -316,7 +317,7 @@ function isFutureRawMessage(value: unknown): boolean {
 				]) &&
 				isIdentifier(value.toolCallId) &&
 				isIdentifier(value.toolName) &&
-				isFutureRawContentBlocks(value.content) &&
+				isContentRefRawContentBlocks(value.content) &&
 				(value.details === undefined || isPiRpcUntrustedJsonRoot(value.details)) &&
 				(value.usage === undefined || isUsageDto(value.usage)) &&
 				(value.addedToolNames === undefined ||
@@ -351,7 +352,7 @@ function isFutureRawMessage(value: unknown): boolean {
 			return (
 				hasOnlyKeys(value, ["role", "customType", "content", "display", "details", "timestamp"]) &&
 				isIdentifier(value.customType) &&
-				(isTextWithin(value.content, MAX_TEXT_BYTES) || isFutureRawContentBlocks(value.content)) &&
+				(isTextWithin(value.content, MAX_TEXT_BYTES) || isContentRefRawContentBlocks(value.content)) &&
 				typeof value.display === "boolean" &&
 				(value.details === undefined || isPiRpcUntrustedJsonRoot(value.details)) &&
 				isCount(value.timestamp)
@@ -363,7 +364,7 @@ function isFutureRawMessage(value: unknown): boolean {
 				isCount(value.timestamp)
 			);
 		default:
-			return isSessionMessageDto(value);
+			return isPiSessionMessageDto(value);
 	}
 }
 
@@ -375,12 +376,12 @@ function isEntryIdentity(value: UnknownRecord): boolean {
 	);
 }
 
-function isFutureRawEntry(value: unknown): boolean {
+function isContentRefRawEntry(value: unknown): boolean {
 	if (!isRecord(value) || !isEntryIdentity(value)) return false;
 	if (value.type === "message") {
 		return (
 			hasOnlyKeys(value, ["type", "id", "parentId", "timestamp", "message"]) &&
-			isFutureRawMessage(value.message)
+			isContentRefRawMessage(value.message)
 		);
 	}
 	if (value.type === "custom_message") {
@@ -396,15 +397,15 @@ function isFutureRawEntry(value: unknown): boolean {
 				"display",
 			]) &&
 			isIdentifier(value.customType) &&
-			(isTextWithin(value.content, MAX_TEXT_BYTES) || isFutureRawContentBlocks(value.content)) &&
+			(isTextWithin(value.content, MAX_TEXT_BYTES) || isContentRefRawContentBlocks(value.content)) &&
 			(value.details === undefined || isPiRpcUntrustedJsonRoot(value.details)) &&
 			typeof value.display === "boolean"
 		);
 	}
-	return isSessionEntryDto(value);
+	return isPiSessionEntryDto(value);
 }
 
-function isFutureRawTree(value: unknown): boolean {
+function isContentRefRawTree(value: unknown): boolean {
 	if (!Array.isArray(value) || value.length > MAX_ARRAY_ITEMS) return false;
 	const stack = value.map((node) => ({ node, depth: 0 }));
 	let nodes = 0;
@@ -414,7 +415,7 @@ function isFutureRawTree(value: unknown): boolean {
 			return false;
 		if (
 			!hasOnlyKeys(current.node, ["entry", "children", "label", "labelTimestamp"]) ||
-			!isFutureRawEntry(current.node.entry) ||
+			!isContentRefRawEntry(current.node.entry) ||
 			!Array.isArray(current.node.children) ||
 			current.node.children.length > MAX_ARRAY_ITEMS ||
 			(current.node.label !== undefined && !isTextWithin(current.node.label, MAX_TEXT_BYTES)) ||
@@ -426,7 +427,7 @@ function isFutureRawTree(value: unknown): boolean {
 	return true;
 }
 
-function isFutureContentHistoryResponse(
+function isContentRefContentHistoryResponse(
 	value: UnknownRecord,
 	command: "get_messages" | "get_entries" | "get_tree",
 ): boolean {
@@ -441,17 +442,17 @@ function isFutureContentHistoryResponse(
 		return false;
 	switch (command) {
 		case "get_messages":
-			return hasOnlyKeys(value.data, ["messages"]) && isArrayOf(value.data.messages, isFutureRawMessage);
+			return hasOnlyKeys(value.data, ["messages"]) && isArrayOf(value.data.messages, isContentRefRawMessage);
 		case "get_entries":
 			return (
 				hasOnlyKeys(value.data, ["entries", "leafId"]) &&
-				isArrayOf(value.data.entries, isFutureRawEntry) &&
+				isArrayOf(value.data.entries, isContentRefRawEntry) &&
 				(value.data.leafId === null || isIdentifier(value.data.leafId))
 			);
 		case "get_tree":
 			return (
 				hasOnlyKeys(value.data, ["tree", "leafId"]) &&
-				isFutureRawTree(value.data.tree) &&
+				isContentRefRawTree(value.data.tree) &&
 				(value.data.leafId === null || isIdentifier(value.data.leafId))
 			);
 	}
@@ -468,39 +469,39 @@ export function isPiRpcContentRawResponse(
 			expectedCommand === "get_entries" ||
 			expectedCommand === "get_tree")
 	) {
-		return isFutureContentHistoryResponse(value, expectedCommand);
+		return isContentRefContentHistoryResponse(value, expectedCommand);
 	}
 	return isPiRpcRawResponse(value, expectedCommand);
 }
 
-function isFutureRawMessageEvent(value: UnknownRecord): boolean {
+function isContentRefRawMessageEvent(value: UnknownRecord): boolean {
 	switch (value.type) {
 		case "agent_end":
 			return (
 				hasOnlyKeys(value, ["type", "messages", "willRetry"]) &&
-				isArrayOf(value.messages, isFutureRawMessage) &&
+				isArrayOf(value.messages, isContentRefRawMessage) &&
 				typeof value.willRetry === "boolean"
 			);
 		case "turn_end":
 			return (
 				hasOnlyKeys(value, ["type", "message", "toolResults"]) &&
-				isFutureRawMessage(value.message) &&
+				isContentRefRawMessage(value.message) &&
 				isArrayOf(
 					value.toolResults,
-					(message) => isRecord(message) && message.role === "toolResult" && isFutureRawMessage(message),
+					(message) => isRecord(message) && message.role === "toolResult" && isContentRefRawMessage(message),
 				)
 			);
 		case "message_start":
 		case "message_end":
-			return hasOnlyKeys(value, ["type", "message"]) && isFutureRawMessage(value.message);
+			return hasOnlyKeys(value, ["type", "message"]) && isContentRefRawMessage(value.message);
 		case "entry_appended":
-			return hasOnlyKeys(value, ["type", "entry"]) && isFutureRawEntry(value.entry);
+			return hasOnlyKeys(value, ["type", "entry"]) && isContentRefRawEntry(value.entry);
 		default:
 			return false;
 	}
 }
 
-function isFutureRawToolCallEndUpdate(value: UnknownRecord): boolean {
+function isContentRefRawToolCallEndUpdate(value: UnknownRecord): boolean {
 	if (
 		!hasOnlyKeys(value, ["type", "usage", "assistantMessageEvent"]) ||
 		!isUsageDto(value.usage) ||
@@ -512,11 +513,11 @@ function isFutureRawToolCallEndUpdate(value: UnknownRecord): boolean {
 		hasOnlyKeys(event, ["type", "contentIndex", "toolCall"]) &&
 		event.type === "toolcall_end" &&
 		isCount(event.contentIndex) &&
-		isFutureRawToolCallContent(event.toolCall)
+		isContentRefRawToolCallContent(event.toolCall)
 	);
 }
 
-function isFutureRawToolExecutionEvent(value: UnknownRecord): boolean {
+function isContentRefRawToolExecutionEvent(value: UnknownRecord): boolean {
 	if (!isIdentifier(value.toolCallId) || !isIdentifier(value.toolName)) return false;
 	switch (value.type) {
 		case "tool_execution_start":
@@ -549,11 +550,11 @@ export function isPiRpcContentRawEvent(value: unknown): value is PiRpcContentRaw
 		value.type === "message_end" ||
 		value.type === "entry_appended"
 	) {
-		return isFutureRawMessageEvent(value);
+		return isContentRefRawMessageEvent(value);
 	}
 	if (value.type === "message_update" && isRecord(value.assistantMessageEvent)) {
 		return value.assistantMessageEvent.type === "toolcall_end"
-			? isFutureRawToolCallEndUpdate(value)
+			? isContentRefRawToolCallEndUpdate(value)
 			: isPiRpcRawEvent(value);
 	}
 	if (
@@ -561,7 +562,7 @@ export function isPiRpcContentRawEvent(value: unknown): value is PiRpcContentRaw
 		value.type === "tool_execution_update" ||
 		value.type === "tool_execution_end"
 	) {
-		return isFutureRawToolExecutionEvent(value);
+		return isContentRefRawToolExecutionEvent(value);
 	}
 	return isPiRpcRawEvent(value);
 }

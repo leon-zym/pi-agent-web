@@ -2,16 +2,14 @@ import { spawn, spawnSync } from "node:child_process";
 import type {
 	ExtensionUiRequestDto,
 	ExtensionUiResponseDto,
-	FutureExtensionUiRequestDto,
-	FutureProductSessionEventDto,
-	FutureSessionCommandResponseDto,
-	FutureSessionContentRefGuardContext,
+	PiExtensionUiRequestDto,
+	PiProductSessionEventDto,
+	PiSessionCommandResponseDto,
 	ProductSessionEventDto,
-	SessionAttachmentGuardContext,
-	SessionAttachmentRefDto,
 	SessionCommandDto,
 	SessionCommandResponseDto,
 	SessionCommandTypeDto,
+	SessionContentRefGuardContext,
 } from "@pi-agent-web/protocol";
 import type { EpochContentHold, EpochStoredContentRef } from "./epoch-content-store.js";
 import type {
@@ -87,18 +85,15 @@ export class PiProtocolIncompatibleError extends Error {
 	}
 }
 
-export type PiHostUnsolicitedFrame<
-	TEvent = ProductSessionEventDto,
-	TExtensionRequest = ExtensionUiRequestDto,
-> =
-	| { kind: "event"; event: TEvent }
-	| { kind: "extension_ui_request"; request: TExtensionRequest }
+export type PiHostUnsolicitedFrame =
+	| { kind: "event"; event: ProductSessionEventDto }
+	| { kind: "extension_ui_request"; request: ExtensionUiRequestDto }
 	| { kind: "ignored"; frameType: string };
 
-export type PiHostFutureUnsolicitedFrame = PiHostUnsolicitedFrame<
-	FutureProductSessionEventDto,
-	FutureExtensionUiRequestDto
->;
+export type PiHostRawUnsolicitedFrame =
+	| { kind: "event"; event: PiProductSessionEventDto }
+	| { kind: "extension_ui_request"; request: PiExtensionUiRequestDto }
+	| { kind: "ignored"; frameType: string };
 
 export type PiHostPayloadLease = PiPayloadLease<EpochStoredContentRef>;
 export type PiHostPayloadLeaseTransfer = PiPayloadLeaseTransfer<EpochStoredContentRef>;
@@ -122,47 +117,32 @@ export function adaptPiPayloadLease<TRef extends EpochStoredContentRef>(
 	});
 }
 
-export interface PiHostDecodeOutcome<T, TRef extends EpochStoredContentRef = SessionAttachmentRefDto> {
+export interface PiHostDecodeOutcome<T, TRef extends EpochStoredContentRef = EpochStoredContentRef> {
 	readonly value: T;
 	readonly lease: PiPayloadLease<TRef> | null;
 }
 
-export interface PiHostAttachmentPayloadExternalizer {
-	/** Omission is the backwards-compatible current attachment mode. */
-	readonly mode?: "attachment";
-	readonly context: SessionAttachmentGuardContext;
-	externalize(input: PiPayloadExternalizerInput, signal: AbortSignal): Promise<Externalized<unknown>>;
-}
-
-export interface PiHostFuturePayloadExternalizer {
-	readonly mode: "future_content";
-	readonly context: FutureSessionContentRefGuardContext;
+export interface PiHostPayloadExternalizer {
+	readonly mode: "content_ref";
+	readonly context: SessionContentRefGuardContext;
 	externalize(
 		input: PiPayloadExternalizerInput,
 		signal: AbortSignal,
 	): Promise<Externalized<unknown, EpochStoredContentRef>>;
 }
 
-export type PiHostPayloadExternalizer = PiHostAttachmentPayloadExternalizer | PiHostFuturePayloadExternalizer;
-
 /** Adapter normalization may be synchronous today or asynchronously externalize bounded payloads. */
-export type PiHostDecodeResult<T, TRef extends EpochStoredContentRef = SessionAttachmentRefDto> =
+export type PiHostDecodeResult<T, TRef extends EpochStoredContentRef = EpochStoredContentRef> =
 	| PiHostDecodeOutcome<T, TRef>
 	| PromiseLike<PiHostDecodeOutcome<T, TRef>>;
 
 /** Spawn-scoped cancellation passed to asynchronous normalization/externalization work. */
 export interface PiHostDecodeContext {
 	readonly signal: AbortSignal;
-	/** Server-private and disabled unless the complete downstream ownership path is installed. */
-	readonly externalizer?: PiHostAttachmentPayloadExternalizer;
+	readonly externalizer: PiHostPayloadExternalizer;
 }
 
-export interface PiHostFutureDecodeContext {
-	readonly signal: AbortSignal;
-	readonly externalizer: PiHostFuturePayloadExternalizer;
-}
-
-export interface PiHostFutureOrphanDecodeContext {
+export interface PiHostOrphanDecodeContext {
 	readonly signal: AbortSignal;
 	readonly externalizer?: never;
 }
@@ -195,40 +175,29 @@ export interface PiHostAdapter {
 	openSessionArguments(target: { sessionFile: string; sessionDir: string }): string[];
 	encodeCommand(command: SessionCommandDto & { id: string }): unknown;
 	encodeExtensionUiResponse(response: ExtensionUiResponseDto): unknown;
+	/** Decode Pi's inline response before the Browser content-reference boundary. */
+	decodePiResponse(
+		value: unknown,
+		expectedCommand: SessionCommandTypeDto,
+	): PiHostDecodeResult<PiSessionCommandResponseDto & { id: string }>;
 	decodeResponse(
 		value: unknown,
 		expectedCommand: SessionCommandTypeDto,
-		context?: PiHostDecodeContext,
+		context: PiHostDecodeContext,
 	): PiHostDecodeResult<
 		SessionCommandResponseDto & {
-			id: string;
-		}
-	>;
-	decodeFutureResponse(
-		value: unknown,
-		expectedCommand: SessionCommandTypeDto,
-		context: PiHostFutureDecodeContext,
-	): PiHostDecodeResult<
-		FutureSessionCommandResponseDto & {
 			id: string;
 		},
 		EpochStoredContentRef
 	>;
 	/** Validate a late/unknown-id response before explicitly ignoring it. */
-	decodeOrphanedResponse(value: unknown, context?: PiHostDecodeContext): PiHostDecodeResult<void>;
-	/** Future raw validation for an ownerless response; externalization is intentionally unavailable. */
-	decodeFutureOrphanedResponse(
-		value: unknown,
-		context?: PiHostFutureOrphanDecodeContext,
-	): PiHostDecodeResult<void>;
-	decodeFutureUnsolicited(
-		value: unknown,
-		context: PiHostFutureDecodeContext,
-	): PiHostDecodeResult<PiHostFutureUnsolicitedFrame, EpochStoredContentRef>;
+	decodeOrphanedResponse(value: unknown, context?: PiHostOrphanDecodeContext): PiHostDecodeResult<void>;
 	decodeUnsolicited(
 		value: unknown,
-		context?: PiHostDecodeContext,
-	): PiHostDecodeResult<PiHostUnsolicitedFrame>;
+		context: PiHostDecodeContext,
+	): PiHostDecodeResult<PiHostUnsolicitedFrame, EpochStoredContentRef>;
+	/** Decode an inline Pi frame for direct upstream conformance consumers. */
+	decodePiUnsolicited(value: unknown): PiHostDecodeResult<PiHostRawUnsolicitedFrame>;
 }
 
 /** Execute an adapter-owned, bounded version probe and clean its whole process group. */

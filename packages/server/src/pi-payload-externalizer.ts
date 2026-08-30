@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import {
-	type FutureSessionContentRefGuardContext,
-	isExtensionUiRequestDto,
-	isFutureSessionContentRefGuardContext,
-	isProductSessionEventDto,
+	type SessionContentRefGuardContext,
+	isPiExtensionUiRequestDto,
+	isSessionContentRefGuardContext,
+	isPiProductSessionEventDto,
 	isSessionAttachmentGuardContext,
-	isSessionCommandResponseDto,
+	isPiSessionCommandResponseDto,
 	isSessionJsonRootDto,
 	isSessionTextPayloadDto,
 	type SessionAttachmentGuardContext,
@@ -123,7 +123,7 @@ export interface PiGenericPayloadExternalizerOptions
 	/** Deterministic supplemental future-product guard after built-in provenance validation. */
 	productGuard?: (
 		candidate: unknown,
-		context: FutureSessionContentRefGuardContext,
+		context: SessionContentRefGuardContext,
 		input: PiPayloadExternalizerInput,
 	) => boolean;
 }
@@ -186,10 +186,10 @@ export async function externalizePiPayload<T = unknown>(
 		const guardCandidate = generic ? transformed.currentGuardShadow : value;
 		const productValid =
 			input.kind === "event"
-				? isProductSessionEventDto(guardCandidate, attachmentContext)
+				? isPiProductSessionEventDto(guardCandidate, attachmentContext)
 				: input.kind === "extension_ui_request"
-					? isExtensionUiRequestDto(guardCandidate)
-					: isSessionCommandResponseDto(guardCandidate, attachmentContext);
+					? isPiExtensionUiRequestDto(guardCandidate)
+					: isPiSessionCommandResponseDto(guardCandidate, attachmentContext);
 		const supplementalGuard = options.productGuard as
 			| ((
 					candidate: unknown,
@@ -224,7 +224,7 @@ function isGenericOptions(
 	return "genericContent" in options;
 }
 
-function futureContext(options: PiGenericPayloadExternalizerOptions): FutureSessionContentRefGuardContext {
+function futureContext(options: PiGenericPayloadExternalizerOptions): SessionContentRefGuardContext {
 	return {
 		serverEpoch: options.serverEpoch,
 		payloadBudget: options.payloadBudget,
@@ -249,7 +249,7 @@ function assertOptions(options: AnyPiPayloadExternalizerOptions): void {
 	}
 	if (
 		isGenericOptions(options) &&
-		(!isFutureSessionContentRefGuardContext(futureContext(options)) ||
+		(!isSessionContentRefGuardContext(futureContext(options)) ||
 			typeof options.contentStore.stageUtf8 !== "function" ||
 			typeof options.contentStore.holdPublishedUtf8 !== "function")
 	) {

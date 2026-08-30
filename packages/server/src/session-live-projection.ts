@@ -1,18 +1,18 @@
 import {
-	type ExtensionUiRequestDto,
-	isExtensionUiRequestDto,
-	isProductSessionEventDto,
+	type InlineSessionProjectionEventDto,
+	isPiExtensionUiRequestDto,
+	isPiProductSessionEventDto,
+	isPiSessionMessageDto,
 	isSessionAttachmentGuardContext,
-	isSessionMessageDto,
-	type ProductSessionEventDto,
+	type PiExtensionUiRequestDto,
+	type PiProductSessionEventDto,
+	type PiSessionMessageDto,
 	SESSION_SNAPSHOT_MAX_BYTES,
 	SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS,
 	SESSION_SNAPSHOT_MAX_MESSAGES,
 	SESSION_SNAPSHOT_MAX_PROJECTION_EVENTS,
 	SESSION_SNAPSHOT_MAX_QUEUE_ITEMS,
 	type SessionAttachmentGuardContext,
-	type SessionMessageDto,
-	type SessionProjectionEventDto,
 } from "@pi-agent-web/protocol";
 import {
 	SessionProductSchemaLogicalError,
@@ -55,9 +55,9 @@ export interface SessionLiveProjectionLimits {
 }
 
 export interface SessionLiveProjectionOptions<
-	TMessage = SessionMessageDto,
-	TEvent = ProductSessionEventDto,
-	TExtensionRequest extends { readonly id: string; readonly method: string } = ExtensionUiRequestDto,
+	TMessage = PiSessionMessageDto,
+	TEvent = PiProductSessionEventDto,
+	TExtensionRequest extends { readonly id: string; readonly method: string } = PiExtensionUiRequestDto,
 > {
 	identity: SessionLiveProjectionIdentity;
 	settledMessages?: readonly TMessage[];
@@ -70,8 +70,8 @@ export interface SessionLiveProjectionOptions<
 }
 
 export type SessionLiveProjectionInput<
-	TEvent = ProductSessionEventDto,
-	TExtensionRequest = ExtensionUiRequestDto,
+	TEvent = PiProductSessionEventDto,
+	TExtensionRequest = PiExtensionUiRequestDto,
 > =
 	| { type: "event"; event: TEvent }
 	| { type: "extension_ui_request"; request: TExtensionRequest }
@@ -81,15 +81,15 @@ export type SessionLiveProjectionInput<
 			reason: "answered" | "cancelled" | "expired" | "process_lost" | "replaced";
 	  };
 
-export type SessionLiveProjectionEventFrame<TEvent = ProductSessionEventDto> = Omit<
-	SessionProjectionEventDto,
+export type SessionLiveProjectionEventFrame<TEvent = PiProductSessionEventDto> = Omit<
+	InlineSessionProjectionEventDto,
 	"event"
 > & { event: TEvent };
 
 export interface SessionLiveProjectionSnapshot<
-	TMessage = SessionMessageDto,
-	TEvent = ProductSessionEventDto,
-	TExtensionRequest = ExtensionUiRequestDto,
+	TMessage = PiSessionMessageDto,
+	TEvent = PiProductSessionEventDto,
+	TExtensionRequest = PiExtensionUiRequestDto,
 > extends SessionLiveProjectionIdentity {
 	baseSeq: number;
 	asOfSeq: number;
@@ -188,9 +188,9 @@ export class SessionLiveProjectionPayloadError extends Error {
  * ConversationProjection reducer and it never persists a second Session truth.
  */
 export class SessionLiveProjection<
-	TMessage = SessionMessageDto,
-	TEvent = ProductSessionEventDto,
-	TExtensionRequest extends { readonly id: string; readonly method: string } = ExtensionUiRequestDto,
+	TMessage = PiSessionMessageDto,
+	TEvent = PiProductSessionEventDto,
+	TExtensionRequest extends { readonly id: string; readonly method: string } = PiExtensionUiRequestDto,
 > {
 	private readonly identity: SessionLiveProjectionIdentity;
 	private readonly limits: SessionLiveProjectionLimits;
@@ -297,13 +297,13 @@ export class SessionLiveProjection<
 		return this.commitPreparedBatchCore(token);
 	}
 
-	/** Legacy inline-only compatibility seam; future mode uses prepare/adopt/commit. */
+	/** Compatibility seam for callers that do not transfer externalized payload ownership. */
 	commitInlineOnly(
 		identity: SessionLiveProjectionIdentity,
 		input: SessionLiveProjectionInput<TEvent, TExtensionRequest>,
 		runtimePhase?: SessionLiveRuntimePhase,
 	): number {
-		if (input.type === "event" && !isProductSessionEventDto(input.event)) {
+		if (input.type === "event" && !isPiProductSessionEventDto(input.event)) {
 			throw new SessionLiveProjectionPayloadError();
 		}
 		const committed = this.commitPrepared(this.prepareCommit(identity, input, runtimePhase));
@@ -411,12 +411,12 @@ export class SessionLiveProjection<
 		);
 	}
 
-	/** Legacy inline-only compatibility seam; future mode uses prepare/adopt/commit. */
+	/** Compatibility seam for callers that do not transfer externalized payload ownership. */
 	commitIdleBaseCompactionInlineOnly(
 		token: SessionLiveProjectionCompactionToken,
 		settledMessages: readonly TMessage[],
 	): boolean {
-		if (!settledMessages.every((message) => isSessionMessageDto(message))) {
+		if (!settledMessages.every((message) => isPiSessionMessageDto(message))) {
 			this.compactionTokens.delete(token);
 			throw new SessionLiveProjectionPayloadError();
 		}
@@ -571,7 +571,7 @@ export class SessionLiveProjection<
 				throw error;
 			}
 			const frameBytes = jsonBytes(nextFrame, "live_events");
-			if (this.schema?.mode === "future_content" && frameBytes > this.schema.maxNormalizedEventWireBytes) {
+			if (this.schema && frameBytes > this.schema.maxNormalizedEventWireBytes) {
 				throw new SessionLiveProjectionLimitError("live_events");
 			}
 			const merging = mergedEvent !== null;
@@ -695,7 +695,7 @@ export class SessionLiveProjection<
 	}
 
 	private maxLiveEventWireBytes(): number {
-		return this.schema?.mode === "future_content"
+		return this.schema
 			? Math.min(this.limits.maxLiveEventBytes, this.schema.maxProjectionSuffixWireBytes)
 			: this.limits.maxLiveEventBytes;
 	}
@@ -722,17 +722,17 @@ export class SessionLiveProjection<
 	private guardMessage(value: unknown): boolean {
 		return this.schema
 			? this.schema.guardMessage(value)
-			: isSessionMessageDto(value, this.attachmentGuardContext);
+			: isPiSessionMessageDto(value, this.attachmentGuardContext);
 	}
 
 	private guardEvent(value: unknown): value is TEvent {
 		if (this.schema) return this.schema.guardEvent(value);
-		return isProductSessionEventDto(value, this.attachmentGuardContext);
+		return isPiProductSessionEventDto(value, this.attachmentGuardContext);
 	}
 
 	private guardExtensionRequest(value: unknown): value is TExtensionRequest {
 		if (this.schema) return this.schema.guardExtensionRequest(value);
-		return isExtensionUiRequestDto(value);
+		return isPiExtensionUiRequestDto(value);
 	}
 
 	private assertSnapshotFits(
@@ -776,7 +776,7 @@ export class SessionLiveProjection<
 	}
 
 	private maxSnapshotWireBytes(): number {
-		return this.schema?.mode === "future_content"
+		return this.schema
 			? Math.min(this.limits.maxSnapshotBytes, this.schema.maxSnapshotCanonicalWireBytes)
 			: this.limits.maxSnapshotBytes;
 	}
