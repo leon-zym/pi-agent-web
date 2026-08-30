@@ -16,8 +16,8 @@
 					"id": "stream-1m",
 					"kind": "streaming",
 					"targetBytes": 1048576,
-					"chunkBytes": 1024,
-					"chunkDelayMs": 1,
+					"chunkBytes": 4096,
+					"chunkDelayMs": 4,
 					"warmups": 1,
 					"samples": 3
 				},
@@ -42,10 +42,10 @@
 					"samples": 3
 				},
 				{
-					"id": "history-16m",
+					"id": "history-65m",
 					"kind": "history",
-					"sourceBytes": 16777216,
-					"turns": 64,
+					"sourceBytes": 68157440,
+					"turns": 96,
 					"warmups": 0,
 					"samples": 1
 				},

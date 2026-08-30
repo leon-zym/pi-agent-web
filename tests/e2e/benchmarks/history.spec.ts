@@ -56,24 +56,24 @@ for (const scenario of scenariosFor("history")) {
 					.click();
 				const viewport = page.locator('[data-chat-viewport="true"]');
 				const turnWindow = viewport.locator('[data-turn-window="true"]');
-				await expect(turnWindow).toHaveAttribute(
-					"data-turn-window-total",
-					String(Math.min(INITIAL_TURNS, turns)),
-					{ timeout: 90_000 },
-				);
+				await expect(turnWindow).toHaveAttribute("data-turn-window-total", /\d+/, { timeout: 90_000 });
 				await expect(turnWindow.locator("[data-turn-id]").last()).toContainText(HISTORY_REPLY, {
 					timeout: 90_000,
 				});
 				const firstPageFinished = await page.evaluate(() => performance.now());
+				const initialTurns = Number(await turnWindow.getAttribute("data-turn-window-total"));
 				const loadOlder = turnWindow.locator('[data-load-older-turns="true"]');
-				await expect(loadOlder).toBeVisible({ timeout: 90_000 });
-				const nextPageStarted = await page.evaluate(() => performance.now());
-				await loadOlder.click();
-				await expect(turnWindow).toHaveAttribute("data-turn-window-total", String(turns), {
-					timeout: 90_000,
-				});
-				await expect(turnWindow.locator('[aria-busy="true"]')).toHaveCount(0, { timeout: 90_000 });
-				const nextPageFinished = await page.evaluate(() => performance.now());
+				let nextPageMs = 0;
+				if (initialTurns < turns) {
+					await expect(loadOlder).toBeVisible({ timeout: 90_000 });
+					const nextPageStarted = await page.evaluate(() => performance.now());
+					await loadOlder.click();
+					await expect(turnWindow).toHaveAttribute("data-turn-window-total", String(turns), {
+						timeout: 90_000,
+					});
+					await expect(turnWindow.locator('[aria-busy="true"]')).toHaveCount(0, { timeout: 90_000 });
+					nextPageMs = (await page.evaluate(() => performance.now())) - nextPageStarted;
+				}
 				await page.locator("[data-toc-tick]").first().click({ force: true });
 				await expect(viewport.getByText(`${HISTORY_PROMPT} [turn 1]`, { exact: true })).toBeVisible({
 					timeout: 90_000,
@@ -94,7 +94,7 @@ for (const scenario of scenariosFor("history")) {
 					warmup: false,
 					metrics: {
 						firstPageMs: firstPageFinished - firstPageStarted,
-						nextPageMs: nextPageFinished - nextPageStarted,
+						nextPageMs,
 						sourceBytes: actualSourceBytes,
 						heapDeltaBytes: heapBefore === null || heapAfter === null ? null : heapAfter - heapBefore,
 						mountedTurnNodes: await turnWindow.locator("[data-turn-id]").count(),
@@ -102,6 +102,8 @@ for (const scenario of scenariosFor("history")) {
 					correctness: {
 						exactSourceBoundary: actualSourceBytes === sourceBytes,
 						allTurnsPaged: (await turnWindow.getAttribute("data-turn-window-total")) === String(turns),
+						oversizedSourceUsedPagination:
+							sourceBytes < 64 * 1024 * 1024 || initialTurns === Math.min(INITIAL_TURNS, turns),
 						oldestTurnReachable: await viewport
 							.getByText(`${HISTORY_PROMPT} [turn 1]`, { exact: true })
 							.isVisible(),

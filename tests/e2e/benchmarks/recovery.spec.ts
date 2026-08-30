@@ -187,7 +187,11 @@ for (const scenario of scenariosFor("recovery-crash")) {
 						{ timeout: 30_000 },
 					)
 					.toBe(1);
+				const currentRow = page.locator('[data-session-row][data-current="true"]');
+				await expect(currentRow).toHaveCount(1);
+				await currentRow.getByRole("button").first().click();
 				await expect(page.locator("textarea")).toBeEnabled({ timeout: 30_000 });
+				const recoveredAt = Date.now();
 				const restarted = harness
 					.piEvents()
 					.find(
@@ -209,7 +213,8 @@ for (const scenario of scenariosFor("recovery-crash")) {
 					index,
 					warmup: index < scenario.warmups,
 					metrics: {
-						recoveryMs: restarted.at - crashEvent.at,
+						recoveryMs: recoveredAt - crashEvent.at,
+						processRestartMs: restarted.at - crashEvent.at,
 						processStarts:
 							harness.piEvents().filter((event) => event.type === "started").length - startsBefore,
 					},
