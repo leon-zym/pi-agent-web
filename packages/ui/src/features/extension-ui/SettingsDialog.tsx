@@ -1,5 +1,5 @@
 import { expectCommandData, type SessionStateDto } from "@pi-agent-web/protocol";
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { toast } from "sonner";
 import { Button } from "../../components/ui/button";
 import {
@@ -11,7 +11,7 @@ import {
 } from "../../components/ui/dialog";
 import { Separator } from "../../components/ui/separator";
 import { Switch } from "../../components/ui/switch";
-import { isAudioMuted, setAudioMuted } from "../../lib/audio-feedback";
+import { isAudioMuted, setAudioMuted, subscribeAudioMuted } from "../../lib/audio-feedback";
 import { displayError } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { isSessionControlReady } from "../../lib/session-capabilities";
@@ -77,7 +77,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 		SessionStateDto,
 		"autoCompactionEnabled" | "steeringMode" | "followUpMode"
 	> | null>(null);
-	const [audioMuted, setAudioMutedState] = useState(isAudioMuted);
+	const audioMuted = useSyncExternalStore(subscribeAudioMuted, isAudioMuted, () => false);
 	const { preference, set: setTheme } = useTheme();
 
 	useEffect(() => {
@@ -103,10 +103,6 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 			cancelled = true;
 		};
 	}, [open, sessionHandle]);
-
-	useEffect(() => {
-		if (open) setAudioMutedState(isAudioMuted());
-	}, [open]);
 
 	const toggleAutoCompaction = async (enabled: boolean) => {
 		if (!sessionHandle || !state) return;
@@ -155,9 +151,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 
 	const disabled = !sessionHandle || !state || !canControl;
 	const setAudioEnabled = (enabled: boolean) => {
-		const muted = !enabled;
-		setAudioMuted(muted);
-		setAudioMutedState(muted);
+		if (!setAudioMuted(!enabled)) toast.error(tt("settings.saveFailed"));
 	};
 
 	return (
