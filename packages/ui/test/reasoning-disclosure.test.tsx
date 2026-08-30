@@ -35,8 +35,8 @@ describe("ReasoningDisclosure component", () => {
 		// Header displays the tail teaser, not the hidden full text's first line.
 		expect(collapsedHeader).toContain("This is the tail conclusion paragraph.");
 		expect(collapsedHeader).not.toContain("First thought.");
-		expect(html).toContain("max-lg:min-h-10");
-		expect(html).toContain("max-lg:size-10");
+		expect(html).toContain("[@media(hover:none)]:min-h-10");
+		expect(html).toContain("[@media(hover:none)]:size-10");
 
 		// Grid collapse structure
 		expect(html).toContain("grid-rows-[0fr]");

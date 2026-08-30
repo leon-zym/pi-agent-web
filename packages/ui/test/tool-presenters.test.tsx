@@ -177,8 +177,8 @@ describe("tool presenters", () => {
 
 		expect(serializationCount).toBe(0);
 		expect(html).toContain("large.json");
-		expect(html).toContain("max-lg:min-h-10");
-		expect(html).toContain("max-lg:size-10");
+		expect(html).toContain("[@media(hover:none)]:min-h-10");
+		expect(html).toContain("[@media(hover:none)]:size-10");
 	});
 
 	it("keeps a multi-MiB Bash command out of the collapsed summary DOM", () => {

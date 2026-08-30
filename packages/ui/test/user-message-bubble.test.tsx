@@ -62,7 +62,7 @@ describe("UserMessageBubble attachment refs", () => {
 		expect(html).toContain(`/api/v1/attachments/epoch-a/${"d".repeat(64)}`);
 		expect(html).not.toContain("data:image/png;base64");
 		expect(html).not.toMatch(/(?:src|href)="https?:\/\//);
-		expect(html).toContain("max-lg:size-10");
-		expect(html).toContain("max-lg:opacity-100");
+		expect(html).toContain("[@media(hover:none)]:size-10");
+		expect(html).toContain("[@media(hover:none)]:opacity-100");
 	});
 });
