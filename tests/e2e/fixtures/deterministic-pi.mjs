@@ -1902,6 +1902,7 @@ function streamPrompt(command) {
 		images.length > 0 && !text
 			? `E2E_IMAGE_OK:${String(images.length)}:${images[0]?.mimeType ?? "unknown"}`
 			: `E2E_REPLY:${text}`;
+	const benchmarkGap = text.startsWith("E2E_BENCH_GAP:");
 	const slow = text.includes("E2E_A_SLOW");
 	const firstDelay = slow ? Math.min(500, Math.floor(slowDelayMs / 3)) : 25;
 	const finishDelay = 90;
@@ -1957,7 +1958,19 @@ function streamPrompt(command) {
 		record("settled", { commandId: command.id, text, label });
 		activeRun = null;
 	};
-	if (slow) scheduleSlowFinish(run, text, finish);
+	if (benchmarkGap) {
+		scheduleConsumedSignal(run, text, "gap", "benchmark_gap_observed", () => {
+			send({
+				type: "extension_ui_request",
+				id: `${sessionId}-benchmark-gap-${command.id}`,
+				method: "notify",
+				message: "E2E_BENCHMARK_TRANSIENT_GAP",
+				notifyType: "info",
+			});
+			record("benchmark_gap_emitted", { commandId: command.id, text });
+			schedule(run, 25, finish);
+		});
+	} else if (slow) scheduleSlowFinish(run, text, finish);
 	else schedule(run, finishDelay, finish);
 }
 

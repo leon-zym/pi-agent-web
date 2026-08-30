@@ -26,7 +26,7 @@ function frame(payload: string | Buffer): WireFrame | undefined {
 }
 
 for (const scenario of scenariosFor("recovery-disconnect")) {
-	test(`${scenario.id} repeats disconnect and replay-gap recovery without projection corruption`, async ({
+	test(`${scenario.id} repeats disconnect and explicit gap resync without projection corruption`, async ({
 		page,
 		harness,
 	}, testInfo) => {
@@ -53,7 +53,7 @@ for (const scenario of scenariosFor("recovery-disconnect")) {
 			const trialCount = scenario.warmups + scenario.samples;
 
 			for (let index = 0; index < trialCount; index += 1) {
-				const prompt = `E2E_A_SLOW_BENCH_${scenario.id}_${String(index)}`;
+				const prompt = `E2E_BENCH_GAP:${scenario.id}:${String(index)}`;
 				await page.locator("textarea").fill(prompt);
 				await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
 				await expect
@@ -64,8 +64,15 @@ for (const scenario of scenariosFor("recovery-disconnect")) {
 				const framesBefore = received.length;
 				const startedAt = await page.evaluate(() => performance.now());
 				await dropControlledWebSockets(page);
+				harness.triggerReplayGap(prompt);
 				await expect.poll(() => closedSockets).toBeGreaterThan(closesBefore);
-				harness.releasePrompt(prompt);
+				await expect
+					.poll(() =>
+						harness
+							.piEvents()
+							.some((event) => event.type === "benchmark_gap_emitted" && event.text === prompt),
+					)
+					.toBe(true);
 				await expect
 					.poll(() => harness.piEvents().some((event) => event.type === "settled" && event.text === prompt), {
 						timeout: 30_000,
@@ -81,19 +88,22 @@ for (const scenario of scenariosFor("recovery-disconnect")) {
 				const finishedAt = await page.evaluate(() => performance.now());
 				const resyncFrames = received
 					.slice(framesBefore)
-					.filter((candidate) => candidate.type === "resync_required").length;
+					.filter((candidate) => candidate.type === "resync_required");
+				const gapResyncFrames = resyncFrames.filter((candidate) => candidate.reason === "gap");
 				outcome.trials.push({
 					index,
 					warmup: index < scenario.warmups,
 					metrics: {
 						recoveryMs: finishedAt - startedAt,
 						reconnectedSockets: sockets.length - socketsBefore,
-						resyncFrames,
+						resyncFrames: resyncFrames.length,
+						gapResyncFrames: gapResyncFrames.length,
 					},
 					correctness: {
 						reconnected: sockets.length > socketsBefore,
 						exactlyOnePrompt: (await turn.getByText(prompt, { exact: true }).count()) === 1,
 						exactlyOneReply: (await turn.getByText(`E2E_REPLY:${prompt}`, { exact: true }).count()) === 1,
+						exactlyOneGapResync: gapResyncFrames.length === 1,
 						singlePiCommand:
 							harness.piEvents().filter((event) => event.type === "prompt" && event.text === prompt)
 								.length === 1,
@@ -137,7 +147,7 @@ for (const scenario of scenariosFor("recovery-disconnect")) {
 				"Browser errors invalidate recovery success.",
 			);
 			outcome.notes.push(
-				"The fault disconnects during a transient active turn and settles while offline; resyncFrames records whether the exact trial used replay or a fresh baseline.",
+				"After a clean socket close, the fixture emits one non-replayable notify while offline; every trial must reconnect through resync_required(reason=gap).",
 			);
 		});
 	});

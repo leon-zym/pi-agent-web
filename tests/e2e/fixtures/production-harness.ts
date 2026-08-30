@@ -60,6 +60,7 @@ export interface ProductionHarness {
 	piEvents: () => PiFixtureEvent[];
 	releasePrompt: (text: string) => void;
 	startPrompt: (text: string) => void;
+	triggerReplayGap: (text: string) => void;
 	requestJson: <T>(pathname: string, init?: RequestInit) => Promise<T>;
 	stop: () => Promise<void>;
 }
@@ -370,6 +371,9 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 			},
 			startPrompt: (text) => {
 				fs.writeFileSync(path.join(controlDir, `${encodeURIComponent(text)}.start`), "start\n", "utf8");
+			},
+			triggerReplayGap: (text) => {
+				fs.writeFileSync(path.join(controlDir, `${encodeURIComponent(text)}.gap`), "gap\n", "utf8");
 			},
 			requestJson,
 			stop: async () => {
