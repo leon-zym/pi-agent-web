@@ -616,6 +616,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	let deliveredNotifyIdentityOrder: string[] = [];
 	const claimAttempts = new Set<string>();
 	const releasedControlIntents = new Set<string>();
+	const pendingOverflowRestarts = new Map<string, SessionRuntimeIdentityDto>();
 	const baselineRefreshes = new Set<string>();
 	const subscriptionBaselines = new Map<string, string | null>();
 	let subscribedLruOrder: string[] = [];
@@ -1234,6 +1235,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		hotRuntimeRevision = -1;
 		claimAttempts.clear();
 		releasedControlIntents.clear();
+		pendingOverflowRestarts.clear();
 		baselineRefreshes.clear();
 		subscriptionBaselines.clear();
 		activeExactHotRecovery = null;
@@ -1501,6 +1503,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		}));
 		claimAttempts.delete(sessionHandle);
 		releasedControlIntents.delete(sessionHandle);
+		pendingOverflowRestarts.delete(sessionHandle);
 		baselineRefreshes.delete(sessionHandle);
 		subscriptionBaselines.delete(sessionHandle);
 		connectionObservations.delete(sessionHandle);
@@ -1531,6 +1534,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		acknowledgedExtensionRequests.delete(sessionHandle);
 		clearDeliveredNotifyKeys(sessionHandle);
 		claimAttempts.delete(sessionHandle);
+		pendingOverflowRestarts.delete(sessionHandle);
 		baselineRefreshes.delete(sessionHandle);
 		subscriptionBaselines.delete(sessionHandle);
 		discardRawEvents(sessionHandle, false);
@@ -1572,6 +1576,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		if (!channel?.subscribed) return false;
 		claimAttempts.delete(sessionHandle);
 		releasedControlIntents.add(sessionHandle);
+		pendingOverflowRestarts.delete(sessionHandle);
 		setChannel(sessionHandle, (current) => ({
 			...current,
 			controllerIntent: false,
@@ -1603,15 +1608,25 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			channel.generation !== null &&
 			recovery?.phase === "degraded"
 		) {
-			const sent = sendWire({
-				type: "session_restart",
-				sessionHandle,
-				expectedGeneration: channel.generation,
-				...(channel.lease.fencingToken ? { fencingToken: channel.lease.fencingToken } : {}),
-			});
-			if (sent !== "sent") return false;
 			releasedControlIntents.delete(sessionHandle);
 			setChannel(sessionHandle, (current) => ({ ...current, controllerIntent: true }));
+			if (channel.lease.fencingToken) {
+				return (
+					sendWire({
+						type: "session_restart",
+						sessionHandle,
+						expectedGeneration: channel.generation,
+						fencingToken: channel.lease.fencingToken,
+					}) === "sent"
+				);
+			}
+			pendingOverflowRestarts.set(sessionHandle, channel.runtime);
+			claimAttempts.add(sessionHandle);
+			if (sendWire({ type: "session_claim", sessionHandle }) !== "sent") {
+				claimAttempts.delete(sessionHandle);
+				pendingOverflowRestarts.delete(sessionHandle);
+				return false;
+			}
 			return true;
 		}
 		return resyncCoordinator.manualRetry(sessionHandle);
@@ -3183,6 +3198,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			}
 		} else if (message.operation === "claim") {
 			claimAttempts.delete(message.sessionHandle);
+			pendingOverflowRestarts.delete(message.sessionHandle);
 		}
 		frameBus.emit(message.sessionHandle, message, now());
 	}
@@ -3269,6 +3285,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			acknowledgedExtensionRequests.delete(sessionHandle);
 			clearDeliveredNotifyKeys(sessionHandle);
 			claimAttempts.delete(sessionHandle);
+			pendingOverflowRestarts.delete(sessionHandle);
 			baselineRefreshes.delete(sessionHandle);
 			subscriptionBaselines.delete(sessionHandle);
 			discardRawEvents(sessionHandle, false);
@@ -3674,7 +3691,25 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		}));
 		frameBus.emit(message.sessionHandle, effectiveMessage, now());
 		if (current.runtime) advanceExactHotRecovery(current.runtime, "lease");
-		if (!effectiveMessage.isController) claimSessionIfReady(message.sessionHandle);
+		if (effectiveMessage.isController && effectiveMessage.fencingToken) {
+			const pendingRestart = pendingOverflowRestarts.get(message.sessionHandle);
+			if (
+				pendingRestart &&
+				identitiesMatch(pendingRestart, current.runtime) &&
+				current.runtime?.error === "session_snapshot_overflow"
+			) {
+				pendingOverflowRestarts.delete(message.sessionHandle);
+				claimAttempts.delete(message.sessionHandle);
+				sendWire({
+					type: "session_restart",
+					sessionHandle: message.sessionHandle,
+					expectedGeneration: message.generation,
+					fencingToken: effectiveMessage.fencingToken,
+				});
+			}
+		} else {
+			claimSessionIfReady(message.sessionHandle);
+		}
 	}
 
 	function handleResyncRequired(
@@ -4181,6 +4216,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		discardRawEvents(sessionHandle, false);
 		claimAttempts.delete(previousSessionHandle);
 		claimAttempts.delete(sessionHandle);
+		pendingOverflowRestarts.delete(previousSessionHandle);
+		pendingOverflowRestarts.delete(sessionHandle);
 		if (releasedControlIntents.delete(previousSessionHandle)) {
 			releasedControlIntents.add(sessionHandle);
 		}
@@ -4241,6 +4278,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		deliveredNotifyIdentityOrder = [];
 		claimAttempts.clear();
 		releasedControlIntents.clear();
+		pendingOverflowRestarts.clear();
 		baselineRefreshes.clear();
 		subscriptionBaselines.clear();
 		subscribedLruOrder = [];

@@ -2968,7 +2968,7 @@ describe("session transport replay and recovery", () => {
 		const clock = new ResyncClock();
 		const h = harness({ resyncClock: clock, resyncRandom: () => 0.5 });
 		const socket = connect(h);
-		h.controller.store.getState().subscribeSession("session-a");
+		subscribeAndPrime(h, "session-a", 3, 8);
 		const overflowed = {
 			...runtime("session-a", 3, 9),
 			state: "crashed" as const,
@@ -2976,19 +2976,18 @@ describe("session transport replay and recovery", () => {
 		};
 		socket.serverMessage({ type: "runtime_state", runtime: overflowed });
 		socket.serverMessage({
-			type: "lease_status",
-			serverEpoch: overflowed.serverEpoch,
-			sessionHandle: overflowed.sessionHandle,
-			generation: overflowed.generation,
-			isController: true,
-			fencingToken: "overflow-fence",
-		});
-		socket.serverMessage({
 			type: "resync_required",
 			serverEpoch: overflowed.serverEpoch,
 			sessionHandle: overflowed.sessionHandle,
 			runtime: overflowed,
 			reason: "gap",
+		});
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: overflowed.serverEpoch,
+			sessionHandle: overflowed.sessionHandle,
+			generation: overflowed.generation,
+			isController: false,
 		});
 		const failAttempt = () =>
 			socket.serverMessage({
@@ -3011,6 +3010,15 @@ describe("session transport replay and recovery", () => {
 		expect(h.controller.store.getState().sessions["session-a"]?.recovery?.phase).toBe("degraded");
 
 		expect(h.controller.store.getState().manualRetryResync("session-a")).toBe(true);
+		expect(socket.sent.at(-1)).toEqual({ type: "session_claim", sessionHandle: "session-a" });
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: overflowed.serverEpoch,
+			sessionHandle: overflowed.sessionHandle,
+			generation: overflowed.generation,
+			isController: true,
+			fencingToken: "overflow-fence",
+		});
 		expect(socket.sent.at(-1)).toEqual({
 			type: "session_restart",
 			sessionHandle: "session-a",
