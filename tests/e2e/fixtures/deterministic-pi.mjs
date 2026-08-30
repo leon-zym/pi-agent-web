@@ -914,7 +914,14 @@ function budgetMarkdown(targetBytes) {
 	return `${body.slice(0, low)}${suffix}`;
 }
 
-function streamBudgetPrompt(command, text, user, userEntryId, targetBytes) {
+function streamBudgetPrompt(
+	command,
+	text,
+	user,
+	userEntryId,
+	targetBytes,
+	{ chunkSize = 4 * 1024, firstChunkDelayMs = 500, chunkDelayMs = 10 } = {},
+) {
 	const markdown = budgetMarkdown(targetBytes);
 	const run = {
 		kind: "stream-budget",
@@ -951,10 +958,15 @@ function streamBudgetPrompt(command, text, user, userEntryId, targetBytes) {
 		assistantMessageEvent: { type: "text_start", contentIndex: 0 },
 	});
 
-	const chunkSize = 4 * 1024;
 	const finishRun = () => {
 		if (activeRun !== run) return;
-		record("stream_end", { commandId: command.id, text, targetBytes, markdownChars: markdown.length });
+		record("stream_end", {
+			commandId: command.id,
+			text,
+			targetBytes,
+			markdownChars: markdown.length,
+			deltaCount: run.deltaIndex,
+		});
 		// Let the browser acknowledge the final delta before the structural text_end
 		// commit is released, keeping the performance fixture's phases deterministic.
 		const finishAfterStreamEnd = () => {
@@ -1025,7 +1037,7 @@ function streamBudgetPrompt(command, text, user, userEntryId, targetBytes) {
 			if (run.deltaIndex === 1 || run.deltaIndex % 16 === 0) {
 				record("delta", { commandId: command.id, text, deltaIndex: run.deltaIndex, targetBytes });
 			}
-			schedule(run, run.deltaIndex === 1 ? 500 : 10, emitChunk);
+			schedule(run, run.deltaIndex === 1 ? firstChunkDelayMs : chunkDelayMs, emitChunk);
 			return;
 		}
 		finishRun();
@@ -1789,6 +1801,19 @@ function streamPrompt(command) {
 	const user = { role: "user", content: userContent, timestamp: Date.now() };
 	const userEntryId = persistMessage(user, null);
 	messages.push(user);
+	if (text.startsWith("E2E_BENCH_CRASH:") && images.length === 0) {
+		record("prompt", {
+			commandId: command.id,
+			text,
+			imageCount: 0,
+			imageMimeTypes: [],
+			imageChars: 0,
+			slow: false,
+		});
+		record("crash_requested", { commandId: command.id, text });
+		setTimeout(() => process.exit(42), 25);
+		return;
+	}
 	if (futureContentRefFixture && text === "E2E_FUTURE_CONTENT_REFS" && images.length === 0) {
 		streamFutureContentPrompt(command, text, user, userEntryId);
 		return;
@@ -1814,6 +1839,30 @@ function streamPrompt(command) {
 		}[text];
 		if (targetBytes) {
 			streamBudgetPrompt(command, text, user, userEntryId, targetBytes);
+			return;
+		}
+	}
+	if (text.startsWith("E2E_BENCH_STREAM:") && images.length === 0) {
+		const [, rawTargetBytes, rawChunkSize, rawChunkDelayMs] = text.split(":", 5);
+		const targetBytes = Number(rawTargetBytes);
+		const chunkSize = Number(rawChunkSize);
+		const chunkDelayMs = Number(rawChunkDelayMs);
+		if (
+			Number.isSafeInteger(targetBytes) &&
+			targetBytes >= 10 * 1024 &&
+			targetBytes <= 1024 * 1024 &&
+			Number.isSafeInteger(chunkSize) &&
+			chunkSize >= 64 &&
+			chunkSize <= 4 * 1024 &&
+			Number.isSafeInteger(chunkDelayMs) &&
+			chunkDelayMs >= 0 &&
+			chunkDelayMs <= 100
+		) {
+			streamBudgetPrompt(command, text, user, userEntryId, targetBytes, {
+				chunkSize,
+				firstChunkDelayMs: 50,
+				chunkDelayMs,
+			});
 			return;
 		}
 	}

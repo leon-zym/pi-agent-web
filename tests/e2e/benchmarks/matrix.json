@@ -1,0 +1,194 @@
+{
+	"schemaVersion": 1,
+	"tiers": {
+		"representative": {
+			"scenarios": [
+				{
+					"id": "stream-120k",
+					"kind": "streaming",
+					"targetBytes": 122880,
+					"chunkBytes": 256,
+					"chunkDelayMs": 1,
+					"warmups": 1,
+					"samples": 3
+				},
+				{
+					"id": "stream-1m",
+					"kind": "streaming",
+					"targetBytes": 1048576,
+					"chunkBytes": 1024,
+					"chunkDelayMs": 1,
+					"warmups": 1,
+					"samples": 3
+				},
+				{
+					"id": "sessions-1",
+					"kind": "concurrency",
+					"sessions": 1,
+					"targetBytes": 122880,
+					"chunkBytes": 512,
+					"chunkDelayMs": 2,
+					"warmups": 1,
+					"samples": 3
+				},
+				{
+					"id": "sessions-4",
+					"kind": "concurrency",
+					"sessions": 4,
+					"targetBytes": 122880,
+					"chunkBytes": 512,
+					"chunkDelayMs": 2,
+					"warmups": 1,
+					"samples": 3
+				},
+				{
+					"id": "history-16m",
+					"kind": "history",
+					"sourceBytes": 16777216,
+					"turns": 64,
+					"warmups": 0,
+					"samples": 1
+				},
+				{
+					"id": "recovery-disconnect-gap",
+					"kind": "recovery-disconnect",
+					"warmups": 1,
+					"samples": 10
+				},
+				{
+					"id": "recovery-pi-crash",
+					"kind": "recovery-crash",
+					"warmups": 1,
+					"samples": 10
+				},
+				{
+					"id": "content-roundtrip",
+					"kind": "content-roundtrip",
+					"inputBytes": 1120000,
+					"warmups": 1,
+					"samples": 3
+				}
+			]
+		},
+		"stress": {
+			"scenarios": [
+				{
+					"id": "stream-10k",
+					"kind": "streaming",
+					"targetBytes": 10240,
+					"chunkBytes": 128,
+					"chunkDelayMs": 1,
+					"warmups": 2,
+					"samples": 7
+				},
+				{
+					"id": "stream-64k",
+					"kind": "streaming",
+					"targetBytes": 65536,
+					"chunkBytes": 256,
+					"chunkDelayMs": 1,
+					"warmups": 2,
+					"samples": 7
+				},
+				{
+					"id": "stream-120k",
+					"kind": "streaming",
+					"targetBytes": 122880,
+					"chunkBytes": 256,
+					"chunkDelayMs": 1,
+					"warmups": 2,
+					"samples": 7
+				},
+				{
+					"id": "stream-1m",
+					"kind": "streaming",
+					"targetBytes": 1048576,
+					"chunkBytes": 512,
+					"chunkDelayMs": 1,
+					"warmups": 2,
+					"samples": 7
+				},
+				{
+					"id": "sessions-1",
+					"kind": "concurrency",
+					"sessions": 1,
+					"targetBytes": 1048576,
+					"chunkBytes": 1024,
+					"chunkDelayMs": 8,
+					"warmups": 1,
+					"samples": 8
+				},
+				{
+					"id": "sessions-4",
+					"kind": "concurrency",
+					"sessions": 4,
+					"targetBytes": 1048576,
+					"chunkBytes": 1024,
+					"chunkDelayMs": 8,
+					"warmups": 1,
+					"samples": 8
+				},
+				{
+					"id": "sessions-8",
+					"kind": "concurrency",
+					"sessions": 8,
+					"targetBytes": 1048576,
+					"chunkBytes": 1024,
+					"chunkDelayMs": 8,
+					"warmups": 1,
+					"samples": 8
+				},
+				{
+					"id": "history-below-64m",
+					"kind": "history",
+					"sourceBytes": 66060288,
+					"turns": 96,
+					"warmups": 0,
+					"samples": 1
+				},
+				{
+					"id": "history-at-64m",
+					"kind": "history",
+					"sourceBytes": 67108864,
+					"turns": 96,
+					"warmups": 0,
+					"samples": 1
+				},
+				{
+					"id": "history-above-64m",
+					"kind": "history",
+					"sourceBytes": 68157440,
+					"turns": 96,
+					"warmups": 0,
+					"samples": 1
+				},
+				{
+					"id": "recovery-disconnect-gap",
+					"kind": "recovery-disconnect",
+					"warmups": 2,
+					"samples": 100
+				},
+				{
+					"id": "recovery-pi-crash",
+					"kind": "recovery-crash",
+					"warmups": 2,
+					"samples": 100
+				},
+				{
+					"id": "content-roundtrip",
+					"kind": "content-roundtrip",
+					"inputBytes": 1120000,
+					"warmups": 2,
+					"samples": 10
+				}
+			]
+		}
+	},
+	"knownCoverageGaps": [
+		"Gateway restart cannot yet preserve the harness origin and is not benchmarked.",
+		"A deliberately slow raw WebSocket client and concurrent history/command fairness are not yet benchmarked.",
+		"Future protocol content-root references remain an explicit private L3 lane; this suite covers production attachment refs only.",
+		"History cancellation and post-cancel process/heap release are not yet measured.",
+		"Stress concurrency approximates the 60 second aggregate-delta load with repeated finite 1 MiB turns; it does not yet certify an exact 1000 delta/s arrival rate."
+	]
+}

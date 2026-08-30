@@ -42,6 +42,7 @@ export interface PiFixtureEvent {
 	imageMimeTypes?: string[];
 	imageChars?: number;
 	deltaIndex?: number;
+	deltaCount?: number;
 	toolCount?: number;
 	markdownChars?: number;
 	targetBytes?: number;
@@ -69,6 +70,8 @@ export interface StartHarnessOptions {
 		userText: string;
 		assistantText: string;
 		turnCount?: number;
+		/** Pad ASCII assistant content so the native JSONL has this exact byte length. */
+		targetSourceBytes?: number;
 	};
 }
 
@@ -90,6 +93,7 @@ function seedHistoricalSession(
 			cwd: workspacePath,
 		},
 	];
+	const assistantMessages: Array<{ content: Array<{ type: "text"; text: string }> }> = [];
 	let parentId: string | null = null;
 	for (let index = 0; index < turnCount; index++) {
 		const userId = `${nativeSessionId}-user-${String(index + 1)}`;
@@ -98,6 +102,24 @@ function seedHistoricalSession(
 		const assistantTimestamp = userTimestamp + 1_000;
 		const userText = turnCount === 1 ? seed.userText : `${seed.userText} [turn ${String(index + 1)}]`;
 		const assistantText = turnCount === 1 ? seed.assistantText : `${seed.assistantText} ${String(index + 1)}`;
+		const assistantMessage = {
+			role: "assistant",
+			content: [{ type: "text" as const, text: assistantText }],
+			api: "openai-completions",
+			provider: "e2e",
+			model: "deterministic",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: assistantTimestamp,
+		};
+		assistantMessages.push(assistantMessage);
 		entries.push(
 			{
 				type: "message",
@@ -115,28 +137,40 @@ function seedHistoricalSession(
 				id: assistantId,
 				parentId: userId,
 				timestamp: new Date(assistantTimestamp).toISOString(),
-				message: {
-					role: "assistant",
-					content: [{ type: "text", text: assistantText }],
-					api: "openai-completions",
-					provider: "e2e",
-					model: "deterministic",
-					usage: {
-						input: 1,
-						output: 1,
-						cacheRead: 0,
-						cacheWrite: 0,
-						totalTokens: 2,
-						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-					},
-					stopReason: "stop",
-					timestamp: assistantTimestamp,
-				},
+				message: assistantMessage,
 			},
 		);
 		parentId = assistantId;
 	}
-	fs.writeFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf8");
+	const serialize = () => `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+	if (seed.targetSourceBytes !== undefined) {
+		if (!Number.isSafeInteger(seed.targetSourceBytes) || seed.targetSourceBytes <= 0) {
+			throw new Error("historical Session targetSourceBytes must be a positive safe integer");
+		}
+		const baseBytes = Buffer.byteLength(serialize(), "utf8");
+		const paddingBytes = seed.targetSourceBytes - baseBytes;
+		if (paddingBytes < 0) {
+			throw new Error(
+				`historical Session base fixture ${String(baseBytes)} exceeds target ${String(seed.targetSourceBytes)}`,
+			);
+		}
+		const perMessage = Math.floor(paddingBytes / assistantMessages.length);
+		let remainder = paddingBytes % assistantMessages.length;
+		for (const message of assistantMessages) {
+			const extra = perMessage + (remainder > 0 ? 1 : 0);
+			if (remainder > 0) remainder -= 1;
+			const content = message.content[0];
+			if (content) content.text += "x".repeat(extra);
+		}
+	}
+	const serialized = serialize();
+	if (
+		seed.targetSourceBytes !== undefined &&
+		Buffer.byteLength(serialized, "utf8") !== seed.targetSourceBytes
+	) {
+		throw new Error("historical Session source byte padding drifted");
+	}
+	fs.writeFileSync(sessionFile, serialized, "utf8");
 	return { nativeSessionId, sessionFile: fs.realpathSync(sessionFile) };
 }
 
