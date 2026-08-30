@@ -8,7 +8,7 @@ import {
 	SESSION_PAYLOAD_BUDGET,
 } from "@pi-agent-web/protocol";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { type LegacyServerHandle, startServerWithCurrentMode } from "../src/main.js";
+import { type ServerHandle, startServer } from "../src/main.js";
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-gateway-test-"));
 const workspacePath = path.join(tempRoot, "workspace");
@@ -22,7 +22,7 @@ const PROVIDER_ID_LIMIT = 256;
 const API_KEY_LIMIT = 16 * 1024;
 const WORKSPACE_PATH_LIMIT = 8192;
 
-let handle: LegacyServerHandle;
+let handle: ServerHandle;
 let base: string;
 let cookie: string;
 let workspaceHandle: string;
@@ -107,7 +107,7 @@ async function rawGet(pathname: string, headers: Record<string, string>): Promis
 
 beforeAll(async () => {
 	fs.mkdirSync(workspacePath, { recursive: true });
-	handle = await startServerWithCurrentMode({
+	handle = await startServer({
 		config: { port: 0, host: "127.0.0.1", agentDir, sessionRootDir, webDataDir },
 		piPath: fakePiPath,
 		handleSignals: false,
@@ -149,7 +149,7 @@ afterAll(async () => {
 
 describe("gateway access control", () => {
 	it("rejects non-loopback listener configuration", async () => {
-		await expect(startServerWithCurrentMode({ config: { host: "0.0.0.0" } })).rejects.toThrow("PI_WEB_HOST");
+		await expect(startServer({ config: { host: "0.0.0.0" } })).rejects.toThrow("PI_WEB_HOST");
 	});
 
 	it("boots only from the Gateway origin without exposing the session secret", async () => {

@@ -1,10 +1,10 @@
 import type {
-	PiExtensionUiRequestDto,
-	PiProductSessionEventDto,
-	PiSessionCommandResponseDto,
+	ExtensionUiRequestDto,
+	ProductSessionEventDto,
+	SessionCommandResponseDto,
 	SessionHistoryMetadataDto,
 	SessionRuntimeDto,
-	InlineSessionSnapshotDto,
+	SessionSnapshotDto,
 } from "@pi-agent-web/protocol";
 import { READ_ONLY_RPC_COMMAND_TYPES } from "@pi-agent-web/protocol";
 
@@ -43,7 +43,7 @@ interface SessionEnvelopeBase {
 	seq: number;
 }
 
-export type SessionReplayFrame<TEvent = PiProductSessionEventDto, TExtensionRequest = PiExtensionUiRequestDto> =
+export type SessionReplayFrame<TEvent = ProductSessionEventDto, TExtensionRequest = ExtensionUiRequestDto> =
 	| (SessionEnvelopeBase & { type: "event"; event: TEvent })
 	| (SessionEnvelopeBase & {
 			type: "extension_ui_request";
@@ -56,8 +56,8 @@ export type SessionReplayFrame<TEvent = PiProductSessionEventDto, TExtensionRequ
 	  });
 
 export type SessionSupervisorMessage<
-	TEvent = PiProductSessionEventDto,
-	TExtensionRequest = PiExtensionUiRequestDto,
+	TEvent = ProductSessionEventDto,
+	TExtensionRequest = ExtensionUiRequestDto,
 > =
 	| SessionReplayFrame<TEvent, TExtensionRequest>
 	| { type: "runtime_state"; runtime: SessionRuntimeSnapshot }
@@ -94,9 +94,9 @@ export interface SessionChunkedSnapshot<TMessage> {
 }
 
 export type ReplayResult<
-	TEvent = PiProductSessionEventDto,
-	TSnapshot = InlineSessionSnapshotDto,
-	TExtensionRequest = PiExtensionUiRequestDto,
+	TEvent = ProductSessionEventDto,
+	TSnapshot = SessionSnapshotDto,
+	TExtensionRequest = ExtensionUiRequestDto,
 	TMessage = TSnapshot extends { settledMessages: (infer TSnapshotMessage)[] } ? TSnapshotMessage : never,
 > =
 	| {
@@ -112,7 +112,7 @@ export type ReplayResult<
 			chunkedSnapshot?: SessionChunkedSnapshot<TMessage>;
 	  };
 
-export interface SessionCommandResult<TResponse = PiSessionCommandResponseDto> {
+export interface SessionCommandResult<TResponse = SessionCommandResponseDto> {
 	serverEpoch: string;
 	sessionHandle: string;
 	generation: number;

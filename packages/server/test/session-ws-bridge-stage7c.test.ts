@@ -3,26 +3,22 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type {
-	FutureProductSessionEventDto,
-	FutureSessionWsServerMessage,
+	ProductSessionEventDto,
 	SessionRuntimeDto,
 	SessionRuntimeIdentityDto,
 	SessionWsServerMessage,
 } from "@pi-agent-web/protocol";
 import {
-	FUTURE_SESSION_CONTENT_REF_BUDGET,
+	SESSION_CONTENT_REF_BUDGET,
 	SESSION_PAYLOAD_BUDGET,
 	SESSION_TEXT_MAX_BYTES,
 } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import { EpochContentStore } from "../src/epoch-content-store.js";
-import {
-	createGatewayFuturePayloadActivation,
-	createGatewayPayloadActivation,
-} from "../src/gateway-payload-activation.js";
-import type { FutureSessionWsBridgeOptions } from "../src/session-ws-bridge.js";
-import { createFutureSessionWsBridge, SessionWsBridge } from "../src/session-ws-bridge.js";
+import { createGatewayPayloadActivation } from "../src/gateway-payload-activation.js";
+import type { SessionWsBridgeOptions } from "../src/session-ws-bridge.js";
+import { SessionWsBridge } from "../src/session-ws-bridge.js";
 
 const SERVER_EPOCH = "stage7c-epoch";
 
@@ -68,7 +64,7 @@ function futureEvent(
 	serverEpoch = SERVER_EPOCH,
 	sessionHandle = "session-a",
 	seq = 1,
-): Extract<FutureSessionWsServerMessage, { type: "event" }> {
+): Extract<SessionWsServerMessage, { type: "event" }> {
 	return {
 		type: "event",
 		serverEpoch,
@@ -84,11 +80,11 @@ function futureEvent(
 				type: "inline_json",
 				value: { nested: { type: "external_json", ref: { serverEpoch, fake: true } }, value: "ordinary" },
 			},
-		} satisfies FutureProductSessionEventDto,
+		} satisfies ProductSessionEventDto,
 	};
 }
 
-function futureSupervisor(): FutureSessionWsBridgeOptions["supervisor"] {
+function futureSupervisor(): SessionWsBridgeOptions["supervisor"] {
 	const currentRuntime = runtime();
 	return {
 		serverEpoch: SERVER_EPOCH,
@@ -143,16 +139,16 @@ function futureSupervisor(): FutureSessionWsBridgeOptions["supervisor"] {
 	};
 }
 
-function bridgeConnection(bridge: ReturnType<typeof createFutureSessionWsBridge>): {
+function bridgeConnection(bridge: SessionWsBridge): {
 	connection: { helloComplete: boolean };
 	socket: TestSocket;
-	send: (message: FutureSessionWsServerMessage) => void;
+	send: (message: SessionWsServerMessage) => void;
 } {
 	const socket = new TestSocket();
 	bridge.wss.emit("connection", socket as unknown as WebSocket, {});
 	const internals = bridge as unknown as {
 		connections: Set<{ helloComplete: boolean; ws: TestSocket }>;
-		send: (connection: { helloComplete: boolean }, message: FutureSessionWsServerMessage) => void;
+		send: (connection: { helloComplete: boolean }, message: SessionWsServerMessage) => void;
 	};
 	const connection = [...internals.connections][0];
 	if (!connection) throw new Error("Stage7C bridge did not create a connection");
@@ -163,7 +159,7 @@ function bridgeConnection(bridge: ReturnType<typeof createFutureSessionWsBridge>
 describe("Stage7C private future SessionWsBridge", () => {
 	let webDataDir: string | undefined;
 	let store: EpochContentStore | undefined;
-	let bridge: ReturnType<typeof createFutureSessionWsBridge> | undefined;
+	let bridge: SessionWsBridge | undefined;
 
 	afterEach(async () => {
 		await bridge?.close();
@@ -171,12 +167,12 @@ describe("Stage7C private future SessionWsBridge", () => {
 		if (webDataDir) await rm(webDataDir, { recursive: true, force: true });
 	});
 
-	async function createFutureBridge() {
+	async function createBridge() {
 		webDataDir = await mkdtemp(path.join(tmpdir(), "pi-web-stage7c-"));
 		store = new EpochContentStore({ webDataDir, serverEpoch: SERVER_EPOCH });
 		await store.initialize();
-		const activation = createGatewayFuturePayloadActivation(store, SERVER_EPOCH);
-		bridge = createFutureSessionWsBridge({
+		const activation = createGatewayPayloadActivation(store, SERVER_EPOCH);
+		bridge = new SessionWsBridge({
 			supervisor: futureSupervisor(),
 			serverBuild: "0.1.0-private",
 			runtime: { version: "0.84.2", adapterId: "pi-rpc", capabilities: [] },
@@ -187,40 +183,41 @@ describe("Stage7C private future SessionWsBridge", () => {
 	}
 
 	it("requires exact future context, generic externalizer, and future product provenance", async () => {
-		const { activation } = await createFutureBridge();
-		const other = createGatewayFuturePayloadActivation(store!, SERVER_EPOCH);
+		const { activation } = await createBridge();
+		const other = createGatewayPayloadActivation(store!, SERVER_EPOCH);
 		expect(activation.context).toMatchObject({
 			serverEpoch: SERVER_EPOCH,
 			payloadBudget: SESSION_PAYLOAD_BUDGET,
-			contentRefBudget: FUTURE_SESSION_CONTENT_REF_BUDGET,
+			contentRefBudget: SESSION_CONTENT_REF_BUDGET,
 		});
 		expect(activation.externalizer.context).toBe(activation.context);
-		expect(activation.externalizer.mode).toBe("future_content");
+		expect(activation.externalizer.mode).toBe("content_ref");
 		expect(activation.supervisorServices.externalizer).toBe(activation.externalizer);
-		expect(() =>
-			createFutureSessionWsBridge({
-				supervisor: futureSupervisor(),
-				serverBuild: "0.1.0-private",
-				runtime: { version: "0.84.2", adapterId: "pi-rpc", capabilities: [] },
-				payloadActivation: { ...activation, externalizer: other.externalizer },
-			}),
+		expect(
+			() =>
+				new SessionWsBridge({
+					supervisor: futureSupervisor(),
+					serverBuild: "0.1.0-private",
+					runtime: { version: "0.84.2", adapterId: "pi-rpc", capabilities: [] },
+					payloadActivation: { ...activation, externalizer: other.externalizer },
+				}),
 		).toThrow("payload activation is invalid");
 	});
 
 	it("accepts root-only nested lookalikes and the exact normalized-frame boundary", async () => {
-		const { bridge: futureBridge } = await createFutureBridge();
-		const { socket, send } = bridgeConnection(futureBridge);
+		const { bridge } = await createBridge();
+		const { socket, send } = bridgeConnection(bridge);
 		const valid = futureEvent();
 		send(valid);
 		expect(socket.sent).toHaveLength(1);
 		expect(JSON.parse(socket.sent[0]!)).toEqual(valid);
 
 		const schema = (
-			futureBridge as unknown as {
-				futureActivation: { supervisorServices: { productSchema: { maxNormalizedEventWireBytes: number } } };
+			bridge as unknown as {
+				payloadActivation: { supervisorServices: { productSchema: { maxNormalizedEventWireBytes: number } } };
 			}
-		).futureActivation.supervisorServices.productSchema;
-		const makeQueueEvent = (totalBytes: number): FutureSessionWsServerMessage => {
+		).payloadActivation.supervisorServices.productSchema;
+		const makeQueueEvent = (totalBytes: number): SessionWsServerMessage => {
 			const base = {
 				type: "event" as const,
 				serverEpoch: SERVER_EPOCH,
@@ -248,12 +245,12 @@ describe("Stage7C private future SessionWsBridge", () => {
 	});
 
 	it("fails closed for wrong epoch/session and malformed future history responses", async () => {
-		const { bridge: futureBridge } = await createFutureBridge();
-		const { socket, send } = bridgeConnection(futureBridge);
+		const { bridge } = await createBridge();
+		const { socket, send } = bridgeConnection(bridge);
 		expect(() => send(futureEvent("wrong-epoch"))).toThrow("exact context guard");
 		expect(socket.sent).toHaveLength(0);
 
-		futureBridge.broadcast(futureEvent(SERVER_EPOCH, "other-session"));
+		bridge.broadcast(futureEvent(SERVER_EPOCH, "other-session"));
 		expect(socket.sent).toHaveLength(0);
 
 		const malformed = {
@@ -279,19 +276,18 @@ describe("Stage7C private future SessionWsBridge", () => {
 					],
 				},
 			},
-		} as unknown as FutureSessionWsServerMessage;
+		} as unknown as SessionWsServerMessage;
 		expect(() => send(malformed)).toThrow("exact context guard");
 		expect(socket.sent).toHaveLength(0);
 	});
 
-	it("keeps the current 1.2 Bridge and attachment activation surface unchanged", async () => {
-		webDataDir = await mkdtemp(path.join(tmpdir(), "pi-web-stage7c-current-"));
+	it("exposes only the canonical Bridge and payload activation", async () => {
+		webDataDir = await mkdtemp(path.join(tmpdir(), "pi-web-stage7c-canonical-"));
 		store = new EpochContentStore({ webDataDir, serverEpoch: SERVER_EPOCH });
 		await store.initialize();
 		const activation = createGatewayPayloadActivation(store, SERVER_EPOCH);
-		expect(activation.externalizer.mode).toBe("attachment");
-		expect(activation.context).not.toHaveProperty("contentRefBudget");
+		expect(activation.externalizer.mode).toBe("content_ref");
+		expect(activation.context.contentRefBudget).toEqual(SESSION_CONTENT_REF_BUDGET);
 		expect(SessionWsBridge).toBeTypeOf("function");
-		expect({} as SessionWsServerMessage).toBeTypeOf("object");
 	});
 });

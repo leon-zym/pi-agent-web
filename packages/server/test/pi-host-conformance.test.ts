@@ -5,8 +5,8 @@ import type {
 	RpcResponse,
 } from "@earendil-works/pi-coding-agent";
 import type {
-	ExtensionUiRequestDto,
-	ProductSessionEventDto,
+	PiExtensionUiRequestDto,
+	PiProductSessionEventDto,
 	SessionCommandTypeDto,
 } from "@pi-agent-web/protocol";
 import { describe, expect, it } from "vitest";
@@ -15,7 +15,7 @@ import { PI_RPC_ADAPTER_ID, piRpcAdapter } from "../src/pi-rpc-adapter.js";
 type IsSubset<Subset, Superset> = [Subset] extends [Superset] ? true : false;
 type Assert<Condition extends true> = Condition;
 type UpstreamSuccessResponseCommand = Exclude<RpcResponse, { success: false }>["command"];
-type ProductAuthoritativeEventType = Exclude<ProductSessionEventDto, { type: "extension_error" }>["type"];
+type ProductAuthoritativeEventType = Exclude<PiProductSessionEventDto, { type: "extension_error" }>["type"];
 
 // These aliases are intentionally type-only. A Pi package upgrade fails this test at the
 // adapter boundary if a product command/event/method disappears from the reviewed upstream wire.
@@ -27,7 +27,7 @@ type _ProductEventsRemainUpstream = Assert<
 	IsSubset<ProductAuthoritativeEventType, JsonAgentSessionEvent["type"]>
 >;
 type _ProductExtensionMethodsRemainUpstream = Assert<
-	IsSubset<ExtensionUiRequestDto["method"], RpcExtensionUIRequest["method"]>
+	IsSubset<PiExtensionUiRequestDto["method"], RpcExtensionUIRequest["method"]>
 >;
 
 const UPSTREAM_CONFORMANCE: readonly [

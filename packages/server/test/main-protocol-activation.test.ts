@@ -2,18 +2,17 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
-	FUTURE_SESSION_CONTENT_REF_BUDGET,
-	GATEWAY_CONTENT_REF_PROTOCOL_MINOR,
 	GATEWAY_PROTOCOL_VERSION,
 	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
-	isGatewayContentRefServerHello,
+	isGatewayServerHello,
+	SESSION_CONTENT_REF_BUDGET,
 	SESSION_PAYLOAD_BUDGET,
 } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import { startServer } from "../src/main.js";
 
-const fixturePath = path.join(import.meta.dirname, "fixtures", "future-payload-pi.mjs");
+const fixturePath = path.join(import.meta.dirname, "fixtures", "content-reference-pi.mjs");
 const temporaryRoots: string[] = [];
 
 afterEach(async () => {
@@ -21,7 +20,7 @@ afterEach(async () => {
 });
 
 describe("production protocol 1.3 Main activation", () => {
-	it("uses one future payload activation for the default server and rejects legacy hello", async () => {
+	it("uses one canonical payload activation and rejects protocol 1.2", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-web-main-future-"));
 		temporaryRoots.push(root);
 		const handle = await startServer({
@@ -61,19 +60,19 @@ describe("production protocol 1.3 Main activation", () => {
 				ws.send(
 					JSON.stringify({
 						type: "client_hello",
-						protocol: { major: GATEWAY_PROTOCOL_VERSION.major, minor: GATEWAY_CONTENT_REF_PROTOCOL_MINOR },
-						clientBuild: "main-future-activation-test",
+						protocol: GATEWAY_PROTOCOL_VERSION,
+						clientBuild: "main-protocol-activation-test",
 						capabilities: [...GATEWAY_SERVER_REQUIRED_CAPABILITIES],
 						limits: { maxServerFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes },
 					}),
 				);
 				const value = await hello;
-				expect(isGatewayContentRefServerHello(value)).toBe(true);
-				if (!isGatewayContentRefServerHello(value)) throw new Error("Gateway did not activate protocol 1.3");
+				expect(isGatewayServerHello(value)).toBe(true);
+				if (!isGatewayServerHello(value)) throw new Error("Gateway did not activate protocol 1.3");
 				expect(value.protocol).toEqual({ major: 1, minor: 3 });
 				expect(value.capabilities).toEqual(expect.arrayContaining([...GATEWAY_SERVER_REQUIRED_CAPABILITIES]));
 				expect(value.payloadBudget).toEqual(SESSION_PAYLOAD_BUDGET);
-				expect(value.contentRefBudget).toEqual(FUTURE_SESSION_CONTENT_REF_BUDGET);
+				expect(value.contentRefBudget).toEqual(SESSION_CONTENT_REF_BUDGET);
 				expect(handle.contentStore.usage).toEqual({ bytes: 0, items: 0 });
 			} finally {
 				ws.close();
@@ -112,7 +111,7 @@ describe("production protocol 1.3 Main activation", () => {
 				);
 				expect(await legacyFrame).toMatchObject({
 					type: "protocol_error",
-					code: "capability_unsupported",
+					code: "invalid_hello",
 				});
 			} finally {
 				legacyWs.close();

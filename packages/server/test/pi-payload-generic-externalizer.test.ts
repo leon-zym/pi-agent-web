@@ -3,8 +3,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
-	FUTURE_SESSION_CONTENT_REF_BUDGET,
 	SESSION_CONTENT_INLINE_THRESHOLD_BYTES,
+	SESSION_CONTENT_REF_BUDGET,
 	SESSION_PAYLOAD_BUDGET,
 	type SessionContentRefDto,
 } from "@pi-agent-web/protocol";
@@ -33,7 +33,7 @@ function options(store: EpochContentStore) {
 		contentStore: store,
 		serverEpoch: EPOCH,
 		payloadBudget: SESSION_PAYLOAD_BUDGET,
-		genericContent: { contentRefBudget: FUTURE_SESSION_CONTENT_REF_BUDGET },
+		genericContent: { contentRefBudget: SESSION_CONTENT_REF_BUDGET },
 	};
 }
 
@@ -185,7 +185,7 @@ describe("Pi payload generic content externalizer", () => {
 			widgetLines: [wideLine],
 		} as const;
 		expect(Buffer.byteLength(JSON.stringify(request.widgetLines))).toBeLessThan(
-			FUTURE_SESSION_CONTENT_REF_BUDGET.maxContentBlobBytes,
+			SESSION_CONTENT_REF_BUDGET.maxContentBlobBytes,
 		);
 		expect(Buffer.byteLength(JSON.stringify(request.widgetLines))).toBeGreaterThanOrEqual(
 			SESSION_CONTENT_INLINE_THRESHOLD_BYTES,
@@ -296,7 +296,7 @@ describe("Pi payload generic content externalizer", () => {
 					...options(store),
 					genericContent: {
 						contentRefBudget: {
-							...FUTURE_SESSION_CONTENT_REF_BUDGET,
+							...SESSION_CONTENT_REF_BUDGET,
 							inlineContentThresholdBytes: SESSION_CONTENT_INLINE_THRESHOLD_BYTES - 1,
 						},
 					},
@@ -549,7 +549,7 @@ describe("Pi payload generic content externalizer", () => {
 					...options(store),
 					genericContent: {
 						contentRefBudget: {
-							...FUTURE_SESSION_CONTENT_REF_BUDGET,
+							...SESSION_CONTENT_REF_BUDGET,
 							maxContentBlobBytes: limit,
 						},
 					},
@@ -700,7 +700,7 @@ describe("Pi payload generic content externalizer", () => {
 		);
 		expect(productGuard).toHaveBeenCalledWith(
 			accepted.value,
-			expect.objectContaining({ contentRefBudget: FUTURE_SESSION_CONTENT_REF_BUDGET }),
+			expect.objectContaining({ contentRefBudget: SESSION_CONTENT_REF_BUDGET }),
 			expect.objectContaining({ kind: "event" }),
 		);
 		await accepted.lease.release();

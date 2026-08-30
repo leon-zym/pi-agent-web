@@ -5,44 +5,37 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type {
-	FutureProductSessionEventDto,
-	FutureSessionWsServerMessage,
+	ProductSessionEventDto,
 	SessionCommandDto,
 	SessionContentRefDto,
 	SessionRuntimeDto,
+	SessionWsServerMessage,
 } from "@pi-agent-web/protocol";
-import {
-	GATEWAY_PROTOCOL_VERSION,
-	SESSION_CONTENT_INLINE_THRESHOLD_BYTES,
-	SESSION_PAYLOAD_BUDGET,
-} from "@pi-agent-web/protocol";
+import { GATEWAY_PROTOCOL_VERSION, SESSION_CONTENT_INLINE_THRESHOLD_BYTES } from "@pi-agent-web/protocol";
 import { Hono } from "hono";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import { createGatewayAccessControl } from "../src/access-control.js";
 import { createContentRoutes } from "../src/content-routes.js";
 import { EpochContentStore } from "../src/epoch-content-store.js";
-import {
-	createGatewayFuturePayloadActivation,
-	createGatewayPayloadActivation,
-} from "../src/gateway-payload-activation.js";
+import { createGatewayPayloadActivation } from "../src/gateway-payload-activation.js";
 import { canonicalizeSessionFile, sessionHandleForFile } from "../src/native-session-catalog.js";
 import { piRpcAdapter } from "../src/pi-rpc-adapter.js";
 import type { ExistingSessionTarget } from "../src/session-runtime-types.js";
-import { createFutureSessionSupervisor } from "../src/session-supervisor.js";
-import { createFutureSessionWsBridge } from "../src/session-ws-bridge.js";
+import { SessionSupervisor } from "../src/session-supervisor.js";
+import { SessionWsBridge } from "../src/session-ws-bridge.js";
 
-const fixturePath = path.join(import.meta.dirname, "fixtures", "future-payload-pi.mjs");
+const fixturePath = path.join(import.meta.dirname, "fixtures", "content-reference-pi.mjs");
 const SERVER_EPOCH = "future-l3-epoch";
 const LARGE_MARKER = "future-l3-large-marker";
 const TEST_ORIGIN = "http://127.0.0.1:31415";
 const TEST_SECRET = "future-l3-test-secret";
 
-type FutureBridge = ReturnType<typeof createFutureSessionWsBridge>;
-type FutureFrame = FutureSessionWsServerMessage;
-type EventFrame = Extract<FutureFrame, { type: "event" }>;
-type ResponseFrame = Extract<FutureFrame, { type: "response" }>;
-type LeaseFrame = Extract<FutureFrame, { type: "lease_status" }>;
+type CanonicalBridge = SessionWsBridge;
+type CanonicalFrame = SessionWsServerMessage;
+type EventFrame = Extract<CanonicalFrame, { type: "event" }>;
+type ResponseFrame = Extract<CanonicalFrame, { type: "response" }>;
+type LeaseFrame = Extract<CanonicalFrame, { type: "lease_status" }>;
 
 class TestSocket extends EventEmitter {
 	readonly OPEN = WebSocket.OPEN;
@@ -69,19 +62,19 @@ class TestSocket extends EventEmitter {
 interface BridgeConnection {
 	connection: { connectionId: string; helloComplete: boolean };
 	socket: TestSocket;
-	send: (message: FutureFrame) => void;
+	send: (message: CanonicalFrame) => void;
 }
 
-interface FutureHarness {
+interface CanonicalHarness {
 	root: string;
 	target: ExistingSessionTarget;
 	store: EpochContentStore;
-	activation: ReturnType<typeof createGatewayFuturePayloadActivation>;
-	supervisor: ReturnType<typeof createFutureSessionSupervisor>;
-	bridge: FutureBridge;
+	activation: ReturnType<typeof createGatewayPayloadActivation>;
+	supervisor: SessionSupervisor;
+	bridge: CanonicalBridge;
 }
 
-const harnesses: FutureHarness[] = [];
+const harnesses: CanonicalHarness[] = [];
 
 function largeText(label: string): string {
 	const prefix = `${LARGE_MARKER}:${label}:`;
@@ -121,8 +114,8 @@ function expectedToolResultRefs(label: string): SessionContentRefDto[] {
 	return [expectedTextRef(`${label}-content`), expectedJsonRef(`${label}-details`)];
 }
 
-function parseFrames(socket: TestSocket): FutureFrame[] {
-	return socket.sent.map((payload) => JSON.parse(payload) as FutureFrame);
+function parseFrames(socket: TestSocket): CanonicalFrame[] {
+	return socket.sent.map((payload) => JSON.parse(payload) as CanonicalFrame);
 }
 
 function refsIn(value: unknown): SessionContentRefDto[] {
@@ -140,7 +133,7 @@ function refsIn(value: unknown): SessionContentRefDto[] {
 	return refs;
 }
 
-function eventFrames(frames: readonly FutureFrame[]): EventFrame[] {
+function eventFrames(frames: readonly CanonicalFrame[]): EventFrame[] {
 	return frames.filter((frame): frame is EventFrame => frame.type === "event");
 }
 
@@ -171,16 +164,16 @@ async function eventually<T>(read: () => T | undefined, timeoutMs = 10_000): Pro
 	throw new Error("condition did not settle before timeout");
 }
 
-async function waitForFrame<T extends FutureFrame>(
+async function waitForFrame<T extends CanonicalFrame>(
 	socket: TestSocket,
-	predicate: (frame: FutureFrame) => frame is T,
+	predicate: (frame: CanonicalFrame) => frame is T,
 	from: number,
 ): Promise<T> {
 	return eventually(() => parseFrames(socket).slice(from).find(predicate));
 }
 
 async function waitForRuntime(
-	harness: FutureHarness,
+	harness: CanonicalHarness,
 	predicate: (runtime: SessionRuntimeDto | undefined) => boolean,
 ): Promise<SessionRuntimeDto> {
 	return eventually(() => {
@@ -189,12 +182,12 @@ async function waitForRuntime(
 	});
 }
 
-function connectFutureBridge(bridge: FutureBridge): BridgeConnection {
+function connectCanonicalBridge(bridge: CanonicalBridge): BridgeConnection {
 	const socket = new TestSocket();
 	bridge.wss.emit("connection", socket as unknown as WebSocket, {});
 	const internals = bridge as unknown as {
 		connections: Set<{ connectionId: string; helloComplete: boolean; ws: TestSocket }>;
-		send: (connection: { connectionId: string; helloComplete: boolean }, message: FutureFrame) => void;
+		send: (connection: { connectionId: string; helloComplete: boolean }, message: CanonicalFrame) => void;
 	};
 	const connection = [...internals.connections].find((candidate) => candidate.ws === socket);
 	if (!connection) throw new Error("future bridge did not create a connection");
@@ -210,12 +203,12 @@ async function subscribe(
 	socket: TestSocket,
 	sessionHandle: string,
 	cursor?: { serverEpoch: string; generation: number; seq: number },
-): Promise<{ runtime: SessionRuntimeDto; frames: FutureFrame[] }> {
+): Promise<{ runtime: SessionRuntimeDto; frames: CanonicalFrame[] }> {
 	const from = socket.sent.length;
 	sendClient(socket, { type: "session_subscribe", sessionHandle, ...(cursor ? { cursor } : {}) });
 	const runtimeFrame = await waitForFrame(
 		socket,
-		(frame): frame is Extract<FutureFrame, { type: "runtime_state" }> => frame.type === "runtime_state",
+		(frame): frame is Extract<CanonicalFrame, { type: "runtime_state" }> => frame.type === "runtime_state",
 		from,
 	);
 	await waitForFrame(socket, (frame): frame is LeaseFrame => frame.type === "lease_status", from);
@@ -311,7 +304,7 @@ function createContentApp(store: EpochContentStore): {
 
 async function createHarness(
 	options: { maxCacheItems?: number; smallHistory?: boolean } = {},
-): Promise<FutureHarness> {
+): Promise<CanonicalHarness> {
 	const root = await mkdtemp(path.join(tmpdir(), "pi-web-future-l3-"));
 	const target = createTarget(root);
 	const store = new EpochContentStore({
@@ -320,9 +313,9 @@ async function createHarness(
 		...(options.maxCacheItems === undefined ? {} : { limits: { maxCacheItems: options.maxCacheItems } }),
 	});
 	await store.initialize();
-	const activation = createGatewayFuturePayloadActivation(store, SERVER_EPOCH);
-	let bridge: FutureBridge | undefined;
-	const supervisor = createFutureSessionSupervisor({
+	const activation = createGatewayPayloadActivation(store, SERVER_EPOCH);
+	let bridge: CanonicalBridge | undefined;
+	const supervisor = new SessionSupervisor({
 		serverEpoch: SERVER_EPOCH,
 		resolved: {
 			command: process.execPath,
@@ -343,7 +336,7 @@ async function createHarness(
 		readyTimeoutMs: 2_000,
 		maxAutoRestarts: 0,
 	});
-	bridge = createFutureSessionWsBridge({
+	bridge = new SessionWsBridge({
 		supervisor,
 		serverBuild: "0.1.0-private",
 		runtime: {
@@ -383,11 +376,11 @@ afterEach(async () => {
 describe("private future payload Gateway vertical integration", () => {
 	it("externalizes large tool/history/extension roots across live, replay, snapshot, and authenticated GET", async () => {
 		const harness = await createHarness();
-		const client = connectFutureBridge(harness.bridge);
+		const client = connectCanonicalBridge(harness.bridge);
 		const initial = await subscribe(client.socket, harness.target.sessionHandle);
 		const lease = await claim(client.socket, harness.target.sessionHandle);
 		const initialSnapshot = initial.frames.find(
-			(frame): frame is Extract<FutureFrame, { type: "session_snapshot" }> =>
+			(frame): frame is Extract<CanonicalFrame, { type: "session_snapshot" }> =>
 				frame.type === "session_snapshot",
 		);
 		expect(initialSnapshot).toBeDefined();
@@ -524,7 +517,7 @@ describe("private future payload Gateway vertical integration", () => {
 		expectRefs(historyResponses[1], expectedToolResultRefs("history-get-entries"));
 		expectRefs(historyResponses[2], expectedToolResultRefs("history-get-tree"));
 
-		const replayClient = connectFutureBridge(harness.bridge);
+		const replayClient = connectCanonicalBridge(harness.bridge);
 		const replay = await subscribe(replayClient.socket, harness.target.sessionHandle, {
 			serverEpoch: SERVER_EPOCH,
 			generation: initial.runtime.generation,
@@ -536,10 +529,10 @@ describe("private future payload Gateway vertical integration", () => {
 		expectRefs(replay.frames, [...toolExpected, ...extensionExpected]);
 		expectNoLargeMarker(replay.frames);
 
-		const snapshotClient = connectFutureBridge(harness.bridge);
+		const snapshotClient = connectCanonicalBridge(harness.bridge);
 		const snapshot = await subscribe(snapshotClient.socket, harness.target.sessionHandle);
 		const currentSnapshot = snapshot.frames.find(
-			(frame): frame is Extract<FutureFrame, { type: "session_snapshot" }> =>
+			(frame): frame is Extract<CanonicalFrame, { type: "session_snapshot" }> =>
 				frame.type === "session_snapshot",
 		);
 		if (!currentSnapshot) throw new Error("future snapshot was not emitted");
@@ -620,7 +613,7 @@ describe("private future payload Gateway vertical integration", () => {
 
 	it("fails closed at the adopted store cache boundary and releases the surviving generation hold", async () => {
 		const harness = await createHarness({ maxCacheItems: 1, smallHistory: true });
-		const client = connectFutureBridge(harness.bridge);
+		const client = connectCanonicalBridge(harness.bridge);
 		const initial = await subscribe(client.socket, harness.target.sessionHandle);
 		const lease = await claim(client.socket, harness.target.sessionHandle);
 		const start = client.socket.sent.length;
@@ -632,7 +625,7 @@ describe("private future payload Gateway vertical integration", () => {
 		expect(response.response).toMatchObject({ id: "cache-boundary", command: "prompt", success: true });
 		const firstEditor = await waitForFrame(
 			client.socket,
-			(frame): frame is Extract<FutureFrame, { type: "extension_ui_request" }> =>
+			(frame): frame is Extract<CanonicalFrame, { type: "extension_ui_request" }> =>
 				frame.type === "extension_ui_request" && frame.request.method === "editor",
 			start,
 		);
@@ -651,29 +644,30 @@ describe("private future payload Gateway vertical integration", () => {
 		expect(harness.store.usage).toEqual({ bytes: 0, items: 0 });
 	});
 
-	it("keeps the current activation separate and rejects wrong future context and product provenance", async () => {
+	it("rejects wrong canonical context and product provenance", async () => {
 		const harness = await createHarness({ smallHistory: true });
-		const client = connectFutureBridge(harness.bridge);
+		const client = connectCanonicalBridge(harness.bridge);
 		const valid = futureQueueEvent(harness.target.sessionHandle);
 		const sentBefore = client.socket.sent.length;
 		expect(() => client.send({ ...valid, serverEpoch: "foreign-epoch" })).toThrow("exact context guard");
 		expect(client.socket.sent).toHaveLength(sentBefore);
 
 		const foreignContext = { ...harness.activation.context, serverEpoch: "foreign-epoch" };
-		expect(() =>
-			createFutureSessionWsBridge({
-				supervisor: harness.supervisor,
-				serverBuild: "0.1.0-private",
-				runtime: { version: "0.84.2", adapterId: "pi-rpc", capabilities: [] },
-				payloadActivation: { ...harness.activation, context: foreignContext },
-			}),
+		expect(
+			() =>
+				new SessionWsBridge({
+					supervisor: harness.supervisor,
+					serverBuild: "0.1.0-private",
+					runtime: { version: "0.84.2", adapterId: "pi-rpc", capabilities: [] },
+					payloadActivation: { ...harness.activation, context: foreignContext },
+				}),
 		).toThrow("payload activation is invalid");
 
 		const badProductSchema = {
 			...harness.activation.supervisorServices.productSchema,
-			guardEvent: (_value: unknown): _value is FutureProductSessionEventDto => false,
+			guardEvent: (_value: unknown): _value is ProductSessionEventDto => false,
 		};
-		const badBridge = createFutureSessionWsBridge({
+		const badBridge = new SessionWsBridge({
 			supervisor: harness.supervisor,
 			serverBuild: "0.1.0-private",
 			runtime: { version: "0.84.2", adapterId: "pi-rpc", capabilities: [] },
@@ -685,18 +679,11 @@ describe("private future payload Gateway vertical integration", () => {
 				},
 			},
 		});
-		const badClient = connectFutureBridge(badBridge);
+		const badClient = connectCanonicalBridge(badBridge);
 		expect(() => badClient.send(valid)).toThrow("product provenance");
 		expect(badClient.socket.sent).toHaveLength(0);
 		await badBridge.close();
 
-		const current = createGatewayPayloadActivation(harness.store, SERVER_EPOCH);
-		expect(current.externalizer.mode).toBe("attachment");
-		expect(current.context).toEqual({
-			serverEpoch: SERVER_EPOCH,
-			payloadBudget: SESSION_PAYLOAD_BUDGET,
-		});
 		expect(GATEWAY_PROTOCOL_VERSION).toEqual({ major: 1, minor: 3 });
-		expect("contentRefBudget" in current.context).toBe(false);
 	});
 });

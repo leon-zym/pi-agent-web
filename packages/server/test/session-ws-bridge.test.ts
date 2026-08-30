@@ -13,6 +13,7 @@ import type {
 	SessionWsServerMessage,
 } from "@pi-agent-web/protocol";
 import {
+	GATEWAY_CONTENT_REF_CAPABILITY,
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 	GATEWAY_SESSION_HISTORY_CAPABILITY,
@@ -39,6 +40,7 @@ import {
 	SessionWsBridge,
 	type SessionWsBridgeOptions,
 } from "../src/session-ws-bridge.js";
+import { createCanonicalPayloadFixture } from "./helpers/canonical-payload.js";
 
 const fixturePath = path.join(import.meta.dirname, "fixtures", "session-runtime-pi.mjs");
 const TEST_SERVER_EPOCH = "session-ws-bridge-test-epoch";
@@ -280,8 +282,8 @@ function ordinaryLargeEvent(textBytes: number, seq = 1): Extract<SessionWsServer
 			type: "tool_execution_update",
 			toolCallId: "ordinary-large-tool",
 			toolName: "large-result",
-			args: {},
-			partialResult: "x".repeat(textBytes),
+			args: { type: "inline_json", value: {} },
+			partialResult: { type: "inline_json", value: { text: "x".repeat(textBytes) } },
 		},
 	};
 }
@@ -364,6 +366,7 @@ async function createHarness(
 ): Promise<Harness> {
 	const connectionEvents: string[] = [];
 	const targetMap = new Map(targets.map((target) => [target.sessionHandle, target]));
+	const payloadActivation = createCanonicalPayloadFixture(options.serverEpoch ?? TEST_SERVER_EPOCH);
 	let bridge: SessionWsBridge;
 	const supervisor = new SessionSupervisor({
 		serverEpoch: options.serverEpoch ?? TEST_SERVER_EPOCH,
@@ -387,6 +390,7 @@ async function createHarness(
 		maxAutoRestarts: options.maxAutoRestarts,
 		readyTimeoutMs: 2_000,
 		idleTtlMs: 60_000,
+		piPayloadServices: payloadActivation.supervisorServices,
 	});
 	bridge = new SessionWsBridge({
 		supervisor,
@@ -400,15 +404,12 @@ async function createHarness(
 				"rpc.extension_ui",
 				"session.multiplex",
 				GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+				GATEWAY_CONTENT_REF_CAPABILITY,
 				...(options.historyCapability ? [GATEWAY_SESSION_HISTORY_CAPABILITY] : []),
 			],
 		},
-		payloadActivation: {
-			context: {
-				serverEpoch: options.serverEpoch ?? TEST_SERVER_EPOCH,
-				payloadBudget: SESSION_PAYLOAD_BUDGET,
-			},
-		},
+		payloadActivation,
 		heartbeatIntervalMs: 60_000,
 		log: (_level, message) => connectionEvents.push(message),
 		...(options.bridge ?? {}),
@@ -459,14 +460,16 @@ async function openClient(
 	ws.send(
 		JSON.stringify({
 			type: "client_hello",
-			protocol: { major: 1, minor: 2 },
+			protocol: { major: 1, minor: 3 },
 			clientBuild: "0.1.0-test",
 			capabilities: [
 				"rpc.commands",
 				"rpc.events",
 				"rpc.extension_ui",
 				"session.multiplex",
+				GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+				GATEWAY_CONTENT_REF_CAPABILITY,
 				...(options.historyCapability ? [GATEWAY_SESSION_HISTORY_CAPABILITY] : []),
 			],
 			limits: { maxServerFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes },
@@ -496,7 +499,7 @@ async function openInventoryClient(
 	ws.send(
 		JSON.stringify({
 			type: "client_hello",
-			protocol: { major: 1, minor: overrides.minor ?? 2 },
+			protocol: { major: 1, minor: overrides.minor ?? 3 },
 			clientBuild: "0.1.0-inventory-test",
 			capabilities: [
 				"rpc.commands",
@@ -504,6 +507,7 @@ async function openInventoryClient(
 				"rpc.extension_ui",
 				"session.multiplex",
 				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+				GATEWAY_CONTENT_REF_CAPABILITY,
 				...(overrides.capability === false ? [] : [GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY]),
 			],
 			limits: {
@@ -1492,7 +1496,7 @@ describe("SessionWsBridge", () => {
 		expect(frames.slice(0, 2).map((frame) => frame.type)).toEqual(["server_hello", "hot_runtime_inventory"]);
 		expect(frames[0]).toMatchObject({
 			type: "server_hello",
-			protocol: { major: 1, minor: 2 },
+			protocol: { major: 1, minor: 3 },
 			capabilities: expect.arrayContaining([GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY]),
 		});
 		expect(inventory).toMatchObject({

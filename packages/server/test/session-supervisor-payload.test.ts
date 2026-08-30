@@ -2,8 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type {
-	FutureExtensionUiRequestDto,
-	FutureProductSessionEventDto,
+	ExtensionUiRequestDto,
+	ProductSessionEventDto,
 	SessionContentRefDto,
 } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it } from "vitest";
@@ -12,9 +12,9 @@ import {
 	EpochContentStore,
 	type EpochStoredContentRef,
 } from "../src/epoch-content-store.js";
-import { createGatewayFuturePayloadActivation } from "../src/gateway-payload-activation.js";
+import { createGatewayPayloadActivation } from "../src/gateway-payload-activation.js";
 import { canonicalizeSessionFile, sessionHandleForFile } from "../src/native-session-catalog.js";
-import type { PiHostFuturePayloadExternalizer } from "../src/pi-host-adapter.js";
+import type { PiHostPayloadExternalizer } from "../src/pi-host-adapter.js";
 import type {
 	PiPayloadExternalizerInput,
 	PiPayloadLease,
@@ -23,15 +23,12 @@ import type {
 import { piRpcAdapter } from "../src/pi-rpc-adapter.js";
 import type { SessionLiveProjectionLimits } from "../src/session-live-projection.js";
 import { SessionLiveProjection } from "../src/session-live-projection.js";
-import type { FutureSessionRuntimePiPayloadServices } from "../src/session-runtime.js";
+import type { SessionRuntimePiPayloadServices } from "../src/session-runtime.js";
 import type { ExistingSessionTarget, SessionSupervisorMessage } from "../src/session-runtime-types.js";
-import { createFutureSessionSupervisor } from "../src/session-supervisor.js";
+import { SessionSupervisor } from "../src/session-supervisor.js";
 
 const fixturePath = path.join(import.meta.dirname, "fixtures", "session-runtime-pi.mjs");
-type FutureSupervisorMessage = SessionSupervisorMessage<
-	FutureProductSessionEventDto,
-	FutureExtensionUiRequestDto
->;
+type CanonicalSupervisorMessage = SessionSupervisorMessage<ProductSessionEventDto, ExtensionUiRequestDto>;
 
 function createTarget(root: string): ExistingSessionTarget {
 	const cwd = path.join(root, "workspace");
@@ -68,10 +65,10 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<voi
 	throw new Error("condition did not settle before timeout");
 }
 
-function createFutureSupervisorFixture(
+function createSupervisorFixture(
 	target: ExistingSessionTarget,
-	piPayloadServices: FutureSessionRuntimePiPayloadServices,
-	messages: FutureSupervisorMessage[],
+	piPayloadServices: SessionRuntimePiPayloadServices,
+	messages: CanonicalSupervisorMessage[],
 	projectionLimits?: Partial<SessionLiveProjectionLimits>,
 	maxAutoRestarts = 0,
 	env?: Record<string, string>,
@@ -82,7 +79,7 @@ function createFutureSupervisorFixture(
 		transientBufferMaxBytes?: number;
 	},
 ) {
-	return createFutureSessionSupervisor({
+	return new SessionSupervisor({
 		serverEpoch: "future-epoch",
 		resolved: {
 			command: process.execPath,
@@ -167,11 +164,11 @@ function instrumentExtensionLease(
 }
 
 function instrumentExtensionExternalizer(
-	base: PiHostFuturePayloadExternalizer,
+	base: PiHostPayloadExternalizer,
 	counters: ExtensionLeaseCounters,
 	forgeRequestRef = false,
 	beforeTransfer?: () => void,
-): PiHostFuturePayloadExternalizer {
+): PiHostPayloadExternalizer {
 	return Object.freeze({
 		...base,
 		async externalize(input: PiPayloadExternalizerInput, signal: AbortSignal) {
@@ -199,9 +196,9 @@ function instrumentExtensionExternalizer(
 }
 
 function logicalPairExtensionExternalizer(
-	base: PiHostFuturePayloadExternalizer,
+	base: PiHostPayloadExternalizer,
 	counters: ExtensionLeaseCounters,
-): PiHostFuturePayloadExternalizer {
+): PiHostPayloadExternalizer {
 	return Object.freeze({
 		...base,
 		async externalize(input: PiPayloadExternalizerInput, signal: AbortSignal) {
@@ -252,8 +249,8 @@ function logicalPairExtensionExternalizer(
 }
 
 function isEventMessage(
-	message: FutureSupervisorMessage,
-): message is Extract<FutureSupervisorMessage, { type: "event" }> {
+	message: CanonicalSupervisorMessage,
+): message is Extract<CanonicalSupervisorMessage, { type: "event" }> {
 	return message.type === "event";
 }
 
@@ -328,9 +325,9 @@ describe("future Session Supervisor payload mode", () => {
 		const target = createTarget(root);
 		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
 		await store.initialize();
-		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
-		const messages: FutureSupervisorMessage[] = [];
-		const supervisor = createFutureSupervisorFixture(target, activation.supervisorServices, messages);
+		const activation = createGatewayPayloadActivation(store, "future-epoch");
+		const messages: CanonicalSupervisorMessage[] = [];
+		const supervisor = createSupervisorFixture(target, activation.supervisorServices, messages);
 		stop = () => supervisor.stopAll();
 
 		const lease = await supervisor.claim(target.sessionHandle, "future-controller");
@@ -378,19 +375,19 @@ describe("future Session Supervisor payload mode", () => {
 		const target = createTarget(root);
 		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
 		await store.initialize();
-		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const activation = createGatewayPayloadActivation(store, "future-epoch");
 		const counters: ExtensionLeaseCounters = {
 			transfer: 0,
 			adopt: 0,
 			transferRelease: 0,
 			leaseRelease: 0,
 		};
-		const services: FutureSessionRuntimePiPayloadServices = Object.freeze({
+		const services: SessionRuntimePiPayloadServices = Object.freeze({
 			...activation.supervisorServices,
 			externalizer: instrumentExtensionExternalizer(activation.externalizer, counters, true),
 		});
-		const messages: FutureSupervisorMessage[] = [];
-		const supervisor = createFutureSupervisorFixture(target, services, messages);
+		const messages: CanonicalSupervisorMessage[] = [];
+		const supervisor = createSupervisorFixture(target, services, messages);
 		stop = () => supervisor.stopAll();
 
 		const lease = await supervisor.claim(target.sessionHandle, "future-controller");
@@ -416,7 +413,7 @@ describe("future Session Supervisor payload mode", () => {
 		const target = createTarget(root);
 		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
 		await store.initialize();
-		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const activation = createGatewayPayloadActivation(store, "future-epoch");
 		const counters: ExtensionLeaseCounters = {
 			transfer: 0,
 			adopt: 0,
@@ -424,7 +421,7 @@ describe("future Session Supervisor payload mode", () => {
 			leaseRelease: 0,
 		};
 		const released: EpochStoredContentRef[] = [];
-		const services: FutureSessionRuntimePiPayloadServices = Object.freeze({
+		const services: SessionRuntimePiPayloadServices = Object.freeze({
 			...activation.supervisorServices,
 			externalizer: instrumentExtensionExternalizer(activation.externalizer, counters),
 			async releaseHold(hold: EpochContentHold<EpochStoredContentRef>) {
@@ -432,8 +429,8 @@ describe("future Session Supervisor payload mode", () => {
 				await activation.supervisorServices.releaseHold(hold);
 			},
 		});
-		const messages: FutureSupervisorMessage[] = [];
-		const supervisor = createFutureSupervisorFixture(target, services, messages, undefined, 3);
+		const messages: CanonicalSupervisorMessage[] = [];
+		const supervisor = createSupervisorFixture(target, services, messages, undefined, 3);
 		stop = () => supervisor.stopAll();
 
 		const lease = await supervisor.claim(target.sessionHandle, "future-controller");
@@ -488,7 +485,7 @@ describe("future Session Supervisor payload mode", () => {
 		const target = createTarget(root);
 		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
 		await store.initialize();
-		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const activation = createGatewayPayloadActivation(store, "future-epoch");
 		const counters: ExtensionLeaseCounters = {
 			transfer: 0,
 			adopt: 0,
@@ -496,7 +493,7 @@ describe("future Session Supervisor payload mode", () => {
 			leaseRelease: 0,
 		};
 		const released: EpochStoredContentRef[] = [];
-		const services: FutureSessionRuntimePiPayloadServices = Object.freeze({
+		const services: SessionRuntimePiPayloadServices = Object.freeze({
 			...activation.supervisorServices,
 			externalizer: instrumentExtensionExternalizer(activation.externalizer, counters),
 			async releaseHold(hold: EpochContentHold<EpochStoredContentRef>) {
@@ -504,8 +501,8 @@ describe("future Session Supervisor payload mode", () => {
 				await activation.supervisorServices.releaseHold(hold);
 			},
 		});
-		const messages: FutureSupervisorMessage[] = [];
-		const supervisor = createFutureSupervisorFixture(target, services, messages);
+		const messages: CanonicalSupervisorMessage[] = [];
+		const supervisor = createSupervisorFixture(target, services, messages);
 		stop = () => supervisor.stopAll();
 
 		const lease = await supervisor.claim(target.sessionHandle, "future-controller");
@@ -556,9 +553,9 @@ describe("future Session Supervisor payload mode", () => {
 		const target = createTarget(root);
 		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
 		await store.initialize();
-		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
-		const messages: FutureSupervisorMessage[] = [];
-		const supervisor = createFutureSupervisorFixture(
+		const activation = createGatewayPayloadActivation(store, "future-epoch");
+		const messages: CanonicalSupervisorMessage[] = [];
+		const supervisor = createSupervisorFixture(
 			target,
 			activation.supervisorServices,
 			messages,
@@ -616,7 +613,7 @@ describe("future Session Supervisor payload mode", () => {
 		const target = createTarget(root);
 		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
 		await store.initialize();
-		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const activation = createGatewayPayloadActivation(store, "future-epoch");
 		const counters: ExtensionLeaseCounters = {
 			transfer: 0,
 			adopt: 0,
@@ -624,14 +621,14 @@ describe("future Session Supervisor payload mode", () => {
 			leaseRelease: 0,
 		};
 		let beforeTransfer = () => {};
-		const services: FutureSessionRuntimePiPayloadServices = Object.freeze({
+		const services: SessionRuntimePiPayloadServices = Object.freeze({
 			...activation.supervisorServices,
 			externalizer: instrumentExtensionExternalizer(activation.externalizer, counters, false, () =>
 				beforeTransfer(),
 			),
 		});
-		const messages: FutureSupervisorMessage[] = [];
-		const supervisor = createFutureSupervisorFixture(target, services, messages, undefined, 3);
+		const messages: CanonicalSupervisorMessage[] = [];
+		const supervisor = createSupervisorFixture(target, services, messages, undefined, 3);
 		stop = () => supervisor.stopAll();
 
 		const lease = await supervisor.claim(target.sessionHandle, "future-controller");
@@ -709,19 +706,19 @@ describe("future Session Supervisor payload mode", () => {
 		const target = createTarget(root);
 		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
 		await store.initialize();
-		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const activation = createGatewayPayloadActivation(store, "future-epoch");
 		const counters: ExtensionLeaseCounters = {
 			transfer: 0,
 			adopt: 0,
 			transferRelease: 0,
 			leaseRelease: 0,
 		};
-		const services: FutureSessionRuntimePiPayloadServices = Object.freeze({
+		const services: SessionRuntimePiPayloadServices = Object.freeze({
 			...activation.supervisorServices,
 			externalizer: instrumentExtensionExternalizer(activation.externalizer, counters),
 		});
-		const messages: FutureSupervisorMessage[] = [];
-		const supervisor = createFutureSupervisorFixture(target, services, messages, undefined, 3, {
+		const messages: CanonicalSupervisorMessage[] = [];
+		const supervisor = createSupervisorFixture(target, services, messages, undefined, 3, {
 			PI_WEB_FIXTURE_STARTUP_FUTURE_EDITOR: "1",
 		});
 		stop = () => supervisor.stopAll();
@@ -761,19 +758,19 @@ describe("future Session Supervisor payload mode", () => {
 		const target = createTarget(root);
 		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
 		await store.initialize();
-		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const activation = createGatewayPayloadActivation(store, "future-epoch");
 		const counters: ExtensionLeaseCounters = {
 			transfer: 0,
 			adopt: 0,
 			transferRelease: 0,
 			leaseRelease: 0,
 		};
-		const services: FutureSessionRuntimePiPayloadServices = Object.freeze({
+		const services: SessionRuntimePiPayloadServices = Object.freeze({
 			...activation.supervisorServices,
 			externalizer: instrumentExtensionExternalizer(activation.externalizer, counters),
 		});
-		const messages: FutureSupervisorMessage[] = [];
-		const supervisor = createFutureSupervisorFixture(target, services, messages, undefined, 0, {
+		const messages: CanonicalSupervisorMessage[] = [];
+		const supervisor = createSupervisorFixture(target, services, messages, undefined, 0, {
 			PI_WEB_FIXTURE_STARTUP_FUTURE_EDITOR_REPLACEMENT: "1",
 		});
 		stop = () => supervisor.stopAll();
@@ -808,9 +805,9 @@ describe("future Session Supervisor payload mode", () => {
 		const target = createTarget(root);
 		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
 		await store.initialize();
-		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
-		const messages: FutureSupervisorMessage[] = [];
-		const supervisor = createFutureSupervisorFixture(
+		const activation = createGatewayPayloadActivation(store, "future-epoch");
+		const messages: CanonicalSupervisorMessage[] = [];
+		const supervisor = createSupervisorFixture(
 			target,
 			activation.supervisorServices,
 			messages,
@@ -823,7 +820,7 @@ describe("future Session Supervisor payload mode", () => {
 
 		await expect(supervisor.activate(target.sessionHandle)).resolves.toMatchObject({ state: "idle" });
 		const stickyFrames = messages.filter(
-			(message): message is Extract<FutureSupervisorMessage, { type: "extension_ui_request" }> =>
+			(message): message is Extract<CanonicalSupervisorMessage, { type: "extension_ui_request" }> =>
 				message.type === "extension_ui_request" && message.request.method === "setStatus",
 		);
 		expect(stickyFrames.map((frame) => frame.request)).toEqual([
@@ -849,7 +846,7 @@ describe("future Session Supervisor payload mode", () => {
 		const target = createTarget(root);
 		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
 		await store.initialize();
-		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const activation = createGatewayPayloadActivation(store, "future-epoch");
 		const counters: ExtensionLeaseCounters = {
 			transfer: 0,
 			adopt: 0,
@@ -857,15 +854,15 @@ describe("future Session Supervisor payload mode", () => {
 			leaseRelease: 0,
 		};
 		const released: EpochStoredContentRef[] = [];
-		const services: FutureSessionRuntimePiPayloadServices = Object.freeze({
+		const services: SessionRuntimePiPayloadServices = Object.freeze({
 			...activation.supervisorServices,
 			externalizer: logicalPairExtensionExternalizer(activation.externalizer, counters),
 			async releaseHold(hold: EpochContentHold<EpochStoredContentRef>) {
 				released.push(hold.ref);
 			},
 		});
-		const messages: FutureSupervisorMessage[] = [];
-		const supervisor = createFutureSupervisorFixture(target, services, messages, undefined, 3, {
+		const messages: CanonicalSupervisorMessage[] = [];
+		const supervisor = createSupervisorFixture(target, services, messages, undefined, 3, {
 			PI_WEB_FIXTURE_STARTUP_FUTURE_EDITOR_LOGICAL_PAIR: "1",
 		});
 		stop = () => supervisor.stopAll();
@@ -892,7 +889,7 @@ describe("future Session Supervisor payload mode", () => {
 		const target = createTarget(root);
 		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
 		await store.initialize();
-		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const activation = createGatewayPayloadActivation(store, "future-epoch");
 		const counters: ExtensionLeaseCounters = {
 			transfer: 0,
 			adopt: 0,
@@ -900,14 +897,14 @@ describe("future Session Supervisor payload mode", () => {
 			leaseRelease: 0,
 		};
 		let beforeTransfer = () => {};
-		const services: FutureSessionRuntimePiPayloadServices = Object.freeze({
+		const services: SessionRuntimePiPayloadServices = Object.freeze({
 			...activation.supervisorServices,
 			externalizer: instrumentExtensionExternalizer(activation.externalizer, counters, false, () =>
 				beforeTransfer(),
 			),
 		});
-		const messages: FutureSupervisorMessage[] = [];
-		const supervisor = createFutureSupervisorFixture(target, services, messages, undefined, 3, {
+		const messages: CanonicalSupervisorMessage[] = [];
+		const supervisor = createSupervisorFixture(target, services, messages, undefined, 3, {
 			PI_WEB_FIXTURE_STARTUP_FUTURE_EDITOR: "1",
 		});
 		stop = () => supervisor.stopAll();
@@ -938,7 +935,7 @@ describe("future Session Supervisor payload mode", () => {
 		const target = createTarget(root);
 		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
 		await store.initialize();
-		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const activation = createGatewayPayloadActivation(store, "future-epoch");
 		const counters: ExtensionLeaseCounters = {
 			transfer: 0,
 			adopt: 0,
@@ -946,7 +943,7 @@ describe("future Session Supervisor payload mode", () => {
 			leaseRelease: 0,
 		};
 		const released: EpochStoredContentRef[] = [];
-		const services: FutureSessionRuntimePiPayloadServices = Object.freeze({
+		const services: SessionRuntimePiPayloadServices = Object.freeze({
 			...activation.supervisorServices,
 			externalizer: instrumentExtensionExternalizer(activation.externalizer, counters),
 			async releaseHold(hold: EpochContentHold<EpochStoredContentRef>) {
@@ -954,8 +951,8 @@ describe("future Session Supervisor payload mode", () => {
 				await activation.supervisorServices.releaseHold(hold);
 			},
 		});
-		const messages: FutureSupervisorMessage[] = [];
-		const supervisor = createFutureSupervisorFixture(target, services, messages, undefined, 0, {
+		const messages: CanonicalSupervisorMessage[] = [];
+		const supervisor = createSupervisorFixture(target, services, messages, undefined, 0, {
 			PI_WEB_FIXTURE_READY_DELAY_MS: "500",
 			PI_WEB_FIXTURE_STARTUP_FUTURE_EDITOR: "1",
 			PI_WEB_FIXTURE_STARTUP_TIMEOUT_INPUT: "1",
@@ -995,19 +992,19 @@ describe("future Session Supervisor payload mode", () => {
 		const target = createTarget(root);
 		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
 		await store.initialize();
-		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const activation = createGatewayPayloadActivation(store, "future-epoch");
 		const counters: ExtensionLeaseCounters = {
 			transfer: 0,
 			adopt: 0,
 			transferRelease: 0,
 			leaseRelease: 0,
 		};
-		const services: FutureSessionRuntimePiPayloadServices = Object.freeze({
+		const services: SessionRuntimePiPayloadServices = Object.freeze({
 			...activation.supervisorServices,
 			externalizer: instrumentExtensionExternalizer(activation.externalizer, counters),
 		});
-		const messages: FutureSupervisorMessage[] = [];
-		const supervisor = createFutureSupervisorFixture(target, services, messages, undefined, 3, {
+		const messages: CanonicalSupervisorMessage[] = [];
+		const supervisor = createSupervisorFixture(target, services, messages, undefined, 3, {
 			PI_WEB_FIXTURE_TRANSITION_FUTURE_EDITOR: "1",
 		});
 		stop = () => supervisor.stopAll();
@@ -1025,7 +1022,7 @@ describe("future Session Supervisor payload mode", () => {
 					fencingToken: lease.fencingToken,
 				},
 			),
-		).rejects.toThrow("future_extension_delivery_phase_unsupported");
+		).rejects.toThrow("content_ref_extension_delivery_phase_unsupported");
 		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "dormant");
 		await waitFor(() => counters.transferRelease === 1);
 		expect(messages.filter((message) => message.type === "extension_ui_request")).toEqual([]);
@@ -1048,19 +1045,19 @@ describe("future Session Supervisor payload mode", () => {
 		const target = createTarget(root);
 		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
 		await store.initialize();
-		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const activation = createGatewayPayloadActivation(store, "future-epoch");
 		const counters: ExtensionLeaseCounters = {
 			transfer: 0,
 			adopt: 0,
 			transferRelease: 0,
 			leaseRelease: 0,
 		};
-		const services: FutureSessionRuntimePiPayloadServices = Object.freeze({
+		const services: SessionRuntimePiPayloadServices = Object.freeze({
 			...activation.supervisorServices,
 			externalizer: instrumentExtensionExternalizer(activation.externalizer, counters),
 		});
-		const messages: FutureSupervisorMessage[] = [];
-		const supervisor = createFutureSupervisorFixture(target, services, messages, undefined, 3, {
+		const messages: CanonicalSupervisorMessage[] = [];
+		const supervisor = createSupervisorFixture(target, services, messages, undefined, 3, {
 			PI_WEB_FIXTURE_TRANSITION_VERIFYING_FUTURE_EDITOR: "1",
 		});
 		stop = () => supervisor.stopAll();
@@ -1078,7 +1075,7 @@ describe("future Session Supervisor payload mode", () => {
 					fencingToken: lease.fencingToken,
 				},
 			),
-		).rejects.toThrow("future_extension_delivery_phase_unsupported");
+		).rejects.toThrow("content_ref_extension_delivery_phase_unsupported");
 		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "dormant");
 		await waitFor(() => counters.transferRelease === 1);
 		expect(messages.filter((message) => message.type === "session_rekeyed")).toEqual([]);
@@ -1099,9 +1096,9 @@ describe("future Session Supervisor payload mode", () => {
 		const target = createTarget(root);
 		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
 		await store.initialize();
-		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
-		const messages: FutureSupervisorMessage[] = [];
-		const supervisor = createFutureSupervisorFixture(target, activation.supervisorServices, messages);
+		const activation = createGatewayPayloadActivation(store, "future-epoch");
+		const messages: CanonicalSupervisorMessage[] = [];
+		const supervisor = createSupervisorFixture(target, activation.supervisorServices, messages);
 		stop = () => supervisor.stopAll();
 
 		const lease = await supervisor.claim(target.sessionHandle, "future-controller");
@@ -1135,9 +1132,9 @@ describe("future Session Supervisor payload mode", () => {
 		const target = createTarget(root);
 		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
 		await store.initialize();
-		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
-		const messages: FutureSupervisorMessage[] = [];
-		const supervisor = createFutureSupervisorFixture(target, activation.supervisorServices, messages);
+		const activation = createGatewayPayloadActivation(store, "future-epoch");
+		const messages: CanonicalSupervisorMessage[] = [];
+		const supervisor = createSupervisorFixture(target, activation.supervisorServices, messages);
 		stop = () => supervisor.stopAll();
 
 		const lease = await supervisor.claim(target.sessionHandle, "future-controller");
@@ -1193,9 +1190,9 @@ describe("future Session Supervisor payload mode", () => {
 		const target = createTarget(root);
 		store = new EpochContentStore({ webDataDir: path.join(root, "web-data"), serverEpoch: "future-epoch" });
 		await store.initialize();
-		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
-		const messages: FutureSupervisorMessage[] = [];
-		const supervisor = createFutureSupervisorFixture(target, activation.supervisorServices, messages);
+		const activation = createGatewayPayloadActivation(store, "future-epoch");
+		const messages: CanonicalSupervisorMessage[] = [];
+		const supervisor = createSupervisorFixture(target, activation.supervisorServices, messages);
 		stop = () => supervisor.stopAll();
 
 		const lease = await supervisor.claim(target.sessionHandle, "future-controller");
@@ -1231,14 +1228,14 @@ describe("future Session Supervisor payload mode", () => {
 		});
 		store = exactStore;
 		await exactStore.initialize();
-		const activation = createGatewayFuturePayloadActivation(exactStore, "future-epoch");
+		const activation = createGatewayPayloadActivation(exactStore, "future-epoch");
 		const oversized = oversizedHistoryLease();
 		expect(oversized.refs.every((ref) => ref.byteLength < 48 * 1024 * 1024)).toBe(true);
 		expect(oversized.refs.reduce((total, ref) => total + ref.byteLength, 0)).toBeGreaterThan(
 			64 * 1024 * 1024,
 		);
 		let historyResponses = 0;
-		const externalizer: PiHostFuturePayloadExternalizer = Object.freeze({
+		const externalizer: PiHostPayloadExternalizer = Object.freeze({
 			...activation.externalizer,
 			async externalize(input: PiPayloadExternalizerInput, signal: AbortSignal) {
 				if (input.kind === "response" && input.expectedCommand === "get_messages") {
@@ -1279,8 +1276,8 @@ describe("future Session Supervisor payload mode", () => {
 				releasedHolds.push(hold.ref);
 			},
 		});
-		const messages: FutureSupervisorMessage[] = [];
-		const supervisor = createFutureSupervisorFixture(
+		const messages: CanonicalSupervisorMessage[] = [];
+		const supervisor = createSupervisorFixture(
 			target,
 			piPayloadServices,
 			messages,

@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { GATEWAY_PAYLOAD_BUDGET_CAPABILITY, SESSION_PAYLOAD_BUDGET } from "@pi-agent-web/protocol";
 import { getAgentDir } from "../src/config.js";
-import { startServerWithCurrentMode } from "../src/main.js";
+import { startServer } from "../src/main.js";
 
 const RUN_REAL_E2E = process.env.PI_WEB_RUN_E2E === "1";
 const COMMAND_TIMEOUT_MS = 30_000;
@@ -678,12 +678,12 @@ if (!RUN_REAL_E2E) {
 	for (const fileName of PRIVATE_CONFIG_FILES) {
 		copyOptionalPrivateConfig(realAgentDir, isolatedAgentDir, fileName);
 	}
-	let handle: Awaited<ReturnType<typeof startServerWithCurrentMode>> | undefined;
+	let handle: Awaited<ReturnType<typeof startServer>> | undefined;
 	let ws: import("ws").default | undefined;
 	const extraSockets: Array<import("ws").default> = [];
 
 	try {
-		const started = await startServerWithCurrentMode({
+		const started = await startServer({
 			config: {
 				port: 0,
 				host: "127.0.0.1",

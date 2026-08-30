@@ -158,7 +158,7 @@ describe("attachment REST routes", () => {
 			contentStore,
 			serverEpoch: EPOCH,
 			readiness: { ready: true },
-		} as AppContext);
+		} as unknown as AppContext);
 		const url = `/api/v1/attachments/${EPOCH}/${"a".repeat(64)}`;
 		const unauthorized = await app.request(url);
 		expect(unauthorized.status).toBe(403);

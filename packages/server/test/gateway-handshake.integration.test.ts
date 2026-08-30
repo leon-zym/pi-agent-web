@@ -1,10 +1,15 @@
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import { GATEWAY_PAYLOAD_BUDGET_CAPABILITY, SESSION_PAYLOAD_BUDGET } from "@pi-agent-web/protocol";
+import {
+	GATEWAY_PROTOCOL_VERSION,
+	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
+	SESSION_PAYLOAD_BUDGET,
+} from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import type { SessionSupervisor } from "../src/session-supervisor.js";
 import { SessionWsBridge } from "../src/session-ws-bridge.js";
+import { createCanonicalPayloadFixture } from "./helpers/canonical-payload.js";
 
 interface Harness {
 	server: http.Server;
@@ -12,32 +17,30 @@ interface Harness {
 	url: string;
 }
 
+const SERVER_EPOCH = "gateway-epoch-test";
 const harnesses: Harness[] = [];
 
-async function createHarness(
-	options: { helloTimeoutMs?: number; serverPayloadCapability?: boolean } = {},
-): Promise<Harness> {
+async function createHarness(options: { helloTimeoutMs?: number; omitServerInventory?: boolean } = {}) {
+	const payloadActivation = createCanonicalPayloadFixture(SERVER_EPOCH);
+	const capabilities = options.omitServerInventory
+		? GATEWAY_SERVER_REQUIRED_CAPABILITIES.filter(
+				(capability) => capability !== "session.hot_runtime_inventory",
+			)
+		: [...GATEWAY_SERVER_REQUIRED_CAPABILITIES];
 	const bridge = new SessionWsBridge({
 		supervisor: {
-			serverEpoch: "gateway-epoch-test",
+			serverEpoch: SERVER_EPOCH,
 			releaseConnection: () => undefined,
+			getHotRuntimeInventory: () => ({
+				type: "hot_runtime_inventory",
+				serverEpoch: SERVER_EPOCH,
+				revision: 0,
+				runtimes: [],
+			}),
 		} as unknown as SessionSupervisor,
 		serverBuild: "0.1.0-test",
-		runtime: {
-			version: "0.84.2",
-			adapterId: "pi-rpc",
-			capabilities: ["rpc.commands", "rpc.events", "rpc.extension_ui", "session.multiplex"],
-		},
-		...(options.serverPayloadCapability === false
-			? {}
-			: {
-					payloadActivation: {
-						context: {
-							serverEpoch: "gateway-epoch-test",
-							payloadBudget: SESSION_PAYLOAD_BUDGET,
-						},
-					},
-				}),
+		runtime: { version: "0.84.2", adapterId: "pi-rpc", capabilities },
+		payloadActivation,
 		helloTimeoutMs: options.helloTimeoutMs,
 	});
 	const server = http.createServer();
@@ -88,6 +91,27 @@ function nextClose(ws: WebSocket): Promise<number> {
 	});
 }
 
+function sendHello(
+	ws: WebSocket,
+	overrides: {
+		protocol?: { major: number; minor: number };
+		capabilities?: string[];
+		maxServerFrameBytes?: number;
+	} = {},
+): void {
+	ws.send(
+		JSON.stringify({
+			type: "client_hello",
+			protocol: overrides.protocol ?? GATEWAY_PROTOCOL_VERSION,
+			clientBuild: "0.1.0-test",
+			capabilities: overrides.capabilities ?? [...GATEWAY_SERVER_REQUIRED_CAPABILITIES],
+			limits: {
+				maxServerFrameBytes: overrides.maxServerFrameBytes ?? SESSION_PAYLOAD_BUDGET.maxServerFrameBytes,
+			},
+		}),
+	);
+}
+
 afterEach(async () => {
 	for (const harness of harnesses.splice(0)) {
 		await harness.bridge.close();
@@ -97,229 +121,70 @@ afterEach(async () => {
 
 describe("Gateway WebSocket hello negotiation", () => {
 	it("closes a silent client that never sends client_hello", async () => {
-		const harness = await createHarness({ helloTimeoutMs: 20 });
-		const ws = await openSocket(harness.url);
-
+		const ws = await openSocket((await createHarness({ helloTimeoutMs: 20 })).url);
 		await expect(nextClose(ws)).resolves.toBe(1008);
 	});
 
 	it("requires client_hello before any Session frame", async () => {
-		const harness = await createHarness();
-		const ws = await openSocket(harness.url);
+		const ws = await openSocket((await createHarness()).url);
 		const frame = nextJson(ws);
-		ws.send(JSON.stringify({ type: "session_subscribe", sessionHandle: "session-before-hello" }));
-
+		ws.send(JSON.stringify({ type: "session_subscribe", sessionHandle: "before-hello" }));
 		await expect(frame).resolves.toMatchObject({ type: "protocol_error", code: "hello_required" });
 	});
 
-	it("rejects an incompatible client major with one stable terminal diagnostic", async () => {
-		const harness = await createHarness();
-		const ws = await openSocket(harness.url);
+	it("rejects an incompatible major with one terminal diagnostic", async () => {
+		const ws = await openSocket((await createHarness()).url);
 		const frame = nextJson(ws);
-		ws.send(
-			JSON.stringify({
-				type: "client_hello",
-				protocol: { major: 99, minor: 0 },
-				clientBuild: "future-ui",
-				capabilities: [],
-				limits: { maxServerFrameBytes: 32 * 1024 * 1024 },
-			}),
-		);
-
-		await expect(frame).resolves.toMatchObject({
-			type: "protocol_error",
-			code: "protocol_major_unsupported",
-			supported: { major: 1 },
-		});
-	});
-
-	it("rejects a client missing a required negotiated capability", async () => {
-		const harness = await createHarness();
-		const ws = await openSocket(harness.url);
-		const frame = nextJson(ws);
-		ws.send(
-			JSON.stringify({
-				type: "client_hello",
-				protocol: { major: 1, minor: 0 },
-				clientBuild: "partial-ui",
-				capabilities: ["rpc.commands", "rpc.events", "session.multiplex"],
-				limits: { maxServerFrameBytes: 32 * 1024 * 1024 },
-			}),
-		);
-
-		await expect(frame).resolves.toMatchObject({
-			type: "protocol_error",
-			code: "capability_unsupported",
-		});
-	});
-
-	it("rejects a protocol 1.2 client that omits epoch attachment references", async () => {
-		const harness = await createHarness();
-		const ws = await openSocket(harness.url);
-		const frame = nextJson(ws);
-		const closed = nextClose(ws);
-		ws.send(
-			JSON.stringify({
-				type: "client_hello",
-				protocol: { major: 1, minor: 2 },
-				clientBuild: "inline-only-ui",
-				capabilities: ["rpc.commands", "rpc.events", "rpc.extension_ui", "session.multiplex"],
-				limits: { maxServerFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes },
-			}),
-		);
-
-		await expect(frame).resolves.toMatchObject({
-			type: "protocol_error",
-			code: "capability_unsupported",
-		});
-		await expect(closed).resolves.toBe(1008);
-	});
-
-	it("rejects a minor 1 client that declares the minor 2 attachment capability", async () => {
-		const harness = await createHarness();
-		const ws = await openSocket(harness.url);
-		const frame = nextJson(ws);
-		const closed = nextClose(ws);
-		ws.send(
-			JSON.stringify({
-				type: "client_hello",
-				protocol: { major: 1, minor: 1 },
-				clientBuild: "invalid-inline-fallback-ui",
-				capabilities: [
-					"rpc.commands",
-					"rpc.events",
-					"rpc.extension_ui",
-					"session.multiplex",
-					GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
-				],
-				limits: { maxServerFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes },
-			}),
-		);
-
+		sendHello(ws, { protocol: { major: 99, minor: 3 } });
 		await expect(frame).resolves.toMatchObject({
 			type: "protocol_error",
 			code: "invalid_hello",
+			supported: { major: 1, minMinor: 3, maxMinor: 3 },
 		});
-		await expect(closed).resolves.toBe(1008);
 	});
 
-	it("rejects negotiation when the Gateway runtime omits a server-required capability", async () => {
-		const harness = await createHarness({ serverPayloadCapability: false });
-		const ws = await openSocket(harness.url);
+	it("rejects protocol 1.2 instead of activating a compatibility path", async () => {
+		const ws = await openSocket((await createHarness()).url);
 		const frame = nextJson(ws);
-		const closed = nextClose(ws);
-		ws.send(
-			JSON.stringify({
-				type: "client_hello",
-				protocol: { major: 1, minor: 2 },
-				clientBuild: "ref-capable-ui",
-				capabilities: [
-					"rpc.commands",
-					"rpc.events",
-					"rpc.extension_ui",
-					"session.multiplex",
-					GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
-				],
-				limits: { maxServerFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes },
-			}),
-		);
+		sendHello(ws, { protocol: { major: 1, minor: 2 } });
+		await expect(frame).resolves.toMatchObject({
+			type: "protocol_error",
+			code: "invalid_hello",
+			supported: { major: 1, minMinor: 3, maxMinor: 3 },
+		});
+	});
 
+	it("rejects a client missing one canonical capability", async () => {
+		const ws = await openSocket((await createHarness()).url);
+		const frame = nextJson(ws);
+		sendHello(ws, {
+			capabilities: GATEWAY_SERVER_REQUIRED_CAPABILITIES.filter(
+				(capability) => capability !== "payload.epoch_content_refs",
+			),
+		});
+		await expect(frame).resolves.toMatchObject({ type: "protocol_error", code: "invalid_hello" });
+	});
+
+	it("rejects a Gateway missing a required canonical capability", async () => {
+		const ws = await openSocket((await createHarness({ omitServerInventory: true })).url);
+		const frame = nextJson(ws);
+		sendHello(ws);
 		await expect(frame).resolves.toMatchObject({
 			type: "protocol_error",
 			code: "capability_unsupported",
 		});
-		await expect(closed).resolves.toBe(1008);
 	});
 
-	it("negotiates a compatible minor and reports the selected Pi adapter", async () => {
-		const harness = await createHarness();
-		const ws = await openSocket(harness.url);
+	it("negotiates only exact protocol 1.3 with both payload budgets", async () => {
+		const ws = await openSocket((await createHarness()).url);
 		const frame = nextJson(ws);
-		ws.send(
-			JSON.stringify({
-				type: "client_hello",
-				protocol: { major: 1, minor: 7 },
-				clientBuild: "0.1.0-test",
-				capabilities: [
-					"rpc.commands",
-					"rpc.events",
-					"rpc.extension_ui",
-					"session.multiplex",
-					GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
-					"unknown-future-capability",
-				],
-				limits: { maxServerFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes },
-			}),
-		);
-
+		sendHello(ws);
 		await expect(frame).resolves.toMatchObject({
 			type: "server_hello",
-			protocol: { major: 1, minor: 2 },
-			serverBuild: "0.1.0-test",
-			serverEpoch: "gateway-epoch-test",
-			piVersion: "0.84.2",
+			protocol: GATEWAY_PROTOCOL_VERSION,
+			serverEpoch: SERVER_EPOCH,
 			adapterId: "pi-rpc",
-			capabilities: [
-				"rpc.commands",
-				"rpc.events",
-				"rpc.extension_ui",
-				"session.multiplex",
-				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
-			],
-			limits: {
-				maxClientFrameBytes: expect.any(Number),
-				maxSnapshotFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes,
-				maxExtensionRequests: expect.any(Number),
-			},
 			payloadBudget: SESSION_PAYLOAD_BUDGET,
-		});
-		ws.close();
-	});
-
-	it("rejects a legacy minor 1 client instead of falling back to inline payloads", async () => {
-		const harness = await createHarness();
-		const ws = await openSocket(harness.url);
-		const frame = nextJson(ws);
-		const closed = nextClose(ws);
-		ws.send(
-			JSON.stringify({
-				type: "client_hello",
-				protocol: { major: 1, minor: 1 },
-				clientBuild: "0.1.0-minor-1-test",
-				capabilities: ["rpc.commands", "rpc.events", "rpc.extension_ui", "session.multiplex"],
-				limits: { maxServerFrameBytes: 4096 },
-			}),
-		);
-
-		await expect(frame).resolves.toMatchObject({
-			type: "protocol_error",
-			code: "capability_unsupported",
-		});
-		await expect(closed).resolves.toBe(1008);
-	});
-
-	it("rejects a client frame ceiling below the required payload budget", async () => {
-		const harness = await createHarness();
-		const ws = await openSocket(harness.url);
-		const hello = nextJson(ws);
-		ws.send(
-			JSON.stringify({
-				type: "client_hello",
-				protocol: { major: 1, minor: 2 },
-				clientBuild: "bounded-ui",
-				capabilities: [
-					"rpc.commands",
-					"rpc.events",
-					"rpc.extension_ui",
-					"session.multiplex",
-					GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
-				],
-				limits: { maxServerFrameBytes: 1024 },
-			}),
-		);
-		await expect(hello).resolves.toMatchObject({
-			type: "protocol_error",
-			code: "capability_unsupported",
 		});
 	});
 });

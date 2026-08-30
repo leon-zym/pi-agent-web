@@ -15,16 +15,10 @@ import {
 	type SessionSupervisorOptions,
 } from "../src/index.js";
 
-it("keeps Runtime and Supervisor internals off the public server barrel", () => {
+it("keeps implementation-only Runtime helpers off the public server barrel", () => {
 	expect(server.SessionRuntime).toBe(SessionRuntime);
 	expect(server.SessionSupervisor).toBe(SessionSupervisor);
-	for (const internal of [
-		"SessionRuntimeCore",
-		"createFutureSessionRuntime",
-		"createFutureSessionSupervisor",
-		"createCurrentSessionRuntimePiPayloadServices",
-		"createFutureSessionRuntimePiPayloadServices",
-	]) {
+	for (const internal of ["SessionRuntimeCore", "createSessionRuntimePiPayloadServices"]) {
 		expect(server).not.toHaveProperty(internal);
 	}
 

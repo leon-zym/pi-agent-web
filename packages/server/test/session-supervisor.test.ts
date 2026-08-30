@@ -9,27 +9,32 @@ import type {
 	SessionCommandResponseDto,
 	SessionRuntimeIdentityDto,
 } from "@pi-agent-web/protocol";
-import { SESSION_PAYLOAD_BUDGET, SESSION_SNAPSHOT_MAX_BYTES } from "@pi-agent-web/protocol";
+import {
+	SESSION_CONTENT_REF_BUDGET,
+	SESSION_PAYLOAD_BUDGET,
+	SESSION_SNAPSHOT_MAX_BYTES,
+} from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { EpochContentHold } from "../src/epoch-content-store.js";
+import type { EpochContentHold, EpochStoredContentRef } from "../src/epoch-content-store.js";
 import { canonicalizeSessionFile, sessionHandleForFile } from "../src/native-session-catalog.js";
 import type { PiHostAdapter, PiHostDecodeOutcome } from "../src/pi-host-adapter.js";
 import type { PiPayloadLease } from "../src/pi-payload-externalizer.js";
 import { piRpcAdapter } from "../src/pi-rpc-adapter.js";
 import { SessionLiveProjection, type SessionLiveProjectionLimits } from "../src/session-live-projection.js";
-import { createCurrentSessionProductSchema } from "../src/session-product-schema.js";
+import { createSessionProductSchema } from "../src/session-product-schema.js";
 import type {
 	SessionIdentityTransitionCommit,
 	SessionRuntime,
 	SessionRuntimePiPayloadServices,
 } from "../src/session-runtime.js";
-import { createCurrentSessionRuntimePiPayloadServices } from "../src/session-runtime.js";
+import { createSessionRuntimePiPayloadServices } from "../src/session-runtime.js";
 import type {
 	ExistingSessionTarget,
 	SessionRuntimeSnapshot,
 	SessionSupervisorMessage,
 } from "../src/session-runtime-types.js";
 import { SessionSupervisor } from "../src/session-supervisor.js";
+import { createCanonicalPayloadFixture } from "./helpers/canonical-payload.js";
 
 const fixturePath = path.join(import.meta.dirname, "fixtures", "session-runtime-pi.mjs");
 const temporaryRoots: string[] = [];
@@ -180,7 +185,9 @@ function createHarness(options: {
 		pendingDialogLimit: options.pendingDialogLimit,
 		maxPendingCommands: options.maxPendingCommands,
 		projectionLimits: options.projectionLimits,
-		piPayloadServices: options.piPayloadServices,
+		piPayloadServices:
+			options.piPayloadServices ??
+			createCanonicalPayloadFixture("session-supervisor-test-epoch").supervisorServices,
 		commandTimeoutFor: options.commandTimeoutFor,
 		restartBaseDelayMs: options.restartBaseDelayMs ?? 5,
 		maxAutoRestarts: options.maxAutoRestarts,
@@ -200,7 +207,7 @@ function exactRuntimeObject(supervisor: SessionSupervisor, sessionHandle: string
 	return runtime;
 }
 
-function deliverCurrentExtension(runtime: object, request: ExtensionUiRequestDto): void {
+function deliverExtension(runtime: object, request: ExtensionUiRequestDto): void {
 	const processToken: unknown = Reflect.get(runtime, "processToken");
 	const handler: unknown = Reflect.get(runtime, "handleExtensionRequest");
 	if (typeof processToken !== "number" || typeof handler !== "function") {
@@ -266,19 +273,22 @@ function attachmentRef(sha256: string): SessionAttachmentRefDto {
 
 function trackedLease(
 	ref: SessionAttachmentRefDto,
-	tracking: { adopted: EpochContentHold[][]; released: EpochContentHold[] },
+	tracking: {
+		adopted: EpochContentHold<EpochStoredContentRef>[][];
+		released: EpochContentHold<EpochStoredContentRef>[];
+	},
 	holdRef: SessionAttachmentRefDto = ref,
-): { hold: EpochContentHold; lease: PiPayloadLease } {
-	const hold: EpochContentHold = Object.freeze({ ref: holdRef });
+): { hold: EpochContentHold<SessionAttachmentRefDto>; lease: PiPayloadLease<EpochStoredContentRef> } {
+	const hold: EpochContentHold<SessionAttachmentRefDto> = Object.freeze({ ref: holdRef });
 	let state: "pending" | "transferred" | "adopted" | "released" = "pending";
-	const lease: PiPayloadLease = Object.freeze({
+	const lease: PiPayloadLease<EpochStoredContentRef> = Object.freeze({
 		refs: Object.freeze([ref]),
 		transfer() {
 			if (state !== "pending") throw new Error("test lease is not pending");
 			state = "transferred";
 			return Object.freeze({
 				refs: Object.freeze([ref]),
-				adopt(accept: Parameters<ReturnType<PiPayloadLease["transfer"]>["adopt"]>[0]) {
+				adopt(accept: Parameters<ReturnType<PiPayloadLease<EpochStoredContentRef>["transfer"]>["adopt"]>[0]) {
 					if (state !== "transferred") throw new Error("test transfer is not pending");
 					if (accept([hold]) !== true) throw new Error("test transfer adoption was rejected");
 					tracking.adopted.push([hold]);
@@ -303,7 +313,7 @@ function trackedLease(
 function rejectingTransferLease(
 	ref: SessionAttachmentRefDto,
 	tracking: { transferReleaseAttempts: number },
-): PiPayloadLease {
+): PiPayloadLease<EpochStoredContentRef> {
 	let state: "pending" | "transferred" = "pending";
 	return Object.freeze({
 		refs: Object.freeze([ref]),
@@ -327,34 +337,38 @@ function rejectingTransferLease(
 	});
 }
 
-function testPayloadServices(released: EpochContentHold[]): SessionRuntimePiPayloadServices {
+function testPayloadServices(
+	released: EpochContentHold<EpochStoredContentRef>[],
+): SessionRuntimePiPayloadServices {
 	const context = {
 		serverEpoch: "session-supervisor-test-epoch",
 		payloadBudget: SESSION_PAYLOAD_BUDGET,
+		contentRefBudget: SESSION_CONTENT_REF_BUDGET,
 	};
-	return createCurrentSessionRuntimePiPayloadServices({
+	return createSessionRuntimePiPayloadServices({
 		externalizer: {
-			mode: "attachment",
+			mode: "content_ref",
 			context,
 			externalize: async () => {
 				throw new Error("the carrier fixture owns decoded outcomes");
 			},
 		},
-		productSchema: createCurrentSessionProductSchema(context),
+		productSchema: createSessionProductSchema(context),
 		releaseHold: async (entry) => {
 			released.push(entry);
 		},
 	});
 }
 
-function startupBaseAdapter(ref: SessionAttachmentRefDto, lease: PiPayloadLease): PiHostAdapter {
+function startupBaseAdapter(
+	ref: SessionAttachmentRefDto,
+	lease: PiPayloadLease<EpochStoredContentRef>,
+): PiHostAdapter {
 	let attached = false;
 	return {
 		...piRpcAdapter,
 		async decodeResponse(value, expectedCommand, context) {
-			const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, {
-				signal: context?.signal ?? new AbortController().signal,
-			});
+			const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, context);
 			if (expectedCommand !== "get_messages" || attached || outcome.value.success !== true) {
 				return outcome;
 			}
@@ -380,27 +394,35 @@ function startupBaseAdapter(ref: SessionAttachmentRefDto, lease: PiPayloadLease)
 			return decoded;
 		},
 		decodeUnsolicited(value, context) {
-			return piRpcAdapter.decodeUnsolicited(value, {
-				signal: context?.signal ?? new AbortController().signal,
-			});
+			return piRpcAdapter.decodeUnsolicited(value, context);
 		},
 	};
 }
 
 function transitionPayloadAdapter(input: {
-	parentBase?: { hold: EpochContentHold; lease: PiPayloadLease };
-	childBase?: { hold: EpochContentHold; lease: PiPayloadLease };
-	staged?: { hold: EpochContentHold; lease: PiPayloadLease };
-	stagedInvalid?: { hold: EpochContentHold; lease: PiPayloadLease };
-	postRekey?: { hold: EpochContentHold; lease: PiPayloadLease };
+	parentBase?: {
+		hold: EpochContentHold<SessionAttachmentRefDto>;
+		lease: PiPayloadLease<EpochStoredContentRef>;
+	};
+	childBase?: {
+		hold: EpochContentHold<SessionAttachmentRefDto>;
+		lease: PiPayloadLease<EpochStoredContentRef>;
+	};
+	staged?: { hold: EpochContentHold<SessionAttachmentRefDto>; lease: PiPayloadLease<EpochStoredContentRef> };
+	stagedInvalid?: {
+		hold: EpochContentHold<SessionAttachmentRefDto>;
+		lease: PiPayloadLease<EpochStoredContentRef>;
+	};
+	postRekey?: {
+		hold: EpochContentHold<SessionAttachmentRefDto>;
+		lease: PiPayloadLease<EpochStoredContentRef>;
+	};
 }): PiHostAdapter {
 	let getMessagesCount = 0;
 	return {
 		...piRpcAdapter,
 		async decodeResponse(value, expectedCommand, context) {
-			const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, {
-				signal: context?.signal ?? new AbortController().signal,
-			});
+			const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, context);
 			if (expectedCommand !== "get_messages" || outcome.value.success !== true) return outcome;
 			getMessagesCount += 1;
 			const attachment = getMessagesCount === 1 ? input.parentBase : input.childBase;
@@ -431,9 +453,7 @@ function transitionPayloadAdapter(input: {
 			};
 		},
 		async decodeUnsolicited(value, context) {
-			const outcome = await piRpcAdapter.decodeUnsolicited(value, {
-				signal: context?.signal ?? new AbortController().signal,
-			});
+			const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 			if (outcome.value.kind !== "event" || outcome.value.event.type !== "message_end") {
 				return outcome;
 			}
@@ -913,8 +933,8 @@ describe("SessionSupervisor", () => {
 		fs.mkdirSync(cwd);
 		const target = createNativeSession(root, cwd, "startup-owned-image");
 		const exactRef = attachmentRef("a".repeat(64));
-		const adopted: EpochContentHold[][] = [];
-		const released: EpochContentHold[] = [];
+		const adopted: EpochContentHold<EpochStoredContentRef>[][] = [];
+		const released: EpochContentHold<EpochStoredContentRef>[] = [];
 		const tracking = { adopted, released };
 		const { hold, lease } = trackedLease(exactRef, tracking);
 		const adapter = startupBaseAdapter(exactRef, lease);
@@ -951,21 +971,17 @@ describe("SessionSupervisor", () => {
 		fs.mkdirSync(cwd);
 		const target = createNativeSession(root, cwd, "startup-owned-event");
 		const exactRef = attachmentRef("2".repeat(64));
-		const adopted: EpochContentHold[][] = [];
-		const released: EpochContentHold[] = [];
+		const adopted: EpochContentHold<EpochStoredContentRef>[][] = [];
+		const released: EpochContentHold<EpochStoredContentRef>[] = [];
 		const { hold, lease } = trackedLease(exactRef, { adopted, released });
 		let attached = false;
 		const adapter: PiHostAdapter = {
 			...piRpcAdapter,
 			decodeResponse(value, expectedCommand, context) {
-				return piRpcAdapter.decodeResponse(value, expectedCommand, {
-					signal: context?.signal ?? new AbortController().signal,
-				});
+				return piRpcAdapter.decodeResponse(value, expectedCommand, context);
 			},
 			async decodeUnsolicited(value, context) {
-				const outcome = await piRpcAdapter.decodeUnsolicited(value, {
-					signal: context?.signal ?? new AbortController().signal,
-				});
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				if (attached || outcome.value.kind !== "event" || outcome.value.event.type !== "agent_start") {
 					return outcome;
 				}
@@ -1020,8 +1036,8 @@ describe("SessionSupervisor", () => {
 		fs.mkdirSync(cwd);
 		const target = createNativeSession(root, cwd, "owned-stop-fence");
 		const exactRef = attachmentRef("e".repeat(64));
-		const adopted: EpochContentHold[][] = [];
-		const released: EpochContentHold[] = [];
+		const adopted: EpochContentHold<EpochStoredContentRef>[][] = [];
+		const released: EpochContentHold<EpochStoredContentRef>[] = [];
 		const { hold, lease } = trackedLease(exactRef, { adopted, released });
 		let releaseGate!: () => void;
 		const gated = new Promise<void>((resolve) => {
@@ -1062,8 +1078,8 @@ describe("SessionSupervisor", () => {
 		fs.mkdirSync(cwd);
 		const target = createNativeSession(root, cwd, "owned-stop-failure");
 		const exactRef = attachmentRef("f".repeat(64));
-		const adopted: EpochContentHold[][] = [];
-		const released: EpochContentHold[] = [];
+		const adopted: EpochContentHold<EpochStoredContentRef>[][] = [];
+		const released: EpochContentHold<EpochStoredContentRef>[] = [];
 		const { lease } = trackedLease(exactRef, { adopted, released });
 		const services = testPayloadServices(released);
 		const { supervisor } = createHarness({
@@ -1095,8 +1111,8 @@ describe("SessionSupervisor", () => {
 		fs.mkdirSync(cwd);
 		const other = createNativeSession(root, cwd, "retained-budget-other");
 		const exactRef = attachmentRef("c".repeat(64));
-		const adopted: EpochContentHold[][] = [];
-		const released: EpochContentHold[] = [];
+		const adopted: EpochContentHold<EpochStoredContentRef>[][] = [];
+		const released: EpochContentHold<EpochStoredContentRef>[] = [];
 		const { hold, lease } = trackedLease(exactRef, { adopted, released });
 		const { supervisor } = createHarness({
 			targets: [other],
@@ -1185,8 +1201,8 @@ describe("SessionSupervisor", () => {
 		const cwd = path.join(root, "workspace");
 		fs.mkdirSync(cwd);
 		const exactRef = attachmentRef("6".repeat(64));
-		const adopted: EpochContentHold[][] = [];
-		const released: EpochContentHold[] = [];
+		const adopted: EpochContentHold<EpochStoredContentRef>[][] = [];
+		const released: EpochContentHold<EpochStoredContentRef>[] = [];
 		const { hold, lease } = trackedLease(exactRef, { adopted, released });
 		const { supervisor } = createHarness({
 			targets: [],
@@ -1245,8 +1261,8 @@ describe("SessionSupervisor", () => {
 		const cwd = path.join(root, "workspace");
 		fs.mkdirSync(cwd);
 		const exactRef = attachmentRef("7".repeat(64));
-		const adopted: EpochContentHold[][] = [];
-		const released: EpochContentHold[] = [];
+		const adopted: EpochContentHold<EpochStoredContentRef>[][] = [];
+		const released: EpochContentHold<EpochStoredContentRef>[] = [];
 		const { hold, lease } = trackedLease(exactRef, { adopted, released });
 		const base = startupBaseAdapter(exactRef, lease);
 		let failEvents = false;
@@ -1361,8 +1377,8 @@ describe("SessionSupervisor", () => {
 		fs.mkdirSync(cwd);
 		const target = createNativeSession(root, cwd, "recoverable-owned-crash");
 		const exactRef = attachmentRef("d".repeat(64));
-		const adopted: EpochContentHold[][] = [];
-		const released: EpochContentHold[] = [];
+		const adopted: EpochContentHold<EpochStoredContentRef>[][] = [];
+		const released: EpochContentHold<EpochStoredContentRef>[] = [];
 		const { hold, lease } = trackedLease(exactRef, { adopted, released });
 		const { supervisor } = createHarness({
 			targets: [target],
@@ -1403,8 +1419,8 @@ describe("SessionSupervisor", () => {
 		fs.mkdirSync(cwd);
 		const target = createNativeSession(root, cwd, "owned-fatal-cleanup");
 		const exactRef = attachmentRef("1".repeat(64));
-		const adopted: EpochContentHold[][] = [];
-		const leaseReleased: EpochContentHold[] = [];
+		const adopted: EpochContentHold<EpochStoredContentRef>[][] = [];
+		const leaseReleased: EpochContentHold<EpochStoredContentRef>[] = [];
 		const first = trackedLease(exactRef, { adopted, released: leaseReleased });
 		const duplicate = trackedLease(exactRef, { adopted, released: leaseReleased });
 		let attachedEvent = false;
@@ -1412,9 +1428,7 @@ describe("SessionSupervisor", () => {
 		const adapter: PiHostAdapter = {
 			...base,
 			async decodeUnsolicited(value, context) {
-				const outcome = await piRpcAdapter.decodeUnsolicited(value, {
-					signal: context?.signal ?? new AbortController().signal,
-				});
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				if (attachedEvent || outcome.value.kind !== "event" || outcome.value.event.type !== "agent_end") {
 					return outcome;
 				}
@@ -1422,7 +1436,7 @@ describe("SessionSupervisor", () => {
 				return { value: outcome.value, lease: duplicate.lease };
 			},
 		};
-		const ownerReleased: EpochContentHold[] = [];
+		const ownerReleased: EpochContentHold<EpochStoredContentRef>[] = [];
 		const services = testPayloadServices(ownerReleased);
 		const { supervisor } = createHarness({
 			targets: [target],
@@ -1463,17 +1477,15 @@ describe("SessionSupervisor", () => {
 		fs.mkdirSync(cwd);
 		const target = createNativeSession(root, cwd, "active-owned-history");
 		const exactRef = attachmentRef("b".repeat(64));
-		const adopted: EpochContentHold[][] = [];
-		const released: EpochContentHold[] = [];
+		const adopted: EpochContentHold<EpochStoredContentRef>[][] = [];
+		const released: EpochContentHold<EpochStoredContentRef>[] = [];
 		const tracking = { adopted, released };
 		const { hold, lease } = trackedLease(exactRef, tracking);
 		let getMessagesCount = 0;
 		const adapter: PiHostAdapter = {
 			...piRpcAdapter,
 			async decodeResponse(value, expectedCommand, context) {
-				const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, {
-					signal: context?.signal ?? new AbortController().signal,
-				});
+				const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, context);
 				if (expectedCommand !== "get_messages") return outcome;
 				getMessagesCount += 1;
 				if (getMessagesCount !== 2 || outcome.value.success !== true) return outcome;
@@ -1534,22 +1546,18 @@ describe("SessionSupervisor", () => {
 		fs.mkdirSync(cwd);
 		const target = createNativeSession(root, cwd, "active-owned-event");
 		const exactRef = attachmentRef("c".repeat(64));
-		const adopted: EpochContentHold[][] = [];
-		const released: EpochContentHold[] = [];
+		const adopted: EpochContentHold<EpochStoredContentRef>[][] = [];
+		const released: EpochContentHold<EpochStoredContentRef>[] = [];
 		const tracking = { adopted, released };
 		const { hold, lease } = trackedLease(exactRef, tracking);
 		let attached = false;
 		const adapter: PiHostAdapter = {
 			...piRpcAdapter,
 			decodeResponse(value, expectedCommand, context) {
-				return piRpcAdapter.decodeResponse(value, expectedCommand, {
-					signal: context?.signal ?? new AbortController().signal,
-				});
+				return piRpcAdapter.decodeResponse(value, expectedCommand, context);
 			},
 			async decodeUnsolicited(value, context) {
-				const outcome = await piRpcAdapter.decodeUnsolicited(value, {
-					signal: context?.signal ?? new AbortController().signal,
-				});
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				if (outcome.value.kind !== "event" || outcome.value.event.type !== "agent_end" || attached) {
 					return outcome;
 				}
@@ -1617,17 +1625,15 @@ describe("SessionSupervisor", () => {
 		fs.mkdirSync(cwd);
 		const target = createNativeSession(root, cwd, "active-owned-compaction");
 		const exactRef = attachmentRef("d".repeat(64));
-		const adopted: EpochContentHold[][] = [];
-		const released: EpochContentHold[] = [];
+		const adopted: EpochContentHold<EpochStoredContentRef>[][] = [];
+		const released: EpochContentHold<EpochStoredContentRef>[] = [];
 		const tracking = { adopted, released };
 		const { hold, lease } = trackedLease(exactRef, tracking);
 		let getMessagesCount = 0;
 		const adapter: PiHostAdapter = {
 			...piRpcAdapter,
 			async decodeResponse(value, expectedCommand, context) {
-				const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, {
-					signal: context?.signal ?? new AbortController().signal,
-				});
+				const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, context);
 				if (expectedCommand !== "get_messages") return outcome;
 				getMessagesCount += 1;
 				if (getMessagesCount !== 2 || outcome.value.success !== true) return outcome;
@@ -1652,9 +1658,7 @@ describe("SessionSupervisor", () => {
 				return decoded;
 			},
 			decodeUnsolicited(value, context) {
-				return piRpcAdapter.decodeUnsolicited(value, {
-					signal: context?.signal ?? new AbortController().signal,
-				});
+				return piRpcAdapter.decodeUnsolicited(value, context);
 			},
 		};
 		const { supervisor } = createHarness({
@@ -1707,9 +1711,7 @@ describe("SessionSupervisor", () => {
 		const adapter: PiHostAdapter = {
 			...piRpcAdapter,
 			async decodeResponse(value, expectedCommand, context) {
-				const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, {
-					signal: context?.signal ?? new AbortController().signal,
-				});
+				const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, context);
 				if (expectedCommand !== "get_messages") return outcome;
 				getMessagesCount += 1;
 				if (getMessagesCount !== 2 || outcome.value.success !== true) return outcome;
@@ -1733,12 +1735,10 @@ describe("SessionSupervisor", () => {
 				};
 			},
 			decodeUnsolicited(value, context) {
-				return piRpcAdapter.decodeUnsolicited(value, {
-					signal: context?.signal ?? new AbortController().signal,
-				});
+				return piRpcAdapter.decodeUnsolicited(value, context);
 			},
 		};
-		const released: EpochContentHold[] = [];
+		const released: EpochContentHold<EpochStoredContentRef>[] = [];
 		const { supervisor } = createHarness({
 			targets: [target],
 			adapter,
@@ -3167,7 +3167,7 @@ describe("SessionSupervisor", () => {
 
 		await supervisor.activate(target.sessionHandle);
 		const runtime = exactRuntimeObject(supervisor, target.sessionHandle);
-		deliverCurrentExtension(runtime, {
+		deliverExtension(runtime, {
 			type: "extension_ui_request",
 			id: "same-dialog",
 			method: "confirm",
@@ -3178,7 +3178,7 @@ describe("SessionSupervisor", () => {
 		messages.length = 0;
 
 		expect(() =>
-			deliverCurrentExtension(runtime, {
+			deliverExtension(runtime, {
 				type: "extension_ui_request",
 				id: "same-dialog",
 				method: "confirm",
@@ -3217,7 +3217,7 @@ describe("SessionSupervisor", () => {
 		await supervisor.activate(target.sessionHandle);
 		const runtime = exactRuntimeObject(supervisor, target.sessionHandle);
 		for (const statusKey of ["oldest", "newer"]) {
-			deliverCurrentExtension(runtime, {
+			deliverExtension(runtime, {
 				type: "extension_ui_request",
 				id: `status-${statusKey}`,
 				method: "setStatus",
@@ -3226,7 +3226,7 @@ describe("SessionSupervisor", () => {
 			});
 		}
 		for (let index = 0; index < 6; index += 1) {
-			deliverCurrentExtension(runtime, {
+			deliverExtension(runtime, {
 				type: "extension_ui_request",
 				id: `notify-${String(index)}`,
 				method: "notify",
@@ -3244,7 +3244,7 @@ describe("SessionSupervisor", () => {
 		messages.length = 0;
 
 		expect(() =>
-			deliverCurrentExtension(runtime, {
+			deliverExtension(runtime, {
 				type: "extension_ui_request",
 				id: "status-next",
 				method: "setStatus",
@@ -3276,7 +3276,7 @@ describe("SessionSupervisor", () => {
 		await supervisor.activate(target.sessionHandle);
 		const runtime = exactRuntimeObject(supervisor, target.sessionHandle);
 		for (const statusKey of ["oldest", "newer"]) {
-			deliverCurrentExtension(runtime, {
+			deliverExtension(runtime, {
 				type: "extension_ui_request",
 				id: `status-${statusKey}`,
 				method: "setStatus",
@@ -3286,7 +3286,7 @@ describe("SessionSupervisor", () => {
 		}
 		messages.length = 0;
 
-		deliverCurrentExtension(runtime, {
+		deliverExtension(runtime, {
 			type: "extension_ui_request",
 			id: "status-next",
 			method: "setStatus",
@@ -3343,7 +3343,7 @@ describe("SessionSupervisor", () => {
 			Reflect.apply(originalEmit, undefined, [message]);
 		});
 
-		deliverCurrentExtension(runtime, {
+		deliverExtension(runtime, {
 			type: "extension_ui_request",
 			id: "waterline-dialog",
 			method: "confirm",
@@ -3366,7 +3366,7 @@ describe("SessionSupervisor", () => {
 
 		await supervisor.activate(target.sessionHandle);
 		const runtime = exactRuntimeObject(supervisor, target.sessionHandle);
-		deliverCurrentExtension(runtime, {
+		deliverExtension(runtime, {
 			type: "extension_ui_request",
 			id: "same-dialog",
 			method: "confirm",
@@ -3399,7 +3399,7 @@ describe("SessionSupervisor", () => {
 
 		try {
 			expect(() =>
-				deliverCurrentExtension(runtime, {
+				deliverExtension(runtime, {
 					type: "extension_ui_request",
 					id: "same-dialog",
 					method: "confirm",
@@ -3443,7 +3443,7 @@ describe("SessionSupervisor", () => {
 
 		await supervisor.activate(target.sessionHandle);
 		const runtime = exactRuntimeObject(supervisor, target.sessionHandle);
-		deliverCurrentExtension(runtime, {
+		deliverExtension(runtime, {
 			type: "extension_ui_request",
 			id: "same-dialog",
 			method: "confirm",
@@ -3460,7 +3460,7 @@ describe("SessionSupervisor", () => {
 		if (!oldEntry) throw new Error("Original dialog entry unavailable");
 		messages.length = 0;
 
-		deliverCurrentExtension(runtime, {
+		deliverExtension(runtime, {
 			type: "extension_ui_request",
 			id: "same-dialog",
 			method: "confirm",
@@ -3719,18 +3719,14 @@ describe("SessionSupervisor", () => {
 			? {
 					...piRpcAdapter,
 					decodeResponse(value, expectedCommand, context) {
-						return piRpcAdapter.decodeResponse(value, expectedCommand, {
-							signal: context?.signal ?? new AbortController().signal,
-						});
+						return piRpcAdapter.decodeResponse(value, expectedCommand, context);
 					},
 					decodeUnsolicited(value, context) {
-						return piRpcAdapter.decodeUnsolicited(value, {
-							signal: context?.signal ?? new AbortController().signal,
-						});
+						return piRpcAdapter.decodeUnsolicited(value, context);
 					},
 				}
 			: piRpcAdapter;
-		const released: EpochContentHold[] = [];
+		const released: EpochContentHold<EpochStoredContentRef>[] = [];
 		const { supervisor } = createHarness({
 			targets: [target],
 			adapter,
@@ -4432,8 +4428,8 @@ describe("SessionSupervisor", () => {
 		const cwd = path.join(root, "workspace");
 		fs.mkdirSync(cwd);
 		const parent = createNativeSession(root, cwd, "payload-transition-parent");
-		const adopted: EpochContentHold[][] = [];
-		const released: EpochContentHold[] = [];
+		const adopted: EpochContentHold<EpochStoredContentRef>[][] = [];
+		const released: EpochContentHold<EpochStoredContentRef>[] = [];
 		const tracking = { adopted, released };
 		const parentBase = trackedLease(attachmentRef("4".repeat(64)), tracking);
 		const staged = trackedLease(attachmentRef("5".repeat(64)), tracking);
@@ -4523,8 +4519,8 @@ describe("SessionSupervisor", () => {
 		const cwd = path.join(root, "workspace");
 		fs.mkdirSync(cwd);
 		const parent = createNativeSession(root, cwd, "payload-transition-applying-dialog");
-		const adopted: EpochContentHold[][] = [];
-		const released: EpochContentHold[] = [];
+		const adopted: EpochContentHold<EpochStoredContentRef>[][] = [];
+		const released: EpochContentHold<EpochStoredContentRef>[] = [];
 		const tracking = { adopted, released };
 		const parentBase = trackedLease(attachmentRef("8".repeat(64)), tracking);
 		const staged = trackedLease(attachmentRef("9".repeat(64)), tracking);
@@ -4609,8 +4605,8 @@ describe("SessionSupervisor", () => {
 		const cwd = path.join(root, "workspace");
 		fs.mkdirSync(cwd);
 		const parent = createNativeSession(root, cwd, "payload-transition-partial-drain");
-		const adopted: EpochContentHold[][] = [];
-		const released: EpochContentHold[] = [];
+		const adopted: EpochContentHold<EpochStoredContentRef>[][] = [];
+		const released: EpochContentHold<EpochStoredContentRef>[] = [];
 		const tracking = { adopted, released };
 		const parentBase = trackedLease(attachmentRef("0".repeat(64)), tracking);
 		const staged = trackedLease(attachmentRef("1".repeat(64)), tracking);
@@ -4674,8 +4670,8 @@ describe("SessionSupervisor", () => {
 		const cwd = path.join(root, "workspace");
 		fs.mkdirSync(cwd);
 		const parent = createNativeSession(root, cwd, "payload-transition-retired-failure");
-		const adopted: EpochContentHold[][] = [];
-		const released: EpochContentHold[] = [];
+		const adopted: EpochContentHold<EpochStoredContentRef>[][] = [];
+		const released: EpochContentHold<EpochStoredContentRef>[] = [];
 		const tracking = { adopted, released };
 		const parentBase = trackedLease(attachmentRef("4".repeat(64)), tracking);
 		const staged = trackedLease(attachmentRef("5".repeat(64)), tracking);
@@ -4731,8 +4727,8 @@ describe("SessionSupervisor", () => {
 		const cwd = path.join(root, "workspace");
 		fs.mkdirSync(cwd);
 		const parent = createNativeSession(root, cwd, `payload-parent-${_label}`);
-		const adopted: EpochContentHold[][] = [];
-		const released: EpochContentHold[] = [];
+		const adopted: EpochContentHold<EpochStoredContentRef>[][] = [];
+		const released: EpochContentHold<EpochStoredContentRef>[] = [];
 		const tracking = { adopted, released };
 		const parentBase = trackedLease(attachmentRef("8".repeat(64)), tracking);
 		const staged = trackedLease(attachmentRef("9".repeat(64)), tracking);
@@ -4797,8 +4793,8 @@ describe("SessionSupervisor", () => {
 		const cwd = path.join(root, "workspace");
 		fs.mkdirSync(cwd);
 		const parent = createNativeSession(root, cwd, "payload-transition-uncertain");
-		const adopted: EpochContentHold[][] = [];
-		const released: EpochContentHold[] = [];
+		const adopted: EpochContentHold<EpochStoredContentRef>[][] = [];
+		const released: EpochContentHold<EpochStoredContentRef>[] = [];
 		const tracking = { adopted, released };
 		const parentBase = trackedLease(attachmentRef("a".repeat(64)), tracking);
 		const staged = trackedLease(attachmentRef("b".repeat(64)), tracking);
@@ -5521,6 +5517,8 @@ describe("SessionSupervisor", () => {
 			releaseResolve = resolve;
 		});
 		const supervisor = new SessionSupervisor({
+			serverEpoch: "session-supervisor-test-epoch",
+			piPayloadServices: createCanonicalPayloadFixture("session-supervisor-test-epoch").supervisorServices,
 			resolved: {
 				command: process.execPath,
 				args: [fixturePath],

@@ -1,13 +1,10 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { FUTURE_SESSION_CONTENT_REF_BUDGET } from "@pi-agent-web/protocol";
+import { SESSION_CONTENT_REF_BUDGET } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import { EpochContentStore } from "../src/epoch-content-store.js";
-import {
-	createGatewayFuturePayloadActivation,
-	createGatewayPayloadActivation,
-} from "../src/gateway-payload-activation.js";
+import { createGatewayPayloadActivation } from "../src/gateway-payload-activation.js";
 
 describe("gateway payload activation", () => {
 	let webDataDir: string | undefined;
@@ -36,17 +33,17 @@ describe("gateway payload activation", () => {
 		store = new EpochContentStore({ webDataDir, serverEpoch: "future-epoch" });
 		await store.initialize();
 
-		const activation = createGatewayFuturePayloadActivation(store, "future-epoch");
+		const activation = createGatewayPayloadActivation(store, "future-epoch");
 
-		expect(activation.externalizer.mode).toBe("future_content");
+		expect(activation.externalizer.mode).toBe("content_ref");
 		expect(activation.externalizer.context).toBe(activation.context);
 		expect(activation.context).toEqual({
 			serverEpoch: "future-epoch",
 			payloadBudget: expect.any(Object),
-			contentRefBudget: FUTURE_SESSION_CONTENT_REF_BUDGET,
+			contentRefBudget: SESSION_CONTENT_REF_BUDGET,
 		});
 		expect(activation.supervisorServices.externalizer).toBe(activation.externalizer);
-		expect(activation.supervisorServices.productSchema.mode).toBe("future_content");
+		expect(activation.supervisorServices.productSchema.mode).toBe("content_ref");
 		expect(activation.supervisorServices.productSchema.serverEpoch).toBe("future-epoch");
 	});
 });

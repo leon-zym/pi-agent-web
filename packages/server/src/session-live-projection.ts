@@ -1,18 +1,18 @@
 import {
+	type ExtensionUiRequestDto,
 	type InlineSessionProjectionEventDto,
 	isPiExtensionUiRequestDto,
 	isPiProductSessionEventDto,
 	isPiSessionMessageDto,
 	isSessionAttachmentGuardContext,
-	type PiExtensionUiRequestDto,
-	type PiProductSessionEventDto,
-	type PiSessionMessageDto,
+	type ProductSessionEventDto,
 	SESSION_SNAPSHOT_MAX_BYTES,
 	SESSION_SNAPSHOT_MAX_EXTENSION_ITEMS,
 	SESSION_SNAPSHOT_MAX_MESSAGES,
 	SESSION_SNAPSHOT_MAX_PROJECTION_EVENTS,
 	SESSION_SNAPSHOT_MAX_QUEUE_ITEMS,
 	type SessionAttachmentGuardContext,
+	type SessionMessageDto,
 } from "@pi-agent-web/protocol";
 import {
 	SessionProductSchemaLogicalError,
@@ -55,9 +55,9 @@ export interface SessionLiveProjectionLimits {
 }
 
 export interface SessionLiveProjectionOptions<
-	TMessage = PiSessionMessageDto,
-	TEvent = PiProductSessionEventDto,
-	TExtensionRequest extends { readonly id: string; readonly method: string } = PiExtensionUiRequestDto,
+	TMessage = SessionMessageDto,
+	TEvent = ProductSessionEventDto,
+	TExtensionRequest extends { readonly id: string; readonly method: string } = ExtensionUiRequestDto,
 > {
 	identity: SessionLiveProjectionIdentity;
 	settledMessages?: readonly TMessage[];
@@ -70,8 +70,8 @@ export interface SessionLiveProjectionOptions<
 }
 
 export type SessionLiveProjectionInput<
-	TEvent = PiProductSessionEventDto,
-	TExtensionRequest = PiExtensionUiRequestDto,
+	TEvent = ProductSessionEventDto,
+	TExtensionRequest = ExtensionUiRequestDto,
 > =
 	| { type: "event"; event: TEvent }
 	| { type: "extension_ui_request"; request: TExtensionRequest }
@@ -81,15 +81,15 @@ export type SessionLiveProjectionInput<
 			reason: "answered" | "cancelled" | "expired" | "process_lost" | "replaced";
 	  };
 
-export type SessionLiveProjectionEventFrame<TEvent = PiProductSessionEventDto> = Omit<
+export type SessionLiveProjectionEventFrame<TEvent = ProductSessionEventDto> = Omit<
 	InlineSessionProjectionEventDto,
 	"event"
 > & { event: TEvent };
 
 export interface SessionLiveProjectionSnapshot<
-	TMessage = PiSessionMessageDto,
-	TEvent = PiProductSessionEventDto,
-	TExtensionRequest = PiExtensionUiRequestDto,
+	TMessage = SessionMessageDto,
+	TEvent = ProductSessionEventDto,
+	TExtensionRequest = ExtensionUiRequestDto,
 > extends SessionLiveProjectionIdentity {
 	baseSeq: number;
 	asOfSeq: number;
@@ -188,9 +188,9 @@ export class SessionLiveProjectionPayloadError extends Error {
  * ConversationProjection reducer and it never persists a second Session truth.
  */
 export class SessionLiveProjection<
-	TMessage = PiSessionMessageDto,
-	TEvent = PiProductSessionEventDto,
-	TExtensionRequest extends { readonly id: string; readonly method: string } = PiExtensionUiRequestDto,
+	TMessage = SessionMessageDto,
+	TEvent = ProductSessionEventDto,
+	TExtensionRequest extends { readonly id: string; readonly method: string } = ExtensionUiRequestDto,
 > {
 	private readonly identity: SessionLiveProjectionIdentity;
 	private readonly limits: SessionLiveProjectionLimits;

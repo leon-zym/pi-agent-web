@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { FUTURE_SESSION_CONTENT_REF_BUDGET, SESSION_PAYLOAD_BUDGET } from "@pi-agent-web/protocol";
+import { SESSION_CONTENT_REF_BUDGET, SESSION_PAYLOAD_BUDGET } from "@pi-agent-web/protocol";
 import { describe, expect, it, vi } from "vitest";
 import { EpochContentStoreError, type EpochStoredContentRef } from "../src/epoch-content-store.js";
 import {
@@ -20,14 +20,14 @@ function syncOutcome<T, TRef extends EpochStoredContentRef>(
 
 const piRpcAdapter = {
 	...outcomePiRpcAdapter,
-	decodeResponse(...args: Parameters<typeof outcomePiRpcAdapter.decodeResponse>) {
-		return syncOutcome(outcomePiRpcAdapter.decodeResponse(...args)).value;
+	decodeResponse(...args: Parameters<typeof outcomePiRpcAdapter.decodePiResponse>) {
+		return syncOutcome(outcomePiRpcAdapter.decodePiResponse(...args)).value;
 	},
 	decodeOrphanedResponse(...args: Parameters<typeof outcomePiRpcAdapter.decodeOrphanedResponse>) {
 		return syncOutcome(outcomePiRpcAdapter.decodeOrphanedResponse(...args)).value;
 	},
-	decodeUnsolicited(...args: Parameters<typeof outcomePiRpcAdapter.decodeUnsolicited>) {
-		return syncOutcome(outcomePiRpcAdapter.decodeUnsolicited(...args)).value;
+	decodeUnsolicited(...args: Parameters<typeof outcomePiRpcAdapter.decodePiUnsolicited>) {
+		return syncOutcome(outcomePiRpcAdapter.decodePiUnsolicited(...args)).value;
 	},
 };
 
@@ -69,15 +69,16 @@ const imageResponse = {
 	},
 } as const;
 
-const attachmentContext = { serverEpoch: "epoch", payloadBudget: SESSION_PAYLOAD_BUDGET } as const;
 const futureContext = {
-	...attachmentContext,
-	contentRefBudget: FUTURE_SESSION_CONTENT_REF_BUDGET,
+	serverEpoch: "epoch",
+	payloadBudget: SESSION_PAYLOAD_BUDGET,
+	contentRefBudget: SESSION_CONTENT_REF_BUDGET,
 } as const;
+const attachmentContext = futureContext;
 
 describe("Pi RPC adapter", () => {
 	it("keeps externalization disabled by default and carries an explicit null lease", () => {
-		const decoded = outcomePiRpcAdapter.decodeResponse(
+		const decoded = outcomePiRpcAdapter.decodePiResponse(
 			{ type: "response", id: "1", command: "get_state", success: true, data: state },
 			"get_state",
 		);
@@ -118,7 +119,8 @@ describe("Pi RPC adapter", () => {
 		const decoded = await outcomePiRpcAdapter.decodeUnsolicited(inline, {
 			signal,
 			externalizer: {
-				context: { serverEpoch: "epoch", payloadBudget: SESSION_PAYLOAD_BUDGET },
+				mode: "content_ref",
+				context: attachmentContext,
 				externalize,
 			},
 		});
@@ -137,7 +139,7 @@ describe("Pi RPC adapter", () => {
 			serverEpoch: "epoch",
 			sha256: "b".repeat(64),
 			encoding: "utf-8",
-			byteLength: FUTURE_SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes,
+			byteLength: SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes,
 		} as const;
 		const release = vi.fn(async () => {});
 		const lease = { refs: [ref], transfer: vi.fn(), release };
@@ -162,9 +164,9 @@ describe("Pi RPC adapter", () => {
 		}));
 		const signal = new AbortController().signal;
 
-		const outcome = await outcomePiRpcAdapter.decodeFutureUnsolicited(raw, {
+		const outcome = await outcomePiRpcAdapter.decodeUnsolicited(raw, {
 			signal,
-			externalizer: { mode: "future_content", context: futureContext, externalize },
+			externalizer: { mode: "content_ref", context: futureContext, externalize },
 		});
 
 		expect(externalize).toHaveBeenCalledWith({ kind: "event", value: raw }, signal);
@@ -182,9 +184,9 @@ describe("Pi RPC adapter", () => {
 	it("rejects a future response command mismatch before generic externalization", () => {
 		const externalize = vi.fn();
 		expect(() =>
-			outcomePiRpcAdapter.decodeFutureResponse(imageResponse, "prompt", {
+			outcomePiRpcAdapter.decodeResponse(imageResponse, "prompt", {
 				signal: new AbortController().signal,
-				externalizer: { mode: "future_content", context: futureContext, externalize },
+				externalizer: { mode: "content_ref", context: futureContext, externalize },
 			}),
 		).toThrowError(
 			expect.objectContaining({
@@ -201,7 +203,7 @@ describe("Pi RPC adapter", () => {
 			serverEpoch: "epoch",
 			sha256: "d".repeat(64),
 			encoding: "utf-8",
-			byteLength: FUTURE_SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes,
+			byteLength: SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes,
 		} as const;
 		const release = vi.fn(async () => {});
 		const lease = { refs: [ref], transfer: vi.fn(), release };
@@ -215,9 +217,9 @@ describe("Pi RPC adapter", () => {
 		const externalize = vi.fn(async () => ({ value: product, lease }));
 		const signal = new AbortController().signal;
 
-		const outcome = await outcomePiRpcAdapter.decodeFutureUnsolicited(request, {
+		const outcome = await outcomePiRpcAdapter.decodeUnsolicited(request, {
 			signal,
-			externalizer: { mode: "future_content", context: futureContext, externalize },
+			externalizer: { mode: "content_ref", context: futureContext, externalize },
 		});
 
 		expect(externalize).toHaveBeenCalledWith({ kind: "extension_ui_request", value: request }, signal);
@@ -232,7 +234,7 @@ describe("Pi RPC adapter", () => {
 			serverEpoch: "epoch",
 			sha256: "e".repeat(64),
 			encoding: "utf-8",
-			byteLength: FUTURE_SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes,
+			byteLength: SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes,
 		} as const;
 		const request = {
 			type: "extension_ui_request",
@@ -250,10 +252,10 @@ describe("Pi RPC adapter", () => {
 		]) {
 			const release = vi.fn(async () => {});
 			await expect(
-				outcomePiRpcAdapter.decodeFutureUnsolicited(request, {
+				outcomePiRpcAdapter.decodeUnsolicited(request, {
 					signal: new AbortController().signal,
 					externalizer: {
-						mode: "future_content",
+						mode: "content_ref",
 						context: futureContext,
 						externalize: async () => ({
 							value: product,
@@ -276,6 +278,7 @@ describe("Pi RPC adapter", () => {
 			outcomePiRpcAdapter.decodeResponse(imageResponse, "get_messages", {
 				signal: new AbortController().signal,
 				externalizer: {
+					mode: "content_ref",
 					context: attachmentContext,
 					externalize: async () => Promise.reject(failure),
 				},
@@ -293,10 +296,10 @@ describe("Pi RPC adapter", () => {
 			actual: 9,
 		});
 		await expect(
-			outcomePiRpcAdapter.decodeFutureResponse(imageResponse, "get_messages", {
+			outcomePiRpcAdapter.decodeResponse(imageResponse, "get_messages", {
 				signal: new AbortController().signal,
 				externalizer: {
-					mode: "future_content",
+					mode: "content_ref",
 					context: futureContext,
 					externalize: async () => Promise.reject(evidenced),
 				},
@@ -309,10 +312,10 @@ describe("Pi RPC adapter", () => {
 
 		const malformed = new PiPayloadExternalizationError("invalid_product_payload", "invalid future root");
 		await expect(
-			outcomePiRpcAdapter.decodeFutureResponse(imageResponse, "get_messages", {
+			outcomePiRpcAdapter.decodeResponse(imageResponse, "get_messages", {
 				signal: new AbortController().signal,
 				externalizer: {
-					mode: "future_content",
+					mode: "content_ref",
 					context: futureContext,
 					externalize: async () => Promise.reject(malformed),
 				},
@@ -326,15 +329,15 @@ describe("Pi RPC adapter", () => {
 			serverEpoch: "epoch",
 			sha256: "c".repeat(64),
 			encoding: "utf-8",
-			byteLength: FUTURE_SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes,
+			byteLength: SESSION_CONTENT_REF_BUDGET.inlineContentThresholdBytes,
 		} as const;
 		const release = vi.fn(async () => {});
 
 		await expect(
-			outcomePiRpcAdapter.decodeFutureResponse(imageResponse, "get_messages", {
+			outcomePiRpcAdapter.decodeResponse(imageResponse, "get_messages", {
 				signal: new AbortController().signal,
 				externalizer: {
-					mode: "future_content",
+					mode: "content_ref",
 					context: futureContext,
 					externalize: async () => ({
 						value: { ...imageResponse, data: { messages: "not-an-array" } },
@@ -361,6 +364,7 @@ describe("Pi RPC adapter", () => {
 			await outcomePiRpcAdapter.decodeResponse(imageResponse, "get_messages", {
 				signal: new AbortController().signal,
 				externalizer: {
+					mode: "content_ref",
 					context: attachmentContext,
 					externalize: async () => Promise.reject(failure),
 				},
@@ -383,6 +387,7 @@ describe("Pi RPC adapter", () => {
 				{
 					signal: new AbortController().signal,
 					externalizer: {
+						mode: "content_ref",
 						context: attachmentContext,
 						externalize: async () => Promise.reject(failure),
 					},
@@ -392,13 +397,10 @@ describe("Pi RPC adapter", () => {
 	});
 
 	it("validates and ignores orphaned responses without externalization", () => {
-		const externalize = vi.fn();
 		const outcome = outcomePiRpcAdapter.decodeOrphanedResponse(imageResponse, {
 			signal: new AbortController().signal,
-			externalizer: { context: attachmentContext, externalize },
 		});
 		expect(syncOutcome(outcome)).toEqual({ value: undefined, lease: null });
-		expect(externalize).not.toHaveBeenCalled();
 	});
 
 	it("releases a nonempty lease when trusted-context post-processing fails", async () => {
@@ -414,6 +416,7 @@ describe("Pi RPC adapter", () => {
 			outcomePiRpcAdapter.decodeResponse(imageResponse, "get_messages", {
 				signal: new AbortController().signal,
 				externalizer: {
+					mode: "content_ref",
 					context: attachmentContext,
 					externalize: async () => ({
 						value: { ...imageResponse, data: { messages: "not-an-array" } },
@@ -708,9 +711,9 @@ describe("Pi RPC adapter", () => {
 			assistantMessageEvent: { type: "toolcall_start", contentIndex: 0 },
 		};
 		expect(piRpcAdapter.decodeUnsolicited(piFrame)).toMatchObject({ kind: "event" });
-		expect(() => candidate.decodeUnsolicited(piFrame)).toThrowError(PiProtocolIncompatibleError);
+		expect(() => candidate.decodePiUnsolicited(piFrame)).toThrowError(PiProtocolIncompatibleError);
 
-		expect(syncOutcome(candidate.decodeUnsolicited(capturedCandidateFrame)).value).toMatchObject({
+		expect(syncOutcome(candidate.decodePiUnsolicited(capturedCandidateFrame)).value).toMatchObject({
 			kind: "event",
 			event: capturedCandidateFrame,
 		});

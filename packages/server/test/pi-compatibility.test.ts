@@ -56,12 +56,12 @@ describe("Pi compatibility fixtures", () => {
 
 			if (fixture.response) {
 				const response = readFixture(fixture.response) as { command: SessionCommandTypeDto };
-				const decoded = syncValue(adapter.decodeResponse(response, response.command));
+				const decoded = syncValue(adapter.decodePiResponse(response, response.command));
 				expect(decoded.value).toMatchObject({ command: response.command, success: true });
 				expect(decoded.lease).toBeNull();
 			}
 			if (fixture.event) {
-				const decoded = syncValue(adapter.decodeUnsolicited(readFixture(fixture.event)));
+				const decoded = syncValue(adapter.decodePiUnsolicited(readFixture(fixture.event)));
 				expect(decoded.value.kind).toBe("event");
 				if (fixture.status === "candidate") {
 					expect(decoded.value.kind === "event" && decoded.value.event).toMatchObject({
@@ -71,7 +71,7 @@ describe("Pi compatibility fixtures", () => {
 				}
 			}
 			if (fixture.extension) {
-				const decoded = syncValue(adapter.decodeUnsolicited(readFixture(fixture.extension)));
+				const decoded = syncValue(adapter.decodePiUnsolicited(readFixture(fixture.extension)));
 				expect(decoded.value).toMatchObject({
 					kind: "extension_ui_request",
 					request: { method: "confirm" },
@@ -85,7 +85,7 @@ describe("Pi compatibility fixtures", () => {
 		if (!compatibility) throw new Error("current fixture is missing from the matrix");
 		const adapter = createPiRpcAdapter("0.84.2", compatibility.capabilities);
 		expect(() =>
-			adapter.decodeUnsolicited({
+			adapter.decodePiUnsolicited({
 				type: "message_start",
 				message: { role: "user", content: 42, timestamp: 1 },
 			}),

@@ -556,7 +556,7 @@ function streamPrompt(command) {
 			type: "extension_ui_request",
 			id: `future-editor-${sessionId}`,
 			method: "editor",
-			title: "Future editor",
+			title: "Canonical editor",
 			prefill: "e".repeat(320 * 1024),
 		});
 		if (process.env.PI_WEB_FIXTURE_FUTURE_EDITOR_SETTLES === "1") {

@@ -1,25 +1,22 @@
 import type {
 	ExtensionUiRequestDto,
-	FutureExtensionUiRequestDto,
-	FutureProductSessionEventDto,
-	FutureSessionSnapshotDto,
-	FutureToolResultMessageDto,
 	ProductSessionEventDto,
 	SessionContentRefDto,
 	SessionExternalTextDto,
 	SessionRuntimeDto,
+	SessionSnapshotDto,
+	ToolResultMessageDto,
 } from "@pi-agent-web/protocol";
 import {
-	analyzeFutureExtensionUiRequestLogicalBytes,
-	FUTURE_SESSION_CONTENT_REF_BUDGET,
+	analyzeExtensionUiRequestLogicalBytes,
+	SESSION_CONTENT_REF_BUDGET,
 	SESSION_NORMALIZED_EVENT_MAX_BYTES,
 	SESSION_PAYLOAD_BUDGET,
 	SESSION_PI_SNAPSHOT_JSONL_MAX_BYTES,
 } from "@pi-agent-web/protocol";
 import { describe, expect, it } from "vitest";
 import {
-	createCurrentSessionProductSchema,
-	createFutureSessionProductSchema,
+	createSessionProductSchema,
 	SessionProductSchemaLogicalError,
 } from "../src/session-product-schema.js";
 
@@ -28,7 +25,7 @@ const serverEpoch = "schema-test-epoch";
 const futureContext = {
 	serverEpoch,
 	payloadBudget: SESSION_PAYLOAD_BUDGET,
-	contentRefBudget: FUTURE_SESSION_CONTENT_REF_BUDGET,
+	contentRefBudget: SESSION_CONTENT_REF_BUDGET,
 };
 
 function contentRef(byteLength: number, sha = "a"): SessionContentRefDto {
@@ -47,8 +44,8 @@ function externalText(byteLength: number, sha = "a"): SessionExternalTextDto {
 
 function toolResult(
 	text: string | SessionExternalTextDto,
-	details?: FutureToolResultMessageDto["details"],
-): FutureToolResultMessageDto {
+	details?: ToolResultMessageDto["details"],
+): ToolResultMessageDto {
 	return {
 		role: "toolResult",
 		toolCallId: "tool-1",
@@ -60,7 +57,7 @@ function toolResult(
 	};
 }
 
-function event(message: FutureToolResultMessageDto): FutureProductSessionEventDto {
+function event(message: ToolResultMessageDto): ProductSessionEventDto {
 	return { type: "message_end", message };
 }
 
@@ -80,7 +77,7 @@ function runtime(lastSeq: number): SessionRuntimeDto {
 	};
 }
 
-function snapshot(firstBytes: number, secondBytes: number): FutureSessionSnapshotDto {
+function snapshot(firstBytes: number, secondBytes: number): SessionSnapshotDto {
 	return {
 		type: "session_snapshot",
 		snapshotId: "snapshot-a",
@@ -100,80 +97,31 @@ function snapshot(firstBytes: number, secondBytes: number): FutureSessionSnapsho
 }
 
 describe("Session product schema", () => {
-	it("closes Extension request guards and logical accounting over the selected product family", () => {
-		const futureRequest = {
+	it("closes Extension request guards and logical accounting over the canonical product family", () => {
+		const request = {
 			type: "extension_ui_request",
-			id: "future-editor",
+			id: "canonical-editor",
 			method: "editor",
 			title: "Edit",
 			prefill: externalText(48 * MIB),
-		} satisfies FutureExtensionUiRequestDto;
-		const currentRequest = {
-			type: "extension_ui_request",
-			id: "current-editor",
-			method: "editor",
-			title: "Edit",
-			prefill: "inline",
 		} satisfies ExtensionUiRequestDto;
-		const future = createFutureSessionProductSchema(futureContext);
-		const current = createCurrentSessionProductSchema({
-			serverEpoch,
-			payloadBudget: SESSION_PAYLOAD_BUDGET,
-		});
+		const schema = createSessionProductSchema(futureContext);
 
-		expect(future.guardExtensionRequest(futureRequest)).toBe(true);
-		expect(future.extensionRequestLogicalBytes(futureRequest)).toBe(
-			analyzeFutureExtensionUiRequestLogicalBytes(futureRequest, {
+		expect(schema.guardExtensionRequest(request)).toBe(true);
+		expect(schema.extensionRequestLogicalBytes(request)).toBe(
+			analyzeExtensionUiRequestLogicalBytes(request, {
 				maxBytes: SESSION_PI_SNAPSHOT_JSONL_MAX_BYTES,
 			}).byteLength,
 		);
-		expect(current.guardExtensionRequest(futureRequest)).toBe(false);
-		expect(current.guardExtensionRequest(currentRequest)).toBe(true);
-		expect(current.extensionRequestLogicalBytes(currentRequest)).toBe(0);
-	});
-
-	it("snapshots a mutable current context before guards can observe caller changes", () => {
-		const mutableContext = {
-			serverEpoch,
-			payloadBudget: { ...SESSION_PAYLOAD_BUDGET },
-		};
-		const schema = createCurrentSessionProductSchema(mutableContext);
-		const value = {
-			type: "message_end",
-			message: {
-				role: "user",
-				content: [
-					{
-						type: "image",
-						data: {
-							type: "attachment_ref",
-							serverEpoch,
-							sha256: "c".repeat(64),
-							mediaType: "image/png",
-							byteLength: 4,
-						},
-						mimeType: "image/png",
-					},
-				],
-				timestamp: 1,
-			},
-		};
-		expect(schema.guardEvent(value)).toBe(true);
-
-		mutableContext.serverEpoch = "mutated-epoch";
-		mutableContext.payloadBudget.maxAttachmentBlobBytes = 1;
-
-		expect(schema.serverEpoch).toBe(serverEpoch);
-		expect(schema.guardEvent(value)).toBe(true);
 	});
 
 	it("snapshots a mutable future context for both guards and logical accounting", () => {
 		const mutableContext = {
 			serverEpoch,
 			payloadBudget: { ...SESSION_PAYLOAD_BUDGET },
-			contentRefBudget: { ...FUTURE_SESSION_CONTENT_REF_BUDGET },
+			contentRefBudget: { ...SESSION_CONTENT_REF_BUDGET },
 		};
-		const schema = createFutureSessionProductSchema(mutableContext);
+		const schema = createSessionProductSchema(mutableContext);
 		const value = event(toolResult(externalText(48 * MIB)));
 		const before = schema.activeTurnEventLogicalBytes(value);
 
@@ -194,10 +142,10 @@ describe("Session product schema", () => {
 				return epochReads === 1 ? serverEpoch : "changed-between-validation-and-capture";
 			},
 			payloadBudget: { ...SESSION_PAYLOAD_BUDGET },
-			contentRefBudget: { ...FUTURE_SESSION_CONTENT_REF_BUDGET },
+			contentRefBudget: { ...SESSION_CONTENT_REF_BUDGET },
 		};
 
-		const schema = createFutureSessionProductSchema(accessorContext);
+		const schema = createSessionProductSchema(accessorContext);
 
 		expect(epochReads).toBe(1);
 		expect(schema.serverEpoch).toBe(serverEpoch);
@@ -210,7 +158,7 @@ describe("Session product schema", () => {
 			{
 				serverEpoch,
 				payloadBudget: { ...SESSION_PAYLOAD_BUDGET },
-				contentRefBudget: { ...FUTURE_SESSION_CONTENT_REF_BUDGET },
+				contentRefBudget: { ...SESSION_CONTENT_REF_BUDGET },
 			},
 			"extra",
 			{
@@ -222,52 +170,17 @@ describe("Session product schema", () => {
 			},
 		);
 
-		expect(() => createFutureSessionProductSchema(contextWithExtra)).toThrow(TypeError);
+		expect(() => createSessionProductSchema(contextWithExtra)).toThrow(TypeError);
 		expect(extraRead).toBe(false);
-	});
-
-	it("rejects an extra current context key without invoking its getter", () => {
-		let extraRead = false;
-		const contextWithExtra = Object.defineProperty(
-			{ serverEpoch, payloadBudget: { ...SESSION_PAYLOAD_BUDGET } },
-			"extra",
-			{
-				enumerable: true,
-				get() {
-					extraRead = true;
-					throw new Error("must not read extra context fields");
-				},
-			},
-		);
-
-		expect(() => createCurrentSessionProductSchema(contextWithExtra)).toThrow(TypeError);
-		expect(extraRead).toBe(false);
-	});
-
-	it("keeps the current schema explicit and rejects future wrappers", () => {
-		const implicit = createCurrentSessionProductSchema();
-		const explicit = createCurrentSessionProductSchema({
-			serverEpoch,
-			payloadBudget: SESSION_PAYLOAD_BUDGET,
-		});
-		const currentEvent: ProductSessionEventDto = { type: "agent_start" };
-		const futureEvent = event(toolResult(externalText(MIB)));
-
-		expect(implicit.guardEvent(currentEvent)).toBe(true);
-		expect(explicit.guardEvent(currentEvent)).toBe(true);
-		expect(implicit.guardEvent(futureEvent)).toBe(false);
-		expect(explicit.guardEvent(futureEvent)).toBe(false);
-		expect(implicit.activeTurnEventLogicalBytes(currentEvent)).toBe(0);
-		expect(explicit.activeTurnEventLogicalBytes(currentEvent)).toBe(0);
 	});
 
 	it("keeps guard and logical accounting in one exact future-context schema", () => {
-		const schema = createFutureSessionProductSchema(futureContext);
+		const schema = createSessionProductSchema(futureContext);
 		const value = event(toolResult(externalText(48 * MIB)));
 
 		expect(schema.guardEvent(value)).toBe(true);
 		expect(
-			createFutureSessionProductSchema({ ...futureContext, serverEpoch: "other-epoch" }).guardEvent(value),
+			createSessionProductSchema({ ...futureContext, serverEpoch: "other-epoch" }).guardEvent(value),
 		).toBe(false);
 		expect(schema.activeTurnEventLogicalBytes(value)).toBeGreaterThan(48 * MIB);
 		expect(schema.activeTurnEventLogicalBytes(value)).toBeLessThanOrEqual(64 * MIB);
@@ -278,7 +191,7 @@ describe("Session product schema", () => {
 	});
 
 	it("charges every repeated root occurrence without digest deduplication", () => {
-		const schema = createFutureSessionProductSchema(futureContext);
+		const schema = createSessionProductSchema(futureContext);
 		const one = event(toolResult(externalText(20 * MIB)));
 		const repeated = event({
 			...toolResult(externalText(20 * MIB)),
@@ -295,7 +208,7 @@ describe("Session product schema", () => {
 	});
 
 	it("keeps nested wrapper lookalikes ordinary inside a closed inline JSON root", () => {
-		const schema = createFutureSessionProductSchema(futureContext);
+		const schema = createSessionProductSchema(futureContext);
 		const plain = event(toolResult("ok", { type: "inline_json", value: {} }));
 		const lookalike = event(
 			toolResult("ok", {
@@ -320,7 +233,7 @@ describe("Session product schema", () => {
 	});
 
 	it("admits exactly 64 MiB of active-turn logical bytes and rejects the next byte", () => {
-		const schema = createFutureSessionProductSchema(futureContext);
+		const schema = createSessionProductSchema(futureContext);
 		const baselineValue = event({
 			...toolResult(externalText(MIB, "a")),
 			content: [
@@ -354,7 +267,7 @@ describe("Session product schema", () => {
 	});
 
 	it("rejects future wrappers outside the closed reviewed slots", () => {
-		const schema = createFutureSessionProductSchema(futureContext);
+		const schema = createSessionProductSchema(futureContext);
 		const unreviewed = {
 			type: "message_end",
 			message: {
@@ -377,7 +290,7 @@ describe("Session product schema", () => {
 	});
 
 	it("enforces a separate exact 64 MiB logical snapshot boundary", () => {
-		const schema = createFutureSessionProductSchema(futureContext);
+		const schema = createSessionProductSchema(futureContext);
 		const baseline = schema.snapshotLogicalBytes(snapshot(MIB, MIB)) - 2 * MIB;
 		const remaining = SESSION_PI_SNAPSHOT_JSONL_MAX_BYTES - baseline;
 		const exact = snapshot(Math.floor(remaining / 2), Math.ceil(remaining / 2));

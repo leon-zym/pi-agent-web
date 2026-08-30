@@ -22,6 +22,7 @@ import {
 	SessionSupervisor,
 } from "../src/session-supervisor.js";
 import { WorkspacePreferences } from "../src/workspace-preferences.js";
+import { createCanonicalPayloadFixture } from "./helpers/canonical-payload.js";
 
 const fixturePath = path.join(import.meta.dirname, "fixtures", "session-runtime-pi.mjs");
 const temporaryRoots: string[] = [];
@@ -546,6 +547,8 @@ describe("native REST routes", () => {
 		const preference = preferences.upsert({ pathHint: workspace });
 		const catalog = new NativeSessionCatalog({ layoutResolver: resolver, preferences, cacheTtlMs: 0 });
 		const supervisor = new SessionSupervisor({
+			serverEpoch: "native-routes-test-epoch",
+			piPayloadServices: createCanonicalPayloadFixture("native-routes-test-epoch").supervisorServices,
 			resolved: {
 				command: process.execPath,
 				args: [fixturePath],
@@ -688,6 +691,9 @@ describe("native REST routes", () => {
 		const preference = preferences.upsert({ pathHint: workspace });
 		const catalog = new NativeSessionCatalog({ layoutResolver: resolver, preferences, cacheTtlMs: 0 });
 		const supervisor = new SessionSupervisor({
+			serverEpoch: "native-routes-transition-test-epoch",
+			piPayloadServices: createCanonicalPayloadFixture("native-routes-transition-test-epoch")
+				.supervisorServices,
 			resolved: {
 				command: process.execPath,
 				args: [fixturePath],

@@ -1,7 +1,7 @@
 import {
-	isExtensionUiRequestDto,
-	isProductSessionEventDto,
-	isSessionCommandResponseDto,
+	isPiExtensionUiRequestDto,
+	isPiProductSessionEventDto,
+	isPiSessionCommandResponseDto,
 } from "@pi-agent-web/protocol";
 import { describe, expect, it } from "vitest";
 import { isPiRpcRawEvent, isPiRpcRawExtensionUiRequest, isPiRpcRawResponse } from "../src/pi-rpc-wire.js";
@@ -37,9 +37,9 @@ describe("Pi RPC raw wire guards", () => {
 		expect(isPiRpcRawEvent(event)).toBe(true);
 		expect(isPiRpcRawExtensionUiRequest(extensionRequest)).toBe(true);
 		// Raw admission is deliberately separate from the Browser/Gateway DTO budget.
-		expect(isSessionCommandResponseDto(response)).toBe(false);
-		expect(isProductSessionEventDto(event)).toBe(false);
-		expect(isExtensionUiRequestDto(extensionRequest)).toBe(true);
+		expect(isPiSessionCommandResponseDto(response)).toBe(false);
+		expect(isPiProductSessionEventDto(event)).toBe(false);
+		expect(isPiExtensionUiRequestDto(extensionRequest)).toBe(true);
 		expect(isPiRpcRawExtensionUiRequest({ ...extensionRequest, prefill: largeInline })).toBe(false);
 	});
 
@@ -216,7 +216,7 @@ describe("Pi RPC raw wire guards", () => {
 		};
 
 		expect(isPiRpcRawEvent(event)).toBe(true);
-		expect(isProductSessionEventDto(event)).toBe(false);
+		expect(isPiProductSessionEventDto(event)).toBe(false);
 	});
 
 	it("does not widen generic raw text while image externalization is the only product scope", () => {
