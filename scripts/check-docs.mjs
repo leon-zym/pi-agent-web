@@ -8,7 +8,7 @@ const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url))
 const ignoredDirectories = new Set(["assets", "notes"]);
 const hanCharacters = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/u;
 const nonAsciiDashes = /[\u2013\u2014]/u;
-const staleDocumentNames = /(?:README\.zh-CN\.md|(?:^|[/(])DESIGN\.md)/u;
+const staleDocumentNames = /(?:^|[/(])DESIGN\.md/u;
 const markdownLink = /!?\[[^\]\n]*\]\((<[^>\n]+>|[^)\s]+)(?:\s+["'][^"']*["'])?\)/gu;
 const htmlLink = /(?:href|src)="([^"]+)"/gu;
 
@@ -68,8 +68,9 @@ async function main() {
 
 	for (const file of files) {
 		const content = await fs.readFile(file, "utf8");
+		const allowsHanCharacters = path.basename(file) === "README.zh-CN.md";
 		for (const [index, line] of content.split("\n").entries()) {
-			if (hanCharacters.test(line)) {
+			if (!allowsHanCharacters && hanCharacters.test(line)) {
 				violations.push({
 					sourceFile: file,
 					line: index + 1,

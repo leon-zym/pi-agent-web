@@ -33,7 +33,7 @@ function getTurnPrompt(turn: ProductTurn): string {
 }
 
 /**
- * Conversation outline rail (docs/design.md, Conversation surfaces):
+ * Conversation outline rail:
  * - Miniature vertical track on the right of the conversation column
  * - Tick marks for each User Turn
  * - Active turn tracking via IntersectionObserver

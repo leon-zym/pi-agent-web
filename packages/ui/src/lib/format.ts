@@ -232,7 +232,7 @@ function isMarkdownOnlyTailLine(line: string): boolean {
 }
 
 /**
- * Tail teaser summary for thinking settlement (docs/design.md, Conversation surfaces):
+ * Tail teaser summary for settled thinking:
  * extracts the last meaningful line or conclusion paragraph.
  */
 export function tailTeaser(text: string): string {

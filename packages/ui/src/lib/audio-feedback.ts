@@ -1,5 +1,5 @@
 /**
- * Native Web Audio API chime synthesis (docs/design.md, Motion and feedback).
+ * Native Web Audio API chime synthesis for optional status feedback.
  * Synthesizes pure sine tones directly without external audio assets.
  */
 

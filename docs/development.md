@@ -19,6 +19,14 @@ pnpm exec playwright install chromium
 Do not commit generated `dist`, `test-results`, Playwright output, credentials, private paths, real Pi
 history, or provider output.
 
+Generated local directories have separate purposes:
+
+- `test-results/` holds Playwright traces, screenshots, and benchmark JSON or Markdown artifacts.
+- `playwright-report/` is Playwright's optional HTML report, produced by the CI Browser reporter or
+  an explicit HTML reporter selection.
+- `tmp/` is reserved for disposable maintainer notes and local experiments. Project scripts use
+  operating-system temporary directories for isolated package and runtime fixtures.
+
 ## Root commands
 
 | Command | Purpose |
@@ -40,6 +48,24 @@ history, or provider output.
 Use package filters and focused test paths while iterating. Run the full risk-appropriate gate before
 handoff. Browser and benchmark suites start real local listeners and Chromium; do not run them
 concurrently across worktrees.
+
+## Repository scripts
+
+Root commands call small repository-specific scripts where package tooling does not cover the
+contract:
+
+| Script | Responsibility |
+| --- | --- |
+| `check-docs.mjs` | Enforce authority-language policy, reject stale document names, and verify local links |
+| `check-style.mjs` | Reject a short list of visual anti-patterns that bypass shared design tokens |
+| `check-ui-bundle-budget.mjs` | Enforce gzip ceilings for the entry, settled-Markdown, and CSS assets |
+| `clean-dist.mjs` | Remove one package's `dist` directory before rebuilding it |
+| `pack-smoke.mjs` | Pack, inspect, install, launch, authenticate, and probe the local distribution |
+| `run-performance-benchmarks.mjs` | Build and run one benchmark tier, then write reproducible artifacts |
+| `performance-benchmark-validator.mjs` | Recompute benchmark summaries and reject incomplete or inconsistent evidence |
+
+Keep these scripts narrow. Do not move ordinary lint, test, or build behavior into another custom
+runner.
 
 ## Verification layers
 

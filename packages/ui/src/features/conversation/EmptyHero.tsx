@@ -2,7 +2,7 @@ import { Bot } from "lucide-react";
 import { tt } from "../../lib/i18n";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
 
-/** Quiet empty state: no marketing hero, just orientation (docs/design.md). */
+/** Quiet empty state with orientation instead of marketing content. */
 export function EmptyHero() {
 	const hasWorkspace = useSessionDirectoryStore((s) => s.currentWorkspaceHandle !== null);
 	const hasSession = useSessionDirectoryStore((s) => s.currentSession !== null);

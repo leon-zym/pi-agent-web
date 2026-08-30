@@ -4,7 +4,7 @@ import path from "node:path";
 /**
  * Web Server configuration.
  *
- * Env contract (matches pi source; see docs/protocol.md for the full map):
+ * Pi directory environment contract:
  * - PI_CODING_AGENT_DIR: overrides the agent config dir (~/.pi/agent)
  * - PI_CODING_AGENT_SESSION_DIR: overrides the session root dir
  * The Web Server only reads these, never hardcodes paths, and passes them

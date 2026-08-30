@@ -16,7 +16,7 @@ export interface ReasoningDisclosureProps {
 }
 
 /**
- * Two-stage in-place thinking disclosure (docs/design.md, Conversation surfaces):
+ * Two-stage in-place thinking disclosure:
  * - Streaming: 5-line scrollable window (max-h-[110px]), auto-scrolled to bottom,
  *   with 2.6s .thinking-sweep signature motion.
  * - Settled: Collapses into tail teaser summary by default using CSS Grid transition.

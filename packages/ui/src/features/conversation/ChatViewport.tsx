@@ -104,7 +104,7 @@ function restoreSessionScroll(element: HTMLDivElement, saved: SavedSessionScroll
 }
 
 /**
- * Scroll container with pinned-follow semantics (docs/design.md): follow only
+ * Scroll container with pinned-follow semantics: follow only
  * while within 24px of the bottom; reading up pauses follow; a floating
  * button returns to the newest message.
  */

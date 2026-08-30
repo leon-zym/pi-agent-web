@@ -109,7 +109,7 @@ export interface DiffBlockProps {
 }
 
 /**
- * Line-level gutter and clean-copy behavior (docs/design.md, Conversation surfaces):
+ * Line-level gutter and clean-copy behavior:
  * - Dual-column Gutter (old line # / new line #) and +/- column
  * - Semantic row highlights (bg-success-soft/30 text-success / bg-danger-soft/30 text-danger)
  * - Top action bar with Clean Copy button (strips +/- markers) and Raw Diff Copy button

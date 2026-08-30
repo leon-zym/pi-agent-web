@@ -2,9 +2,10 @@
 
 Pi Agent Web is a local, Session-native workbench for Pi Coding Agent's RPC mode.
 
-## Read first
+## Documentation map
 
-- `README.md`: product boundary and quick start.
+Start with `README.md`, then open only the contract relevant to the task:
+
 - `docs/architecture.md`: identity, ownership, concurrency, and recovery.
 - `docs/protocol.md`: verified Pi RPC facts and the REST/WebSocket contract.
 - `docs/ui-ux.md`: user-visible behavior and accessibility.

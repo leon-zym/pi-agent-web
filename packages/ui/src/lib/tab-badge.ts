@@ -1,5 +1,5 @@
 /**
- * Background tab badge and title indicator (docs/design.md, Motion and feedback).
+ * Background tab badge and title indicator for optional status feedback.
  * Updates document.title and draws a status indicator dot on the favicon canvas when the tab is hidden.
  */
 

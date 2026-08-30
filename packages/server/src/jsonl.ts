@@ -25,8 +25,7 @@ export type JsonlLineConsumer = (line: string) => unknown;
 /**
  * Strict LF-only JSONL line reader.
  *
- * Semantically identical to pi's src/modes/rpc/jsonl.ts (see docs/protocol.md,
- * Appendix B):
+ * Semantically identical to Pi's RPC JSONL reader:
  * - Split on LF only; U+2028/U+2029 are legal inside JSON strings, so Node's
  *   readline must never be used.
  * - Tolerate a trailing \r (accept CRLF input).

@@ -40,7 +40,7 @@ function sessionTitle(session?: NativeSessionDto | null): string {
 }
 
 /**
- * 48px mobile header per docs/design.md, Application shell.
+ * Compact mobile header with primary navigation and Session actions.
  * Integrates workspace name, session title, status indicator, and switcher drawer trigger.
  * All interactive hit targets >= 40px.
  */

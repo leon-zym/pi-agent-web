@@ -1,5 +1,7 @@
 # Pi Agent Web
 
+English | [Chinese](README.zh-CN.md)
+
 Pi Agent Web is a local web workbench for Pi Coding Agent's RPC mode. It opens Pi's native JSONL
 Sessions, keeps active Sessions independent, and lets background work continue while the Browser
 moves between conversations.

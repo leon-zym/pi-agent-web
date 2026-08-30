@@ -60,7 +60,7 @@ function isValidFocusTarget(target: Element | null): target is HTMLElement {
 }
 
 /**
- * Three-column app shell with the squeeze policy from docs/design.md:
+ * Three-column app shell with a bounded squeeze policy:
  * details shrinks to 300, then moves into an overlay, and only then may the
  * center drop below 640. The sidebar can be manually reduced to a 56px rail
  * and does so automatically under 1024px.
@@ -94,7 +94,7 @@ export function AppShell() {
 		return () => observer.disconnect();
 	}, []);
 
-	// visualViewport adaptation prevents mobile keyboard shift (docs/design.md).
+	// visualViewport adaptation prevents mobile keyboard shift.
 	useEffect(() => {
 		if (typeof window === "undefined") return;
 		const vv = window.visualViewport;

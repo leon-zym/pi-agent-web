@@ -4,6 +4,10 @@ ADRs record decisions that change identity, process ownership, protocol ordering
 operations, or major UI performance strategy. Current contracts remain in the parent documentation;
 an ADR explains why the contract exists and which alternatives were rejected.
 
+Read superseded ADR text as historical context only. `docs/architecture.md`, `docs/protocol.md`,
+`docs/ui-ux.md`, and `docs/design.md` define current behavior; the newest accepted ADR wins when
+earlier records describe a different implementation.
+
 | ADR | Decision |
 |---|---|
 | [0001](0001-pi-native-identity.md) | Pi-native Session and Workspace identity |
