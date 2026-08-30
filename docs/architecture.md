@@ -202,16 +202,12 @@ Disk spool 只保存 blob 与校验所需的 manifest。Reservation、hold、pin
 digest 的并发写入只发布一个条目。未 publish 且没有 hold/pin 的条目会被回收，已 publish 且没有
 hold/pin 的条目可以由 GC 淘汰。
 
-Gateway 已提供同源、认证后的 attachment REST ingress，另有只读 generic content route：
+Gateway 只提供同源、认证后的 attachment 与 generic content 读取路由。Blob 只由 Gateway 内部的 Pi
+payload externalizer 写入 store，不存在 Browser 可调用的 attachment upload ingress：
 
-- `PUT /api/v1/attachments/:serverEpoch/:sha256` 接受 raw raster body。它在访问 store 前精确比较当前
-  epoch 和 64 位小写 digest，要求正的 safe-integer `Content-Length`、identity encoding，以及精确的
-  PNG、JPEG、WebP 或 GIF media type。新 digest 在读取 body 前 reservation，并在写盘时流式计算 digest
-  和实际长度；已有 exact metadata 的 digest 先 pin，再以固定内存完整重验 raster gross contract、length
-  与 SHA-256 后返回 200，不创建新 reservation。
 - `GET /api/v1/attachments/:serverEpoch/:sha256` 只在 URL epoch 等于当前 epoch 后按 digest pin 已发布
   内容。Pin 持续到 EOF、stream error 或 Browser cancel。`Range` 返回 416，`HEAD` 明确返回 405。
-- Raster admission 验证 media type、magic、最低 header/tail、gross container length/padding 和明显截断。
+- 内部 raster admission 验证 media type、magic、最低 header/tail、gross container length/padding 和明显截断。
   它不是 codec decoder，也不证明 PNG CRC、JPEG marker graph、WebP frame semantics、GIF sub-block graph
   或像素数据可解码。Browser preprocessing 与最终 Pi/provider 消费路径仍需处理 decode failure。
 

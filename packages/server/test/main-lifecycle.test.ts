@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { createConnection, createServer } from "node:net";
 import os from "node:os";
@@ -11,7 +10,6 @@ import { WorkspacePreferences } from "../src/workspace-preferences.js";
 
 const temporaryRoots: string[] = [];
 const fixturePath = path.join(import.meta.dirname, "fixtures", "session-runtime-pi.mjs");
-const PNG_HEADER = Buffer.from("89504e470d0a1a0a0000000d494844520000000100000001", "hex");
 
 function webpPayload(byteLength: number, fill: number): Buffer {
 	const payload = Buffer.alloc(byteLength, fill);
@@ -165,71 +163,6 @@ describe("production server lifecycle", () => {
 		await storeAfterServeFailure.shutdown();
 	});
 
-	it("force-closes an active streaming attachment upload within the shutdown bound", async () => {
-		const root = temporaryRoot();
-		const webDataDir = path.join(root, "web-data");
-		const handle = await startServerWithCurrentMode({
-			config: {
-				port: 0,
-				host: "127.0.0.1",
-				agentDir: path.join(root, "agent"),
-				sessionRootDir: path.join(root, "sessions"),
-				webDataDir,
-			},
-			piPath: fixturePath,
-			handleSignals: false,
-		});
-		const address = handle.server.address();
-		if (!address || typeof address === "string") throw new Error("server did not bind a TCP port");
-		const origin = `http://127.0.0.1:${String(address.port)}`;
-		const bootstrap = await fetch(`${origin}/api/v1/bootstrap`, { headers: { Origin: origin } });
-		const cookie = bootstrap.headers.get("set-cookie")?.split(";", 1)[0];
-		if (!cookie) throw new Error("bootstrap did not issue a cookie");
-		const stageEntered = deferred();
-		const allowStage = deferred();
-		const realStage = handle.contentStore.stage.bind(handle.contentStore);
-		handle.contentStore.stage = async (input) => {
-			stageEntered.resolve();
-			await allowStage.promise;
-			return realStage(input);
-		};
-		const socket = createConnection({ host: "127.0.0.1", port: address.port });
-		socket.on("error", () => undefined);
-		await new Promise<void>((resolve) => socket.once("connect", resolve));
-		await new Promise<void>((resolve, reject) => {
-			socket.write(
-				[
-					`PUT /api/v1/attachments/${handle.serverEpoch}/${"0".repeat(64)} HTTP/1.1`,
-					`Host: 127.0.0.1:${String(address.port)}`,
-					`Origin: ${origin}`,
-					`Cookie: ${cookie}`,
-					"Content-Type: image/png",
-					`Content-Length: ${String(8 * 1024 * 1024)}`,
-					"Connection: keep-alive",
-					"",
-					"",
-				].join("\r\n"),
-			);
-			socket.write(PNG_HEADER, (error) => (error ? reject(error) : resolve()));
-		});
-		await stageEntered.promise;
-		const socketClosed = new Promise<void>((resolve) => socket.once("close", () => resolve()));
-
-		const startedAt = Date.now();
-		const closing = handle.close();
-		allowStage.resolve();
-		await closing;
-		await socketClosed;
-		expect(Date.now() - startedAt).toBeLessThan(1_000);
-		expect(socket.destroyed).toBe(true);
-
-		const replacement = new WorkspacePreferences(webDataDir);
-		replacement.close();
-		const replacementStore = new EpochContentStore({ webDataDir, serverEpoch: "replacement" });
-		await replacementStore.initialize();
-		await replacementStore.shutdown();
-	});
-
 	it("waits for WebSocket and runtime shutdown before releasing preferences", async () => {
 		const root = temporaryRoot();
 		const webDataDir = path.join(root, "web-data");
@@ -328,16 +261,13 @@ describe("production server lifecycle", () => {
 			expect(handle.config.webDataDir).toBe(canonicalWebDataDir);
 			const { origin, headers } = await authenticatedOrigin(handle);
 			const bytes = webpPayload(256 * 1024, 7);
-			const sha256 = createHash("sha256").update(bytes).digest("hex");
-			const uploaded = await fetch(`${origin}/api/v1/attachments/${handle.serverEpoch}/${sha256}`, {
-				method: "PUT",
-				headers: {
-					...headers,
-					"Content-Type": "image/webp",
-				},
-				body: bytes,
+			const staged = await handle.contentStore.stage({
+				source: Readable.from([bytes]),
+				mediaType: "image/webp",
 			});
-			expect(uploaded.status).toBe(201);
+			await handle.contentStore.publish(staged.hold);
+			await handle.contentStore.release(staged.hold);
+			const sha256 = staged.ref.sha256;
 			const stale = await fetch(`${origin}/api/v1/attachments/old-epoch/${sha256}`, { headers });
 			expect(stale.status).toBe(410);
 
@@ -356,16 +286,13 @@ describe("production server lifecycle", () => {
 			expect(collected).toEqual({ bytes: bytes.byteLength, items: 1 });
 
 			const largeBytes = webpPayload(8 * 1024 * 1024, 9);
-			const largeDigest = createHash("sha256").update(largeBytes).digest("hex");
-			const largeUpload = await fetch(`${origin}/api/v1/attachments/${handle.serverEpoch}/${largeDigest}`, {
-				method: "PUT",
-				headers: {
-					...headers,
-					"Content-Type": "image/webp",
-				},
-				body: largeBytes,
+			const largeStaged = await handle.contentStore.stage({
+				source: Readable.from([largeBytes]),
+				mediaType: "image/webp",
 			});
-			expect(largeUpload.status).toBe(201);
+			await handle.contentStore.publish(largeStaged.hold);
+			await handle.contentStore.release(largeStaged.hold);
+			const largeDigest = largeStaged.ref.sha256;
 			const pinEntered = deferred();
 			const pinReleased = deferred();
 			let activePin: Awaited<ReturnType<typeof handle.contentStore.pinByDigest>>["pin"] | undefined;
