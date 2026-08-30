@@ -97,7 +97,7 @@ export type ComposerKeyAction =
 	| { type: "none" };
 
 /**
- * Keybinding arbitration state machine (DESIGN.md Section 6.2):
+ * Keybinding arbitration state machine (docs/design.md, Composer and controls):
  * - Idle + Normal: Enter sends prompt, Shift+Enter wraps.
  * - Idle + 70vh: Enter wraps, Cmd/Ctrl+Enter sends prompt.
  * - Running + Normal: Enter steers, Cmd/Ctrl+Enter follow_up.

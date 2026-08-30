@@ -55,7 +55,7 @@ type GroupedBlockItem =
 
 /**
  * One assistant response step: blocks in source order, then tool results.
- * Text blocks sit on the 748px reading axis; no bubble (DESIGN.md).
+ * Text blocks sit on the reading axis without a bubble (docs/design.md).
  * When settled, >2 consecutive tool calls are aggregated into a ToolGroupView.
  */
 export const AssistantStepView = memo(function AssistantStepView({

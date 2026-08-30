@@ -42,7 +42,7 @@ export function formatToolGroupSummary(
 }
 
 /**
- * Settled ToolGroup Aggregation & Stacked Layout (DESIGN.md Section 5.3):
+ * Settled tool aggregation and stacked layout (docs/design.md, Conversation surfaces):
  * - Aggregates >2 consecutive tool calls in settled steps into a single collapsible row.
  * - Expands into a stacked layout with 1px hairline dividers, rounded-t-md on first item,
  *   rounded-none on middle items, and rounded-b-md on last item.

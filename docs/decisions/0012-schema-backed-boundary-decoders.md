@@ -1,6 +1,6 @@
 # ADR 0012: Schema-backed boundary decoders for Pi compatibility
 
-- Status: Accepted
+- Status: Superseded by ADR 0013
 - Date: 2026-08-30
 
 ## Context

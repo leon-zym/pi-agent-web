@@ -75,7 +75,7 @@ export function ComposerCommandToken({
 }
 
 /**
- * Persistent sticky composer (DESIGN.md Section 6):
+ * Persistent sticky composer (docs/design.md, Composer and controls):
  * - Floating capsule card with 70vh immersive mode toggle
  * - Queue dock above, toolbar below
  * - Keybinding arbitration state machine for Steer / Follow-up / Multiline wrap

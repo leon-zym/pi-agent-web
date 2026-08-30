@@ -1,6 +1,6 @@
 # ADR 0010: Epoch-scoped attachment references and payload budgets
 
-- Status: Accepted (amended)
+- Status: Accepted; Browser/Gateway activation wording amended by ADR 0013
 - Date: 2026-08-27
 - Amended: 2026-08-28
 

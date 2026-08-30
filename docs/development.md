@@ -1,342 +1,163 @@
-# 开发：工具链、测试与发布门禁
+# Development
 
-## 环境
+This document defines the supported toolchain, verification layers, CI, packaging, and release
+checks. It is intentionally operational. Product behavior belongs in the other current contracts.
 
-- Node.js 22+；pnpm 11.21.0（以根 `packageManager` 为准）。
-- 一个可解析的 Pi runtime；开发与确定性测试使用 fake Pi，不需要 Provider credential。
-- Chromium 由 Playwright 管理。编辑器使用 Biome；项目不使用 ESLint/Prettier。
+## Environment
+
+- Node.js 22 or later
+- pnpm 11.21.0 through Corepack or an equivalent pinned installation
+- Chromium installed through Playwright for Browser tests
+- a compatible Pi runtime for local use; deterministic CI does not require provider credentials
 
 ```bash
+corepack enable
 pnpm install --frozen-lockfile
-pnpm dev                    # protocol build + server :3000 + Vite :5173
-pnpm build                  # 四个 package 的发行产物
-pnpm start                  # build 后由 pi-web 提供单端口 SPA/REST/WS
+pnpm exec playwright install chromium
 ```
 
-Vite 只接受同源的 `/api` 与 `/api/v1/ws` 请求，再代理到 `127.0.0.1:3000` 并把 Host/Origin 收敛为
-Gateway 同源值；Gateway 本身没有开发端口 allowlist，因此 production/packaged 启动不会信任
-`:5173`。
+Do not commit generated `dist`, `test-results`, Playwright output, credentials, private paths, real Pi
+history, or provider output.
 
-根 `pnpm start` 参数放在 `--` 之后，例如：
+## Root commands
 
-```bash
-pnpm start -- --pi-path /path/to/rpc-entry.js --port 3100 --no-open
-```
+| Command | Purpose |
+| --- | --- |
+| `pnpm dev` | Build protocol, then run Gateway and Vite development servers |
+| `pnpm build` | Build all packages and enforce the UI bundle budget |
+| `pnpm lint` | Run package lint, Biome, style, and documentation guards |
+| `pnpm typecheck` | Build shared boundaries and typecheck packages plus Browser tests |
+| `pnpm test` | Run deterministic package test suites |
+| `pnpm verify` | Lint, types, benchmark-validator tests, package tests, and production build |
+| `pnpm test:smoke` | Exercise authenticated REST and WebSocket with deterministic Pi |
+| `pnpm test:browser` | Build and run the packaged Playwright suite |
+| `pnpm test:compat` | Run exact-version Pi adapter fixtures and conformance |
+| `pnpm test:pack` | Pack, install, inspect, and launch the four local packages |
+| `pnpm bench:representative` | Run the reproducible representative performance matrix |
+| `pnpm bench:stress` | Run the explicit long-running stress matrix |
+| `PI_WEB_RUN_E2E=1 pnpm test:e2e:real` | Run explicit credential-bearing real-Pi acceptance |
 
-CLI 只接受 `127.0.0.1`、`localhost` 或 `::1`。
+Use package filters and focused test paths while iterating. Run the full risk-appropriate gate before
+handoff. Browser and benchmark suites start real local listeners and Chromium; do not run them
+concurrently across worktrees.
 
-## 根命令
+## Verification layers
 
-| 命令 | 作用 | Credential |
-|---|---|---|
-| `pnpm lint` | 全 package Biome + root scripts/e2e files | 无 |
-| `pnpm typecheck` | 先 build protocol/server，再检查四包与 E2E TS | 无 |
-| `pnpm test` | protocol/server/UI/CLI 确定性测试 | 无 |
-| `pnpm build` | 清理并生成发行 dist，并检查 UI gzip bundle 预算 | 无 |
-| `pnpm check:bundle` | 单独检查已生成 UI 产物的 gzip bundle 预算 | 无 |
-| `pnpm verify` | lint → typecheck → test → build | 无 |
-| `pnpm test:smoke` | fake Pi 的 authenticated REST/WS gateway smoke | 无 |
-| `pnpm test:browser` | production build + packaged Chromium black-box | 无 |
-| `pnpm test:e2e` | `test:browser` 的用户友好别名 | 无 |
-| `pnpm test:pack` | 四 tarball → install → bin/npx help + bin 启动工作台 | 无 |
-| `pnpm test:compat` | 锁定 Pi 版本的 current/candidate fixture、resolver、adapter 与 upstream conformance | 无 |
-| `pnpm test:e2e:real` | 默认明确 skip；显式运行真实 Pi/provider compatibility | 有，release only |
-| `pnpm bench:representative` | production Chromium 代表性性能/正确性矩阵与 JSON/Markdown 产物 | 无 |
-| `pnpm bench:stress` | 手动压力矩阵；64 MiB 边界、8 Session、100 次恢复试验 | 无 |
-| `pnpm --filter @pi-agent-web/ui bench:conversation` | scheduler 与 Markdown benchmark | 无 |
-| `pnpm --filter @pi-agent-web/protocol bench:schema` | 产品/Pi wire 边界 schema 与 decoder benchmark | 无 |
+### Unit and property tests
 
-Focused Vitest 可以在 package 内传文件：
+Pure guards, reducers, identities, policies, byte accounting, and state machines should have direct
+tests. Filesystem, clock, process, and transport seams are injected where practical so edge cases do
+not depend on local state.
 
-```bash
-pnpm --filter @pi-agent-web/server exec vitest run test/session-supervisor.test.ts
-pnpm --filter @pi-agent-web/server exec vitest run test/epoch-content-store.test.ts
-pnpm --filter @pi-agent-web/server exec vitest run test/attachment-routes.test.ts test/main-lifecycle.test.ts
-pnpm --filter @pi-agent-web/server exec vitest run \
-  test/pi-rpc-wire.test.ts test/pi-payload-externalizer.test.ts
-pnpm --filter @pi-agent-web/server exec vitest run \
-  test/pi-process.test.ts test/generation-content-owner.test.ts
-pnpm --filter @pi-agent-web/server exec vitest run \
-  test/transition-payload-ledger.test.ts test/session-live-projection.test.ts
-pnpm --filter @pi-agent-web/server exec vitest run test/payload-reference-gateway.integration.test.ts
-pnpm --filter @pi-agent-web/ui exec vitest run \
-  test/session-transport.test.ts test/projection.test.ts test/user-message-bubble.test.tsx
-pnpm exec playwright test --config tests/e2e/playwright.config.ts multi-session.spec.ts
-```
+### Server integration
 
-Focused 绿灯不是 release gate；修改完成后仍按风险运行上层组合。
+Server tests exercise actual Session supervision, JSONL parsing, replay, control fencing, resource
+custody, recovery, native discovery, deletion, and authenticated routes with deterministic process
+fixtures.
 
-## 测试层级
+Architecture, protocol, transport, deletion, or Session-scope changes require both focused
+invariants and an upper-layer integration or Browser regression. A shallow smoke test is not enough.
 
-| 层 | 目标 | 主要证据 |
-|---|---|---|
-| L0 静态 | 类型、格式、browser/server 包边界、可构建产物 | lint、typecheck、build |
-| L1 单元 | guards、LF reader、identity、layout、reducer、scheduler、formatter | package Vitest |
-| L2 模块集成 | 文件、process group、runtime pool、rekey、trash、shutdown | server fixtures + Vitest |
-| L3 Gateway 黑盒 | Cookie/Origin/Host、REST+real WS、lease/fencing/replay/dialog/backpressure | gateway/security/bridge tests + smoke |
-| L4 Packaged browser | 用户操作、同 Workspace 多 Session、后台运行、image-only、typed content refs、responsive、console errors | Playwright `test:browser` |
-| L5 Real Pi | fake 无法证明的 upstream/provider/multimodal/queue/fork 兼容性 | opt-in `test:e2e:real` |
-| L6 视觉/性能 | light/dark/mobile/zoom/states、长流公平性、Markdown/DOM profile | screenshots + benchmark |
-| L7 分发 | tarball contents、依赖可发布性、bin/npx、single port、clean dist | `verify` + smoke + pack |
+### Deterministic Browser E2E
 
-架构或协议改动至少要有 L1/L2 不变式与 L3/L4 中一条用户路径。UI shell/composer 改动不能用
-reducer 单测代替 browser bounding-box/console 断言。删除、process 或 shutdown 改动必须覆盖 race 和
-失败恢复；不能只检查 happy path。
+Playwright launches the production Gateway and UI against deterministic Pi fixtures. The suite
+covers navigation, multiple Sessions, streaming, recovery, Extension UI, attachments and typed
+content, large history, responsive layouts, accessibility regressions, and runtime resilience.
 
-资源治理改动还必须覆盖共享边界，而非只覆盖单连接 happy path：多连接 admission/snapshot
-coalescing、慢客户端与 catch-up storm、热 Runtime pressure、目录 unchanged-file cache、append/inode
-replacement、预算截断、partial/stale/retryable 诊断，以及 Browser 对 protected overage 与 retryable
-rejection 的区分。
+Tests must assert product behavior rather than incidental animation frames. Use stable readiness and
+projection barriers. Keep test data free of credentials, user history, and private paths. Record
+traces on failure; keep screenshots only when they provide durable visual evidence.
 
-Protocol 1.3、shared content store 与 REST 变更至少覆盖以下边界：
+### Real Pi acceptance
 
-- Store 测试验证 raster 与 `utf8` namespace 的 exact epoch/digest/length identity、pre-read reservation、
-  48 MiB content 与 8 MiB raster blob ceiling、共享 64 MiB/256 item cache、streaming digest/length、同
-  bytes dedupe、hold/publish/pin/release/GC、temp cleanup、path/symlink/manifest/inode 防护，以及 lifecycle
-  lock、tombstone 和 shutdown race。Route 测试还要证明 raster exact-metadata PUT 快路径先 pin，使用固定
-  内存重验完整 gross contract/length/SHA-256，content route 则只允许 authenticated GET。测试不能把整段
-  request body 读入内存来替代 streaming seam。
-- Route 测试验证 auth、旧 epoch 和非法 digest 在触碰 store 前失败，required `Content-Length`、identity
-  encoding、allowlisted raster MIME、magic/gross container/truncation、canonical admission evidence、
-  201/200 并发语义、GET safety headers、明确拒绝 Range/HEAD，以及真实 HTTP client abort 后 pin release。
-- Main lifecycle 测试用 entered gate 证明 active PUT/GET 已进入 store，不使用固定 sleep 猜测时序。Shutdown
-  顺序必须是 ingress、Supervisor、content store、preferences；store failure 仍要释放 preferences，startup
-  init/bind failure 仍要释放已经取得的锁。
+Real-Pi tests are explicit because they can use the developer's configured provider credentials.
+They create isolated temporary Workspace, Session, Browser-data, and Pi Agent roots. Only the
+minimum required authentication and model configuration is copied into the private temporary Agent
+root. Existing Pi history, extensions, settings, and project data are not loaded or modified.
 
-Raster fixtures 只证明 Gateway admission 的 MIME、magic、gross container 与 truncation 边界，不宣称图片
-通过真实 decoder。Browser preprocessing 已用原生 decode seam 覆盖；server-private adapter externalizer
-复用同一 raster admission，并验证 canonical base64、decoded/blob ceiling、同帧去重、单 Buffer streaming
-与整帧 rollback。Typed externalizer 另验证 text/JSON bounded encoding、256 KiB threshold、48 MiB root、
-inline_json/external_json、root-only provenance 和 opaque nested lookalike。PiProcess 与 Runtime 测试覆盖
-late/deadline/stale/orphan disposal，startup、普通 response/event、idle compaction、generation cleanup、
-fork/clone/rekey ownership，以及 cleanup rejection 的永久 fence。Production Main 通过一个 activation root
-把相同 store、epoch、两套 budget context 与 Pi payload services 接到 REST、Supervisor 和 WebSocket hello。
-L3 real HTTP/WS integration 已验证大 tool result 在 live/replay/snapshot/history response 中只以 typed
-reference 出现，认证 content GET 返回原 UTF-8 bytes，stop 后 hold/GC 清理完成。L4 packaged Browser coverage
-验证 trusted-context projection/render、collapsed Tool 不 GET、expand/Inspector lazy materialization、
-Extension eager roots、精确失败 recovery 和 inline-only command ingress。
+The lane verifies the upstream boundary with concurrent Sessions, streaming follow-up and abort,
+image input, rekey, fork or clone behavior, isolation, and RPC metadata. A release report states
+whether it ran and why it was skipped if the explicit environment was unavailable.
 
-## 确定性 browser E2E
+## Performance evidence
 
-`tests/e2e` 启动 build 后的真实 CLI、Hono、WebSocket 与 SPA，只替换 Pi RPC child。Harness 为每个
-case 建立隔离的 agent/session/web/workspace/control 目录，并从 child env 过滤 credential-like 变量。
+`pnpm bench:representative` runs a bounded production-Chromium matrix and writes strict JSON plus
+derived Markdown under `test-results/performance`. The artifact validator rejects missing scenarios,
+invalid metrics, wrong tier labels, and incomplete outputs.
 
-当前必须覆盖：
+The representative matrix targets high-value risks:
 
-- cold bootstrap，无 console/page error；
-- 同一 Workspace 的两个独立 Pi PID/Session 并发；A 后台流式时选择并完成 B，再切回 A；
-- image-only prompt 后同一 multiplexed socket 仍能发下一条 command；
-- Pi output attachment/content reference 通过同源认证 URL 渲染；失效 reference 触发精确、单次 resync；
-- collapsed Tool 不发 content GET，展开或打开 Inspector 后才 GET；replay、snapshot、history response 仍保留 lazy reference；
-- Extension editor、set_editor_text 与 widget root 在 semantic state/seq commit 前 eager materialize；
-- hot Runtime inventory 在后台运行、waiting UI、idle 与多 Runtime pressure 下持续发布一致的
-  phase/operationCount/busyReasons；普通订阅超出 soft target 时显示 protected 或可重试拒绝，而不
-  静默取消后台 Session；
-- 404/410、错误 metadata、malformed UTF-8、JSON parse 与 slot guard failure 不产生空值或 inline fallback；
-- stale Session/generation/epoch、Abort、disconnect、rekey、unmount 与 late completion 不触发 recovery，也不污染当前选中 Session；
-- 结构化 payload admission failure 显示本地化文案并保留 draft/images，重试成功后才清空；
-- ordinary first prompt 不被标成 steer，真实 event order 不留下空 Working step；
-- 375×812 没有页面水平 overflow，composer 主控件 bounding box 都在 viewport。
+- concurrent Session publication and Browser fairness;
+- long streaming with structural flush boundaries;
+- large native history and incremental Browser loading;
+- replay, resync, crash recovery, and stale mutation rejection;
+- large typed content references near declared limits;
+- bounded projection, queue, and materialization behavior.
 
-失败时 Playwright 保存 screenshot 与 trace 到 `test-results/browser-e2e`；CI 只在失败时上传并保留
-7 天。Fixture 文案、路径和截图不得包含维护者数据。
+`pnpm bench:stress` extends duration and load and runs only by explicit request or manual CI. It is
+not a substitute for deterministic correctness.
 
-## 真实 Pi 验收
+This is Issue #28 Phase 1 and remains incomplete. Structural checks and declared artifact shape are
+hard gates. Host-sensitive latency, throughput, long-task, and heap measurements are observations
+until the project publishes a reference-host baseline and variance policy. A green run proves only
+the declared scenarios.
 
-运行方式：
+When changing a targeted optimization, add a reproducible scenario only if it guards a real product
+risk. Do not create a generic benchmark framework or convert unstable workstation timing into a
+release promise.
 
-```bash
-PI_WEB_RUN_E2E=1 pnpm test:e2e:real
+## Visual verification
 
-# 可选：指定已配置且支持图片的 provider/model
-PI_WEB_RUN_E2E=1 \
-PI_WEB_E2E_IMAGE_MODEL=provider/model \
-pnpm test:e2e:real
-```
+Use the matrix in [Visual design](design.md). At minimum, inspect changed surfaces in both themes,
+both product locales, keyboard and coarse-pointer modes, reduced motion, and relevant narrow and
+wide widths.
 
-规则：
-
-- 使用 `mkdtemp` 的 Workspace、Session root、Web data 与 Pi Agent root；只把现有 `auth.json` 和
-  `models.json` 白名单复制到权限为 `0700` 的临时 Agent 目录（文件为 `0600`），不加载用户的
-  `settings.json`、扩展、技能或 prompt。
-- 开始前记录真实 `settings.json` 的路径/目标元数据与内容哈希，所有 Pi 子进程退出后再次比对；任何
-  差异都令验收失败，测试绝不通过 snapshot/restore 覆盖并发用户修改。
-- 允许使用复制后的 Pi authentication 发请求，但不扫描、修改或删除用户旧 JSONL。
-- 不打印 key、Cookie、fencing token、私人 prompt/history 或 provider raw payload。
-- 测试自己生成小图片与唯一 marker；清理只针对已验证的临时根。
-- 未设置 opt-in 时输出明确 SKIPPED；已经 opt-in 却找不到配置好的 image-capable model 时必须失败，
-  不得空洞 0-exit 假装通过。
-- Release 记录通过的 provider/model 与场景，不记录 credential。
-
-当前 suite 验证一条 socket 上两个 Session 并发、image-only、typed content 内容隔离、streaming `follow_up`、
-abort、clone rekey/generation、父子 history isolation，以及 stats/tree/commands；release gate 还覆盖
-Extension editor、set_editor_text 与 widget 的 eager materialization、content GET 认证与失败 recovery。
-
-## Conversation 性能
-
-```bash
-pnpm --filter @pi-agent-web/ui bench:conversation
-```
-
-Benchmark 至少报告：10k sequential reducer、scheduler coalescing、多 Session 公平性，以及大 GFM/code
-settlement。它是诊断数据，不是跨机器的绝对通过阈值。原始 profile 和候选库对比放在 gitignored
-`tmp/`；稳定决策写入 `docs/decisions/0005-conversation-rendering.md`。
-
-必须保持的语义门禁：
-
-- 同显示帧连续 compatible delta 至多一次 publication；
-- hidden tab 用 bounded timer 最终追上；
-- structural/error/settled/rekey/dialog boundary 不延迟；
-- 一个高频 Session 不饿死其他 Session；
-- 用户上翻不被吸底，settled Markdown 仍有完整 GFM/code 语义。
-- 流式 Markdown 不进入 settled 全文解析器；超过 256 KiB UTF-8 的 settled 文本走完整可选取纯文本降级；
-- 长历史首屏最多挂载 64 个 Turn，旧/新历史按 24 个分页，prepend、resize、selection 和 focus 保持稳定；
-- TOC 每个 User Turn 保留一个轻量刻度，未挂载 Turn 由窗口 reveal 后再滚动。
-
-当前选择的是 bounded older-history window，而非固定高度的 full virtualization；这是针对生产
-Chromium 中 DOM/layout 压力的最小实现。只有候选 renderer 在真实长 Markdown、Unicode、unfinished
-fence、GFM、highlight、DOM stability 上有证据时才替换当前 renderer。
-
-生产 Chromium 性能门禁：
-
-```bash
-pnpm build
-pnpm exec playwright test --config tests/e2e/playwright.config.ts conversation-performance.spec.ts
-pnpm exec playwright test --config tests/e2e/playwright.config.ts conversation-window.spec.ts
-```
-
-性能 fixture 固定覆盖 10 KiB、64 KiB、120 KiB、1 MiB；live long task 上限为 200ms，cold/warm
-settlement 上限为 2,000/1,500ms，mounted Turn 上限为 64，强制 GC 后 heap delta 上限为 64MiB。
-性能测试中的大文本只在页面内读取长度/形状，不能把完整文本通过测试协议反复搬运，否则会污染
-heap 测量。
-
-`pnpm build` 同时执行 gzip bundle 门禁：entry JavaScript ≤240 KiB、lazy settled-Markdown
-JavaScript ≤110 KiB、全部 UI CSS ≤12 KiB。需要单独复核已生成产物时可运行 `pnpm check:bundle`。
-
-Protocol schema benchmark 是兼容性升级 lane 的性能证据，不把跨机器的绝对延迟伪装成稳定门禁。
-在同一环境比较同名 fixture 时，升级候选的中位吞吐预算为不得比记录基线下降超过 20%；若超过预算，
-先检查 schema 是否重复遍历或把资源/语义校验错误地移入通用 validator，再决定是否晋级。当前 registry
-只做浅层 envelope 形状检查，UTF-8、item、depth、identity、resource budget 与脱敏仍由边界 guard 和
-PiHostAdapter 负责。
-
-### Issue #28 Phase 1 / incomplete：可复现 performance matrix
-
-根命令从 clean checkout 构建 production 产物，启动隔离 Gateway/fake Pi/Chromium，最后严格校验每个
-预期场景都产生非空结果。Phase 1 matrix 通过只证明其中声明的场景，不代表 #28 已完成：
-
-```bash
-pnpm bench:representative
-pnpm bench:stress
-```
-
-产物写入 gitignored `test-results/performance/<tier>/`：
-
-- `benchmark.json`：schema version、commit/dirty state、OS/CPU/memory、Node/Playwright/Chromium、完整
-  workload 参数、warmup/sample、raw metrics、median/p95/max、门禁和已知 coverage gap；
-- `benchmark.md`：便于人工读取的短表，不是另一份事实来源；
-- `raw/*.json`：逐场景原始样本；Playwright failure 另保留 screenshot/trace。
-
-Runner 会拒绝 skip、空样本、缺场景、重复/额外场景、schema 错误、非有限 gated sample、汇总不一致和
-hard gate failure。每次运行都重新构建 production 产物；不存在把 stale `dist` 标记为当前 commit 的
-skip-build 路径。
-
-`representative` 是可在 PR CI 承受的 120 KiB/1 MiB streaming、1/4 Session、65 MiB native
-history、disconnect/gap、Pi crash/restart 和近上限 Browser image→typed attachment ref round trip。
-`stress` 扩展为 10/64/120 KiB/1 MiB、1/4/8 Session、small/below/at/above 64 MiB、恢复各 100 次和
-更多样本；它由手动 workflow 运行，不属于每次 PR 的隐式成本。
-
-只有确定性 correctness 与结构性质作为 portable hard gate，例如 Browser 实际 frame 到达与投影、
-streaming→settled DOM 边界、分页内容、post-crash command barrier、旧 generation/fence 拒绝、并发
-Session 持续 ingest，以及 DOM/socket/process 数量边界。first-paint、absolute latency、throughput、
-long-task 和 heap 等对硬件、调度与 GC 敏感的样本，在建立同机 reference baseline、容差与足够重复数前
-只记录为 observe；不得作为共享 CI 的 release hard failure。真实数值必须从同次产物读取。
-`matrix.json` 中声明的 coverage gap 不得从 Markdown 汇总中省略。
-
-三类性能证据不可互换：Vitest microbenchmark 用于定位 reducer/schema 热点；reference-host 数值用于
-同机候选对比；portable hard gate 只用于确定性 correctness 和结构边界。
-
-Phase 1 尚未覆盖的主要类别包括 Gateway restart、慢 raw client 与 history/command 并发公平性、future
-private content refs、Browser 发起的 history cancellation 及释放观测、持续 60 秒的 1,000 delta/s、
-真实 provider/reference host，以及多 Browser/adversarial backpressure。在这些证据补齐并重新验收前，
-#28 保持 open；即便产物显示 `8/8`，也只能解释为 Phase 1 声明的八个场景通过。
-
-## 视觉验收
-
-使用 production build 与隔离 deterministic fixture；不要把开发者的真实 Session 当 demo 数据。
-最小矩阵见 `DESIGN.md`。操作并截图后逐项检查：
-
-- selected/background Session identity 与 runtime state；
-- composer send/stop、附件、model/context 在 375px 的实际 bounding box；
-- Details 初始关闭、上下文打开、固定 reopen 入口；
-- observer、waiting_ui、crashed、resync、no-model 与 context unavailable；
-- focus-visible、keyboard-only、reduced motion、200% zoom；
-- ANSI/control chars、绝对路径、credential、私人标题与真实 Provider 输出均不存在。
-
-截图不是测试替代品；功能/边界使用 Playwright assertion，审美与信息层级使用视觉 review。
+Exercise empty, streaming, settled, failed, blocked, recovering, long-content, overlay, and
+software-keyboard states where relevant. Check focus restoration, clipping, overlap, scroll
+anchoring, background Session continuity, and critical action reachability.
 
 ## CI
 
-GitHub Actions 使用 Node 22、pnpm 11.21.0，不读取 Pi credential 或用户目录：
+The main CI workflow has three independent jobs:
 
-1. `pnpm install --frozen-lockfile`；
-2. `pnpm verify`、`pnpm test:smoke`、`pnpm test:pack`；
-3. 独立 browser job 安装 Chromium 并运行 `pnpm test:browser`；
-4. 独立 performance job 运行 `pnpm bench:representative` 并始终上传 JSON/Markdown/raw 产物；
-5. 手动 `Performance stress` workflow 运行 `pnpm bench:stress`；在 reference host 建立稳定耗时与预算前
-   不启用定时压力任务；
-6. 同一 ref 的旧 run 会被取消；browser failure 上传 trace/screenshot。
+1. deterministic `verify`, authenticated smoke, and package smoke;
+2. packaged Browser E2E with failure traces;
+3. the representative performance matrix with artifacts.
 
-Real Pi/provider 与人工视觉检查只在本地 release 执行，不能成为隐式 CI dependency。
+Pi compatibility has a separate exact-version workflow. The stress matrix is manual. Real-Pi
+acceptance is never an implicit CI dependency.
 
-## 打包与发布
+## Packaging
 
-Runtime 由 `@pi-agent-web/protocol`、`server`、`ui`、`cli` 四包组成。`test:pack` 在临时目录创建
-tarball，检查 LICENSE/repository 元数据、拒绝残留 `workspace:*`；安装后由 bin 与等价本地 npx
-验证 `--help`。随后从安装目录外、受控且没有 `pi` 的 PATH 启动绝对 CLI entry，断言 Gateway 发现
-发行依赖的 bundled Pi、readiness/hello 元数据正确，并实际创建空 Session 完成 `get_state`。
-确定性的 fake child/RPC 路径由 `test:smoke` 验证。Build 在 tsc 前清理 `dist`，避免删除源码后
-孤儿 JS 泄漏进 tarball。
+The workspace contains protocol, server, UI, and CLI packages. `pnpm test:pack` creates local
+tarballs in a temporary directory, checks package contents and dependency edges, installs them,
+verifies the CLI help path, and launches the installed single-port workbench.
 
-公开源码与发布 npm 包是两个门槛。除非 registry 中真的存在对应版本，不要把
-`npx --yes @pi-agent-web/cli` 写成可用安装方式。
+The packages are not published to npm. Passing package smoke proves local distribution integrity;
+it does not imply registry publication or a stable public release.
 
-Release 前从干净 clone 运行：
+## Release gate
+
+Before a release-related handoff:
 
 ```bash
-pnpm install --frozen-lockfile
 pnpm verify
 pnpm test:smoke
+pnpm test:compat
 pnpm test:browser
 pnpm test:pack
-PI_WEB_RUN_E2E=1 pnpm test:e2e:real  # 有 credential 的显式 compatibility gate
+pnpm bench:representative
 ```
 
-同时完成最终截图、安全内容扫描、文档 consistency grep、版本/tag/change record；任何跳过的 L5/L6
-场景必须写原因。
+Also inspect the final diff, repository status, package contents, Browser artifacts, benchmark
+artifact, and documentation links. Report the exact real-Pi outcome. Do not close a tracked issue
+until its accepted behavior is on the shipped branch and deferred work is explicitly recorded.
 
-Activation commit 的文档门禁还要确认：active 文档与 ADR 0011 都写 minor 3、双 capability、两套完整
-budget、shared `EpochContentStore`、root-only materialization、exact identity/Abort/barrier/recovery 和
-Extension eager roots；不能把 1.2 写成当前 production，也不能留下未完成占位或 per-connection inline
-fallback。本仓库没有独立 Markdown linter，因此至少运行 `pnpm check:style`、`pnpm lint`、Markdown 结构
-检查（如环境提供）与 `git diff --check`。
+## Code and commit conventions
 
-## 代码与提交约定
-
-- Biome tabs、110 columns、文件末尾换行；comments English。
-- UI copy 先加 `src/lib/i18n/zh-CN.ts` id，再在 `en.ts` 同形镜像；非 React 模块用 `tt()`。
-- 上游 Pi wire types 只能停留在 server adapter/native integration；Browser↔Gateway DTO、decoders
-  与 guards 由 protocol 自有，protocol/UI 不依赖任何 `@earendil-works/pi-*` package。
-- Components 只读 stores；socket ingestion 留在 transport/frame bus/pipeline。
-- Conventional Commits，按可验证切片提交，例如：
-
-```text
-feat(server): supervise Pi at Session granularity
-fix(ui): preserve background Session projections
-perf(ui): coalesce compatible streaming deltas
-test(e2e): cover concurrent native Sessions
-docs: record Session runtime decisions
-```
-
-临时审计与 benchmark raw output 可以放 gitignored `tmp/`。GitHub Issues 是唯一的待办、排序与完成
-状态来源；决定延期的永久产品工作建 GitHub Issue，包含用户问题、成功条件、非目标、安全/性能边界与
-测试层级。不要在仓库内维护第二份待办清单，也不要把一次性 audit 原样提交为公共契约。
+- Use tabs and Biome. Do not add ESLint or Prettier.
+- Keep Browser-safe code in protocol and Node-specific code in server.
+- Prefer explicit state machines, bounded ownership, and pure reducers over generic frameworks.
+- Treat untrusted values at their first authoritative boundary.
+- Use Conventional Commits and keep stages independently reviewable.
+- Preserve unrelated worktree changes and never hide a skipped or failed gate.

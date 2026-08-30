@@ -10,7 +10,7 @@ import { cn } from "../../lib/utils";
 import type { UiUserMessage } from "../../types/view-models";
 
 /**
- * Right-aligned light-blue bubble (DESIGN.md): max 525px, 22px radius,
+ * Right-aligned semantic user bubble (docs/design.md): max 525px, 22px radius,
  * queued injections carry a 插队/排队 badge.
  */
 interface UserMessageBubbleProps {

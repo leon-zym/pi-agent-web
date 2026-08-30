@@ -618,7 +618,7 @@ function AddWorkspaceDialog({
 }
 
 /**
- * Workspace / session browser (DESIGN.md): expanded 280px tree or 56px rail.
+ * Workspace and Session browser (docs/design.md): expanded tree or 56px rail.
  * Rows are hover-fill only; the selected session gets a 2px primary bar.
  */
 interface WorkspaceSidebarProps {

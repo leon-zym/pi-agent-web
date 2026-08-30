@@ -1,6 +1,6 @@
 # ADR 0011: Epoch-scoped typed content references
 
-- Status: Accepted and activated
+- Status: Accepted and activated; compatibility wording amended by ADR 0013
 - Date: 2026-08-28
 
 Protocol 1.3 activation is part of the same release change as this document update. The accepted

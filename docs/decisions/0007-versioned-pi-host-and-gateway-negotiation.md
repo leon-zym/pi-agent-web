@@ -1,6 +1,6 @@
 # ADR 0007: Versioned Pi host and Gateway negotiation
 
-- Status: Accepted
+- Status: Accepted; Browser/Gateway compatibility policy amended by ADR 0013
 - Date: 2026-08-25
 
 ## Context

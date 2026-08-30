@@ -676,7 +676,7 @@ export function DebugEventsRegion({
 }
 
 /**
- * Right details panel (DESIGN.md): inspector / conversation tree / debug drawer.
+ * Right details panel (docs/design.md): inspector, conversation tree, and debug drawer.
  * The column width is owned by AppShell; closing keeps this subtree mounted.
  */
 export function DetailsPanel({ open, onToggle }: { open: boolean; onToggle: () => void }) {

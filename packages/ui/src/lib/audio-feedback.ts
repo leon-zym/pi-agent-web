@@ -1,5 +1,5 @@
 /**
- * Native Web Audio API chime synthesis (DESIGN.md 8.2).
+ * Native Web Audio API chime synthesis (docs/design.md, Motion and feedback).
  * Synthesizes pure sine tones directly without external audio assets.
  */
 
