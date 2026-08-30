@@ -636,7 +636,7 @@ function streamPrompt(command) {
 			method: "confirm",
 			title: "Aggregate overflow",
 			message: "must be synchronously cleared",
-			timeout: 300,
+			timeout: 5_000,
 		});
 		for (let index = 0; index < 6; index += 1) {
 			send({

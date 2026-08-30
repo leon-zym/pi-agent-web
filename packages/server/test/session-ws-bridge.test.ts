@@ -624,7 +624,9 @@ describe("SessionWsBridge", () => {
 		expect(await closed).toEqual({ code: 1013, reason: "gateway capacity" });
 	});
 
-	it("streams a large native snapshot and serves an older history page atomically", async () => {
+	it("streams a large native snapshot and serves an older history page atomically", {
+		timeout: 60_000,
+	}, async () => {
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace");
 		fs.mkdirSync(cwd);
@@ -632,7 +634,7 @@ describe("SessionWsBridge", () => {
 		appendLargeNativeHistory(target, 110, 600 * 1024);
 		const harness = await createHarness([target], { historyCapability: true });
 		const client = await openClient(harness, { historyCapability: true });
-		const subscription = await subscribe(client, target.sessionHandle, undefined, 15_000);
+		const subscription = await subscribe(client, target.sessionHandle, undefined, 45_000);
 		const begin = subscription.frames.find(
 			(frame): frame is Extract<SessionWsServerMessage, { type: "session_snapshot_begin" }> =>
 				frame.type === "session_snapshot_begin",

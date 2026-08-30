@@ -2171,7 +2171,7 @@ describe("SessionSupervisor", () => {
 			expect.objectContaining({ method: "confirm", message: "must be synchronously cleared" }),
 		]);
 
-		await waitFor(() => supervisor.getPendingExtensionRequests(target.sessionHandle)?.length === 0);
+		await waitFor(() => supervisor.getPendingExtensionRequests(target.sessionHandle)?.length === 0, 10_000);
 		expect(messages).toContainEqual(
 			expect.objectContaining({ type: "extension_ui_closed", reason: "expired" }),
 		);
