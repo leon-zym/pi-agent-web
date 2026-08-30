@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { validateBenchmarkArtifacts } from "./performance-benchmark-validator.mjs";
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(scriptDirectory, "..");
@@ -58,43 +59,20 @@ const playwrightStatus = run(
 );
 
 const expectedScenarios = matrix.tiers[tier].scenarios;
-const expectedIds = expectedScenarios.map((scenario) => scenario.id).sort();
-const validationErrors = [];
-const results = [];
+const parseErrors = [];
+const artifacts = [];
 for (const entry of fs.readdirSync(rawDirectory, { withFileTypes: true })) {
 	if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
 	const resultPath = path.join(rawDirectory, entry.name);
 	try {
-		const result = JSON.parse(fs.readFileSync(resultPath, "utf8"));
-		if (result.schemaVersion !== 1) throw new Error("schemaVersion must be 1");
-		if (result.tier !== tier) throw new Error(`tier must be ${tier}`);
-		if (typeof result.scenarioId !== "string") throw new Error("scenarioId must be a string");
-		if (!Array.isArray(result.trials)) throw new Error("trials must be an array");
-		if (!Array.isArray(result.gates)) throw new Error("gates must be an array");
-		const definition = expectedScenarios.find((scenario) => scenario.id === result.scenarioId);
-		if (!definition) throw new Error("scenario is not present in the checked matrix");
-		const expectedTrials = definition.warmups + definition.samples;
-		if (result.trials.length !== expectedTrials) {
-			throw new Error(`recorded ${String(result.trials.length)} trials; expected ${String(expectedTrials)}`);
-		}
-		if (result.trials.filter((trial) => !trial.warmup).length !== definition.samples) {
-			throw new Error(`measured sample count must be ${String(definition.samples)}`);
-		}
-		if (result.gates.length === 0) throw new Error("scenario has no gates");
-		results.push(result);
+		artifacts.push({ name: entry.name, value: JSON.parse(fs.readFileSync(resultPath, "utf8")) });
 	} catch (error) {
-		validationErrors.push(`${entry.name}: ${error instanceof Error ? error.message : String(error)}`);
+		parseErrors.push(`${entry.name}: ${error instanceof Error ? error.message : String(error)}`);
 	}
 }
-results.sort((left, right) => left.scenarioId.localeCompare(right.scenarioId));
-const actualIds = results.map((result) => result.scenarioId).sort();
-for (const id of expectedIds) {
-	if (!actualIds.includes(id)) validationErrors.push(`missing scenario artifact: ${id}`);
-}
-for (const id of actualIds) {
-	if (!expectedIds.includes(id)) validationErrors.push(`unexpected scenario artifact: ${id}`);
-}
-if (new Set(actualIds).size !== actualIds.length) validationErrors.push("duplicate scenario artifacts");
+const validated = validateBenchmarkArtifacts({ matrix, tier, artifacts });
+const validationErrors = [...parseErrors, ...validated.errors];
+const results = validated.results;
 
 const commit = commandOutput("git", ["rev-parse", "HEAD"]);
 const dirty = commandOutput("git", ["status", "--porcelain"], "") !== "";
