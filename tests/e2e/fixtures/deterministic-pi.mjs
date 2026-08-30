@@ -1965,13 +1965,23 @@ function handleLine(line) {
 								name: "review",
 								description: "Review the current implementation",
 								source: "prompt",
-								sourceInfo: { path: "/synthetic/review.md" },
+								sourceInfo: {
+									path: "/synthetic/review.md",
+									source: "synthetic",
+									scope: "temporary",
+									origin: "top-level",
+								},
 							},
 							{
 								name: "skill:e2e",
 								description: "Synthetic acceptance skill",
 								source: "skill",
-								sourceInfo: { path: "/synthetic/e2e/SKILL.md" },
+								sourceInfo: {
+									path: "/synthetic/e2e/SKILL.md",
+									source: "synthetic",
+									scope: "temporary",
+									origin: "top-level",
+								},
 							},
 						]
 					: [],
