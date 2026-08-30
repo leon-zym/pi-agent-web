@@ -33,7 +33,7 @@ const futureServerHello = {
 	serverBuild: "0.1.0-private",
 	serverEpoch: "epoch-private",
 	piVersion: "0.84.2",
-	adapterId: "legacy-rpc-v1",
+	adapterId: "pi-rpc",
 	capabilities: futureServerCapabilities,
 	limits: {
 		maxClientFrameBytes: SESSION_PAYLOAD_BUDGET.maxCommandFrameBytes,
@@ -77,7 +77,7 @@ function currentServerHello() {
 		serverBuild: "0.1.0",
 		serverEpoch: "epoch-current",
 		piVersion: "0.84.2",
-		adapterId: "legacy-rpc-v1",
+		adapterId: "pi-rpc",
 		capabilities,
 		limits: {
 			maxClientFrameBytes: SESSION_PAYLOAD_BUDGET.maxCommandFrameBytes,

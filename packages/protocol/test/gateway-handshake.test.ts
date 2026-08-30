@@ -70,7 +70,7 @@ describe("Gateway hello DTOs", () => {
 				serverBuild: "0.1.0",
 				serverEpoch: "0198f1f1-epoch",
 				piVersion: "0.84.2",
-				adapterId: "legacy-rpc-v1",
+				adapterId: "pi-rpc",
 				capabilities: ["rpc.commands", "rpc.events", GATEWAY_PAYLOAD_BUDGET_CAPABILITY],
 				limits: {
 					maxClientFrameBytes: 8 * 1024 * 1024,
@@ -110,7 +110,7 @@ describe("Gateway hello DTOs", () => {
 			serverBuild: "0.1.0",
 			serverEpoch: "epoch-a",
 			piVersion: "0.84.2",
-			adapterId: "legacy-rpc-v1",
+			adapterId: "pi-rpc",
 			capabilities: legacyCapabilities,
 			limits: {
 				maxClientFrameBytes: 8 * 1024 * 1024,
@@ -157,7 +157,7 @@ describe("Gateway hello DTOs", () => {
 			serverBuild: "0.1.0",
 			serverEpoch: "epoch-a",
 			piVersion: "0.84.2",
-			adapterId: "legacy-rpc-v1",
+			adapterId: "pi-rpc",
 			capabilities: legacyServerCapabilities,
 			limits: {
 				maxClientFrameBytes: SESSION_PAYLOAD_BUDGET.maxCommandFrameBytes,

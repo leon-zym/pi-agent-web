@@ -133,11 +133,11 @@ describe("Pi runtime resolution", () => {
 		expect(resolved).toMatchObject({
 			source: "bundled",
 			version: "0.84.2",
-			adapterId: "legacy-rpc-v1",
+			adapterId: "pi-rpc",
 			compatibilityStatus: "current",
 		});
 		expect(resolved.adapter).toMatchObject({
-			id: "legacy-rpc-v1",
+			id: "pi-rpc",
 			version: "0.84.2",
 			capabilities: resolved.capabilities,
 		});
@@ -362,11 +362,11 @@ describe("Pi compatibility matrix", () => {
 	it("records the pinned current and next-candidate adapter capabilities", () => {
 		expect(PI_COMPATIBILITY_MATRIX["0.84.2"]).toMatchObject({
 			status: "current",
-			adapterId: "legacy-rpc-v1",
+			adapterId: "pi-rpc",
 		});
 		expect(PI_COMPATIBILITY_MATRIX["0.84.3"]).toMatchObject({
 			status: "candidate",
-			adapterId: "legacy-rpc-v1",
+			adapterId: "pi-rpc",
 			capabilities: expect.arrayContaining(["rpc.toolcall_identity"]),
 		});
 	});

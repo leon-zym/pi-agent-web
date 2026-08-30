@@ -29,7 +29,7 @@
 		"build": "node ../../scripts/clean-dist.mjs && tsc -p tsconfig.build.json",
 		"typecheck": "tsc -p tsconfig.json --noEmit",
 		"test": "vitest run",
-		"test:compat": "vitest run test/pi-compatibility.test.ts test/resolver.test.ts test/legacy-rpc-v1.test.ts test/legacy-rpc-v1-wire.test.ts test/legacy-rpc-v1-content-wire.test.ts test/pi-host-conformance.test.ts",
+		"test:compat": "vitest run test/pi-compatibility.test.ts test/resolver.test.ts test/pi-rpc-adapter.test.ts test/pi-rpc-wire.test.ts test/pi-rpc-content-wire.test.ts test/pi-host-conformance.test.ts",
 		"test:watch": "vitest",
 		"test:smoke": "tsx test/smoke.ts",
 		"test:e2e": "tsx test/e2e-conversation.ts",

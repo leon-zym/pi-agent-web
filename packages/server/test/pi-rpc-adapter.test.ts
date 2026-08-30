@@ -3,16 +3,13 @@ import { FUTURE_SESSION_CONTENT_REF_BUDGET, SESSION_PAYLOAD_BUDGET } from "@pi-a
 import { describe, expect, it, vi } from "vitest";
 import { EpochContentStoreError, type EpochStoredContentRef } from "../src/epoch-content-store.js";
 import {
-	createLegacyRpcV1Adapter,
-	legacyRpcV1Adapter as outcomeLegacyRpcV1Adapter,
-} from "../src/legacy-rpc-v1.js";
-import {
 	type PiHostDecodeOutcome,
 	type PiHostDecodeResult,
 	PiHostResponseExternalizationError,
 	PiProtocolIncompatibleError,
 } from "../src/pi-host-adapter.js";
 import { PiPayloadExternalizationError } from "../src/pi-payload-externalizer.js";
+import { createPiRpcAdapter, piRpcAdapter as outcomePiRpcAdapter } from "../src/pi-rpc-adapter.js";
 
 function syncOutcome<T, TRef extends EpochStoredContentRef>(
 	result: PiHostDecodeResult<T, TRef>,
@@ -21,16 +18,16 @@ function syncOutcome<T, TRef extends EpochStoredContentRef>(
 	return result;
 }
 
-const legacyRpcV1Adapter = {
-	...outcomeLegacyRpcV1Adapter,
-	decodeResponse(...args: Parameters<typeof outcomeLegacyRpcV1Adapter.decodeResponse>) {
-		return syncOutcome(outcomeLegacyRpcV1Adapter.decodeResponse(...args)).value;
+const piRpcAdapter = {
+	...outcomePiRpcAdapter,
+	decodeResponse(...args: Parameters<typeof outcomePiRpcAdapter.decodeResponse>) {
+		return syncOutcome(outcomePiRpcAdapter.decodeResponse(...args)).value;
 	},
-	decodeOrphanedResponse(...args: Parameters<typeof outcomeLegacyRpcV1Adapter.decodeOrphanedResponse>) {
-		return syncOutcome(outcomeLegacyRpcV1Adapter.decodeOrphanedResponse(...args)).value;
+	decodeOrphanedResponse(...args: Parameters<typeof outcomePiRpcAdapter.decodeOrphanedResponse>) {
+		return syncOutcome(outcomePiRpcAdapter.decodeOrphanedResponse(...args)).value;
 	},
-	decodeUnsolicited(...args: Parameters<typeof outcomeLegacyRpcV1Adapter.decodeUnsolicited>) {
-		return syncOutcome(outcomeLegacyRpcV1Adapter.decodeUnsolicited(...args)).value;
+	decodeUnsolicited(...args: Parameters<typeof outcomePiRpcAdapter.decodeUnsolicited>) {
+		return syncOutcome(outcomePiRpcAdapter.decodeUnsolicited(...args)).value;
 	},
 };
 
@@ -78,9 +75,9 @@ const futureContext = {
 	contentRefBudget: FUTURE_SESSION_CONTENT_REF_BUDGET,
 } as const;
 
-describe("legacy-rpc-v1 adapter", () => {
+describe("Pi RPC adapter", () => {
 	it("keeps externalization disabled by default and carries an explicit null lease", () => {
-		const decoded = outcomeLegacyRpcV1Adapter.decodeResponse(
+		const decoded = outcomePiRpcAdapter.decodeResponse(
 			{ type: "response", id: "1", command: "get_state", success: true, data: state },
 			"get_state",
 		);
@@ -118,7 +115,7 @@ describe("legacy-rpc-v1 adapter", () => {
 		};
 
 		const signal = new AbortController().signal;
-		const decoded = await outcomeLegacyRpcV1Adapter.decodeUnsolicited(inline, {
+		const decoded = await outcomePiRpcAdapter.decodeUnsolicited(inline, {
 			signal,
 			externalizer: {
 				context: { serverEpoch: "epoch", payloadBudget: SESSION_PAYLOAD_BUDGET },
@@ -165,7 +162,7 @@ describe("legacy-rpc-v1 adapter", () => {
 		}));
 		const signal = new AbortController().signal;
 
-		const outcome = await outcomeLegacyRpcV1Adapter.decodeFutureUnsolicited(raw, {
+		const outcome = await outcomePiRpcAdapter.decodeFutureUnsolicited(raw, {
 			signal,
 			externalizer: { mode: "future_content", context: futureContext, externalize },
 		});
@@ -185,7 +182,7 @@ describe("legacy-rpc-v1 adapter", () => {
 	it("rejects a future response command mismatch before generic externalization", () => {
 		const externalize = vi.fn();
 		expect(() =>
-			outcomeLegacyRpcV1Adapter.decodeFutureResponse(imageResponse, "prompt", {
+			outcomePiRpcAdapter.decodeFutureResponse(imageResponse, "prompt", {
 				signal: new AbortController().signal,
 				externalizer: { mode: "future_content", context: futureContext, externalize },
 			}),
@@ -218,7 +215,7 @@ describe("legacy-rpc-v1 adapter", () => {
 		const externalize = vi.fn(async () => ({ value: product, lease }));
 		const signal = new AbortController().signal;
 
-		const outcome = await outcomeLegacyRpcV1Adapter.decodeFutureUnsolicited(request, {
+		const outcome = await outcomePiRpcAdapter.decodeFutureUnsolicited(request, {
 			signal,
 			externalizer: { mode: "future_content", context: futureContext, externalize },
 		});
@@ -253,7 +250,7 @@ describe("legacy-rpc-v1 adapter", () => {
 		]) {
 			const release = vi.fn(async () => {});
 			await expect(
-				outcomeLegacyRpcV1Adapter.decodeFutureUnsolicited(request, {
+				outcomePiRpcAdapter.decodeFutureUnsolicited(request, {
 					signal: new AbortController().signal,
 					externalizer: {
 						mode: "future_content",
@@ -276,7 +273,7 @@ describe("legacy-rpc-v1 adapter", () => {
 		new PiPayloadExternalizationError("decoded_image_too_large", "blob", 8, 9),
 	])("classifies only evidenced response delivery failures as response-local: %s", async (failure) => {
 		await expect(
-			outcomeLegacyRpcV1Adapter.decodeResponse(imageResponse, "get_messages", {
+			outcomePiRpcAdapter.decodeResponse(imageResponse, "get_messages", {
 				signal: new AbortController().signal,
 				externalizer: {
 					context: attachmentContext,
@@ -296,7 +293,7 @@ describe("legacy-rpc-v1 adapter", () => {
 			actual: 9,
 		});
 		await expect(
-			outcomeLegacyRpcV1Adapter.decodeFutureResponse(imageResponse, "get_messages", {
+			outcomePiRpcAdapter.decodeFutureResponse(imageResponse, "get_messages", {
 				signal: new AbortController().signal,
 				externalizer: {
 					mode: "future_content",
@@ -312,7 +309,7 @@ describe("legacy-rpc-v1 adapter", () => {
 
 		const malformed = new PiPayloadExternalizationError("invalid_product_payload", "invalid future root");
 		await expect(
-			outcomeLegacyRpcV1Adapter.decodeFutureResponse(imageResponse, "get_messages", {
+			outcomePiRpcAdapter.decodeFutureResponse(imageResponse, "get_messages", {
 				signal: new AbortController().signal,
 				externalizer: {
 					mode: "future_content",
@@ -334,7 +331,7 @@ describe("legacy-rpc-v1 adapter", () => {
 		const release = vi.fn(async () => {});
 
 		await expect(
-			outcomeLegacyRpcV1Adapter.decodeFutureResponse(imageResponse, "get_messages", {
+			outcomePiRpcAdapter.decodeFutureResponse(imageResponse, "get_messages", {
 				signal: new AbortController().signal,
 				externalizer: {
 					mode: "future_content",
@@ -361,7 +358,7 @@ describe("legacy-rpc-v1 adapter", () => {
 		new PiPayloadExternalizationError("rollback_failed", "unknown ownership"),
 	])("leaves corruption, contract failures, and invalid evidence terminal: %s", async (failure) => {
 		try {
-			await outcomeLegacyRpcV1Adapter.decodeResponse(imageResponse, "get_messages", {
+			await outcomePiRpcAdapter.decodeResponse(imageResponse, "get_messages", {
 				signal: new AbortController().signal,
 				externalizer: {
 					context: attachmentContext,
@@ -381,7 +378,7 @@ describe("legacy-rpc-v1 adapter", () => {
 			actual: 9,
 		});
 		await expect(
-			outcomeLegacyRpcV1Adapter.decodeUnsolicited(
+			outcomePiRpcAdapter.decodeUnsolicited(
 				{ type: "agent_start" },
 				{
 					signal: new AbortController().signal,
@@ -396,7 +393,7 @@ describe("legacy-rpc-v1 adapter", () => {
 
 	it("validates and ignores orphaned responses without externalization", () => {
 		const externalize = vi.fn();
-		const outcome = outcomeLegacyRpcV1Adapter.decodeOrphanedResponse(imageResponse, {
+		const outcome = outcomePiRpcAdapter.decodeOrphanedResponse(imageResponse, {
 			signal: new AbortController().signal,
 			externalizer: { context: attachmentContext, externalize },
 		});
@@ -414,7 +411,7 @@ describe("legacy-rpc-v1 adapter", () => {
 		} as const;
 		const release = vi.fn(async () => {});
 		await expect(
-			outcomeLegacyRpcV1Adapter.decodeResponse(imageResponse, "get_messages", {
+			outcomePiRpcAdapter.decodeResponse(imageResponse, "get_messages", {
 				signal: new AbortController().signal,
 				externalizer: {
 					context: attachmentContext,
@@ -429,15 +426,15 @@ describe("legacy-rpc-v1 adapter", () => {
 	});
 	it("fully decodes command-specific responses", () => {
 		expect(
-			legacyRpcV1Adapter.decodeResponse(
+			piRpcAdapter.decodeResponse(
 				{ type: "response", id: "1", command: "get_state", success: true, data: state },
 				"get_state",
 			),
 		).toMatchObject({ success: true, data: state });
 	});
 
-	it("validates and strips reviewed legacy Model routing fields at the product boundary", () => {
-		const decoded = legacyRpcV1Adapter.decodeResponse(
+	it("validates and strips reviewed upstream Model routing fields at the product boundary", () => {
+		const decoded = piRpcAdapter.decodeResponse(
 			{
 				type: "response",
 				id: "1",
@@ -512,7 +509,7 @@ describe("legacy-rpc-v1 adapter", () => {
 			},
 			timestamp: 1,
 		} as const;
-		const response = legacyRpcV1Adapter.decodeResponse(
+		const response = piRpcAdapter.decodeResponse(
 			{
 				type: "response",
 				id: "1",
@@ -522,7 +519,7 @@ describe("legacy-rpc-v1 adapter", () => {
 			},
 			"get_messages",
 		);
-		const event = legacyRpcV1Adapter.decodeUnsolicited({ type: "message_start", message: assistant });
+		const event = piRpcAdapter.decodeUnsolicited({ type: "message_start", message: assistant });
 
 		for (const decoded of [response, event]) {
 			const json = JSON.stringify(decoded);
@@ -534,7 +531,7 @@ describe("legacy-rpc-v1 adapter", () => {
 
 	it("normalizes Pi's credential-free unknown Model sentinel", () => {
 		expect(
-			legacyRpcV1Adapter.decodeResponse(
+			piRpcAdapter.decodeResponse(
 				{
 					type: "response",
 					id: "1",
@@ -563,7 +560,7 @@ describe("legacy-rpc-v1 adapter", () => {
 
 	it("rejects an unreviewed Model field instead of silently normalizing it", () => {
 		expect(() =>
-			legacyRpcV1Adapter.decodeResponse(
+			piRpcAdapter.decodeResponse(
 				{
 					type: "response",
 					id: "1",
@@ -581,7 +578,7 @@ describe("legacy-rpc-v1 adapter", () => {
 
 	it("reserves the export URL for Gateway enrichment", () => {
 		expect(() =>
-			legacyRpcV1Adapter.decodeResponse(
+			piRpcAdapter.decodeResponse(
 				{
 					type: "response",
 					id: "1",
@@ -610,10 +607,8 @@ describe("legacy-rpc-v1 adapter", () => {
 			},
 		} as const;
 
-		expect(() => legacyRpcV1Adapter.decodeResponse(frame, "prompt")).toThrowError(
-			PiProtocolIncompatibleError,
-		);
-		expect(() => legacyRpcV1Adapter.decodeOrphanedResponse(frame)).toThrowError(PiProtocolIncompatibleError);
+		expect(() => piRpcAdapter.decodeResponse(frame, "prompt")).toThrowError(PiProtocolIncompatibleError);
+		expect(() => piRpcAdapter.decodeOrphanedResponse(frame)).toThrowError(PiProtocolIncompatibleError);
 	});
 
 	it("preserves Gateway-shaped lookalikes inside opaque Pi JSON fields", () => {
@@ -625,7 +620,7 @@ describe("legacy-rpc-v1 adapter", () => {
 			actualBytes: 9,
 		} as const;
 		expect(
-			legacyRpcV1Adapter.decodeResponse(
+			piRpcAdapter.decodeResponse(
 				{
 					type: "response",
 					id: "1",
@@ -643,7 +638,7 @@ describe("legacy-rpc-v1 adapter", () => {
 		).toMatchObject({ success: true, data: { details: { admissionError } } });
 
 		expect(
-			legacyRpcV1Adapter.decodeUnsolicited({
+			piRpcAdapter.decodeUnsolicited({
 				type: "tool_execution_end",
 				toolCallId: "tool-1",
 				toolName: "read",
@@ -675,16 +670,16 @@ describe("legacy-rpc-v1 adapter", () => {
 			},
 		};
 
-		expect(() => legacyRpcV1Adapter.decodeUnsolicited(frame)).toThrowError(PiProtocolIncompatibleError);
+		expect(() => piRpcAdapter.decodeUnsolicited(frame)).toThrowError(PiProtocolIncompatibleError);
 	});
 
 	it("owns create/open arguments and the probed version capability set", () => {
-		expect(legacyRpcV1Adapter.version).toBe("0.84.2");
+		expect(piRpcAdapter.version).toBe("0.84.2");
 		expect(
-			legacyRpcV1Adapter.createSessionArguments({ nativeSessionId: "native-1", sessionDir: "/sessions" }),
+			piRpcAdapter.createSessionArguments({ nativeSessionId: "native-1", sessionDir: "/sessions" }),
 		).toEqual(["--session-id", "native-1", "--session-dir", "/sessions"]);
 		expect(
-			legacyRpcV1Adapter.openSessionArguments({
+			piRpcAdapter.openSessionArguments({
 				sessionFile: "/sessions/one.jsonl",
 				sessionDir: "/sessions",
 			}),
@@ -692,11 +687,7 @@ describe("legacy-rpc-v1 adapter", () => {
 	});
 
 	it("enforces the captured 0.84.3 toolcall identity addition only for the candidate", () => {
-		const candidate = createLegacyRpcV1Adapter("0.84.3", [
-			"rpc.commands",
-			"rpc.events",
-			"rpc.toolcall_identity",
-		]);
+		const candidate = createPiRpcAdapter("0.84.3", ["rpc.commands", "rpc.events", "rpc.toolcall_identity"]);
 		const capturedCandidateFrame = JSON.parse(
 			fs.readFileSync(
 				new URL("./fixtures/pi-compatibility/0.84.3/event-toolcall-start.json", import.meta.url),
@@ -712,12 +703,12 @@ describe("legacy-rpc-v1 adapter", () => {
 				toolName: string;
 			};
 		};
-		const legacyFrame = {
+		const piFrame = {
 			...capturedCandidateFrame,
 			assistantMessageEvent: { type: "toolcall_start", contentIndex: 0 },
 		};
-		expect(legacyRpcV1Adapter.decodeUnsolicited(legacyFrame)).toMatchObject({ kind: "event" });
-		expect(() => candidate.decodeUnsolicited(legacyFrame)).toThrowError(PiProtocolIncompatibleError);
+		expect(piRpcAdapter.decodeUnsolicited(piFrame)).toMatchObject({ kind: "event" });
+		expect(() => candidate.decodeUnsolicited(piFrame)).toThrowError(PiProtocolIncompatibleError);
 
 		expect(syncOutcome(candidate.decodeUnsolicited(capturedCandidateFrame)).value).toMatchObject({
 			kind: "event",
@@ -737,7 +728,7 @@ describe("legacy-rpc-v1 adapter", () => {
 			"response_command_mismatch",
 		],
 	] as const)("fails closed for %s", (_label, frame, reason) => {
-		expect(() => legacyRpcV1Adapter.decodeResponse(frame, "get_state")).toThrowError(
+		expect(() => piRpcAdapter.decodeResponse(frame, "get_state")).toThrowError(
 			expect.objectContaining({
 				name: "PiProtocolIncompatibleError",
 				diagnostic: expect.objectContaining({ code: "protocol_incompatible", reason }),
@@ -746,7 +737,7 @@ describe("legacy-rpc-v1 adapter", () => {
 	});
 
 	it("decodes authoritative events and every Extension UI variant through product guards", () => {
-		expect(legacyRpcV1Adapter.decodeUnsolicited({ type: "agent_start" })).toEqual({
+		expect(piRpcAdapter.decodeUnsolicited({ type: "agent_start" })).toEqual({
 			kind: "event",
 			event: { type: "agent_start" },
 		});
@@ -761,14 +752,14 @@ describe("legacy-rpc-v1 adapter", () => {
 			{ type: "extension_ui_request", id: "8", method: "setTitle", title: "Title" },
 			{ type: "extension_ui_request", id: "9", method: "set_editor_text", text: "Text" },
 		]) {
-			expect(legacyRpcV1Adapter.decodeUnsolicited(request)).toMatchObject({
+			expect(piRpcAdapter.decodeUnsolicited(request)).toMatchObject({
 				kind: "extension_ui_request",
 			});
 		}
 	});
 
 	it("has an explicit ignorable allowlist and rejects unknown or malformed authoritative frames", () => {
-		expect(legacyRpcV1Adapter.decodeUnsolicited({ type: "log", message: "side channel" })).toEqual({
+		expect(piRpcAdapter.decodeUnsolicited({ type: "log", message: "side channel" })).toEqual({
 			kind: "ignored",
 			frameType: "log",
 		});
@@ -778,7 +769,7 @@ describe("legacy-rpc-v1 adapter", () => {
 			{ type: "extension_ui_request", id: "x", method: "select", options: "not-an-array" },
 		]) {
 			try {
-				legacyRpcV1Adapter.decodeUnsolicited(frame);
+				piRpcAdapter.decodeUnsolicited(frame);
 				throw new Error("expected decode failure");
 			} catch (error) {
 				expect(error).toBeInstanceOf(PiProtocolIncompatibleError);

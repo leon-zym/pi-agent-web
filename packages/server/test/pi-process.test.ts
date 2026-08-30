@@ -15,7 +15,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { EpochContentHold, EpochStoredContentRef } from "../src/epoch-content-store.js";
 import { GenerationContentOwner } from "../src/generation-content-owner.js";
 import { MAX_JSONL_FUTURE_CONTENT_LINE_BYTES, MAX_JSONL_LINE_BYTES } from "../src/jsonl.js";
-import { legacyRpcV1Adapter } from "../src/legacy-rpc-v1.js";
 import {
 	type PiHostAdapter,
 	type PiHostDecodeContext,
@@ -31,6 +30,7 @@ import {
 	type PiPayloadLeaseTransfer,
 } from "../src/pi-payload-externalizer.js";
 import { type PiDecodedDeliveryConsumer, PiProcess, type PiProcessOptions } from "../src/pi-process.js";
+import { piRpcAdapter } from "../src/pi-rpc-adapter.js";
 
 const fakePiPath = path.join(import.meta.dirname, "fixtures", "fake-pi.mjs");
 const processGroupPiPath = path.join(import.meta.dirname, "fixtures", "process-group-pi.mjs");
@@ -185,19 +185,19 @@ function withAsyncDecodeGate(
 	gate: (frame: DecodedFrame, signal: AbortSignal | undefined) => Promise<void>,
 ): PiHostAdapter {
 	return {
-		...legacyRpcV1Adapter,
+		...piRpcAdapter,
 		async decodeResponse(value, expectedCommand, context?: PiHostDecodeContext) {
-			const decoded = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand);
+			const decoded = await piRpcAdapter.decodeResponse(value, expectedCommand);
 			await gate({ kind: "response", command: expectedCommand }, context?.signal);
 			return decoded;
 		},
 		async decodeOrphanedResponse(value, context?: PiHostDecodeContext) {
-			const decoded = await legacyRpcV1Adapter.decodeOrphanedResponse(value);
+			const decoded = await piRpcAdapter.decodeOrphanedResponse(value);
 			await gate({ kind: "orphaned_response" }, context?.signal);
 			return decoded;
 		},
 		async decodeUnsolicited(value, context?: PiHostDecodeContext) {
-			const decoded = await legacyRpcV1Adapter.decodeUnsolicited(value);
+			const decoded = await piRpcAdapter.decodeUnsolicited(value);
 			await gate(decoded.value, context?.signal);
 			return decoded;
 		},
@@ -268,10 +268,10 @@ describe("PiProcess response correlation", () => {
 	it("reuses a settled public id with a fresh wire id without correlating the late old response", async () => {
 		const encodedIds: string[] = [];
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			encodeCommand(command) {
 				encodedIds.push(command.id);
-				return legacyRpcV1Adapter.encodeCommand(command);
+				return piRpcAdapter.encodeCommand(command);
 			},
 		};
 		proc = new PiProcess({
@@ -314,13 +314,13 @@ describe("PiProcess response correlation", () => {
 		const orphanContexts: Array<PiHostDecodeContext | undefined> = [];
 		const externalize = vi.fn();
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			decodeResponse(value, expectedCommand) {
-				return legacyRpcV1Adapter.decodeResponse(value, expectedCommand);
+				return piRpcAdapter.decodeResponse(value, expectedCommand);
 			},
 			decodeOrphanedResponse(value, context) {
 				orphanContexts.push(context);
-				return legacyRpcV1Adapter.decodeOrphanedResponse(value, context);
+				return piRpcAdapter.decodeOrphanedResponse(value, context);
 			},
 		};
 		proc = new PiProcess({
@@ -577,9 +577,9 @@ describe("PiProcess response correlation", () => {
 		const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
 		process.on("unhandledRejection", onUnhandledRejection);
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				if (outcome.value.kind !== "event" || outcome.value.event.type !== "agent_start") return outcome;
 				decodeStarted.resolve();
 				await releaseDecode.promise;
@@ -629,9 +629,9 @@ describe("PiProcess response correlation", () => {
 		const leased = fakeLease();
 		const delivered: string[] = [];
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
 					? { value: outcome.value, lease: leased.lease }
 					: outcome;
@@ -658,9 +658,9 @@ describe("PiProcess response correlation", () => {
 		let claimed: PiPayloadLeaseTransfer | null | undefined;
 		let consumerReturned = false;
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
 					? { value: outcome.value, lease: leased.lease }
 					: outcome;
@@ -696,9 +696,9 @@ describe("PiProcess response correlation", () => {
 	it("returns a leased response transfer from sendDecoded without releasing it", async () => {
 		const leased = fakeLease();
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeResponse(value, expectedCommand, context) {
-				const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, context);
+				const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, context);
 				return expectedCommand === "prompt" ? { value: outcome.value, lease: leased.lease } : outcome;
 			},
 		};
@@ -730,9 +730,9 @@ describe("PiProcess response correlation", () => {
 	it("delivers a future content lease as an EpochStoredContentRef transfer", async () => {
 		const leased = fakeMixedFutureLease();
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeFutureResponse(value, expectedCommand, context: PiHostFutureDecodeContext) {
-				const outcome = await legacyRpcV1Adapter.decodeFutureResponse(value, expectedCommand, context);
+				const outcome = await piRpcAdapter.decodeFutureResponse(value, expectedCommand, context);
 				return expectedCommand === "prompt" ? { value: outcome.value, lease: leased.lease } : outcome;
 			},
 		};
@@ -785,9 +785,9 @@ describe("PiProcess response correlation", () => {
 	] as const)("never leaks a future history %s through current send", async (_name, withLease) => {
 		const leased = fakeFutureLease();
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeFutureResponse(value, expectedCommand, context) {
-				const outcome = await legacyRpcV1Adapter.decodeFutureResponse(value, expectedCommand, context);
+				const outcome = await piRpcAdapter.decodeFutureResponse(value, expectedCommand, context);
 				if (expectedCommand !== "get_messages") return outcome;
 				return {
 					value: {
@@ -833,9 +833,9 @@ describe("PiProcess response correlation", () => {
 		const releaseResponse = deferred();
 		const leased = fakeFutureLease();
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeFutureResponse(value, expectedCommand, context) {
-				const outcome = await legacyRpcV1Adapter.decodeFutureResponse(value, expectedCommand, context);
+				const outcome = await piRpcAdapter.decodeFutureResponse(value, expectedCommand, context);
 				if (expectedCommand !== "prompt") return outcome;
 				responseStarted.resolve();
 				await releaseResponse.promise;
@@ -868,9 +868,9 @@ describe("PiProcess response correlation", () => {
 		const releaseResponse = deferred();
 		const leased = fakeFutureLease();
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeFutureResponse(value, expectedCommand, context) {
-				const outcome = await legacyRpcV1Adapter.decodeFutureResponse(value, expectedCommand, context);
+				const outcome = await piRpcAdapter.decodeFutureResponse(value, expectedCommand, context);
 				if (expectedCommand !== "prompt") return outcome;
 				responseStarted.resolve();
 				await releaseResponse.promise;
@@ -921,9 +921,9 @@ describe("PiProcess response correlation", () => {
 		const delivered: string[] = [];
 		let claimed: PiPayloadLeaseTransfer<EpochStoredContentRef> | null | undefined;
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeFutureUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeFutureUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeFutureUnsolicited(value, context);
 				return outcome.value.kind === "extension_ui_request"
 					? { value: outcome.value, lease: leased.lease }
 					: outcome;
@@ -958,9 +958,9 @@ describe("PiProcess response correlation", () => {
 		const leased = fakeFutureLease();
 		const exits: Array<{ stderrTail: string }> = [];
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeFutureUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeFutureUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeFutureUnsolicited(value, context);
 				return outcome.value.kind === "extension_ui_request"
 					? { value: outcome.value, lease: leased.lease }
 					: outcome;
@@ -990,9 +990,9 @@ describe("PiProcess response correlation", () => {
 		const delivered: string[] = [];
 		let extensionSignal: AbortSignal | undefined;
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeFutureUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeFutureUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeFutureUnsolicited(value, context);
 				if (outcome.value.kind !== "extension_ui_request") return outcome;
 				extensionSignal = context.signal;
 				extensionStarted.resolve();
@@ -1037,9 +1037,9 @@ describe("PiProcess response correlation", () => {
 		const exits: Array<{ stderrTail: string }> = [];
 		let eventSignal: AbortSignal | undefined;
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeFutureUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeFutureUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeFutureUnsolicited(value, context);
 				if (outcome.value.kind !== "event" || outcome.value.event.type !== "agent_start") return outcome;
 				eventSignal = context.signal;
 				eventStarted.resolve();
@@ -1076,9 +1076,9 @@ describe("PiProcess response correlation", () => {
 		const delivered: string[] = [];
 		let eventSignal: AbortSignal | undefined;
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeFutureUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeFutureUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeFutureUnsolicited(value, context);
 				if (outcome.value.kind !== "event" || outcome.value.event.type !== "agent_start") return outcome;
 				eventSignal = context.signal;
 				eventStarted.resolve();
@@ -1119,9 +1119,9 @@ describe("PiProcess response correlation", () => {
 	it("releases and rejects a decoded callback that returns true without claiming ownership", async () => {
 		const leased = fakeLease();
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
 					? { value: outcome.value, lease: leased.lease }
 					: outcome;
@@ -1144,9 +1144,9 @@ describe("PiProcess response correlation", () => {
 	it("releases and fails closed when inline-only send receives a leased response", async () => {
 		const leased = fakeLease();
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeResponse(value, expectedCommand, context) {
-				const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, context);
+				const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, context);
 				return expectedCommand === "prompt" ? { value: outcome.value, lease: leased.lease } : outcome;
 			},
 		};
@@ -1176,9 +1176,9 @@ describe("PiProcess response correlation", () => {
 	] as const)("releases a leased event when the decoded callback returns %s", async (_name, callback) => {
 		const leased = fakeLease();
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
 					? { value: outcome.value, lease: leased.lease }
 					: outcome;
@@ -1212,9 +1212,9 @@ describe("PiProcess response correlation", () => {
 		const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
 		process.on("unhandledRejection", onUnhandledRejection);
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
 					? { value: outcome.value, lease: leased.lease }
 					: outcome;
@@ -1243,9 +1243,9 @@ describe("PiProcess response correlation", () => {
 		const leased = fakeLease();
 		let commitCalled = false;
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
 					? { value: outcome.value, lease: leased.lease }
 					: outcome;
@@ -1276,9 +1276,9 @@ describe("PiProcess response correlation", () => {
 		const leased = fakeLease();
 		let ownedTransfer: PiPayloadLeaseTransfer | null | undefined;
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
 					? { value: outcome.value, lease: leased.lease }
 					: outcome;
@@ -1343,9 +1343,9 @@ describe("PiProcess response correlation", () => {
 		};
 		const exits: Array<{ stderrTail: string }> = [];
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
 					? { value: outcome.value, lease }
 					: outcome;
@@ -1380,9 +1380,9 @@ describe("PiProcess response correlation", () => {
 	it("releases a leased event when no event callback is installed", async () => {
 		const leased = fakeLease();
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 				return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
 					? { value: outcome.value, lease: leased.lease }
 					: outcome;
@@ -1425,9 +1425,9 @@ describe("PiProcess response correlation", () => {
 		process.on("unhandledRejection", onUnhandledRejection);
 		try {
 			const adapter: PiHostAdapter = {
-				...legacyRpcV1Adapter,
+				...piRpcAdapter,
 				async decodeUnsolicited(value, context) {
-					const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, context);
+					const outcome = await piRpcAdapter.decodeUnsolicited(value, context);
 					return outcome.value.kind === "event" && outcome.value.event.type === "agent_start"
 						? { value: outcome.value, lease }
 						: outcome;
@@ -1465,9 +1465,9 @@ describe("PiProcess response correlation", () => {
 		const releaseResponse = deferred();
 		const leased = fakeLease();
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeResponse(value, expectedCommand, context) {
-				const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, context);
+				const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, context);
 				if (expectedCommand !== "prompt") return outcome;
 				responseStarted.resolve();
 				await releaseResponse.promise;
@@ -1491,12 +1491,12 @@ describe("PiProcess response correlation", () => {
 
 	it("rejects a response-local delivery failure without terminating the Pi process", async () => {
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			decodeResponse(value, expectedCommand, context) {
 				if (expectedCommand === "prompt") {
 					throw new PiHostResponseExternalizationError("prompt", "cache_bytes_exhausted");
 				}
-				return legacyRpcV1Adapter.decodeResponse(value, expectedCommand, context);
+				return piRpcAdapter.decodeResponse(value, expectedCommand, context);
 			},
 		};
 		proc = new PiProcess({
@@ -1521,9 +1521,9 @@ describe("PiProcess response correlation", () => {
 		let responseSignal: AbortSignal | undefined;
 		const never = new Promise<void>(() => {});
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeResponse(value, expectedCommand, context) {
-				const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, context);
+				const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, context);
 				if (expectedCommand !== "prompt") return outcome;
 				responseSignal = context?.signal;
 				responseStarted.resolve();
@@ -1553,9 +1553,9 @@ describe("PiProcess response correlation", () => {
 	it("uses its own deadline provenance when the adapter rejects from the operation abort signal", async () => {
 		const responseStarted = deferred();
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeResponse(value, expectedCommand, context) {
-				const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, context);
+				const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, context);
 				if (expectedCommand !== "prompt") return outcome;
 				responseStarted.resolve();
 				await new Promise<never>((_resolve, reject) => {
@@ -1588,12 +1588,12 @@ describe("PiProcess response correlation", () => {
 	it("treats a typed response-local error from an authoritative event as terminal", async () => {
 		const exits: Array<{ stderrTail: string }> = [];
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			decodeUnsolicited(value, context) {
 				if ((value as { type?: string }).type === "agent_start") {
 					throw new PiHostResponseExternalizationError("get_messages", "cache_bytes_exhausted");
 				}
-				return legacyRpcV1Adapter.decodeUnsolicited(value, context);
+				return piRpcAdapter.decodeUnsolicited(value, context);
 			},
 		};
 		proc = new PiProcess({
@@ -1623,7 +1623,7 @@ describe("PiProcess response correlation", () => {
 			await releaseDecode.promise;
 			throw new PiProtocolIncompatibleError({
 				code: "protocol_incompatible",
-				adapterId: legacyRpcV1Adapter.id,
+				adapterId: piRpcAdapter.id,
 				frameKind: "event",
 				reason: "malformed_event",
 				frameType: "agent_start",
@@ -1665,7 +1665,7 @@ describe("PiProcess response correlation", () => {
 			await releaseDecode.promise;
 			throw new PiProtocolIncompatibleError({
 				code: "protocol_incompatible",
-				adapterId: legacyRpcV1Adapter.id,
+				adapterId: piRpcAdapter.id,
 				frameKind: "event",
 				reason: "malformed_event",
 				frameType: "agent_start",

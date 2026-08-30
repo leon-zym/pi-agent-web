@@ -3,7 +3,6 @@ import os from "node:os";
 import path from "node:path";
 import { RpcError } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { legacyRpcV1Adapter } from "../src/legacy-rpc-v1.js";
 import {
 	createNativeRoutes,
 	type NativeRouteSupervisor,
@@ -14,6 +13,7 @@ import {
 	NativeSessionCatalog,
 	sessionHandleForFile,
 } from "../src/native-session-catalog.js";
+import { piRpcAdapter } from "../src/pi-rpc-adapter.js";
 import { SessionLayoutResolver, workspaceHandleForPath } from "../src/session-layout-resolver.js";
 import type { SessionRuntimeSnapshot } from "../src/session-runtime-types.js";
 import {
@@ -551,11 +551,11 @@ describe("native REST routes", () => {
 				args: [fixturePath],
 				source: "pi-path",
 				label: "native routes fixture",
-				adapter: legacyRpcV1Adapter,
+				adapter: piRpcAdapter,
 				version: "0.84.2",
-				adapterId: "legacy-rpc-v1",
+				adapterId: "pi-rpc",
 				compatibilityStatus: "current",
-				capabilities: legacyRpcV1Adapter.capabilities,
+				capabilities: piRpcAdapter.capabilities,
 			},
 			resolveSession: async () => undefined,
 			broadcast: () => undefined,
@@ -693,11 +693,11 @@ describe("native REST routes", () => {
 				args: [fixturePath],
 				source: "pi-path",
 				label: "native routes transition fixture",
-				adapter: legacyRpcV1Adapter,
+				adapter: piRpcAdapter,
 				version: "0.84.2",
-				adapterId: "legacy-rpc-v1",
+				adapterId: "pi-rpc",
 				compatibilityStatus: "current",
-				capabilities: legacyRpcV1Adapter.capabilities,
+				capabilities: piRpcAdapter.capabilities,
 			},
 			env: { PI_WEB_FIXTURE_TRANSITION_STATE_DELAY_MS: "250" },
 			resolveSession: async (sessionHandle) => {

@@ -12,24 +12,24 @@ import {
 	isUsageDto,
 } from "@pi-agent-web/protocol";
 import { MAX_JSONL_SNAPSHOT_LINE_BYTES } from "./jsonl.js";
-import { isLegacyRpcV1RawEvent, isLegacyRpcV1RawResponse } from "./legacy-rpc-v1-wire.js";
+import { isPiRpcRawEvent, isPiRpcRawResponse } from "./pi-rpc-wire.js";
 
 /** Pi-owned JSON before the Gateway wraps or externalizes an approved root. */
-export type LegacyRpcV1UntrustedJsonRoot =
+export type PiRpcUntrustedJsonRoot =
 	| null
 	| boolean
 	| number
 	| string
-	| LegacyRpcV1UntrustedJsonRoot[]
-	| { [key: string]: LegacyRpcV1UntrustedJsonRoot };
+	| PiRpcUntrustedJsonRoot[]
+	| { [key: string]: PiRpcUntrustedJsonRoot };
 
-/** Pi-owned text before the Gateway creates a future external_text wrapper. */
-export type LegacyRpcV1UntrustedTextRoot = string;
+/** Pi-owned text before the Gateway creates an external_text wrapper. */
+export type PiRpcUntrustedTextRoot = string;
 
-/** Future-only raw frame aliases. Production decoding remains on legacy-rpc-v1-wire. */
-export type LegacyRpcV1FutureContentRawResponse = RpcResponse;
-export type LegacyRpcV1FutureContentRawEvent = JsonAgentSessionEvent;
-export type LegacyRpcV1FutureContentRawExtensionUiRequest = RpcExtensionUIRequest;
+/** Content-reference raw frames whose large roots are externalized after validation. */
+export type PiRpcContentRawResponse = RpcResponse;
+export type PiRpcContentRawEvent = JsonAgentSessionEvent;
+export type PiRpcContentRawExtensionUiRequest = RpcExtensionUIRequest;
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -78,7 +78,7 @@ function isArrayOf(value: unknown, guard: (item: unknown) => boolean, max = MAX_
  * Validate only the JSON data model and resource bounds. Discriminants are deliberately opaque:
  * exact or nested product-wrapper lookalikes remain ordinary Pi JSON at this boundary.
  */
-export function isLegacyRpcV1UntrustedJsonRoot(value: unknown): value is LegacyRpcV1UntrustedJsonRoot {
+export function isPiRpcUntrustedJsonRoot(value: unknown): value is PiRpcUntrustedJsonRoot {
 	const stack: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
 	const seen = new Set<object>();
 	let items = 0;
@@ -121,29 +121,29 @@ export function isLegacyRpcV1UntrustedJsonRoot(value: unknown): value is LegacyR
 	return true;
 }
 
-export function isLegacyRpcV1UntrustedTextRoot(value: unknown): value is LegacyRpcV1UntrustedTextRoot {
+export function isPiRpcUntrustedTextRoot(value: unknown): value is PiRpcUntrustedTextRoot {
 	return isTextWithin(value, MAX_JSONL_SNAPSHOT_LINE_BYTES);
 }
 
-export function isLegacyRpcV1FutureContentRawExtensionUiRequest(
+export function isPiRpcContentRawExtensionUiRequest(
 	value: unknown,
-): value is LegacyRpcV1FutureContentRawExtensionUiRequest {
+): value is PiRpcContentRawExtensionUiRequest {
 	if (!isRecord(value)) return false;
 	switch (value.method) {
 		case "editor":
 			return (
-				(value.prefill === undefined || isLegacyRpcV1UntrustedTextRoot(value.prefill)) &&
+				(value.prefill === undefined || isPiRpcUntrustedTextRoot(value.prefill)) &&
 				isExtensionUiRequestDto({ ...value, prefill: value.prefill === undefined ? undefined : "" })
 			);
 		case "set_editor_text":
-			return isLegacyRpcV1UntrustedTextRoot(value.text) && isExtensionUiRequestDto({ ...value, text: "" });
+			return isPiRpcUntrustedTextRoot(value.text) && isExtensionUiRequestDto({ ...value, text: "" });
 		case "setWidget":
 			return (
 				(value.widgetLines === undefined ||
 					(Array.isArray(value.widgetLines) &&
 						value.widgetLines.length <= 1_000 &&
 						value.widgetLines.every((line) => typeof line === "string") &&
-						isLegacyRpcV1UntrustedJsonRoot(value.widgetLines))) &&
+						isPiRpcUntrustedJsonRoot(value.widgetLines))) &&
 				isExtensionUiRequestDto({
 					...value,
 					widgetLines: value.widgetLines === undefined ? undefined : [],
@@ -179,7 +179,7 @@ function isFutureRawTextContent(value: unknown): boolean {
 		isRecord(value) &&
 		hasOnlyKeys(value, ["type", "text", "textSignature"]) &&
 		value.type === "text" &&
-		isLegacyRpcV1UntrustedTextRoot(value.text) &&
+		isPiRpcUntrustedTextRoot(value.text) &&
 		isOptionalTextWithin(value.textSignature, MAX_TEXT_BYTES)
 	);
 }
@@ -202,7 +202,7 @@ function isFutureRawToolCallContent(value: unknown): boolean {
 		value.type === "toolCall" &&
 		isIdentifier(value.id) &&
 		isIdentifier(value.name) &&
-		isLegacyRpcV1UntrustedJsonRoot(value.arguments) &&
+		isPiRpcUntrustedJsonRoot(value.arguments) &&
 		isOptionalTextWithin(value.thoughtSignature, MAX_TEXT_BYTES) &&
 		(value.namespace === undefined || isIdentifier(value.namespace))
 	);
@@ -317,7 +317,7 @@ function isFutureRawMessage(value: unknown): boolean {
 				isIdentifier(value.toolCallId) &&
 				isIdentifier(value.toolName) &&
 				isFutureRawContentBlocks(value.content) &&
-				(value.details === undefined || isLegacyRpcV1UntrustedJsonRoot(value.details)) &&
+				(value.details === undefined || isPiRpcUntrustedJsonRoot(value.details)) &&
 				(value.usage === undefined || isUsageDto(value.usage)) &&
 				(value.addedToolNames === undefined ||
 					isArrayOf(value.addedToolNames, (item) => isIdentifier(item), 1_000)) &&
@@ -338,7 +338,7 @@ function isFutureRawMessage(value: unknown): boolean {
 					"timestamp",
 				]) &&
 				isTextWithin(value.command, MAX_TEXT_BYTES) &&
-				isLegacyRpcV1UntrustedTextRoot(value.output) &&
+				isPiRpcUntrustedTextRoot(value.output) &&
 				(value.exitCode === undefined ||
 					(isFiniteNumber(value.exitCode) && Number.isSafeInteger(value.exitCode))) &&
 				typeof value.cancelled === "boolean" &&
@@ -353,7 +353,7 @@ function isFutureRawMessage(value: unknown): boolean {
 				isIdentifier(value.customType) &&
 				(isTextWithin(value.content, MAX_TEXT_BYTES) || isFutureRawContentBlocks(value.content)) &&
 				typeof value.display === "boolean" &&
-				(value.details === undefined || isLegacyRpcV1UntrustedJsonRoot(value.details)) &&
+				(value.details === undefined || isPiRpcUntrustedJsonRoot(value.details)) &&
 				isCount(value.timestamp)
 			);
 		case "user":
@@ -397,7 +397,7 @@ function isFutureRawEntry(value: unknown): boolean {
 			]) &&
 			isIdentifier(value.customType) &&
 			(isTextWithin(value.content, MAX_TEXT_BYTES) || isFutureRawContentBlocks(value.content)) &&
-			(value.details === undefined || isLegacyRpcV1UntrustedJsonRoot(value.details)) &&
+			(value.details === undefined || isPiRpcUntrustedJsonRoot(value.details)) &&
 			typeof value.display === "boolean"
 		);
 	}
@@ -457,10 +457,10 @@ function isFutureContentHistoryResponse(
 	}
 }
 
-export function isLegacyRpcV1FutureContentRawResponse(
+export function isPiRpcContentRawResponse(
 	value: unknown,
 	expectedCommand: SessionCommandTypeDto,
-): value is LegacyRpcV1FutureContentRawResponse {
+): value is PiRpcContentRawResponse {
 	if (
 		isRecord(value) &&
 		value.success === true &&
@@ -470,7 +470,7 @@ export function isLegacyRpcV1FutureContentRawResponse(
 	) {
 		return isFutureContentHistoryResponse(value, expectedCommand);
 	}
-	return isLegacyRpcV1RawResponse(value, expectedCommand);
+	return isPiRpcRawResponse(value, expectedCommand);
 }
 
 function isFutureRawMessageEvent(value: UnknownRecord): boolean {
@@ -521,19 +521,18 @@ function isFutureRawToolExecutionEvent(value: UnknownRecord): boolean {
 	switch (value.type) {
 		case "tool_execution_start":
 			return (
-				hasOnlyKeys(value, ["type", "toolCallId", "toolName", "args"]) &&
-				isLegacyRpcV1UntrustedJsonRoot(value.args)
+				hasOnlyKeys(value, ["type", "toolCallId", "toolName", "args"]) && isPiRpcUntrustedJsonRoot(value.args)
 			);
 		case "tool_execution_update":
 			return (
 				hasOnlyKeys(value, ["type", "toolCallId", "toolName", "args", "partialResult"]) &&
-				isLegacyRpcV1UntrustedJsonRoot(value.args) &&
-				isLegacyRpcV1UntrustedJsonRoot(value.partialResult)
+				isPiRpcUntrustedJsonRoot(value.args) &&
+				isPiRpcUntrustedJsonRoot(value.partialResult)
 			);
 		case "tool_execution_end":
 			return (
 				hasOnlyKeys(value, ["type", "toolCallId", "toolName", "result", "isError"]) &&
-				isLegacyRpcV1UntrustedJsonRoot(value.result) &&
+				isPiRpcUntrustedJsonRoot(value.result) &&
 				typeof value.isError === "boolean"
 			);
 		default:
@@ -541,9 +540,7 @@ function isFutureRawToolExecutionEvent(value: UnknownRecord): boolean {
 	}
 }
 
-export function isLegacyRpcV1FutureContentRawEvent(
-	value: unknown,
-): value is LegacyRpcV1FutureContentRawEvent {
+export function isPiRpcContentRawEvent(value: unknown): value is PiRpcContentRawEvent {
 	if (!isRecord(value)) return false;
 	if (
 		value.type === "agent_end" ||
@@ -557,7 +554,7 @@ export function isLegacyRpcV1FutureContentRawEvent(
 	if (value.type === "message_update" && isRecord(value.assistantMessageEvent)) {
 		return value.assistantMessageEvent.type === "toolcall_end"
 			? isFutureRawToolCallEndUpdate(value)
-			: isLegacyRpcV1RawEvent(value);
+			: isPiRpcRawEvent(value);
 	}
 	if (
 		value.type === "tool_execution_start" ||
@@ -566,5 +563,5 @@ export function isLegacyRpcV1FutureContentRawEvent(
 	) {
 		return isFutureRawToolExecutionEvent(value);
 	}
-	return isLegacyRpcV1RawEvent(value);
+	return isPiRpcRawEvent(value);
 }

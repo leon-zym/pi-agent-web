@@ -4,13 +4,9 @@ import {
 	isSessionCommandResponseDto,
 } from "@pi-agent-web/protocol";
 import { describe, expect, it } from "vitest";
-import {
-	isLegacyRpcV1RawEvent,
-	isLegacyRpcV1RawExtensionUiRequest,
-	isLegacyRpcV1RawResponse,
-} from "../src/legacy-rpc-v1-wire.js";
+import { isPiRpcRawEvent, isPiRpcRawExtensionUiRequest, isPiRpcRawResponse } from "../src/pi-rpc-wire.js";
 
-describe("legacy RPC v1 raw Pi wire guards", () => {
+describe("Pi RPC raw wire guards", () => {
 	it("admits upstream inline images up to the raw line budget without widening text/UI DTOs", () => {
 		const largeInline = "x".repeat(2 * 1024 * 1024 + 1);
 		const response = {
@@ -37,14 +33,14 @@ describe("legacy RPC v1 raw Pi wire guards", () => {
 			prefill: "small inline text",
 		} as const;
 
-		expect(isLegacyRpcV1RawResponse(response, "get_messages")).toBe(true);
-		expect(isLegacyRpcV1RawEvent(event)).toBe(true);
-		expect(isLegacyRpcV1RawExtensionUiRequest(extensionRequest)).toBe(true);
+		expect(isPiRpcRawResponse(response, "get_messages")).toBe(true);
+		expect(isPiRpcRawEvent(event)).toBe(true);
+		expect(isPiRpcRawExtensionUiRequest(extensionRequest)).toBe(true);
 		// Raw admission is deliberately separate from the Browser/Gateway DTO budget.
 		expect(isSessionCommandResponseDto(response)).toBe(false);
 		expect(isProductSessionEventDto(event)).toBe(false);
 		expect(isExtensionUiRequestDto(extensionRequest)).toBe(true);
-		expect(isLegacyRpcV1RawExtensionUiRequest({ ...extensionRequest, prefill: largeInline })).toBe(false);
+		expect(isPiRpcRawExtensionUiRequest({ ...extensionRequest, prefill: largeInline })).toBe(false);
 	});
 
 	it("rejects Gateway-owned attachment references in typed message and image-data slots", () => {
@@ -65,9 +61,9 @@ describe("legacy RPC v1 raw Pi wire guards", () => {
 			},
 		};
 
-		expect(isLegacyRpcV1RawEvent(injected)).toBe(false);
+		expect(isPiRpcRawEvent(injected)).toBe(false);
 		expect(
-			isLegacyRpcV1RawEvent({
+			isPiRpcRawEvent({
 				type: "message_start",
 				message: {
 					role: "user",
@@ -111,7 +107,7 @@ describe("legacy RPC v1 raw Pi wire guards", () => {
 			["get_tree", { tree: [{ entry, children: [] }], leafId: "entry-1" }],
 		] as const) {
 			expect(
-				isLegacyRpcV1RawResponse(
+				isPiRpcRawResponse(
 					{ type: "response", id: "1", command, success: true, data },
 					command,
 					futureProductGuard,
@@ -125,7 +121,7 @@ describe("legacy RPC v1 raw Pi wire guards", () => {
 			{ type: "message_end", message },
 			{ type: "entry_appended", entry },
 		]) {
-			expect(isLegacyRpcV1RawEvent(event, futureProductGuard)).toBe(false);
+			expect(isPiRpcRawEvent(event, futureProductGuard)).toBe(false);
 		}
 		expect(productCalls).toBe(0);
 	});
@@ -159,8 +155,8 @@ describe("legacy RPC v1 raw Pi wire guards", () => {
 			isError: true,
 		};
 
-		expect(isLegacyRpcV1RawResponse(failure, "prompt")).toBe(false);
-		expect(isLegacyRpcV1RawEvent(nested)).toBe(true);
+		expect(isPiRpcRawResponse(failure, "prompt")).toBe(false);
+		expect(isPiRpcRawEvent(nested)).toBe(true);
 	});
 
 	it("leaves million-node and deeply nested opaque JSON rejection to existing bounded guards", () => {
@@ -180,7 +176,7 @@ describe("legacy RPC v1 raw Pi wire guards", () => {
 				},
 			},
 		);
-		expect(isLegacyRpcV1RawEvent({ ...base, result: millionNodes })).toBe(false);
+		expect(isPiRpcRawEvent({ ...base, result: millionNodes })).toBe(false);
 		expect(elementReads).toBe(0);
 
 		let childReads = 0;
@@ -195,7 +191,7 @@ describe("legacy RPC v1 raw Pi wire guards", () => {
 				},
 			});
 		}
-		expect(isLegacyRpcV1RawEvent({ ...base, result: deeplyNested })).toBe(false);
+		expect(isPiRpcRawEvent({ ...base, result: deeplyNested })).toBe(false);
 		expect(childReads).toBeLessThanOrEqual(33);
 	});
 
@@ -219,13 +215,13 @@ describe("legacy RPC v1 raw Pi wire guards", () => {
 			},
 		};
 
-		expect(isLegacyRpcV1RawEvent(event)).toBe(true);
+		expect(isPiRpcRawEvent(event)).toBe(true);
 		expect(isProductSessionEventDto(event)).toBe(false);
 	});
 
 	it("does not widen generic raw text while image externalization is the only product scope", () => {
 		expect(
-			isLegacyRpcV1RawEvent({
+			isPiRpcRawEvent({
 				type: "message_update",
 				usage: {
 					input: 1,

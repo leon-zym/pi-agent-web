@@ -15,9 +15,9 @@ import {
 } from "@pi-agent-web/protocol";
 
 /** Upstream Pi stdout types. These are deliberately not product DTO aliases. */
-export type LegacyRpcV1RawResponse = RpcResponse;
-export type LegacyRpcV1RawEvent = JsonAgentSessionEvent;
-export type LegacyRpcV1RawExtensionUiRequest = RpcExtensionUIRequest;
+export type PiRpcRawResponse = RpcResponse;
+export type PiRpcRawEvent = JsonAgentSessionEvent;
+export type PiRpcRawExtensionUiRequest = RpcExtensionUIRequest;
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -202,11 +202,11 @@ function isWideImageResponse(value: UnknownRecord, command: SessionCommandTypeDt
 	}
 }
 
-export function isLegacyRpcV1RawResponse(
+export function isPiRpcRawResponse(
 	value: unknown,
 	expectedCommand: SessionCommandTypeDto,
 	productGuard: (candidate: unknown) => boolean = isSessionCommandResponseDto,
-): value is LegacyRpcV1RawResponse {
+): value is PiRpcRawResponse {
 	if (
 		!isRecord(value) ||
 		value.type !== "response" ||
@@ -253,10 +253,10 @@ function isWideImageEvent(value: UnknownRecord): boolean {
 	}
 }
 
-export function isLegacyRpcV1RawEvent(
+export function isPiRpcRawEvent(
 	value: unknown,
 	productGuard: (candidate: unknown) => boolean = isProductSessionEventDto,
-): value is LegacyRpcV1RawEvent {
+): value is PiRpcRawEvent {
 	if (!isRecord(value)) return false;
 	if (
 		value.type === "agent_end" ||
@@ -270,8 +270,6 @@ export function isLegacyRpcV1RawEvent(
 	return productGuard(value);
 }
 
-export function isLegacyRpcV1RawExtensionUiRequest(
-	value: unknown,
-): value is LegacyRpcV1RawExtensionUiRequest {
+export function isPiRpcRawExtensionUiRequest(value: unknown): value is PiRpcRawExtensionUiRequest {
 	return isExtensionUiRequestDto(value);
 }

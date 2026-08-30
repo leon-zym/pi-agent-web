@@ -179,7 +179,7 @@ describe("Stage7C private future SessionWsBridge", () => {
 		bridge = createFutureSessionWsBridge({
 			supervisor: futureSupervisor(),
 			serverBuild: "0.1.0-private",
-			runtime: { version: "0.84.2", adapterId: "legacy-rpc-v1", capabilities: [] },
+			runtime: { version: "0.84.2", adapterId: "pi-rpc", capabilities: [] },
 			payloadActivation: activation,
 			heartbeatIntervalMs: 60_000,
 		});
@@ -201,7 +201,7 @@ describe("Stage7C private future SessionWsBridge", () => {
 			createFutureSessionWsBridge({
 				supervisor: futureSupervisor(),
 				serverBuild: "0.1.0-private",
-				runtime: { version: "0.84.2", adapterId: "legacy-rpc-v1", capabilities: [] },
+				runtime: { version: "0.84.2", adapterId: "pi-rpc", capabilities: [] },
 				payloadActivation: { ...activation, externalizer: other.externalizer },
 			}),
 		).toThrow("payload activation is invalid");

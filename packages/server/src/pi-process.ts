@@ -23,8 +23,6 @@ import {
 	MAX_JSONL_LINE_BYTES,
 	MAX_JSONL_SNAPSHOT_LINE_BYTES,
 } from "./jsonl.js";
-import { legacyRpcV1Adapter } from "./legacy-rpc-v1.js";
-import { isLegacyRpcV1FutureContentRawExtensionUiRequest } from "./legacy-rpc-v1-content-wire.js";
 import {
 	type PiHostAdapter,
 	type PiHostDecodeOutcome,
@@ -37,6 +35,8 @@ import {
 	type PiRuntimeDiagnostic,
 } from "./pi-host-adapter.js";
 import type { PiPayloadLeaseTransfer } from "./pi-payload-externalizer.js";
+import { piRpcAdapter } from "./pi-rpc-adapter.js";
+import { isPiRpcContentRawExtensionUiRequest } from "./pi-rpc-content-wire.js";
 import type { ResolvedPi } from "./resolver.js";
 
 /**
@@ -268,7 +268,7 @@ export class PiProcess {
 
 	constructor(opts: PiProcessOptions) {
 		this.cwd = opts.cwd;
-		this.adapter = opts.adapter ?? legacyRpcV1Adapter;
+		this.adapter = opts.adapter ?? piRpcAdapter;
 		this.opts = {
 			...opts,
 			readyTimeoutMs: opts.readyTimeoutMs ?? 10_000,
@@ -1191,7 +1191,7 @@ export class PiProcess {
 		}
 		if (!isRecord(data)) return false;
 		if (data.type === "extension_ui_request") {
-			return isLegacyRpcV1FutureContentRawExtensionUiRequest(data);
+			return isPiRpcContentRawExtensionUiRequest(data);
 		}
 		if (data.type === "response") {
 			if (data.success !== true || typeof data.id !== "string") return false;

@@ -53,7 +53,7 @@ pnpm --filter @pi-agent-web/server exec vitest run test/session-supervisor.test.
 pnpm --filter @pi-agent-web/server exec vitest run test/epoch-content-store.test.ts
 pnpm --filter @pi-agent-web/server exec vitest run test/attachment-routes.test.ts test/main-lifecycle.test.ts
 pnpm --filter @pi-agent-web/server exec vitest run \
-  test/legacy-rpc-v1-wire.test.ts test/pi-payload-externalizer.test.ts
+  test/pi-rpc-wire.test.ts test/pi-payload-externalizer.test.ts
 pnpm --filter @pi-agent-web/server exec vitest run \
   test/pi-process.test.ts test/generation-content-owner.test.ts
 pnpm --filter @pi-agent-web/server exec vitest run \

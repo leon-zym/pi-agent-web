@@ -10,11 +10,11 @@ import {
 } from "@pi-agent-web/protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EpochContentStore, EpochContentStoreError } from "../src/epoch-content-store.js";
-import { isLegacyRpcV1FutureContentRawExtensionUiRequest } from "../src/legacy-rpc-v1-content-wire.js";
 import {
 	externalizePiPayload,
 	type PiGenericPayloadExternalizerContentStore,
 } from "../src/pi-payload-externalizer.js";
+import { isPiRpcContentRawExtensionUiRequest } from "../src/pi-rpc-content-wire.js";
 
 const EPOCH = "generic-externalizer-epoch";
 const PNG_HEADER = Buffer.from("89504e470d0a1a0a0000000d494844520000000100000001", "hex");
@@ -190,7 +190,7 @@ describe("Pi payload generic content externalizer", () => {
 		expect(Buffer.byteLength(JSON.stringify(request.widgetLines))).toBeGreaterThanOrEqual(
 			SESSION_CONTENT_INLINE_THRESHOLD_BYTES,
 		);
-		expect(isLegacyRpcV1FutureContentRawExtensionUiRequest(request)).toBe(true);
+		expect(isPiRpcContentRawExtensionUiRequest(request)).toBe(true);
 
 		const result = await externalizePiPayload(
 			{ kind: "extension_ui_request", value: request },

@@ -25,7 +25,7 @@ async function createHarness(
 		serverBuild: "0.1.0-test",
 		runtime: {
 			version: "0.84.2",
-			adapterId: "legacy-rpc-v1",
+			adapterId: "pi-rpc",
 			capabilities: ["rpc.commands", "rpc.events", "rpc.extension_ui", "session.multiplex"],
 		},
 		...(options.serverPayloadCapability === false
@@ -258,7 +258,7 @@ describe("Gateway WebSocket hello negotiation", () => {
 			serverBuild: "0.1.0-test",
 			serverEpoch: "gateway-epoch-test",
 			piVersion: "0.84.2",
-			adapterId: "legacy-rpc-v1",
+			adapterId: "pi-rpc",
 			capabilities: [
 				"rpc.commands",
 				"rpc.events",

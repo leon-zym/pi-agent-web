@@ -27,16 +27,6 @@ import {
 } from "@pi-agent-web/protocol";
 import { EpochContentStoreError, type EpochStoredContentRef } from "./epoch-content-store.js";
 import {
-	isLegacyRpcV1FutureContentRawEvent,
-	isLegacyRpcV1FutureContentRawExtensionUiRequest,
-	isLegacyRpcV1FutureContentRawResponse,
-} from "./legacy-rpc-v1-content-wire.js";
-import {
-	isLegacyRpcV1RawEvent,
-	isLegacyRpcV1RawExtensionUiRequest,
-	isLegacyRpcV1RawResponse,
-} from "./legacy-rpc-v1-wire.js";
-import {
 	type PiCapability,
 	type PiHostAdapter,
 	type PiHostDecodeContext,
@@ -53,14 +43,25 @@ import {
 	PiPayloadExternalizationError,
 	type PiPayloadLease,
 } from "./pi-payload-externalizer.js";
+import {
+	isPiRpcContentRawEvent,
+	isPiRpcContentRawExtensionUiRequest,
+	isPiRpcContentRawResponse,
+} from "./pi-rpc-content-wire.js";
+import { isPiRpcRawEvent, isPiRpcRawExtensionUiRequest, isPiRpcRawResponse } from "./pi-rpc-wire.js";
 
-export const LEGACY_RPC_V1_ADAPTER_ID = "legacy-rpc-v1";
+export const PI_RPC_ADAPTER_ID = "pi-rpc";
+
+/** Concrete adapter for Pi's documented RPC mode. */
+export interface PiRpcAdapter extends PiHostAdapter {
+	readonly id: typeof PI_RPC_ADAPTER_ID;
+}
 
 /**
  * Only these side-channel JSON frames are intentionally non-authoritative.
  * Every other unknown discriminant fails closed instead of being silently lost.
  */
-export const LEGACY_RPC_V1_IGNORABLE_FRAME_TYPES: ReadonlySet<string> = new Set(["log"]);
+export const PI_RPC_IGNORABLE_FRAME_TYPES: ReadonlySet<string> = new Set(["log"]);
 
 const AUTHORITATIVE_EVENT_TYPES: ReadonlySet<string> = new Set([
 	"agent_start",
@@ -179,7 +180,7 @@ function incompatible(
 ): never {
 	throw new PiProtocolIncompatibleError({
 		code: "protocol_incompatible",
-		adapterId: LEGACY_RPC_V1_ADAPTER_ID,
+		adapterId: PI_RPC_ADAPTER_ID,
 		frameKind,
 		reason,
 		...(frameType ? { frameType } : {}),
@@ -202,10 +203,10 @@ function isCount(value: unknown): value is number {
 
 /**
  * Pi's reviewed Model wire has provider-routing fields the Browser does not
- * consume. Validate that exact legacy shape, then copy only product fields so
+ * consume. Validate that exact upstream shape, then copy only product fields so
  * headers/base URLs and future unknown keys never cross the adapter boundary.
  */
-function normalizeLegacyModel(value: unknown): unknown {
+function normalizePiModel(value: unknown): unknown {
 	if (!isRecord(value) || !Object.keys(value).every((key) => LEGACY_MODEL_KEYS.has(key))) return value;
 	if (
 		(value.api !== undefined && !isBoundedString(value.api, 256)) ||
@@ -254,7 +255,7 @@ function normalizeLegacyModel(value: unknown): unknown {
 	return isModelDto(normalized) ? normalized : value;
 }
 
-function normalizeLegacyResponse(value: unknown): unknown {
+function normalizePiResponse(value: unknown): unknown {
 	if (!isRecord(value) || value.type !== "response" || value.success !== true || !isRecord(value.data)) {
 		return value;
 	}
@@ -262,24 +263,24 @@ function normalizeLegacyResponse(value: unknown): unknown {
 	switch (value.command) {
 		case "get_state": {
 			if (value.data.model === undefined) return value;
-			const model = normalizeLegacyModel(value.data.model);
+			const model = normalizePiModel(value.data.model);
 			if (model === value.data.model) return value;
 			data = { ...value.data, model };
 			break;
 		}
 		case "set_model":
-			data = normalizeLegacyModel(value.data);
+			data = normalizePiModel(value.data);
 			break;
 		case "cycle_model": {
 			if (value.data.model === undefined) return value;
-			const model = normalizeLegacyModel(value.data.model);
+			const model = normalizePiModel(value.data.model);
 			if (model === value.data.model) return value;
 			data = { ...value.data, model };
 			break;
 		}
 		case "get_available_models":
 			if (!Array.isArray(value.data.models)) return value;
-			data = { ...value.data, models: value.data.models.map(normalizeLegacyModel) };
+			data = { ...value.data, models: value.data.models.map(normalizePiModel) };
 			break;
 		default:
 			return value;
@@ -638,13 +639,10 @@ async function externalizeFutureExtensionRequest(
 	}
 }
 
-export function createLegacyRpcV1Adapter(
-	version: string,
-	capabilities: readonly PiCapability[],
-): PiHostAdapter {
+export function createPiRpcAdapter(version: string, capabilities: readonly PiCapability[]): PiRpcAdapter {
 	const requiresToolcallIdentity = capabilities.includes("rpc.toolcall_identity");
 	return {
-		id: LEGACY_RPC_V1_ADAPTER_ID,
+		id: PI_RPC_ADAPTER_ID,
 		version,
 		capabilities,
 		probeVersion: probeExactPiVersion,
@@ -669,7 +667,7 @@ export function createLegacyRpcV1Adapter(
 		},
 
 		decodeResponse(value, expectedCommand, context) {
-			const normalized = normalizeLegacyResponse(value);
+			const normalized = normalizePiResponse(value);
 			const frameType = isRecord(normalized) ? boundedFrameType(normalized.command) : undefined;
 			if (!isRecord(normalized) || normalized.type !== "response" || typeof normalized.id !== "string") {
 				return incompatible("response", "malformed_response", frameType);
@@ -680,7 +678,7 @@ export function createLegacyRpcV1Adapter(
 			if (hasGatewayOnlyResponseFields(normalized)) {
 				return incompatible("response", "malformed_response", frameType);
 			}
-			if (!isLegacyRpcV1RawResponse(normalized, expectedCommand)) {
+			if (!isPiRpcRawResponse(normalized, expectedCommand)) {
 				return incompatible("response", "malformed_response", frameType);
 			}
 			const externalizer = context?.externalizer;
@@ -694,7 +692,7 @@ export function createLegacyRpcV1Adapter(
 		},
 
 		decodeFutureResponse(value, expectedCommand, context) {
-			const normalized = normalizeLegacyResponse(value);
+			const normalized = normalizePiResponse(value);
 			const frameType = isRecord(normalized) ? boundedFrameType(normalized.command) : undefined;
 			if (!isRecord(normalized) || normalized.type !== "response" || typeof normalized.id !== "string") {
 				return incompatible("response", "malformed_response", frameType);
@@ -704,7 +702,7 @@ export function createLegacyRpcV1Adapter(
 			}
 			if (
 				hasGatewayOnlyResponseFields(normalized) ||
-				!isLegacyRpcV1FutureContentRawResponse(normalized, expectedCommand)
+				!isPiRpcContentRawResponse(normalized, expectedCommand)
 			) {
 				return incompatible("response", "malformed_response", frameType);
 			}
@@ -712,7 +710,7 @@ export function createLegacyRpcV1Adapter(
 		},
 
 		decodeOrphanedResponse(value) {
-			const normalized = normalizeLegacyResponse(value);
+			const normalized = normalizePiResponse(value);
 			const frameType = isRecord(normalized) ? boundedFrameType(normalized.command) : undefined;
 			if (
 				!isRecord(normalized) ||
@@ -720,7 +718,7 @@ export function createLegacyRpcV1Adapter(
 				typeof normalized.id !== "string" ||
 				hasGatewayOnlyResponseFields(normalized) ||
 				!isSessionCommandTypeDto(normalized.command) ||
-				!isLegacyRpcV1RawResponse(normalized, normalized.command)
+				!isPiRpcRawResponse(normalized, normalized.command)
 			) {
 				return incompatible("response", "malformed_response", frameType);
 			}
@@ -728,7 +726,7 @@ export function createLegacyRpcV1Adapter(
 		},
 
 		decodeFutureOrphanedResponse(value) {
-			const normalized = normalizeLegacyResponse(value);
+			const normalized = normalizePiResponse(value);
 			const frameType = isRecord(normalized) ? boundedFrameType(normalized.command) : undefined;
 			if (
 				!isRecord(normalized) ||
@@ -736,7 +734,7 @@ export function createLegacyRpcV1Adapter(
 				typeof normalized.id !== "string" ||
 				hasGatewayOnlyResponseFields(normalized) ||
 				!isSessionCommandTypeDto(normalized.command) ||
-				!isLegacyRpcV1FutureContentRawResponse(normalized, normalized.command)
+				!isPiRpcContentRawResponse(normalized, normalized.command)
 			) {
 				return incompatible("response", "malformed_response", frameType);
 			}
@@ -748,7 +746,7 @@ export function createLegacyRpcV1Adapter(
 				return incompatible("frame", "malformed_frame");
 			}
 			if (value.type === "extension_ui_request") {
-				if (!isLegacyRpcV1RawExtensionUiRequest(value) || !isExtensionUiRequestDto(value)) {
+				if (!isPiRpcRawExtensionUiRequest(value) || !isExtensionUiRequestDto(value)) {
 					return incompatible(
 						"extension_ui_request",
 						"malformed_extension_ui_request",
@@ -757,7 +755,7 @@ export function createLegacyRpcV1Adapter(
 				}
 				return decoded({ kind: "extension_ui_request", request: value } satisfies PiHostUnsolicitedFrame);
 			}
-			if (isLegacyRpcV1RawEvent(value)) {
+			if (isPiRpcRawEvent(value)) {
 				const externalizer = context?.externalizer;
 				if (externalizer) {
 					return externalizeEvent(value, { ...context, externalizer }, requiresToolcallIdentity);
@@ -780,7 +778,7 @@ export function createLegacyRpcV1Adapter(
 			if (AUTHORITATIVE_EVENT_TYPES.has(value.type)) {
 				return incompatible("event", "malformed_event", boundedFrameType(value.type));
 			}
-			if (LEGACY_RPC_V1_IGNORABLE_FRAME_TYPES.has(value.type)) {
+			if (PI_RPC_IGNORABLE_FRAME_TYPES.has(value.type)) {
 				return decoded({ kind: "ignored", frameType: value.type } satisfies PiHostUnsolicitedFrame);
 			}
 			return incompatible("event", "unknown_authoritative_event", boundedFrameType(value.type));
@@ -791,7 +789,7 @@ export function createLegacyRpcV1Adapter(
 				return incompatible("frame", "malformed_frame");
 			}
 			if (value.type === "extension_ui_request") {
-				if (!isLegacyRpcV1FutureContentRawExtensionUiRequest(value)) {
+				if (!isPiRpcContentRawExtensionUiRequest(value)) {
 					return incompatible(
 						"extension_ui_request",
 						"malformed_extension_ui_request",
@@ -800,13 +798,13 @@ export function createLegacyRpcV1Adapter(
 				}
 				return externalizeFutureExtensionRequest(value, context);
 			}
-			if (isLegacyRpcV1FutureContentRawEvent(value)) {
+			if (isPiRpcContentRawEvent(value)) {
 				return externalizeFutureEvent(value, context, requiresToolcallIdentity);
 			}
 			if (AUTHORITATIVE_EVENT_TYPES.has(value.type)) {
 				return incompatible("event", "malformed_event", boundedFrameType(value.type));
 			}
-			if (LEGACY_RPC_V1_IGNORABLE_FRAME_TYPES.has(value.type)) {
+			if (PI_RPC_IGNORABLE_FRAME_TYPES.has(value.type)) {
 				return decoded({
 					kind: "ignored",
 					frameType: value.type,
@@ -817,7 +815,7 @@ export function createLegacyRpcV1Adapter(
 	};
 }
 
-const LEGACY_CURRENT_CAPABILITIES = [
+const PI_RPC_DEFAULT_CAPABILITIES = [
 	"session.create",
 	"session.open",
 	"session.fork",
@@ -827,12 +825,12 @@ const LEGACY_CURRENT_CAPABILITIES = [
 	"rpc.extension_ui",
 ] as const satisfies readonly PiCapability[];
 
-export const legacyRpcV1Adapter = createLegacyRpcV1Adapter("0.84.2", LEGACY_CURRENT_CAPABILITIES);
+export const piRpcAdapter = createPiRpcAdapter("0.84.2", PI_RPC_DEFAULT_CAPABILITIES);
 
-export function encodeLegacyRpcV1Command(command: SessionCommandDto & { id: string }): unknown {
-	return legacyRpcV1Adapter.encodeCommand(command);
+export function encodePiRpcCommand(command: SessionCommandDto & { id: string }): unknown {
+	return piRpcAdapter.encodeCommand(command);
 }
 
-export function decodeLegacyRpcV1Response(value: unknown, command: SessionCommandTypeDto) {
-	return legacyRpcV1Adapter.decodeResponse(value, command);
+export function decodePiRpcResponse(value: unknown, command: SessionCommandTypeDto) {
+	return piRpcAdapter.decodeResponse(value, command);
 }

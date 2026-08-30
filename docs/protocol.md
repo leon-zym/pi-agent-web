@@ -540,7 +540,7 @@ probe，再以 exact version compatibility matrix 校验 adapter 与必需 capab
 package manifest 与 probe 输出必须一致；失败使用稳定且不含路径/凭据的诊断码。
 
 Pi stdout 先由独立的 `PI_WIRE_RUNTIME_SCHEMA_REGISTRY` 做有界 envelope 形状筛选，再由
-`legacy-rpc-v1` adapter 的 raw wire guard 按 command/event 验证并转换为产品 DTO。Browser/Gateway 方向
+`pi-rpc` adapter 的 raw wire guard 按 command/event 验证并转换为产品 DTO。Browser/Gateway 方向
 使用独立的 `PRODUCT_RUNTIME_SCHEMA_REGISTRY`；它同样只声明浅层 envelope，产品 guard 继续负责 nested
 data、UTF-8 bytes、item count、safe number、JSON depth、epoch/generation identity 与 resource budget。
 这样 schema 不会把 Pi-owned opaque JSON 误认成 Gateway-owned DTO，也不会在通用 validator 中重复实现

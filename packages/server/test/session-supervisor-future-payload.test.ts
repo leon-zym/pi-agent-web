@@ -13,7 +13,6 @@ import {
 	type EpochStoredContentRef,
 } from "../src/epoch-content-store.js";
 import { createGatewayFuturePayloadActivation } from "../src/gateway-payload-activation.js";
-import { legacyRpcV1Adapter } from "../src/legacy-rpc-v1.js";
 import { canonicalizeSessionFile, sessionHandleForFile } from "../src/native-session-catalog.js";
 import type { PiHostFuturePayloadExternalizer } from "../src/pi-host-adapter.js";
 import type {
@@ -21,6 +20,7 @@ import type {
 	PiPayloadLease,
 	PiPayloadLeaseTransfer,
 } from "../src/pi-payload-externalizer.js";
+import { piRpcAdapter } from "../src/pi-rpc-adapter.js";
 import type { SessionLiveProjectionLimits } from "../src/session-live-projection.js";
 import { SessionLiveProjection } from "../src/session-live-projection.js";
 import type { FutureSessionRuntimePiPayloadServices } from "../src/session-runtime.js";
@@ -89,11 +89,11 @@ function createFutureSupervisorFixture(
 			args: [fixturePath],
 			source: "pi-path",
 			label: "future Session runtime fixture",
-			adapter: legacyRpcV1Adapter,
+			adapter: piRpcAdapter,
 			version: "0.84.2",
-			adapterId: "legacy-rpc-v1",
+			adapterId: "pi-rpc",
 			compatibilityStatus: "current",
-			capabilities: legacyRpcV1Adapter.capabilities,
+			capabilities: piRpcAdapter.capabilities,
 		},
 		resolveSession: async (handle) => (handle === target.sessionHandle ? target : undefined),
 		broadcast: (message) => messages.push(message),

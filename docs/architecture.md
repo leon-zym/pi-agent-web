@@ -223,7 +223,7 @@ context 注入 WebSocket Bridge。REST routes 使用同一个 store。Bridge 复
 product mode 后才广告并要求 `payload.epoch_attachment_refs`、`payload.epoch_content_refs`；缺少任一
 required capability 的连接在 subscribe 前终止，不退回 inline output。
 
-Production Pi externalization 路径中，`legacy-rpc-v1` 先用 command/event-specific
+Production Pi externalization 路径中，`pi-rpc` 先用 command/event-specific
 raw guard 验证来源，再只遍历明确的 image 语义槽：user、toolResult 与 custom message content，message
 与 custom_message entry，`get_messages`、`get_entries`、`get_tree` 成功响应，以及 `agent_end`、
 `turn_end`、`message_start`、`message_end`、`entry_appended` 事件。Tool args/result/details、Extension UI

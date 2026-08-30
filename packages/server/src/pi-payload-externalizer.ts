@@ -31,11 +31,11 @@ import {
 	type StagedEpochContent,
 } from "./epoch-content-store.js";
 import {
-	isLegacyRpcV1FutureContentRawEvent,
-	isLegacyRpcV1FutureContentRawExtensionUiRequest,
-	isLegacyRpcV1FutureContentRawResponse,
-} from "./legacy-rpc-v1-content-wire.js";
-import { isLegacyRpcV1RawEvent, isLegacyRpcV1RawResponse } from "./legacy-rpc-v1-wire.js";
+	isPiRpcContentRawEvent,
+	isPiRpcContentRawExtensionUiRequest,
+	isPiRpcContentRawResponse,
+} from "./pi-rpc-content-wire.js";
+import { isPiRpcRawEvent, isPiRpcRawResponse } from "./pi-rpc-wire.js";
 import { createRasterAdmissionValidator, RasterAdmissionError } from "./raster-admission.js";
 
 type UnknownRecord = Record<string, unknown>;
@@ -260,13 +260,13 @@ function assertOptions(options: AnyPiPayloadExternalizerOptions): void {
 function assertRawInput(input: PiPayloadExternalizerInput, generic: boolean): void {
 	const valid = generic
 		? input.kind === "event"
-			? isLegacyRpcV1FutureContentRawEvent(input.value)
+			? isPiRpcContentRawEvent(input.value)
 			: input.kind === "extension_ui_request"
-				? isLegacyRpcV1FutureContentRawExtensionUiRequest(input.value)
-				: isLegacyRpcV1FutureContentRawResponse(input.value, input.expectedCommand)
+				? isPiRpcContentRawExtensionUiRequest(input.value)
+				: isPiRpcContentRawResponse(input.value, input.expectedCommand)
 		: input.kind === "event"
-			? isLegacyRpcV1RawEvent(input.value)
-			: input.kind === "response" && isLegacyRpcV1RawResponse(input.value, input.expectedCommand);
+			? isPiRpcRawEvent(input.value)
+			: input.kind === "response" && isPiRpcRawResponse(input.value, input.expectedCommand);
 	if (!valid) {
 		throw new PiPayloadExternalizationError("invalid_raw_payload", "Pi payload failed raw provenance guards");
 	}

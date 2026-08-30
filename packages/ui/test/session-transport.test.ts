@@ -101,7 +101,7 @@ function serverHello(overrides: Partial<GatewayServerHelloDto> = {}): GatewaySer
 		serverBuild: "9.7.0-independent-server",
 		serverEpoch: "test-server-epoch",
 		piVersion: "0.84.2",
-		adapterId: "legacy-rpc-v1",
+		adapterId: "pi-rpc",
 		capabilities: [
 			"rpc.commands",
 			"rpc.events",

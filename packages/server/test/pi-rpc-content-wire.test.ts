@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
-	isLegacyRpcV1FutureContentRawEvent,
-	isLegacyRpcV1FutureContentRawExtensionUiRequest,
-	isLegacyRpcV1FutureContentRawResponse,
-	isLegacyRpcV1UntrustedJsonRoot,
-	type LegacyRpcV1UntrustedJsonRoot,
-} from "../src/legacy-rpc-v1-content-wire.js";
+	isPiRpcContentRawEvent,
+	isPiRpcContentRawExtensionUiRequest,
+	isPiRpcContentRawResponse,
+	isPiRpcUntrustedJsonRoot,
+	type PiRpcUntrustedJsonRoot,
+} from "../src/pi-rpc-content-wire.js";
 
 const usage = {
 	input: 1,
@@ -29,7 +29,7 @@ const wrapperLookalikes = [
 	{ type: "external_json", ref: lookalikeRef },
 	{ type: "inline_json", value: { nested: true } },
 	{ type: "external_text", ref: lookalikeRef },
-] as const satisfies readonly LegacyRpcV1UntrustedJsonRoot[];
+] as const satisfies readonly PiRpcUntrustedJsonRoot[];
 
 function entry(message: unknown) {
 	return {
@@ -41,7 +41,7 @@ function entry(message: unknown) {
 	};
 }
 
-describe("legacy RPC v1 future content raw guards", () => {
+describe("Pi RPC content-reference raw guards", () => {
 	it("admits only the three closed future Extension roots without interpreting wrappers", () => {
 		const wideText = "x".repeat(1024 * 1024 + 1);
 		for (const request of [
@@ -66,11 +66,11 @@ describe("legacy RPC v1 future content raw guards", () => {
 				widgetLines: [wideText],
 			},
 		]) {
-			expect(isLegacyRpcV1FutureContentRawExtensionUiRequest(request)).toBe(true);
+			expect(isPiRpcContentRawExtensionUiRequest(request)).toBe(true);
 		}
 
 		expect(
-			isLegacyRpcV1FutureContentRawExtensionUiRequest({
+			isPiRpcContentRawExtensionUiRequest({
 				type: "extension_ui_request",
 				id: "status-a",
 				method: "setStatus",
@@ -79,7 +79,7 @@ describe("legacy RPC v1 future content raw guards", () => {
 			}),
 		).toBe(false);
 		expect(
-			isLegacyRpcV1FutureContentRawExtensionUiRequest({
+			isPiRpcContentRawExtensionUiRequest({
 				type: "extension_ui_request",
 				id: "widget-too-many",
 				method: "setWidget",
@@ -88,7 +88,7 @@ describe("legacy RPC v1 future content raw guards", () => {
 			}),
 		).toBe(false);
 		expect(
-			isLegacyRpcV1FutureContentRawExtensionUiRequest({
+			isPiRpcContentRawExtensionUiRequest({
 				type: "extension_ui_request",
 				id: "editor-forged",
 				method: "editor",
@@ -100,8 +100,8 @@ describe("legacy RPC v1 future content raw guards", () => {
 
 	it("admits only the approved opaque JSON roots without interpreting nested wrapper lookalikes", () => {
 		for (const root of wrapperLookalikes) {
-			expect(isLegacyRpcV1UntrustedJsonRoot(root)).toBe(true);
-			expect(isLegacyRpcV1UntrustedJsonRoot({ nested: { ordinaryPiData: root } })).toBe(true);
+			expect(isPiRpcUntrustedJsonRoot(root)).toBe(true);
+			expect(isPiRpcUntrustedJsonRoot({ nested: { ordinaryPiData: root } })).toBe(true);
 		}
 
 		const toolCall = { type: "toolCall", id: "tool-1", name: "read", arguments: wrapperLookalikes[1] };
@@ -132,7 +132,7 @@ describe("legacy RPC v1 future content raw guards", () => {
 
 		for (const message of [assistant, toolResult, custom]) {
 			expect(
-				isLegacyRpcV1FutureContentRawResponse(
+				isPiRpcContentRawResponse(
 					{
 						type: "response",
 						id: "response-1",
@@ -143,11 +143,11 @@ describe("legacy RPC v1 future content raw guards", () => {
 					"get_messages",
 				),
 			).toBe(true);
-			expect(isLegacyRpcV1FutureContentRawEvent({ type: "message_start", message })).toBe(true);
+			expect(isPiRpcContentRawEvent({ type: "message_start", message })).toBe(true);
 		}
 
 		expect(
-			isLegacyRpcV1FutureContentRawEvent({
+			isPiRpcContentRawEvent({
 				type: "message_update",
 				usage,
 				assistantMessageEvent: { type: "toolcall_end", contentIndex: 0, toolCall },
@@ -170,7 +170,7 @@ describe("legacy RPC v1 future content raw guards", () => {
 				isError: false,
 			},
 		]) {
-			expect(isLegacyRpcV1FutureContentRawEvent(event)).toBe(true);
+			expect(isPiRpcContentRawEvent(event)).toBe(true);
 		}
 	});
 
@@ -219,7 +219,7 @@ describe("legacy RPC v1 future content raw guards", () => {
 		entries.push(customMessageEntry);
 
 		expect(
-			isLegacyRpcV1FutureContentRawResponse(
+			isPiRpcContentRawResponse(
 				{
 					type: "response",
 					id: "messages",
@@ -231,7 +231,7 @@ describe("legacy RPC v1 future content raw guards", () => {
 			),
 		).toBe(true);
 		expect(
-			isLegacyRpcV1FutureContentRawResponse(
+			isPiRpcContentRawResponse(
 				{
 					type: "response",
 					id: "entries",
@@ -243,7 +243,7 @@ describe("legacy RPC v1 future content raw guards", () => {
 			),
 		).toBe(true);
 		expect(
-			isLegacyRpcV1FutureContentRawResponse(
+			isPiRpcContentRawResponse(
 				{
 					type: "response",
 					id: "tree",
@@ -254,9 +254,7 @@ describe("legacy RPC v1 future content raw guards", () => {
 				"get_tree",
 			),
 		).toBe(true);
-		expect(isLegacyRpcV1FutureContentRawEvent({ type: "entry_appended", entry: customMessageEntry })).toBe(
-			true,
-		);
+		expect(isPiRpcContentRawEvent({ type: "entry_appended", entry: customMessageEntry })).toBe(true);
 	});
 
 	it("rejects Pi-authored values in typed product wrapper slots and does not widen excluded roots", () => {
@@ -281,7 +279,7 @@ describe("legacy RPC v1 future content raw guards", () => {
 			{ type: "image", data: forgedImageRef, mimeType: "image/png" },
 		]) {
 			expect(
-				isLegacyRpcV1FutureContentRawEvent({
+				isPiRpcContentRawEvent({
 					type: "message_start",
 					message: { ...baseToolResult, content: [block] },
 				}),
@@ -290,14 +288,14 @@ describe("legacy RPC v1 future content raw guards", () => {
 
 		const wideExcluded = "x".repeat(1024 * 1024 + 1);
 		expect(
-			isLegacyRpcV1FutureContentRawEvent({
+			isPiRpcContentRawEvent({
 				type: "message_update",
 				usage,
 				assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: wideExcluded },
 			}),
 		).toBe(false);
 		expect(
-			isLegacyRpcV1FutureContentRawEvent({
+			isPiRpcContentRawEvent({
 				type: "extension_error",
 				extensionPath: "/fixture",
 				event: "load",
@@ -310,7 +308,7 @@ describe("legacy RPC v1 future content raw guards", () => {
 		const wideArguments = { payload: "x".repeat(8 * 1024 * 1024 + 1) };
 		const toolCall = { type: "toolCall", id: "tool-1", name: "read", arguments: wideArguments };
 		expect(
-			isLegacyRpcV1FutureContentRawEvent({
+			isPiRpcContentRawEvent({
 				type: "message_update",
 				usage,
 				assistantMessageEvent: { type: "toolcall_end", contentIndex: 0, toolCall },
@@ -328,12 +326,10 @@ describe("legacy RPC v1 future content raw guards", () => {
 			{ type: "done", reason: "stop", message: assistant },
 			{ type: "error", reason: "error", error: assistant },
 		]) {
-			expect(
-				isLegacyRpcV1FutureContentRawEvent({ type: "message_update", usage, assistantMessageEvent }),
-			).toBe(false);
+			expect(isPiRpcContentRawEvent({ type: "message_update", usage, assistantMessageEvent })).toBe(false);
 		}
 		expect(
-			isLegacyRpcV1FutureContentRawEvent({
+			isPiRpcContentRawEvent({
 				type: "message_update",
 				usage,
 				assistantMessageEvent: {
@@ -357,10 +353,10 @@ describe("legacy RPC v1 future content raw guards", () => {
 				timestamp: 1,
 			},
 		]) {
-			expect(isLegacyRpcV1FutureContentRawEvent({ type: "message_start", message })).toBe(false);
+			expect(isPiRpcContentRawEvent({ type: "message_start", message })).toBe(false);
 		}
 		expect(
-			isLegacyRpcV1FutureContentRawEvent({
+			isPiRpcContentRawEvent({
 				type: "entry_appended",
 				entry: {
 					type: "custom_message",
@@ -374,7 +370,7 @@ describe("legacy RPC v1 future content raw guards", () => {
 			}),
 		).toBe(false);
 		expect(
-			isLegacyRpcV1FutureContentRawEvent({
+			isPiRpcContentRawEvent({
 				type: "extension_ui_request",
 				id: "request-1",
 				method: "editor",
@@ -387,13 +383,13 @@ describe("legacy RPC v1 future content raw guards", () => {
 	it("bounds malformed raw JSON structure without recursively interpreting discriminants", () => {
 		const cyclic: Record<string, unknown> = {};
 		cyclic.self = cyclic;
-		expect(isLegacyRpcV1UntrustedJsonRoot(cyclic)).toBe(false);
-		expect(isLegacyRpcV1UntrustedJsonRoot(new Date(0))).toBe(false);
-		expect(isLegacyRpcV1UntrustedJsonRoot(Number.NaN)).toBe(false);
+		expect(isPiRpcUntrustedJsonRoot(cyclic)).toBe(false);
+		expect(isPiRpcUntrustedJsonRoot(new Date(0))).toBe(false);
+		expect(isPiRpcUntrustedJsonRoot(Number.NaN)).toBe(false);
 
 		let tooDeep: unknown = null;
 		for (let depth = 0; depth < 34; depth += 1) tooDeep = { child: tooDeep };
-		expect(isLegacyRpcV1UntrustedJsonRoot(tooDeep)).toBe(false);
+		expect(isPiRpcUntrustedJsonRoot(tooDeep)).toBe(false);
 
 		let childReads = 0;
 		const accessor = Object.defineProperty({}, "child", {
@@ -403,7 +399,7 @@ describe("legacy RPC v1 future content raw guards", () => {
 				return wrapperLookalikes[0];
 			},
 		});
-		expect(isLegacyRpcV1UntrustedJsonRoot(accessor)).toBe(false);
+		expect(isPiRpcUntrustedJsonRoot(accessor)).toBe(false);
 		expect(childReads).toBe(0);
 	});
 });

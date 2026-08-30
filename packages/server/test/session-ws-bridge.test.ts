@@ -24,8 +24,8 @@ import {
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import { MAX_JSONL_SNAPSHOT_LINE_BYTES } from "../src/jsonl.js";
-import { legacyRpcV1Adapter } from "../src/legacy-rpc-v1.js";
 import { canonicalizeSessionFile, sessionHandleForFile } from "../src/native-session-catalog.js";
+import { piRpcAdapter } from "../src/pi-rpc-adapter.js";
 import type { ExistingSessionTarget } from "../src/session-runtime-types.js";
 import { SessionSupervisor } from "../src/session-supervisor.js";
 import {
@@ -372,11 +372,11 @@ async function createHarness(
 			args: [fixturePath],
 			source: "pi-path",
 			label: "session runtime fixture",
-			adapter: legacyRpcV1Adapter,
+			adapter: piRpcAdapter,
 			version: "0.84.2",
-			adapterId: "legacy-rpc-v1",
+			adapterId: "pi-rpc",
 			compatibilityStatus: "current",
-			capabilities: legacyRpcV1Adapter.capabilities,
+			capabilities: piRpcAdapter.capabilities,
 		},
 		resolveSession: async (sessionHandle) => targetMap.get(sessionHandle),
 		env: options.env,
@@ -393,7 +393,7 @@ async function createHarness(
 		serverBuild: "0.1.0-test",
 		runtime: {
 			version: "0.84.2",
-			adapterId: "legacy-rpc-v1",
+			adapterId: "pi-rpc",
 			capabilities: [
 				"rpc.commands",
 				"rpc.events",

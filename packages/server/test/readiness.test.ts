@@ -39,7 +39,7 @@ describe("gateway liveness and readiness", () => {
 		const runtime = {
 			source: "bundled" as const,
 			version: "0.84.2",
-			adapterId: "legacy-rpc-v1",
+			adapterId: "pi-rpc",
 			capabilities: ["rpc.commands", "rpc.events"],
 		};
 		const { app, headers } = appWithReadiness({ ready: true, runtime });

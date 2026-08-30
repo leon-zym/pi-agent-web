@@ -11,7 +11,7 @@ protocol. A changed nested response could therefore fail inside UI projection, w
 event could put a persisted Session into a restart loop. Runtime resolution failure was also hidden
 behind a speculative `pi --mode rpc` fallback and an always-healthy endpoint.
 
-The Pi legacy RPC stream has no protocol version or capability discovery command. Browser and
+The documented Pi RPC stream has no protocol version or capability discovery command. Browser and
 Gateway builds can also update independently, so WebSocket compatibility cannot be inferred from
 the application package version.
 
@@ -24,9 +24,10 @@ the application package version.
    version-to-adapter capability matrix records the current distribution version and reviewed
    candidates. Missing, failed, mismatched, unsupported, and capability-deficient runtimes use
    stable redacted diagnostics.
-3. `PiHostAdapter` owns legacy command encoding and complete response, event, and Extension UI
-   decoding. The current `legacy-rpc-v1` adapter remains available while a future versioned Pi
-   protocol can implement the same product boundary.
+3. `PiHostAdapter` owns the upstream boundary, and `PiRpcAdapter` implements Pi's documented RPC
+   command encoding plus complete response, event, and Extension UI decoding. Its stable diagnostic
+   id is `pi-rpc`; a second adapter is introduced only if upstream publishes an evidenced,
+   incompatible protocol contract.
 4. Browser-facing commands, responses, events, messages, models, stats, trees, and Extension UI are
    product-owned DTOs with runtime guards and byte/item/depth limits. Provider routing data,
    response tokens, deferred handles, and diagnostic stacks are validated and removed at the
@@ -57,7 +58,7 @@ the application package version.
 
 - **PATH-first resolution**: convenient but makes the installed product depend on unrelated local
   state.
-- **Semver-range acceptance without fixtures**: legacy RPC exposes no capability negotiation, so a
+- **Semver-range acceptance without fixtures**: Pi RPC exposes no capability negotiation, so a
   version range would claim compatibility that was not tested.
 - **Shallow envelope validation**: defers failures into Session projections and cannot distinguish
   malformed authoritative data from safe side channels.

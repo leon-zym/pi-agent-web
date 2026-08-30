@@ -12,10 +12,10 @@ import type {
 import { SESSION_PAYLOAD_BUDGET, SESSION_SNAPSHOT_MAX_BYTES } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { EpochContentHold } from "../src/epoch-content-store.js";
-import { legacyRpcV1Adapter } from "../src/legacy-rpc-v1.js";
 import { canonicalizeSessionFile, sessionHandleForFile } from "../src/native-session-catalog.js";
 import type { PiHostAdapter, PiHostDecodeOutcome } from "../src/pi-host-adapter.js";
 import type { PiPayloadLease } from "../src/pi-payload-externalizer.js";
+import { piRpcAdapter } from "../src/pi-rpc-adapter.js";
 import { SessionLiveProjection, type SessionLiveProjectionLimits } from "../src/session-live-projection.js";
 import { createCurrentSessionProductSchema } from "../src/session-product-schema.js";
 import type {
@@ -146,7 +146,7 @@ function createHarness(options: {
 }) {
 	const messages: SessionSupervisorMessage[] = [];
 	const targets = new Map(options.targets.map((target) => [target.sessionHandle, target]));
-	const adapter = options.adapter ?? legacyRpcV1Adapter;
+	const adapter = options.adapter ?? piRpcAdapter;
 	const supervisor = new SessionSupervisor({
 		serverEpoch: "session-supervisor-test-epoch",
 		resolved: {
@@ -156,7 +156,7 @@ function createHarness(options: {
 			label: "session runtime fixture",
 			adapter,
 			version: "0.84.2",
-			adapterId: "legacy-rpc-v1",
+			adapterId: "pi-rpc",
 			compatibilityStatus: "current",
 			capabilities: adapter.capabilities,
 		},
@@ -350,9 +350,9 @@ function testPayloadServices(released: EpochContentHold[]): SessionRuntimePiPayl
 function startupBaseAdapter(ref: SessionAttachmentRefDto, lease: PiPayloadLease): PiHostAdapter {
 	let attached = false;
 	return {
-		...legacyRpcV1Adapter,
+		...piRpcAdapter,
 		async decodeResponse(value, expectedCommand, context) {
-			const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, {
+			const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, {
 				signal: context?.signal ?? new AbortController().signal,
 			});
 			if (expectedCommand !== "get_messages" || attached || outcome.value.success !== true) {
@@ -380,7 +380,7 @@ function startupBaseAdapter(ref: SessionAttachmentRefDto, lease: PiPayloadLease)
 			return decoded;
 		},
 		decodeUnsolicited(value, context) {
-			return legacyRpcV1Adapter.decodeUnsolicited(value, {
+			return piRpcAdapter.decodeUnsolicited(value, {
 				signal: context?.signal ?? new AbortController().signal,
 			});
 		},
@@ -396,9 +396,9 @@ function transitionPayloadAdapter(input: {
 }): PiHostAdapter {
 	let getMessagesCount = 0;
 	return {
-		...legacyRpcV1Adapter,
+		...piRpcAdapter,
 		async decodeResponse(value, expectedCommand, context) {
-			const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, {
+			const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, {
 				signal: context?.signal ?? new AbortController().signal,
 			});
 			if (expectedCommand !== "get_messages" || outcome.value.success !== true) return outcome;
@@ -431,7 +431,7 @@ function transitionPayloadAdapter(input: {
 			};
 		},
 		async decodeUnsolicited(value, context) {
-			const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, {
+			const outcome = await piRpcAdapter.decodeUnsolicited(value, {
 				signal: context?.signal ?? new AbortController().signal,
 			});
 			if (outcome.value.kind !== "event" || outcome.value.event.type !== "message_end") {
@@ -956,14 +956,14 @@ describe("SessionSupervisor", () => {
 		const { hold, lease } = trackedLease(exactRef, { adopted, released });
 		let attached = false;
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			decodeResponse(value, expectedCommand, context) {
-				return legacyRpcV1Adapter.decodeResponse(value, expectedCommand, {
+				return piRpcAdapter.decodeResponse(value, expectedCommand, {
 					signal: context?.signal ?? new AbortController().signal,
 				});
 			},
 			async decodeUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, {
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, {
 					signal: context?.signal ?? new AbortController().signal,
 				});
 				if (attached || outcome.value.kind !== "event" || outcome.value.event.type !== "agent_start") {
@@ -1412,7 +1412,7 @@ describe("SessionSupervisor", () => {
 		const adapter: PiHostAdapter = {
 			...base,
 			async decodeUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, {
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, {
 					signal: context?.signal ?? new AbortController().signal,
 				});
 				if (attachedEvent || outcome.value.kind !== "event" || outcome.value.event.type !== "agent_end") {
@@ -1469,9 +1469,9 @@ describe("SessionSupervisor", () => {
 		const { hold, lease } = trackedLease(exactRef, tracking);
 		let getMessagesCount = 0;
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeResponse(value, expectedCommand, context) {
-				const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, {
+				const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, {
 					signal: context?.signal ?? new AbortController().signal,
 				});
 				if (expectedCommand !== "get_messages") return outcome;
@@ -1540,14 +1540,14 @@ describe("SessionSupervisor", () => {
 		const { hold, lease } = trackedLease(exactRef, tracking);
 		let attached = false;
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			decodeResponse(value, expectedCommand, context) {
-				return legacyRpcV1Adapter.decodeResponse(value, expectedCommand, {
+				return piRpcAdapter.decodeResponse(value, expectedCommand, {
 					signal: context?.signal ?? new AbortController().signal,
 				});
 			},
 			async decodeUnsolicited(value, context) {
-				const outcome = await legacyRpcV1Adapter.decodeUnsolicited(value, {
+				const outcome = await piRpcAdapter.decodeUnsolicited(value, {
 					signal: context?.signal ?? new AbortController().signal,
 				});
 				if (outcome.value.kind !== "event" || outcome.value.event.type !== "agent_end" || attached) {
@@ -1623,9 +1623,9 @@ describe("SessionSupervisor", () => {
 		const { hold, lease } = trackedLease(exactRef, tracking);
 		let getMessagesCount = 0;
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeResponse(value, expectedCommand, context) {
-				const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, {
+				const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, {
 					signal: context?.signal ?? new AbortController().signal,
 				});
 				if (expectedCommand !== "get_messages") return outcome;
@@ -1652,7 +1652,7 @@ describe("SessionSupervisor", () => {
 				return decoded;
 			},
 			decodeUnsolicited(value, context) {
-				return legacyRpcV1Adapter.decodeUnsolicited(value, {
+				return piRpcAdapter.decodeUnsolicited(value, {
 					signal: context?.signal ?? new AbortController().signal,
 				});
 			},
@@ -1705,9 +1705,9 @@ describe("SessionSupervisor", () => {
 		const lease = rejectingTransferLease(exactRef, tracking);
 		let getMessagesCount = 0;
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			async decodeResponse(value, expectedCommand, context) {
-				const outcome = await legacyRpcV1Adapter.decodeResponse(value, expectedCommand, {
+				const outcome = await piRpcAdapter.decodeResponse(value, expectedCommand, {
 					signal: context?.signal ?? new AbortController().signal,
 				});
 				if (expectedCommand !== "get_messages") return outcome;
@@ -1733,7 +1733,7 @@ describe("SessionSupervisor", () => {
 				};
 			},
 			decodeUnsolicited(value, context) {
-				return legacyRpcV1Adapter.decodeUnsolicited(value, {
+				return piRpcAdapter.decodeUnsolicited(value, {
 					signal: context?.signal ?? new AbortController().signal,
 				});
 			},
@@ -2684,10 +2684,10 @@ describe("SessionSupervisor", () => {
 		const target = createNativeSession(root, cwd, "selected-adapter");
 		let openCalls = 0;
 		const adapter: PiHostAdapter = {
-			...legacyRpcV1Adapter,
+			...piRpcAdapter,
 			openSessionArguments(input) {
 				openCalls += 1;
-				return legacyRpcV1Adapter.openSessionArguments(input);
+				return piRpcAdapter.openSessionArguments(input);
 			},
 		};
 		const { supervisor } = createHarness({ targets: [target], adapter });
@@ -3717,19 +3717,19 @@ describe("SessionSupervisor", () => {
 		const target = createNativeSession(root, cwd, `startup-stop-${String(services)}`);
 		const adapter: PiHostAdapter = services
 			? {
-					...legacyRpcV1Adapter,
+					...piRpcAdapter,
 					decodeResponse(value, expectedCommand, context) {
-						return legacyRpcV1Adapter.decodeResponse(value, expectedCommand, {
+						return piRpcAdapter.decodeResponse(value, expectedCommand, {
 							signal: context?.signal ?? new AbortController().signal,
 						});
 					},
 					decodeUnsolicited(value, context) {
-						return legacyRpcV1Adapter.decodeUnsolicited(value, {
+						return piRpcAdapter.decodeUnsolicited(value, {
 							signal: context?.signal ?? new AbortController().signal,
 						});
 					},
 				}
-			: legacyRpcV1Adapter;
+			: piRpcAdapter;
 		const released: EpochContentHold[] = [];
 		const { supervisor } = createHarness({
 			targets: [target],
@@ -5526,11 +5526,11 @@ describe("SessionSupervisor", () => {
 				args: [fixturePath],
 				source: "pi-path",
 				label: "session runtime fixture",
-				adapter: legacyRpcV1Adapter,
+				adapter: piRpcAdapter,
 				version: "0.84.2",
-				adapterId: "legacy-rpc-v1",
+				adapterId: "pi-rpc",
 				compatibilityStatus: "current",
-				capabilities: legacyRpcV1Adapter.capabilities,
+				capabilities: piRpcAdapter.capabilities,
 			},
 			resolveSession: async () => {
 				await resolveGate;

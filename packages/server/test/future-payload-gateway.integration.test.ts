@@ -26,8 +26,8 @@ import {
 	createGatewayFuturePayloadActivation,
 	createGatewayPayloadActivation,
 } from "../src/gateway-payload-activation.js";
-import { legacyRpcV1Adapter } from "../src/legacy-rpc-v1.js";
 import { canonicalizeSessionFile, sessionHandleForFile } from "../src/native-session-catalog.js";
+import { piRpcAdapter } from "../src/pi-rpc-adapter.js";
 import type { ExistingSessionTarget } from "../src/session-runtime-types.js";
 import { createFutureSessionSupervisor } from "../src/session-supervisor.js";
 import { createFutureSessionWsBridge } from "../src/session-ws-bridge.js";
@@ -329,11 +329,11 @@ async function createHarness(
 			args: [fixturePath],
 			source: "pi-path",
 			label: "future L3 payload fixture",
-			adapter: legacyRpcV1Adapter,
+			adapter: piRpcAdapter,
 			version: "0.84.2",
-			adapterId: "legacy-rpc-v1",
+			adapterId: "pi-rpc",
 			compatibilityStatus: "current",
-			capabilities: legacyRpcV1Adapter.capabilities,
+			capabilities: piRpcAdapter.capabilities,
 		},
 		resolveSession: async (sessionHandle) => (sessionHandle === target.sessionHandle ? target : undefined),
 		broadcast: (message) => bridge?.broadcast(message),
@@ -348,8 +348,8 @@ async function createHarness(
 		serverBuild: "0.1.0-private",
 		runtime: {
 			version: "0.84.2",
-			adapterId: "legacy-rpc-v1",
-			capabilities: legacyRpcV1Adapter.capabilities,
+			adapterId: "pi-rpc",
+			capabilities: piRpcAdapter.capabilities,
 		},
 		payloadActivation: activation,
 		heartbeatIntervalMs: 60_000,
@@ -664,7 +664,7 @@ describe("private future payload Gateway vertical integration", () => {
 			createFutureSessionWsBridge({
 				supervisor: harness.supervisor,
 				serverBuild: "0.1.0-private",
-				runtime: { version: "0.84.2", adapterId: "legacy-rpc-v1", capabilities: [] },
+				runtime: { version: "0.84.2", adapterId: "pi-rpc", capabilities: [] },
 				payloadActivation: { ...harness.activation, context: foreignContext },
 			}),
 		).toThrow("payload activation is invalid");
@@ -676,7 +676,7 @@ describe("private future payload Gateway vertical integration", () => {
 		const badBridge = createFutureSessionWsBridge({
 			supervisor: harness.supervisor,
 			serverBuild: "0.1.0-private",
-			runtime: { version: "0.84.2", adapterId: "legacy-rpc-v1", capabilities: [] },
+			runtime: { version: "0.84.2", adapterId: "pi-rpc", capabilities: [] },
 			payloadActivation: {
 				...harness.activation,
 				supervisorServices: {

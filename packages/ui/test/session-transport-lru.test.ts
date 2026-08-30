@@ -40,7 +40,7 @@ function open(socket: FakeSocket | undefined): void {
 			serverBuild: "test-server",
 			serverEpoch: "test-epoch",
 			piVersion: "0.84.2",
-			adapterId: "legacy-rpc-v1",
+			adapterId: "pi-rpc",
 			capabilities: [
 				"rpc.commands",
 				"rpc.events",
