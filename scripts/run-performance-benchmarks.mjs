@@ -608,29 +608,30 @@ async function main() {
 		return 2;
 	}
 
-	let runDirectory;
+	let ownedRunDirectory;
 	let logsDirectory;
 	const source = sourceIdentity();
 	try {
 		const tierDirectory = path.join(artifactRoot, tier);
 		fs.mkdirSync(tierDirectory, { recursive: true });
-		runDirectory = path.join(tierDirectory, runId);
+		const proposedRunDirectory = path.join(tierDirectory, runId);
 		try {
-			fs.mkdirSync(runDirectory, { recursive: false });
+			fs.mkdirSync(proposedRunDirectory, { recursive: false });
 		} catch (error) {
 			if (isNodeError(error, "EEXIST")) {
 				throw new RunFailure(
 					"run-creation",
-					`Refusing to overwrite existing benchmark run: ${path.relative(repositoryRoot, runDirectory)}`,
+					`Refusing to overwrite existing benchmark run: ${path.relative(repositoryRoot, proposedRunDirectory)}`,
 				);
 			}
 			throw error;
 		}
-		const rawDirectory = path.join(runDirectory, "raw");
-		logsDirectory = path.join(runDirectory, "logs");
-		const playwrightDirectory = path.join(runDirectory, "playwright");
+		ownedRunDirectory = proposedRunDirectory;
+		const rawDirectory = path.join(ownedRunDirectory, "raw");
+		logsDirectory = path.join(ownedRunDirectory, "logs");
+		const playwrightDirectory = path.join(ownedRunDirectory, "playwright");
 		writeJson(
-			path.join(runDirectory, "run-manifest.json"),
+			path.join(ownedRunDirectory, "run-manifest.json"),
 			initialRunManifest({ runId, tier, variants, source }),
 		);
 		fs.mkdirSync(rawDirectory, { recursive: true });
@@ -665,7 +666,10 @@ async function main() {
 				uiTreeHash: "0".repeat(64),
 			},
 			buildVariants: Object.fromEntries(
-				FORMAL_BENCHMARK_VARIANTS.map((variant) => [variant, placeholderBuildVariant(runDirectory, variant)]),
+				FORMAL_BENCHMARK_VARIANTS.map((variant) => [
+					variant,
+					placeholderBuildVariant(ownedRunDirectory, variant),
+				]),
 			),
 			canonicalVariants: [...FORMAL_BENCHMARK_VARIANTS],
 			executionOrder,
@@ -674,8 +678,8 @@ async function main() {
 			capabilities: capabilitiesFor(expected, []),
 			expectedScenarioSet: expected,
 		};
-		writeJson(path.join(runDirectory, "manifest.json"), manifest);
-		writeJson(path.join(runDirectory, "environment.json"), environmentForRun(runId));
+		writeJson(path.join(ownedRunDirectory, "manifest.json"), manifest);
+		writeJson(path.join(ownedRunDirectory, "environment.json"), environmentForRun(runId));
 
 		if (fs.existsSync(benchmarkServerLegacyOutput)) {
 			throw new RunFailure(
@@ -694,11 +698,11 @@ async function main() {
 			identity: standardIdentity,
 			...standardExclusion,
 		});
-		writeJson(path.join(runDirectory, "manifest.json"), manifest);
+		writeJson(path.join(ownedRunDirectory, "manifest.json"), manifest);
 
 		const statuses = [{ phase: "build-standard", status: standardBuildStatus }];
 		for (const variant of executionOrder) {
-			const paths = variantBuildPaths(runDirectory, variant);
+			const paths = variantBuildPaths(ownedRunDirectory, variant);
 			try {
 				fs.mkdirSync(paths.serverDirectory, { recursive: true });
 				fs.mkdirSync(paths.uiDirectory, { recursive: true });
@@ -708,7 +712,7 @@ async function main() {
 					PI_WEB_BENCHMARK_SEED: seed,
 					PI_WEB_BENCHMARK_TIER: tier,
 					PI_WEB_BENCHMARK_VARIANT: variant,
-					PI_WEB_BENCHMARK_ARTIFACT_DIR: runDirectory,
+					PI_WEB_BENCHMARK_ARTIFACT_DIR: ownedRunDirectory,
 					PI_WEB_BENCHMARK_RAW_DIR: rawDirectory,
 					PI_WEB_BENCHMARK_PLAYWRIGHT_DIR: path.join(playwrightDirectory, variant),
 					PI_WEB_BENCHMARK_VARIANT_BUILD_DIR: paths.root,
@@ -762,16 +766,16 @@ async function main() {
 					);
 				}
 				const buildVariant = {
-					serverEntry: relativeRunPath(runDirectory, paths.serverEntry),
+					serverEntry: relativeRunPath(ownedRunDirectory, paths.serverEntry),
 					serverEntryHash: hashFile(paths.serverEntry),
 					serverTreeHash: hashTree(paths.serverDirectory),
-					uiDirectory: relativeRunPath(runDirectory, paths.uiDirectory),
+					uiDirectory: relativeRunPath(ownedRunDirectory, paths.uiDirectory),
 					uiTreeHash: hashTree(paths.uiDirectory),
 				};
 				manifest.buildVariants[variant] = buildVariant;
-				writeJson(path.join(runDirectory, "manifest.json"), manifest);
+				writeJson(path.join(ownedRunDirectory, "manifest.json"), manifest);
 				assertStandardBuildUnchanged(standardIdentity);
-				const preflight = verifyVariantBuild(runDirectory, paths, buildVariant);
+				const preflight = verifyVariantBuild(ownedRunDirectory, paths, buildVariant);
 				writeJson(path.join(logsDirectory, `preflight-${variant}.json`), {
 					variant,
 					...preflight,
@@ -789,7 +793,7 @@ async function main() {
 					logsDirectory,
 				);
 				statuses.push({ phase: `playwright-${variant}`, status: playwrightStatus });
-				const served = verifyVariantBuild(runDirectory, paths, buildVariant);
+				const served = verifyVariantBuild(ownedRunDirectory, paths, buildVariant);
 				writeJson(path.join(logsDirectory, `served-${variant}.json`), {
 					variant,
 					...served,
@@ -797,10 +801,10 @@ async function main() {
 				});
 				assertStandardBuildUnchanged(standardIdentity);
 			} finally {
-				if (fs.existsSync(paths.root)) removeVariantBuild(runDirectory, paths.root);
+				if (fs.existsSync(paths.root)) removeVariantBuild(ownedRunDirectory, paths.root);
 			}
 		}
-		removeRunOwnedBuilds(runDirectory);
+		removeRunOwnedBuilds(ownedRunDirectory);
 
 		const { artifacts, parseErrors, rawArtifacts } = collectRawArtifacts(rawDirectory);
 		const browserVersions = [
@@ -812,9 +816,9 @@ async function main() {
 		];
 		const chromium = browserVersions.length === 1 ? browserVersions[0] : "unavailable";
 		manifest.capabilities = capabilitiesFor(expected, artifacts);
-		writeJson(path.join(runDirectory, "manifest.json"), manifest);
+		writeJson(path.join(ownedRunDirectory, "manifest.json"), manifest);
 		const environment = environmentForRun(runId, chromium);
-		writeJson(path.join(runDirectory, "environment.json"), environment);
+		writeJson(path.join(ownedRunDirectory, "environment.json"), environment);
 		const playwrightStatuses = statuses
 			.filter((status) => status.phase.startsWith("playwright-"))
 			.map((status) => status.status)
@@ -844,28 +848,32 @@ async function main() {
 			suiteVersion: BENCHMARK_SUITE_VERSION,
 			tier,
 			runId,
-			manifestHash: hashFile(path.join(runDirectory, "manifest.json")),
-			environmentHash: hashFile(path.join(runDirectory, "environment.json")),
+			manifestHash: hashFile(path.join(ownedRunDirectory, "manifest.json")),
+			environmentHash: hashFile(path.join(ownedRunDirectory, "environment.json")),
 			playwrightExitCode,
 			results: validated.results,
 			validationErrors,
 		};
-		writeJson(path.join(runDirectory, "benchmark.json"), report);
+		writeJson(path.join(ownedRunDirectory, "benchmark.json"), report);
 		if (validationErrors.length === 0) {
-			fs.writeFileSync(path.join(runDirectory, "benchmark.md"), reportMarkdown(report, manifest), "utf8");
+			fs.writeFileSync(
+				path.join(ownedRunDirectory, "benchmark.md"),
+				reportMarkdown(report, manifest),
+				"utf8",
+			);
 		} else {
-			writeFailure(runDirectory, logsDirectory, {
+			writeFailure(ownedRunDirectory, logsDirectory, {
 				phase: "validation",
 				message: validationErrors.join("\n"),
 				statuses,
 			});
 		}
-		process.stdout.write(`benchmark artifacts: ${path.relative(repositoryRoot, runDirectory)}\n`);
+		process.stdout.write(`benchmark artifacts: ${path.relative(repositoryRoot, ownedRunDirectory)}\n`);
 		if (validationErrors.length > 0) {
 			for (const error of validationErrors) process.stderr.write(`benchmark validation: ${error}\n`);
 			return 1;
 		}
-		const runManifestPath = path.join(runDirectory, "run-manifest.json");
+		const runManifestPath = path.join(ownedRunDirectory, "run-manifest.json");
 		const runManifest = JSON.parse(fs.readFileSync(runManifestPath, "utf8"));
 		writeJson(runManifestPath, { ...runManifest, status: "completed", finishedAt: new Date().toISOString() });
 		return 0;
@@ -877,11 +885,11 @@ async function main() {
 						"unexpected",
 						error instanceof Error ? (error.stack ?? error.message) : String(error),
 					);
-		if (runDirectory) {
-			writeFailure(runDirectory, logsDirectory, { phase: failure.phase, message: failure.message });
+		if (ownedRunDirectory) {
+			writeFailure(ownedRunDirectory, logsDirectory, { phase: failure.phase, message: failure.message });
 			try {
 				writeJson(
-					path.join(runDirectory, "benchmark.json"),
+					path.join(ownedRunDirectory, "benchmark.json"),
 					failureReport({ runId, tier, source, phase: failure.phase, message: failure.message }),
 				);
 			} catch (reportError) {
@@ -891,7 +899,7 @@ async function main() {
 			}
 		}
 		try {
-			if (runDirectory) removeRunOwnedBuilds(runDirectory);
+			if (ownedRunDirectory) removeRunOwnedBuilds(ownedRunDirectory);
 		} catch (cleanupError) {
 			process.stderr.write(
 				`benchmark build cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}\n`,
