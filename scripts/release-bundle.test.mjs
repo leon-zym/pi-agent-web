@@ -8,9 +8,16 @@ import { gunzipSync, gzipSync } from "node:zlib";
 import {
 	createBundleRootManifest,
 	createDeterministicTarGz,
+	createImmutableSourceSnapshot,
+	createReleaseBundle,
+	createSanitizedNpmEnvironment,
 	inspectDeterministicTarGz,
+	prepareOutputDirectory,
+	publishBundleOutputs,
+	rebindFrozenBundleLockfile,
 	requireCleanCommit,
 	validateBundledPackageGraph,
+	validateBundleLockfile,
 	verifyReleaseTag,
 } from "./create-release-bundle.mjs";
 
@@ -28,6 +35,37 @@ function corruptArchive(archive, mutate) {
 	compressed.writeUInt32LE(0, 4);
 	compressed[9] = 255;
 	return compressed;
+}
+
+function tarEntryLength(header) {
+	const rawSize = header.subarray(124, 136).toString("utf8").replace(/\0.*$/, "").trim();
+	const size = Number.parseInt(rawSize, 8);
+	return 512 + Math.ceil(size / 512) * 512;
+}
+
+function headerOffsetForPath(unpacked, targetPath) {
+	let offset = 0;
+	while (offset + 512 <= unpacked.byteLength) {
+		const header = unpacked.subarray(offset, offset + 512);
+		if (header.every((byte) => byte === 0)) break;
+		const nameEnd = header.subarray(0, 100).indexOf(0);
+		const name = header
+			.subarray(0, nameEnd === -1 ? 100 : nameEnd)
+			.toString("utf8")
+			.replace(/\/$/, "");
+		if (name === targetPath) return offset;
+		offset += tarEntryLength(header);
+	}
+	throw new Error(`archive has no ${targetPath} entry`);
+}
+
+function lstatOrNull(filePath) {
+	try {
+		return fs.lstatSync(filePath);
+	} catch (error) {
+		if (error?.code === "ENOENT") return null;
+		throw error;
+	}
 }
 
 function packageEntry(name, dependencies = {}) {
@@ -49,10 +87,43 @@ function packageSet() {
 	];
 }
 
+function packageSetWithTarballs(root) {
+	return packageSet().map((entry, index) => {
+		const tarball = path.join(root, `${entry.manifest.name.replace(/[/@]/g, "-")}.tgz`);
+		fs.writeFileSync(tarball, `tarball-${String(index)}\n`);
+		return { ...entry, tarball };
+	});
+}
+
 function git(root, args) {
 	const result = spawnSync("git", args, { cwd: root, encoding: "utf8" });
 	if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
 	return result.stdout.trim();
+}
+
+function npmConfig(root, environment, key) {
+	const result = spawnSync("npm", ["config", "get", key], { cwd: root, env: environment, encoding: "utf8" });
+	if (result.status !== 0) throw new Error(`npm config get ${key} failed: ${result.stderr}`);
+	return result.stdout.trim();
+}
+
+function bundledLockfile(rootManifest, externalResolved = "https://registry.npmjs.org/ws/-/ws-8.18.3.tgz") {
+	const packages = {
+		"": {
+			name: rootManifest.name,
+			version: rootManifest.version,
+			dependencies: rootManifest.dependencies,
+		},
+		"node_modules/ws": {
+			version: "8.18.3",
+			integrity: "sha512-fixture",
+			resolved: externalResolved,
+		},
+	};
+	for (const [packageName, resolved] of Object.entries(rootManifest.dependencies)) {
+		packages[`node_modules/${packageName}`] = { version: rootManifest.version, resolved };
+	}
+	return { lockfileVersion: 3, packages };
 }
 
 test("builds a byte-stable, canonical bundle archive", () => {
@@ -89,6 +160,15 @@ test("rejects archive traversal and non-canonical owner, mode, and mtime corrupt
 	});
 	assert.throws(() => inspectDeterministicTarGz(traversal), /escapes the bundle root/);
 
+	const malformedPrefix = corruptArchive(archive, (unpacked) => {
+		unpacked.fill(0, 512, 612);
+		unpacked.write("file.txt", 512, "utf8");
+		unpacked.fill(0, 512 + 345, 512 + 500);
+		unpacked.write("../bundle", 512 + 345, "utf8");
+		rewriteChecksum(unpacked.subarray(512, 1024));
+	});
+	assert.throws(() => inspectDeterministicTarGz(malformedPrefix), /escapes the bundle root/);
+
 	const wrongOwner = corruptArchive(archive, (unpacked) => {
 		unpacked.write("0000001\0", 108, "ascii");
 		rewriteChecksum(unpacked.subarray(0, 512));
@@ -110,6 +190,148 @@ test("rejects archive traversal and non-canonical owner, mode, and mtime corrupt
 	const wrongGzipHeader = Buffer.from(archive);
 	wrongGzipHeader.writeUInt32LE(1, 4);
 	assert.throws(() => inspectDeterministicTarGz(wrongGzipHeader), /gzip header is not deterministic/);
+
+	const gzipWithFilename = Buffer.from(archive);
+	gzipWithFilename[3] = 0x08;
+	assert.throws(() => inspectDeterministicTarGz(gzipWithFilename), /gzip header is not deterministic/);
+});
+
+test("rejects file entries that are ancestors of other archive entries", () => {
+	assert.throws(
+		() =>
+			createDeterministicTarGz([
+				{ path: "bundle", type: "directory" },
+				{ path: "bundle/parent", type: "file", content: "not a directory" },
+				{ path: "bundle/parent/child.txt", type: "file", content: "child" },
+			]),
+		/cannot be an ancestor/,
+	);
+
+	const archive = createDeterministicTarGz([
+		{ path: "bundle", type: "directory" },
+		{ path: "bundle/parent", type: "directory" },
+		{ path: "bundle/parent/child.txt", type: "file", content: "child" },
+	]);
+	const corrupted = corruptArchive(archive, (unpacked) => {
+		const offset = headerOffsetForPath(unpacked, "bundle/parent");
+		unpacked[offset + 156] = 0;
+		unpacked.write("0000644\0", offset + 100, "ascii");
+		rewriteChecksum(unpacked.subarray(offset, offset + 512));
+	});
+	assert.throws(() => inspectDeterministicTarGz(corrupted), /cannot be an ancestor/);
+});
+
+test("contains output roots after resolving symlink ancestors", (t) => {
+	if (process.platform === "win32") {
+		t.skip("symlink fixture requires a privileged Windows test environment");
+		return;
+	}
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-output-containment-test-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const repositoryRoot = path.join(root, "repository");
+	fs.mkdirSync(repositoryRoot);
+	const sentinel = path.join(repositoryRoot, "sentinel.txt");
+	fs.writeFileSync(sentinel, "unchanged\n");
+	const linkedParent = path.join(root, "linked-output");
+	fs.symlinkSync(repositoryRoot, linkedParent);
+
+	assert.throws(
+		() => prepareOutputDirectory(path.join(linkedParent, "candidate"), repositoryRoot),
+		/outside the repository/,
+	);
+	assert.equal(fs.readFileSync(sentinel, "utf8"), "unchanged\n");
+	assert.equal(fs.existsSync(path.join(repositoryRoot, "candidate")), false);
+});
+
+test("publishes archive and checksum atomically without following occupied outputs", (t) => {
+	const outputParent = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-output-publication-test-"));
+	t.after(() => fs.rmSync(outputParent, { recursive: true, force: true }));
+	const outputRoot = path.join(outputParent, "published-bundle");
+	const archiveName = "bundle.tar.gz";
+	const archivePath = path.join(outputRoot, archiveName);
+	const checksumPath = `${archivePath}.sha256`;
+	fs.symlinkSync(path.join(outputParent, "missing-target"), outputRoot);
+	assert.throws(
+		() =>
+			publishBundleOutputs({
+				outputRoot,
+				archiveName,
+				archive: Buffer.from("archive"),
+				checksum: "checksum\n",
+			}),
+		/refusing to overwrite existing bundle output/,
+	);
+	assert.equal(fs.lstatSync(outputRoot).isSymbolicLink(), true);
+	fs.unlinkSync(outputRoot);
+	fs.mkdirSync(outputRoot);
+	assert.throws(
+		() =>
+			publishBundleOutputs({
+				outputRoot,
+				archiveName,
+				archive: Buffer.from("archive"),
+				checksum: "checksum\n",
+			}),
+		/refusing to overwrite existing bundle output/,
+	);
+	fs.rmdirSync(outputRoot);
+	fs.mkdirSync(`${outputRoot}.staging`);
+	assert.throws(
+		() =>
+			publishBundleOutputs({
+				outputRoot,
+				archiveName,
+				archive: Buffer.from("archive"),
+				checksum: "checksum\n",
+			}),
+		/concurrently/,
+	);
+	fs.rmdirSync(`${outputRoot}.staging`);
+
+	const operations = {
+		...fs,
+		renameSync() {
+			throw new Error("injected final publication failure");
+		},
+	};
+	assert.throws(
+		() =>
+			publishBundleOutputs({
+				outputRoot,
+				archiveName,
+				archive: Buffer.from("archive"),
+				checksum: "checksum\n",
+				operations,
+			}),
+		/injected final publication failure/,
+	);
+	assert.equal(lstatOrNull(outputRoot), null);
+	assert.equal(lstatOrNull(archivePath), null);
+	assert.equal(lstatOrNull(checksumPath), null);
+	assert.deepEqual(fs.readdirSync(outputParent), []);
+
+	let fsyncCalls = 0;
+	const fsyncOperations = {
+		...fs,
+		fsyncSync(descriptor) {
+			fsyncCalls += 1;
+			if (fsyncCalls === 4) throw new Error("injected post-rename fsync failure");
+			return fs.fsyncSync(descriptor);
+		},
+	};
+	assert.throws(
+		() =>
+			publishBundleOutputs({
+				outputRoot,
+				archiveName,
+				archive: Buffer.from("archive"),
+				checksum: "checksum\n",
+				operations: fsyncOperations,
+			}),
+		/injected post-rename fsync failure/,
+	);
+	assert.equal(lstatOrNull(outputRoot), null);
+	assert.deepEqual(fs.readdirSync(outputParent), []);
 });
 
 test("maps every internal package edge to a bundle-local tgz and rejects version drift", () => {
@@ -129,6 +351,109 @@ test("maps every internal package edge to a bundle-local tgz and rejects version
 	const unbundled = packageSet();
 	unbundled[3].manifest.dependencies["@pi-agent-web/missing"] = "0.1.0";
 	assert.throws(() => validateBundledPackageGraph(unbundled, "0.1.0"), /unbundled internal package/);
+});
+
+test("validates bundle lockfiles against exact local packages and the canonical public registry", () => {
+	const rootManifest = createBundleRootManifest(packageSet(), "0.1.0");
+	assert.doesNotThrow(() => validateBundleLockfile(bundledLockfile(rootManifest), rootManifest));
+
+	for (const resolved of [
+		"https://registry.example.invalid/ws/-/ws-8.18.3.tgz",
+		"https://registry.npmjs.org.example.invalid/ws/-/ws-8.18.3.tgz",
+		"http://registry.npmjs.org/ws/-/ws-8.18.3.tgz",
+		"git+https://github.com/websockets/ws.git",
+		"git+ssh://git@github.com/websockets/ws.git",
+		"file:../external/ws.tgz",
+		"workspace:*",
+	]) {
+		assert.throws(
+			() => validateBundleLockfile(bundledLockfile(rootManifest, resolved), rootManifest),
+			/canonical public registry|non-HTTPS resolution/,
+		);
+	}
+
+	const missingResolution = bundledLockfile(rootManifest);
+	delete missingResolution.packages["node_modules/ws"].resolved;
+	assert.throws(() => validateBundleLockfile(missingResolution, rootManifest), /missing a resolution/);
+
+	const wrongInternalTarball = bundledLockfile(rootManifest);
+	wrongInternalTarball.packages["node_modules/@pi-agent-web/cli"].resolved = "file:packages/other.tgz";
+	assert.throws(() => validateBundleLockfile(wrongInternalTarball, rootManifest), /bundled tarball/);
+});
+
+test("rebinds only local tarball integrities in a frozen dependency lock", (t) => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-frozen-lock-test-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const packages = packageSetWithTarballs(root);
+	const rootManifest = createBundleRootManifest(packages, "0.1.0");
+	const frozen = bundledLockfile(rootManifest);
+	const rebound = rebindFrozenBundleLockfile(frozen, rootManifest, packages);
+	assert.deepEqual(rebound.packages["node_modules/ws"], frozen.packages["node_modules/ws"]);
+	for (const packageName of Object.keys(rootManifest.dependencies)) {
+		assert.match(rebound.packages[`node_modules/${packageName}`].integrity, /^sha512-/);
+		assert.equal(
+			rebound.packages[`node_modules/${packageName}`].resolved,
+			rootManifest.dependencies[packageName],
+		);
+	}
+});
+
+test("fails release mode before any source build when no reviewed frozen lock is supplied", () => {
+	assert.throws(
+		() => createReleaseBundle({ mode: "release" }),
+		/pre-reviewed frozen npm dependency lock input/,
+	);
+});
+
+test("extracts immutable source bytes from the captured commit instead of mutable worktree files", (t) => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-source-snapshot-test-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	git(root, ["init"]);
+	git(root, ["config", "user.email", "release-test@example.invalid"]);
+	git(root, ["config", "user.name", "Release Test"]);
+	fs.writeFileSync(path.join(root, "fixture.txt"), "committed\n");
+	git(root, ["add", "fixture.txt"]);
+	git(root, ["commit", "-m", "fixture"]);
+	const commit = git(root, ["rev-parse", "HEAD"]);
+	fs.writeFileSync(path.join(root, "fixture.txt"), "mutable\n");
+	const snapshotRoot = path.join(root, "snapshot");
+	createImmutableSourceSnapshot({ root, sourceCommit: commit, destinationRoot: snapshotRoot });
+	assert.equal(fs.readFileSync(path.join(snapshotRoot, "fixture.txt"), "utf8"), "committed\n");
+	assert.equal(fs.existsSync(path.join(snapshotRoot, ".git")), false);
+});
+
+test("isolates npm config precedence from hostile scoped registries without network access", (t) => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-npm-config-test-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const hostileUserConfig = path.join(root, "hostile-user.npmrc");
+	const hostileGlobalConfig = path.join(root, "hostile-global.npmrc");
+	fs.writeFileSync(hostileUserConfig, "@earendil-works:registry=https://example.invalid/\n");
+	fs.writeFileSync(hostileGlobalConfig, "registry=https://example.invalid/\n");
+	const inheritedEnvironment = {
+		PATH: process.env.PATH ?? "",
+		...(process.platform === "win32" && process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+		NPM_CONFIG_CACHE: path.join(root, "hostile-cache"),
+		NPM_CONFIG_GLOBALCONFIG: hostileGlobalConfig,
+		Npm_Config_Registry: "https://registry.example.invalid/",
+		npm_config_userconfig: hostileUserConfig,
+		UNRELATED_TEST_VALUE: "preserved",
+	};
+	assert.equal(npmConfig(root, inheritedEnvironment, "@earendil-works:registry"), "https://example.invalid/");
+
+	const environment = createSanitizedNpmEnvironment({ tempRoot: root, baseEnv: inheritedEnvironment });
+	assert.equal(npmConfig(root, environment, "@earendil-works:registry"), "undefined");
+	assert.equal(npmConfig(root, environment, "registry"), "https://registry.npmjs.org/");
+	assert.equal(environment.UNRELATED_TEST_VALUE, "preserved");
+	assert.deepEqual(
+		Object.keys(environment)
+			.filter((key) => key.toLowerCase().startsWith("npm_config_"))
+			.sort(),
+		["npm_config_cache", "npm_config_globalconfig", "npm_config_registry", "npm_config_userconfig"],
+	);
+	assert.match(
+		fs.readFileSync(environment.npm_config_userconfig, "utf8"),
+		/^registry=https:\/\/registry\.npmjs\.org\/\n$/,
+	);
 });
 
 test("requires a clean commit and an exact annotated release tag", (t) => {

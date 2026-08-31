@@ -1,8 +1,11 @@
+import { spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { gunzipSync, gzipSync } from "node:zlib";
+import { gzipSync } from "node:zlib";
+import { extractTarEntries, readGzipTarEntries, readTarEntries } from "./lib/archive.mjs";
 import {
 	inspectPackageTarballs,
 	PACKAGE_NAMES,
@@ -19,6 +22,7 @@ const ARCHIVE_MTIME = 0;
 const FILE_MODE = 0o644;
 const DIRECTORY_MODE = 0o755;
 const PUBLIC_NPM_REGISTRY = "https://registry.npmjs.org/";
+const PUBLIC_NPM_REGISTRY_ORIGIN = new URL(PUBLIC_NPM_REGISTRY).origin;
 const INTERNAL_PACKAGE_PREFIX = "@pi-agent-web/";
 
 function comparePaths(left, right) {
@@ -139,7 +143,22 @@ function normaliseArchiveEntries(entries) {
 			parent = path.posix.dirname(parent);
 		}
 	}
-	return [...byPath.values()].sort((left, right) => comparePaths(left.path, right.path));
+	const normalised = [...byPath.values()].sort((left, right) => comparePaths(left.path, right.path));
+	assertNoFileEntryAncestors(normalised, "archive");
+	return normalised;
+}
+
+function assertNoFileEntryAncestors(entries, label) {
+	const files = new Set(entries.filter((entry) => entry.type === "file").map((entry) => entry.path));
+	for (const entry of entries) {
+		let parent = path.posix.dirname(entry.path);
+		while (parent !== ".") {
+			if (files.has(parent)) {
+				throw new Error(`${label} file entry ${parent} cannot be an ancestor of ${entry.path}`);
+			}
+			parent = path.posix.dirname(parent);
+		}
+	}
 }
 
 export function createDeterministicTarGz(entries) {
@@ -158,33 +177,6 @@ export function createDeterministicTarGz(entries) {
 	return compressed;
 }
 
-function readNullTerminatedString(buffer, offset, byteLength) {
-	const raw = buffer.subarray(offset, offset + byteLength);
-	const end = raw.indexOf(0);
-	return raw.subarray(0, end === -1 ? raw.byteLength : end).toString("utf8");
-}
-
-function readOctal(buffer, offset, byteLength, label) {
-	const raw = readNullTerminatedString(buffer, offset, byteLength).trim();
-	if (!/^[0-7]+$/.test(raw)) throw new Error(`${label} is not a valid octal value`);
-	const value = Number.parseInt(raw, 8);
-	if (!Number.isSafeInteger(value)) throw new Error(`${label} is outside the safe integer range`);
-	return value;
-}
-
-function validateHeaderChecksum(header) {
-	const expected = readOctal(header, 148, 8, "ustar checksum");
-	const copy = Buffer.from(header);
-	copy.fill(0x20, 148, 156);
-	let actual = 0;
-	for (const byte of copy) actual += byte;
-	if (expected !== actual) throw new Error("ustar header checksum is invalid");
-}
-
-function isZeroBlock(block) {
-	return block.every((byte) => byte === 0);
-}
-
 export function inspectDeterministicTarGz(archive, options = {}) {
 	const compressed = asBuffer(archive, "archive");
 	if (
@@ -192,56 +184,22 @@ export function inspectDeterministicTarGz(archive, options = {}) {
 		compressed[0] !== 0x1f ||
 		compressed[1] !== 0x8b ||
 		compressed[2] !== 8 ||
+		compressed[3] !== 0 ||
 		compressed.readUInt32LE(4) !== ARCHIVE_MTIME ||
+		compressed[8] !== 2 ||
 		compressed[9] !== 255
 	) {
 		throw new Error("archive gzip header is not deterministic");
 	}
-	let unpacked;
-	try {
-		unpacked = gunzipSync(compressed);
-	} catch (error) {
-		throw new Error("archive is not a valid gzip stream", { cause: error });
-	}
-	const entries = [];
-	let offset = 0;
-	let terminated = false;
-	while (offset + ARCHIVE_BLOCK_BYTES <= unpacked.byteLength) {
-		const header = unpacked.subarray(offset, offset + ARCHIVE_BLOCK_BYTES);
-		if (isZeroBlock(header)) {
-			if (
-				offset + ARCHIVE_END_BYTES > unpacked.byteLength ||
-				!isZeroBlock(unpacked.subarray(offset + ARCHIVE_BLOCK_BYTES, offset + ARCHIVE_END_BYTES))
-			) {
-				throw new Error("archive must end with two zero blocks");
-			}
-			if (!unpacked.subarray(offset).every((byte) => byte === 0))
-				throw new Error("archive has data after its terminator");
-			terminated = true;
-			break;
-		}
-		validateHeaderChecksum(header);
-		if (readNullTerminatedString(header, 257, 6) !== "ustar") throw new Error("archive entry is not ustar");
-		const typeFlag = header[156];
-		const type =
-			typeFlag === 0 || typeFlag === "0".charCodeAt(0)
-				? "file"
-				: typeFlag === "5".charCodeAt(0)
-					? "directory"
-					: null;
-		if (!type) throw new Error("archive contains an unsupported entry type");
-		const name = readNullTerminatedString(header, 0, 100);
-		const prefix = readNullTerminatedString(header, 345, 155);
-		const archivePath = `${prefix ? `${prefix}/` : ""}${name}`.replace(/\/$/, "");
-		assertSafeArchivePath(archivePath);
-		const mode = readOctal(header, 100, 8, `archive mode for ${archivePath}`);
-		const uid = readOctal(header, 108, 8, `archive uid for ${archivePath}`);
-		const gid = readOctal(header, 116, 8, `archive gid for ${archivePath}`);
-		const size = readOctal(header, 124, 12, `archive size for ${archivePath}`);
-		const mtime = readOctal(header, 136, 12, `archive mtime for ${archivePath}`);
+	const entries = readGzipTarEntries(compressed);
+	for (const entry of entries) {
+		const { archivePath, gid, mode, mtime, size, type, uid, user, group } = {
+			archivePath: entry.path,
+			...entry,
+		};
 		if (uid !== 0 || gid !== 0)
 			throw new Error(`archive entry ${archivePath} has non-root numeric ownership`);
-		if (readNullTerminatedString(header, 265, 32) || readNullTerminatedString(header, 297, 32)) {
+		if (user || group) {
 			throw new Error(`archive entry ${archivePath} has named ownership`);
 		}
 		if (mode !== (type === "directory" ? DIRECTORY_MODE : FILE_MODE)) {
@@ -250,20 +208,8 @@ export function inspectDeterministicTarGz(archive, options = {}) {
 		if (mtime !== ARCHIVE_MTIME)
 			throw new Error(`archive entry ${archivePath} has a non-deterministic mtime`);
 		if (type === "directory" && size !== 0) throw new Error(`archive directory ${archivePath} must be empty`);
-		const contentStart = offset + ARCHIVE_BLOCK_BYTES;
-		const contentEnd = contentStart + size;
-		if (contentEnd > unpacked.byteLength)
-			throw new Error(`archive entry ${archivePath} exceeds archive bounds`);
-		entries.push({
-			path: archivePath,
-			type,
-			mode,
-			size,
-			content: Buffer.from(unpacked.subarray(contentStart, contentEnd)),
-		});
-		offset = contentEnd + archivePadding(size);
 	}
-	if (!terminated) throw new Error("archive is missing its terminator");
+	assertNoFileEntryAncestors(entries, "archive");
 	let previousPath;
 	for (const entry of entries) {
 		if (previousPath !== undefined && comparePaths(previousPath, entry.path) >= 0) {
@@ -343,7 +289,94 @@ export function createBundleRootManifest(packages, version) {
 	};
 }
 
-function assertBundleLockfile(lockfile, rootManifest) {
+function recordsMatch(actual, expected) {
+	if (!actual || typeof actual !== "object" || Array.isArray(actual)) return false;
+	const actualEntries = Object.entries(actual);
+	const expectedEntries = Object.entries(expected);
+	return (
+		actualEntries.length === expectedEntries.length &&
+		expectedEntries.every(([key, value]) => actual[key] === value)
+	);
+}
+
+function expectedInternalDependencies(rootManifest) {
+	if (!rootManifest || typeof rootManifest !== "object" || typeof rootManifest.version !== "string") {
+		throw new Error("bundle root manifest has no version");
+	}
+	const expected = Object.fromEntries(
+		PACKAGE_NAMES.map((packageName) => {
+			const archiveName = `${packageName.slice(1).replace("/", "-")}-${rootManifest.version}.tgz`;
+			return [packageName, `file:packages/${archiveName}`];
+		}),
+	);
+	if (!recordsMatch(rootManifest.dependencies, expected)) {
+		throw new Error("bundle root manifest does not contain exact bundled dependencies");
+	}
+	return expected;
+}
+
+function assertCanonicalPublicResolution(packagePath, resolved) {
+	if (typeof resolved !== "string" || resolved.length === 0 || resolved.trim() !== resolved) {
+		throw new Error(`external package lock entry ${packagePath} is missing a resolution`);
+	}
+	let url;
+	try {
+		url = new URL(resolved);
+	} catch {
+		throw new Error(`external package lock entry ${packagePath} has a non-HTTPS resolution`);
+	}
+	if (
+		url.protocol !== "https:" ||
+		url.origin !== PUBLIC_NPM_REGISTRY_ORIGIN ||
+		url.username.length > 0 ||
+		url.password.length > 0 ||
+		!url.pathname.includes("/-/") ||
+		url.search.length > 0 ||
+		url.hash.length > 0
+	) {
+		throw new Error(`external package lock entry ${packagePath} is not from the canonical public registry`);
+	}
+}
+
+function assertExternalPackageLockEntry(packagePath, value) {
+	if (
+		typeof value.version !== "string" ||
+		value.version.length === 0 ||
+		value.version.trim() !== value.version
+	) {
+		throw new Error(`external package lock entry ${packagePath} is missing a package version`);
+	}
+	if (
+		value.version.startsWith("workspace:") ||
+		value.version.startsWith("file:") ||
+		value.version.startsWith("link:") ||
+		value.version.startsWith("git+")
+	) {
+		throw new Error(`external package lock entry ${packagePath} has a non-registry package spec`);
+	}
+	if (
+		typeof value.integrity !== "string" ||
+		value.integrity.length === 0 ||
+		value.integrity.trim() !== value.integrity
+	) {
+		throw new Error(`external package lock entry ${packagePath} is missing an integrity`);
+	}
+	assertCanonicalPublicResolution(packagePath, value.resolved);
+}
+
+function internalTarballIntegrities(packages) {
+	if (!Array.isArray(packages) || packages.length !== PACKAGE_NAMES.length) {
+		throw new Error("bundle must contain every internal tarball before lock validation");
+	}
+	return new Map(
+		packages.map((entry) => [
+			entry.manifest.name,
+			`sha512-${createHash("sha512").update(fs.readFileSync(entry.tarball)).digest("base64")}`,
+		]),
+	);
+}
+
+export function validateBundleLockfile(lockfile, rootManifest, { internalIntegrityByPackage } = {}) {
 	if (
 		!lockfile ||
 		typeof lockfile !== "object" ||
@@ -355,35 +388,126 @@ function assertBundleLockfile(lockfile, rootManifest) {
 	const rootPackage = lockfile.packages[""];
 	if (!rootPackage || typeof rootPackage !== "object")
 		throw new Error("generated package-lock.json has no root package");
-	if (JSON.stringify(rootPackage.dependencies) !== JSON.stringify(rootManifest.dependencies)) {
+	const expectedDependencies = expectedInternalDependencies(rootManifest);
+	if (!recordsMatch(rootPackage.dependencies, expectedDependencies)) {
 		throw new Error("generated package-lock.json does not preserve bundle-local dependencies");
 	}
-	for (const [packagePath, value] of Object.entries(lockfile.packages)) {
-		if (!packagePath.includes("node_modules/@pi-agent-web/")) continue;
-		if (!value || typeof value !== "object" || value.link === true || typeof value.resolved !== "string") {
-			throw new Error(`internal package lock entry ${packagePath} is not a bundled tarball`);
-		}
-		const packageName = `@pi-agent-web/${packagePath.split("node_modules/@pi-agent-web/").at(-1)}`;
-		const expected = rootManifest.dependencies[packageName];
-		if (!expected || value.resolved !== expected) {
-			throw new Error(`internal package lock entry ${packagePath} does not resolve to ${String(expected)}`);
-		}
+	if (rootPackage.link === true || rootPackage.resolved !== undefined) {
+		throw new Error("generated package-lock.json root package must be metadata only");
 	}
-	for (const [packageName, resolved] of Object.entries(rootManifest.dependencies)) {
-		const lockEntry = lockfile.packages[`node_modules/${packageName}`];
-		if (!lockEntry || lockEntry.resolved !== resolved || lockEntry.link === true) {
-			throw new Error(`bundle package ${packageName} does not resolve to its local tgz`);
+	const expectedEntries = new Map(
+		Object.entries(expectedDependencies).map(([packageName, resolved]) => [
+			`node_modules/${packageName}`,
+			resolved,
+		]),
+	);
+	const observedEntries = new Set();
+	for (const [packagePath, value] of Object.entries(lockfile.packages)) {
+		if (packagePath === "") continue;
+		if (!value || typeof value !== "object" || Array.isArray(value)) {
+			throw new Error(`package lock entry ${packagePath} is not an object`);
 		}
+		const expected = expectedEntries.get(packagePath);
+		if (expected) {
+			if (value.link === true || value.resolved !== expected || value.version !== rootManifest.version) {
+				throw new Error(`internal package lock entry ${packagePath} is not its bundled tarball`);
+			}
+			const packageName = packagePath.slice("node_modules/".length);
+			const expectedIntegrity = internalIntegrityByPackage?.get(packageName);
+			if (expectedIntegrity && value.integrity !== expectedIntegrity) {
+				throw new Error(`internal package lock entry ${packagePath} has the wrong bundled tarball integrity`);
+			}
+			observedEntries.add(packagePath);
+			continue;
+		}
+		if (packagePath.includes(`node_modules/${INTERNAL_PACKAGE_PREFIX}`)) {
+			throw new Error(`unexpected internal package lock entry ${packagePath}`);
+		}
+		if (!packagePath.startsWith("node_modules/")) {
+			throw new Error(`unexpected package lock entry ${packagePath}`);
+		}
+		if (value.link === true) {
+			throw new Error(`external package lock entry ${packagePath} must not link outside the bundle`);
+		}
+		assertExternalPackageLockEntry(packagePath, value);
+	}
+	if (observedEntries.size !== expectedEntries.size) {
+		throw new Error("generated package-lock.json is missing bundled package entries");
 	}
 }
 
-function assertOutsideRepository(candidatePath, root) {
-	const resolvedCandidate = path.resolve(candidatePath);
-	const resolvedRoot = path.resolve(root);
-	if (resolvedCandidate === resolvedRoot || resolvedCandidate.startsWith(`${resolvedRoot}${path.sep}`)) {
-		throw new Error("bundle output must stay outside the repository");
+function externalLockEntries(lockfile, rootManifest) {
+	const internalPaths = new Set(
+		Object.keys(expectedInternalDependencies(rootManifest)).map(
+			(packageName) => `node_modules/${packageName}`,
+		),
+	);
+	return Object.fromEntries(
+		Object.entries(lockfile.packages)
+			.filter(([packagePath]) => packagePath !== "" && !internalPaths.has(packagePath))
+			.map(([packagePath, value]) => [packagePath, value]),
+	);
+}
+
+/**
+ * Release mode never asks npm to resolve a graph. It copies the reviewed graph
+ * and changes only the exact local tarball integrity fields for this build.
+ */
+export function rebindFrozenBundleLockfile(frozenLockfile, rootManifest, packages) {
+	validateBundleLockfile(frozenLockfile, rootManifest);
+	const rebound = JSON.parse(JSON.stringify(frozenLockfile));
+	const integrityByPackage = internalTarballIntegrities(packages);
+	for (const [packageName, integrity] of integrityByPackage) {
+		const packagePath = `node_modules/${packageName}`;
+		const entry = rebound.packages[packagePath];
+		if (!entry || typeof entry !== "object") {
+			throw new Error(`frozen package-lock.json is missing ${packagePath}`);
+		}
+		entry.integrity = integrity;
 	}
-	return resolvedCandidate;
+	if (
+		JSON.stringify(externalLockEntries(frozenLockfile, rootManifest)) !==
+		JSON.stringify(externalLockEntries(rebound, rootManifest))
+	) {
+		throw new Error("rebinding a frozen package-lock.json changed an external dependency");
+	}
+	validateBundleLockfile(rebound, rootManifest, { internalIntegrityByPackage: integrityByPackage });
+	return rebound;
+}
+
+function isSameOrDescendant(candidatePath, parentPath) {
+	return candidatePath === parentPath || candidatePath.startsWith(`${parentPath}${path.sep}`);
+}
+
+function lstatOrNull(filePath, operations = fs) {
+	try {
+		return operations.lstatSync(filePath);
+	} catch (error) {
+		if (error?.code === "ENOENT") return null;
+		throw error;
+	}
+}
+
+function assertOutputTargetIsSafe(destination, realRepositoryRoot, operations) {
+	const ancestors = [];
+	for (let candidate = destination; ; candidate = path.dirname(candidate)) {
+		ancestors.push(candidate);
+		if (path.dirname(candidate) === candidate) break;
+	}
+	for (const candidate of ancestors) {
+		const stat = lstatOrNull(candidate, operations);
+		if (!stat) continue;
+		const realCandidate = operations.realpathSync(candidate);
+		if (isSameOrDescendant(realCandidate, realRepositoryRoot)) {
+			throw new Error("bundle output must stay outside the repository");
+		}
+		if (candidate === destination) {
+			throw new Error(`refusing to overwrite existing bundle output: ${destination}`);
+		}
+		if (!stat.isDirectory() && !stat.isSymbolicLink()) {
+			throw new Error(`bundle output ancestor is not a directory: ${candidate}`);
+		}
+	}
 }
 
 function writeGeneratedFile(filePath, content) {
@@ -393,6 +517,210 @@ function writeGeneratedFile(filePath, content) {
 		mode: FILE_MODE,
 	});
 	fs.chmodSync(filePath, FILE_MODE);
+}
+
+function fsyncFile(filePath, operations) {
+	const descriptor = operations.openSync(filePath, "r");
+	try {
+		operations.fsyncSync(descriptor);
+	} finally {
+		operations.closeSync(descriptor);
+	}
+}
+
+function fsyncDirectory(directory, operations) {
+	const descriptor = operations.openSync(directory, "r");
+	try {
+		operations.fsyncSync(descriptor);
+	} finally {
+		operations.closeSync(descriptor);
+	}
+}
+
+function writeStagedFile(filePath, content, operations) {
+	const descriptor = operations.openSync(filePath, "wx", FILE_MODE);
+	try {
+		operations.writeFileSync(descriptor, content, {
+			encoding: Buffer.isBuffer(content) ? undefined : "utf8",
+		});
+		operations.fchmodSync(descriptor, FILE_MODE);
+		operations.fsyncSync(descriptor);
+	} finally {
+		operations.closeSync(descriptor);
+	}
+}
+
+function sameNodeIdentity(left, right) {
+	return left.dev === right.dev && left.ino === right.ino;
+}
+
+function removeOwnedDirectory(directory, identity, operations) {
+	if (!identity) return;
+	try {
+		const current = operations.lstatSync(directory);
+		if (sameNodeIdentity(current, identity)) operations.rmSync(directory, { recursive: true, force: true });
+	} catch (error) {
+		if (error?.code !== "ENOENT") {
+			// Preserve the original publication failure and never remove a path
+			// whose inode no longer proves this invocation created it.
+		}
+	}
+}
+
+/**
+ * Publishes the archive/checksum set by renaming one fully written sibling
+ * directory. The final target must not exist; dangling symlinks count as
+ * occupied and no pre-existing target is ever removed during rollback.
+ */
+export function publishBundleOutputs({
+	outputRoot,
+	archiveName,
+	archive,
+	checksum,
+	validate,
+	operations = fs,
+}) {
+	const destination = path.resolve(outputRoot);
+	if (lstatOrNull(destination, operations)) {
+		throw new Error(`refusing to overwrite existing bundle output: ${destination}`);
+	}
+	const outputParent = path.dirname(destination);
+	const parentStat = operations.lstatSync(outputParent);
+	if (parentStat.isSymbolicLink() || !parentStat.isDirectory()) {
+		throw new Error("bundle output parent must be a real directory");
+	}
+	const stageRoot = `${destination}.staging`;
+	if (lstatOrNull(stageRoot, operations)) {
+		throw new Error(`refusing to publish concurrently to bundle output: ${destination}`);
+	}
+	try {
+		operations.mkdirSync(stageRoot, { mode: DIRECTORY_MODE });
+	} catch (error) {
+		if (error?.code === "EEXIST") {
+			throw new Error(`refusing to publish concurrently to bundle output: ${destination}`);
+		}
+		throw error;
+	}
+	const stageIdentity = operations.lstatSync(stageRoot);
+	const stagedArchivePath = path.join(stageRoot, archiveName);
+	const stagedChecksumPath = `${stagedArchivePath}.sha256`;
+	let publishedIdentity;
+	try {
+		writeStagedFile(stagedArchivePath, archive, operations);
+		writeStagedFile(stagedChecksumPath, checksum, operations);
+		validate?.({ archivePath: stagedArchivePath, checksumPath: stagedChecksumPath });
+		fsyncDirectory(stageRoot, operations);
+		if (lstatOrNull(destination, operations)) {
+			throw new Error(`refusing to overwrite existing bundle output: ${destination}`);
+		}
+		operations.renameSync(stageRoot, destination);
+		publishedIdentity = operations.lstatSync(destination);
+		fsyncDirectory(destination, operations);
+		fsyncDirectory(outputParent, operations);
+		return {
+			archivePath: path.join(destination, archiveName),
+			checksumPath: `${path.join(destination, archiveName)}.sha256`,
+			outputRoot: destination,
+		};
+	} catch (error) {
+		removeOwnedDirectory(destination, publishedIdentity, operations);
+		throw error;
+	} finally {
+		removeOwnedDirectory(stageRoot, stageIdentity, operations);
+	}
+}
+
+export function createSanitizedNpmEnvironment({ tempRoot, baseEnv = process.env }) {
+	const configRoot = path.join(tempRoot, "npm-config");
+	const userConfigPath = path.join(configRoot, "user.npmrc");
+	const globalConfigPath = path.join(configRoot, "global.npmrc");
+	const cachePath = path.join(configRoot, "cache");
+	fs.mkdirSync(configRoot, { recursive: true, mode: DIRECTORY_MODE });
+	fs.mkdirSync(cachePath, { recursive: true, mode: DIRECTORY_MODE });
+	const registryConfig = `registry=${PUBLIC_NPM_REGISTRY}\n`;
+	writeGeneratedFile(userConfigPath, registryConfig);
+	writeGeneratedFile(globalConfigPath, registryConfig);
+	const environment = Object.fromEntries(
+		Object.entries(baseEnv).filter(([key]) => !key.toLowerCase().startsWith("npm_config_")),
+	);
+	return {
+		...environment,
+		npm_config_cache: cachePath,
+		npm_config_globalconfig: globalConfigPath,
+		npm_config_registry: PUBLIC_NPM_REGISTRY,
+		npm_config_userconfig: userConfigPath,
+	};
+}
+
+function lockfileText(lockfile) {
+	return `${JSON.stringify(lockfile, null, "\t")}\n`;
+}
+
+function sourcePnpmLockSha256(snapshotRoot) {
+	const sourceLockfile = path.join(snapshotRoot, "pnpm-lock.yaml");
+	if (!fs.lstatSync(sourceLockfile).isFile())
+		throw new Error("immutable source snapshot has no pnpm-lock.yaml");
+	return sha256File(sourceLockfile);
+}
+
+function createProvisionalDependencyLock({
+	packages,
+	rootManifest,
+	snapshotRoot,
+	stagingRoot,
+	npmEnvironment,
+}) {
+	run("npm", ["install", "--package-lock-only", "--ignore-scripts", "--omit=dev"], {
+		cwd: stagingRoot,
+		env: npmEnvironment,
+	});
+	const lockPath = path.join(stagingRoot, "package-lock.json");
+	fs.chmodSync(lockPath, FILE_MODE);
+	const lockBytes = fs.readFileSync(lockPath);
+	const lockfile = readJson(lockPath, "provisional bundle package-lock.json");
+	validateBundleLockfile(lockfile, rootManifest, {
+		internalIntegrityByPackage: internalTarballIntegrities(packages),
+	});
+	return {
+		lockfile,
+		metadata: {
+			kind: "provisional",
+			packageLockSha256: sha256(lockBytes),
+			sourcePnpmLockSha256: sourcePnpmLockSha256(snapshotRoot),
+		},
+	};
+}
+
+function consumeFrozenDependencyLock({
+	frozenDependencyLock,
+	packages,
+	rootManifest,
+	snapshotRoot,
+	stagingRoot,
+}) {
+	if (typeof frozenDependencyLock !== "string" || frozenDependencyLock.length === 0) {
+		throw new Error("release mode requires a pre-reviewed frozen npm dependency lock input");
+	}
+	const frozenPath = path.resolve(frozenDependencyLock);
+	const frozenBytes = fs.readFileSync(frozenPath);
+	let frozenLockfile;
+	try {
+		frozenLockfile = JSON.parse(frozenBytes.toString("utf8"));
+	} catch (error) {
+		throw new Error("unable to read the pre-reviewed frozen npm dependency lock", { cause: error });
+	}
+	const lockfile = rebindFrozenBundleLockfile(frozenLockfile, rootManifest, packages);
+	const reboundBytes = Buffer.from(lockfileText(lockfile));
+	writeGeneratedFile(path.join(stagingRoot, "package-lock.json"), reboundBytes);
+	return {
+		lockfile,
+		metadata: {
+			kind: "frozen",
+			frozenNpmLockSha256: sha256(frozenBytes),
+			packageLockSha256: sha256(reboundBytes),
+			sourcePnpmLockSha256: sourcePnpmLockSha256(snapshotRoot),
+		},
+	};
 }
 
 function collectBundleEntries(bundleRoot) {
@@ -479,6 +807,48 @@ export function requireCleanCommit(root = REPOSITORY_ROOT) {
 	return commit;
 }
 
+export function captureSourceIdentity(root = REPOSITORY_ROOT) {
+	const commit = requireCleanCommit(root);
+	const tree = run("git", ["rev-parse", `${commit}^{tree}`], { cwd: root }).trim();
+	if (!/^[0-9a-f]{40}$/.test(tree)) throw new Error("Git did not return a full source tree SHA");
+	return { commit, tree };
+}
+
+export function createImmutableSourceSnapshot({ root = REPOSITORY_ROOT, sourceCommit, destinationRoot }) {
+	if (!/^[0-9a-f]{40}$/.test(sourceCommit))
+		throw new Error("immutable source snapshot requires a full commit SHA");
+	if (lstatOrNull(destinationRoot))
+		throw new Error("immutable source snapshot destination must not already exist");
+	const result = spawnSync("git", ["archive", "--format=tar", sourceCommit], {
+		cwd: root,
+		encoding: null,
+		maxBuffer: 128 * 1024 * 1024,
+		stdio: "pipe",
+	});
+	if (result.status !== 0 || !Buffer.isBuffer(result.stdout)) {
+		throw new Error(`git archive ${sourceCommit} failed: ${result.stderr?.toString("utf8") ?? ""}`);
+	}
+	extractTarEntries(readTarEntries(result.stdout), destinationRoot);
+	return destinationRoot;
+}
+
+function buildImmutableSourceSnapshot(snapshotRoot, npmEnvironment) {
+	run("pnpm", ["install", "--frozen-lockfile", "--ignore-scripts"], {
+		cwd: snapshotRoot,
+		env: npmEnvironment,
+		timeoutMs: 300_000,
+	});
+	run("pnpm", ["-r", "build"], { cwd: snapshotRoot, env: npmEnvironment, timeoutMs: 300_000 });
+}
+
+function revalidateSourceIdentity({ root, sourceCommit, sourceTree, mode, source, tag }) {
+	const current = captureSourceIdentity(root);
+	if (current.commit !== sourceCommit || current.tree !== sourceTree) {
+		throw new Error("source commit or tree changed while the release bundle was being prepared");
+	}
+	if (mode === "release") verifyReleaseTag({ root, tag, version: source.version, sourceCommit });
+}
+
 export function verifyReleaseTag({ root = REPOSITORY_ROOT, tag, version, sourceCommit }) {
 	if (typeof tag !== "string" || !/^v[0-9A-Za-z.+-]+$/.test(tag))
 		throw new Error("release mode requires a safe v-prefixed tag");
@@ -499,7 +869,15 @@ function toolchain() {
 	};
 }
 
-function createBundleManifest({ bundleName, packages, source, sourceCommit, tag }) {
+function createBundleManifest({
+	bundleName,
+	dependencyLock,
+	packages,
+	source,
+	sourceCommit,
+	sourceTree,
+	tag,
+}) {
 	return {
 		schemaVersion: 1,
 		integrity: {
@@ -512,7 +890,8 @@ function createBundleManifest({ bundleName, packages, source, sourceCommit, tag 
 			name: bundleName,
 			version: source.version,
 		},
-		source: { commit: sourceCommit, tag: tag ?? null },
+		source: { commit: sourceCommit, tree: sourceTree, tag: tag ?? null },
+		dependencyLock,
 		toolchain: toolchain(),
 		runtime: { piVersion: source.piVersion, gatewayProtocol: source.protocolVersion },
 		packages: packages.map((entry) => ({
@@ -529,7 +908,8 @@ function createInstallInstructions(bundleName) {
 	return [
 		`# ${bundleName}`,
 		"",
-		"This bundle installs the included Pi Agent Web packages and resolves third-party dependencies from the npm registry.",
+		"Requires Node.js >=22, npm, and public network access to the npm registry for third-party dependencies.",
+		"This bundle installs the included Pi Agent Web packages and resolves third-party dependencies from that registry.",
 		"It is not offline or self-contained.",
 		"",
 		"```sh",
@@ -540,27 +920,50 @@ function createInstallInstructions(bundleName) {
 	].join("\n");
 }
 
-function prepareOutputDirectory(outputDir, root) {
-	if (outputDir === undefined) return fs.mkdtempSync(path.join(os.tmpdir(), "piweb-release-bundle-"));
-	const destination = assertOutsideRepository(outputDir, root);
-	fs.mkdirSync(destination, { recursive: true, mode: DIRECTORY_MODE });
-	if (fs.lstatSync(destination).isSymbolicLink())
-		throw new Error("bundle output directory must not be a symlink");
+export function prepareOutputDirectory(outputDir, root = REPOSITORY_ROOT, operations = fs) {
+	const realRepositoryRoot = operations.realpathSync(root);
+	const destination =
+		outputDir === undefined
+			? path.join(os.tmpdir(), `piweb-release-bundle-${randomUUID()}`)
+			: path.resolve(outputDir);
+	// Validate all existing ancestors before creating either the output target or
+	// its sibling stage. This prevents a symlinked parent from creating files in
+	// the repository before containment can be checked.
+	assertOutputTargetIsSafe(destination, realRepositoryRoot, operations);
 	return destination;
 }
 
-export function createReleaseBundle({ mode = "candidate", outputDir, root = REPOSITORY_ROOT, tag } = {}) {
+export function createReleaseBundle({
+	mode = "candidate",
+	outputDir,
+	root = REPOSITORY_ROOT,
+	tag,
+	frozenDependencyLock,
+} = {}) {
 	if (mode !== "candidate" && mode !== "release") throw new Error(`unknown bundle mode: ${mode}`);
-	const source = releaseSource(root);
-	const sourceCommit = requireCleanCommit(root);
-	if (mode === "release") verifyReleaseTag({ root, tag, version: source.version, sourceCommit });
 	if (mode === "candidate" && tag !== undefined)
 		throw new Error("candidate bundles must not claim a release tag");
+	if (mode === "candidate" && frozenDependencyLock !== undefined) {
+		throw new Error("candidate bundles must create a provisional dependency lock proposal");
+	}
+	if (mode === "release" && (typeof frozenDependencyLock !== "string" || frozenDependencyLock.length === 0)) {
+		throw new Error("release mode requires a pre-reviewed frozen npm dependency lock input");
+	}
+	const { commit: sourceCommit, tree: sourceTree } = captureSourceIdentity(root);
 
 	const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-release-bundle-staging-"));
 	try {
+		const snapshotRoot = createImmutableSourceSnapshot({
+			root,
+			sourceCommit,
+			destinationRoot: path.join(tempRoot, "source"),
+		});
+		const source = releaseSource(snapshotRoot);
+		if (mode === "release") verifyReleaseTag({ root, tag, version: source.version, sourceCommit });
+		const npmEnvironment = createSanitizedNpmEnvironment({ tempRoot });
+		buildImmutableSourceSnapshot(snapshotRoot, npmEnvironment);
 		const tarballDir = path.join(tempRoot, "tarballs");
-		const tarballs = packWorkspacePackages({ root, tarballDir });
+		const tarballs = packWorkspacePackages({ root: snapshotRoot, tarballDir, env: npmEnvironment });
 		const packages = inspectPackageTarballs(tarballs, { repositoryUrl: source.repositoryUrl });
 		validateBundledPackageGraph(packages, source.version);
 
@@ -580,25 +983,34 @@ export function createReleaseBundle({ mode = "candidate", outputDir, root = REPO
 		}
 		writeGeneratedFile(path.join(stagingRoot, "INSTALL.md"), createInstallInstructions(bundleName));
 		fs.copyFileSync(
-			path.join(root, "LICENSE"),
+			path.join(snapshotRoot, "LICENSE"),
 			path.join(stagingRoot, "LICENSE"),
 			fs.constants.COPYFILE_EXCL,
 		);
 		fs.chmodSync(path.join(stagingRoot, "LICENSE"), FILE_MODE);
-		run("npm", ["install", "--package-lock-only", "--ignore-scripts", "--omit=dev"], {
-			cwd: stagingRoot,
-			env: { ...process.env, npm_config_registry: PUBLIC_NPM_REGISTRY },
-		});
-		fs.chmodSync(path.join(stagingRoot, "package-lock.json"), FILE_MODE);
-		assertBundleLockfile(
-			readJson(path.join(stagingRoot, "package-lock.json"), "bundle package-lock.json"),
-			rootManifest,
-		);
+		const dependencyLock =
+			mode === "candidate"
+				? createProvisionalDependencyLock({
+						packages,
+						rootManifest,
+						snapshotRoot,
+						stagingRoot,
+						npmEnvironment,
+					})
+				: consumeFrozenDependencyLock({
+						frozenDependencyLock,
+						packages,
+						rootManifest,
+						snapshotRoot,
+						stagingRoot,
+					});
 		const manifest = createBundleManifest({
 			bundleName,
+			dependencyLock: dependencyLock.metadata,
 			packages,
 			source,
 			sourceCommit,
+			sourceTree,
 			tag: mode === "release" ? tag : undefined,
 		});
 		writeGeneratedFile(
@@ -607,18 +1019,30 @@ export function createReleaseBundle({ mode = "candidate", outputDir, root = REPO
 		);
 		writeGeneratedFile(path.join(stagingRoot, "SHA256SUMS"), createChecksums(stagingRoot));
 
-		const outputRoot = prepareOutputDirectory(outputDir, root);
 		const archiveName = `${bundleName}.tar.gz`;
-		const archivePath = path.join(outputRoot, archiveName);
-		const checksumPath = `${archivePath}.sha256`;
-		if (fs.existsSync(archivePath) || fs.existsSync(checksumPath)) {
-			throw new Error(`refusing to overwrite existing bundle output in ${outputRoot}`);
-		}
 		const archive = createDeterministicTarGz(collectBundleEntries(stagingRoot));
 		inspectDeterministicTarGz(archive, { rootName: bundleName });
-		writeGeneratedFile(archivePath, archive);
-		writeGeneratedFile(checksumPath, `${sha256(archive)}  ${archiveName}\n`);
-		return { archivePath, checksumPath, manifest, outputRoot };
+		revalidateSourceIdentity({ root, sourceCommit, sourceTree, mode, source, tag });
+		const outputRoot = prepareOutputDirectory(outputDir, root);
+		const {
+			archivePath,
+			checksumPath,
+			outputRoot: publishedOutputRoot,
+		} = publishBundleOutputs({
+			outputRoot,
+			archiveName,
+			archive,
+			checksum: `${sha256(archive)}  ${archiveName}\n`,
+			validate: ({ archivePath: stagedArchivePath, checksumPath: stagedChecksumPath }) => {
+				const stagedArchive = fs.readFileSync(stagedArchivePath);
+				inspectDeterministicTarGz(stagedArchive, { rootName: bundleName });
+				const expectedChecksum = `${sha256(stagedArchive)}  ${archiveName}\n`;
+				if (fs.readFileSync(stagedChecksumPath, "utf8") !== expectedChecksum) {
+					throw new Error("staged bundle checksum does not match its archive");
+				}
+			},
+		});
+		return { archivePath, checksumPath, manifest, outputRoot: publishedOutputRoot };
 	} finally {
 		fs.rmSync(tempRoot, { recursive: true, force: true });
 	}
@@ -628,6 +1052,7 @@ function parseCliArguments(argv) {
 	let mode = "candidate";
 	let outputDir;
 	let tag;
+	let frozenDependencyLock;
 	for (let index = 0; index < argv.length; index += 1) {
 		const argument = argv[index];
 		if (argument === "--candidate") {
@@ -638,17 +1063,18 @@ function parseCliArguments(argv) {
 			mode = "release";
 			continue;
 		}
-		if (argument === "--output" || argument === "--tag") {
+		if (argument === "--output" || argument === "--tag" || argument === "--frozen-lock") {
 			const value = argv[index + 1];
 			if (!value) throw new Error(`${argument} requires a value`);
 			if (argument === "--output") outputDir = value;
-			else tag = value;
+			else if (argument === "--tag") tag = value;
+			else frozenDependencyLock = value;
 			index += 1;
 			continue;
 		}
 		throw new Error(`unknown argument: ${argument}`);
 	}
-	return { mode, outputDir, tag };
+	return { mode, outputDir, tag, frozenDependencyLock };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
