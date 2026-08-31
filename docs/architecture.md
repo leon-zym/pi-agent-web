@@ -136,6 +136,18 @@ The Browser retrieves referenced content through authenticated same-origin GET r
 command images remain bounded inline ingress. There is no public upload endpoint for the derived
 store.
 
+Workspace file references are a separate, Host-owned prompt-ingress boundary. Search publishes only
+bounded metadata and a non-sensitive text preview. Selecting a file captures exact bytes only after
+the required warning or confirmation. The Browser retains those captured bytes in the owning
+Session's composer until submission; Pi receives the captured text, base64, or image payload, and
+file-reference expansion does not ask Pi RPC to reopen the Workspace path. Ordinary agent tools
+remain governed separately. The resulting native Pi user message remains normal JSONL truth.
+
+Capture revalidates the canonical Workspace, relative path, resolved target, device/inode, size, and
+modification identity around a no-follow file descriptor read. Symlink or replacement uncertainty
+fails closed. Git ignore state, hidden paths, generated output, credential patterns, large content,
+binary data, and images are explicit policy inputs rather than filename-only UI decoration.
+
 ## Lifecycle and recovery
 
 - Recoverable process crashes use bounded restart policy and preserve exact generation semantics.

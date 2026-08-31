@@ -4,6 +4,9 @@ import type {
 	NativeSessionListDto,
 	NativeWorkspaceDto,
 	SessionRuntimeDto,
+	WorkspaceFileMetadataDto,
+	WorkspaceFileReferenceDto,
+	WorkspaceFileSearchDto,
 } from "@pi-agent-web/protocol";
 
 /** Structured REST failure returned by the local gateway. */
@@ -75,10 +78,27 @@ export const api = {
 		}),
 	activateWorkspace: (workspaceHandle: string) =>
 		request<NativeWorkspaceDto>(workspacePath(workspaceHandle, "/activate"), { method: "POST" }),
-	searchWorkspaceFiles: (workspaceHandle: string, query = "") =>
-		request<{ files: string[] }>(
-			workspacePath(workspaceHandle, `/files?q=${encodeURIComponent(query)}`),
-		).then((res) => res.files),
+	searchWorkspaceFiles: (workspaceHandle: string, query = "", signal?: AbortSignal) =>
+		request<WorkspaceFileSearchDto>(workspacePath(workspaceHandle, `/files?q=${encodeURIComponent(query)}`), {
+			signal,
+		}),
+	captureWorkspaceFile: (
+		workspaceHandle: string,
+		file: Pick<WorkspaceFileMetadataDto, "path" | "canonicalIdentity">,
+		confirmed: boolean,
+		signal?: AbortSignal,
+	) => {
+		if (!file.canonicalIdentity) throw new Error("Workspace file identity is unavailable");
+		return request<WorkspaceFileReferenceDto>(workspacePath(workspaceHandle, "/file-references/capture"), {
+			method: "POST",
+			body: JSON.stringify({
+				path: file.path,
+				canonicalIdentity: file.canonicalIdentity,
+				confirmed,
+			}),
+			signal,
+		});
+	},
 
 	listSessions: (workspaceHandle: string, options: { force?: boolean } = {}) =>
 		request<NativeSessionListDto>(

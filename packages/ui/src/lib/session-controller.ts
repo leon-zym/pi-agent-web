@@ -1,7 +1,13 @@
-import type { PiSessionCommandResponseDto } from "@pi-agent-web/protocol";
-import { expectCommandData, type NativeSessionDto } from "@pi-agent-web/protocol";
+import {
+	expectCommandData,
+	type NativeSessionDto,
+	type PiSessionCommandResponseDto,
+	SESSION_IMAGE_MAX_BASE64_CHARS,
+	SESSION_IMAGE_MAX_COUNT,
+	SESSION_IMAGE_TOTAL_MAX_BASE64_CHARS,
+} from "@pi-agent-web/protocol";
 import { toast } from "sonner";
-import { serializeComposerMessage, useComposerStore } from "../stores/composer";
+import { serializeComposerMessage, useComposerStore, workspaceFileImages } from "../stores/composer";
 import { useProjectionStore } from "../stores/projection";
 import {
 	isSessionBeingAbandoned,
@@ -324,8 +330,18 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 	}
 	const composer = useComposerStore.getState();
 	const initial = composer.bySession[sessionHandle];
-	const text = serializeComposerMessage(initial?.command ?? null, initial?.draft ?? "");
-	if (!text && (initial?.images.length ?? 0) === 0) return;
+	let text: string;
+	try {
+		text = serializeComposerMessage(
+			initial?.command ?? null,
+			initial?.draft ?? "",
+			initial?.fileReferences ?? [],
+		);
+	} catch (error) {
+		toast.error(tt("composer.fileReferenceBudgetExceeded"), { description: displayError(error) });
+		return;
+	}
+	if (!text && (initial?.images.length ?? 0) === 0 && (initial?.fileReferences.length ?? 0) === 0) return;
 	if (!composer.beginSubmitForSession(sessionHandle)) return;
 	const submitted = useComposerStore.getState().bySession[sessionHandle];
 	if (!submitted) return;
@@ -336,7 +352,17 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 		resolvedKind = submitted.deliveryMode === "follow_up" ? "follow_up" : "steer";
 	} else if (!running) resolvedKind = "prompt";
 
-	const images = submitted.images.length > 0 ? submitted.images : undefined;
+	const allImages = [...submitted.images, ...workspaceFileImages(submitted.fileReferences)];
+	if (
+		allImages.length > SESSION_IMAGE_MAX_COUNT ||
+		allImages.some((image) => image.data.length > SESSION_IMAGE_MAX_BASE64_CHARS) ||
+		allImages.reduce((total, image) => total + image.data.length, 0) > SESSION_IMAGE_TOTAL_MAX_BASE64_CHARS
+	) {
+		toast.error(tt("composer.fileReferenceBudgetExceeded"));
+		composer.finishSubmitForSession(sessionHandle, submitted.activeSubmitId);
+		return;
+	}
+	const images = allImages.length > 0 ? allImages : undefined;
 	try {
 		let response: PiSessionCommandResponseDto;
 		if (resolvedKind === "steer" || resolvedKind === "follow_up") {
@@ -360,6 +386,7 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 					submitted.images,
 					submitted.command,
 					submitted.activeSubmitId,
+					submitted.fileReferences,
 				);
 		}
 	} catch (error) {

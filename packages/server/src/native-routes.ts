@@ -14,10 +14,12 @@ import {
 	optionalBoundedStringField,
 	RequestInputError,
 	readBoundedJsonObject,
+	requiredBoundedStringField,
 } from "./request-input.js";
 import { canonicalizePathAllowMissing, type SessionLayoutResolver } from "./session-layout-resolver.js";
 import type { SessionRuntimeSnapshot } from "./session-runtime-types.js";
 import type { CreateSessionRequest, SessionManagementContext } from "./session-supervisor.js";
+import { WorkspaceFileReferenceError, WorkspaceFileReferenceService } from "./workspace-file-references.js";
 import type { WorkspacePreference, WorkspacePreferences } from "./workspace-preferences.js";
 
 export type { NativeSessionDto, NativeWorkspaceDto } from "@pi-agent-web/protocol";
@@ -55,10 +57,11 @@ export interface NativeRoutesContext {
 	supervisor: NativeRouteSupervisor;
 	/** Must move the exact canonical file to a recoverable trash location. */
 	trashSession: (target: RecoverableTrashTarget) => Promise<void>;
+	workspaceFileService?: WorkspaceFileReferenceService;
 	now?: () => number;
 }
 
-type NativeRouteStatus = 400 | 404 | 409 | 422 | 500 | 502;
+type NativeRouteStatus = 400 | 404 | 409 | 422 | 429 | 500 | 502;
 
 class NativeRouteError extends Error {
 	constructor(
@@ -83,6 +86,7 @@ interface WorkspaceProjection {
 export function createNativeRoutes(ctx: NativeRoutesContext): Hono {
 	const app = new Hono();
 	const now = ctx.now ?? Date.now;
+	const workspaceFiles = ctx.workspaceFileService ?? new WorkspaceFileReferenceService();
 
 	app.get("/workspaces", async (c) => {
 		const snapshot = await ctx.catalog.refresh();
@@ -168,8 +172,34 @@ export function createNativeRoutes(ctx: NativeRoutesContext): Hono {
 		if (!workspace.dto.path || !workspace.dto.available) {
 			throw new NativeRouteError(409, "workspace_unavailable", "workspace is not an available directory");
 		}
-		const files = await walkAndFilterFiles(workspace.dto.path, query);
-		return c.json({ files });
+		return c.json(await workspaceFiles.search(workspace.dto.path, query, c.req.raw.signal));
+	});
+
+	app.post("/workspaces/:workspaceHandle/file-references/capture", async (c) => {
+		const workspaceHandle = c.req.param("workspaceHandle");
+		const snapshot = await ctx.catalog.refresh();
+		const workspace = await requireWorkspace(
+			snapshot,
+			ctx.preferences,
+			workspaceHandle,
+			ctx.supervisor.listRuntimes(),
+		);
+		if (!workspace.dto.path || !workspace.dto.available) {
+			throw new NativeRouteError(409, "workspace_unavailable", "workspace is not an available directory");
+		}
+		const body = await readBoundedJsonObject(c.req.raw);
+		const filePath = requiredExactStringField(body, "path", MAX_WORKSPACE_PATH_LENGTH);
+		const canonicalIdentity = requiredBoundedStringField(body, "canonicalIdentity", 256);
+		if (typeof body.confirmed !== "boolean") {
+			throw new NativeRouteError(422, "invalid_confirmed", "body.confirmed must be a boolean");
+		}
+		return c.json(
+			await workspaceFiles.capture(
+				workspace.dto.path,
+				{ path: filePath, canonicalIdentity, confirmed: body.confirmed },
+				c.req.raw.signal,
+			),
+		);
 	});
 
 	app.get("/workspaces/:workspaceHandle/sessions", async (c) => {
@@ -332,6 +362,9 @@ export function createNativeRoutes(ctx: NativeRoutesContext): Hono {
 		if (error instanceof NativeRouteError) {
 			return c.json({ error: { code: error.code, message: error.message } }, error.status);
 		}
+		if (error instanceof WorkspaceFileReferenceError) {
+			return c.json({ error: { code: error.code, message: error.message } }, error.status);
+		}
 		return c.json(
 			{
 				error: {
@@ -366,6 +399,17 @@ function optionalBoolean(body: Record<string, unknown>, key: string): boolean | 
 		throw new NativeRouteError(422, `invalid_${key}`, `body.${key} must be a boolean`);
 	}
 	return body[key];
+}
+
+function requiredExactStringField(body: Record<string, unknown>, key: string, maxLength: number): string {
+	const value = body[key];
+	if (typeof value !== "string" || value.length === 0) {
+		throw new NativeRouteError(400, `invalid_${key}`, `body.${key} is required`);
+	}
+	if (value.length > maxLength) {
+		throw new NativeRouteError(422, `invalid_${key}`, `body.${key} is too long`);
+	}
+	return value;
 }
 
 function optionalDisplayName(body: Record<string, unknown>): { present: boolean; value: string | null } {
@@ -403,59 +447,6 @@ async function validateWorkspacePath(input: string): Promise<string> {
 		);
 	}
 	return canonicalizePathAllowMissing(canonical);
-}
-
-const EXCLUDED_SCAN_DIRS = new Set([".git", "node_modules", "dist", ".pi"]);
-const MAX_SEARCH_RESULTS = 50;
-const MAX_DIRECTORY_SCANS = 300;
-
-async function walkAndFilterFiles(rootPath: string, query: string): Promise<string[]> {
-	const results: string[] = [];
-	const lowerQuery = query.slice(0, 200).toLowerCase().trim();
-	const queue: string[] = [""];
-	let scannedDirs = 0;
-
-	while (queue.length > 0 && results.length < MAX_SEARCH_RESULTS && scannedDirs < MAX_DIRECTORY_SCANS) {
-		const relDir = queue.shift()!;
-		scannedDirs += 1;
-		const fullDir = relDir ? path.join(rootPath, relDir) : rootPath;
-		let entries: fs.Dirent[];
-		try {
-			entries = await fs.promises.readdir(fullDir, { withFileTypes: true });
-		} catch {
-			continue;
-		}
-
-		entries.sort((a, b) => a.name.localeCompare(b.name));
-
-		for (const entry of entries) {
-			if (results.length >= MAX_SEARCH_RESULTS) break;
-			if (EXCLUDED_SCAN_DIRS.has(entry.name)) continue;
-
-			const relPath = relDir ? `${relDir}/${entry.name}` : entry.name;
-			if (entry.isDirectory()) {
-				queue.push(relPath);
-			} else if (entry.isFile()) {
-				if (!lowerQuery || relPath.toLowerCase().includes(lowerQuery)) {
-					results.push(relPath);
-				}
-			} else if (entry.isSymbolicLink()) {
-				try {
-					const fullPath = path.join(fullDir, entry.name);
-					const real = await fs.promises.realpath(fullPath);
-					const stat = await fs.promises.stat(real);
-					if (stat.isFile() && (real === rootPath || real.startsWith(`${rootPath}${path.sep}`))) {
-						if (!lowerQuery || relPath.toLowerCase().includes(lowerQuery)) {
-							results.push(relPath);
-						}
-					}
-				} catch {
-					// Broken or circular symlink - skip safely
-				}
-			}
-		}
-	}
-	return results;
 }
 
 async function projectWorkspaces(

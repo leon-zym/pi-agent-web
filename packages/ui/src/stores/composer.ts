@@ -1,3 +1,8 @@
+import {
+	WORKSPACE_FILE_REFERENCE_MAX_COUNT,
+	WORKSPACE_FILE_REFERENCE_TEXT_TOTAL_MAX_BYTES,
+	type WorkspaceFileReferenceDto,
+} from "@pi-agent-web/protocol";
 import { create } from "zustand";
 import type { ImageContent } from "../types/pi-types";
 
@@ -30,16 +35,63 @@ export interface SlashCommandToken {
 	readonly source: "extension" | "prompt" | "skill";
 }
 
-/** Serialize the atomic command and editable body once at the transport boundary. */
-export function serializeComposerMessage(command: SlashCommandToken | null, draft: string): string {
-	const body = draft.trim();
+/** Serialize Host-captured files using Pi's established CLI file envelope. */
+export function serializeComposerMessage(
+	command: SlashCommandToken | null,
+	draft: string,
+	fileReferences: WorkspaceFileReferenceDto[] = [],
+): string {
+	if (fileReferences.length > WORKSPACE_FILE_REFERENCE_MAX_COUNT) {
+		throw new Error("workspace_file_reference_count_exceeded");
+	}
+	let expandedBytes = 0;
+	const files = fileReferences.map((reference) => {
+		const name = escapeFileName(reference.metadata.path);
+		if (reference.content.type === "image") return `<file name="${name}"></file>`;
+		if (reference.content.type === "binary_base64") {
+			expandedBytes += reference.content.data.length;
+			return `<file name="${name}" encoding="base64">\n${reference.content.data}\n</file>`;
+		}
+		expandedBytes += new TextEncoder().encode(reference.content.text).byteLength;
+		return `<file name="${name}">\n${reference.content.text}\n</file>`;
+	});
+	if (expandedBytes > WORKSPACE_FILE_REFERENCE_TEXT_TOTAL_MAX_BYTES) {
+		throw new Error("workspace_file_reference_text_budget_exceeded");
+	}
+	const body = [draft.trim(), ...files].filter(Boolean).join("\n");
 	if (!command) return body;
 	return body ? `/${command.name} ${body}` : `/${command.name}`;
+}
+
+export function workspaceFileImages(fileReferences: WorkspaceFileReferenceDto[]): ImageContent[] {
+	return fileReferences.flatMap((reference) =>
+		reference.content.type === "image"
+			? [
+					{
+						type: "image" as const,
+						mimeType: reference.content.mimeType,
+						data: reference.content.data,
+					},
+				]
+			: [],
+	);
+}
+
+function escapeFileName(value: string): string {
+	return value
+		.replaceAll("&", "&amp;")
+		.replaceAll("<", "&lt;")
+		.replaceAll(">", "&gt;")
+		.replaceAll('"', "&quot;")
+		.replaceAll("\r", "&#13;")
+		.replaceAll("\n", "&#10;")
+		.replaceAll("\t", "&#9;");
 }
 
 export interface ComposerSnapshot {
 	draft: string;
 	images: ImageContent[];
+	fileReferences: WorkspaceFileReferenceDto[];
 	trigger: SlashTrigger | null;
 	mentionTrigger: MentionTrigger | null;
 	command: SlashCommandToken | null;
@@ -64,6 +116,10 @@ interface ComposerState extends ComposerSnapshot {
 	setDraftForSession: (sessionHandle: string, draft: string) => void;
 	setImages: (images: ImageContent[]) => void;
 	setImagesForSession: (sessionHandle: string, images: ImageContent[]) => void;
+	addFileReference: (reference: WorkspaceFileReferenceDto) => void;
+	addFileReferenceForSession: (sessionHandle: string, reference: WorkspaceFileReferenceDto) => void;
+	removeFileReference: (canonicalIdentity: string) => void;
+	removeFileReferenceForSession: (sessionHandle: string, canonicalIdentity: string) => void;
 	beginAttachmentWorkForSession: (sessionHandle: string) => number;
 	finishAttachmentWorkForSession: (
 		sessionHandle: string,
@@ -98,13 +154,19 @@ interface ComposerState extends ComposerSnapshot {
 	clearDraft: () => void;
 	clearDraftForSession: (sessionHandle: string) => void;
 	/** Clear only when the user has not edited the draft during submission. */
-	clearDraftIfUnchanged: (draft: string, images: ImageContent[], command?: SlashCommandToken | null) => void;
+	clearDraftIfUnchanged: (
+		draft: string,
+		images: ImageContent[],
+		command?: SlashCommandToken | null,
+		fileReferences?: WorkspaceFileReferenceDto[],
+	) => void;
 	clearDraftIfUnchangedForSession: (
 		sessionHandle: string,
 		draft: string,
 		images: ImageContent[],
 		command?: SlashCommandToken | null,
 		activeSubmitId?: number | null,
+		fileReferences?: WorkspaceFileReferenceDto[],
 	) => void;
 	finishSubmitForSession: (sessionHandle: string, activeSubmitId: number | null) => void;
 	/** Move in-flight composer state when a pending Session gets its canonical handle. */
@@ -120,6 +182,7 @@ function emptySnapshot(): ComposerSnapshot {
 	return {
 		draft: "",
 		images: [],
+		fileReferences: [],
 		trigger: null,
 		mentionTrigger: null,
 		command: null,
@@ -138,6 +201,7 @@ function visible(snapshot: ComposerSnapshot): ComposerSnapshot {
 	return {
 		draft: snapshot.draft,
 		images: snapshot.images,
+		fileReferences: snapshot.fileReferences,
 		trigger: snapshot.trigger,
 		mentionTrigger: snapshot.mentionTrigger,
 		command: snapshot.command,
@@ -215,6 +279,32 @@ export const useComposerStore = create<ComposerState>()((set, get) => {
 		},
 		setImagesForSession: (sessionHandle, images) =>
 			updateSession(sessionHandle, (snapshot) => ({ ...snapshot, images })),
+		addFileReference: (reference) => {
+			const handle = get().activeSessionHandle;
+			if (handle) get().addFileReferenceForSession(handle, reference);
+		},
+		addFileReferenceForSession: (sessionHandle, reference) =>
+			updateSession(sessionHandle, (snapshot) => {
+				const withoutSamePath = snapshot.fileReferences.filter(
+					(candidate) => candidate.metadata.path !== reference.metadata.path,
+				);
+				if (withoutSamePath.length >= WORKSPACE_FILE_REFERENCE_MAX_COUNT) return snapshot;
+				return {
+					...snapshot,
+					fileReferences: [...withoutSamePath, reference],
+				};
+			}),
+		removeFileReference: (canonicalIdentity) => {
+			const handle = get().activeSessionHandle;
+			if (handle) get().removeFileReferenceForSession(handle, canonicalIdentity);
+		},
+		removeFileReferenceForSession: (sessionHandle, canonicalIdentity) =>
+			updateSession(sessionHandle, (snapshot) => ({
+				...snapshot,
+				fileReferences: snapshot.fileReferences.filter(
+					(reference) => reference.metadata.canonicalIdentity !== canonicalIdentity,
+				),
+			})),
 		beginAttachmentWorkForSession: (sessionHandle) => {
 			attachmentWorkIdCounter += 1;
 			const attachmentWorkId = attachmentWorkIdCounter;
@@ -346,14 +436,15 @@ export const useComposerStore = create<ComposerState>()((set, get) => {
 				...snapshot,
 				draft: "",
 				images: [],
+				fileReferences: [],
 				trigger: null,
 				mentionTrigger: null,
 				command: null,
 			})),
 
-		clearDraftIfUnchanged: (draft, images, command = null) => {
+		clearDraftIfUnchanged: (draft, images, command = null, fileReferences) => {
 			const handle = get().activeSessionHandle;
-			if (handle) get().clearDraftIfUnchangedForSession(handle, draft, images, command);
+			if (handle) get().clearDraftIfUnchangedForSession(handle, draft, images, command, null, fileReferences);
 		},
 		clearDraftIfUnchangedForSession: (
 			sessionHandle,
@@ -361,6 +452,7 @@ export const useComposerStore = create<ComposerState>()((set, get) => {
 			images,
 			command = null,
 			activeSubmitId = null,
+			fileReferences,
 		) => {
 			const state = get();
 			const targetHandle =
@@ -375,6 +467,7 @@ export const useComposerStore = create<ComposerState>()((set, get) => {
 				current?.draft === draft &&
 				current.images === images &&
 				current.command === command &&
+				(fileReferences === undefined || current.fileReferences === fileReferences) &&
 				(activeSubmitId === null || current.activeSubmitId === activeSubmitId)
 			) {
 				get().clearDraftForSession(targetHandle);

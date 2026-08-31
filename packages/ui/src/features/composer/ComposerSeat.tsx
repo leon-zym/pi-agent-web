@@ -1,4 +1,10 @@
 import {
+	WORKSPACE_FILE_REFERENCE_MAX_COUNT,
+	WORKSPACE_FILE_REFERENCE_TEXT_TOTAL_MAX_BYTES,
+	type WorkspaceFileReferenceDto,
+} from "@pi-agent-web/protocol";
+import {
+	FileText,
 	ImagePlus,
 	Maximize2,
 	Minimize2,
@@ -14,6 +20,7 @@ import { toast } from "sonner";
 import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
+import { api } from "../../lib/api";
 import { stripAnsi } from "../../lib/format";
 import { tt, useT } from "../../lib/i18n";
 import { ImageAttachmentError, prepareImageAttachments } from "../../lib/image-attachments";
@@ -97,6 +104,7 @@ export function ComposerSeat() {
 
 	const draft = activeSnapshot.draft;
 	const images = activeSnapshot.images;
+	const fileReferences = activeSnapshot.fileReferences;
 	const trigger = activeSnapshot.trigger;
 	const mentionTrigger = activeSnapshot.mentionTrigger;
 	const command = activeSnapshot.command;
@@ -107,6 +115,8 @@ export function ComposerSeat() {
 
 	const setDraft = useComposerStore((s) => s.setDraft);
 	const setImages = useComposerStore((s) => s.setImages);
+	const addFileReference = useComposerStore((s) => s.addFileReference);
+	const removeFileReference = useComposerStore((s) => s.removeFileReference);
 	const setTrigger = useComposerStore((s) => s.setTrigger);
 	const setMentionTrigger = useComposerStore((s) => s.setMentionTrigger);
 	const setCommand = useComposerStore((s) => s.setCommand);
@@ -337,13 +347,41 @@ export function ComposerSeat() {
 			)}
 			{mentionTrigger && currentWorkspaceHandle && (
 				<FileMentionMenu
+					key={`${sessionHandle ?? "none"}:${currentWorkspaceHandle}`}
 					ref={fileMentionMenuRef}
 					workspaceHandle={currentWorkspaceHandle}
-					onSelect={(filePath) => {
+					onCapture={async (file, confirmed, signal) => {
+						if (!sessionHandle) throw new Error("Session is unavailable");
+						const composer = useComposerStore.getState();
+						const workId = composer.beginAttachmentWorkForSession(sessionHandle);
+						try {
+							return await api.captureWorkspaceFile(currentWorkspaceHandle, file, confirmed, signal);
+						} finally {
+							useComposerStore.getState().finishAttachmentWorkForSession(sessionHandle, workId);
+							reconcileHiddenSessionLifecycle(sessionHandle);
+						}
+					}}
+					onSelect={(reference) => {
 						if (!mentionTrigger) return;
+						const replacing = fileReferences.some(
+							(candidate) => candidate.metadata.path === reference.metadata.path,
+						);
+						const nextReferences = [
+							...fileReferences.filter((candidate) => candidate.metadata.path !== reference.metadata.path),
+							reference,
+						];
+						if (
+							(!replacing && fileReferences.length >= WORKSPACE_FILE_REFERENCE_MAX_COUNT) ||
+							fileReferenceTextBytes(nextReferences) > WORKSPACE_FILE_REFERENCE_TEXT_TOTAL_MAX_BYTES
+						) {
+							toast.error(tt("composer.fileReferenceBudgetExceeded"));
+							setMentionTrigger(null);
+							return;
+						}
 						const el = textareaRef.current;
 						const cursor = el?.selectionStart ?? draft.length;
-						const selected = selectFileMention(draft, mentionTrigger, filePath, cursor);
+						const selected = selectFileMention(draft, mentionTrigger, reference.metadata.path, cursor);
+						addFileReference(reference);
 						setDraft(selected.draft);
 						setMentionTrigger(null);
 						focus();
@@ -366,6 +404,31 @@ export function ComposerSeat() {
 				aria-busy={submitting}
 			>
 				<div className={cn("px-4 pt-3", isExpanded && "flex min-h-0 flex-1 flex-col")}>
+					{fileReferences.length > 0 && (
+						<div data-testid="composer-file-references" className="mb-2 flex shrink-0 flex-wrap gap-1.5">
+							{fileReferences.map((reference) => (
+								<Badge
+									key={`${reference.metadata.path}:${reference.metadata.canonicalIdentity ?? "unknown"}`}
+									variant={reference.metadata.risks.length > 0 ? "warning" : "default"}
+									className="max-w-full gap-1.5 py-1 pr-1 pl-2"
+								>
+									<FileText aria-hidden="true" className="size-3 shrink-0" />
+									<span className="max-w-64 truncate font-mono">{reference.metadata.path}</span>
+									<button
+										type="button"
+										aria-label={tt("composer.removeFileReference", { path: reference.metadata.path })}
+										className="inline-flex size-6 shrink-0 items-center justify-center rounded-full transition-transform active:scale-96 focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none motion-reduce:transform-none"
+										onClick={() =>
+											reference.metadata.canonicalIdentity &&
+											removeFileReference(reference.metadata.canonicalIdentity)
+										}
+									>
+										<X className="size-3" />
+									</button>
+								</Badge>
+							))}
+						</div>
+					)}
 					{images.length > 0 && (
 						<div className="mb-2 flex shrink-0 flex-wrap gap-2">
 							{images.map((image, index) => (
@@ -651,4 +714,14 @@ export function ComposerSeat() {
 			)}
 		</div>
 	);
+}
+
+function fileReferenceTextBytes(references: WorkspaceFileReferenceDto[]): number {
+	return references.reduce((total, reference) => {
+		if (reference.content.type === "text") {
+			return total + new TextEncoder().encode(reference.content.text).byteLength;
+		}
+		if (reference.content.type === "binary_base64") return total + reference.content.data.length;
+		return total;
+	}, 0);
 }

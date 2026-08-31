@@ -810,7 +810,7 @@ describe("native REST routes", () => {
 		expect(restart.status).toBe(404);
 	});
 
-	it("safely searches workspace files excluding git, node_modules, dist, and .pi", async () => {
+	it("returns bounded file metadata while excluding private implementation directories", async () => {
 		const root = temporaryRoot();
 		const workspace = path.join(root, "my-workspace");
 		fs.mkdirSync(workspace);
@@ -836,28 +836,52 @@ describe("native REST routes", () => {
 		const resAll = await app.request(`/workspaces/${preference.workspaceHandle}/files`);
 		expect(resAll.status).toBe(200);
 		const dataAll = await json(resAll);
-		expect(dataAll.files).toEqual(
+		const paths = dataAll.files.map((file: { path: string }) => file.path);
+		expect(paths).toEqual(
 			expect.arrayContaining([
 				"package.json",
 				"src/index.ts",
 				"src/components/Button.tsx",
 				"src/components/Card.tsx",
+				"dist/bundle.js",
 			]),
 		);
-		expect(dataAll.files).not.toEqual(
+		expect(paths).not.toEqual(
 			expect.arrayContaining([
 				expect.stringContaining(".git"),
 				expect.stringContaining("node_modules"),
-				expect.stringContaining("dist/"),
 				expect.stringContaining(".pi/"),
 			]),
 		);
+		expect(dataAll.files.find((file: { path: string }) => file.path === "dist/bundle.js")).toMatchObject({
+			risks: expect.arrayContaining(["generated"]),
+			availability: "confirmation_required",
+		});
 
 		// Test query filter
 		const resQuery = await app.request(`/workspaces/${preference.workspaceHandle}/files?q=Card`);
 		expect(resQuery.status).toBe(200);
 		const dataQuery = await json(resQuery);
-		expect(dataQuery.files).toEqual(["src/components/Card.tsx"]);
+		expect(dataQuery.files.map((file: { path: string }) => file.path)).toEqual(["src/components/Card.tsx"]);
+		expect(dataQuery.files[0]).toMatchObject({
+			risks: expect.arrayContaining(["policy_unknown"]),
+			availability: "confirmation_required",
+		});
+		expect(dataQuery.files[0].preview).toBeUndefined();
+		const captured = await app.request(`/workspaces/${preference.workspaceHandle}/file-references/capture`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				path: dataQuery.files[0].path,
+				canonicalIdentity: dataQuery.files[0].canonicalIdentity,
+				confirmed: true,
+			}),
+		});
+		expect(captured.status).toBe(200);
+		expect(await json(captured)).toMatchObject({
+			metadata: { path: "src/components/Card.tsx" },
+			content: { type: "text", text: "export const Card = 1;" },
+		});
 
 		// Test non-existent workspace
 		const resMissing = await app.request("/workspaces/non-existent-workspace/files");

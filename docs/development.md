@@ -94,6 +94,12 @@ Tests must assert product behavior rather than incidental animation frames. Use 
 projection barriers. Keep test data free of credentials, user history, and private paths. Record
 traces on failure; keep screenshots only when they provide durable visual evidence.
 
+Workspace file-reference coverage uses synthetic paths and non-secret credential-like values. It
+must exercise canonical path and file identity changes, symlink swaps, traversal, ignore and hidden
+policy, binary and image classification, capture budgets, cancellation, Session changes, keyboard
+confirmation, narrow viewports, and draft preservation. The prompt assertion verifies that
+file-reference expansion sends captured bytes rather than asking Pi RPC to reopen a path.
+
 ### Real Pi acceptance
 
 Real-Pi tests are explicit because they can use the developer's configured provider credentials.
@@ -153,6 +159,18 @@ The main CI workflow has three independent jobs:
 Pi compatibility has a separate exact-version workflow. The stress matrix is manual. Real-Pi
 acceptance is never an implicit CI dependency.
 
+The active repository ruleset `protect main` requires pull requests and the exact GitHub Actions
+checks `Deterministic verification` and `Packaged browser E2E`. Required branches must be current
+with `main`; deletion and non-fast-forward updates remain blocked. These credential-free jobs run on
+fork pull requests without provider secrets. The representative performance job remains evidence,
+not a required correctness check.
+
+The repository currently has one maintainer, so the pull-request rule temporarily requires zero
+approving reviews and has no bypass actor. This is a review-count exception only: the pull request,
+up-to-date branch, required checks, deletion protection, and non-fast-forward protection still apply.
+When a second maintainer becomes active, change the required approval count to one before treating
+their access as part of the release process.
+
 ## Packaging
 
 The workspace contains protocol, server, UI, and CLI packages. `pnpm test:pack` creates local
@@ -178,6 +196,8 @@ pnpm bench:representative
 Also inspect the final diff, repository status, package contents, Browser artifacts, benchmark
 artifact, and documentation links. Report the exact real-Pi outcome. Do not close a tracked issue
 until its accepted behavior is on the shipped branch and deferred work is explicitly recorded.
+Confirm that the `protect main` ruleset is active with the two exact required check names above and
+that the temporary review-count exception still matches the current maintainer count.
 
 ## Code and commit conventions
 

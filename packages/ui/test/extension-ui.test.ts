@@ -41,6 +41,7 @@ describe("Session-scoped extension UI", () => {
 			submitState: "plain",
 			activeSubmitId: null,
 			attachmentWorkCount: 0,
+			fileReferences: [],
 			attachmentWorkIds: [],
 			deliveryMode: "auto",
 			queue: { steering: [], followUp: [] },

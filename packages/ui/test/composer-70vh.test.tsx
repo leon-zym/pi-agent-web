@@ -43,6 +43,7 @@ const storeHarness = vi.hoisted(() => ({
 		submitState: "plain" as const,
 		activeSubmitId: null,
 		attachmentWorkCount: 0,
+		fileReferences: [],
 		attachmentWorkIds: [],
 		deliveryMode: "steer" as const,
 		queue: { steering: [], followUp: [] },

@@ -68,7 +68,7 @@ All paths below use the `/api/v1` prefix.
 | Bootstrap | `GET /bootstrap` issues the local session cookie |
 | Health | `GET /health/live`, `GET /health/ready`; `/health` aliases readiness |
 | Auth | Read provider status and store a bounded provider key in Pi's configured Agent directory |
-| Workspaces | List, add, remove a discovery hint, activate, and list files or Sessions |
+| Workspaces | List, add, remove a discovery hint, activate, search bounded file metadata, capture an exact file reference, and list Sessions |
 | Sessions | Create, inspect process state, abandon an untouched transient, or request fenced deletion |
 | Attachments | Authenticated `GET /attachments/:serverEpoch/:sha256` for validated raster content |
 | Content | Authenticated `GET /content/:serverEpoch/:sha256` for typed UTF-8 content |
@@ -80,6 +80,29 @@ only its preference. Session deletion is the separate fenced recoverable transac
 Derived-content routes are read-only. They reject stale epochs, invalid digests, ranges, unsupported
 methods, missing content, and closed stores. Responses are `no-store`, same-origin, and `nosniff`.
 There is no public attachment or generic-content upload endpoint.
+
+### Workspace file-reference ingress
+
+Pi RPC accepts prompt text and inline images; it does not expand CLI `@file` arguments. The Gateway
+therefore owns Workspace file expansion. `GET /workspaces/:workspaceHandle/files` returns bounded
+metadata, policy flags, availability, and an ordinary-text preview where safe. It never returns a
+credential-pattern preview. `POST /workspaces/:workspaceHandle/file-references/capture` requires the
+exact metadata identity and an explicit confirmation bit, then reopens and revalidates the file
+before returning captured prompt content.
+
+Search is capped at 50 results, 300 directories, a 200-character query, 16 KiB of classification
+input per candidate, and four concurrent file operations. Preview text is capped at 2 KiB. Files
+above 64 KiB, images, binary files, hidden or ignored paths, generated output, credential patterns,
+and unknown ignore policy require confirmation. Per-file capture ceilings are 256 KiB for UTF-8
+text, 64 KiB for base64 binary, and 1.5 MiB raw for supported images. One Session draft retains at
+most eight references and 512 KiB of captured text or base64. Downstream command and image budgets
+remain authoritative if combined ordinary attachments consume the remaining capacity.
+
+The path in the draft is a display label. Submission appends the already captured bytes using the
+established Pi file envelope and inline image field; file-reference expansion does not ask Pi RPC to
+reopen the path. Ordinary agent tools remain governed by their separate tool and Workspace policy.
+Unavailable, truncated, confirmation-required, policy-blocked, cancelled, and stale-identity states
+remain distinct.
 
 ## WebSocket negotiation
 
