@@ -1269,10 +1269,12 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 	private leaseStateFor(sessionHandle: string, generation: number): LeaseState {
 		const existing = this.leases.get(sessionHandle);
 		if (existing && existing.generation === generation) return existing;
+		// A generation is an identity fence, not a continuation of the previous
+		// process. Never carry an owner or its fence across this boundary: a
+		// restarted, forked, or cloned runtime starts free at revision zero.
 		const state: LeaseState = {
 			generation,
 			revision: 0,
-			owner: existing?.terminal ? undefined : existing?.owner,
 			terminal: false,
 		};
 		this.leases.set(sessionHandle, state);
@@ -1388,10 +1390,12 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 			this.leases.delete(previousHandle);
 			this.leases.delete(nextHandle);
 			if (!previous || previous.generation !== runtime.generation) {
+				// The child/restarted runtime has a distinct generation. Its lease
+				// domain begins ownerless, so a prior controller cannot reuse either
+				// a connection identity or a fencing token on the new process.
 				const next: LeaseState = {
 					generation: runtime.generation,
 					revision: 0,
-					owner: previous?.owner,
 					terminal: false,
 				};
 				this.leases.set(nextHandle, next);

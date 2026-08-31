@@ -94,6 +94,8 @@ interface ConnectionState<M extends SessionRuntimeProductMode = "content_ref"> {
 	admittedExactOperations: number;
 	helloTimer?: NodeJS.Timeout;
 	negotiatedMaxServerFrameBytes: number;
+	/** Resolves only after the supervisor actor has published disconnect releases. */
+	disconnectCompletion?: Promise<void>;
 }
 
 interface OutboundPayload {
@@ -2003,8 +2005,9 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		return clientId ? ({ ...rest, id: clientId } as BridgeResponse<M>) : (rest as BridgeResponse<M>);
 	}
 
-	private disconnect(connection: ConnectionState<M>): void {
-		if (connection.closed) return;
+	private disconnect(connection: ConnectionState<M>): Promise<void> {
+		if (connection.disconnectCompletion) return connection.disconnectCompletion;
+		if (connection.closed) return Promise.resolve();
 		connection.closed = true;
 		if (connection.helloTimer) clearTimeout(connection.helloTimer);
 		connection.helloTimer = undefined;
@@ -2020,7 +2023,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		connection.historySnapshots.clear();
 		connection.restartableOverflows.clear();
 		connection.pendingRekeyLeases.clear();
-		void this.releaseDisconnectedLeases(connection.connectionId);
+		connection.disconnectCompletion = this.releaseDisconnectedLeases(connection.connectionId);
 		connection.subscriptions.clear();
 		connection.subscriptionAliases.clear();
 		connection.controlledSessions.clear();
@@ -2036,6 +2039,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		connection.outboundHistoryQueuedBytes = 0;
 		connection.outboundSending = false;
 		this.log("info", `ws disconnected (${this.connections.size} open)`);
+		return connection.disconnectCompletion;
 	}
 
 	private async releaseDisconnectedLeases(connectionId: string): Promise<void> {
