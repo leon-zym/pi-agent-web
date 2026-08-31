@@ -299,6 +299,20 @@ describe("Session runtime browser frame guard", () => {
 		).toBe(true);
 	});
 
+	it("keeps protocol 1.3 control frames limited to claim and release", () => {
+		expect(isSessionWsClientMessage({ type: "session_claim", sessionHandle: "session-native-a" })).toBe(true);
+		expect(isSessionWsClientMessage({ type: "session_release", sessionHandle: "session-native-a" })).toBe(
+			true,
+		);
+		expect(
+			isSessionWsClientMessage({
+				type: "session_takeover",
+				sessionHandle: "session-native-a",
+				expectedGeneration: 2,
+			}),
+		).toBe(false);
+	});
+
 	it("accepts practical image payloads but bounds each image and the aggregate frame", () => {
 		const command = (
 			images: Array<{ type: "image"; data: string; mimeType: string }>,
