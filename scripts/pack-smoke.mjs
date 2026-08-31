@@ -398,6 +398,7 @@ async function runBundledRuntimeSmoke({ bundleRoot, expectedPiVersion, tempRoot,
 
 async function runDeterministicConversationSmoke({
 	bundleRoot,
+	bundleToolchain,
 	expectedPiVersion,
 	tempRoot,
 	npmEnvironment,
@@ -430,6 +431,7 @@ async function runDeterministicConversationSmoke({
 		cwd: bundleRoot,
 		detached: process.platform !== "win32",
 		env,
+		invocation: bundleToolchain.npx,
 	});
 	const processIds = new Set();
 	const recordFixtureProcessIds = () => {
@@ -507,9 +509,13 @@ try {
 	});
 	const npmEnvironment = createSanitizedNpmEnvironment({ tempRoot });
 	assertExtractedBundleLockfile(bundleRoot);
-	installBundle({ bundleRoot, env: npmEnvironment });
+	installBundle({ bundleRoot, env: npmEnvironment, toolchain: bundle.manifest.toolchain });
 	assertInstalledProductIsolation({ installDir: bundleRoot });
-	run("npx", ["--no-install", "pi-web", "--help"], { cwd: bundleRoot, env: npmEnvironment });
+	run("npx", ["--no-install", "pi-web", "--help"], {
+		cwd: bundleRoot,
+		env: npmEnvironment,
+		toolchain: bundle.manifest.toolchain,
+	});
 	await runBundledRuntimeSmoke({
 		bundleRoot,
 		expectedPiVersion: bundle.manifest.runtime.piVersion,
@@ -518,6 +524,7 @@ try {
 	});
 	await runDeterministicConversationSmoke({
 		bundleRoot,
+		bundleToolchain: bundle.manifest.toolchain,
 		expectedPiVersion: bundle.manifest.runtime.piVersion,
 		tempRoot,
 		npmEnvironment,

@@ -15,6 +15,7 @@ import {
 	PACKAGE_NAMES,
 	packWorkspacePackages,
 	REPOSITORY_ROOT,
+	resolveTrustedPackageManagerToolchain,
 	run,
 	sha256,
 	sha256File,
@@ -145,7 +146,92 @@ function assertCanonicalPublicResolution(packagePath, resolved) {
 	}
 }
 
-function assertExternalPackageLockEntry(packagePath, value) {
+function assertSha512Integrity(packagePath, integrity) {
+	if (typeof integrity !== "string" || integrity.trim() !== integrity) {
+		throw new Error(`package lock entry ${packagePath} has an invalid sha512 integrity`);
+	}
+	const match = integrity.match(/^sha512-([A-Za-z0-9+/]+={0,2})$/);
+	if (!match) throw new Error(`package lock entry ${packagePath} has an invalid sha512 integrity`);
+	const decoded = Buffer.from(match[1], "base64");
+	if (decoded.byteLength !== 64 || decoded.toString("base64") !== match[1]) {
+		throw new Error(`package lock entry ${packagePath} has an invalid sha512 integrity`);
+	}
+}
+
+function packageNameFromLockPath(packagePath) {
+	if (typeof packagePath !== "string" || packagePath.length === 0) {
+		throw new Error("package lock entry has an invalid path");
+	}
+	const segments = packagePath.split("/");
+	if (segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")) {
+		throw new Error(`package lock entry ${packagePath} has an invalid path`);
+	}
+	const marker = segments.lastIndexOf("node_modules");
+	if (marker === -1 || marker === segments.length - 1) {
+		throw new Error(`unexpected package lock entry ${packagePath}`);
+	}
+	const nameSegments = segments.slice(marker + 1);
+	const expectedLength = nameSegments[0].startsWith("@") ? 2 : 1;
+	if (
+		nameSegments.length !== expectedLength ||
+		(nameSegments[0].startsWith("@") && (nameSegments[0].length === 1 || !nameSegments[1]))
+	) {
+		throw new Error(`unexpected package lock entry ${packagePath}`);
+	}
+	return nameSegments.join("/");
+}
+
+function assertNoSensitiveLockMetadata(value, packagePath) {
+	const visit = (candidate, fieldPath) => {
+		if (!candidate || typeof candidate !== "object") return;
+		for (const [key, nested] of Object.entries(candidate)) {
+			const nestedPath = `${fieldPath}.${key}`;
+			if (/(?:auth|token|password|credential|proxy|registry)/i.test(key)) {
+				throw new Error(`package lock entry ${packagePath} contains a forbidden ${nestedPath} field`);
+			}
+			visit(nested, nestedPath);
+		}
+	};
+	visit(value, "entry");
+}
+
+function npmAliasTarget(specifier) {
+	if (typeof specifier !== "string" || !specifier.startsWith("npm:")) return null;
+	const target = specifier.slice("npm:".length);
+	const match = target.match(/^(@[^/@]+\/[^/@]+|[^/@]+)(?:@.*)?$/);
+	if (!match) throw new Error(`package dependency alias has an invalid target: ${specifier}`);
+	return match[1];
+}
+
+function assertInternalDependencySpecs(packagePath, value, expectedDependencies) {
+	for (const field of ["dependencies", "optionalDependencies", "peerDependencies"]) {
+		if (value[field] === undefined) continue;
+		if (!value[field] || typeof value[field] !== "object" || Array.isArray(value[field])) {
+			throw new Error(`package lock entry ${packagePath} has invalid ${field}`);
+		}
+		for (const [declaredName, specifier] of Object.entries(value[field])) {
+			if (typeof specifier !== "string" || specifier.trim() !== specifier) {
+				throw new Error(`package lock entry ${packagePath} has an invalid dependency spec`);
+			}
+			const aliasTarget = npmAliasTarget(specifier);
+			const targetName = aliasTarget ?? declaredName;
+			if (!targetName.startsWith(INTERNAL_PACKAGE_PREFIX)) continue;
+			if (!Object.hasOwn(expectedDependencies, targetName)) {
+				throw new Error(`package lock entry ${packagePath} references an unbundled internal package`);
+			}
+			if (aliasTarget) {
+				throw new Error(`package lock entry ${packagePath} aliases an internal package`);
+			}
+		}
+	}
+}
+
+function assertExternalPackageLockEntry(
+	packagePath,
+	value,
+	expectedDependencies,
+	{ allowMissingIntegrity = false } = {},
+) {
 	if (
 		typeof value.version !== "string" ||
 		value.version.length === 0 ||
@@ -161,20 +247,13 @@ function assertExternalPackageLockEntry(packagePath, value) {
 	) {
 		throw new Error(`external package lock entry ${packagePath} has a non-registry package spec`);
 	}
-	// npm lockfile v3 may omit integrity for nested records that npm resolves
-	// through a bundled dependency. Those records are still unambiguous when
-	// their exact canonical public `resolved` URL is present. If npm supplies
-	// integrity, however, it must be a usable value rather than an empty or
-	// malformed placeholder.
-	if (
-		value.integrity !== undefined &&
-		(typeof value.integrity !== "string" ||
-			value.integrity.length === 0 ||
-			value.integrity.trim() !== value.integrity)
-	) {
-		throw new Error(`external package lock entry ${packagePath} has an invalid integrity`);
+	if (value.integrity === undefined && allowMissingIntegrity) {
+		// Candidate generation may hydrate this exact canonical tarball below.
+	} else {
+		assertSha512Integrity(packagePath, value.integrity);
 	}
 	assertCanonicalPublicResolution(packagePath, value.resolved);
+	assertInternalDependencySpecs(packagePath, value, expectedDependencies);
 }
 
 function internalTarballIntegrities(packages) {
@@ -189,19 +268,40 @@ function internalTarballIntegrities(packages) {
 	);
 }
 
-export function validateBundleLockfile(lockfile, rootManifest, { internalIntegrityByPackage } = {}) {
+export function validateBundleLockfile(
+	lockfile,
+	rootManifest,
+	{ internalIntegrityByPackage, allowMissingExternalIntegrity = false } = {},
+) {
 	if (
 		!lockfile ||
 		typeof lockfile !== "object" ||
+		Array.isArray(lockfile) ||
+		lockfile.lockfileVersion !== 3 ||
+		lockfile.requires !== true ||
+		lockfile.name !== rootManifest?.name ||
+		lockfile.version !== rootManifest?.version ||
+		Object.keys(lockfile).some(
+			(key) => !["name", "version", "lockfileVersion", "requires", "packages"].includes(key),
+		) ||
+		Object.hasOwn(lockfile, "dependencies") ||
 		!lockfile.packages ||
 		typeof lockfile.packages !== "object"
 	) {
-		throw new Error("generated package-lock.json has no packages map");
+		throw new Error("package-lock.json is not the supported complete v3 shape");
 	}
 	const rootPackage = lockfile.packages[""];
 	if (!rootPackage || typeof rootPackage !== "object")
 		throw new Error("generated package-lock.json has no root package");
 	const expectedDependencies = expectedInternalDependencies(rootManifest);
+	if (
+		Object.keys(rootPackage).some((key) => !["name", "version", "engines", "dependencies"].includes(key)) ||
+		rootPackage.name !== rootManifest.name ||
+		rootPackage.version !== rootManifest.version ||
+		!recordsMatch(rootPackage.engines, rootManifest.engines)
+	) {
+		throw new Error("generated package-lock.json root package has unexpected metadata");
+	}
 	if (!recordsMatch(rootPackage.dependencies, expectedDependencies)) {
 		throw new Error("generated package-lock.json does not preserve bundle-local dependencies");
 	}
@@ -220,46 +320,104 @@ export function validateBundleLockfile(lockfile, rootManifest, { internalIntegri
 		if (!value || typeof value !== "object" || Array.isArray(value)) {
 			throw new Error(`package lock entry ${packagePath} is not an object`);
 		}
+		assertNoSensitiveLockMetadata(value, packagePath);
+		const pathPackageName = packageNameFromLockPath(packagePath);
+		if (value.name !== undefined && value.name !== pathPackageName) {
+			throw new Error(`package lock entry ${packagePath} has an ambiguous package identity`);
+		}
 		const expected = expectedEntries.get(packagePath);
-		if (expected) {
+		if (pathPackageName.startsWith(INTERNAL_PACKAGE_PREFIX)) {
+			if (!expected || packagePath !== `node_modules/${pathPackageName}`) {
+				throw new Error(`unexpected internal package lock entry ${packagePath}`);
+			}
 			if (value.link === true || value.resolved !== expected || value.version !== rootManifest.version) {
 				throw new Error(`internal package lock entry ${packagePath} is not its bundled tarball`);
 			}
-			const packageName = packagePath.slice("node_modules/".length);
-			const expectedIntegrity = internalIntegrityByPackage?.get(packageName);
+			assertSha512Integrity(packagePath, value.integrity);
+			const expectedIntegrity = internalIntegrityByPackage?.get(pathPackageName);
 			if (expectedIntegrity && value.integrity !== expectedIntegrity) {
 				throw new Error(`internal package lock entry ${packagePath} has the wrong bundled tarball integrity`);
 			}
+			assertInternalDependencySpecs(packagePath, value, expectedDependencies);
 			observedEntries.add(packagePath);
 			continue;
-		}
-		if (packagePath.includes(`node_modules/${INTERNAL_PACKAGE_PREFIX}`)) {
-			throw new Error(`unexpected internal package lock entry ${packagePath}`);
-		}
-		if (!packagePath.startsWith("node_modules/")) {
-			throw new Error(`unexpected package lock entry ${packagePath}`);
 		}
 		if (value.link === true) {
 			throw new Error(`external package lock entry ${packagePath} must not link outside the bundle`);
 		}
-		assertExternalPackageLockEntry(packagePath, value);
+		assertExternalPackageLockEntry(packagePath, value, expectedDependencies, {
+			allowMissingIntegrity: allowMissingExternalIntegrity,
+		});
 	}
 	if (observedEntries.size !== expectedEntries.size) {
 		throw new Error("generated package-lock.json is missing bundled package entries");
 	}
 }
 
-function externalLockEntries(lockfile, rootManifest) {
-	const internalPaths = new Set(
-		Object.keys(expectedInternalDependencies(rootManifest)).map(
-			(packageName) => `node_modules/${packageName}`,
-		),
-	);
-	return Object.fromEntries(
-		Object.entries(lockfile.packages)
-			.filter(([packagePath]) => packagePath !== "" && !internalPaths.has(packagePath))
-			.map(([packagePath, value]) => [packagePath, value]),
-	);
+function minimalNodeFetchEnvironment() {
+	const environment = {};
+	if (typeof process.env.PATH === "string" && process.env.PATH.length > 0) {
+		environment.PATH = process.env.PATH;
+	}
+	if (process.platform === "win32" && typeof process.env.SystemRoot === "string") {
+		environment.SystemRoot = process.env.SystemRoot;
+	}
+	return environment;
+}
+
+function fetchCanonicalTarball(resolved) {
+	const program = [
+		"const response = await fetch(process.argv[1], { redirect: 'error' });",
+		"if (!response.ok) throw new Error('public tarball fetch failed');",
+		"process.stdout.write(Buffer.from(await response.arrayBuffer()));",
+	].join("\n");
+	const result = spawnSync(process.execPath, ["--input-type=module", "-e", program, resolved], {
+		encoding: null,
+		stdio: ["ignore", "pipe", "pipe"],
+		env: minimalNodeFetchEnvironment(),
+		timeout: 120_000,
+		maxBuffer: 128 * 1024 * 1024,
+	});
+	if (result.status !== 0 || !Buffer.isBuffer(result.stdout) || result.stdout.byteLength === 0) {
+		throw new Error("unable to fetch a canonical public dependency tarball for provisional lock hydration");
+	}
+	return result.stdout;
+}
+
+/**
+ * Candidate mode may add missing integrity fields by downloading only the
+ * already-validated canonical public tarballs. Release mode never calls this.
+ */
+export function hydrateProvisionalBundleLockfile(
+	lockfile,
+	rootManifest,
+	{ fetchTarball = fetchCanonicalTarball } = {},
+) {
+	validateBundleLockfile(lockfile, rootManifest, { allowMissingExternalIntegrity: true });
+	const hydrated = JSON.parse(JSON.stringify(lockfile));
+	for (const [packagePath, value] of Object.entries(hydrated.packages)) {
+		if (packagePath === "" || value.integrity !== undefined) continue;
+		const packageName = packageNameFromLockPath(packagePath);
+		if (packageName.startsWith(INTERNAL_PACKAGE_PREFIX)) {
+			throw new Error(`internal package lock entry ${packagePath} is missing its bundled tarball integrity`);
+		}
+		assertCanonicalPublicResolution(packagePath, value.resolved);
+		const tarball = fetchTarball(value.resolved);
+		if (!Buffer.isBuffer(tarball) && !(tarball instanceof Uint8Array)) {
+			throw new Error(`provisional lock hydration did not return bytes for ${packagePath}`);
+		}
+		value.integrity = `sha512-${createHash("sha512").update(tarball).digest("base64")}`;
+	}
+	validateBundleLockfile(hydrated, rootManifest);
+	return hydrated;
+}
+
+function nonRebindableLockState(lockfile, rootManifest) {
+	const state = JSON.parse(JSON.stringify(lockfile));
+	for (const packageName of Object.keys(expectedInternalDependencies(rootManifest))) {
+		delete state.packages[`node_modules/${packageName}`].integrity;
+	}
+	return state;
 }
 
 /**
@@ -279,10 +437,10 @@ export function rebindFrozenBundleLockfile(frozenLockfile, rootManifest, package
 		entry.integrity = integrity;
 	}
 	if (
-		JSON.stringify(externalLockEntries(frozenLockfile, rootManifest)) !==
-		JSON.stringify(externalLockEntries(rebound, rootManifest))
+		JSON.stringify(nonRebindableLockState(frozenLockfile, rootManifest)) !==
+		JSON.stringify(nonRebindableLockState(rebound, rootManifest))
 	) {
-		throw new Error("rebinding a frozen package-lock.json changed an external dependency");
+		throw new Error("rebinding a frozen package-lock.json changed a non-local dependency graph field");
 	}
 	validateBundleLockfile(rebound, rootManifest, { internalIntegrityByPackage: integrityByPackage });
 	return rebound;
@@ -517,25 +675,87 @@ export function publishBundleOutputs({
 	}
 }
 
+function createOwnedDirectory(directory) {
+	fs.mkdirSync(directory, { recursive: true, mode: DIRECTORY_MODE });
+	const stat = fs.lstatSync(directory);
+	if (stat.isSymbolicLink() || !stat.isDirectory()) {
+		throw new Error(`release tool environment path is not a real directory: ${directory}`);
+	}
+}
+
+const SAFE_BUILD_ENVIRONMENT_KEYS = new Set([
+	"PATH",
+	"LANG",
+	"LC_ALL",
+	"TZ",
+	"SystemRoot",
+	"SYSTEMROOT",
+	"ComSpec",
+	"COMSPEC",
+	"PATHEXT",
+	"WINDIR",
+]);
+
+function isForbiddenBuildEnvironmentKey(key) {
+	const normalized = key.toLowerCase();
+	return (
+		normalized.startsWith("npm_config_") ||
+		normalized.startsWith("pnpm_config_") ||
+		normalized === "npm_token" ||
+		normalized === "node_auth_token" ||
+		/(?:auth|token|password|credential|proxy|registry)/i.test(key)
+	);
+}
+
+export function assertSafeProjectNpmrc(root) {
+	const projectConfig = path.join(root, ".npmrc");
+	const stat = lstatOrNull(projectConfig);
+	if (!stat) return;
+	if (stat.isSymbolicLink() || !stat.isFile()) {
+		throw new Error("project .npmrc must be an absent regular file for release builds");
+	}
+	const meaningfulLines = fs
+		.readFileSync(projectConfig, "utf8")
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter((line) => line.length > 0 && !line.startsWith("#") && !line.startsWith(";"));
+	if (meaningfulLines.length > 0) {
+		throw new Error("project .npmrc is not allowed in an isolated release build");
+	}
+}
+
 export function createSanitizedNpmEnvironment({ tempRoot, baseEnv = process.env }) {
 	const configRoot = path.join(tempRoot, "npm-config");
+	const homePath = path.join(configRoot, "home");
 	const userConfigPath = path.join(configRoot, "user.npmrc");
 	const globalConfigPath = path.join(configRoot, "global.npmrc");
-	const cachePath = path.join(configRoot, "cache");
-	fs.mkdirSync(configRoot, { recursive: true, mode: DIRECTORY_MODE });
-	fs.mkdirSync(cachePath, { recursive: true, mode: DIRECTORY_MODE });
+	const cachePath = path.join(configRoot, "npm-cache");
+	const prefixPath = path.join(configRoot, "npm-prefix");
+	const pnpmStorePath = path.join(configRoot, "pnpm-store");
+	const xdgConfigPath = path.join(configRoot, "xdg-config");
+	for (const directory of [configRoot, homePath, cachePath, prefixPath, pnpmStorePath, xdgConfigPath]) {
+		createOwnedDirectory(directory);
+	}
 	const registryConfig = `registry=${PUBLIC_NPM_REGISTRY}\n`;
 	writeGeneratedFile(userConfigPath, registryConfig);
 	writeGeneratedFile(globalConfigPath, registryConfig);
-	const environment = Object.fromEntries(
-		Object.entries(baseEnv).filter(([key]) => !key.toLowerCase().startsWith("npm_config_")),
-	);
+	const environment = {};
+	for (const [key, value] of Object.entries(baseEnv)) {
+		if (isForbiddenBuildEnvironmentKey(key) || !SAFE_BUILD_ENVIRONMENT_KEYS.has(key)) continue;
+		environment[key] = value;
+	}
 	return {
 		...environment,
+		HOME: homePath,
+		XDG_CACHE_HOME: cachePath,
+		XDG_CONFIG_HOME: xdgConfigPath,
 		npm_config_cache: cachePath,
 		npm_config_globalconfig: globalConfigPath,
+		npm_config_prefix: prefixPath,
 		npm_config_registry: PUBLIC_NPM_REGISTRY,
 		npm_config_userconfig: userConfigPath,
+		pnpm_config_store_dir: pnpmStorePath,
+		...(process.platform === "win32" ? { USERPROFILE: homePath } : {}),
 	};
 }
 
@@ -556,15 +776,19 @@ function createProvisionalDependencyLock({
 	snapshotRoot,
 	stagingRoot,
 	npmEnvironment,
+	trustedToolchain,
 }) {
 	run("npm", ["install", "--package-lock-only", "--ignore-scripts", "--omit=dev"], {
 		cwd: stagingRoot,
 		env: npmEnvironment,
+		toolchain: trustedToolchain,
 	});
 	const lockPath = path.join(stagingRoot, "package-lock.json");
+	const proposedLockfile = readJson(lockPath, "provisional bundle package-lock.json");
+	const lockfile = hydrateProvisionalBundleLockfile(proposedLockfile, rootManifest);
+	fs.writeFileSync(lockPath, lockfileText(lockfile), { encoding: "utf8", flag: "w", mode: FILE_MODE });
 	fs.chmodSync(lockPath, FILE_MODE);
 	const lockBytes = fs.readFileSync(lockPath);
-	const lockfile = readJson(lockPath, "provisional bundle package-lock.json");
 	validateBundleLockfile(lockfile, rootManifest, {
 		internalIntegrityByPackage: internalTarballIntegrities(packages),
 	});
@@ -719,13 +943,19 @@ export function createImmutableSourceSnapshot({ root = REPOSITORY_ROOT, sourceCo
 	return destinationRoot;
 }
 
-function buildImmutableSourceSnapshot(snapshotRoot, npmEnvironment) {
+function buildImmutableSourceSnapshot(snapshotRoot, npmEnvironment, trustedToolchain) {
 	run("pnpm", ["install", "--frozen-lockfile", "--ignore-scripts"], {
 		cwd: snapshotRoot,
 		env: npmEnvironment,
+		toolchain: trustedToolchain,
 		timeoutMs: 300_000,
 	});
-	run("pnpm", ["-r", "build"], { cwd: snapshotRoot, env: npmEnvironment, timeoutMs: 300_000 });
+	run("pnpm", ["-r", "build"], {
+		cwd: snapshotRoot,
+		env: npmEnvironment,
+		toolchain: trustedToolchain,
+		timeoutMs: 300_000,
+	});
 }
 
 function revalidateSourceIdentity({ root, sourceCommit, sourceTree, mode, source, tag }) {
@@ -748,14 +978,6 @@ export function verifyReleaseTag({ root = REPOSITORY_ROOT, tag, version, sourceC
 	if (taggedCommit !== sourceCommit) throw new Error(`release tag ${tag} does not point at ${sourceCommit}`);
 }
 
-function toolchain() {
-	return {
-		node: process.version,
-		npm: run("npm", ["--version"]).trim(),
-		pnpm: run("pnpm", ["--version"]).trim(),
-	};
-}
-
 function createBundleManifest({
 	bundleName,
 	dependencyLock,
@@ -764,6 +986,7 @@ function createBundleManifest({
 	sourceCommit,
 	sourceTree,
 	tag,
+	trustedToolchain,
 }) {
 	return {
 		schemaVersion: 1,
@@ -779,7 +1002,7 @@ function createBundleManifest({
 		},
 		source: { commit: sourceCommit, tree: sourceTree, tag: tag ?? null },
 		dependencyLock,
-		toolchain: toolchain(),
+		toolchain: trustedToolchain,
 		runtime: { piVersion: source.piVersion, gatewayProtocol: source.protocolVersion },
 		packages: packages.map((entry) => ({
 			name: entry.manifest.name,
@@ -833,6 +1056,7 @@ export function createReleaseBundle({
 		throw new Error("release mode requires a pre-reviewed frozen npm dependency lock input");
 	}
 	const { commit: sourceCommit, tree: sourceTree } = captureSourceIdentity(root);
+	const trustedToolchain = resolveTrustedPackageManagerToolchain({ repositoryRoot: root });
 
 	const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-release-bundle-staging-"));
 	try {
@@ -841,12 +1065,18 @@ export function createReleaseBundle({
 			sourceCommit,
 			destinationRoot: path.join(tempRoot, "source"),
 		});
+		assertSafeProjectNpmrc(snapshotRoot);
 		const source = releaseSource(snapshotRoot);
 		if (mode === "release") verifyReleaseTag({ root, tag, version: source.version, sourceCommit });
 		const npmEnvironment = createSanitizedNpmEnvironment({ tempRoot });
-		buildImmutableSourceSnapshot(snapshotRoot, npmEnvironment);
+		buildImmutableSourceSnapshot(snapshotRoot, npmEnvironment, trustedToolchain);
 		const tarballDir = path.join(tempRoot, "tarballs");
-		const tarballs = packWorkspacePackages({ root: snapshotRoot, tarballDir, env: npmEnvironment });
+		const tarballs = packWorkspacePackages({
+			root: snapshotRoot,
+			tarballDir,
+			env: npmEnvironment,
+			toolchain: trustedToolchain,
+		});
 		const packages = inspectPackageTarballs(tarballs, { repositoryUrl: source.repositoryUrl });
 		validateBundledPackageGraph(packages, source.version);
 
@@ -879,6 +1109,7 @@ export function createReleaseBundle({
 						snapshotRoot,
 						stagingRoot,
 						npmEnvironment,
+						trustedToolchain,
 					})
 				: consumeFrozenDependencyLock({
 						frozenDependencyLock,
@@ -895,6 +1126,7 @@ export function createReleaseBundle({
 			sourceCommit,
 			sourceTree,
 			tag: mode === "release" ? tag : undefined,
+			trustedToolchain,
 		});
 		writeGeneratedFile(
 			path.join(stagingRoot, "bundle-manifest.json"),

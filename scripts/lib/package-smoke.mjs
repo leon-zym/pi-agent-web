@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { extractTarEntries, readGzipTarEntries } from "./archive.mjs";
@@ -23,11 +24,12 @@ export function sha256File(filePath) {
 }
 
 export function run(command, args, options = {}) {
-	const { cwd = REPOSITORY_ROOT, env = process.env, timeoutMs = 120_000 } = options;
+	const { cwd = REPOSITORY_ROOT, env = process.env, timeoutMs = 120_000, toolchain } = options;
 	const invocation =
-		command === "npm" || command === "npx" || command === "pnpm"
+		toolchain?.[command] ??
+		(command === "npm" || command === "npx" || command === "pnpm"
 			? resolvePackageManagerCommand(command, { env })
-			: { command, argsPrefix: [] };
+			: { command, argsPrefix: [] });
 	const result = spawnSync(invocation.command, [...invocation.argsPrefix, ...args], {
 		cwd,
 		env,
@@ -123,10 +125,14 @@ export function inspectPackageTarballs(tarballs, options = {}) {
 	return inspected;
 }
 
-export function packWorkspacePackages({ root = REPOSITORY_ROOT, tarballDir, env = process.env }) {
+export function packWorkspacePackages({ root = REPOSITORY_ROOT, tarballDir, env = process.env, toolchain }) {
 	fs.mkdirSync(tarballDir, { recursive: true });
 	for (const packageName of PACKAGE_NAMES) {
-		run("pnpm", ["--filter", packageName, "pack", "--pack-destination", tarballDir], { cwd: root, env });
+		run("pnpm", ["--filter", packageName, "pack", "--pack-destination", tarballDir], {
+			cwd: root,
+			env,
+			toolchain,
+		});
 	}
 	return fs
 		.readdirSync(tarballDir)
@@ -349,11 +355,11 @@ export function launchInstalledCli({ installDir, args, cwd, detached = false, en
 	});
 }
 
-export function launchInstalledNpx({ args, cwd, detached = false, env }) {
-	const invocation = resolvePackageManagerCommand("npx", { env });
+export function launchInstalledNpx({ args, cwd, detached = false, env, invocation }) {
+	const npxInvocation = invocation ?? resolvePackageManagerCommand("npx", { env });
 	return spawnOwnedProcess({
-		command: invocation.command,
-		args: [...invocation.argsPrefix, "--no-install", "pi-web", ...args],
+		command: npxInvocation.command,
+		args: [...npxInvocation.argsPrefix, "--no-install", "pi-web", ...args],
 		cwd,
 		detached,
 		env,
@@ -446,10 +452,11 @@ export function extractBundleArchive({ archivePath, destinationDir, bundleName }
 	return bundleRoot;
 }
 
-export function installBundle({ bundleRoot, env = process.env }) {
+export function installBundle({ bundleRoot, env = process.env, toolchain }) {
 	run("npm", ["ci", "--omit=dev", "--ignore-scripts"], {
 		cwd: bundleRoot,
 		env,
+		toolchain,
 	});
 }
 
@@ -506,6 +513,145 @@ export function resolvePackageManagerCommand(
 	return { command: process.execPath, argsPrefix: [readWindowsCommandEntrypoint(commandPath)] };
 }
 
+function pathIsWithin(candidate, parent) {
+	return candidate === parent || candidate.startsWith(`${parent}${path.sep}`);
+}
+
+function realpathOrNull(candidate) {
+	try {
+		return fs.realpathSync(candidate);
+	} catch (error) {
+		if (error?.code === "ENOENT") return null;
+		throw error;
+	}
+}
+
+function lstatOrNull(candidate) {
+	try {
+		return fs.lstatSync(candidate);
+	} catch (error) {
+		if (error?.code === "ENOENT") return null;
+		throw error;
+	}
+}
+
+function trustedRuntimeEnvironment(baseEnv = process.env) {
+	const environment = {};
+	for (const key of [
+		"PATH",
+		"LANG",
+		"LC_ALL",
+		"TZ",
+		"SystemRoot",
+		"SYSTEMROOT",
+		"ComSpec",
+		"COMSPEC",
+		"PATHEXT",
+		"WINDIR",
+	]) {
+		if (typeof baseEnv[key] === "string" && baseEnv[key].length > 0) environment[key] = baseEnv[key];
+	}
+	return environment;
+}
+
+function assertTrustedToolPath(candidate, { workspaceRoots, temporaryRoots, label }) {
+	const lexical = path.resolve(candidate);
+	const stat = fs.lstatSync(lexical);
+	if (stat.isDirectory()) throw new Error(`${label} must be an executable file`);
+	const real = fs.realpathSync(lexical);
+	const prohibitedRoots = [...workspaceRoots, ...temporaryRoots]
+		.map((root) => realpathOrNull(root))
+		.filter(Boolean);
+	if (
+		isNodeModulesBinDirectory(path.dirname(lexical)) ||
+		isNodeModulesBinDirectory(path.dirname(real)) ||
+		prohibitedRoots.some((root) => pathIsWithin(lexical, root) || pathIsWithin(real, root))
+	) {
+		throw new Error(`${label} resolves through an untrusted workspace or temporary path`);
+	}
+	return real;
+}
+
+function packageManagerEntryPath(invocation, trustedNode, details) {
+	if (invocation.command === process.execPath && invocation.argsPrefix.length === 1) {
+		return assertTrustedToolPath(invocation.argsPrefix[0], details);
+	}
+	const canonicalCommand = assertTrustedToolPath(invocation.command, details);
+	if (!/\.(?:c?js|mjs)$/i.test(canonicalCommand)) {
+		throw new Error(`${details.label} must resolve to a canonical Node CLI entrypoint`);
+	}
+	if (!trustedNode) throw new Error("trusted Node executable is required");
+	return canonicalCommand;
+}
+
+function readTrustedToolVersion(nodePath, entryPath, environment) {
+	const result = spawnSync(nodePath, [entryPath, "--version"], {
+		cwd: os.tmpdir(),
+		env: trustedRuntimeEnvironment(environment),
+		encoding: "utf8",
+		stdio: "pipe",
+		timeout: 30_000,
+	});
+	if (result.status !== 0 || typeof result.stdout !== "string") {
+		throw new Error(`unable to read trusted tool version for ${path.basename(entryPath)}`);
+	}
+	const version = result.stdout.trim();
+	if (version.length === 0) throw new Error(`trusted tool returned no version: ${path.basename(entryPath)}`);
+	return version;
+}
+
+/**
+ * Resolves npm-family tools before release environment sanitization. Every
+ * package-manager CLI is invoked through the captured canonical Node binary,
+ * never through PATH after the build environment has been isolated.
+ */
+export function resolveTrustedPackageManagerToolchain({
+	baseEnv = process.env,
+	platform = process.platform,
+	repositoryRoot = REPOSITORY_ROOT,
+	workspaceRoots = [repositoryRoot],
+	executableResolver = resolveExecutable,
+	nodePath = process.execPath,
+} = {}) {
+	const temporaryRoots = [os.tmpdir(), baseEnv.TMPDIR, baseEnv.TEMP, baseEnv.TMP].filter(
+		(value) => typeof value === "string" && value.length > 0,
+	);
+	const trustedNode = assertTrustedToolPath(nodePath, {
+		workspaceRoots,
+		temporaryRoots,
+		label: "Node executable",
+	});
+	const toolchain = {
+		node: {
+			command: trustedNode,
+			argsPrefix: [],
+			path: trustedNode,
+			sha256: sha256File(trustedNode),
+			version: process.version,
+		},
+	};
+	for (const name of ["npm", "pnpm", "npx"]) {
+		const invocation = resolvePackageManagerCommand(name, {
+			env: baseEnv,
+			platform,
+			executableResolver,
+		});
+		const entryPath = packageManagerEntryPath(invocation, trustedNode, {
+			workspaceRoots,
+			temporaryRoots,
+			label: `${name} executable`,
+		});
+		toolchain[name] = {
+			command: trustedNode,
+			argsPrefix: [entryPath],
+			path: entryPath,
+			sha256: sha256File(entryPath),
+			version: readTrustedToolVersion(trustedNode, entryPath, baseEnv),
+		};
+	}
+	return toolchain;
+}
+
 function isNodeModulesBinDirectory(directory) {
 	const resolvedDirectory = path.resolve(directory);
 	return (
@@ -514,22 +660,44 @@ function isNodeModulesBinDirectory(directory) {
 	);
 }
 
-export function controlledNpxEnvironment({ emptyBinDir, baseEnv = process.env }) {
+function canonicalRuntimePathComponent(entry) {
+	const lexical = path.resolve(entry);
+	const stat = lstatOrNull(lexical);
+	if (!stat?.isDirectory() || stat.isSymbolicLink()) return null;
+	return fs.realpathSync(lexical);
+}
+
+export function controlledNpxEnvironment({
+	emptyBinDir,
+	baseEnv = process.env,
+	workspaceRoots = [REPOSITORY_ROOT],
+}) {
 	const npxPath = resolveExecutable("npx", baseEnv.PATH);
-	const npxDirectory = path.dirname(npxPath);
-	if (isNodeModulesBinDirectory(npxDirectory)) {
+	const realNpxPath = fs.realpathSync(npxPath);
+	const npxDirectory = canonicalRuntimePathComponent(path.dirname(npxPath));
+	const realNpxDirectory = path.dirname(realNpxPath);
+	if (
+		!npxDirectory ||
+		isNodeModulesBinDirectory(path.dirname(npxPath)) ||
+		isNodeModulesBinDirectory(realNpxDirectory)
+	) {
 		throw new Error("controlled npx must not inherit an npx executable from node_modules/.bin");
 	}
+	const realWorkspaceRoots = workspaceRoots.map((root) => fs.realpathSync(root));
+	const isWorkspaceNodeBin = (directory) =>
+		isNodeModulesBinDirectory(directory) && realWorkspaceRoots.some((root) => pathIsWithin(directory, root));
 	// npx needs the ordinary host command search path to start its package bin
 	// through sh on POSIX. Keep that runtime path, but remove every inherited
 	// project node_modules/.bin entry so a source checkout cannot satisfy the
 	// installed-product command by PATH fallback.
-	const inheritedRuntimePaths = baseEnv.PATH.split(path.delimiter).filter(
-		(entry) => entry.length > 0 && !isNodeModulesBinDirectory(entry),
-	);
-	const pathEntries = [emptyBinDir, npxDirectory, ...inheritedRuntimePaths].map((entry) =>
-		path.resolve(entry),
-	);
+	const inheritedRuntimePaths = baseEnv.PATH.split(path.delimiter)
+		.filter((entry) => entry.length > 0)
+		.map(canonicalRuntimePathComponent)
+		.filter(Boolean)
+		.filter((directory) => !isNodeModulesBinDirectory(directory) && !isWorkspaceNodeBin(directory));
+	const canonicalEmptyBinDir = canonicalRuntimePathComponent(emptyBinDir);
+	if (!canonicalEmptyBinDir) throw new Error("controlled npx empty bin must be a real directory");
+	const pathEntries = [canonicalEmptyBinDir, npxDirectory, ...inheritedRuntimePaths];
 	return { ...baseEnv, PATH: [...new Set(pathEntries)].join(path.delimiter) };
 }
 

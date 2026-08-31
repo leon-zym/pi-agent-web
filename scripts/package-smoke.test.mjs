@@ -14,6 +14,7 @@ import {
 	inspectPackageTarballs,
 	PACKAGE_NAMES,
 	resolvePackageManagerCommand,
+	resolveTrustedPackageManagerToolchain,
 	terminateOwnedProcessTree,
 } from "./lib/package-smoke.mjs";
 
@@ -378,21 +379,55 @@ test("keeps system command paths while excluding inherited node_modules bins for
 	const npxDir = path.join(root, "npm-runtime");
 	const shellDir = path.join(root, "shell-runtime");
 	const inheritedBin = path.join(root, "source", "node_modules", ".bin");
+	const inheritedBinAlias = path.join(root, "source-bin-alias");
 	const emptyBinDir = path.join(root, "empty-bin");
 	fs.mkdirSync(npxDir, { recursive: true });
 	fs.mkdirSync(shellDir, { recursive: true });
 	fs.mkdirSync(inheritedBin, { recursive: true });
+	fs.symlinkSync(inheritedBin, inheritedBinAlias);
 	fs.mkdirSync(emptyBinDir, { recursive: true });
 	const npxPath = path.join(npxDir, "npx");
 	fs.writeFileSync(npxPath, "#!/bin/sh\n");
 	fs.chmodSync(npxPath, 0o755);
 	const environment = controlledNpxEnvironment({
 		emptyBinDir,
-		baseEnv: { PATH: [inheritedBin, npxDir, shellDir].join(path.delimiter) },
+		baseEnv: { PATH: [inheritedBinAlias, inheritedBin, npxDir, shellDir].join(path.delimiter) },
 	});
 	const pathEntries = environment.PATH.split(path.delimiter).map((entry) => path.resolve(entry));
-	assert.ok(pathEntries.includes(path.resolve(emptyBinDir)));
-	assert.ok(pathEntries.includes(path.resolve(npxDir)));
-	assert.ok(pathEntries.includes(path.resolve(shellDir)));
-	assert.ok(!pathEntries.includes(path.resolve(inheritedBin)));
+	assert.ok(pathEntries.includes(fs.realpathSync(emptyBinDir)));
+	assert.ok(pathEntries.includes(fs.realpathSync(npxDir)));
+	assert.ok(pathEntries.includes(fs.realpathSync(shellDir)));
+	assert.ok(!pathEntries.includes(fs.realpathSync(inheritedBin)));
+	assert.ok(!pathEntries.includes(fs.realpathSync(inheritedBinAlias)));
+});
+
+test("rejects PATH-first fake package managers and workspace symlink aliases", () => {
+	const root = tempRoot();
+	const fakeBin = path.join(root, "fake-bin");
+	fs.mkdirSync(fakeBin);
+	const fakePnpm = path.join(fakeBin, "pnpm");
+	fs.writeFileSync(fakePnpm, "#!/bin/sh\necho fake\n");
+	fs.chmodSync(fakePnpm, 0o755);
+	assert.throws(
+		() =>
+			resolveTrustedPackageManagerToolchain({
+				baseEnv: { PATH: [fakeBin, process.env.PATH].filter(Boolean).join(path.delimiter) },
+				repositoryRoot: process.cwd(),
+			}),
+		/untrusted workspace or temporary path/,
+	);
+
+	const workspace = path.join(root, "workspace");
+	const workspaceBin = path.join(workspace, "node_modules", ".bin");
+	fs.mkdirSync(workspaceBin, { recursive: true });
+	fs.symlinkSync(process.execPath, path.join(workspaceBin, "pnpm"));
+	assert.throws(
+		() =>
+			resolveTrustedPackageManagerToolchain({
+				baseEnv: { PATH: [workspaceBin, process.env.PATH].filter(Boolean).join(path.delimiter) },
+				repositoryRoot: workspace,
+				workspaceRoots: [workspace],
+			}),
+		/untrusted workspace or temporary path/,
+	);
 });

@@ -8,11 +8,13 @@ import { test } from "node:test";
 import { gunzipSync, gzipSync } from "node:zlib";
 import {
 	assertCommittedBundleOutput,
+	assertSafeProjectNpmrc,
 	createBundleRootManifest,
 	createDeterministicTarGz,
 	createImmutableSourceSnapshot,
 	createReleaseBundle,
 	createSanitizedNpmEnvironment,
+	hydrateProvisionalBundleLockfile,
 	inspectDeterministicTarGz,
 	prepareOutputDirectory,
 	publishBundleOutputs,
@@ -110,23 +112,36 @@ function npmConfig(root, environment, key) {
 	return result.stdout.trim();
 }
 
+const VALID_SHA512_SRI = `sha512-${Buffer.alloc(64, 7).toString("base64")}`;
+
 function bundledLockfile(rootManifest, externalResolved = "https://registry.npmjs.org/ws/-/ws-8.18.3.tgz") {
 	const packages = {
 		"": {
 			name: rootManifest.name,
 			version: rootManifest.version,
+			engines: rootManifest.engines,
 			dependencies: rootManifest.dependencies,
 		},
 		"node_modules/ws": {
 			version: "8.18.3",
-			integrity: "sha512-fixture",
+			integrity: VALID_SHA512_SRI,
 			resolved: externalResolved,
 		},
 	};
 	for (const [packageName, resolved] of Object.entries(rootManifest.dependencies)) {
-		packages[`node_modules/${packageName}`] = { version: rootManifest.version, resolved };
+		packages[`node_modules/${packageName}`] = {
+			version: rootManifest.version,
+			integrity: VALID_SHA512_SRI,
+			resolved,
+		};
 	}
-	return { lockfileVersion: 3, packages };
+	return {
+		name: rootManifest.name,
+		version: rootManifest.version,
+		lockfileVersion: 3,
+		requires: true,
+		packages,
+	};
 }
 
 test("builds a byte-stable, canonical bundle archive", () => {
@@ -441,7 +456,7 @@ test("maps every internal package edge to a bundle-local tgz and rejects version
 	assert.throws(() => validateBundledPackageGraph(unbundled, "0.1.0"), /unbundled internal package/);
 });
 
-test("validates bundle lockfiles against exact local packages and the canonical public registry", () => {
+test("validates only a complete v3 frozen graph with exact local edges and public SRI sources", () => {
 	const rootManifest = createBundleRootManifest(packageSet(), "0.1.0");
 	assert.doesNotThrow(() => validateBundleLockfile(bundledLockfile(rootManifest), rootManifest));
 
@@ -464,21 +479,45 @@ test("validates bundle lockfiles against exact local packages and the canonical 
 	delete missingResolution.packages["node_modules/ws"].resolved;
 	assert.throws(() => validateBundleLockfile(missingResolution, rootManifest), /missing a resolution/);
 
-	// npm lockfile v3 can omit integrity for a nested entry that is resolved
-	// from a bundled dependency. The exact public tarball URL remains present,
-	// so absence is not an ambiguous source.
-	const resolvedWithoutIntegrity = bundledLockfile(rootManifest);
-	delete resolvedWithoutIntegrity.packages["node_modules/ws"];
-	resolvedWithoutIntegrity.packages[
+	const missingIntegrity = bundledLockfile(rootManifest);
+	delete missingIntegrity.packages["node_modules/ws"].integrity;
+	assert.throws(() => validateBundleLockfile(missingIntegrity, rootManifest), /integrity/);
+	const malformedIntegrity = bundledLockfile(rootManifest);
+	malformedIntegrity.packages["node_modules/ws"].integrity = "sha512-fixture";
+	assert.throws(() => validateBundleLockfile(malformedIntegrity, rootManifest), /integrity/);
+
+	const nestedExternal = bundledLockfile(rootManifest);
+	delete nestedExternal.packages["node_modules/ws"];
+	nestedExternal.packages[
 		"node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-agent-core"
 	] = {
 		version: "0.84.2",
+		integrity: VALID_SHA512_SRI,
 		resolved: "https://registry.npmjs.org/@earendil-works/pi-agent-core/-/pi-agent-core-0.84.2.tgz",
 	};
-	assert.doesNotThrow(() => validateBundleLockfile(resolvedWithoutIntegrity, rootManifest));
-	const malformedIntegrity = bundledLockfile(rootManifest);
-	malformedIntegrity.packages["node_modules/ws"].integrity = "";
-	assert.throws(() => validateBundleLockfile(malformedIntegrity, rootManifest), /invalid integrity/);
+	assert.doesNotThrow(() => validateBundleLockfile(nestedExternal, rootManifest));
+
+	const hybrid = bundledLockfile(rootManifest);
+	hybrid.dependencies = { ws: { version: "8.18.3" } };
+	assert.throws(() => validateBundleLockfile(hybrid, rootManifest), /v3|legacy|top-level/);
+	const legacy = bundledLockfile(rootManifest);
+	legacy.lockfileVersion = 2;
+	assert.throws(() => validateBundleLockfile(legacy, rootManifest), /v3|legacy|top-level/);
+	const credentialUrl = bundledLockfile(rootManifest);
+	credentialUrl.packages["node_modules/ws"].resolved = "https://token@registry.npmjs.org/ws/-/ws-8.18.3.tgz";
+	assert.throws(() => validateBundleLockfile(credentialUrl, rootManifest), /canonical public registry/);
+	const internalAlias = bundledLockfile(rootManifest);
+	internalAlias.packages["node_modules/ws"].dependencies = {
+		"pi-web-alias": "npm:@pi-agent-web/cli@0.1.0",
+	};
+	assert.throws(() => validateBundleLockfile(internalAlias, rootManifest), /alias|internal/);
+	const nestedLegitimateExternal = bundledLockfile(rootManifest);
+	nestedLegitimateExternal.packages["node_modules/@pi-agent-web/cli/node_modules/ws"] = {
+		version: "8.18.3",
+		integrity: VALID_SHA512_SRI,
+		resolved: "https://registry.npmjs.org/ws/-/ws-8.18.3.tgz",
+	};
+	assert.doesNotThrow(() => validateBundleLockfile(nestedLegitimateExternal, rootManifest));
 
 	const wrongInternalTarball = bundledLockfile(rootManifest);
 	wrongInternalTarball.packages["node_modules/@pi-agent-web/cli"].resolved = "file:packages/other.tgz";
@@ -491,8 +530,18 @@ test("rebinds only local tarball integrities in a frozen dependency lock", (t) =
 	const packages = packageSetWithTarballs(root);
 	const rootManifest = createBundleRootManifest(packages, "0.1.0");
 	const frozen = bundledLockfile(rootManifest);
+	frozen.packages["node_modules/@pi-agent-web/cli/node_modules/ws"] = {
+		version: "8.18.3",
+		integrity: VALID_SHA512_SRI,
+		resolved: "https://registry.npmjs.org/ws/-/ws-8.18.3.tgz",
+	};
 	const rebound = rebindFrozenBundleLockfile(frozen, rootManifest, packages);
 	assert.deepEqual(rebound.packages["node_modules/ws"], frozen.packages["node_modules/ws"]);
+	assert.deepEqual(
+		rebound.packages["node_modules/@pi-agent-web/cli/node_modules/ws"],
+		frozen.packages["node_modules/@pi-agent-web/cli/node_modules/ws"],
+	);
+	assert.equal(rebound.requires, frozen.requires);
 	for (const packageName of Object.keys(rootManifest.dependencies)) {
 		assert.match(rebound.packages[`node_modules/${packageName}`].integrity, /^sha512-/);
 		assert.equal(
@@ -500,6 +549,33 @@ test("rebinds only local tarball integrities in a frozen dependency lock", (t) =
 			rootManifest.dependencies[packageName],
 		);
 	}
+});
+
+test("hydrates only missing canonical external SRI fields in a provisional graph", () => {
+	const rootManifest = createBundleRootManifest(packageSet(), "0.1.0");
+	const proposal = bundledLockfile(rootManifest);
+	delete proposal.packages["node_modules/ws"].integrity;
+	const requested = [];
+	const hydrated = hydrateProvisionalBundleLockfile(proposal, rootManifest, {
+		fetchTarball(resolved) {
+			requested.push(resolved);
+			return Buffer.from("fixture tarball bytes");
+		},
+	});
+	assert.deepEqual(requested, ["https://registry.npmjs.org/ws/-/ws-8.18.3.tgz"]);
+	assert.match(hydrated.packages["node_modules/ws"].integrity, /^sha512-[A-Za-z0-9+/]+={0,2}$/);
+	assert.equal(proposal.packages["node_modules/ws"].integrity, undefined);
+	assert.doesNotThrow(() => validateBundleLockfile(hydrated, rootManifest));
+
+	const privateProposal = bundledLockfile(rootManifest, "https://example.invalid/ws/-/ws-8.18.3.tgz");
+	delete privateProposal.packages["node_modules/ws"].integrity;
+	assert.throws(
+		() =>
+			hydrateProvisionalBundleLockfile(privateProposal, rootManifest, {
+				fetchTarball: () => Buffer.alloc(1),
+			}),
+		/canonical public registry/,
+	);
 });
 
 test("fails release mode before any source build when no reviewed frozen lock is supplied", () => {
@@ -533,6 +609,7 @@ test("isolates npm config precedence from hostile scoped registries without netw
 	const hostileGlobalConfig = path.join(root, "hostile-global.npmrc");
 	fs.writeFileSync(hostileUserConfig, "@earendil-works:registry=https://example.invalid/\n");
 	fs.writeFileSync(hostileGlobalConfig, "registry=https://example.invalid/\n");
+	fs.writeFileSync(path.join(root, ".npmrc"), "@earendil-works:registry=https://example.invalid/\n");
 	const inheritedEnvironment = {
 		PATH: process.env.PATH ?? "",
 		...(process.platform === "win32" && process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
@@ -540,19 +617,35 @@ test("isolates npm config precedence from hostile scoped registries without netw
 		NPM_CONFIG_GLOBALCONFIG: hostileGlobalConfig,
 		Npm_Config_Registry: "https://registry.example.invalid/",
 		npm_config_userconfig: hostileUserConfig,
+		PNPM_CONFIG_REGISTRY: "https://registry.example.invalid/",
+		NPM_TOKEN: "must-not-forward",
+		NODE_AUTH_TOKEN: "must-not-forward",
+		HTTPS_PROXY: "https://proxy.example.invalid/",
+		HOME: path.join(root, "hostile-home"),
 		UNRELATED_TEST_VALUE: "preserved",
 	};
 	assert.equal(npmConfig(root, inheritedEnvironment, "@earendil-works:registry"), "https://example.invalid/");
 
 	const environment = createSanitizedNpmEnvironment({ tempRoot: root, baseEnv: inheritedEnvironment });
-	assert.equal(npmConfig(root, environment, "@earendil-works:registry"), "undefined");
-	assert.equal(npmConfig(root, environment, "registry"), "https://registry.npmjs.org/");
-	assert.equal(environment.UNRELATED_TEST_VALUE, "preserved");
+	assert.throws(() => assertSafeProjectNpmrc(root), /project \.npmrc/);
+	assert.equal(environment.UNRELATED_TEST_VALUE, undefined);
+	assert.equal(environment.NPM_TOKEN, undefined);
+	assert.equal(environment.NODE_AUTH_TOKEN, undefined);
+	assert.equal(environment.HTTPS_PROXY, undefined);
+	assert.equal(environment.PNPM_CONFIG_REGISTRY, undefined);
+	assert.notEqual(environment.HOME, inheritedEnvironment.HOME);
 	assert.deepEqual(
 		Object.keys(environment)
-			.filter((key) => key.toLowerCase().startsWith("npm_config_"))
+			.filter((key) => /^(?:npm|pnpm)_config_/i.test(key))
 			.sort(),
-		["npm_config_cache", "npm_config_globalconfig", "npm_config_registry", "npm_config_userconfig"],
+		[
+			"npm_config_cache",
+			"npm_config_globalconfig",
+			"npm_config_prefix",
+			"npm_config_registry",
+			"npm_config_userconfig",
+			"pnpm_config_store_dir",
+		],
 	);
 	assert.match(
 		fs.readFileSync(environment.npm_config_userconfig, "utf8"),
