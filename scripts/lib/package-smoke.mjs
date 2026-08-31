@@ -38,8 +38,14 @@ export function listTarballEntries(tarball, options = {}) {
 	return run("tar", ["-tzf", tarball], options).split("\n").filter(Boolean);
 }
 
-function hasPackageDirectory(entries, directory) {
-	return entries.includes(`package/${directory}/`);
+function hasPackageFile(entries, directory) {
+	const prefix = `package/${directory}/`;
+	return entries.some((entry) => entry.startsWith(prefix) && !entry.endsWith("/"));
+}
+
+function hasPackagePath(entries, directory) {
+	const prefix = `package/${directory}/`;
+	return entries.some((entry) => entry === prefix || entry.startsWith(prefix));
 }
 
 export function inspectPackageTarballs(tarballs, options = {}) {
@@ -51,13 +57,13 @@ export function inspectPackageTarballs(tarballs, options = {}) {
 	const inspected = tarballs
 		.map((tarball) => {
 			const entries = listTarballEntries(tarball);
-			if (!hasPackageDirectory(entries, "dist")) {
+			if (!hasPackageFile(entries, "dist")) {
 				throw new Error(`Missing dist directory in ${path.basename(tarball)}`);
 			}
 			if (!entries.includes("package/LICENSE")) {
 				throw new Error(`Missing LICENSE in ${path.basename(tarball)}`);
 			}
-			if (hasPackageDirectory(entries, "src")) {
+			if (hasPackagePath(entries, "src")) {
 				throw new Error(`Source directory leaked into ${path.basename(tarball)}`);
 			}
 			const manifest = packageManifest(tarball);
