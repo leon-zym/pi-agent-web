@@ -357,14 +357,7 @@ function countsFor(expected, field) {
 }
 
 function capabilitiesFor(expected, artifacts) {
-	const required = [
-		...new Set([
-			...expected.flatMap((entry) => entry.requiredCapabilities),
-			"browser-memory-sampler",
-			"gateway-trial-telemetry",
-			"react-profiler",
-		]),
-	].sort();
+	const required = [...new Set(expected.flatMap((entry) => entry.requiredCapabilities))].sort();
 	const values = Object.fromEntries(required.map((capability) => [capability, true]));
 	for (const artifact of artifacts) {
 		if (artifact?.value?.capabilities === undefined) continue;

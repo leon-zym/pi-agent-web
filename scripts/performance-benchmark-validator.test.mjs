@@ -42,25 +42,9 @@ function variantOrder(seed = "fixture-seed") {
 	});
 }
 
-function telemetryMetrics(latencyMs) {
+function trialMetrics(latencyMs) {
 	return {
 		latencyMs,
-		browserHeapPeakBytes: 1_024,
-		browserHeapSampleCount: 2,
-		browserHeapSampleIntervalMs: 50,
-		browserHeapSamplerOverheadMs: 1,
-		gatewayHeapPeakBytes: 2_048,
-		gatewayMemorySampleCount: 2,
-		gatewayMemorySampleIntervalMs: 50,
-		gatewayMemorySamplerOverheadMs: 1,
-		gatewayPublicationCount: 0,
-		gatewayRssPeakBytes: 4_096,
-		gatewaySnapshotBuildCount: 0,
-		gatewayTrialEpoch: 1,
-		reactActualDurationMs: 1,
-		reactBaseDurationMs: 1,
-		reactCommitCount: 1,
-		reactCommitMaxDurationMs: 1,
 	};
 }
 
@@ -83,27 +67,24 @@ function validResult(variant, baseLatency = variant === "coalesced" ? 10 : 11) {
 		capabilities: {
 			browser: true,
 			websocket: true,
-			"browser-memory-sampler": true,
-			"gateway-trial-telemetry": true,
-			"react-profiler": true,
 		},
 		trials: [
-			{ index: 0, warmup: true, metrics: telemetryMetrics(5), correctness: { complete: true } },
+			{ index: 0, warmup: true, metrics: trialMetrics(5), correctness: { complete: true } },
 			{
 				index: 1,
 				warmup: false,
-				metrics: telemetryMetrics(measured[0]),
+				metrics: trialMetrics(measured[0]),
 				correctness: { complete: true },
 			},
 			{
 				index: 2,
 				warmup: false,
-				metrics: telemetryMetrics(measured[1]),
+				metrics: trialMetrics(measured[1]),
 				correctness: { complete: true },
 			},
 		],
 		summaries: Object.fromEntries(
-			Object.entries(telemetryMetrics(measured[0])).map(([metric, value]) => [
+			Object.entries(trialMetrics(measured[0])).map(([metric, value]) => [
 				metric,
 				metric === "latencyMs"
 					? { count: 2, min: measured[0], median: baseLatency + 5, p95: measured[1], max: measured[1] }
@@ -189,9 +170,6 @@ function validManifest() {
 		capabilities: {
 			browser: true,
 			websocket: true,
-			"browser-memory-sampler": true,
-			"gateway-trial-telemetry": true,
-			"react-profiler": true,
 		},
 		expectedScenarioSet: expected,
 	};
@@ -309,7 +287,7 @@ test("rejects missing, duplicate, and partial raw trial evidence", () => {
 	assert.match(errorText(validate({ results, rawArtifacts: duplicate })), /duplicate raw trial/);
 });
 
-test("fails closed on malformed telemetry and missing required capabilities", () => {
+test("fails closed on malformed evidence and missing required capabilities", () => {
 	const nonfinite = validResults();
 	nonfinite[0].trials[1].metrics.latencyMs = Number.NaN;
 	nonfinite[0].summaries.latencyMs = {
@@ -324,10 +302,10 @@ test("fails closed on malformed telemetry and missing required capabilities", ()
 		/metrics\.latencyMs must be finite/,
 	);
 	const missing = validResults();
-	delete missing[0].trials[1].metrics.gatewayMemorySampleCount;
+	missing[0].trials[1].metrics = {};
 	assert.match(
 		errorText(validate({ results: missing, rawArtifacts: missing.flatMap(rawFor) })),
-		/missing required telemetry metric: gatewayMemorySampleCount/,
+		/metrics must be a non-empty record/,
 	);
 	const unavailable = validResults();
 	unavailable[0].capabilities.websocket = false;

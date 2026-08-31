@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Page, TestInfo } from "@playwright/test";
-import type { BenchmarkGatewaySnapshot, ProductionHarness } from "../fixtures/production-harness";
+import type { ProductionHarness } from "../fixtures/production-harness";
 
 export type BenchmarkTier = "representative" | "stress";
 export type BenchmarkVariant = "coalesced" | "sequential";
@@ -68,15 +68,8 @@ export interface BenchmarkTrialExecution {
 	metrics: Record<string, number | null>;
 }
 
-export interface BenchmarkTrialContext {
-	finishBrowserMeasurement: () => Promise<BrowserBenchmarkMeasurement>;
-}
-
 export interface BenchmarkTrialLifecycle {
-	run: (
-		index: number,
-		execute: (context: BenchmarkTrialContext) => Promise<BenchmarkTrialExecution>,
-	) => Promise<void>;
+	run: (index: number, execute: () => Promise<BenchmarkTrialExecution>) => Promise<void>;
 }
 
 export interface BenchmarkScenarioResult {
@@ -109,26 +102,8 @@ export interface BrowserBenchmarkSnapshot {
 	totalCompletionMs: number | null;
 	liveLongTaskMaxMs: number;
 	liveLongTasksOver50Ms: number;
-	heapDeltaBytes: number | null;
-	heapPeakBytes: number | null;
-	heapSampleCount: number;
-	heapSampleIntervalMs: number;
-	heapSamplerOverheadMs: number;
 	publicationBatches: number;
 	turnNodes: number;
-}
-
-export interface BrowserReactTrialSnapshot {
-	actualDurationMs: number;
-	baseDurationMs: number;
-	commitCount: number;
-	epoch: number;
-	maxCommitDurationMs: number;
-}
-
-export interface BrowserBenchmarkMeasurement {
-	browser: BrowserBenchmarkSnapshot;
-	react: BrowserReactTrialSnapshot;
 }
 
 export interface BrowserSessionFrameSnapshot {
@@ -336,15 +311,10 @@ async function browserCapabilities(page: Page): Promise<Record<string, boolean>>
 	const browser = page.context().browser();
 	const observed = await page.evaluate(() => {
 		const performanceWithMemory = performance as Performance & { memory?: { usedJSHeapSize?: unknown } };
-		const benchmarkWindow = window as typeof window & {
-			__piwebBenchmarkRuntime?: { trialSnapshot: () => unknown };
-		};
 		return {
 			browser: true,
-			"browser-memory-sampler": typeof performanceWithMemory.memory?.usedJSHeapSize === "number",
 			longtask: PerformanceObserver.supportedEntryTypes?.includes("longtask") === true,
 			"precise-memory": typeof performanceWithMemory.memory?.usedJSHeapSize === "number",
-			"react-profiler": typeof benchmarkWindow.__piwebBenchmarkRuntime?.trialSnapshot === "function",
 			websocket: typeof WebSocket === "function",
 		};
 	});
@@ -358,86 +328,10 @@ function scenarioDirectory(scenario: BenchmarkScenario): string {
 	return path.join(rawDirectory(), scenario.id);
 }
 
-function isFiniteMetric(value: unknown): value is number {
-	return typeof value === "number" && Number.isFinite(value);
-}
-
-function trialTelemetry(
-	measurement: BrowserBenchmarkMeasurement,
-	gateway: Readonly<BenchmarkGatewaySnapshot>,
-): Record<string, number> {
-	const browser = measurement.browser;
-	const react = measurement.react;
-	const counters = gateway.counters;
-	if (
-		browser.heapPeakBytes === null ||
-		browser.heapSampleCount < 1 ||
-		browser.heapSampleIntervalMs <= 0 ||
-		gateway.trial.state !== "ended" ||
-		counters.memorySampleCount < 1 ||
-		counters.memorySampleIntervalMs <= 0 ||
-		react.commitCount < 1
-	) {
-		throw new Error("benchmark trial telemetry is incomplete");
-	}
-	const telemetry = {
-		browserHeapPeakBytes: browser.heapPeakBytes,
-		browserHeapSampleCount: browser.heapSampleCount,
-		browserHeapSampleIntervalMs: browser.heapSampleIntervalMs,
-		browserHeapSamplerOverheadMs: browser.heapSamplerOverheadMs,
-		gatewayHeapPeakBytes: counters.maxHeapUsedBytes,
-		gatewayMemorySampleCount: counters.memorySampleCount,
-		gatewayMemorySampleIntervalMs: counters.memorySampleIntervalMs,
-		gatewayMemorySamplerOverheadMs: counters.memorySamplerOverheadMs,
-		gatewayPublicationCount: counters.publicationCount,
-		gatewayRssPeakBytes: counters.maxRssBytes,
-		gatewaySnapshotBuildCount: counters.snapshotBuildCount,
-		gatewayTrialEpoch: counters.trialEpoch,
-		reactActualDurationMs: react.actualDurationMs,
-		reactBaseDurationMs: react.baseDurationMs,
-		reactCommitCount: react.commitCount,
-		reactCommitMaxDurationMs: react.maxCommitDurationMs,
-	};
-	if (!Object.values(telemetry).every(isFiniteMetric)) {
-		throw new Error("benchmark trial telemetry contains a non-finite value");
-	}
-	return telemetry;
-}
-
-function trialTelemetryCapabilities(trials: BenchmarkTrial[]): Record<string, boolean> {
-	const keys = [
-		"browserHeapPeakBytes",
-		"browserHeapSampleCount",
-		"browserHeapSampleIntervalMs",
-		"browserHeapSamplerOverheadMs",
-		"gatewayHeapPeakBytes",
-		"gatewayMemorySampleCount",
-		"gatewayMemorySampleIntervalMs",
-		"gatewayMemorySamplerOverheadMs",
-		"gatewayPublicationCount",
-		"gatewayRssPeakBytes",
-		"gatewaySnapshotBuildCount",
-		"gatewayTrialEpoch",
-		"reactActualDurationMs",
-		"reactBaseDurationMs",
-		"reactCommitCount",
-		"reactCommitMaxDurationMs",
-	];
-	const complete =
-		trials.length > 0 && trials.every((trial) => keys.every((key) => isFiniteMetric(trial.metrics[key])));
-	return {
-		"browser-memory-sampler":
-			complete && trials.every((trial) => (trial.metrics.browserHeapSampleCount ?? 0) > 0),
-		"gateway-trial-telemetry":
-			complete && trials.every((trial) => (trial.metrics.gatewayMemorySampleCount ?? 0) > 0),
-		"react-profiler": complete && trials.every((trial) => (trial.metrics.reactCommitCount ?? 0) > 0),
-	};
-}
-
 export async function runBenchmarkScenario(
 	page: Page,
 	testInfo: TestInfo,
-	harness: ProductionHarness,
+	_harness: ProductionHarness,
 	scenario: BenchmarkScenario,
 	execute: (outcome: BenchmarkOutcome, trials: BenchmarkTrialLifecycle) => Promise<void>,
 ): Promise<void> {
@@ -452,42 +346,16 @@ export async function runBenchmarkScenario(
 			if (index !== outcome.trials.length) {
 				throw new Error(`benchmark trial index ${String(index)} is not the next canonical trial`);
 			}
-			const trialId = `${scenario.id}-${String(index)}`;
-			let gatewayActive = false;
-			let browserFinished = false;
-			let measurement: BrowserBenchmarkMeasurement | undefined;
-			try {
-				await harness.beginBenchmarkTrial(trialId);
-				gatewayActive = true;
-				await startBrowserMeasurement(page);
-				const finish = async () => {
-					if (!measurement) measurement = await finishBrowserMeasurement(page);
-					browserFinished = true;
-					return measurement;
-				};
-				const execution = await executeTrial({ finishBrowserMeasurement: finish });
-				const completedMeasurement = await finish();
-				const gateway = await harness.endBenchmarkTrial(trialId);
-				gatewayActive = false;
-				outcome.trials.push({
-					index,
-					warmup: index < scenario.warmups,
-					metrics: { ...execution.metrics, ...trialTelemetry(completedMeasurement, gateway) },
-					correctness: {
-						...execution.correctness,
-						complete: Object.values(execution.correctness).every((value) => value === true),
-					},
-				});
-			} catch (error) {
-				try {
-					if (gatewayActive) await harness.abortBenchmarkTrial(trialId);
-				} catch (abortError) {
-					throw new Error(`${errorText(error)}\nbenchmark trial abort failed: ${errorText(abortError)}`);
-				} finally {
-					if (!browserFinished) await abortBrowserMeasurement(page);
-				}
-				throw error;
-			}
+			const execution = await executeTrial();
+			outcome.trials.push({
+				index,
+				warmup: index < scenario.warmups,
+				metrics: execution.metrics,
+				correctness: {
+					...execution.correctness,
+					complete: Object.values(execution.correctness).every((value) => value === true),
+				},
+			});
 		},
 	};
 	try {
@@ -515,7 +383,6 @@ export async function runBenchmarkScenario(
 	let capabilities: Record<string, boolean>;
 	try {
 		capabilities = await browserCapabilities(page);
-		Object.assign(capabilities, trialTelemetryCapabilities(outcome.trials));
 	} catch (error) {
 		errors.push(`benchmark capability observation failed: ${errorText(error)}`);
 		capabilities = Object.fromEntries(scenario.requiredCapabilities.map((capability) => [capability, false]));
@@ -574,11 +441,6 @@ export async function runBenchmarkScenario(
 
 export async function installBrowserBenchmarkObserver(page: Page): Promise<void> {
 	await page.addInitScript(() => {
-		const HEAP_SAMPLE_INTERVAL_MS = 50;
-		const getUsedHeap = () => {
-			const memory = (performance as Performance & { memory?: { usedJSHeapSize: number } }).memory;
-			return memory?.usedJSHeapSize ?? null;
-		};
 		const state = {
 			active: false,
 			startedAt: 0,
@@ -586,28 +448,8 @@ export async function installBrowserBenchmarkObserver(page: Page): Promise<void>
 			firstPaintAt: null as number | null,
 			streamEndedAt: null as number | null,
 			settledAt: null as number | null,
-			heapStartedAt: null as number | null,
-			heapPeakBytes: null as number | null,
-			heapSampleCount: 0,
-			heapSamplerOverheadMs: 0,
-			heapSampler: null as number | null,
 			publicationBatches: 0,
 			longTasks: [] as Array<{ startTime: number; duration: number }>,
-		};
-		const sampleHeap = () => {
-			if (!state.active) return;
-			const startedAt = performance.now();
-			const heap = getUsedHeap();
-			const elapsed = performance.now() - startedAt;
-			if (Number.isFinite(elapsed) && elapsed >= 0) state.heapSamplerOverheadMs += elapsed;
-			if (heap === null) return;
-			state.heapPeakBytes = Math.max(state.heapPeakBytes ?? 0, heap);
-			state.heapSampleCount += 1;
-		};
-		const stopHeapSampler = () => {
-			if (state.heapSampler === null) return;
-			window.clearInterval(state.heapSampler);
-			state.heapSampler = null;
 		};
 		type SessionFrameState = {
 			deltaFrames: number;
@@ -709,33 +551,23 @@ export async function installBrowserBenchmarkObserver(page: Page): Promise<void>
 				return observed ? { ...observed } : null;
 			},
 			start: () => {
-				stopHeapSampler();
 				state.active = true;
 				state.startedAt = performance.now();
 				state.firstPublicationAt = null;
 				state.firstPaintAt = null;
 				state.streamEndedAt = null;
 				state.settledAt = null;
-				state.heapStartedAt = getUsedHeap();
-				state.heapPeakBytes = null;
-				state.heapSampleCount = 0;
-				state.heapSamplerOverheadMs = 0;
 				state.publicationBatches = 0;
 				state.longTasks.length = 0;
-				sampleHeap();
-				state.heapSampler = window.setInterval(sampleHeap, HEAP_SAMPLE_INTERVAL_MS);
 			},
 			markStreamEnd: () => {
 				state.streamEndedAt = performance.now();
 			},
 			markSettled: () => {
-				sampleHeap();
-				stopHeapSampler();
 				state.settledAt = performance.now();
 				state.active = false;
 			},
 			snapshot: (): BrowserBenchmarkSnapshot => {
-				const heapNow = getUsedHeap();
 				const streamEnd = state.streamEndedAt ?? performance.now();
 				const liveLongTasks = state.longTasks.filter(
 					(entry) => entry.startTime >= state.startedAt && entry.startTime < streamEnd,
@@ -752,12 +584,6 @@ export async function installBrowserBenchmarkObserver(page: Page): Promise<void>
 					totalCompletionMs: state.settledAt === null ? null : state.settledAt - state.startedAt,
 					liveLongTaskMaxMs: Math.max(0, ...liveLongTasks.map((entry) => entry.duration)),
 					liveLongTasksOver50Ms: liveLongTasks.filter((entry) => entry.duration > 50).length,
-					heapDeltaBytes:
-						state.heapStartedAt === null || heapNow === null ? null : heapNow - state.heapStartedAt,
-					heapPeakBytes: state.heapPeakBytes,
-					heapSampleCount: state.heapSampleCount,
-					heapSampleIntervalMs: HEAP_SAMPLE_INTERVAL_MS,
-					heapSamplerOverheadMs: state.heapSamplerOverheadMs,
 					publicationBatches: state.publicationBatches,
 					turnNodes: document.querySelectorAll("[data-turn-id]").length,
 				};
@@ -768,12 +594,6 @@ export async function installBrowserBenchmarkObserver(page: Page): Promise<void>
 }
 
 type BenchmarkWindow = typeof window & {
-	__piwebBenchmarkRuntime: {
-		abortTrial: () => BrowserReactTrialSnapshot;
-		beginTrial: () => number;
-		endTrial: () => BrowserReactTrialSnapshot;
-		trialSnapshot: () => BrowserReactTrialSnapshot;
-	};
 	__piwebBenchmark: {
 		resetSessionFrames: (sessionHandles: string[]) => void;
 		sessionFrameSnapshot: (sessionHandle: string) => BrowserSessionFrameSnapshot | null;
@@ -804,39 +624,21 @@ export async function browserSessionFrameSnapshot(
 }
 
 export async function startBrowserMeasurement(page: Page): Promise<void> {
-	await page.evaluate(() => {
-		const benchmarkWindow = window as BenchmarkWindow;
-		if (!benchmarkWindow.__piwebBenchmarkRuntime) {
-			throw new Error("benchmark React profiling runtime is unavailable");
-		}
-		benchmarkWindow.__piwebBenchmarkRuntime.beginTrial();
-		benchmarkWindow.__piwebBenchmark.start();
-	});
+	await page.evaluate(() => (window as BenchmarkWindow).__piwebBenchmark.start());
 }
 
 export async function markBrowserStreamEnd(page: Page): Promise<void> {
 	await page.evaluate(() => (window as BenchmarkWindow).__piwebBenchmark.markStreamEnd());
 }
 
-export async function finishBrowserMeasurement(page: Page): Promise<BrowserBenchmarkMeasurement> {
+export async function finishBrowserMeasurement(page: Page): Promise<BrowserBenchmarkSnapshot> {
 	await page.evaluate(
 		() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))),
 	);
 	return page.evaluate(() => {
 		const benchmarkWindow = window as BenchmarkWindow;
 		benchmarkWindow.__piwebBenchmark.markSettled();
-		return {
-			browser: benchmarkWindow.__piwebBenchmark.snapshot(),
-			react: benchmarkWindow.__piwebBenchmarkRuntime.endTrial(),
-		};
-	});
-}
-
-export async function abortBrowserMeasurement(page: Page): Promise<void> {
-	await page.evaluate(() => {
-		const benchmarkWindow = window as BenchmarkWindow;
-		benchmarkWindow.__piwebBenchmark.markSettled();
-		benchmarkWindow.__piwebBenchmarkRuntime.abortTrial();
+		return benchmarkWindow.__piwebBenchmark.snapshot();
 	});
 }
 

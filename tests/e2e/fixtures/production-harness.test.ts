@@ -1,57 +1,77 @@
 import assert from "node:assert/strict";
-import { createBenchmarkGatewayIpcFence } from "./production-harness";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { test } from "node:test";
+import { benchmarkBuildPathsFromEnvironment } from "./production-harness";
 
-declare const describe: typeof import("node:test").describe;
-declare const it: typeof import("node:test").it;
+const buildEnvironmentKeys = [
+	"PI_WEB_BENCHMARK_VARIANT_BUILD_DIR",
+	"PI_WEB_BENCHMARK_SERVER_ENTRY",
+	"PI_WEB_BENCHMARK_STATIC_DIR",
+	"PI_WEB_BENCHMARK_SERVER_ENTRY_HASH",
+	"PI_WEB_BENCHMARK_SERVER_TREE_HASH",
+	"PI_WEB_BENCHMARK_UI_TREE_HASH",
+] as const;
 
-const idleSnapshot = {
-	type: "piweb-benchmark-gateway-counters",
-	generation: "gateway-test",
-	trial: { epoch: 0, id: null, state: "idle" },
-	counters: {
-		maxHeapUsedBytes: 0,
-		maxRssBytes: 0,
-		memorySampleCount: 0,
-		memorySampleIntervalMs: 50,
-		memorySamplerOverheadMs: 0,
-		publicationCount: 0,
-		snapshotBuildCount: 0,
-		trialEpoch: 0,
-	},
-} as const;
+function sha256(value: Buffer | string): string {
+	return createHash("sha256").update(value).digest("hex");
+}
 
-describe("benchmark Gateway IPC fence", () => {
-	it("accepts the exact requested begin transition before clearing its expectation", () => {
-		const fence = createBenchmarkGatewayIpcFence();
-		fence.receive(idleSnapshot);
-		fence.expect({
-			type: "piweb-benchmark-gateway-trial",
-			action: "begin",
-			trialId: "trial-1",
+function hashTree(directory: string): string {
+	const files: string[] = [];
+	const visit = (current: string) => {
+		for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+			const entryPath = path.join(current, entry.name);
+			if (entry.isDirectory()) visit(entryPath);
+			else if (entry.isFile()) files.push(entryPath);
+		}
+	};
+	visit(directory);
+	const hash = createHash("sha256");
+	for (const filePath of files.sort((left, right) => left.localeCompare(right))) {
+		hash.update(path.relative(directory, filePath).replaceAll(path.sep, "/"));
+		hash.update("\0");
+		hash.update(sha256(fs.readFileSync(filePath)));
+		hash.update("\n");
+	}
+	return hash.digest("hex");
+}
+
+test("accepts only exact run-owned benchmark executables", () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-benchmark-build-"));
+	const previous = Object.fromEntries(buildEnvironmentKeys.map((key) => [key, process.env[key]]));
+	try {
+		const serverDirectory = path.join(root, "server");
+		const staticDirectory = path.join(root, "ui");
+		fs.mkdirSync(serverDirectory, { recursive: true });
+		fs.mkdirSync(staticDirectory, { recursive: true });
+		const serverEntry = path.join(serverDirectory, "benchmark-main.js");
+		fs.writeFileSync(serverEntry, "export {};\n", "utf8");
+		fs.writeFileSync(path.join(staticDirectory, "index.html"), "<main>benchmark</main>\n", "utf8");
+		Object.assign(process.env, {
+			PI_WEB_BENCHMARK_VARIANT_BUILD_DIR: root,
+			PI_WEB_BENCHMARK_SERVER_ENTRY: serverEntry,
+			PI_WEB_BENCHMARK_STATIC_DIR: staticDirectory,
+			PI_WEB_BENCHMARK_SERVER_ENTRY_HASH: sha256(fs.readFileSync(serverEntry)),
+			PI_WEB_BENCHMARK_SERVER_TREE_HASH: hashTree(serverDirectory),
+			PI_WEB_BENCHMARK_UI_TREE_HASH: hashTree(staticDirectory),
 		});
-		fence.receive({
-			...idleSnapshot,
-			trial: { epoch: 1, id: "trial-1", state: "active" },
-			counters: { ...idleSnapshot.counters, memorySampleCount: 1, trialEpoch: 1 },
-		});
 
-		assert.equal(fence.error(), undefined);
-		assert.deepEqual(fence.snapshot()?.trial, { epoch: 1, id: "trial-1", state: "active" });
-	});
+		const resolved = benchmarkBuildPathsFromEnvironment();
+		assert.equal(resolved.buildRoot, fs.realpathSync(root));
+		assert.equal(resolved.serverEntry, fs.realpathSync(serverEntry));
+		assert.equal(resolved.staticDir, fs.realpathSync(staticDirectory));
 
-	it("fails immediately on malformed IPC after a valid launch snapshot", () => {
-		const fence = createBenchmarkGatewayIpcFence();
-		fence.receive(idleSnapshot);
-		assert.equal(fence.error(), undefined);
-		assert.deepEqual(fence.snapshot(), {
-			generation: "gateway-test",
-			trial: { epoch: 0, id: null, state: "idle" },
-			counters: idleSnapshot.counters,
-		});
-
-		fence.receive({ type: "unexpected-after-launch" });
-
-		assert.match(fence.error() ?? "", /malformed or unexpected IPC/);
-		assert.equal(fence.snapshot()?.generation, "gateway-test");
-	});
+		process.env.PI_WEB_BENCHMARK_UI_TREE_HASH = "0".repeat(64);
+		assert.throws(() => benchmarkBuildPathsFromEnvironment(), /run manifest; refusing stale or mixed output/);
+	} finally {
+		for (const key of buildEnvironmentKeys) {
+			const value = previous[key];
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+		fs.rmSync(root, { recursive: true, force: true });
+	}
 });

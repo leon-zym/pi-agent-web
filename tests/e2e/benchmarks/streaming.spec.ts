@@ -4,10 +4,12 @@ import {
 	addSummaryGate,
 	addValueGate,
 	correctnessFailureCount,
+	finishBrowserMeasurement,
 	installBrowserBenchmarkObserver,
 	markBrowserStreamEnd,
 	runBenchmarkScenario,
 	scenariosFor,
+	startBrowserMeasurement,
 } from "./benchmark-support";
 
 test.use({ harnessOptions: { benchmarkGateway: true } });
@@ -33,7 +35,8 @@ for (const scenario of scenariosFor("streaming")) {
 			const trialCount = scenario.warmups + scenario.samples;
 
 			for (let index = 0; index < trialCount; index += 1) {
-				await trials.run(index, async ({ finishBrowserMeasurement }) => {
+				await trials.run(index, async () => {
+					await startBrowserMeasurement(page);
 					const prompt = [
 						"E2E_BENCH_STREAM",
 						String(targetBytes),
@@ -93,8 +96,7 @@ for (const scenario of scenariosFor("streaming")) {
 					const largeFrames = harness
 						.piEvents()
 						.filter((event) => event.type === "large_frame" && event.text === prompt);
-					const measurement = await finishBrowserMeasurement();
-					const metrics = measurement.browser;
+					const metrics = await finishBrowserMeasurement(page);
 					return {
 						metrics: {
 							...metrics,

@@ -7,11 +7,13 @@ import {
 	addValueGate,
 	browserSessionFrameSnapshot,
 	correctnessFailureCount,
+	finishBrowserMeasurement,
 	installBrowserBenchmarkObserver,
 	markBrowserStreamEnd,
 	resetBrowserSessionFrames,
 	runBenchmarkScenario,
 	scenariosFor,
+	startBrowserMeasurement,
 } from "./benchmark-support";
 
 test.use({ harnessOptions: { benchmarkGateway: true } });
@@ -89,7 +91,8 @@ for (const scenario of scenariosFor("concurrency")) {
 			const trialCount = scenario.warmups + scenario.samples;
 
 			for (let index = 0; index < trialCount; index += 1) {
-				await trials.run(index, async ({ finishBrowserMeasurement }) => {
+				await trials.run(index, async () => {
+					await startBrowserMeasurement(page);
 					const prompts = Array.from({ length: sessionCount }, (_, sessionIndex) =>
 						[
 							"E2E_BENCH_STREAM",
@@ -231,8 +234,7 @@ for (const scenario of scenariosFor("concurrency")) {
 						await expect(settled).toContainText("STREAM_BUDGET_END", { timeout: 30_000 });
 						projectedSessions += 1;
 					}
-					const measurement = await finishBrowserMeasurement();
-					const browserMetrics = measurement.browser;
+					const browserMetrics = await finishBrowserMeasurement(page);
 					const events = harness.piEvents();
 					const starts = prompts.map(
 						(prompt) => eventFor(harness, "benchmark_start_observed", prompt)?.at ?? 0,

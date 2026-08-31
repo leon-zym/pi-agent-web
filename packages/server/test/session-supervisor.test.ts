@@ -834,19 +834,15 @@ describe("SessionSupervisor", () => {
 		const runtime = exactRuntimeObject(supervisor, target.sessionHandle) as SessionRuntime;
 		const internal = runtime as unknown as { buildSessionSnapshot: () => unknown };
 		const build = vi.spyOn(internal, "buildSessionSnapshot");
-		const lifecycle = runtime as unknown as { onSnapshotBuild: () => void };
-		const observation = vi.spyOn(lifecycle, "onSnapshotBuild");
 
 		const first = runtime.sessionSnapshot();
 		const second = runtime.sessionSnapshot();
 
 		expect(build).toHaveBeenCalledTimes(1);
-		expect(observation).toHaveBeenCalledTimes(1);
 		expect(second).toBe(first);
 		await new Promise<void>((resolve) => setTimeout(resolve, 0));
 		expect(runtime.sessionSnapshot()).toBe(first);
 		expect(build).toHaveBeenCalledTimes(1);
-		expect(observation).toHaveBeenCalledTimes(1);
 
 		const lease = await supervisor.claim(target.sessionHandle, "snapshot-controller");
 		const generation = runtime.generation;
@@ -872,7 +868,6 @@ describe("SessionSupervisor", () => {
 		const afterClose = runtime.sessionSnapshot();
 		expect(afterClose).not.toBe(beforeClose);
 		expect(build).toHaveBeenCalledTimes(buildsBeforeClose + 1);
-		expect(observation).toHaveBeenCalledTimes(buildsBeforeClose + 1);
 	});
 
 	it("revalidates exact process ownership after capturing the replay baseline", async () => {

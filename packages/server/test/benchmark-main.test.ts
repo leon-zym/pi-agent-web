@@ -4,11 +4,11 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
-	startServerWithRuntimeComposition: vi.fn(),
+	startServer: vi.fn(),
 }));
 
 vi.mock("../src/main.js", () => ({
-	startServerWithRuntimeComposition: mocks.startServerWithRuntimeComposition,
+	startServer: mocks.startServer,
 }));
 
 import { runBenchmarkGateway } from "../src/benchmark-main.js";
@@ -37,7 +37,7 @@ function installConnectedParent(): () => void {
 }
 
 afterEach(() => {
-	mocks.startServerWithRuntimeComposition.mockReset();
+	mocks.startServer.mockReset();
 	for (const directory of temporaryDirectories.splice(0))
 		fs.rmSync(directory, { recursive: true, force: true });
 });
@@ -51,7 +51,7 @@ describe("benchmark Gateway late-start lifecycle", () => {
 		const restoreParent = installConnectedParent();
 		const startup = deferred<{ close: () => Promise<void> }>();
 		const close = vi.fn().mockResolvedValue(undefined);
-		mocks.startServerWithRuntimeComposition.mockReturnValue(startup.promise);
+		mocks.startServer.mockReturnValue(startup.promise);
 		const listenerCount = process.listenerCount(event);
 
 		try {

@@ -82,9 +82,6 @@ export function createGatewayProxy(gatewayOrigin: string): Record<string, ProxyO
 
 export default defineConfig({
 	plugins: [react(), tailwindcss()],
-	resolve: {
-		alias: benchmarkBuild ? { "react-dom/client": "react-dom/profiling" } : {},
-	},
 	server: {
 		port: 5173,
 		proxy: createGatewayProxy(DEV_GATEWAY_ORIGIN),

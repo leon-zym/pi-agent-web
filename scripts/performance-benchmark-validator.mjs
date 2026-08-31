@@ -108,25 +108,6 @@ const FORMAL_BENCHMARK_VARIANTS = Object.freeze(["coalesced", "sequential"]);
 const BENCHMARK_VARIANTS = new Set(FORMAL_BENCHMARK_VARIANTS);
 const BUILD_VARIANT_KEYS = ["serverEntry", "serverEntryHash", "serverTreeHash", "uiDirectory", "uiTreeHash"];
 const STANDARD_BUILD_IDENTITY_KEYS = ["cliTreeHash", "serverTreeHash", "uiTreeHash"];
-const REQUIRED_TRIAL_CAPABILITIES = ["browser-memory-sampler", "gateway-trial-telemetry", "react-profiler"];
-const REQUIRED_TRIAL_METRICS = [
-	"browserHeapPeakBytes",
-	"browserHeapSampleCount",
-	"browserHeapSampleIntervalMs",
-	"browserHeapSamplerOverheadMs",
-	"gatewayHeapPeakBytes",
-	"gatewayMemorySampleCount",
-	"gatewayMemorySampleIntervalMs",
-	"gatewayMemorySamplerOverheadMs",
-	"gatewayPublicationCount",
-	"gatewayRssPeakBytes",
-	"gatewaySnapshotBuildCount",
-	"gatewayTrialEpoch",
-	"reactActualDurationMs",
-	"reactBaseDurationMs",
-	"reactCommitCount",
-	"reactCommitMaxDurationMs",
-];
 
 function isRecord(value) {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -474,46 +455,6 @@ function validateTrials(result, definition, errors) {
 			for (const [metric, value] of Object.entries(trial.metrics)) {
 				if (!isFiniteNumber(value)) errors.push(`trial ${String(index)} metrics.${metric} must be finite`);
 			}
-			for (const metric of REQUIRED_TRIAL_METRICS) {
-				if (!isFiniteNumber(trial.metrics[metric])) {
-					errors.push(`trial ${String(index)} is missing required telemetry metric: ${metric}`);
-				}
-			}
-			for (const metric of [
-				"browserHeapPeakBytes",
-				"browserHeapSampleCount",
-				"browserHeapSampleIntervalMs",
-				"browserHeapSamplerOverheadMs",
-				"gatewayHeapPeakBytes",
-				"gatewayMemorySampleCount",
-				"gatewayMemorySampleIntervalMs",
-				"gatewayMemorySamplerOverheadMs",
-				"gatewayPublicationCount",
-				"gatewayRssPeakBytes",
-				"gatewaySnapshotBuildCount",
-				"gatewayTrialEpoch",
-				"reactActualDurationMs",
-				"reactBaseDurationMs",
-				"reactCommitCount",
-				"reactCommitMaxDurationMs",
-			]) {
-				if (isFiniteNumber(trial.metrics[metric]) && trial.metrics[metric] < 0) {
-					errors.push(`trial ${String(index)} metrics.${metric} must be non-negative`);
-				}
-			}
-			for (const metric of [
-				"browserHeapSampleCount",
-				"gatewayMemorySampleCount",
-				"gatewayTrialEpoch",
-				"reactCommitCount",
-			]) {
-				if (
-					isFiniteNumber(trial.metrics[metric]) &&
-					(!Number.isSafeInteger(trial.metrics[metric]) || trial.metrics[metric] <= 0)
-				) {
-					errors.push(`trial ${String(index)} metrics.${metric} must be a positive safe integer`);
-				}
-			}
 		}
 		if (!isRecord(trial.correctness) || Object.keys(trial.correctness).length === 0) {
 			errors.push(`trial ${String(index)} correctness must be a non-empty record`);
@@ -670,12 +611,7 @@ function validateResult(result, definition, tier, runId) {
 	if (typeof result.browserVersion !== "string" || result.browserVersion.length === 0) {
 		errors.push("browserVersion must be a non-empty string");
 	}
-	validateCapabilities(
-		result.capabilities,
-		[...(definition.requiredCapabilities ?? []), ...REQUIRED_TRIAL_CAPABILITIES],
-		errors,
-		"result",
-	);
+	validateCapabilities(result.capabilities, definition.requiredCapabilities ?? [], errors, "result");
 	const startedAt = Date.parse(result.startedAt);
 	const finishedAt = Date.parse(result.finishedAt);
 	if (!Number.isFinite(startedAt)) errors.push("startedAt must be an ISO timestamp");
@@ -911,12 +847,7 @@ function validateManifest(manifest, matrix, tier, runId, results, errors) {
 	}
 	validateCapabilities(
 		manifest.capabilities,
-		[
-			...new Set([
-				...canonicalExpected.flatMap((entry) => entry.requiredCapabilities),
-				...REQUIRED_TRIAL_CAPABILITIES,
-			]),
-		],
+		[...new Set(canonicalExpected.flatMap((entry) => entry.requiredCapabilities))],
 		errors,
 		"manifest",
 	);
