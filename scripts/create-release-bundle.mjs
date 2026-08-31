@@ -189,6 +189,21 @@ function assertNoSensitiveLockMetadata(value, packagePath) {
 			if (/(?:auth|token|password|credential|proxy|registry)/i.test(key)) {
 				throw new Error(`package lock entry ${packagePath} contains a forbidden ${nestedPath} field`);
 			}
+			if (
+				[
+					"dependencies",
+					"optionalDependencies",
+					"peerDependencies",
+					"peerDependenciesMeta",
+					"bin",
+					"engines",
+				].includes(key)
+			) {
+				// These maps are keyed by package names or executable names. A legal
+				// package such as @aws-sdk/credential-provider-node is not a config
+				// field and must not be treated as a credential leak.
+				continue;
+			}
 			visit(nested, nestedPath);
 		}
 	};

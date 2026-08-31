@@ -506,6 +506,14 @@ test("validates only a complete v3 frozen graph with exact local edges and publi
 	const credentialUrl = bundledLockfile(rootManifest);
 	credentialUrl.packages["node_modules/ws"].resolved = "https://token@registry.npmjs.org/ws/-/ws-8.18.3.tgz";
 	assert.throws(() => validateBundleLockfile(credentialUrl, rootManifest), /canonical public registry/);
+	const poisonedMetadata = bundledLockfile(rootManifest);
+	poisonedMetadata.packages["node_modules/ws"].authToken = "redacted";
+	assert.throws(() => validateBundleLockfile(poisonedMetadata, rootManifest), /forbidden/);
+	const credentialNamedDependency = bundledLockfile(rootManifest);
+	credentialNamedDependency.packages["node_modules/ws"].dependencies = {
+		"@aws-sdk/credential-provider-node": "3.0.0",
+	};
+	assert.doesNotThrow(() => validateBundleLockfile(credentialNamedDependency, rootManifest));
 	const internalAlias = bundledLockfile(rootManifest);
 	internalAlias.packages["node_modules/ws"].dependencies = {
 		"pi-web-alias": "npm:@pi-agent-web/cli@0.1.0",
