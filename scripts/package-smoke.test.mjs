@@ -8,6 +8,7 @@ import { gunzipSync, gzipSync } from "node:zlib";
 import { createDeterministicTarGz } from "./create-release-bundle.mjs";
 import {
 	assertInstalledProductIsolation,
+	controlledNpxEnvironment,
 	createOwnedProcessTree,
 	inspectPackageTarballs,
 	PACKAGE_NAMES,
@@ -287,4 +288,28 @@ test("selects a Windows npm-family wrapper through its Node entrypoint without a
 	});
 	assert.equal(invocation.command, process.execPath);
 	assert.deepEqual(invocation.argsPrefix, [entryPath]);
+});
+
+test("keeps system command paths while excluding inherited node_modules bins for npx", () => {
+	const root = tempRoot();
+	const npxDir = path.join(root, "npm-runtime");
+	const shellDir = path.join(root, "shell-runtime");
+	const inheritedBin = path.join(root, "source", "node_modules", ".bin");
+	const emptyBinDir = path.join(root, "empty-bin");
+	fs.mkdirSync(npxDir, { recursive: true });
+	fs.mkdirSync(shellDir, { recursive: true });
+	fs.mkdirSync(inheritedBin, { recursive: true });
+	fs.mkdirSync(emptyBinDir, { recursive: true });
+	const npxPath = path.join(npxDir, "npx");
+	fs.writeFileSync(npxPath, "#!/bin/sh\n");
+	fs.chmodSync(npxPath, 0o755);
+	const environment = controlledNpxEnvironment({
+		emptyBinDir,
+		baseEnv: { PATH: [inheritedBin, npxDir, shellDir].join(path.delimiter) },
+	});
+	const pathEntries = environment.PATH.split(path.delimiter).map((entry) => path.resolve(entry));
+	assert.ok(pathEntries.includes(path.resolve(emptyBinDir)));
+	assert.ok(pathEntries.includes(path.resolve(npxDir)));
+	assert.ok(pathEntries.includes(path.resolve(shellDir)));
+	assert.ok(!pathEntries.includes(path.resolve(inheritedBin)));
 });

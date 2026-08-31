@@ -506,9 +506,30 @@ export function resolvePackageManagerCommand(
 	return { command: process.execPath, argsPrefix: [readWindowsCommandEntrypoint(commandPath)] };
 }
 
+function isNodeModulesBinDirectory(directory) {
+	const resolvedDirectory = path.resolve(directory);
+	return (
+		path.basename(resolvedDirectory) === ".bin" &&
+		path.basename(path.dirname(resolvedDirectory)) === "node_modules"
+	);
+}
+
 export function controlledNpxEnvironment({ emptyBinDir, baseEnv = process.env }) {
 	const npxPath = resolveExecutable("npx", baseEnv.PATH);
-	const pathEntries = [path.dirname(npxPath), path.dirname(process.execPath), emptyBinDir];
+	const npxDirectory = path.dirname(npxPath);
+	if (isNodeModulesBinDirectory(npxDirectory)) {
+		throw new Error("controlled npx must not inherit an npx executable from node_modules/.bin");
+	}
+	// npx needs the ordinary host command search path to start its package bin
+	// through sh on POSIX. Keep that runtime path, but remove every inherited
+	// project node_modules/.bin entry so a source checkout cannot satisfy the
+	// installed-product command by PATH fallback.
+	const inheritedRuntimePaths = baseEnv.PATH.split(path.delimiter).filter(
+		(entry) => entry.length > 0 && !isNodeModulesBinDirectory(entry),
+	);
+	const pathEntries = [emptyBinDir, npxDirectory, ...inheritedRuntimePaths].map((entry) =>
+		path.resolve(entry),
+	);
 	return { ...baseEnv, PATH: [...new Set(pathEntries)].join(path.delimiter) };
 }
 
