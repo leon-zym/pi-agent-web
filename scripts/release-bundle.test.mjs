@@ -376,6 +376,22 @@ test("validates bundle lockfiles against exact local packages and the canonical 
 	delete missingResolution.packages["node_modules/ws"].resolved;
 	assert.throws(() => validateBundleLockfile(missingResolution, rootManifest), /missing a resolution/);
 
+	// npm lockfile v3 can omit integrity for a nested entry that is resolved
+	// from a bundled dependency. The exact public tarball URL remains present,
+	// so absence is not an ambiguous source.
+	const resolvedWithoutIntegrity = bundledLockfile(rootManifest);
+	delete resolvedWithoutIntegrity.packages["node_modules/ws"];
+	resolvedWithoutIntegrity.packages[
+		"node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-agent-core"
+	] = {
+		version: "0.84.2",
+		resolved: "https://registry.npmjs.org/@earendil-works/pi-agent-core/-/pi-agent-core-0.84.2.tgz",
+	};
+	assert.doesNotThrow(() => validateBundleLockfile(resolvedWithoutIntegrity, rootManifest));
+	const malformedIntegrity = bundledLockfile(rootManifest);
+	malformedIntegrity.packages["node_modules/ws"].integrity = "";
+	assert.throws(() => validateBundleLockfile(malformedIntegrity, rootManifest), /invalid integrity/);
+
 	const wrongInternalTarball = bundledLockfile(rootManifest);
 	wrongInternalTarball.packages["node_modules/@pi-agent-web/cli"].resolved = "file:packages/other.tgz";
 	assert.throws(() => validateBundleLockfile(wrongInternalTarball, rootManifest), /bundled tarball/);

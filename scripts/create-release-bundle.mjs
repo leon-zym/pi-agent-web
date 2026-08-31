@@ -354,12 +354,18 @@ function assertExternalPackageLockEntry(packagePath, value) {
 	) {
 		throw new Error(`external package lock entry ${packagePath} has a non-registry package spec`);
 	}
+	// npm lockfile v3 may omit integrity for nested records that npm resolves
+	// through a bundled dependency. Those records are still unambiguous when
+	// their exact canonical public `resolved` URL is present. If npm supplies
+	// integrity, however, it must be a usable value rather than an empty or
+	// malformed placeholder.
 	if (
-		typeof value.integrity !== "string" ||
-		value.integrity.length === 0 ||
-		value.integrity.trim() !== value.integrity
+		value.integrity !== undefined &&
+		(typeof value.integrity !== "string" ||
+			value.integrity.length === 0 ||
+			value.integrity.trim() !== value.integrity)
 	) {
-		throw new Error(`external package lock entry ${packagePath} is missing an integrity`);
+		throw new Error(`external package lock entry ${packagePath} has an invalid integrity`);
 	}
 	assertCanonicalPublicResolution(packagePath, value.resolved);
 }
