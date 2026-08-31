@@ -459,50 +459,52 @@ export async function installBrowserBenchmarkObserver(page: Page): Promise<void>
 			maxFrameGapMs: number;
 		};
 		const sessionFrames = new Map<string, SessionFrameState>();
-		const observeSocket = (socket: WebSocket) => {
-			socket.addEventListener("message", (message) => {
-				if (typeof message.data !== "string") return;
-				let wire: unknown;
-				try {
-					wire = JSON.parse(message.data);
-				} catch {
-					return;
-				}
-				if (wire === null || typeof wire !== "object") return;
-				const candidate = wire as {
-					type?: unknown;
-					sessionHandle?: unknown;
-					event?: {
+		const socketObserver = {
+			observe(socket: WebSocket) {
+				socket.addEventListener("message", (message) => {
+					if (typeof message.data !== "string") return;
+					let wire: unknown;
+					try {
+						wire = JSON.parse(message.data);
+					} catch {
+						return;
+					}
+					if (wire === null || typeof wire !== "object") return;
+					const candidate = wire as {
 						type?: unknown;
-						assistantMessageEvent?: { type?: unknown; delta?: unknown };
+						sessionHandle?: unknown;
+						event?: {
+							type?: unknown;
+							assistantMessageEvent?: { type?: unknown; delta?: unknown };
+						};
 					};
-				};
-				const delta = candidate.event?.assistantMessageEvent;
-				if (
-					candidate.type !== "event" ||
-					typeof candidate.sessionHandle !== "string" ||
-					candidate.event?.type !== "message_update" ||
-					delta?.type !== "text_delta" ||
-					typeof delta.delta !== "string"
-				) {
-					return;
-				}
-				const observed = sessionFrames.get(candidate.sessionHandle);
-				if (!observed) return;
-				const now = performance.now();
-				if (observed.lastArrivalAt !== null) {
-					observed.maxFrameGapMs = Math.max(observed.maxFrameGapMs, now - observed.lastArrivalAt);
-				}
-				observed.deltaFrames += 1;
-				observed.deltaChars += delta.delta.length;
-				observed.firstArrivalAt ??= now;
-				observed.lastArrivalAt = now;
-			});
+					const delta = candidate.event?.assistantMessageEvent;
+					if (
+						candidate.type !== "event" ||
+						typeof candidate.sessionHandle !== "string" ||
+						candidate.event?.type !== "message_update" ||
+						delta?.type !== "text_delta" ||
+						typeof delta.delta !== "string"
+					) {
+						return;
+					}
+					const observed = sessionFrames.get(candidate.sessionHandle);
+					if (!observed) return;
+					const now = performance.now();
+					if (observed.lastArrivalAt !== null) {
+						observed.maxFrameGapMs = Math.max(observed.maxFrameGapMs, now - observed.lastArrivalAt);
+					}
+					observed.deltaFrames += 1;
+					observed.deltaChars += delta.delta.length;
+					observed.firstArrivalAt ??= now;
+					observed.lastArrivalAt = now;
+				});
+			},
 		};
 		const BenchmarkWebSocket = new Proxy(window.WebSocket, {
 			construct(target, args) {
 				const socket = Reflect.construct(target, args) as WebSocket;
-				observeSocket(socket);
+				socketObserver.observe(socket);
 				return socket;
 			},
 		});
@@ -534,7 +536,7 @@ export async function installBrowserBenchmarkObserver(page: Page): Promise<void>
 			// Capability is represented by empty long-task data on unsupported browsers.
 		}
 		const api = {
-			resetSessionFrames: (sessionHandles: string[]) => {
+			resetSessionFrames(sessionHandles: string[]) {
 				sessionFrames.clear();
 				for (const sessionHandle of sessionHandles) {
 					sessionFrames.set(sessionHandle, {
@@ -546,11 +548,11 @@ export async function installBrowserBenchmarkObserver(page: Page): Promise<void>
 					});
 				}
 			},
-			sessionFrameSnapshot: (sessionHandle: string): BrowserSessionFrameSnapshot | null => {
+			sessionFrameSnapshot(sessionHandle: string): BrowserSessionFrameSnapshot | null {
 				const observed = sessionFrames.get(sessionHandle);
 				return observed ? { ...observed } : null;
 			},
-			start: () => {
+			start() {
 				state.active = true;
 				state.startedAt = performance.now();
 				state.firstPublicationAt = null;
@@ -560,14 +562,14 @@ export async function installBrowserBenchmarkObserver(page: Page): Promise<void>
 				state.publicationBatches = 0;
 				state.longTasks.length = 0;
 			},
-			markStreamEnd: () => {
+			markStreamEnd() {
 				state.streamEndedAt = performance.now();
 			},
-			markSettled: () => {
+			markSettled() {
 				state.settledAt = performance.now();
 				state.active = false;
 			},
-			snapshot: (): BrowserBenchmarkSnapshot => {
+			snapshot(): BrowserBenchmarkSnapshot {
 				const streamEnd = state.streamEndedAt ?? performance.now();
 				const liveLongTasks = state.longTasks.filter(
 					(entry) => entry.startTime >= state.startedAt && entry.startTime < streamEnd,
