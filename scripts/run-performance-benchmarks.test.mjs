@@ -42,6 +42,8 @@ test("creates parent and run evidence before a clean-checkout build failure", ()
 		assert.ok(fs.existsSync(path.join(runDirectory, "logs", "build-standard.stderr.log")));
 		assert.ok(fs.existsSync(path.join(runDirectory, "failure.json")));
 		assert.ok(fs.existsSync(path.join(runDirectory, "benchmark.json")));
+		const runManifest = JSON.parse(fs.readFileSync(path.join(runDirectory, "run-manifest.json"), "utf8"));
+		assert.equal(runManifest.source.dirty, false);
 		const failure = JSON.parse(fs.readFileSync(path.join(runDirectory, "failure.json"), "utf8"));
 		assert.equal(failure.phase, "build-standard");
 		assert.equal(fs.existsSync(runnerLockPath), false);

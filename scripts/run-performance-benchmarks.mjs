@@ -99,6 +99,17 @@ function commandOutput(command, args, fallback = "unavailable") {
 	}
 }
 
+function sourceIdentity() {
+	const status = commandOutput("git", ["status", "--porcelain"], "");
+	return {
+		commit: commandOutput("git", ["rev-parse", "HEAD"]),
+		dirty: status
+			.split("\n")
+			.filter(Boolean)
+			.some((line) => line !== "?? .piweb-benchmark-runner.lock"),
+	};
+}
+
 function sha256(value) {
 	return createHash("sha256").update(value).digest("hex");
 }
@@ -443,6 +454,14 @@ function removeVariantBuild(runDirectory, buildDirectory) {
 	fs.rmSync(buildDirectory, { recursive: true, force: true });
 }
 
+function removeRunOwnedBuilds(runDirectory) {
+	const buildsDirectory = path.join(runDirectory, "builds");
+	const relativePath = path.relative(runDirectory, buildsDirectory);
+	if (relativePath !== "builds")
+		throw new Error("refusing to remove an unexpected benchmark build directory");
+	fs.rmSync(buildsDirectory, { recursive: true, force: true });
+}
+
 function claimRunnerLock(runId) {
 	try {
 		const descriptor = fs.openSync(runnerLockPath, "wx", 0o600);
@@ -591,10 +610,7 @@ async function main() {
 
 	let runDirectory;
 	let logsDirectory;
-	const source = {
-		commit: commandOutput("git", ["rev-parse", "HEAD"]),
-		dirty: commandOutput("git", ["status", "--porcelain"], "") !== "",
-	};
+	const source = sourceIdentity();
 	try {
 		const tierDirectory = path.join(artifactRoot, tier);
 		fs.mkdirSync(tierDirectory, { recursive: true });
@@ -784,6 +800,7 @@ async function main() {
 				if (fs.existsSync(paths.root)) removeVariantBuild(runDirectory, paths.root);
 			}
 		}
+		removeRunOwnedBuilds(runDirectory);
 
 		const { artifacts, parseErrors, rawArtifacts } = collectRawArtifacts(rawDirectory);
 		const browserVersions = [
@@ -872,6 +889,13 @@ async function main() {
 					`benchmark failure report could not be written: ${reportError instanceof Error ? reportError.message : String(reportError)}\n`,
 				);
 			}
+		}
+		try {
+			if (runDirectory) removeRunOwnedBuilds(runDirectory);
+		} catch (cleanupError) {
+			process.stderr.write(
+				`benchmark build cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}\n`,
+			);
 		}
 		process.stderr.write(`benchmark ${failure.phase}: ${failure.message}\n`);
 		return 1;
