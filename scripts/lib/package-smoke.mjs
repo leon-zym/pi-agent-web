@@ -452,8 +452,6 @@ export function assertInstalledProductIsolation({ installDir, repositoryRoot = R
 }
 
 export function extractBundleArchive({ archivePath, destinationDir, bundleName }) {
-	fs.mkdirSync(destinationDir, { recursive: true });
-	assertRegularDirectory(destinationDir, "bundle extraction directory");
 	extractTarEntries(readGzipTarEntries(fs.readFileSync(archivePath)), destinationDir);
 	const bundleRoot = path.join(destinationDir, bundleName);
 	assertRegularDirectory(bundleRoot, "extracted bundle root");

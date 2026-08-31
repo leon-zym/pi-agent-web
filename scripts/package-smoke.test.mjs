@@ -11,6 +11,7 @@ import {
 	cleanupOwnedProcessTree,
 	controlledNpxEnvironment,
 	createOwnedProcessTree,
+	extractBundleArchive,
 	inspectPackageTarballs,
 	installedNpxCommand,
 	PACKAGE_NAMES,
@@ -250,6 +251,21 @@ test("accepts dist files without an explicit dist directory header", () => {
 		),
 	);
 	assert.equal(inspectPackageTarballs(tarballs).length, PACKAGE_NAMES.length);
+});
+
+test("extracts a bundle archive into a newly owned root", () => {
+	const root = tempRoot();
+	const archivePath = path.join(root, "bundle.tar.gz");
+	fs.writeFileSync(
+		archivePath,
+		createDeterministicTarGz([{ path: "bundle/package.json", type: "file", content: "{}\n" }]),
+	);
+	const bundleRoot = extractBundleArchive({
+		archivePath,
+		destinationDir: path.join(root, "extracted"),
+		bundleName: "bundle",
+	});
+	assert.equal(fs.readFileSync(path.join(bundleRoot, "package.json"), "utf8"), "{}\n");
 });
 
 test("requires a dist file instead of only a dist directory header", () => {
