@@ -230,9 +230,22 @@ function scheduleHiddenLifecycleAfterSnapshot(runtime: SessionRuntimeDto): void 
 function scheduleHiddenLifecycleAfterLease(
 	message: Extract<InlineSessionWsServerMessage, { type: "lease_status" }>,
 ): void {
+	// A recipient-local observer status is not lifecycle authority. In particular, a remote
+	// controller transition must never cause this Browser to release or unsubscribe a hidden Session.
+	if (!message.isController) return;
 	const channel = sessionTransport.store.getState().sessions[message.sessionHandle];
 	const runtime = channel?.runtime;
-	if (!runtime || !hasFreshLeaseBaseline(channel)) return;
+	if (
+		!runtime ||
+		!hasFreshLeaseBaseline(channel) ||
+		channel.lease.conflicted === true ||
+		channel.lease.leaseRevision !== message.leaseRevision ||
+		channel.lease.controlState !== message.controlState ||
+		channel.lease.transition !== message.transition ||
+		channel.lease.fencingToken !== message.fencingToken
+	) {
+		return;
+	}
 	queueMicrotask(() => {
 		const current = sessionTransport.store.getState().sessions[message.sessionHandle];
 		if (
@@ -243,7 +256,13 @@ function scheduleHiddenLifecycleAfterLease(
 			current.runtime?.serverEpoch !== runtime.serverEpoch ||
 			current.runtime.workspaceId !== runtime.workspaceId ||
 			current.runtime.sessionHandle !== runtime.sessionHandle ||
-			current.runtime.generation !== runtime.generation
+			current.runtime.generation !== runtime.generation ||
+			!current.lease.isController ||
+			current.lease.conflicted === true ||
+			current.lease.leaseRevision !== message.leaseRevision ||
+			current.lease.controlState !== message.controlState ||
+			current.lease.transition !== message.transition ||
+			current.lease.fencingToken !== message.fencingToken
 		) {
 			return;
 		}

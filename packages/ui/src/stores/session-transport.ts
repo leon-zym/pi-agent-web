@@ -89,6 +89,7 @@ import {
 	type SessionContentAdapterInstallation,
 	type SessionHistoryState,
 	type SessionLazyIdentity,
+	type SessionLeaseState,
 	type SessionSubscriptionAdmission,
 	type SessionTransportController,
 	SessionTransportError,
@@ -506,6 +507,29 @@ function identitiesMatch(
 	);
 }
 
+type LeaseStatusMessage = Extract<InlineSessionWsServerMessage, { type: "lease_status" }>;
+
+function leaseStateFrom(message: LeaseStatusMessage): SessionLeaseState {
+	return {
+		isController: message.isController,
+		...(message.fencingToken ? { fencingToken: message.fencingToken } : {}),
+		leaseRevision: message.leaseRevision,
+		controlState: message.controlState,
+		transition: message.transition,
+	};
+}
+
+function leaseStatusMatchesState(message: LeaseStatusMessage, state: SessionLeaseState): boolean {
+	return (
+		state.conflicted !== true &&
+		state.leaseRevision === message.leaseRevision &&
+		state.controlState === message.controlState &&
+		state.transition === message.transition &&
+		state.isController === message.isController &&
+		state.fencingToken === message.fencingToken
+	);
+}
+
 function lazyAbortError(): DOMException {
 	return new DOMException("Session lazy content operation was aborted", "AbortError");
 }
@@ -574,7 +598,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	const deliveredNotifyKeys = new Map<string, DeliveredNotifyKeys>();
 	let deliveredNotifyIdentityOrder: string[] = [];
 	const claimAttempts = new Set<string>();
+	const takeoverAttempts = new Set<string>();
 	const releasedControlIntents = new Set<string>();
+	const pendingLeaseStatuses = new Map<string, LeaseStatusMessage>();
 	const pendingOverflowRestarts = new Map<string, SessionRuntimeIdentityDto>();
 	const baselineRefreshes = new Set<string>();
 	const subscriptionBaselines = new Map<string, string | null>();
@@ -630,6 +656,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		invalidateSessionSnapshot,
 		claimSession,
 		releaseSession,
+		takeoverSession,
 		sendCommand,
 		sendExtensionUiResponse,
 		manualRetryResync,
@@ -1135,7 +1162,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		attachmentGuardContext = null;
 		hotRuntimeRevision = -1;
 		claimAttempts.clear();
+		takeoverAttempts.clear();
 		releasedControlIntents.clear();
+		pendingLeaseStatuses.clear();
 		pendingOverflowRestarts.clear();
 		baselineRefreshes.clear();
 		subscriptionBaselines.clear();
@@ -1143,9 +1172,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		exactHotRecoveryQueue.length = 0;
 		queuedExactHotRecoveries.clear();
 		connectionObservations.clear();
-		const receivedAt = now();
 		const sessions: Record<string, SessionChannelState> = {};
-		const lostLeases: string[] = [];
 		for (const [sessionHandle, channel] of Object.entries(store.getState().sessions)) {
 			abortHistoryForSession(sessionHandle);
 			sessions[sessionHandle] = {
@@ -1154,24 +1181,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				lease: { isController: false },
 				history: emptyHistoryState(),
 			};
-			if (channel.lease.isController || channel.lease.fencingToken) lostLeases.push(sessionHandle);
 		}
 		store.setState({ connectionState, hotRuntimeInventory: null, sessions });
-		for (const sessionHandle of lostLeases) {
-			const channel = sessions[sessionHandle];
-			if (!channel?.runtime || channel.generation === null) continue;
-			frameBus.emit(
-				sessionHandle,
-				{
-					type: "lease_status",
-					serverEpoch: channel.runtime.serverEpoch,
-					sessionHandle,
-					generation: channel.generation,
-					isController: false,
-				},
-				receivedAt,
-			);
-		}
 	}
 
 	function touchSubscriptionLru(sessionHandle: string): void {
@@ -1403,7 +1414,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			subscriptionAdmission: null,
 		}));
 		claimAttempts.delete(sessionHandle);
+		takeoverAttempts.delete(sessionHandle);
 		releasedControlIntents.delete(sessionHandle);
+		pendingLeaseStatuses.delete(sessionHandle);
 		pendingOverflowRestarts.delete(sessionHandle);
 		baselineRefreshes.delete(sessionHandle);
 		subscriptionBaselines.delete(sessionHandle);
@@ -1435,7 +1448,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		acknowledgedExtensionRequests.delete(sessionHandle);
 		clearDeliveredNotifyKeys(sessionHandle);
 		claimAttempts.delete(sessionHandle);
+		takeoverAttempts.delete(sessionHandle);
 		pendingOverflowRestarts.delete(sessionHandle);
+		pendingLeaseStatuses.delete(sessionHandle);
 		baselineRefreshes.delete(sessionHandle);
 		subscriptionBaselines.delete(sessionHandle);
 		discardRawEvents(sessionHandle, false);
@@ -1445,7 +1460,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 
 	function claimSession(sessionHandle: string): boolean {
 		const channel = store.getState().sessions[sessionHandle];
-		if (!channel?.subscribed) return false;
+		if (!channel?.subscribed || takeoverAttempts.has(sessionHandle)) return false;
 		releasedControlIntents.delete(sessionHandle);
 		setChannel(sessionHandle, (channel) => ({ ...channel, controllerIntent: true }));
 		claimSessionIfReady(sessionHandle);
@@ -1476,29 +1491,62 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		const channel = store.getState().sessions[sessionHandle];
 		if (!channel?.subscribed) return false;
 		claimAttempts.delete(sessionHandle);
+		takeoverAttempts.delete(sessionHandle);
 		releasedControlIntents.add(sessionHandle);
 		pendingOverflowRestarts.delete(sessionHandle);
 		setChannel(sessionHandle, (current) => ({
 			...current,
 			controllerIntent: false,
 			freshLeaseBaseline: null,
-			lease: { isController: false },
+			lease: {
+				isController: false,
+				...(current.lease.leaseRevision === undefined ? {} : { leaseRevision: current.lease.leaseRevision }),
+				...(current.lease.controlState === undefined ? {} : { controlState: current.lease.controlState }),
+				...(current.lease.transition === undefined ? {} : { transition: current.lease.transition }),
+			},
 		}));
-		if (channel.runtime && channel.generation !== null) {
-			frameBus.emit(
-				sessionHandle,
-				{
-					type: "lease_status",
-					serverEpoch: channel.runtime.serverEpoch,
-					sessionHandle,
-					generation: channel.generation,
-					isController: false,
-				},
-				now(),
-			);
-		}
 		if (store.getState().connectionState !== "online") return false;
 		return sendWire({ type: "session_release", sessionHandle }) === "sent";
+	}
+
+	function takeoverSession(sessionHandle: string): boolean {
+		const channel = store.getState().sessions[sessionHandle];
+		const runtime = channel?.runtime;
+		const leaseRevision = channel?.lease.leaseRevision;
+		if (
+			store.getState().connectionState !== "online" ||
+			!channel?.subscribed ||
+			!runtime ||
+			runtime.state === "dormant" ||
+			runtime.sessionFile === null ||
+			channel.generation === null ||
+			!channel.baselineAuthoritative ||
+			!hasFreshLeaseBaseline(channel) ||
+			channel.resync !== null ||
+			channel.lease.conflicted === true ||
+			channel.lease.isController ||
+			channel.lease.controlState !== "held" ||
+			typeof leaseRevision !== "number" ||
+			!Number.isSafeInteger(leaseRevision) ||
+			claimAttempts.has(sessionHandle) ||
+			takeoverAttempts.has(sessionHandle) ||
+			subscriptionBaselines.has(sessionHandle)
+		) {
+			return false;
+		}
+		takeoverAttempts.add(sessionHandle);
+		if (
+			sendWire({
+				type: "session_takeover",
+				sessionHandle,
+				expectedGeneration: channel.generation,
+				expectedLeaseRevision: leaseRevision,
+			}) !== "sent"
+		) {
+			takeoverAttempts.delete(sessionHandle);
+			return false;
+		}
+		return true;
 	}
 
 	function manualRetryResync(sessionHandle: string): boolean {
@@ -1511,7 +1559,12 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		) {
 			releasedControlIntents.delete(sessionHandle);
 			setChannel(sessionHandle, (current) => ({ ...current, controllerIntent: true }));
-			if (channel.lease.fencingToken) {
+			if (
+				channel.baselineAuthoritative &&
+				hasFreshLeaseBaseline(channel) &&
+				channel.resync === null &&
+				channel.lease.fencingToken
+			) {
 				return (
 					sendWire({
 						type: "session_restart",
@@ -1522,6 +1575,12 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				);
 			}
 			pendingOverflowRestarts.set(sessionHandle, channel.runtime);
+			if (!channel.baselineAuthoritative || !hasFreshLeaseBaseline(channel) || channel.resync !== null) {
+				if (resyncCoordinator.manualRetry(sessionHandle)) return true;
+				pendingOverflowRestarts.delete(sessionHandle);
+				setChannel(sessionHandle, (current) => ({ ...current, controllerIntent: false }));
+				return false;
+			}
 			claimAttempts.add(sessionHandle);
 			if (sendWire({ type: "session_claim", sessionHandle }) !== "sent") {
 				claimAttempts.delete(sessionHandle);
@@ -3069,6 +3128,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			subscriptionBaselines.delete(message.sessionHandle);
 			baselineRefreshes.delete(message.sessionHandle);
 			claimAttempts.delete(message.sessionHandle);
+			takeoverAttempts.delete(message.sessionHandle);
+			pendingLeaseStatuses.delete(message.sessionHandle);
 			if (current.resync && current.runtime) {
 				failSnapshot(current.runtime, new SessionTransportError("unavailable", message.error));
 				frameBus.emit(message.sessionHandle, message, now());
@@ -3092,6 +3153,25 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		} else if (message.operation === "claim") {
 			claimAttempts.delete(message.sessionHandle);
 			pendingOverflowRestarts.delete(message.sessionHandle);
+		} else if (message.operation === "takeover") {
+			// Takeover is an explicit one-shot request. A newer lease view may permit a later user action,
+			// but transport never turns a retryable error into a queued or automatic retry.
+			takeoverAttempts.delete(message.sessionHandle);
+			// The rejected CAS proves that the local observation is no longer an action-safe
+			// lease baseline. Keep the diagnostic global state, but fence any repeat until
+			// the Gateway supplies a fresh recipient-local lease_status.
+			setChannel(message.sessionHandle, (channel) => ({
+				...channel,
+				freshLeaseBaseline: null,
+				lease: {
+					isController: false,
+					...(channel.lease.leaseRevision === undefined
+						? {}
+						: { leaseRevision: channel.lease.leaseRevision }),
+					...(channel.lease.controlState === undefined ? {} : { controlState: channel.lease.controlState }),
+					...(channel.lease.transition === undefined ? {} : { transition: channel.lease.transition }),
+				},
+			}));
 		}
 		frameBus.emit(message.sessionHandle, message, now());
 	}
@@ -3180,6 +3260,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			acknowledgedExtensionRequests.delete(sessionHandle);
 			clearDeliveredNotifyKeys(sessionHandle);
 			claimAttempts.delete(sessionHandle);
+			takeoverAttempts.delete(sessionHandle);
+			pendingLeaseStatuses.delete(sessionHandle);
 			pendingOverflowRestarts.delete(sessionHandle);
 			baselineRefreshes.delete(sessionHandle);
 			subscriptionBaselines.delete(sessionHandle);
@@ -3549,7 +3631,52 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		return true;
 	}
 
-	function handleLease(message: Extract<InlineSessionWsServerMessage, { type: "lease_status" }>): void {
+	function failClosedLeaseView(sessionHandle: string, message: LeaseStatusMessage): void {
+		claimAttempts.delete(sessionHandle);
+		takeoverAttempts.delete(sessionHandle);
+		pendingOverflowRestarts.delete(sessionHandle);
+		pendingLeaseStatuses.delete(sessionHandle);
+		setChannel(sessionHandle, (channel) => ({
+			...channel,
+			freshLeaseBaseline: null,
+			lease: {
+				isController: false,
+				leaseRevision: message.leaseRevision,
+				controlState: message.controlState,
+				transition: message.transition,
+				conflicted: true,
+			},
+		}));
+	}
+
+	function deferLeaseUntilBaseline(message: LeaseStatusMessage): void {
+		const pending = pendingLeaseStatuses.get(message.sessionHandle);
+		if (!pending || message.leaseRevision > pending.leaseRevision) {
+			pendingLeaseStatuses.set(message.sessionHandle, message);
+			return;
+		}
+		if (
+			message.leaseRevision === pending.leaseRevision &&
+			!leaseStatusMatchesState(message, leaseStateFrom(pending))
+		) {
+			failClosedLeaseView(message.sessionHandle, message);
+		}
+	}
+
+	function flushDeferredLease(identity: SessionRuntimeIdentityDto): void {
+		const pending = pendingLeaseStatuses.get(identity.sessionHandle);
+		if (
+			!pending ||
+			pending.serverEpoch !== identity.serverEpoch ||
+			pending.generation !== identity.generation
+		) {
+			return;
+		}
+		pendingLeaseStatuses.delete(identity.sessionHandle);
+		handleLease(pending);
+	}
+
+	function handleLease(message: LeaseStatusMessage): void {
 		const current = store.getState().sessions[message.sessionHandle];
 		if (
 			!current?.subscribed ||
@@ -3558,35 +3685,42 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		) {
 			return;
 		}
-		let effectiveMessage = message;
+		if (!current.baselineAuthoritative) {
+			deferLeaseUntilBaseline(message);
+			return;
+		}
 		if (message.isController && releasedControlIntents.has(message.sessionHandle)) {
+			// Never synthesize a local observer view or retain a token after an explicit release.
+			// The server will serialize the release and send the next authoritative revision.
 			sendWire({ type: "session_release", sessionHandle: message.sessionHandle });
-			effectiveMessage = {
-				type: "lease_status",
-				serverEpoch: message.serverEpoch,
-				sessionHandle: message.sessionHandle,
-				generation: message.generation,
-				isController: false,
-			};
+			return;
+		}
+		const knownRevision = current.lease.leaseRevision;
+		if (knownRevision !== undefined) {
+			if (message.leaseRevision < knownRevision) return;
+			if (message.leaseRevision === knownRevision) {
+				if (!leaseStatusMatchesState(message, current.lease)) {
+					failClosedLeaseView(message.sessionHandle, message);
+					return;
+				}
+				if (hasFreshLeaseBaseline(current)) return;
+			}
 		}
 		if (subscriptionBaselines.get(message.sessionHandle) === identityKey(current.runtime)) {
 			subscriptionBaselines.delete(message.sessionHandle);
 		}
+		if (!message.isController) releasedControlIntents.delete(message.sessionHandle);
+		takeoverAttempts.delete(message.sessionHandle);
 		setChannel(message.sessionHandle, (channel) => ({
 			...channel,
 			freshLeaseBaseline: channel.runtime,
 			subscriptionAdmission:
 				channel.subscriptionAdmission?.kind === "rejected" ? null : channel.subscriptionAdmission,
-			lease: effectiveMessage.isController
-				? {
-						isController: true,
-						...(effectiveMessage.fencingToken ? { fencingToken: effectiveMessage.fencingToken } : {}),
-					}
-				: { isController: false },
+			lease: leaseStateFrom(message),
 		}));
-		frameBus.emit(message.sessionHandle, effectiveMessage, now());
+		frameBus.emit(message.sessionHandle, message, now());
 		if (current.runtime) advanceExactHotRecovery(current.runtime, "lease");
-		if (effectiveMessage.isController && effectiveMessage.fencingToken) {
+		if (message.isController && message.fencingToken) {
 			const pendingRestart = pendingOverflowRestarts.get(message.sessionHandle);
 			if (
 				pendingRestart &&
@@ -3599,7 +3733,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 					type: "session_restart",
 					sessionHandle: message.sessionHandle,
 					expectedGeneration: message.generation,
-					fencingToken: effectiveMessage.fencingToken,
+					fencingToken: message.fencingToken,
 				});
 			}
 		} else {
@@ -3642,6 +3776,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			clearIdentityBuffers(current.runtime);
 			resyncCoordinator.unsubscribe(message.sessionHandle);
 			claimAttempts.delete(message.sessionHandle);
+			takeoverAttempts.delete(message.sessionHandle);
+			pendingLeaseStatuses.delete(message.sessionHandle);
 			baselineRefreshes.delete(message.sessionHandle);
 			subscriptionBaselines.delete(message.sessionHandle);
 			discardRawEvents(message.sessionHandle, false);
@@ -3809,6 +3945,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		clearAcknowledgedExtensionRequests(identity);
 		snapshotWaiters.delete(key);
 		waiter.resolve({ identity, snapshotId, asOfSeq: endpointSeq });
+		flushDeferredLease(identity);
 		advanceExactHotRecovery(identity, "baseline");
 		resolvePendingResponsesForSession(identity.sessionHandle);
 		claimSessionIfReady(identity.sessionHandle);
@@ -4113,6 +4250,10 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		discardRawEvents(sessionHandle, false);
 		claimAttempts.delete(previousSessionHandle);
 		claimAttempts.delete(sessionHandle);
+		takeoverAttempts.delete(previousSessionHandle);
+		takeoverAttempts.delete(sessionHandle);
+		pendingLeaseStatuses.delete(previousSessionHandle);
+		pendingLeaseStatuses.delete(sessionHandle);
 		pendingOverflowRestarts.delete(previousSessionHandle);
 		pendingOverflowRestarts.delete(sessionHandle);
 		if (releasedControlIntents.delete(previousSessionHandle)) {
@@ -4174,7 +4315,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		deliveredNotifyKeys.clear();
 		deliveredNotifyIdentityOrder = [];
 		claimAttempts.clear();
+		takeoverAttempts.clear();
 		releasedControlIntents.clear();
+		pendingLeaseStatuses.clear();
 		pendingOverflowRestarts.clear();
 		baselineRefreshes.clear();
 		subscriptionBaselines.clear();
