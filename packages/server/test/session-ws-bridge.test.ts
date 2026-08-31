@@ -3877,18 +3877,27 @@ describe("SessionWsBridge", () => {
 		await subscribe(rightObserver, target.sessionHandle);
 		expect((await claim(owner, target.sessionHandle)).isController).toBe(true);
 
+		const leftObserverRequestId = "observer-read-only-response";
+		const rightObserverBarrierId = "observer-isolation-barrier";
 		const rightObserverMark = rightObserver.mark();
 		await expect(
 			command(leftObserver, target.sessionHandle, ownerSubscription.runtime.generation, {
-				id: "observer-read-only-response",
+				id: leftObserverRequestId,
 				type: "get_state",
 			}),
-		).resolves.toMatchObject({ response: { success: true } });
-		await new Promise<void>((resolve) => setImmediate(resolve));
+		).resolves.toMatchObject({ response: { id: leftObserverRequestId, success: true } });
+		const rightObserverBarrier = await command(
+			rightObserver,
+			target.sessionHandle,
+			ownerSubscription.runtime.generation,
+			{ id: rightObserverBarrierId, type: "get_state" },
+		);
+		expect(rightObserverBarrier.response).toMatchObject({ id: rightObserverBarrierId, success: true });
+		expect(rightObserverBarrier.response.id).not.toBe(leftObserverRequestId);
 		expect(
 			rightObserver.frames
 				.slice(rightObserverMark)
-				.filter((frame) => frame.type === "response" && frame.response.id === "observer-read-only-response"),
+				.filter((frame) => frame.type === "response" && frame.response.id === leftObserverRequestId),
 		).toEqual([]);
 
 		const deniedRacers = await Promise.all([
@@ -3900,12 +3909,14 @@ describe("SessionWsBridge", () => {
 			expect(lease.fencingToken).toBeUndefined();
 		}
 
+		const releaseMark = owner.mark();
 		owner.send({ type: "session_release", sessionHandle: target.sessionHandle });
 		await owner.waitForFrame(
 			(frame): frame is LeaseFrame =>
 				frame.type === "lease_status" &&
 				frame.sessionHandle === target.sessionHandle &&
 				frame.isController === false,
+			releaseMark,
 		);
 		const successors = await Promise.all([
 			claim(leftObserver, target.sessionHandle),

@@ -1,4 +1,5 @@
 import type { Browser, BrowserContext, Page } from "@playwright/test";
+import { observeWire, receivedWireFrames } from "../fixtures/content-reference";
 import { observePageErrors } from "../fixtures/page-observation";
 import type { PiFixtureEvent, ProductionHarness } from "../fixtures/production-harness";
 import { expect, test } from "../fixtures/test";
@@ -41,6 +42,7 @@ test("two Browser contexts characterize the current controller-only Session surf
 	const observer = await isolatedPage(browser);
 	const ownerErrors = observePageErrors(owner.page);
 	const observerErrors = observePageErrors(observer.page);
+	const observerWire = observeWire(observer.page);
 	try {
 		await openWorkbench(owner.page, harness);
 		await sendPrompt(owner.page, RUNNING_PROMPT);
@@ -66,11 +68,31 @@ test("two Browser contexts characterize the current controller-only Session surf
 		await expect(observer.page.locator("main")).toContainText(`E2E_REPLY:${RUNNING_PROMPT}`);
 		await expect(owner.page.locator("textarea")).toBeEnabled();
 
+		const observerExtensionMark = observerWire.events.length;
 		await sendPrompt(owner.page, EXTENSION_PROMPT);
 		const ownerDialog = owner.page.getByRole("dialog", { name: "Synthetic approval" });
 		await expect(ownerDialog).toBeVisible();
+		await expect
+			.poll(() =>
+				receivedWireFrames({
+					...observerWire,
+					events: observerWire.events.slice(observerExtensionMark),
+				}).some((frame) => {
+					if (frame.type !== "extension_ui_request") return false;
+					const request = frame.request;
+					if (typeof request !== "object" || request === null || Array.isArray(request)) return false;
+					const requestRecord = request as Record<string, unknown>;
+					return requestRecord.title === "Synthetic approval" && requestRecord.method === "confirm";
+				}),
+			)
+			.toBe(true);
 		await expect(observer.page.locator("header").getByText(/^(Waiting for input|等待输入)$/)).toBeVisible();
 		await expect(observer.page.getByRole("dialog", { name: "Synthetic approval" })).toHaveCount(0);
+		expect(
+			observerWire.events
+				.slice(observerExtensionMark)
+				.filter((event) => event.direction === "sent" && event.frame.type === "extension_ui_response"),
+		).toEqual([]);
 		await expect(observer.page.locator("textarea")).toBeDisabled();
 		await expect(observer.page.getByRole("button", { name: /^(Take over|接管)$/ })).toHaveCount(0);
 
