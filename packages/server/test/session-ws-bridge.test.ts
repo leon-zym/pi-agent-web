@@ -3694,6 +3694,19 @@ describe("SessionWsBridge", () => {
 		const successor = await openClient(harness);
 		await subscribe(successor, target.sessionHandle);
 		const originalClaim = harness.supervisor.claimWithTransition.bind(harness.supervisor);
+		let abandonedConnectionId: string | undefined;
+		let disconnectCleanupFinished: (() => void) | undefined;
+		const disconnectCleanup = new Promise<void>((resolve) => {
+			disconnectCleanupFinished = resolve;
+		});
+		const originalReleaseConnection = harness.supervisor.releaseConnectionWithTransitions.bind(
+			harness.supervisor,
+		);
+		harness.supervisor.releaseConnectionWithTransitions = async (connectionId) => {
+			const result = await originalReleaseConnection(connectionId);
+			if (connectionId === abandonedConnectionId) disconnectCleanupFinished?.();
+			return result;
+		};
 		let claimStarted: (() => void) | undefined;
 		const started = new Promise<void>((resolve) => {
 			claimStarted = resolve;
@@ -3707,6 +3720,7 @@ describe("SessionWsBridge", () => {
 			claimReturned = resolve;
 		});
 		harness.supervisor.claimWithTransition = async (sessionHandle, connectionId) => {
+			abandonedConnectionId = connectionId;
 			claimStarted?.();
 			await claimGate;
 			const claimed = await originalClaim(sessionHandle, connectionId);
@@ -3718,9 +3732,10 @@ describe("SessionWsBridge", () => {
 		await started;
 		const successorMark = successor.mark();
 		await abandoned.close();
+		await disconnectCleanup;
 		releaseClaim?.();
 		await returned;
-		await successor.waitForFrame(
+		const disconnected = await successor.waitForFrame(
 			(frame): frame is LeaseFrame =>
 				frame.type === "lease_status" &&
 				frame.sessionHandle === target.sessionHandle &&
@@ -3729,8 +3744,101 @@ describe("SessionWsBridge", () => {
 				frame.isController === false,
 			successorMark,
 		);
+		expect(disconnected).toMatchObject({ leaseRevision: 2, controlState: "free", transition: "disconnect" });
 		const successorLease = await claim(successor, target.sessionHandle);
-		expect(successorLease.isController).toBe(true);
+		expect(successorLease).toMatchObject({
+			isController: true,
+			leaseRevision: disconnected.leaseRevision + 1,
+		});
+	});
+
+	it("releases a takeover acquired after its socket already closed as a disconnect", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "takeover-after-close");
+		const harness = await createHarness([target]);
+		const owner = await openClient(harness);
+		const requester = await openClient(harness);
+		const ownerSubscription = await subscribe(owner, target.sessionHandle);
+		await subscribe(requester, target.sessionHandle);
+		const ownerLease = await claim(owner, target.sessionHandle);
+		const originalTakeover = harness.supervisor.takeover.bind(harness.supervisor);
+		const originalReleaseConnection = harness.supervisor.releaseConnectionWithTransitions.bind(
+			harness.supervisor,
+		);
+		let requesterConnectionId: string | undefined;
+		let takeoverStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			takeoverStarted = resolve;
+		});
+		let releaseTakeover: (() => void) | undefined;
+		const takeoverGate = new Promise<void>((resolve) => {
+			releaseTakeover = resolve;
+		});
+		let takeoverReturned: (() => void) | undefined;
+		const returned = new Promise<void>((resolve) => {
+			takeoverReturned = resolve;
+		});
+		let disconnectCleanupFinished: (() => void) | undefined;
+		const disconnectCleanup = new Promise<void>((resolve) => {
+			disconnectCleanupFinished = resolve;
+		});
+		harness.supervisor.takeover = async (
+			sessionHandle,
+			expectedGeneration,
+			expectedLeaseRevision,
+			connectionId,
+		) => {
+			requesterConnectionId = connectionId;
+			takeoverStarted?.();
+			await takeoverGate;
+			const transition = await originalTakeover(
+				sessionHandle,
+				expectedGeneration,
+				expectedLeaseRevision,
+				connectionId,
+			);
+			takeoverReturned?.();
+			return transition;
+		};
+		harness.supervisor.releaseConnectionWithTransitions = async (connectionId) => {
+			const result = await originalReleaseConnection(connectionId);
+			if (connectionId === requesterConnectionId) disconnectCleanupFinished?.();
+			return result;
+		};
+
+		requester.send({
+			type: "session_takeover",
+			sessionHandle: target.sessionHandle,
+			expectedGeneration: ownerSubscription.runtime.generation,
+			expectedLeaseRevision: ownerLease.leaseRevision,
+		});
+		await started;
+		const ownerMark = owner.mark();
+		await requester.close();
+		await disconnectCleanup;
+		releaseTakeover?.();
+		await returned;
+		const disconnected = await owner.waitForFrame(
+			(frame): frame is LeaseFrame =>
+				frame.type === "lease_status" &&
+				frame.sessionHandle === target.sessionHandle &&
+				frame.transition === "disconnect" &&
+				frame.controlState === "free" &&
+				frame.isController === false,
+			ownerMark,
+		);
+		expect(disconnected).toMatchObject({
+			leaseRevision: ownerLease.leaseRevision + 2,
+			controlState: "free",
+			transition: "disconnect",
+		});
+		const reclaimed = await claim(owner, target.sessionHandle);
+		expect(reclaimed).toMatchObject({
+			isController: true,
+			leaseRevision: disconnected.leaseRevision + 1,
+		});
 	});
 
 	it("multiplexes independent Session event streams over one socket", async () => {
