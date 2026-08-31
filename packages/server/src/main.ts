@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 import { type ServerType, serve } from "@hono/node-server";
 import {
 	GATEWAY_CONTENT_REF_CAPABILITY,
+	GATEWAY_FENCED_TAKEOVER_CAPABILITY,
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 	GATEWAY_SESSION_HISTORY_CAPABILITY,
@@ -185,6 +186,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 					...runtime.capabilities,
 					"session.multiplex",
 					GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+					GATEWAY_FENCED_TAKEOVER_CAPABILITY,
 					GATEWAY_SESSION_HISTORY_CAPABILITY,
 					GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 					GATEWAY_CONTENT_REF_CAPABILITY,

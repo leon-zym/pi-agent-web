@@ -6,6 +6,7 @@ import {
 	commandResponseReservationBytes,
 	GATEWAY_CLIENT_REQUIRED_CAPABILITIES,
 	GATEWAY_CONTENT_REF_CAPABILITY,
+	GATEWAY_FENCED_TAKEOVER_CAPABILITY,
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 	GATEWAY_PROTOCOL_VERSION,
@@ -49,7 +50,12 @@ import type {
 	SessionRuntimeProductResponse,
 	SessionRuntimeProductSnapshot,
 } from "./session-runtime.js";
-import type { ReplayResult, SessionSupervisorMessage } from "./session-runtime-types.js";
+import type {
+	ReplayResult,
+	SessionLeaseSnapshot,
+	SessionLeaseTransition,
+	SessionSupervisorMessage,
+} from "./session-runtime-types.js";
 import type { HotRuntimeSubscriptionToken, SessionSupervisorCore } from "./session-supervisor.js";
 
 interface ConnectionState<M extends SessionRuntimeProductMode = "content_ref"> {
@@ -58,6 +64,8 @@ interface ConnectionState<M extends SessionRuntimeProductMode = "content_ref"> {
 	subscriptions: Set<string>;
 	subscriptionAliases: Map<string, string>;
 	catchUps: Set<SessionCatchUp<M>>;
+	/** Child handles awaiting an authoritative post-rekey baseline. */
+	pendingRekeyLeases: Map<string, SessionLeaseTransition | undefined>;
 	catchUpSmallBufferedBytes: number;
 	catchUpLargeItems: number;
 	nextCatchUpOrder: number;
@@ -130,6 +138,7 @@ interface SessionCatchUp<M extends SessionRuntimeProductMode = "content_ref"> {
 	order: number;
 	rekeyVersion: number;
 	exactTransactional: boolean;
+	pendingLease?: SessionLeaseTransition;
 }
 
 type BridgeChunkedSnapshot<M extends SessionRuntimeProductMode> = NonNullable<
@@ -170,10 +179,11 @@ type SessionWsBridgeSupervisor<M extends SessionRuntimeProductMode> = Pick<
 	| "subscribe"
 	| "subscribeHotExact"
 	| "revalidateHotExactSubscription"
-	| "claim"
-	| "release"
-	| "releaseExact"
-	| "releaseConnection"
+	| "claimWithTransition"
+	| "releaseWithTransition"
+	| "releaseExactWithTransition"
+	| "releaseConnectionWithTransitions"
+	| "takeover"
 	| "leaseFor"
 	| "restart"
 	| "sendCommand"
@@ -290,6 +300,9 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		if (!capabilities.includes(GATEWAY_CONTENT_REF_CAPABILITY)) {
 			capabilities.push(GATEWAY_CONTENT_REF_CAPABILITY);
 		}
+		if (!capabilities.includes(GATEWAY_FENCED_TAKEOVER_CAPABILITY)) {
+			capabilities.push(GATEWAY_FENCED_TAKEOVER_CAPABILITY);
+		}
 		this.runtime = {
 			...opts.runtime,
 			capabilities,
@@ -374,6 +387,10 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 
 	/** SessionSupervisor broadcast sink. */
 	broadcast(message: BridgeSupervisorMessage<M>): void {
+		if (message.type === "lease_transition") {
+			this.broadcastLeaseTransition(message.transition);
+			return;
+		}
 		if (message.type === "session_rekeyed") {
 			this.broadcastRekey(message);
 			return;
@@ -448,9 +465,79 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			case "session_directory_changed":
 			case "auth_changed":
 				return null;
+			case "lease_transition":
+				return message.transition.sessionHandle;
 			case "session_rekeyed":
 				return message.previousSessionHandle;
 		}
+	}
+
+	private broadcastLeaseTransition(transition: SessionLeaseTransition): void {
+		for (const connection of this.connections) {
+			if (connection.closed || !connection.helloComplete) continue;
+			const catchUps = this.findCatchUps(connection, transition.sessionHandle);
+			if (catchUps.length > 0) {
+				for (const catchUp of catchUps) this.deferCatchUpLease(connection, catchUp, transition);
+				continue;
+			}
+			if (connection.pendingRekeyLeases.has(transition.sessionHandle)) {
+				this.deferPendingRekeyLease(connection, transition);
+				continue;
+			}
+			if (this.isSubscribed(connection, transition.sessionHandle)) {
+				this.sendLeaseTransition(connection, transition);
+			}
+		}
+	}
+
+	private deferPendingRekeyLease(connection: ConnectionState<M>, transition: SessionLeaseTransition): void {
+		const previous = connection.pendingRekeyLeases.get(transition.sessionHandle);
+		if (!previous || transition.leaseRevision > previous.leaseRevision) {
+			connection.pendingRekeyLeases.set(transition.sessionHandle, transition);
+			return;
+		}
+		if (transition.leaseRevision < previous.leaseRevision) return;
+		if (!sameLeaseTransition(previous, transition)) {
+			this.closeForPolicyViolation(connection, "conflicting Session lease revision");
+		}
+	}
+
+	private deferCatchUpLease(
+		connection: ConnectionState<M>,
+		catchUp: SessionCatchUp<M>,
+		transition: SessionLeaseTransition,
+	): void {
+		if (catchUp.currentHandle !== transition.sessionHandle) return;
+		const previous = catchUp.pendingLease;
+		if (!previous || transition.leaseRevision > previous.leaseRevision) {
+			catchUp.pendingLease = transition;
+			return;
+		}
+		if (transition.leaseRevision < previous.leaseRevision) return;
+		if (!sameLeaseTransition(previous, transition)) {
+			this.closeForPolicyViolation(connection, "conflicting Session lease revision");
+		}
+	}
+
+	private leaseViewForConnection(
+		connection: ConnectionState<M>,
+		transition: SessionLeaseTransition,
+	): SessionLeaseSnapshot {
+		const isController = transition.ownerConnectionId === connection.connectionId;
+		return {
+			serverEpoch: transition.serverEpoch,
+			sessionHandle: transition.sessionHandle,
+			generation: transition.generation,
+			leaseRevision: transition.leaseRevision,
+			controlState: transition.controlState,
+			transition: transition.transition,
+			isController,
+			...(isController && transition.fencingToken ? { fencingToken: transition.fencingToken } : {}),
+		};
+	}
+
+	private sendLeaseTransition(connection: ConnectionState<M>, transition: SessionLeaseTransition): void {
+		this.sendLease(connection, this.leaseViewForConnection(connection, transition));
 	}
 
 	private broadcastRekey(message: Extract<BridgeSupervisorMessage<M>, { type: "session_rekeyed" }>): void {
@@ -462,6 +549,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				catchUp.currentHandle = message.runtime.sessionHandle;
 				catchUp.handles.add(message.runtime.sessionHandle);
 				catchUp.rekeyVersion += 1;
+				catchUp.pendingLease = undefined;
 				this.bufferCatchUpMessage(connection, catchUp, message, payload);
 			}
 			this.clearHistorySnapshot(connection, message.previousSessionHandle);
@@ -470,6 +558,10 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				message.previousSessionHandle,
 				message.runtime.sessionHandle,
 			);
+			if (wasSubscribed) {
+				connection.pendingRekeyLeases.delete(message.previousSessionHandle);
+				connection.pendingRekeyLeases.set(message.runtime.sessionHandle, undefined);
+			}
 			if (connection.controlledSessions.delete(message.previousSessionHandle)) {
 				connection.controlledSessions.add(message.runtime.sessionHandle);
 			}
@@ -483,7 +575,9 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				connection.controlIntents.delete(message.previousSessionHandle);
 				connection.controlIntents.set(message.runtime.sessionHandle, controlIntent);
 			}
-			if (wasSubscribed && catchUps.length === 0) this.sendPayload(connection, payload);
+			if (wasSubscribed && catchUps.length === 0) {
+				this.sendPayload(connection, payload);
+			}
 		}
 	}
 
@@ -507,6 +601,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			subscriptions: new Set(),
 			subscriptionAliases: new Map(),
 			catchUps: new Set(),
+			pendingRekeyLeases: new Map(),
 			catchUpSmallBufferedBytes: 0,
 			catchUpLargeItems: 0,
 			nextCatchUpOrder: 0,
@@ -590,13 +685,16 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				await this.subscribe(connection, message.sessionHandle, message.cursor, message.expectedHotRuntime);
 				return;
 			case "session_unsubscribe":
-				this.unsubscribe(connection, message.sessionHandle);
+				await this.unsubscribe(connection, message.sessionHandle);
 				return;
 			case "session_claim":
 				await this.claim(connection, message.sessionHandle);
 				return;
 			case "session_release":
-				this.release(connection, message.sessionHandle);
+				await this.release(connection, message.sessionHandle);
+				return;
+			case "session_takeover":
+				await this.takeover(connection, message);
 				return;
 			case "session_restart":
 				await this.handleRestart(connection, message);
@@ -846,14 +944,16 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			} else {
 				for (const frame of result.frames) this.send(connection, frame as BridgeServerMessage<M>);
 			}
-			this.sendLease(connection, this.supervisor.leaseFor(resolvedHandle, connection.connectionId));
 			connection.restartableOverflows.delete(resolvedHandle);
 
 			if (!this.isCurrentCatchUp(connection, catchUp, lifecycleEpoch)) return;
 			const buffered = [...catchUp.buffered];
+			const pendingLease = catchUp.pendingLease;
 			const baselineMarker = this.findBaselineMarker(buffered, result.runtime);
 			this.establishLiveSubscription(connection, catchUp, resolvedHandle);
 			if (historySnapshot) connection.historySnapshots.set(resolvedHandle, historySnapshot);
+			if (pendingLease) this.sendLeaseTransition(connection, pendingLease);
+			else this.sendLease(connection, this.supervisor.leaseFor(resolvedHandle, connection.connectionId));
 			for (const [index, entry] of buffered.entries()) {
 				if (
 					this.isNonReplayableCatchUpMessage(entry.message) ||
@@ -907,11 +1007,13 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			runtime,
 			reason: "gap",
 		});
-		this.sendLease(connection, this.supervisor.leaseFor(runtime.sessionHandle, connection.connectionId));
 		const buffered = [...catchUp.buffered];
+		const pendingLease = catchUp.pendingLease;
 		const baselineMarker = this.findBaselineMarker(buffered, runtime);
 		this.establishLiveSubscription(connection, catchUp, runtime.sessionHandle);
 		connection.restartableOverflows.set(runtime.sessionHandle, runtime.generation);
+		if (pendingLease) this.sendLeaseTransition(connection, pendingLease);
+		else this.sendLease(connection, this.supervisor.leaseFor(runtime.sessionHandle, connection.connectionId));
 		for (const [index, entry] of buffered.entries()) {
 			if (
 				this.isNonReplayableCatchUpMessage(entry.message) ||
@@ -1240,6 +1342,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				exactTransactional: true,
 			};
 			connection.catchUps.add(catchUp);
+			this.adoptPendingRekeyLease(connection, catchUp);
 			return { catchUp };
 		}
 		// An explicit subscribe to a fork parent is not a stale reference to the
@@ -1258,6 +1361,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			exactTransactional: false,
 		};
 		connection.catchUps.add(catchUp);
+		this.adoptPendingRekeyLease(connection, catchUp);
 		for (const existing of [...connection.catchUps]) {
 			if (existing === catchUp) continue;
 			if ([...handles].some((handle) => existing.handles.has(handle))) {
@@ -1266,6 +1370,13 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		}
 		this.removeLiveSubscription(connection, activeHandle);
 		return { catchUp };
+	}
+
+	private adoptPendingRekeyLease(connection: ConnectionState<M>, catchUp: SessionCatchUp<M>): void {
+		if (!connection.pendingRekeyLeases.has(catchUp.currentHandle)) return;
+		const pendingLease = connection.pendingRekeyLeases.get(catchUp.currentHandle);
+		connection.pendingRekeyLeases.delete(catchUp.currentHandle);
+		if (pendingLease) catchUp.pendingLease = pendingLease;
 	}
 
 	private totalSubscriptionChannels(): number {
@@ -1281,11 +1392,13 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		return total;
 	}
 
-	private unsubscribe(connection: ConnectionState<M>, sessionHandle: string): void {
+	private async unsubscribe(connection: ConnectionState<M>, sessionHandle: string): Promise<void> {
 		const canonicalHandle = this.connectionSessionHandle(connection, sessionHandle);
 		this.invalidateControlIntent(connection, canonicalHandle);
 		connection.restartableOverflows.delete(sessionHandle);
 		connection.restartableOverflows.delete(canonicalHandle);
+		connection.pendingRekeyLeases.delete(sessionHandle);
+		connection.pendingRekeyLeases.delete(canonicalHandle);
 		for (const catchUp of [...connection.catchUps]) {
 			if (
 				catchUp.requestedHandle === sessionHandle ||
@@ -1298,9 +1411,10 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			}
 		}
 		this.removeLiveSubscription(connection, canonicalHandle);
-		this.supervisor.release(canonicalHandle, connection.connectionId);
+		const release = await this.supervisor.releaseWithTransition(canonicalHandle, connection.connectionId);
 		connection.controlledSessions.delete(canonicalHandle);
 		connection.controlledSessions.delete(sessionHandle);
+		if (release.transition) this.broadcastLeaseTransition(release.transition);
 		this.flushDeferredHotInventory(connection);
 	}
 
@@ -1426,11 +1540,13 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			(entry) =>
 				entry.message.type === "session_rekeyed" || this.isNonReplayableCatchUpMessage(entry.message),
 		);
+		const pendingLease = from.pendingLease;
 		this.cancelCatchUp(connection, from);
 		for (const entry of retained) {
 			if (to.buffered.some((existing) => existing.payload === entry.payload)) continue;
 			this.bufferCatchUpMessage(connection, to, entry.message, entry.payload);
 		}
+		if (pendingLease) this.deferCatchUpLease(connection, to, pendingLease);
 	}
 
 	private establishLiveSubscription(
@@ -1515,6 +1631,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		baselineMarker: number,
 	): boolean {
 		if (message.type === "session_rekeyed") return false;
+		if (message.type === "lease_transition") return false;
 		if (message.type === "session_directory_changed" || message.type === "auth_changed") return false;
 		const generation = message.type === "runtime_state" ? message.runtime.generation : message.generation;
 		const seq = message.type === "runtime_state" ? message.runtime.lastSeq : message.seq;
@@ -1534,7 +1651,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 	}
 
 	private async claim(connection: ConnectionState<M>, sessionHandle: string): Promise<void> {
-		if (!this.isSubscribed(connection, sessionHandle)) {
+		if (connection.pendingRekeyLeases.has(sessionHandle) || !this.isSubscribed(connection, sessionHandle)) {
 			this.sendSessionError(connection, sessionHandle, "claim", "session_not_subscribed");
 			return;
 		}
@@ -1544,7 +1661,8 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		const lifecycleEpoch = connection.epoch;
 		let leaseHandle = sessionHandle;
 		try {
-			const lease = await this.supervisor.claim(sessionHandle, connection.connectionId);
+			const claimed = await this.supervisor.claimWithTransition(sessionHandle, connection.connectionId);
+			const { lease, transition } = claimed;
 			leaseHandle = lease.sessionHandle;
 			const currentIntent =
 				connection.controlIntents.get(lease.sessionHandle) ?? connection.controlIntents.get(sessionHandle);
@@ -1555,12 +1673,18 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				if (lease.isController && lease.fencingToken) {
 					const canonicalHandle =
 						connection.subscriptionAliases.get(lease.sessionHandle) ?? lease.sessionHandle;
-					this.supervisor.releaseExact(canonicalHandle, connection.connectionId, lease.fencingToken);
+					const release = await this.supervisor.releaseExactWithTransition(
+						canonicalHandle,
+						connection.connectionId,
+						lease.fencingToken,
+					);
+					if (release.transition) this.broadcastLeaseTransition(release.transition);
 				}
 				return;
 			}
 			if (lease.isController) connection.controlledSessions.add(lease.sessionHandle);
-			this.sendLease(connection, lease);
+			if (transition) this.broadcastLeaseTransition(transition);
+			else this.sendLease(connection, lease);
 		} catch (error) {
 			if (connection.closed || connection.epoch !== lifecycleEpoch) return;
 			this.sendSessionError(connection, sessionHandle, "claim", error);
@@ -1569,16 +1693,68 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		}
 	}
 
-	private release(connection: ConnectionState<M>, sessionHandle: string): void {
+	private async release(connection: ConnectionState<M>, sessionHandle: string): Promise<void> {
 		try {
 			const canonicalHandle = this.connectionSessionHandle(connection, sessionHandle);
 			this.invalidateControlIntent(connection, canonicalHandle);
-			this.supervisor.release(canonicalHandle, connection.connectionId);
+			const release = await this.supervisor.releaseWithTransition(canonicalHandle, connection.connectionId);
 			connection.controlledSessions.delete(sessionHandle);
 			connection.controlledSessions.delete(canonicalHandle);
-			this.sendLease(connection, this.supervisor.leaseFor(canonicalHandle, connection.connectionId));
+			if (release.transition) this.broadcastLeaseTransition(release.transition);
+			else this.sendLease(connection, this.supervisor.leaseFor(canonicalHandle, connection.connectionId));
 		} catch (error) {
 			this.sendSessionError(connection, sessionHandle, "release", error);
+		}
+	}
+
+	private async takeover(
+		connection: ConnectionState<M>,
+		message: Extract<SessionWsClientMessage, { type: "session_takeover" }>,
+	): Promise<void> {
+		if (
+			connection.pendingRekeyLeases.has(message.sessionHandle) ||
+			!this.isSubscribed(connection, message.sessionHandle)
+		) {
+			const runtime = this.supervisor.getRuntime(message.sessionHandle);
+			this.sendSessionError(
+				connection,
+				message.sessionHandle,
+				"takeover",
+				runtime && runtime.sessionHandle !== message.sessionHandle
+					? "session_handle_stale"
+					: "session_not_subscribed",
+			);
+			return;
+		}
+		const lifecycleEpoch = connection.epoch;
+		try {
+			const transition = await this.supervisor.takeover(
+				message.sessionHandle,
+				message.expectedGeneration,
+				message.expectedLeaseRevision,
+				connection.connectionId,
+			);
+			if (
+				connection.closed ||
+				connection.epoch !== lifecycleEpoch ||
+				!this.connections.has(connection) ||
+				!this.isSubscribed(connection, transition.sessionHandle)
+			) {
+				if (transition.fencingToken) {
+					const release = await this.supervisor.releaseExactWithTransition(
+						transition.sessionHandle,
+						connection.connectionId,
+						transition.fencingToken,
+					);
+					if (release.transition) this.broadcastLeaseTransition(release.transition);
+				}
+				return;
+			}
+			connection.controlledSessions.add(transition.sessionHandle);
+			this.broadcastLeaseTransition(transition);
+		} catch (error) {
+			if (connection.closed || connection.epoch !== lifecycleEpoch) return;
+			this.sendSessionError(connection, message.sessionHandle, "takeover", error);
 		}
 	}
 
@@ -1809,7 +1985,11 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 			code,
 			retryable:
 				(operation === "subscribe" && RETRYABLE_SESSION_ERROR_CODES.has(code)) ||
-				(operation === "history_page" && RETRYABLE_HISTORY_ERROR_CODES.has(code)),
+				(operation === "history_page" && RETRYABLE_HISTORY_ERROR_CODES.has(code)) ||
+				(operation === "takeover" &&
+					["session_not_subscribed", "session_generation_stale", "session_lease_revision_stale"].includes(
+						code,
+					)),
 		});
 	}
 
@@ -1839,7 +2019,8 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		}
 		connection.historySnapshots.clear();
 		connection.restartableOverflows.clear();
-		this.supervisor.releaseConnection(connection.connectionId);
+		connection.pendingRekeyLeases.clear();
+		void this.releaseDisconnectedLeases(connection.connectionId);
 		connection.subscriptions.clear();
 		connection.subscriptionAliases.clear();
 		connection.controlledSessions.clear();
@@ -1855,6 +2036,15 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		connection.outboundHistoryQueuedBytes = 0;
 		connection.outboundSending = false;
 		this.log("info", `ws disconnected (${this.connections.size} open)`);
+	}
+
+	private async releaseDisconnectedLeases(connectionId: string): Promise<void> {
+		try {
+			const released = await this.supervisor.releaseConnectionWithTransitions(connectionId);
+			for (const transition of released.transitions) this.broadcastLeaseTransition(transition);
+		} catch (error) {
+			this.log("warn", `lease cleanup failed for disconnected socket: ${this.errorText(error)}`);
+		}
 	}
 
 	private heartbeat(): void {
@@ -1891,7 +2081,9 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 		}
 	}
 
-	private sendLease(connection: ConnectionState<M>, lease: Omit<SessionLeaseSnapshot, "type">): void {
+	private sendLease(connection: ConnectionState<M>, lease: SessionLeaseSnapshot): void {
+		if (lease.isController) connection.controlledSessions.add(lease.sessionHandle);
+		else connection.controlledSessions.delete(lease.sessionHandle);
 		this.send(connection, { type: "lease_status", ...lease });
 	}
 
@@ -2161,6 +2353,19 @@ function sessionErrorCode(errorText: string): string {
 	return match?.[1] ?? "session_error";
 }
 
+function sameLeaseTransition(left: SessionLeaseTransition, right: SessionLeaseTransition): boolean {
+	return (
+		left.serverEpoch === right.serverEpoch &&
+		left.sessionHandle === right.sessionHandle &&
+		left.generation === right.generation &&
+		left.leaseRevision === right.leaseRevision &&
+		left.controlState === right.controlState &&
+		left.transition === right.transition &&
+		left.ownerConnectionId === right.ownerConnectionId &&
+		left.fencingToken === right.fencingToken
+	);
+}
+
 function historyIdentity<M extends SessionRuntimeProductMode>(snapshot: BridgeSnapshot<M>) {
 	return {
 		serverEpoch: snapshot.serverEpoch,
@@ -2289,12 +2494,3 @@ function assertLogicalBytes(read: () => number, label: string): void {
 }
 
 export class SessionWsBridge extends SessionWsBridgeCore<"content_ref"> {}
-
-interface SessionLeaseSnapshot {
-	type: "lease_status";
-	serverEpoch: string;
-	sessionHandle: string;
-	generation: number;
-	isController: boolean;
-	fencingToken?: string;
-}
