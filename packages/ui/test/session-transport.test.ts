@@ -56,51 +56,6 @@ const EXPECTED_RESYNC_FRAME_LIMIT = 1_024;
 const EXPECTED_RESYNC_BYTE_LIMIT = 1024 * 1024;
 const EXPECTED_PENDING_EXTENSION_LIMIT = 256;
 
-interface TestLeaseRevision {
-	revision: number;
-	signature: string;
-}
-
-/** Upgrade pre-1.4 test fixtures into one strict, revisioned Gateway wire shape. */
-function normalizeTestLeaseStatus(message: object, revisions: Map<string, TestLeaseRevision>): object {
-	if (typeof message !== "object" || message === null || Array.isArray(message)) return message;
-	const candidate = message as Record<string, unknown>;
-	if (candidate.type !== "lease_status" || typeof candidate.isController !== "boolean") return message;
-	const serverEpoch = typeof candidate.serverEpoch === "string" ? candidate.serverEpoch : "";
-	const sessionHandle = typeof candidate.sessionHandle === "string" ? candidate.sessionHandle : "";
-	const generation = typeof candidate.generation === "number" ? candidate.generation : -1;
-	const key = `${serverEpoch}:${sessionHandle}:${String(generation)}`;
-	const controlState =
-		candidate.controlState === "held" || candidate.controlState === "free"
-			? candidate.controlState
-			: candidate.isController
-				? "held"
-				: "free";
-	const fencingToken = typeof candidate.fencingToken === "string" ? candidate.fencingToken : "";
-	const signature = `${controlState}:${String(candidate.isController)}:${fencingToken}`;
-	const known = revisions.get(key);
-	const explicitRevision =
-		typeof candidate.leaseRevision === "number" && Number.isSafeInteger(candidate.leaseRevision)
-			? candidate.leaseRevision
-			: undefined;
-	const revision = explicitRevision ?? (known ? known.revision + (known.signature === signature ? 0 : 1) : 0);
-	const transition =
-		candidate.transition === "baseline" ||
-		candidate.transition === "claim" ||
-		candidate.transition === "release" ||
-		candidate.transition === "takeover" ||
-		candidate.transition === "disconnect" ||
-		candidate.transition === "rekey"
-			? candidate.transition
-			: known && known.signature !== signature
-				? controlState === "held"
-					? "claim"
-					: "release"
-				: "baseline";
-	revisions.set(key, { revision, signature });
-	return { ...candidate, leaseRevision: revision, controlState, transition };
-}
-
 class FakeSocket implements SessionWebSocket {
 	readyState = 0;
 	onopen: (() => void) | null = null;
@@ -108,7 +63,6 @@ class FakeSocket implements SessionWebSocket {
 	onerror: (() => void) | null = null;
 	onmessage: ((event: { data: unknown }) => void) | null = null;
 	readonly sent: Array<SessionWsClientMessage | GatewayClientHelloDto> = [];
-	private readonly leaseRevisions = new Map<string, TestLeaseRevision>();
 	throwOnSend = false;
 
 	send(data: string): void {
@@ -127,7 +81,7 @@ class FakeSocket implements SessionWebSocket {
 	}
 
 	serverMessage(message: object): void {
-		this.onmessage?.({ data: JSON.stringify(normalizeTestLeaseStatus(message, this.leaseRevisions)) });
+		this.onmessage?.({ data: JSON.stringify(message) });
 	}
 
 	serverClose(): void {
@@ -848,6 +802,9 @@ describe("session transport Gateway negotiation", () => {
 			serverEpoch: first.serverEpoch,
 			sessionHandle: first.sessionHandle,
 			generation: first.generation,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
 			isController: false,
 		});
 
@@ -988,6 +945,9 @@ describe("session transport Gateway negotiation", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "hot-a",
 			generation: 1,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
 			isController: false,
 		});
 		const before = socket.sent.filter(({ type }) => type === "session_subscribe").length;
@@ -1032,6 +992,9 @@ describe("session transport Gateway negotiation", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "hot-a",
 			generation: 1,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
 			isController: false,
 		});
 		firstSocket.serverClose();
@@ -1137,6 +1100,9 @@ describe("session transport Gateway negotiation", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-parent",
 			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "child-fence",
 		});
@@ -1160,8 +1126,10 @@ describe("session transport Gateway negotiation", () => {
 			serverEpoch: child.serverEpoch,
 			sessionHandle: child.sessionHandle,
 			generation: child.generation,
-			isController: true,
-			fencingToken: "child-fence",
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "rekey",
+			isController: false,
 		});
 		const beforeInventory = socket.sent.filter(
 			(message) => message.type === "session_subscribe" && message.sessionHandle === child.sessionHandle,
@@ -1190,7 +1158,12 @@ describe("session transport Gateway negotiation", () => {
 		expect(h.controller.store.getState().sessions[child.sessionHandle]).toMatchObject({
 			baselineAuthoritative: true,
 			freshLeaseBaseline: child,
-			lease: { isController: true, fencingToken: "child-fence" },
+			lease: {
+				isController: false,
+				leaseRevision: 0,
+				controlState: "free",
+				transition: "rekey",
+			},
 		});
 	});
 
@@ -1409,6 +1382,9 @@ describe("session transport Gateway negotiation", () => {
 			serverEpoch: runtimeB.serverEpoch,
 			sessionHandle: runtimeB.sessionHandle,
 			generation: runtimeB.generation,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
 			isController: false,
 		});
 
@@ -1563,6 +1539,9 @@ describe("session transport Gateway negotiation", () => {
 			serverEpoch: active.serverEpoch,
 			sessionHandle: active.sessionHandle,
 			generation: active.generation,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
 			isController: false,
 		});
 		expect(socket.sent.filter(({ type }) => type === "session_claim")).toEqual([]);
@@ -2060,6 +2039,9 @@ describe("session transport replay and recovery", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
 			isController: false,
 		});
 		expect(socket.sent.filter(({ type }) => type === "session_claim")).toEqual([
@@ -2077,6 +2059,9 @@ describe("session transport replay and recovery", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "session-token",
 		});
@@ -2200,6 +2185,9 @@ describe("session transport replay and recovery", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "lease-before-incompatible",
 		});
@@ -2679,6 +2667,9 @@ describe("session transport replay and recovery", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "dialog-token",
 		});
@@ -2721,6 +2712,9 @@ describe("session transport replay and recovery", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "dialog-token",
 		});
@@ -2750,6 +2744,9 @@ describe("session transport replay and recovery", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "dialog-token",
 		});
@@ -2957,6 +2954,9 @@ describe("session transport replay and recovery", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "old-fence",
 		});
@@ -2970,6 +2970,9 @@ describe("session transport replay and recovery", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 2,
+			controlState: "free",
+			transition: "disconnect",
 			isController: false,
 		});
 
@@ -3048,6 +3051,9 @@ describe("session transport replay and recovery", () => {
 			serverEpoch: overflowed.serverEpoch,
 			sessionHandle: overflowed.sessionHandle,
 			generation: overflowed.generation,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
 			isController: false,
 		});
 		const failAttempt = () =>
@@ -3085,6 +3091,9 @@ describe("session transport replay and recovery", () => {
 			serverEpoch: overflowed.serverEpoch,
 			sessionHandle: overflowed.sessionHandle,
 			generation: overflowed.generation,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
 			isController: false,
 		});
 		expect(socket.sent.at(-1)).toEqual({ type: "session_claim", sessionHandle: "session-a" });
@@ -3093,6 +3102,9 @@ describe("session transport replay and recovery", () => {
 			serverEpoch: overflowed.serverEpoch,
 			sessionHandle: overflowed.sessionHandle,
 			generation: overflowed.generation,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "overflow-fence",
 		});
@@ -3179,6 +3191,9 @@ describe("session transport replay and recovery", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "fence",
 		});
@@ -3252,6 +3267,9 @@ describe("session transport replay and recovery", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "old-fence",
 		});
@@ -3280,6 +3298,9 @@ describe("session transport replay and recovery", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 2,
+			controlState: "held",
+			transition: "takeover",
 			isController: true,
 			fencingToken: "fresh-fence",
 		});
@@ -3301,6 +3322,9 @@ describe("session transport replay and recovery", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "old-fence",
 		});
@@ -3362,6 +3386,9 @@ describe("session transport commands and identity", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "session-token",
 		});
@@ -3430,6 +3457,9 @@ describe("session transport commands and identity", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-resolved",
 			generation: 7,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
 			isController: false,
 		});
 
@@ -3485,6 +3515,9 @@ describe("session transport commands and identity", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-parent",
 			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "parent-token",
 		});
@@ -3563,6 +3596,9 @@ describe("session transport commands and identity", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-parent",
 			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "parent-token",
 		});
@@ -3648,7 +3684,6 @@ describe("session transport commands and identity", () => {
 		});
 		expect(socket.sent.filter(({ type }) => type === "session_subscribe")).toEqual([
 			{ type: "session_subscribe", sessionHandle: "session-parent" },
-			{ type: "session_subscribe", sessionHandle: "session-child" },
 		]);
 	});
 
@@ -3661,6 +3696,9 @@ describe("session transport commands and identity", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "session-token",
 		});
@@ -3673,9 +3711,9 @@ describe("session transport commands and identity", () => {
 		expect(h.controller.store.getState().releaseSession("session-a")).toBe(true);
 		expect(h.controller.store.getState().sessions["session-a"]?.lease).toEqual({
 			isController: false,
-			leaseRevision: 0,
+			leaseRevision: 1,
 			controlState: "held",
-			transition: "baseline",
+			transition: "claim",
 		});
 		expect(leaseFrames).toEqual([]);
 		expect(
@@ -3774,6 +3812,125 @@ describe("session transport commands and identity", () => {
 		});
 	});
 
+	it("keeps a newer lease baseline after a delayed loser takeover error", () => {
+		const h = harness();
+		const socket = connect(h);
+		const sessionHandle = "session-takeover-late-error";
+		subscribeAndPrime(h, sessionHandle);
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: "test-server-epoch",
+			sessionHandle,
+			generation: 1,
+			leaseRevision: 7,
+			controlState: "held",
+			transition: "claim",
+			isController: false,
+		});
+		expect(h.controller.store.getState().takeoverSession(sessionHandle)).toBe(true);
+
+		// The Gateway serializes a winning transition before this loser's stale CAS
+		// error arrives. The r+1 recipient-local status is the fresh authority.
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: "test-server-epoch",
+			sessionHandle,
+			generation: 1,
+			leaseRevision: 8,
+			controlState: "held",
+			transition: "takeover",
+			isController: false,
+		});
+		socket.serverMessage({
+			type: "session_error",
+			serverEpoch: "test-server-epoch",
+			sessionHandle,
+			operation: "takeover",
+			error: "session_lease_revision_stale",
+			code: "session_lease_revision_stale",
+			retryable: true,
+		});
+
+		expect(h.controller.store.getState().sessions[sessionHandle]).toMatchObject({
+			freshLeaseBaseline: runtime(sessionHandle, 1, 0),
+			lease: {
+				leaseRevision: 8,
+				controlState: "held",
+				transition: "takeover",
+				isController: false,
+			},
+		});
+		expect(h.controller.store.getState().takeoverSession(sessionHandle)).toBe(true);
+		expect(socket.sent.at(-1)).toEqual({
+			type: "session_takeover",
+			sessionHandle,
+			expectedGeneration: 1,
+			expectedLeaseRevision: 8,
+		});
+	});
+
+	it.each([
+		{ transition: "claim" as const, leaseRevision: 1, fencingToken: "bridge-claim-fence" },
+		{ transition: "takeover" as const, leaseRevision: 2, fencingToken: "bridge-takeover-fence" },
+	])(
+		"accepts same-revision Bridge %s rebaselines for controller and observer recipients",
+		({ transition, leaseRevision, fencingToken }) => {
+			const sessionHandle = `session-bridge-${transition}-baseline`;
+			const controllerHarness = harness();
+			const observerHarness = harness();
+			const controllerSocket = connect(controllerHarness);
+			const observerSocket = connect(observerHarness);
+			subscribeAndPrime(controllerHarness, sessionHandle);
+			subscribeAndPrime(observerHarness, sessionHandle);
+
+			for (const { current, socket, isController } of [
+				{ current: controllerHarness, socket: controllerSocket, isController: true },
+				{ current: observerHarness, socket: observerSocket, isController: false },
+			]) {
+				socket.serverMessage({
+					type: "lease_status",
+					serverEpoch: "test-server-epoch",
+					sessionHandle,
+					generation: 1,
+					leaseRevision,
+					controlState: "held",
+					transition,
+					isController,
+					...(isController ? { fencingToken } : {}),
+				});
+				expect(
+					current.controller.reportProjectionFailure(sessionHandle, 1, new Error("controlled resync")),
+				).toBe(true);
+				expect(socket.sent.at(-1)).toEqual({ type: "session_subscribe", sessionHandle });
+				completeWithSnapshot(current, sessionHandle, 1, 0);
+				socket.serverMessage({
+					type: "lease_status",
+					serverEpoch: "test-server-epoch",
+					sessionHandle,
+					generation: 1,
+					leaseRevision,
+					controlState: "held",
+					transition: "baseline",
+					isController,
+					...(isController ? { fencingToken } : {}),
+				});
+				const channel = current.controller.store.getState().sessions[sessionHandle];
+				expect(channel).toMatchObject({
+					baselineAuthoritative: true,
+					freshLeaseBaseline: runtime(sessionHandle, 1, 0),
+					lease: {
+						leaseRevision,
+						controlState: "held",
+						transition,
+						isController,
+					},
+				});
+				if (isController) expect(channel?.lease.fencingToken).toBe(fencingToken);
+				else expect(Object.hasOwn(channel?.lease ?? {}, "fencingToken")).toBe(false);
+			}
+		},
+	);
+
 	it("fails closed on same-revision lease contradictions until a newer authoritative status arrives", async () => {
 		const h = harness();
 		const socket = connect(h);
@@ -3850,6 +4007,9 @@ describe("session transport commands and identity", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "owner-token",
 		});
@@ -3863,6 +4023,9 @@ describe("session transport commands and identity", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 2,
+			controlState: "free",
+			transition: "release",
 			isController: false,
 		});
 		await flushPromises();
@@ -3899,6 +4062,9 @@ describe("session transport commands and identity", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "late-token",
 		});
@@ -3922,6 +4088,9 @@ describe("session transport commands and identity", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "token-a",
 		});
@@ -3967,6 +4136,9 @@ describe("session transport commands and identity", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "token-a",
 		});
@@ -3975,6 +4147,9 @@ describe("session transport commands and identity", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-b",
 			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "token-b",
 		});
@@ -3994,6 +4169,9 @@ describe("session transport commands and identity", () => {
 				serverEpoch: "test-server-epoch",
 				sessionHandle,
 				generation: 1,
+				leaseRevision: sessionHandle === "session-observer" ? 0 : 2,
+				controlState: "free",
+				transition: sessionHandle === "session-observer" ? "baseline" : "disconnect",
 				isController: false,
 			});
 		}
@@ -4008,6 +4186,9 @@ describe("session transport commands and identity", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 3,
+			controlState: "held",
+			transition: "claim",
 			isController: false,
 		});
 		expect(second.sent.filter(({ type }) => type === "session_claim")).toHaveLength(2);
@@ -4045,6 +4226,9 @@ describe("session transport commands and identity", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
 			isController: false,
 		});
 		expect(socket.sent.filter(({ type }) => type === "session_claim")).toEqual([
@@ -4081,6 +4265,9 @@ describe("session transport commands and identity", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-observer",
 			generation: 1,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
 			isController: false,
 		});
 		socket.serverMessage({
@@ -4088,6 +4275,9 @@ describe("session transport commands and identity", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
 			isController: false,
 		});
 		expect(socket.sent.filter(({ type }) => type === "session_claim")).toEqual([

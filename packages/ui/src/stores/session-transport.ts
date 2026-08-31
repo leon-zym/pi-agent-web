@@ -509,6 +509,16 @@ function identitiesMatch(
 
 type LeaseStatusMessage = Extract<InlineSessionWsServerMessage, { type: "lease_status" }>;
 
+interface PendingLeaseStatus {
+	message: LeaseStatusMessage;
+	expectedBaseline: boolean;
+}
+
+interface TakeoverAttempt {
+	identity: SessionRuntimeIdentityDto;
+	leaseRevision: number;
+}
+
 function leaseStateFrom(message: LeaseStatusMessage): SessionLeaseState {
 	return {
 		isController: message.isController,
@@ -520,11 +530,20 @@ function leaseStateFrom(message: LeaseStatusMessage): SessionLeaseState {
 }
 
 function leaseStatusMatchesState(message: LeaseStatusMessage, state: SessionLeaseState): boolean {
+	return leaseStatusSemanticsMatchState(message, state) && state.transition === message.transition;
+}
+
+/**
+ * A cursorless re-subscribe may deliver the current lease as `baseline` at the
+ * same revision as the locally recorded owner transition. The delivery is
+ * authoritative, but it is not a second transition. Keep the transition
+ * provenance separate from the recipient-local lease semantics.
+ */
+function leaseStatusSemanticsMatchState(message: LeaseStatusMessage, state: SessionLeaseState): boolean {
 	return (
 		state.conflicted !== true &&
 		state.leaseRevision === message.leaseRevision &&
 		state.controlState === message.controlState &&
-		state.transition === message.transition &&
 		state.isController === message.isController &&
 		state.fencingToken === message.fencingToken
 	);
@@ -598,9 +617,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	const deliveredNotifyKeys = new Map<string, DeliveredNotifyKeys>();
 	let deliveredNotifyIdentityOrder: string[] = [];
 	const claimAttempts = new Set<string>();
-	const takeoverAttempts = new Set<string>();
+	const takeoverAttempts = new Map<string, TakeoverAttempt>();
 	const releasedControlIntents = new Set<string>();
-	const pendingLeaseStatuses = new Map<string, LeaseStatusMessage>();
+	const pendingLeaseStatuses = new Map<string, PendingLeaseStatus>();
 	const pendingOverflowRestarts = new Map<string, SessionRuntimeIdentityDto>();
 	const baselineRefreshes = new Set<string>();
 	const subscriptionBaselines = new Map<string, string | null>();
@@ -1534,7 +1553,10 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		) {
 			return false;
 		}
-		takeoverAttempts.add(sessionHandle);
+		takeoverAttempts.set(sessionHandle, {
+			identity: runtime,
+			leaseRevision,
+		});
 		if (
 			sendWire({
 				type: "session_takeover",
@@ -3156,7 +3178,19 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		} else if (message.operation === "takeover") {
 			// Takeover is an explicit one-shot request. A newer lease view may permit a later user action,
 			// but transport never turns a retryable error into a queued or automatic retry.
+			const attempt = takeoverAttempts.get(message.sessionHandle);
 			takeoverAttempts.delete(message.sessionHandle);
+			const errorIsStaleAgainstCurrentLease =
+				!attempt ||
+				!identitiesMatch(current.runtime, attempt.identity) ||
+				(typeof current.lease.leaseRevision === "number" &&
+					current.lease.leaseRevision > attempt.leaseRevision);
+			if (errorIsStaleAgainstCurrentLease) {
+				// A loser can receive its CAS error after a newer recipient-local
+				// lease_status. Do not erase that newer authoritative baseline.
+				frameBus.emit(message.sessionHandle, message, now());
+				return;
+			}
 			// The rejected CAS proves that the local observation is no longer an action-safe
 			// lease baseline. Keep the diagnostic global state, but fence any repeat until
 			// the Gateway supplies a fresh recipient-local lease_status.
@@ -3649,15 +3683,36 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		}));
 	}
 
-	function deferLeaseUntilBaseline(message: LeaseStatusMessage): void {
+	function isExpectedLeaseBaseline(message: LeaseStatusMessage, current: SessionChannelState): boolean {
+		const expectedIdentity = subscriptionBaselines.get(message.sessionHandle);
+		return (
+			message.transition === "baseline" &&
+			current.runtime !== null &&
+			subscriptionBaselines.has(message.sessionHandle) &&
+			(expectedIdentity === null || expectedIdentity === identityKey(current.runtime))
+		);
+	}
+
+	function consumeSubscriptionBaseline(
+		sessionHandle: string,
+		runtime: SessionRuntimeIdentityDto | null,
+	): void {
+		if (runtime === null || !subscriptionBaselines.has(sessionHandle)) return;
+		const expectedIdentity = subscriptionBaselines.get(sessionHandle);
+		if (expectedIdentity === null || expectedIdentity === identityKey(runtime)) {
+			subscriptionBaselines.delete(sessionHandle);
+		}
+	}
+
+	function deferLeaseUntilBaseline(message: LeaseStatusMessage, expectedBaseline: boolean): void {
 		const pending = pendingLeaseStatuses.get(message.sessionHandle);
-		if (!pending || message.leaseRevision > pending.leaseRevision) {
-			pendingLeaseStatuses.set(message.sessionHandle, message);
+		if (!pending || message.leaseRevision > pending.message.leaseRevision) {
+			pendingLeaseStatuses.set(message.sessionHandle, { message, expectedBaseline });
 			return;
 		}
 		if (
-			message.leaseRevision === pending.leaseRevision &&
-			!leaseStatusMatchesState(message, leaseStateFrom(pending))
+			message.leaseRevision === pending.message.leaseRevision &&
+			!leaseStatusMatchesState(message, leaseStateFrom(pending.message))
 		) {
 			failClosedLeaseView(message.sessionHandle, message);
 		}
@@ -3667,16 +3722,16 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		const pending = pendingLeaseStatuses.get(identity.sessionHandle);
 		if (
 			!pending ||
-			pending.serverEpoch !== identity.serverEpoch ||
-			pending.generation !== identity.generation
+			pending.message.serverEpoch !== identity.serverEpoch ||
+			pending.message.generation !== identity.generation
 		) {
 			return;
 		}
 		pendingLeaseStatuses.delete(identity.sessionHandle);
-		handleLease(pending);
+		handleLease(pending.message, pending.expectedBaseline);
 	}
 
-	function handleLease(message: LeaseStatusMessage): void {
+	function handleLease(message: LeaseStatusMessage, expectedBaseline = false): void {
 		const current = store.getState().sessions[message.sessionHandle];
 		if (
 			!current?.subscribed ||
@@ -3686,7 +3741,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			return;
 		}
 		if (!current.baselineAuthoritative) {
-			deferLeaseUntilBaseline(message);
+			deferLeaseUntilBaseline(message, isExpectedLeaseBaseline(message, current));
 			return;
 		}
 		if (message.isController && releasedControlIntents.has(message.sessionHandle)) {
@@ -3696,19 +3751,22 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			return;
 		}
 		const knownRevision = current.lease.leaseRevision;
+		const controlledBaseline = expectedBaseline || isExpectedLeaseBaseline(message, current);
+		let preserveTransitionProvenance = false;
 		if (knownRevision !== undefined) {
 			if (message.leaseRevision < knownRevision) return;
 			if (message.leaseRevision === knownRevision) {
-				if (!leaseStatusMatchesState(message, current.lease)) {
+				if (leaseStatusMatchesState(message, current.lease)) {
+					if (hasFreshLeaseBaseline(current)) return;
+				} else if (controlledBaseline && leaseStatusSemanticsMatchState(message, current.lease)) {
+					preserveTransitionProvenance = true;
+				} else {
 					failClosedLeaseView(message.sessionHandle, message);
 					return;
 				}
-				if (hasFreshLeaseBaseline(current)) return;
 			}
 		}
-		if (subscriptionBaselines.get(message.sessionHandle) === identityKey(current.runtime)) {
-			subscriptionBaselines.delete(message.sessionHandle);
-		}
+		consumeSubscriptionBaseline(message.sessionHandle, current.runtime);
 		if (!message.isController) releasedControlIntents.delete(message.sessionHandle);
 		takeoverAttempts.delete(message.sessionHandle);
 		setChannel(message.sessionHandle, (channel) => ({
@@ -3716,7 +3774,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			freshLeaseBaseline: channel.runtime,
 			subscriptionAdmission:
 				channel.subscriptionAdmission?.kind === "rejected" ? null : channel.subscriptionAdmission,
-			lease: leaseStateFrom(message),
+			lease: preserveTransitionProvenance ? channel.lease : leaseStateFrom(message),
 		}));
 		frameBus.emit(message.sessionHandle, message, now());
 		if (current.runtime) advanceExactHotRecovery(current.runtime, "lease");
@@ -3938,7 +3996,6 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			subscriptionAdmission:
 				current.subscriptionAdmission?.kind === "rejected" ? null : current.subscriptionAdmission,
 		}));
-		subscriptionBaselines.delete(identity.sessionHandle);
 		baselineRefreshes.delete(identity.sessionHandle);
 		resyncBuffers.delete(key);
 		resyncBufferBytes.delete(key);
