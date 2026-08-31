@@ -14,6 +14,7 @@ import {
 	openSession,
 	renameSession,
 } from "../src/lib/session-controller";
+import { selectSessionControlStatus } from "../src/stores/session-control";
 import { selectCurrentWorkspaceSessions, useSessionDirectoryStore } from "../src/stores/session-directory";
 import {
 	emptySessionHistoryState,
@@ -50,6 +51,36 @@ function runtime(sessionHandle: string, workspaceHandle: string): SessionRuntime
 		state: "idle",
 		lastActivityAt: 1,
 		recoverable: true,
+	};
+}
+
+function transportChannel(
+	sessionHandle: string,
+	controlState: "free" | "held",
+	baselineAuthoritative: boolean,
+): SessionChannelState {
+	const runtimeValue = runtime(sessionHandle, "workspace-a");
+	return {
+		sessionHandle,
+		subscribed: true,
+		controllerIntent: false,
+		runtime: runtimeValue,
+		generation: runtimeValue.generation,
+		baselineAuthoritative,
+		freshLeaseBaseline: baselineAuthoritative ? runtimeValue : null,
+		lastSeq: 0,
+		projectedSeq: 0,
+		lease: {
+			isController: false,
+			leaseRevision: 0,
+			controlState,
+			transition: "baseline",
+		},
+		pendingExtensionRequests: [],
+		resync: null,
+		recovery: null,
+		history: emptySessionHistoryState(),
+		rawEvents: [],
 	};
 }
 
@@ -950,11 +981,20 @@ describe("Session-scoped controls", () => {
 		).toBe(false);
 	});
 
-	it("opens an observer Session without requiring a controller lease", async () => {
+	it("waits for a free authoritative baseline before claiming a persisted observer Session", async () => {
 		const observerSession = session("session-observer", "workspace-a");
+		const otherSession = session("session-other", "workspace-a");
 		const activateWorkspace = vi.spyOn(api, "activateWorkspace").mockResolvedValue(workspace("workspace-a"));
 		vi.spyOn(api, "listSessions").mockResolvedValue(nativeList([observerSession]));
 		const { subscribeSession, claimSession } = isolateTransportActions();
+		subscribeSession.mockImplementation((sessionHandle: string) => {
+			sessionTransport.store.setState((state) => ({
+				sessions: {
+					...state.sessions,
+					[sessionHandle]: transportChannel(sessionHandle, "held", false),
+				},
+			}));
+		});
 		useSessionDirectoryStore.setState({
 			workspaces: [workspace("workspace-a")],
 			currentWorkspaceHandle: "workspace-a",
@@ -967,8 +1007,54 @@ describe("Session-scoped controls", () => {
 
 		expect(useSessionDirectoryStore.getState().currentSession).toEqual(observerSession);
 		expect(subscribeSession).toHaveBeenCalledWith("session-observer");
+		expect(claimSession).not.toHaveBeenCalled();
+
+		const heldBaseline = transportChannel("session-observer", "held", true);
+		sessionTransport.store.setState((state) => ({
+			sessions: {
+				...state.sessions,
+				[heldBaseline.sessionHandle]: heldBaseline,
+				[otherSession.sessionHandle]: transportChannel("session-other", "free", true),
+			},
+		}));
+		expect(claimSession).not.toHaveBeenCalled();
+		expect(
+			selectSessionControlStatus({
+				connectionState: "online",
+				channel: heldBaseline,
+				sessionHandle: heldBaseline.sessionHandle,
+			}).canTakeOver,
+		).toBe(true);
+		expect(sessionTransport.store.getState().sessions[otherSession.sessionHandle]?.lease.controlState).toBe(
+			"free",
+		);
+
+		sessionTransport.store.setState((state) => ({
+			sessions: {
+				...state.sessions,
+				[heldBaseline.sessionHandle]: transportChannel("session-observer", "free", true),
+			},
+		}));
+		expect(claimSession).toHaveBeenCalledTimes(1);
 		expect(claimSession).toHaveBeenCalledWith("session-observer");
 		expect(activateWorkspace).toHaveBeenCalledWith("workspace-a");
+	});
+
+	it("claims an explicitly unpersisted runtime Session immediately", async () => {
+		const transientSession = {
+			...session("session-transient", "workspace-a"),
+			persisted: false,
+			sessionFile: null,
+			runtime: { ...runtime("session-transient", "workspace-a"), sessionFile: null, recoverable: false },
+		};
+		vi.spyOn(api, "activateWorkspace").mockResolvedValue(workspace("workspace-a"));
+		vi.spyOn(api, "listSessions").mockResolvedValue(nativeList([]));
+		const { subscribeSession, claimSession } = isolateTransportActions();
+		await openSession(transientSession);
+
+		expect(subscribeSession).toHaveBeenCalledWith("session-transient");
+		expect(claimSession).toHaveBeenCalledTimes(1);
+		expect(claimSession).toHaveBeenCalledWith("session-transient");
 	});
 
 	it("opens the exact cross-Workspace Session without an intermediate cached selection", async () => {
