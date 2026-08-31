@@ -1,9 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Page, TestInfo } from "@playwright/test";
-import matrix from "./matrix.json" with { type: "json" };
 
 export type BenchmarkTier = "representative" | "stress";
+export type BenchmarkVariant = "coalesced" | "sequential";
 export type BenchmarkKind =
 	| "streaming"
 	| "concurrency"
@@ -14,7 +15,9 @@ export type BenchmarkKind =
 
 export interface BenchmarkScenario {
 	id: string;
+	domain: string;
 	kind: BenchmarkKind;
+	requiredCapabilities: string[];
 	warmups: number;
 	samples: number;
 	targetBytes?: number;
@@ -24,6 +27,7 @@ export interface BenchmarkScenario {
 	sourceBytes?: number;
 	turns?: number;
 	inputBytes?: number;
+	historyReadMode?: "verified_nonempty_native";
 }
 
 export interface BenchmarkTrial {
@@ -59,15 +63,20 @@ export interface BenchmarkOutcome {
 }
 
 export interface BenchmarkScenarioResult {
-	schemaVersion: 1;
+	schemaVersion: 2;
+	suiteVersion: 2;
 	tier: BenchmarkTier;
+	runId: string;
 	scenarioId: string;
+	domain: string;
+	variant: BenchmarkVariant;
 	kind: BenchmarkKind;
 	status: "passed" | "failed";
 	startedAt: string;
 	finishedAt: string;
 	browserVersion: string;
 	parameters: BenchmarkScenario;
+	capabilities: Record<string, boolean>;
 	trials: BenchmarkTrial[];
 	summaries: Record<string, BenchmarkMetricSummary>;
 	gates: BenchmarkGate[];
@@ -100,6 +109,65 @@ function isTier(value: string | undefined): value is BenchmarkTier {
 	return value === "representative" || value === "stress";
 }
 
+function isVariant(value: string | undefined): value is BenchmarkVariant {
+	return value === "coalesced" || value === "sequential";
+}
+
+const configDirectory = path.dirname(fileURLToPath(import.meta.url));
+const rootMatrixPath = path.join(configDirectory, "matrix.json");
+
+interface MatrixDomainEntry {
+	id: string;
+	path: string;
+}
+
+interface DomainMatrix {
+	schemaVersion: number;
+	id: string;
+	requiredCapabilities: string[];
+	tiers: Record<BenchmarkTier, { scenarios: Omit<BenchmarkScenario, "domain" | "requiredCapabilities">[] }>;
+}
+
+function loadScenarios(tier: BenchmarkTier): BenchmarkScenario[] {
+	const root = JSON.parse(fs.readFileSync(rootMatrixPath, "utf8")) as {
+		schemaVersion?: unknown;
+		domains?: unknown;
+	};
+	if (root.schemaVersion !== 2 || !Array.isArray(root.domains)) {
+		throw new Error("Benchmark root matrix must use schema version 2");
+	}
+	const domains = root.domains as MatrixDomainEntry[];
+	const scenarios: BenchmarkScenario[] = [];
+	for (const entry of domains) {
+		if (
+			typeof entry?.id !== "string" ||
+			typeof entry.path !== "string" ||
+			path.isAbsolute(entry.path) ||
+			entry.path.includes("..")
+		) {
+			throw new Error("Benchmark root matrix has an invalid domain entry");
+		}
+		const domainPath = path.join(configDirectory, entry.path);
+		const domain = JSON.parse(fs.readFileSync(domainPath, "utf8")) as DomainMatrix;
+		if (
+			domain.schemaVersion !== 2 ||
+			domain.id !== entry.id ||
+			!Array.isArray(domain.requiredCapabilities) ||
+			!Array.isArray(domain.tiers?.[tier]?.scenarios)
+		) {
+			throw new Error(`Benchmark domain matrix is invalid: ${entry.id}`);
+		}
+		for (const scenario of domain.tiers[tier].scenarios) {
+			scenarios.push({
+				...scenario,
+				domain: domain.id,
+				requiredCapabilities: [...domain.requiredCapabilities],
+			});
+		}
+	}
+	return scenarios;
+}
+
 export function benchmarkTier(): BenchmarkTier {
 	const value = process.env.PI_WEB_BENCHMARK_TIER;
 	if (!isTier(value)) {
@@ -108,9 +176,23 @@ export function benchmarkTier(): BenchmarkTier {
 	return value;
 }
 
+export function benchmarkRunId(): string {
+	const value = process.env.PI_WEB_BENCHMARK_RUN_ID;
+	if (!value || !/^[a-z0-9][a-z0-9._-]{0,127}$/i.test(value)) {
+		throw new Error("PI_WEB_BENCHMARK_RUN_ID must be a safe artifact directory name");
+	}
+	return value;
+}
+
+export function benchmarkVariant(): BenchmarkVariant {
+	const value = process.env.PI_WEB_BENCHMARK_VARIANT;
+	if (!isVariant(value)) throw new Error("PI_WEB_BENCHMARK_VARIANT must be coalesced or sequential");
+	return value;
+}
+
 export function scenariosFor(kind: BenchmarkKind): BenchmarkScenario[] {
 	const tier = benchmarkTier();
-	return (matrix.tiers[tier].scenarios as BenchmarkScenario[]).filter((scenario) => scenario.kind === kind);
+	return loadScenarios(tier).filter((scenario) => scenario.kind === kind);
 }
 
 function measuredValues(trials: BenchmarkTrial[], metric: string): number[] {
@@ -205,7 +287,7 @@ function summariesFor(trials: BenchmarkTrial[]): Record<string, BenchmarkMetricS
 }
 
 function errorText(error: unknown): string {
-	return error instanceof Error ? (error.stack ?? error.message) : String(error);
+	return error instanceof Error ? error.message : String(error);
 }
 
 function rawDirectory(): string {
@@ -216,6 +298,27 @@ function rawDirectory(): string {
 	return directory;
 }
 
+async function browserCapabilities(page: Page): Promise<Record<string, boolean>> {
+	const browser = page.context().browser();
+	const observed = await page.evaluate(() => {
+		const performanceWithMemory = performance as Performance & { memory?: { usedJSHeapSize?: unknown } };
+		return {
+			browser: true,
+			longtask: PerformanceObserver.supportedEntryTypes?.includes("longtask") === true,
+			"precise-memory": typeof performanceWithMemory.memory?.usedJSHeapSize === "number",
+			websocket: typeof WebSocket === "function",
+		};
+	});
+	return { ...observed, cdp: browser?.browserType().name() === "chromium" };
+}
+
+function scenarioDirectory(scenario: BenchmarkScenario): string {
+	if (!/^[a-z0-9][a-z0-9._-]*$/i.test(scenario.id)) {
+		throw new Error(`Benchmark scenario id is not safe for an artifact directory: ${scenario.id}`);
+	}
+	return path.join(rawDirectory(), scenario.id);
+}
+
 export async function runBenchmarkScenario(
 	page: Page,
 	testInfo: TestInfo,
@@ -223,6 +326,8 @@ export async function runBenchmarkScenario(
 	execute: (outcome: BenchmarkOutcome) => Promise<void>,
 ): Promise<void> {
 	const tier = benchmarkTier();
+	const runId = benchmarkRunId();
+	const variant = benchmarkVariant();
 	const startedAt = new Date().toISOString();
 	const outcome: BenchmarkOutcome = { trials: [], gates: [], notes: [] };
 	const errors: string[] = [];
@@ -248,27 +353,59 @@ export async function runBenchmarkScenario(
 			`scenario recorded ${String(outcome.trials.length)} trials; expected ${String(expectedTrials)}`,
 		);
 	}
+	let capabilities: Record<string, boolean>;
+	try {
+		capabilities = await browserCapabilities(page);
+	} catch (error) {
+		errors.push(`benchmark capability observation failed: ${errorText(error)}`);
+		capabilities = Object.fromEntries(scenario.requiredCapabilities.map((capability) => [capability, false]));
+	}
 	const result: BenchmarkScenarioResult = {
-		schemaVersion: 1,
+		schemaVersion: 2,
+		suiteVersion: 2,
 		tier,
+		runId,
 		scenarioId: scenario.id,
+		domain: scenario.domain,
+		variant,
 		kind: scenario.kind,
 		status: errors.length === 0 ? "passed" : "failed",
 		startedAt,
 		finishedAt: new Date().toISOString(),
 		browserVersion: page.context().browser()?.version() ?? "unknown",
 		parameters: scenario,
+		capabilities,
 		trials: outcome.trials,
 		summaries: summariesFor(outcome.trials),
 		gates: outcome.gates,
 		notes: outcome.notes,
 		errors,
 	};
-	const directory = rawDirectory();
+	const directory = scenarioDirectory(scenario);
 	fs.mkdirSync(directory, { recursive: true });
-	const resultPath = path.join(directory, `${scenario.id}.json`);
+	for (const trial of result.trials) {
+		const rawTrial = {
+			schemaVersion: result.schemaVersion,
+			suiteVersion: result.suiteVersion,
+			tier: result.tier,
+			runId: result.runId,
+			scenarioId: result.scenarioId,
+			domain: result.domain,
+			variant: result.variant,
+			kind: result.kind,
+			parameters: result.parameters,
+			capabilities: result.capabilities,
+			trial,
+		};
+		fs.writeFileSync(
+			path.join(directory, `${variant}-${String(trial.index)}.json`),
+			`${JSON.stringify(rawTrial, null, 2)}\n`,
+			"utf8",
+		);
+	}
+	const resultPath = path.join(directory, `${variant}.result.json`);
 	fs.writeFileSync(resultPath, `${JSON.stringify(result, null, 2)}\n`, "utf8");
-	await testInfo.attach(`${scenario.id}.json`, {
+	await testInfo.attach(`${scenario.id}-${variant}.result.json`, {
 		path: resultPath,
 		contentType: "application/json",
 	});

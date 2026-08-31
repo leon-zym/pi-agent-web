@@ -356,7 +356,9 @@ for (const scenario of scenariosFor("recovery-crash")) {
 				"hard",
 				"Browser errors invalidate crash recovery.",
 			);
-			outcome.notes.push("Gateway process restart remains outside this harness and is not claimed here.");
+			outcome.notes.push(
+				"Gateway restart is available through the common production harness, but no restart workload is added to this inherited recovery matrix.",
+			);
 		});
 	});
 }
