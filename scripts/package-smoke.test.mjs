@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -7,8 +8,11 @@ import { gunzipSync, gzipSync } from "node:zlib";
 import { createDeterministicTarGz } from "./create-release-bundle.mjs";
 import {
 	assertInstalledProductIsolation,
+	createOwnedProcessTree,
 	inspectPackageTarballs,
 	PACKAGE_NAMES,
+	resolvePackageManagerCommand,
+	terminateOwnedProcessTree,
 } from "./lib/package-smoke.mjs";
 
 const tempRoots = [];
@@ -76,6 +80,50 @@ function writePackageTarball(root, name, manifest = {}, options = {}) {
 	const tarball = path.join(root, `${name.replace("/", "-")}.tgz`);
 	fs.writeFileSync(tarball, archive);
 	return tarball;
+}
+
+class FakeChild extends EventEmitter {
+	constructor(pid = 4101) {
+		super();
+		this.pid = pid;
+		this.exitCode = null;
+		this.signalCode = null;
+	}
+
+	exit(code = 0, signal = null) {
+		this.exitCode = code;
+		this.signalCode = signal;
+		this.emit("exit", code, signal);
+	}
+}
+
+function ownedTreeFixture({ onSignal, platform = "linux" } = {}) {
+	const child = new FakeChild();
+	const state = { groupAlive: true, leaderAlive: true, now: 0, signals: [], taskkills: 0 };
+	const operations = {
+		platform,
+		now: () => state.now,
+		processExists: () => state.leaderAlive,
+		processGroupExists: () => state.groupAlive,
+		signalProcessGroup: (_groupId, signal) => {
+			state.signals.push(signal);
+			onSignal?.({ child, signal, state });
+			return true;
+		},
+		sleep: async (milliseconds) => {
+			state.now += milliseconds;
+		},
+		taskkillProcessTree: () => {
+			state.taskkills += 1;
+			onSignal?.({ child, signal: "TASKKILL", state });
+			return true;
+		},
+	};
+	return {
+		child,
+		state,
+		tree: createOwnedProcessTree(child, { detached: platform !== "win32", operations }),
+	};
 }
 
 afterEach(() => {
@@ -155,4 +203,88 @@ test("requires installed product packages to be real paths outside the workspace
 		() => assertInstalledProductIsolation({ installDir, repositoryRoot: process.cwd() }),
 		/must not be a symlink/,
 	);
+});
+
+test("cleans a live owned POSIX group with TERM", async () => {
+	const { tree, state } = ownedTreeFixture({
+		onSignal: ({ child, signal, state: fixtureState }) => {
+			if (signal === "SIGTERM") {
+				fixtureState.groupAlive = false;
+				fixtureState.leaderAlive = false;
+				child.exit();
+			}
+		},
+	});
+	await terminateOwnedProcessTree(tree, { termTimeoutMs: 10, killTimeoutMs: 10, pollIntervalMs: 1 });
+	assert.deepEqual(state.signals, ["SIGTERM"]);
+});
+
+test("cleans an early-exited owned group but fails the smoke", async () => {
+	const { child, tree, state } = ownedTreeFixture({
+		onSignal: ({ signal, state: fixtureState }) => {
+			if (signal === "SIGTERM") {
+				fixtureState.groupAlive = false;
+				fixtureState.leaderAlive = false;
+			}
+		},
+	});
+	state.leaderAlive = false;
+	child.exit(1);
+	await assert.rejects(
+		() => terminateOwnedProcessTree(tree, { termTimeoutMs: 10, killTimeoutMs: 10, pollIntervalMs: 1 }),
+		/exited before controlled shutdown/,
+	);
+	assert.deepEqual(state.signals, ["SIGTERM"]);
+});
+
+test("refuses to signal a reused saved POSIX PID or process group", async () => {
+	const { child, tree, state } = ownedTreeFixture();
+	child.exit(1);
+	state.leaderAlive = true;
+	await assert.rejects(
+		() => terminateOwnedProcessTree(tree, { termTimeoutMs: 10, killTimeoutMs: 10, pollIntervalMs: 1 }),
+		/saved process-group identity is no longer valid/,
+	);
+	assert.deepEqual(state.signals, []);
+});
+
+test("uses a bounded TERM-to-KILL sequence only while the saved group is valid", async () => {
+	const { tree, state } = ownedTreeFixture({
+		onSignal: ({ signal, state: fixtureState }) => {
+			if (signal === "SIGKILL") {
+				fixtureState.groupAlive = false;
+				fixtureState.leaderAlive = false;
+			}
+		},
+	});
+	await terminateOwnedProcessTree(tree, { termTimeoutMs: 4, killTimeoutMs: 4, pollIntervalMs: 1 });
+	assert.deepEqual(state.signals, ["SIGTERM", "SIGKILL"]);
+	assert.ok(state.now <= 8);
+});
+
+test("uses bounded Windows tree cleanup only while the root identity is live", async () => {
+	const { tree, state } = ownedTreeFixture({
+		platform: "win32",
+		onSignal: ({ signal, state: fixtureState }) => {
+			if (signal === "TASKKILL") fixtureState.leaderAlive = false;
+		},
+	});
+	await terminateOwnedProcessTree(tree, { termTimeoutMs: 10, killTimeoutMs: 10, pollIntervalMs: 1 });
+	assert.equal(state.taskkills, 1);
+});
+
+test("selects a Windows npm-family wrapper through its Node entrypoint without a shell string", () => {
+	const root = tempRoot();
+	const wrapperPath = path.join(root, "npx.cmd");
+	const entryPath = path.join(root, "node_modules", "npm", "bin", "npx-cli.js");
+	fs.mkdirSync(path.dirname(entryPath), { recursive: true });
+	fs.writeFileSync(entryPath, "// fixture\n");
+	fs.writeFileSync(wrapperPath, '@echo off\r\n"%dp0%\\node_modules\\npm\\bin\\npx-cli.js" %*\r\n');
+	const invocation = resolvePackageManagerCommand("npx", {
+		platform: "win32",
+		env: { PATH: root },
+		executableResolver: () => wrapperPath,
+	});
+	assert.equal(invocation.command, process.execPath);
+	assert.deepEqual(invocation.argsPrefix, [entryPath]);
 });

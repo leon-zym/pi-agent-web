@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { extractTarEntries, readGzipTarEntries } from "./archive.mjs";
 
 export const REPOSITORY_ROOT = path.resolve(fileURLToPath(new URL("../../", import.meta.url)));
 
@@ -23,7 +24,17 @@ export function sha256File(filePath) {
 
 export function run(command, args, options = {}) {
 	const { cwd = REPOSITORY_ROOT, env = process.env, timeoutMs = 120_000 } = options;
-	const result = spawnSync(command, args, { cwd, env, encoding: "utf8", stdio: "pipe", timeout: timeoutMs });
+	const invocation =
+		command === "npm" || command === "npx" || command === "pnpm"
+			? resolvePackageManagerCommand(command, { env })
+			: { command, argsPrefix: [] };
+	const result = spawnSync(invocation.command, [...invocation.argsPrefix, ...args], {
+		cwd,
+		env,
+		encoding: "utf8",
+		stdio: "pipe",
+		timeout: timeoutMs,
+	});
 	if (result.status !== 0) {
 		throw new Error(`${command} ${args.join(" ")} failed:\n${result.stdout ?? ""}\n${result.stderr ?? ""}`);
 	}
@@ -31,11 +42,32 @@ export function run(command, args, options = {}) {
 }
 
 export function packageManifest(tarball, options = {}) {
-	return JSON.parse(run("tar", ["-xOf", tarball, "package/package.json"], options));
+	const entries = readPackageTarball(tarball, options);
+	return packageManifestFromEntries(entries, tarball);
 }
 
 export function listTarballEntries(tarball, options = {}) {
-	return run("tar", ["-tzf", tarball], options).split("\n").filter(Boolean);
+	return archiveEntryNames(readPackageTarball(tarball, options));
+}
+
+function readPackageTarball(tarball) {
+	return readGzipTarEntries(fs.readFileSync(tarball));
+}
+
+function archiveEntryNames(entries) {
+	return entries.map((entry) => (entry.type === "directory" ? `${entry.path}/` : entry.path));
+}
+
+function packageManifestFromEntries(entries, tarball) {
+	const entry = entries.find(
+		(candidate) => candidate.path === "package/package.json" && candidate.type === "file",
+	);
+	if (!entry) throw new Error(`Missing package/package.json in ${path.basename(tarball)}`);
+	try {
+		return JSON.parse(entry.content.toString("utf8"));
+	} catch (error) {
+		throw new Error(`Invalid package/package.json in ${path.basename(tarball)}`, { cause: error });
+	}
 }
 
 function hasPackageFile(entries, directory) {
@@ -56,7 +88,8 @@ export function inspectPackageTarballs(tarballs, options = {}) {
 	const expectedNames = new Set(PACKAGE_NAMES);
 	const inspected = tarballs
 		.map((tarball) => {
-			const entries = listTarballEntries(tarball);
+			const archiveEntries = readPackageTarball(tarball);
+			const entries = archiveEntryNames(archiveEntries);
 			if (!hasPackageFile(entries, "dist")) {
 				throw new Error(`Missing dist directory in ${path.basename(tarball)}`);
 			}
@@ -66,7 +99,7 @@ export function inspectPackageTarballs(tarballs, options = {}) {
 			if (hasPackagePath(entries, "src")) {
 				throw new Error(`Source directory leaked into ${path.basename(tarball)}`);
 			}
-			const manifest = packageManifest(tarball);
+			const manifest = packageManifestFromEntries(archiveEntries, tarball);
 			if (manifest.license !== "MIT" || manifest.repository?.url !== repositoryUrl) {
 				throw new Error(`Missing publish metadata in ${path.basename(tarball)}`);
 			}
@@ -90,10 +123,10 @@ export function inspectPackageTarballs(tarballs, options = {}) {
 	return inspected;
 }
 
-export function packWorkspacePackages({ root = REPOSITORY_ROOT, tarballDir }) {
+export function packWorkspacePackages({ root = REPOSITORY_ROOT, tarballDir, env = process.env }) {
 	fs.mkdirSync(tarballDir, { recursive: true });
 	for (const packageName of PACKAGE_NAMES) {
-		run("pnpm", ["--filter", packageName, "pack", "--pack-destination", tarballDir], { cwd: root });
+		run("pnpm", ["--filter", packageName, "pack", "--pack-destination", tarballDir], { cwd: root, env });
 	}
 	return fs
 		.readdirSync(tarballDir)
@@ -118,11 +151,211 @@ export function installedCliEntry(installDir) {
 	return path.join(installDir, "node_modules", "@pi-agent-web", "cli", "dist", "cli.js");
 }
 
-export function launchInstalledCli({ installDir, args, cwd, detached = false, env }) {
-	return spawn(process.execPath, [installedCliEntry(installDir), ...args], {
+function childHasExited(child) {
+	return child.exitCode !== null || child.signalCode !== null;
+}
+
+function processExists(pid) {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return error?.code === "EPERM";
+	}
+}
+
+function processGroupExists(processGroupId) {
+	try {
+		process.kill(-processGroupId, 0);
+		return true;
+	} catch (error) {
+		return error?.code === "EPERM";
+	}
+}
+
+function signalProcessGroup(processGroupId, signal) {
+	try {
+		process.kill(-processGroupId, signal);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function taskkillProcessTree(rootPid, timeoutMs) {
+	const result = spawnSync("taskkill", ["/PID", String(rootPid), "/T", "/F"], {
+		encoding: "utf8",
+		stdio: "pipe",
+		timeout: timeoutMs,
+	});
+	return result.status === 0 && !result.error;
+}
+
+function defaultOwnedProcessOperations() {
+	return {
+		platform: process.platform,
+		now: () => Date.now(),
+		processExists,
+		processGroupExists,
+		signalProcessGroup,
+		sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+		taskkillProcessTree,
+	};
+}
+
+/**
+ * Records a process-tree identity at spawn. A detached POSIX child owns a
+ * group whose saved PGID is its original leader PID; that identity is never
+ * inferred again from a later PID lookup.
+ */
+export function createOwnedProcessTree(child, { detached = false, operations = {} } = {}) {
+	if (!child || typeof child.once !== "function")
+		throw new Error("owned process tree requires a child process");
+	const ownedOperations = { ...defaultOwnedProcessOperations(), ...operations };
+	const leaderPid = Number.isSafeInteger(child.pid) && child.pid > 0 ? child.pid : null;
+	const processGroupId =
+		ownedOperations.platform !== "win32" && detached && leaderPid !== null ? leaderPid : null;
+	const tree = {
+		child,
+		leaderPid,
+		processGroupId,
+		leaderExitObserved: childHasExited(child),
+		operations: ownedOperations,
+	};
+	child.once("exit", () => {
+		tree.leaderExitObserved = true;
+	});
+	return tree;
+}
+
+function savedGroupState(tree) {
+	const { leaderPid, processGroupId, leaderExitObserved, operations } = tree;
+	if (leaderPid === null || processGroupId === null || leaderPid !== processGroupId) {
+		throw new Error("owned POSIX process group identity was not established at spawn");
+	}
+	const groupAlive = operations.processGroupExists(processGroupId);
+	const reused = leaderExitObserved && operations.processExists(leaderPid);
+	return { groupAlive, reused };
+}
+
+function signalSavedProcessGroup(tree, signal) {
+	const state = savedGroupState(tree);
+	if (state.reused) throw new Error("saved process-group identity is no longer valid after leader exit");
+	if (!state.groupAlive) return false;
+	if (!tree.operations.signalProcessGroup(tree.processGroupId, signal)) {
+		throw new Error(`unable to signal owned process group with ${signal}`);
+	}
+	return true;
+}
+
+async function waitForSavedProcessGroupExit(tree, timeoutMs, pollIntervalMs) {
+	const deadline = tree.operations.now() + timeoutMs;
+	for (;;) {
+		const state = savedGroupState(tree);
+		if (!state.groupAlive) return { exited: true, reused: false };
+		if (state.reused) return { exited: false, reused: true };
+		const now = tree.operations.now();
+		if (now >= deadline) return { exited: false, reused: false };
+		await tree.operations.sleep(Math.min(pollIntervalMs, deadline - now));
+	}
+}
+
+async function terminatePosixOwnedProcessTree(tree, { termTimeoutMs, killTimeoutMs, pollIntervalMs }) {
+	const exitedBeforeShutdown = tree.leaderExitObserved || childHasExited(tree.child);
+	const initialState = savedGroupState(tree);
+	if (initialState.reused) {
+		throw new Error("saved process-group identity is no longer valid after leader exit");
+	}
+	if (initialState.groupAlive) {
+		signalSavedProcessGroup(tree, "SIGTERM");
+		let result = await waitForSavedProcessGroupExit(tree, termTimeoutMs, pollIntervalMs);
+		if (result.reused) throw new Error("saved process-group identity is no longer valid after leader exit");
+		if (!result.exited) {
+			signalSavedProcessGroup(tree, "SIGKILL");
+			result = await waitForSavedProcessGroupExit(tree, killTimeoutMs, pollIntervalMs);
+			if (result.reused) throw new Error("saved process-group identity is no longer valid after leader exit");
+			if (!result.exited) throw new Error("owned packaged process group did not exit after SIGKILL");
+		}
+	}
+	if (exitedBeforeShutdown) {
+		throw new Error("packaged CLI exited before controlled shutdown; owned descendants were cleaned first");
+	}
+}
+
+async function waitForWindowsRootExit(tree, timeoutMs, pollIntervalMs) {
+	const deadline = tree.operations.now() + timeoutMs;
+	for (;;) {
+		if (!tree.operations.processExists(tree.leaderPid)) return true;
+		const now = tree.operations.now();
+		if (now >= deadline) return false;
+		await tree.operations.sleep(Math.min(pollIntervalMs, deadline - now));
+	}
+}
+
+async function terminateWindowsOwnedProcessTree(tree, { termTimeoutMs, killTimeoutMs, pollIntervalMs }) {
+	const exitedBeforeShutdown = tree.leaderExitObserved || childHasExited(tree.child);
+	if (tree.leaderPid === null || exitedBeforeShutdown || !tree.operations.processExists(tree.leaderPid)) {
+		throw new Error("cannot prove Windows process-tree cleanup after early root exit");
+	}
+	if (!tree.operations.taskkillProcessTree(tree.leaderPid, termTimeoutMs + killTimeoutMs)) {
+		throw new Error("bounded Windows taskkill process-tree cleanup failed");
+	}
+	if (!(await waitForWindowsRootExit(tree, termTimeoutMs + killTimeoutMs, pollIntervalMs))) {
+		throw new Error("Windows process-tree root did not exit after taskkill");
+	}
+}
+
+/**
+ * Terminates only the tree identity captured by createOwnedProcessTree. POSIX
+ * never falls back to a positive PID after the original leader exits.
+ */
+export async function terminateOwnedProcessTree(tree, options = {}) {
+	if (!tree?.operations) throw new Error("owned process tree is required");
+	const { termTimeoutMs = 2_000, killTimeoutMs = 2_000, pollIntervalMs = 25 } = options;
+	if (
+		!Number.isSafeInteger(termTimeoutMs) ||
+		!Number.isSafeInteger(killTimeoutMs) ||
+		!Number.isSafeInteger(pollIntervalMs) ||
+		termTimeoutMs < 0 ||
+		killTimeoutMs < 0 ||
+		pollIntervalMs <= 0
+	) {
+		throw new Error("owned process-tree timeouts must be bounded positive integers");
+	}
+	if (tree.operations.platform === "win32") {
+		await terminateWindowsOwnedProcessTree(tree, { termTimeoutMs, killTimeoutMs, pollIntervalMs });
+		return;
+	}
+	await terminatePosixOwnedProcessTree(tree, { termTimeoutMs, killTimeoutMs, pollIntervalMs });
+}
+
+function spawnOwnedProcess({ command, args, cwd, detached, env }) {
+	const child = spawn(command, args, {
 		cwd,
 		detached,
 		stdio: ["ignore", "pipe", "pipe"],
+		env,
+	});
+	return createOwnedProcessTree(child, { detached });
+}
+
+export function launchInstalledCli({ installDir, args, cwd, detached = false, env }) {
+	return spawnOwnedProcess({
+		command: process.execPath,
+		args: [installedCliEntry(installDir), ...args],
+		cwd,
+		detached,
+		env,
+	});
+}
+
+export function launchInstalledNpx({ args, cwd, detached = false, env }) {
+	const invocation = resolvePackageManagerCommand("npx", { env });
+	return spawnOwnedProcess({
+		command: invocation.command,
+		args: [...invocation.argsPrefix, "--no-install", "pi-web", ...args],
+		cwd,
+		detached,
 		env,
 	});
 }
@@ -148,45 +381,6 @@ export function waitForOutput(child, pattern, timeoutMs = 10_000) {
 		});
 		child.once("error", reject);
 	});
-}
-
-export function waitForChildExit(child, timeoutMs) {
-	if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
-	return new Promise((resolve) => {
-		const onExit = () => finish(true);
-		const timer = setTimeout(() => finish(false), timeoutMs);
-		const finish = (exited) => {
-			clearTimeout(timer);
-			child.off("exit", onExit);
-			resolve(exited);
-		};
-		child.once("exit", onExit);
-	});
-}
-
-function signalChild(child, signal, processGroup) {
-	if (processGroup && process.platform !== "win32" && child.pid !== undefined) {
-		try {
-			process.kill(-child.pid, signal);
-			return true;
-		} catch (error) {
-			if (error?.code === "ESRCH") return false;
-			throw error;
-		}
-	}
-	return child.kill(signal);
-}
-
-export async function closeChild(child, timeoutMs = 2_000, options = {}) {
-	const { processGroup = false } = options;
-	if (child.exitCode !== null || child.signalCode !== null) {
-		if (processGroup) signalChild(child, "SIGKILL", true);
-		return;
-	}
-	signalChild(child, "SIGTERM", processGroup);
-	if (await waitForChildExit(child, timeoutMs)) return;
-	signalChild(child, "SIGKILL", processGroup);
-	if (!(await waitForChildExit(child, timeoutMs))) throw new Error("Packaged CLI did not exit after SIGKILL");
 }
 
 export function waitForSocket(socket, setup, timeoutMessage, timeoutMs = 10_000) {
@@ -246,23 +440,24 @@ export function assertInstalledProductIsolation({ installDir, repositoryRoot = R
 export function extractBundleArchive({ archivePath, destinationDir, bundleName }) {
 	fs.mkdirSync(destinationDir, { recursive: true });
 	assertRegularDirectory(destinationDir, "bundle extraction directory");
-	run("tar", ["-xzf", archivePath, "-C", destinationDir], { cwd: destinationDir });
+	extractTarEntries(readGzipTarEntries(fs.readFileSync(archivePath)), destinationDir);
 	const bundleRoot = path.join(destinationDir, bundleName);
 	assertRegularDirectory(bundleRoot, "extracted bundle root");
 	return bundleRoot;
 }
 
-export function installBundle({ bundleRoot }) {
+export function installBundle({ bundleRoot, env = process.env }) {
 	run("npm", ["ci", "--omit=dev", "--ignore-scripts"], {
 		cwd: bundleRoot,
-		env: { ...process.env, npm_config_registry: "https://registry.npmjs.org/" },
+		env,
 	});
 }
 
-export function resolveExecutable(name, pathValue = process.env.PATH) {
+export function resolveExecutable(name, pathValue = process.env.PATH, { platform = process.platform } = {}) {
 	if (typeof pathValue !== "string" || pathValue.length === 0) throw new Error(`PATH cannot resolve ${name}`);
-	const suffixes = process.platform === "win32" ? [".cmd", ".exe", ".bat", ""] : [""];
-	for (const directory of pathValue.split(path.delimiter)) {
+	const suffixes = platform === "win32" ? [".cmd", ".exe", ".bat", ""] : [""];
+	const delimiter = platform === "win32" ? ";" : path.delimiter;
+	for (const directory of pathValue.split(delimiter)) {
 		if (!directory) continue;
 		for (const suffix of suffixes) {
 			const candidate = path.join(directory, `${name}${suffix}`);
@@ -277,21 +472,44 @@ export function resolveExecutable(name, pathValue = process.env.PATH) {
 	throw new Error(`Unable to resolve ${name} from PATH`);
 }
 
+function readWindowsCommandEntrypoint(commandPath) {
+	const wrapper = fs.readFileSync(commandPath, "utf8");
+	const match = wrapper.match(/"(?:%~dp0|%dp0%)\\([^"\r\n]+\.(?:c?js|mjs))"/i);
+	if (!match) throw new Error(`cannot safely resolve Node entrypoint from ${path.basename(commandPath)}`);
+	const relativeEntry = match[1].replaceAll("\\", path.sep);
+	if (
+		path.isAbsolute(relativeEntry) ||
+		relativeEntry.split(path.sep).some((segment) => segment === "..") ||
+		!relativeEntry.startsWith(`node_modules${path.sep}`)
+	) {
+		throw new Error(`unsafe Node entrypoint in ${path.basename(commandPath)}`);
+	}
+	return path.join(path.dirname(commandPath), relativeEntry);
+}
+
+/**
+ * Uses a direct Node entrypoint for npm-family .cmd wrappers on Windows rather
+ * than building a shell command string. Other platforms execute the resolved
+ * binary directly.
+ */
+export function resolvePackageManagerCommand(
+	name,
+	{ env = process.env, platform = process.platform, executableResolver = resolveExecutable } = {},
+) {
+	if (name !== "npm" && name !== "npx" && name !== "pnpm") {
+		throw new Error(`unsupported package-manager command: ${name}`);
+	}
+	const commandPath = executableResolver(name, env.PATH, { platform });
+	if (platform !== "win32" || path.extname(commandPath).toLowerCase() !== ".cmd") {
+		return { command: commandPath, argsPrefix: [] };
+	}
+	return { command: process.execPath, argsPrefix: [readWindowsCommandEntrypoint(commandPath)] };
+}
+
 export function controlledNpxEnvironment({ emptyBinDir, baseEnv = process.env }) {
 	const npxPath = resolveExecutable("npx", baseEnv.PATH);
 	const pathEntries = [path.dirname(npxPath), path.dirname(process.execPath), emptyBinDir];
 	return { ...baseEnv, PATH: [...new Set(pathEntries)].join(path.delimiter) };
-}
-
-export async function terminateChildWithin(child, timeoutMs = 2_000, options = {}) {
-	const { processGroup = false } = options;
-	if (child.exitCode !== null || child.signalCode !== null) return;
-	if (!signalChild(child, "SIGTERM", processGroup)) {
-		throw new Error("Unable to send SIGTERM to the packaged CLI");
-	}
-	if (!(await waitForChildExit(child, timeoutMs))) {
-		throw new Error(`Packaged CLI did not exit after SIGTERM within ${String(timeoutMs)}ms`);
-	}
 }
 
 function processIsAlive(pid) {

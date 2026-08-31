@@ -3,16 +3,21 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { createReleaseBundle, inspectDeterministicTarGz } from "./create-release-bundle.mjs";
+import {
+	createReleaseBundle,
+	createSanitizedNpmEnvironment,
+	inspectDeterministicTarGz,
+	validateBundleLockfile,
+} from "./create-release-bundle.mjs";
 import {
 	assertInstalledProductIsolation,
-	closeChild,
 	controlledNpxEnvironment,
 	extractBundleArchive,
 	installBundle,
 	launchInstalledCli,
+	launchInstalledNpx,
 	run,
-	terminateChildWithin,
+	terminateOwnedProcessTree,
 	waitForOutput,
 	waitForProcessesToExit,
 	waitForSocket,
@@ -359,43 +364,48 @@ async function runNonEmptyConversation({ WebSocket, cookie, origin, protocol, ru
 	}
 }
 
-function assertPublicRegistryLock(bundleRoot) {
+function assertExtractedBundleLockfile(bundleRoot) {
 	const lockfile = JSON.parse(fs.readFileSync(path.join(bundleRoot, "package-lock.json"), "utf8"));
-	for (const entry of Object.values(lockfile.packages ?? {})) {
-		if (!entry || typeof entry !== "object" || typeof entry.resolved !== "string") continue;
-		if (entry.resolved.startsWith("http") && !entry.resolved.startsWith("https://registry.npmjs.org/")) {
-			throw new Error(`Installed bundle lockfile points at a non-public registry: ${entry.resolved}`);
-		}
-	}
+	const rootManifest = JSON.parse(fs.readFileSync(path.join(bundleRoot, "package.json"), "utf8"));
+	validateBundleLockfile(lockfile, rootManifest);
 }
 
-async function terminatePackagedProcess(child, fixturePids = []) {
-	let stopped = false;
+async function terminatePackagedProcess(tree, fixturePids = []) {
+	let terminationError;
 	try {
-		await terminateChildWithin(child, 2_000, { processGroup: true });
-		if (fixturePids.length > 0) await waitForProcessesToExit(fixturePids, 2_000);
-		stopped = true;
-	} finally {
-		if (!stopped) {
-			await closeChild(child, 2_000, { processGroup: true });
-			if (fixturePids.length > 0) await waitForProcessesToExit(fixturePids, 2_000);
-		}
+		await terminateOwnedProcessTree(tree, { termTimeoutMs: 2_000, killTimeoutMs: 2_000 });
+	} catch (error) {
+		terminationError = error;
 	}
+	let fixtureError;
+	try {
+		if (fixturePids.length > 0) await waitForProcessesToExit(fixturePids, 2_000);
+	} catch (error) {
+		fixtureError = error;
+	}
+	if (terminationError && fixtureError) {
+		throw new AggregateError(
+			[terminationError, fixtureError],
+			"packaged process and fixture cleanup both failed",
+		);
+	}
+	if (terminationError) throw terminationError;
+	if (fixtureError) throw fixtureError;
 }
 
-async function runBundledRuntimeSmoke({ bundleRoot, expectedPiVersion, tempRoot }) {
+async function runBundledRuntimeSmoke({ bundleRoot, expectedPiVersion, tempRoot, npmEnvironment }) {
 	const emptyBinDir = path.join(tempRoot, "bundled-empty-bin");
 	const workspacePath = path.join(tempRoot, "bundled-external-workspace");
 	fs.mkdirSync(emptyBinDir);
 	fs.mkdirSync(workspacePath);
 	const env = {
-		...controlledNpxEnvironment({ emptyBinDir }),
+		...controlledNpxEnvironment({ emptyBinDir, baseEnv: npmEnvironment }),
 		PI_CODING_AGENT_DIR: path.join(tempRoot, "bundled-agent"),
 		PI_CODING_AGENT_SESSION_DIR: path.join(tempRoot, "bundled-sessions"),
 		PI_WEB_DATA_DIR: path.join(tempRoot, "bundled-web-data"),
 	};
 	delete env.PI_PATH;
-	const child = launchInstalledCli({
+	const tree = launchInstalledCli({
 		installDir: bundleRoot,
 		args: ["--host", "127.0.0.1", "--port", "0", "--no-open"],
 		cwd: workspacePath,
@@ -403,13 +413,18 @@ async function runBundledRuntimeSmoke({ bundleRoot, expectedPiVersion, tempRoot 
 		env,
 	});
 	try {
-		await verifyBundledReadiness({ bundleRoot, child, expectedPiVersion, workspacePath });
+		await verifyBundledReadiness({ bundleRoot, child: tree.child, expectedPiVersion, workspacePath });
 	} finally {
-		await terminatePackagedProcess(child);
+		await terminatePackagedProcess(tree);
 	}
 }
 
-async function runDeterministicConversationSmoke({ bundleRoot, expectedPiVersion, tempRoot }) {
+async function runDeterministicConversationSmoke({
+	bundleRoot,
+	expectedPiVersion,
+	tempRoot,
+	npmEnvironment,
+}) {
 	const emptyBinDir = path.join(tempRoot, "deterministic-empty-bin");
 	const workspacePath = path.join(tempRoot, "deterministic-external-workspace");
 	const fixturePath = path.join(tempRoot, "deterministic-pi.mjs");
@@ -426,23 +441,29 @@ async function runDeterministicConversationSmoke({ bundleRoot, expectedPiVersion
 	);
 	fs.chmodSync(fixturePath, 0o644);
 	const env = {
-		...controlledNpxEnvironment({ emptyBinDir }),
+		...controlledNpxEnvironment({ emptyBinDir, baseEnv: npmEnvironment }),
 		PI_CODING_AGENT_DIR: path.join(tempRoot, "deterministic-agent"),
 		PI_CODING_AGENT_SESSION_DIR: path.join(tempRoot, "deterministic-sessions"),
 		PI_WEB_DATA_DIR: path.join(tempRoot, "deterministic-web-data"),
 		PI_WEB_FIXTURE_LIFECYCLE_MARKER: lifecycleMarker,
 	};
 	delete env.PI_PATH;
-	const child = launchInstalledCli({
-		installDir: bundleRoot,
+	const tree = launchInstalledNpx({
 		args: ["--pi-path", fixturePath, "--host", "127.0.0.1", "--port", "0", "--no-open"],
-		cwd: workspacePath,
+		cwd: bundleRoot,
 		detached: process.platform !== "win32",
 		env,
 	});
-	let processIds = [];
+	const processIds = new Set();
+	const recordFixtureProcessIds = () => {
+		for (const processId of fixtureProcessIds(lifecycleMarker)) processIds.add(processId);
+	};
+	let failure;
+	let npxReachedReadiness = false;
 	try {
-		const match = await waitForOutput(child, /listening on http:\/\/127\.0\.0\.1:(\d+)/);
+		const match = await waitForOutput(tree.child, /listening on http:\/\/127\.0\.0\.1:(\d+)/);
+		npxReachedReadiness = true;
+		recordFixtureProcessIds();
 		const origin = `http://127.0.0.1:${match[1]}`;
 		const { cookie, headers } = await bootstrap(origin);
 		const response = await fetch(`${origin}/api/v1/health/ready`, { headers });
@@ -458,15 +479,34 @@ async function runDeterministicConversationSmoke({ bundleRoot, expectedPiVersion
 				`Packaged Gateway did not use the explicit deterministic Pi runtime: ${JSON.stringify(readiness)}`,
 			);
 		}
+		recordFixtureProcessIds();
 		const runtime = await createWorkspaceAndSession({ headers, origin, workspacePath });
+		recordFixtureProcessIds();
 		const protocol = await installedProtocol(bundleRoot);
 		const WebSocket = installedWebSocket(bundleRoot);
 		await runNonEmptyConversation({ WebSocket, cookie, origin, protocol, runtime });
-		processIds = fixtureProcessIds(lifecycleMarker);
-		if (processIds.length === 0) throw new Error("Explicit deterministic Pi did not record a child process");
+		recordFixtureProcessIds();
+		if (!npxReachedReadiness) throw new Error("canonical npx command did not reach packaged readiness");
+		if (processIds.size === 0) throw new Error("Explicit deterministic Pi did not record a child process");
+	} catch (error) {
+		failure = error;
 	} finally {
-		await terminatePackagedProcess(child, processIds);
+		recordFixtureProcessIds();
+		let cleanupError;
+		try {
+			if (processIds.size === 0)
+				cleanupError = new Error("Explicit deterministic Pi did not record a child process");
+			else await terminatePackagedProcess(tree, [...processIds]);
+		} catch (error) {
+			cleanupError = error;
+		}
+		if (cleanupError) {
+			failure = failure
+				? new AggregateError([failure, cleanupError], "deterministic installed smoke and cleanup both failed")
+				: cleanupError;
+		}
 	}
+	if (failure) throw failure;
 }
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-pack-smoke-"));
@@ -483,19 +523,22 @@ try {
 		destinationDir: path.join(tempRoot, "extracted"),
 		bundleName: bundle.manifest.bundle.name,
 	});
-	assertPublicRegistryLock(bundleRoot);
-	installBundle({ bundleRoot });
+	const npmEnvironment = createSanitizedNpmEnvironment({ tempRoot });
+	assertExtractedBundleLockfile(bundleRoot);
+	installBundle({ bundleRoot, env: npmEnvironment });
 	assertInstalledProductIsolation({ installDir: bundleRoot });
-	run("npx", ["--no-install", "pi-web", "--help"], { cwd: bundleRoot });
+	run("npx", ["--no-install", "pi-web", "--help"], { cwd: bundleRoot, env: npmEnvironment });
 	await runBundledRuntimeSmoke({
 		bundleRoot,
 		expectedPiVersion: bundle.manifest.runtime.piVersion,
 		tempRoot,
+		npmEnvironment,
 	});
 	await runDeterministicConversationSmoke({
 		bundleRoot,
 		expectedPiVersion: bundle.manifest.runtime.piVersion,
 		tempRoot,
+		npmEnvironment,
 	});
 	console.log("PACK SMOKE OK");
 } finally {
