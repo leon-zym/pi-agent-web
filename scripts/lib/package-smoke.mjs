@@ -469,22 +469,34 @@ export function installBundle({ bundleRoot, env = process.env, toolchain }) {
 }
 
 export function resolveExecutable(name, pathValue = process.env.PATH, { platform = process.platform } = {}) {
+	const candidates = resolveExecutableCandidates(name, pathValue, { platform });
+	if (candidates.length > 0) return candidates[0];
+	throw new Error(`Unable to resolve ${name} from PATH`);
+}
+
+function resolveExecutableCandidates(name, pathValue, { platform = process.platform } = {}) {
 	if (typeof pathValue !== "string" || pathValue.length === 0) throw new Error(`PATH cannot resolve ${name}`);
 	const suffixes = platform === "win32" ? [".cmd", ".exe", ".bat", ""] : [""];
 	const delimiter = platform === "win32" ? ";" : path.delimiter;
+	const candidates = [];
+	const seen = new Set();
 	for (const directory of pathValue.split(delimiter)) {
 		if (!directory) continue;
 		for (const suffix of suffixes) {
 			const candidate = path.join(directory, `${name}${suffix}`);
 			try {
 				fs.accessSync(candidate, fs.constants.X_OK);
-				return candidate;
+				const resolved = path.resolve(candidate);
+				if (!seen.has(resolved)) {
+					seen.add(resolved);
+					candidates.push(candidate);
+				}
 			} catch {
 				// Try the next directory or platform suffix.
 			}
 		}
 	}
-	throw new Error(`Unable to resolve ${name} from PATH`);
+	return candidates;
 }
 
 function readWindowsCommandEntrypoint(commandPath) {
@@ -592,6 +604,69 @@ function packageManagerEntryPath(invocation, trustedNode, details) {
 	return canonicalCommand;
 }
 
+function packageBinDeclaration(manifest, commandName) {
+	if (typeof manifest?.bin === "string") return manifest.bin;
+	if (!manifest?.bin || typeof manifest.bin !== "object" || Array.isArray(manifest.bin)) return null;
+	return typeof manifest.bin[commandName] === "string" ? manifest.bin[commandName] : null;
+}
+
+function packageOwnsNodeEntrypoint(entryPath, packageName, commandName) {
+	for (let packageRoot = path.dirname(entryPath); ; packageRoot = path.dirname(packageRoot)) {
+		const manifestPath = path.join(packageRoot, "package.json");
+		let manifest;
+		try {
+			manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+		} catch {
+			manifest = null;
+		}
+		if (manifest?.name === packageName) {
+			const declaration = packageBinDeclaration(manifest, commandName);
+			if (typeof declaration !== "string" || declaration.length === 0) return false;
+			const normalizedDeclaration = declaration.replaceAll("\\", path.sep);
+			if (
+				path.isAbsolute(normalizedDeclaration) ||
+				normalizedDeclaration.split(path.sep).some((segment) => segment === "..")
+			) {
+				return false;
+			}
+			const declaredEntrypoint = path.resolve(packageRoot, normalizedDeclaration);
+			return (
+				pathIsWithin(declaredEntrypoint, packageRoot) && realpathOrNull(declaredEntrypoint) === entryPath
+			);
+		}
+		if (path.dirname(packageRoot) === packageRoot) return false;
+	}
+}
+
+function verifiedPnpmEntrypoint(candidate, { details, platform }) {
+	if (typeof candidate !== "string" || candidate.length === 0) return null;
+	let entryCandidate = candidate;
+	try {
+		if (platform === "win32" && path.extname(candidate).toLowerCase() === ".cmd") {
+			assertTrustedToolPath(candidate, details);
+			entryCandidate = readWindowsCommandEntrypoint(candidate);
+		}
+		const entryPath = assertTrustedToolPath(entryCandidate, details);
+		if (!/\.(?:c?js|mjs)$/i.test(entryPath)) return null;
+		return packageOwnsNodeEntrypoint(entryPath, "pnpm", "pnpm") ? entryPath : null;
+	} catch {
+		return null;
+	}
+}
+
+function resolveTrustedPnpmEntrypoint({ baseEnv, platform, details }) {
+	const candidates = [];
+	if (typeof baseEnv.npm_execpath === "string" && path.isAbsolute(baseEnv.npm_execpath)) {
+		candidates.push(baseEnv.npm_execpath);
+	}
+	candidates.push(...resolveExecutableCandidates("pnpm", baseEnv.PATH, { platform }));
+	for (const candidate of candidates) {
+		const entryPath = verifiedPnpmEntrypoint(candidate, { details, platform });
+		if (entryPath) return entryPath;
+	}
+	throw new Error("Unable to resolve a verified pnpm Node CLI entrypoint");
+}
+
 function readTrustedToolVersion(nodePath, entryPath, environment) {
 	const result = spawnSync(nodePath, [entryPath, "--version"], {
 		cwd: os.tmpdir(),
@@ -618,15 +693,18 @@ export function resolveTrustedPackageManagerToolchain({
 	platform = process.platform,
 	repositoryRoot = REPOSITORY_ROOT,
 	workspaceRoots = [repositoryRoot],
+	temporaryRoots,
 	executableResolver = resolveExecutable,
 	nodePath = process.execPath,
 } = {}) {
-	const temporaryRoots = [os.tmpdir(), baseEnv.TMPDIR, baseEnv.TEMP, baseEnv.TMP].filter(
-		(value) => typeof value === "string" && value.length > 0,
-	);
+	const resolvedTemporaryRoots =
+		temporaryRoots ??
+		[os.tmpdir(), baseEnv.TMPDIR, baseEnv.TEMP, baseEnv.TMP].filter(
+			(value) => typeof value === "string" && value.length > 0,
+		);
 	const trustedNode = assertTrustedToolPath(nodePath, {
 		workspaceRoots,
-		temporaryRoots,
+		temporaryRoots: resolvedTemporaryRoots,
 		label: "Node executable",
 	});
 	const toolchain = {
@@ -639,16 +717,23 @@ export function resolveTrustedPackageManagerToolchain({
 		},
 	};
 	for (const name of ["npm", "pnpm", "npx"]) {
-		const invocation = resolvePackageManagerCommand(name, {
-			env: baseEnv,
-			platform,
-			executableResolver,
-		});
-		const entryPath = packageManagerEntryPath(invocation, trustedNode, {
+		const details = {
 			workspaceRoots,
-			temporaryRoots,
+			temporaryRoots: resolvedTemporaryRoots,
 			label: `${name} executable`,
-		});
+		};
+		const entryPath =
+			name === "pnpm"
+				? resolveTrustedPnpmEntrypoint({ baseEnv, platform, details })
+				: packageManagerEntryPath(
+						resolvePackageManagerCommand(name, {
+							env: baseEnv,
+							platform,
+							executableResolver,
+						}),
+						trustedNode,
+						details,
+					);
 		toolchain[name] = {
 			command: trustedNode,
 			argsPrefix: [entryPath],

@@ -14,6 +14,7 @@ import {
 	inspectPackageTarballs,
 	installedNpxCommand,
 	PACKAGE_NAMES,
+	resolveExecutable,
 	resolvePackageManagerCommand,
 	resolveTrustedPackageManagerToolchain,
 	terminateOwnedProcessTree,
@@ -26,6 +27,53 @@ function tempRoot() {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-package-smoke-test-"));
 	tempRoots.push(root);
 	return root;
+}
+
+function createPnpmPackageFixture(root, name, { packageName = "pnpm", version = "1.2.3", onRun } = {}) {
+	const packageRoot = path.join(root, name, "package");
+	const entryPath = path.join(packageRoot, "bin", "pnpm.mjs");
+	const binDir = path.join(root, name, "bin");
+	fs.mkdirSync(path.dirname(entryPath), { recursive: true });
+	fs.mkdirSync(binDir, { recursive: true });
+	fs.writeFileSync(
+		path.join(packageRoot, "package.json"),
+		`${JSON.stringify({ name: packageName, bin: { pnpm: "bin/pnpm.mjs" } })}\n`,
+	);
+	fs.writeFileSync(
+		entryPath,
+		`${onRun ?? ""}\nif (process.argv.includes("--version")) console.log(${JSON.stringify(version)});\n`,
+	);
+	fs.chmodSync(entryPath, 0o755);
+	fs.symlinkSync(entryPath, path.join(binDir, "pnpm"));
+	return { binDir, entryPath, packageRoot };
+}
+
+function createPnpmShellShim(root, name) {
+	const binDir = path.join(root, name, "bin");
+	const shimPath = path.join(binDir, "pnpm");
+	fs.mkdirSync(binDir, { recursive: true });
+	fs.writeFileSync(shimPath, "#!/bin/sh\necho shell-shim-should-not-run >&2\nexit 9\n");
+	fs.chmodSync(shimPath, 0o755);
+	return { binDir, shimPath };
+}
+
+function fixtureAwarePackageManagerResolver(name, pathValue, options) {
+	return resolveExecutable(name, name === "pnpm" ? pathValue : process.env.PATH, options);
+}
+
+function resolveFixtureToolchain({
+	PATH,
+	npmExecPath,
+	repositoryRoot = process.cwd(),
+	workspaceRoots = [repositoryRoot],
+}) {
+	return resolveTrustedPackageManagerToolchain({
+		baseEnv: { PATH, ...(npmExecPath ? { npm_execpath: npmExecPath } : {}) },
+		repositoryRoot,
+		workspaceRoots,
+		temporaryRoots: [],
+		executableResolver: fixtureAwarePackageManagerResolver,
+	});
 }
 
 function archiveEntryPath(header) {
@@ -429,33 +477,56 @@ test("keeps system command paths while excluding inherited node_modules bins for
 	assert.ok(!pathEntries.includes(fs.realpathSync(inheritedBinAlias)));
 });
 
-test("rejects PATH-first fake package managers and workspace symlink aliases", () => {
+test("prefers a verified npm_execpath over PATH pnpm candidates", () => {
 	const root = tempRoot();
-	const fakeBin = path.join(root, "fake-bin");
-	fs.mkdirSync(fakeBin);
-	const fakePnpm = path.join(fakeBin, "pnpm");
-	fs.writeFileSync(fakePnpm, "#!/bin/sh\necho fake\n");
-	fs.chmodSync(fakePnpm, 0o755);
-	assert.throws(
-		() =>
-			resolveTrustedPackageManagerToolchain({
-				baseEnv: { PATH: [fakeBin, process.env.PATH].filter(Boolean).join(path.delimiter) },
-				repositoryRoot: process.cwd(),
-			}),
-		/untrusted workspace or temporary path/,
-	);
+	const preferred = createPnpmPackageFixture(root, "preferred", { version: "2.0.0" });
+	const fallback = createPnpmPackageFixture(root, "fallback", { version: "1.0.0" });
+	const shim = createPnpmShellShim(root, "leading-shim");
+	const toolchain = resolveFixtureToolchain({
+		PATH: [shim.binDir, fallback.binDir].join(path.delimiter),
+		npmExecPath: preferred.entryPath,
+	});
+	assert.equal(toolchain.pnpm.path, fs.realpathSync(preferred.entryPath));
+	assert.equal(toolchain.pnpm.version, "2.0.0");
+});
+
+test("skips a pnpm-script leading shell shim for a later verified canonical CLI", () => {
+	const root = tempRoot();
+	const shim = createPnpmShellShim(root, "script-store-shim");
+	const fallback = createPnpmPackageFixture(root, "later-pnpm", { version: "3.0.0" });
+	const toolchain = resolveFixtureToolchain({ PATH: [shim.binDir, fallback.binDir].join(path.delimiter) });
+	assert.equal(toolchain.pnpm.path, fs.realpathSync(fallback.entryPath));
+	assert.equal(toolchain.pnpm.version, "3.0.0");
+});
+
+test("skips a fake canonical-looking pnpm entry without executing it", () => {
+	const root = tempRoot();
+	const markerPath = path.join(root, "fake-ran");
+	const fake = createPnpmPackageFixture(root, "fake", {
+		packageName: "not-pnpm",
+		onRun: `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(markerPath)}, "ran");`,
+	});
+	const fallback = createPnpmPackageFixture(root, "verified", { version: "4.0.0" });
+	const toolchain = resolveFixtureToolchain({ PATH: [fake.binDir, fallback.binDir].join(path.delimiter) });
+	assert.equal(toolchain.pnpm.path, fs.realpathSync(fallback.entryPath));
+	assert.equal(fs.existsSync(markerPath), false);
+});
+
+test("fails closed for a shim-only PATH and excludes workspace pnpm aliases", () => {
+	const root = tempRoot();
+	const shim = createPnpmShellShim(root, "shim-only");
+	assert.throws(() => resolveFixtureToolchain({ PATH: shim.binDir }), /verified pnpm Node CLI entrypoint/);
 
 	const workspace = path.join(root, "workspace");
 	const workspaceBin = path.join(workspace, "node_modules", ".bin");
+	const aliasTarget = createPnpmPackageFixture(root, "workspace-target", { version: "5.0.0" });
+	const fallback = createPnpmPackageFixture(root, "external-fallback", { version: "6.0.0" });
 	fs.mkdirSync(workspaceBin, { recursive: true });
-	fs.symlinkSync(process.execPath, path.join(workspaceBin, "pnpm"));
-	assert.throws(
-		() =>
-			resolveTrustedPackageManagerToolchain({
-				baseEnv: { PATH: [workspaceBin, process.env.PATH].filter(Boolean).join(path.delimiter) },
-				repositoryRoot: workspace,
-				workspaceRoots: [workspace],
-			}),
-		/untrusted workspace or temporary path/,
-	);
+	fs.symlinkSync(aliasTarget.entryPath, path.join(workspaceBin, "pnpm"));
+	const toolchain = resolveFixtureToolchain({
+		PATH: [workspaceBin, fallback.binDir].join(path.delimiter),
+		repositoryRoot: workspace,
+		workspaceRoots: [workspace],
+	});
+	assert.equal(toolchain.pnpm.path, fs.realpathSync(fallback.entryPath));
 });
