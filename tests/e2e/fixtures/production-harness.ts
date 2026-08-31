@@ -1,5 +1,6 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import fs from "node:fs";
+import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -52,6 +53,7 @@ export interface PiFixtureEvent {
 
 export interface ProductionHarness {
 	origin: string;
+	port: number;
 	rootDir: string;
 	workspacePath: string;
 	workspace: HarnessWorkspace;
@@ -61,6 +63,8 @@ export interface ProductionHarness {
 	releasePrompt: (text: string) => void;
 	startPrompt: (text: string) => void;
 	triggerReplayGap: (text: string) => void;
+	gatewayObservation: () => GatewayObservation;
+	restartGateway: () => Promise<GatewayObservation>;
 	requestJson: <T>(pathname: string, init?: RequestInit) => Promise<T>;
 	stop: () => Promise<void>;
 }
@@ -68,6 +72,10 @@ export interface ProductionHarness {
 export interface StartHarnessOptions {
 	fakePiPath?: string;
 	extraEnv?: NodeJS.ProcessEnv;
+	/** A deterministic seed exposed only to benchmark fixture processes. */
+	benchmarkSeed?: string;
+	/** Tests may reserve an explicit loopback port; the default finds one once and reuses it on restart. */
+	port?: number;
 	seedHistoricalSession?: {
 		userText: string;
 		assistantText: string;
@@ -75,6 +83,13 @@ export interface StartHarnessOptions {
 		/** Pad ASCII assistant content so the native JSONL has this exact byte length. */
 		targetSourceBytes?: number;
 	};
+}
+
+export interface GatewayObservation {
+	origin: string;
+	port: number;
+	pid: number;
+	restartCount: number;
 }
 
 function seedHistoricalSession(
@@ -228,6 +243,68 @@ async function terminate(child: ChildProcessWithoutNullStreams): Promise<void> {
 	await exited;
 }
 
+function delay(milliseconds: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function availableLoopbackPort(port: number): Promise<boolean> {
+	return new Promise((resolve) => {
+		const server = createServer();
+		server.once("error", () => resolve(false));
+		server.listen(port, "127.0.0.1", () => {
+			server.close(() => resolve(true));
+		});
+	});
+}
+
+async function reserveLoopbackPort(): Promise<number> {
+	const server = createServer();
+	return new Promise((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(0, "127.0.0.1", () => {
+			const address = server.address();
+			if (!address || typeof address === "string" || address.port < 1) {
+				server.close(() => reject(new Error("unable to reserve a loopback benchmark port")));
+				return;
+			}
+			server.close((error) => {
+				if (error) reject(error);
+				else resolve(address.port);
+			});
+		});
+	});
+}
+
+async function waitForLoopbackPortRelease(port: number, output: () => string): Promise<void> {
+	const deadline = Date.now() + 15_000;
+	while (Date.now() < deadline) {
+		if (await availableLoopbackPort(port)) return;
+		await delay(25);
+	}
+	throw new Error(`loopback port ${String(port)} was not released:\n${output()}`);
+}
+
+async function bootstrapGateway(origin: string, output: () => string): Promise<string> {
+	const deadline = Date.now() + 15_000;
+	let lastFailure = "not attempted";
+	while (Date.now() < deadline) {
+		try {
+			const bootstrap = await fetch(`${origin}/api/v1/bootstrap`, { headers: { Origin: origin } });
+			if (bootstrap.ok) {
+				const cookie = bootstrap.headers.get("set-cookie")?.split(";", 1)[0];
+				if (cookie) return cookie;
+				lastFailure = "bootstrap did not issue a session cookie";
+			} else {
+				lastFailure = `bootstrap failed with ${String(bootstrap.status)}`;
+			}
+		} catch (error) {
+			lastFailure = error instanceof Error ? error.message : String(error);
+		}
+		await delay(25);
+	}
+	throw new Error(`pi-web did not become ready (${lastFailure}):\n${output()}`);
+}
+
 export async function startProductionHarness(options: StartHarnessOptions = {}): Promise<ProductionHarness> {
 	const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-browser-e2e-"));
 	const agentDir = path.join(rootDir, "agent");
@@ -249,46 +326,75 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 	);
 
 	let output = "";
-	const child = spawn(
-		process.execPath,
-		[
-			cliPath,
-			"--pi-path",
-			options.fakePiPath ?? defaultFakePiPath,
-			"--host",
-			"127.0.0.1",
-			"--port",
-			"0",
-			"--no-open",
-		],
-		{
-			cwd: repositoryRoot,
-			stdio: ["pipe", "pipe", "pipe"],
-			env: childEnvironment({
-				...options.extraEnv,
-				PI_CODING_AGENT_DIR: agentDir,
-				PI_CODING_AGENT_SESSION_DIR: sessionDir,
-				PI_WEB_DATA_DIR: webDataDir,
-				PI_WEB_E2E_MARKER: markerPath,
-				PI_WEB_E2E_CONTROL_DIR: controlDir,
-			}),
-		},
-	);
-	child.stdout.setEncoding("utf8");
-	child.stderr.setEncoding("utf8");
-	child.stdout.on("data", (chunk) => {
-		output += String(chunk);
-	});
-	child.stderr.on("data", (chunk) => {
-		output += String(chunk);
-	});
+	const port = options.port ?? (await reserveLoopbackPort());
+	if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+		fs.rmSync(rootDir, { recursive: true, force: true });
+		throw new Error("production harness port must be an explicit loopback TCP port");
+	}
+	const origin = `http://127.0.0.1:${String(port)}`;
+	let activeChild: ChildProcessWithoutNullStreams | undefined;
+	let cookie = "";
+	let restartCount = 0;
+
+	const startGateway = async (): Promise<void> => {
+		let childOutput = "";
+		const child = spawn(
+			process.execPath,
+			[
+				cliPath,
+				"--pi-path",
+				options.fakePiPath ?? defaultFakePiPath,
+				"--host",
+				"127.0.0.1",
+				"--port",
+				String(port),
+				"--no-open",
+			],
+			{
+				cwd: repositoryRoot,
+				stdio: ["pipe", "pipe", "pipe"],
+				env: childEnvironment({
+					...options.extraEnv,
+					// These isolated roots deliberately replace all default Pi roots for every launch.
+					PI_CODING_AGENT_DIR: agentDir,
+					PI_CODING_AGENT_SESSION_DIR: sessionDir,
+					PI_WEB_DATA_DIR: webDataDir,
+					PI_WEB_E2E_MARKER: markerPath,
+					PI_WEB_E2E_CONTROL_DIR: controlDir,
+					...(options.benchmarkSeed ? { PI_WEB_BENCHMARK_SEED: options.benchmarkSeed } : {}),
+				}),
+			},
+		);
+		activeChild = child;
+		child.stdout.setEncoding("utf8");
+		child.stderr.setEncoding("utf8");
+		const recordOutput = (chunk: unknown) => {
+			const text = String(chunk);
+			childOutput += text;
+			output += text;
+		};
+		child.stdout.on("data", recordOutput);
+		child.stderr.on("data", recordOutput);
+		try {
+			const observedOrigin = await waitForListening(child, () => childOutput);
+			if (observedOrigin !== origin) {
+				throw new Error(`gateway listened on ${observedOrigin}, expected stable origin ${origin}`);
+			}
+			cookie = await bootstrapGateway(origin, () => childOutput);
+		} catch (error) {
+			await terminate(child);
+			if (activeChild === child) activeChild = undefined;
+			throw error;
+		}
+	};
+
+	const observation = (): GatewayObservation => {
+		if (!activeChild?.pid) throw new Error("production harness gateway is not running");
+		return { origin, port, pid: activeChild.pid, restartCount };
+	};
 
 	try {
-		const origin = await waitForListening(child, () => output);
-		const bootstrap = await fetch(`${origin}/api/v1/bootstrap`, { headers: { Origin: origin } });
-		if (!bootstrap.ok) throw new Error(`bootstrap failed with ${String(bootstrap.status)}`);
-		const cookie = bootstrap.headers.get("set-cookie")?.split(";", 1)[0];
-		if (!cookie) throw new Error("bootstrap did not issue a session cookie");
+		await startGateway();
 
 		const requestJson = async <T>(pathname: string, init: RequestInit = {}): Promise<T> => {
 			const headers = new Headers(init.headers);
@@ -342,6 +448,7 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 
 		return {
 			origin,
+			port,
 			rootDir,
 			workspacePath,
 			workspace,
@@ -375,14 +482,26 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 			triggerReplayGap: (text) => {
 				fs.writeFileSync(path.join(controlDir, `${encodeURIComponent(text)}.gap`), "gap\n", "utf8");
 			},
+			gatewayObservation: observation,
+			restartGateway: async () => {
+				const previous = activeChild;
+				if (!previous) throw new Error("production harness gateway is not running");
+				await terminate(previous);
+				if (activeChild === previous) activeChild = undefined;
+				await waitForLoopbackPortRelease(port, () => output);
+				await startGateway();
+				restartCount += 1;
+				return observation();
+			},
 			requestJson,
 			stop: async () => {
-				await terminate(child);
+				if (activeChild) await terminate(activeChild);
+				activeChild = undefined;
 				fs.rmSync(rootDir, { recursive: true, force: true });
 			},
 		};
 	} catch (error) {
-		await terminate(child);
+		if (activeChild) await terminate(activeChild);
 		fs.rmSync(rootDir, { recursive: true, force: true });
 		throw error;
 	}
