@@ -136,6 +136,7 @@ docs/              Current contracts and architecture decisions
 - [UI and UX](docs/ui-ux.md): user-visible behavior and accessibility
 - [Design](docs/design.md): visual language and acceptance criteria
 - [Development](docs/development.md): test layers, CI, packaging, and release checks
+- [Security policy](SECURITY.md): private reporting, supported versions, and threat boundary
 - [Architecture decisions](docs/decisions/README.md): rationale, supersession, and rejected alternatives
 - [GitHub Issues](https://github.com/leon-zym/pi-agent-web/issues): backlog and delivery status
 

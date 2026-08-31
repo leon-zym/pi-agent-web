@@ -128,6 +128,7 @@ docs/              当前契约和架构决策
 - [UI 与 UX](docs/ui-ux.md)：用户可见行为和可访问性
 - [视觉设计](docs/design.md)：视觉语言和验收标准
 - [开发](docs/development.md)：测试层次、CI、打包和发布检查
+- [安全策略](SECURITY.md)：私密漏洞报告、支持版本和威胁边界
 - [架构决策](docs/decisions/README.md)：决策理由、替代关系和被否决的方案
 - [GitHub Issues](https://github.com/leon-zym/pi-agent-web/issues)：待办事项和交付状态
 
