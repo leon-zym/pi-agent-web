@@ -16,10 +16,22 @@ Start with `README.md`, then open only the contract relevant to the task:
 Issues hold backlog and delivery state. `docs/notes/` and `tmp/` are ignored working material. Do not
 promote a temporary note into product authority by linking to it from tracked documentation.
 
+## Contract authority
+
+`AGENTS.md` is a binding summary for ordinary implementation. It is not an independent, exhaustive,
+or immutable product specification. Current tracked contracts define product behavior, and accepted
+ADRs record the decisions that govern intentional architectural change.
+
+An intentional architecture change updates the relevant current contracts, an accepted ADR, this
+summary, and executable fixtures or tests in one dependency chain. Do not infer a product change
+from an omission in this summary or silently reverse an accepted decision.
+
 ## Package boundaries
 
 - `packages/protocol` is Browser-safe. It owns product DTOs, strict guards, command policy, and
-  shared budgets. It must not import Node APIs or upstream Pi packages.
+  shared budgets. Its production source, exports, and package manifest must not import or expose
+  Node APIs or upstream Pi packages. Node tooling is allowed only in test harnesses and must not
+  enter the production package.
 - `packages/server` owns the local Gateway, Pi process supervision, native discovery, recovery,
   content custody, and authenticated REST/WebSocket transport.
 - `packages/ui` owns the React workbench, transport consumption, projections, and Session-scoped
@@ -39,12 +51,14 @@ perform a repository-wide rename between them.
 - Browser selection is a view pointer. Navigation must not call Pi `switch_session` or
   `new_session`, and must not stop background Sessions.
 - Pending, forked, and cloned Sessions remain unverified until Pi materializes and freezes their
-  native identity. Abandoning an untouched transient Session stops memory state only; it never
-  deletes a file.
+  native identity. A pending Session may use an opaque temporary handle until canonical rekey.
+  Abandoning an untouched transient Session stops memory state only; it never deletes a file.
 - One authenticated WebSocket multiplexes isolated Session channels. Generation, sequence,
   subscription, lease, fencing token, command id, recovery, and Extension UI state are per Session.
-- Browser/Gateway protocol 1.3 is the sole production contract. Version mismatch is terminal. Pi
-  RPC is a separate upstream boundary named `PiRpcAdapter` with exact-version fixtures.
+- Browser/Gateway protocol 1.3 is the current exact and sole production contract. Version mismatch
+  is terminal; never silently mutate its DTOs or keep a parallel success path. A future version
+  change is atomic only through current contracts, an accepted ADR, and matching fixtures and tests.
+  Pi RPC is a separate upstream boundary named `PiRpcAdapter` with exact-version fixtures.
 - Read-only commands do not require a controller lease. Mutations and Extension responses require
   the exact generation and current fence. Uncertain identity or ordering fails closed.
 - Events are authoritative. A command resolves in the UI only after projection reaches its
@@ -56,10 +70,16 @@ perform a repository-wide rename between them.
 
 ## UI and safety invariants
 
-- Transport frames flow through the ordered Session bus, stream pipeline, and stores before UI
-  components consume them.
+- Session-scoped event, Extension UI, snapshot, and history frames flow through transport, the
+  ordered Session bus, the stream pipeline, and Session-keyed stores. Command responses are
+  correlated in transport and resolve only after their projection barrier. Hot-runtime inventory,
+  directory, and auth updates use the global transport path. Components never consume raw
+  WebSocket frames.
 - Projection, draft, attachments, submit state, model/thinking controls, commands, usage, and
-  Extension UI are partitioned by canonical Session handle. Async work updates its captured Session.
+  Extension UI are partitioned by canonical Session handle. Session-bound async work captures the
+  target handle plus the server epoch, generation, workspace, and request or operation identity its
+  boundary requires, then rechecks that identity before updating state. Global async work declares
+  an explicit target policy instead of binding to whichever Session is visible when it completes.
 - Background subscribed Sessions continue ingesting while another Session is visible.
 - Coalesce only compatible text, thinking, or tool-call deltas. Structural, settled, error, rekey,
   and dialog-close boundaries flush synchronously.

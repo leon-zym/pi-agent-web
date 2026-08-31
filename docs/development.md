@@ -46,8 +46,28 @@ Generated local directories have separate purposes:
 | `PI_WEB_RUN_E2E=1 pnpm test:e2e:real` | Run explicit credential-bearing real-Pi acceptance |
 
 Use package filters and focused test paths while iterating. Run the full risk-appropriate gate before
-handoff. Browser and benchmark suites start real local listeners and Chromium; do not run them
-concurrently across worktrees.
+handoff.
+
+## WorkTree and host-resource isolation
+
+Filesystem isolation and host-resource isolation are different constraints.
+
+- In one physical WorkTree, serialize commands that write the same output, including `dist`,
+  `test-results`, Playwright output, or pack output. Package smoke creates tarballs in an
+  operating-system temporary directory, but it rebuilds package `dist` first and therefore must be
+  serialized with other commands that write those directories.
+- Different WorkTrees have path-isolated package build outputs, so normal builds and `pnpm verify`
+  may run concurrently when CPU and disk capacity permit. They do not share a WorkTree's `dist` or
+  test-result paths.
+- On one host, queue full Browser suites, performance work, and reference benchmarks so Chromium,
+  local listeners, CPU, disk, and timing evidence remain valid. Independent runners with isolated
+  host resources may run those jobs concurrently.
+- The current `dev` defaults share Gateway port 3000, Vite port 5173, and Vite's proxy target, as
+  well as default Pi Agent, Session, and web-data roots. Do not run default development instances
+  in parallel; use explicit isolation for ports, proxy, and data roots when concurrent development
+  is required.
+- Shared pnpm, npm, and Playwright caches are tool-managed caches, not shared `dist` directories.
+  One Agent must not clear or repurpose a shared cache used by another Agent.
 
 ## Repository scripts
 
