@@ -5,6 +5,7 @@ import {
 	addSummaryGate,
 	addValueGate,
 	correctnessFailureCount,
+	installBrowserBenchmarkObserver,
 	runBenchmarkScenario,
 	scenariosFor,
 } from "./benchmark-support";
@@ -23,6 +24,7 @@ for (const scenario of scenariosFor("history")) {
 	test.describe(scenario.id, () => {
 		test.use({
 			harnessOptions: {
+				benchmarkGateway: true,
 				seedHistoricalSession: {
 					userText: HISTORY_PROMPT,
 					assistantText: HISTORY_REPLY,
@@ -34,84 +36,83 @@ for (const scenario of scenariosFor("history")) {
 
 		test("loads the exact native source and pages older turns", async ({ page, harness }, testInfo) => {
 			test.slow();
-			await runBenchmarkScenario(page, testInfo, scenario, async (outcome) => {
+			await runBenchmarkScenario(page, testInfo, harness, scenario, async (outcome, trials) => {
 				const historyTimeoutMs = 90_000;
 				const errors = observePageErrors(page);
+				await installBrowserBenchmarkObserver(page);
 				await page.goto(harness.origin, { waitUntil: "domcontentloaded" });
 				await expect(page.locator("#root > div")).toBeVisible();
 				await expect(page.locator("textarea")).toBeEnabled();
 				if (!harness.session.sessionFile) throw new Error("historical fixture omitted its session file");
 				const actualSourceBytes = fs.statSync(harness.session.sessionFile).size;
-				const cdp = await page.context().newCDPSession(page);
-				await cdp.send("HeapProfiler.collectGarbage");
-				const heapBefore = await page.evaluate(
-					() =>
-						(performance as Performance & { memory?: { usedJSHeapSize: number } }).memory?.usedJSHeapSize ??
-						null,
-				);
-				const firstPageStarted = await page.evaluate(() => performance.now());
-				await page
-					.locator("[data-session-row]")
-					.filter({ hasText: HISTORY_PROMPT })
-					.getByRole("button")
-					.first()
-					.click();
-				const viewport = page.locator('[data-chat-viewport="true"]');
-				const turnWindow = viewport.locator('[data-turn-window="true"]');
-				await expect(turnWindow).toHaveAttribute("data-turn-window-total", /\d+/, {
-					timeout: historyTimeoutMs,
-				});
-				await expect(turnWindow.locator("[data-turn-id]").last()).toContainText(HISTORY_REPLY, {
-					timeout: historyTimeoutMs,
-				});
-				const firstPageFinished = await page.evaluate(() => performance.now());
-				const initialTurns = Number(await turnWindow.getAttribute("data-turn-window-total"));
-				const loadOlder = turnWindow.locator('[data-load-older-turns="true"]');
-				let nextPageMs = 0;
-				if (initialTurns < turns) {
-					await expect(loadOlder).toBeVisible({ timeout: 90_000 });
-					const nextPageStarted = await page.evaluate(() => performance.now());
-					await loadOlder.click();
-					await expect(turnWindow).toHaveAttribute("data-turn-window-total", String(turns), {
+				let getMessagesCount = 0;
+				await trials.run(0, async () => {
+					const heapBefore = await page.evaluate(
+						() =>
+							(performance as Performance & { memory?: { usedJSHeapSize: number } }).memory?.usedJSHeapSize ??
+							null,
+					);
+					const firstPageStarted = await page.evaluate(() => performance.now());
+					await page
+						.locator("[data-session-row]")
+						.filter({ hasText: HISTORY_PROMPT })
+						.getByRole("button")
+						.first()
+						.click();
+					const viewport = page.locator('[data-chat-viewport="true"]');
+					const turnWindow = viewport.locator('[data-turn-window="true"]');
+					await expect(turnWindow).toHaveAttribute("data-turn-window-total", /\d+/, {
+						timeout: historyTimeoutMs,
+					});
+					await expect(turnWindow.locator("[data-turn-id]").last()).toContainText(HISTORY_REPLY, {
+						timeout: historyTimeoutMs,
+					});
+					const firstPageFinished = await page.evaluate(() => performance.now());
+					const initialTurns = Number(await turnWindow.getAttribute("data-turn-window-total"));
+					const loadOlder = turnWindow.locator('[data-load-older-turns="true"]');
+					let nextPageMs = 0;
+					if (initialTurns < turns) {
+						await expect(loadOlder).toBeVisible({ timeout: 90_000 });
+						const nextPageStarted = await page.evaluate(() => performance.now());
+						await loadOlder.click();
+						await expect(turnWindow).toHaveAttribute("data-turn-window-total", String(turns), {
+							timeout: 90_000,
+						});
+						await expect(turnWindow.locator('[aria-busy="true"]')).toHaveCount(0, { timeout: 90_000 });
+						nextPageMs = (await page.evaluate(() => performance.now())) - nextPageStarted;
+					}
+					await page.locator("[data-toc-tick]").first().click({ force: true });
+					await expect(viewport.getByText(`${HISTORY_PROMPT} [turn 1]`, { exact: true })).toBeVisible({
 						timeout: 90_000,
 					});
-					await expect(turnWindow.locator('[aria-busy="true"]')).toHaveCount(0, { timeout: 90_000 });
-					nextPageMs = (await page.evaluate(() => performance.now())) - nextPageStarted;
-				}
-				await page.locator("[data-toc-tick]").first().click({ force: true });
-				await expect(viewport.getByText(`${HISTORY_PROMPT} [turn 1]`, { exact: true })).toBeVisible({
-					timeout: 90_000,
-				});
-				await cdp.send("HeapProfiler.collectGarbage");
-				const heapAfter = await page.evaluate(
-					() =>
-						(performance as Performance & { memory?: { usedJSHeapSize: number } }).memory?.usedJSHeapSize ??
-						null,
-				);
-				const getMessages = harness
-					.piEvents()
-					.filter(
-						(event) => event.sessionId === "browser-e2e-history" && event.commandType === "get_messages",
+					const heapAfter = await page.evaluate(
+						() =>
+							(performance as Performance & { memory?: { usedJSHeapSize: number } }).memory?.usedJSHeapSize ??
+							null,
 					);
-				outcome.trials.push({
-					index: 0,
-					warmup: false,
-					metrics: {
-						firstPageMs: firstPageFinished - firstPageStarted,
-						nextPageMs,
-						sourceBytes: actualSourceBytes,
-						heapDeltaBytes: heapBefore === null || heapAfter === null ? null : heapAfter - heapBefore,
-						mountedTurnNodes: await turnWindow.locator("[data-turn-id]").count(),
-					},
-					correctness: {
-						exactSourceBoundary: actualSourceBytes === sourceBytes,
-						allTurnsPaged: (await turnWindow.getAttribute("data-turn-window-total")) === String(turns),
-						historyWindowMatchesReadPath: initialTurns === Math.min(INITIAL_TURNS, turns),
-						oldestTurnReachable: await viewport
-							.getByText(`${HISTORY_PROMPT} [turn 1]`, { exact: true })
-							.isVisible(),
-						expectedHistoryReadPath: getMessages.length === 0,
-					},
+					getMessagesCount = harness
+						.piEvents()
+						.filter(
+							(event) => event.sessionId === "browser-e2e-history" && event.commandType === "get_messages",
+						).length;
+					return {
+						metrics: {
+							firstPageMs: firstPageFinished - firstPageStarted,
+							nextPageMs,
+							sourceBytes: actualSourceBytes,
+							heapDeltaBytes: heapBefore === null || heapAfter === null ? null : heapAfter - heapBefore,
+							mountedTurnNodes: await turnWindow.locator("[data-turn-id]").count(),
+						},
+						correctness: {
+							exactSourceBoundary: actualSourceBytes === sourceBytes,
+							allTurnsPaged: (await turnWindow.getAttribute("data-turn-window-total")) === String(turns),
+							historyWindowMatchesReadPath: initialTurns === Math.min(INITIAL_TURNS, turns),
+							oldestTurnReachable: await viewport
+								.getByText(`${HISTORY_PROMPT} [turn 1]`, { exact: true })
+								.isVisible(),
+							expectedHistoryReadPath: getMessagesCount === 0,
+						},
+					};
 				});
 				addValueGate(
 					outcome,
@@ -168,7 +169,7 @@ for (const scenario of scenariosFor("history")) {
 					"Browser errors invalidate the history sample.",
 				);
 				outcome.notes.push(
-					`Declared history read path: ${historyReadMode}; Pi get_messages count: ${String(getMessages.length)}.`,
+					`Declared history read path: ${historyReadMode}; Pi get_messages count: ${String(getMessagesCount)}.`,
 					"History cancellation and post-cancel resource release remain an explicit coverage gap.",
 				);
 			});

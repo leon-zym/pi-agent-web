@@ -15,6 +15,7 @@ export type CoalescibleMessageUpdate = Omit<StreamMessageUpdate, "assistantMessa
 	assistantMessageEvent: AssistantMessageDelta;
 };
 export type SessionEventEnqueueResult = "deferred" | "flushed" | "rejected";
+export type SessionEventPublicationMode = "coalesced" | "sequential";
 
 interface DeltaDescriptor {
 	type: "text_delta" | "thinking_delta" | "toolcall_delta";
@@ -60,6 +61,12 @@ type TimerHandle = ReturnType<typeof setTimeout>;
 
 export interface SessionEventSchedulerOptions {
 	onFlush: (sessionHandle: string, generation: number, events: CoalescibleMessageUpdate[]) => void;
+	/**
+	 * The normal product path coalesces compatible deltas until the next native frame. The explicit
+	 * sequential mode exists only for the benchmark build and publishes each delta through this
+	 * scheduler seam; it never changes global browser timing primitives.
+	 */
+	publicationMode?: SessionEventPublicationMode;
 	isHidden?: () => boolean;
 	requestFrame?: (callback: FrameRequestCallback) => number;
 	cancelFrame?: (handle: number) => void;
@@ -156,6 +163,7 @@ export class SessionEventScheduler {
 	private readonly maxCharactersTotal: number;
 	private readonly maxReducerEventsPerSession: number;
 	private readonly maxReducerEventsTotal: number;
+	private readonly publicationMode: SessionEventPublicationMode;
 
 	private readonly pending = new Map<string, PendingSession>();
 	private pendingSourceEvents = 0;
@@ -190,6 +198,7 @@ export class SessionEventScheduler {
 		this.maxReducerEventsPerSession =
 			options.maxReducerEventsPerSession ?? MAX_PENDING_REDUCER_EVENTS_PER_SESSION;
 		this.maxReducerEventsTotal = options.maxReducerEventsTotal ?? MAX_PENDING_REDUCER_EVENTS_TOTAL;
+		this.publicationMode = options.publicationMode ?? "coalesced";
 	}
 
 	enqueue(
@@ -204,6 +213,10 @@ export class SessionEventScheduler {
 		if (this.disposed) {
 			this.metrics.discardedEvents += 1;
 			return "rejected";
+		}
+		if (this.publicationMode === "sequential") {
+			this.emitBatch(sessionHandle, generation, [event], 1);
+			return "flushed";
 		}
 
 		const stale = this.pending.get(sessionHandle);

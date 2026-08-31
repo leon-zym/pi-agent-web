@@ -1,0 +1,65 @@
+{
+	"schemaVersion": 2,
+	"id": "concurrency",
+	"requiredCapabilities": ["browser", "cdp", "longtask", "websocket"],
+	"tiers": {
+		"representative": {
+			"scenarios": [
+				{
+					"id": "sessions-1",
+					"kind": "concurrency",
+					"sessions": 1,
+					"targetBytes": 122880,
+					"chunkBytes": 512,
+					"chunkDelayMs": 10,
+					"warmups": 1,
+					"samples": 3
+				},
+				{
+					"id": "sessions-4",
+					"kind": "concurrency",
+					"sessions": 4,
+					"targetBytes": 122880,
+					"chunkBytes": 512,
+					"chunkDelayMs": 10,
+					"warmups": 1,
+					"samples": 3
+				}
+			]
+		},
+		"stress": {
+			"scenarios": [
+				{
+					"id": "sessions-1",
+					"kind": "concurrency",
+					"sessions": 1,
+					"targetBytes": 1048576,
+					"chunkBytes": 1024,
+					"chunkDelayMs": 8,
+					"warmups": 1,
+					"samples": 8
+				},
+				{
+					"id": "sessions-4",
+					"kind": "concurrency",
+					"sessions": 4,
+					"targetBytes": 1048576,
+					"chunkBytes": 1024,
+					"chunkDelayMs": 8,
+					"warmups": 1,
+					"samples": 8
+				},
+				{
+					"id": "sessions-8",
+					"kind": "concurrency",
+					"sessions": 8,
+					"targetBytes": 1048576,
+					"chunkBytes": 1024,
+					"chunkDelayMs": 8,
+					"warmups": 1,
+					"samples": 8
+				}
+			]
+		}
+	}
+}

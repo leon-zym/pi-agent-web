@@ -1,9 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Page, TestInfo } from "@playwright/test";
-import matrix from "./matrix.json" with { type: "json" };
+import type { ProductionHarness } from "../fixtures/production-harness";
 
 export type BenchmarkTier = "representative" | "stress";
+export type BenchmarkVariant = "coalesced" | "sequential";
 export type BenchmarkKind =
 	| "streaming"
 	| "concurrency"
@@ -14,7 +16,9 @@ export type BenchmarkKind =
 
 export interface BenchmarkScenario {
 	id: string;
+	domain: string;
 	kind: BenchmarkKind;
+	requiredCapabilities: string[];
 	warmups: number;
 	samples: number;
 	targetBytes?: number;
@@ -24,6 +28,7 @@ export interface BenchmarkScenario {
 	sourceBytes?: number;
 	turns?: number;
 	inputBytes?: number;
+	historyReadMode?: "verified_nonempty_native";
 }
 
 export interface BenchmarkTrial {
@@ -58,16 +63,30 @@ export interface BenchmarkOutcome {
 	notes: string[];
 }
 
+export interface BenchmarkTrialExecution {
+	correctness: Record<string, boolean>;
+	metrics: Record<string, number | null>;
+}
+
+export interface BenchmarkTrialLifecycle {
+	run: (index: number, execute: () => Promise<BenchmarkTrialExecution>) => Promise<void>;
+}
+
 export interface BenchmarkScenarioResult {
-	schemaVersion: 1;
+	schemaVersion: 2;
+	suiteVersion: 2;
 	tier: BenchmarkTier;
+	runId: string;
 	scenarioId: string;
+	domain: string;
+	variant: BenchmarkVariant;
 	kind: BenchmarkKind;
 	status: "passed" | "failed";
 	startedAt: string;
 	finishedAt: string;
 	browserVersion: string;
 	parameters: BenchmarkScenario;
+	capabilities: Record<string, boolean>;
 	trials: BenchmarkTrial[];
 	summaries: Record<string, BenchmarkMetricSummary>;
 	gates: BenchmarkGate[];
@@ -75,7 +94,7 @@ export interface BenchmarkScenarioResult {
 	errors: string[];
 }
 
-interface BrowserBenchmarkSnapshot {
+export interface BrowserBenchmarkSnapshot {
 	inputToPublicationMs: number | null;
 	inputToNextPaintMs: number | null;
 	streamDurationMs: number | null;
@@ -83,7 +102,6 @@ interface BrowserBenchmarkSnapshot {
 	totalCompletionMs: number | null;
 	liveLongTaskMaxMs: number;
 	liveLongTasksOver50Ms: number;
-	heapDeltaBytes: number | null;
 	publicationBatches: number;
 	turnNodes: number;
 }
@@ -100,6 +118,65 @@ function isTier(value: string | undefined): value is BenchmarkTier {
 	return value === "representative" || value === "stress";
 }
 
+function isVariant(value: string | undefined): value is BenchmarkVariant {
+	return value === "coalesced" || value === "sequential";
+}
+
+const configDirectory = path.dirname(fileURLToPath(import.meta.url));
+const rootMatrixPath = path.join(configDirectory, "matrix.json");
+
+interface MatrixDomainEntry {
+	id: string;
+	path: string;
+}
+
+interface DomainMatrix {
+	schemaVersion: number;
+	id: string;
+	requiredCapabilities: string[];
+	tiers: Record<BenchmarkTier, { scenarios: Omit<BenchmarkScenario, "domain" | "requiredCapabilities">[] }>;
+}
+
+function loadScenarios(tier: BenchmarkTier): BenchmarkScenario[] {
+	const root = JSON.parse(fs.readFileSync(rootMatrixPath, "utf8")) as {
+		schemaVersion?: unknown;
+		domains?: unknown;
+	};
+	if (root.schemaVersion !== 2 || !Array.isArray(root.domains)) {
+		throw new Error("Benchmark root matrix must use schema version 2");
+	}
+	const domains = root.domains as MatrixDomainEntry[];
+	const scenarios: BenchmarkScenario[] = [];
+	for (const entry of domains) {
+		if (
+			typeof entry?.id !== "string" ||
+			typeof entry.path !== "string" ||
+			path.isAbsolute(entry.path) ||
+			entry.path.includes("..")
+		) {
+			throw new Error("Benchmark root matrix has an invalid domain entry");
+		}
+		const domainPath = path.join(configDirectory, entry.path);
+		const domain = JSON.parse(fs.readFileSync(domainPath, "utf8")) as DomainMatrix;
+		if (
+			domain.schemaVersion !== 2 ||
+			domain.id !== entry.id ||
+			!Array.isArray(domain.requiredCapabilities) ||
+			!Array.isArray(domain.tiers?.[tier]?.scenarios)
+		) {
+			throw new Error(`Benchmark domain matrix is invalid: ${entry.id}`);
+		}
+		for (const scenario of domain.tiers[tier].scenarios) {
+			scenarios.push({
+				...scenario,
+				domain: domain.id,
+				requiredCapabilities: [...domain.requiredCapabilities],
+			});
+		}
+	}
+	return scenarios;
+}
+
 export function benchmarkTier(): BenchmarkTier {
 	const value = process.env.PI_WEB_BENCHMARK_TIER;
 	if (!isTier(value)) {
@@ -108,9 +185,23 @@ export function benchmarkTier(): BenchmarkTier {
 	return value;
 }
 
+export function benchmarkRunId(): string {
+	const value = process.env.PI_WEB_BENCHMARK_RUN_ID;
+	if (!value || !/^[a-z0-9][a-z0-9._-]{0,127}$/i.test(value)) {
+		throw new Error("PI_WEB_BENCHMARK_RUN_ID must be a safe artifact directory name");
+	}
+	return value;
+}
+
+export function benchmarkVariant(): BenchmarkVariant {
+	const value = process.env.PI_WEB_BENCHMARK_VARIANT;
+	if (!isVariant(value)) throw new Error("PI_WEB_BENCHMARK_VARIANT must be coalesced or sequential");
+	return value;
+}
+
 export function scenariosFor(kind: BenchmarkKind): BenchmarkScenario[] {
 	const tier = benchmarkTier();
-	return (matrix.tiers[tier].scenarios as BenchmarkScenario[]).filter((scenario) => scenario.kind === kind);
+	return loadScenarios(tier).filter((scenario) => scenario.kind === kind);
 }
 
 function measuredValues(trials: BenchmarkTrial[], metric: string): number[] {
@@ -205,7 +296,7 @@ function summariesFor(trials: BenchmarkTrial[]): Record<string, BenchmarkMetricS
 }
 
 function errorText(error: unknown): string {
-	return error instanceof Error ? (error.stack ?? error.message) : String(error);
+	return error instanceof Error ? error.message : String(error);
 }
 
 function rawDirectory(): string {
@@ -216,18 +307,59 @@ function rawDirectory(): string {
 	return directory;
 }
 
+async function browserCapabilities(page: Page): Promise<Record<string, boolean>> {
+	const browser = page.context().browser();
+	const observed = await page.evaluate(() => {
+		const performanceWithMemory = performance as Performance & { memory?: { usedJSHeapSize?: unknown } };
+		return {
+			browser: true,
+			longtask: PerformanceObserver.supportedEntryTypes?.includes("longtask") === true,
+			"precise-memory": typeof performanceWithMemory.memory?.usedJSHeapSize === "number",
+			websocket: typeof WebSocket === "function",
+		};
+	});
+	return { ...observed, cdp: browser?.browserType().name() === "chromium" };
+}
+
+function scenarioDirectory(scenario: BenchmarkScenario): string {
+	if (!/^[a-z0-9][a-z0-9._-]*$/i.test(scenario.id)) {
+		throw new Error(`Benchmark scenario id is not safe for an artifact directory: ${scenario.id}`);
+	}
+	return path.join(rawDirectory(), scenario.id);
+}
+
 export async function runBenchmarkScenario(
 	page: Page,
 	testInfo: TestInfo,
+	_harness: ProductionHarness,
 	scenario: BenchmarkScenario,
-	execute: (outcome: BenchmarkOutcome) => Promise<void>,
+	execute: (outcome: BenchmarkOutcome, trials: BenchmarkTrialLifecycle) => Promise<void>,
 ): Promise<void> {
 	const tier = benchmarkTier();
+	const runId = benchmarkRunId();
+	const variant = benchmarkVariant();
 	const startedAt = new Date().toISOString();
 	const outcome: BenchmarkOutcome = { trials: [], gates: [], notes: [] };
 	const errors: string[] = [];
+	const trials: BenchmarkTrialLifecycle = {
+		run: async (index, executeTrial) => {
+			if (index !== outcome.trials.length) {
+				throw new Error(`benchmark trial index ${String(index)} is not the next canonical trial`);
+			}
+			const execution = await executeTrial();
+			outcome.trials.push({
+				index,
+				warmup: index < scenario.warmups,
+				metrics: execution.metrics,
+				correctness: {
+					...execution.correctness,
+					complete: Object.values(execution.correctness).every((value) => value === true),
+				},
+			});
+		},
+	};
 	try {
-		await execute(outcome);
+		await execute(outcome, trials);
 	} catch (error) {
 		errors.push(errorText(error));
 	}
@@ -248,27 +380,59 @@ export async function runBenchmarkScenario(
 			`scenario recorded ${String(outcome.trials.length)} trials; expected ${String(expectedTrials)}`,
 		);
 	}
+	let capabilities: Record<string, boolean>;
+	try {
+		capabilities = await browserCapabilities(page);
+	} catch (error) {
+		errors.push(`benchmark capability observation failed: ${errorText(error)}`);
+		capabilities = Object.fromEntries(scenario.requiredCapabilities.map((capability) => [capability, false]));
+	}
 	const result: BenchmarkScenarioResult = {
-		schemaVersion: 1,
+		schemaVersion: 2,
+		suiteVersion: 2,
 		tier,
+		runId,
 		scenarioId: scenario.id,
+		domain: scenario.domain,
+		variant,
 		kind: scenario.kind,
 		status: errors.length === 0 ? "passed" : "failed",
 		startedAt,
 		finishedAt: new Date().toISOString(),
 		browserVersion: page.context().browser()?.version() ?? "unknown",
 		parameters: scenario,
+		capabilities,
 		trials: outcome.trials,
 		summaries: summariesFor(outcome.trials),
 		gates: outcome.gates,
 		notes: outcome.notes,
 		errors,
 	};
-	const directory = rawDirectory();
+	const directory = scenarioDirectory(scenario);
 	fs.mkdirSync(directory, { recursive: true });
-	const resultPath = path.join(directory, `${scenario.id}.json`);
+	for (const trial of result.trials) {
+		const rawTrial = {
+			schemaVersion: result.schemaVersion,
+			suiteVersion: result.suiteVersion,
+			tier: result.tier,
+			runId: result.runId,
+			scenarioId: result.scenarioId,
+			domain: result.domain,
+			variant: result.variant,
+			kind: result.kind,
+			parameters: result.parameters,
+			capabilities: result.capabilities,
+			trial,
+		};
+		fs.writeFileSync(
+			path.join(directory, `${variant}-${String(trial.index)}.json`),
+			`${JSON.stringify(rawTrial, null, 2)}\n`,
+			"utf8",
+		);
+	}
+	const resultPath = path.join(directory, `${variant}.result.json`);
 	fs.writeFileSync(resultPath, `${JSON.stringify(result, null, 2)}\n`, "utf8");
-	await testInfo.attach(`${scenario.id}.json`, {
+	await testInfo.attach(`${scenario.id}-${variant}.result.json`, {
 		path: resultPath,
 		contentType: "application/json",
 	});
@@ -277,13 +441,6 @@ export async function runBenchmarkScenario(
 
 export async function installBrowserBenchmarkObserver(page: Page): Promise<void> {
 	await page.addInitScript(() => {
-		const getUsedHeap = () => {
-			const memory = (performance as Performance & { memory?: { usedJSHeapSize: number } }).memory;
-			return memory?.usedJSHeapSize ?? null;
-		};
-		const collectGarbage = () => {
-			(globalThis as typeof globalThis & { gc?: () => void }).gc?.();
-		};
 		const state = {
 			active: false,
 			startedAt: 0,
@@ -291,7 +448,6 @@ export async function installBrowserBenchmarkObserver(page: Page): Promise<void>
 			firstPaintAt: null as number | null,
 			streamEndedAt: null as number | null,
 			settledAt: null as number | null,
-			heapStartedAt: null as number | null,
 			publicationBatches: 0,
 			longTasks: [] as Array<{ startTime: number; duration: number }>,
 		};
@@ -303,50 +459,52 @@ export async function installBrowserBenchmarkObserver(page: Page): Promise<void>
 			maxFrameGapMs: number;
 		};
 		const sessionFrames = new Map<string, SessionFrameState>();
-		const observeSocket = (socket: WebSocket) => {
-			socket.addEventListener("message", (message) => {
-				if (typeof message.data !== "string") return;
-				let wire: unknown;
-				try {
-					wire = JSON.parse(message.data);
-				} catch {
-					return;
-				}
-				if (wire === null || typeof wire !== "object") return;
-				const candidate = wire as {
-					type?: unknown;
-					sessionHandle?: unknown;
-					event?: {
+		const socketObserver = {
+			observe(socket: WebSocket) {
+				socket.addEventListener("message", (message) => {
+					if (typeof message.data !== "string") return;
+					let wire: unknown;
+					try {
+						wire = JSON.parse(message.data);
+					} catch {
+						return;
+					}
+					if (wire === null || typeof wire !== "object") return;
+					const candidate = wire as {
 						type?: unknown;
-						assistantMessageEvent?: { type?: unknown; delta?: unknown };
+						sessionHandle?: unknown;
+						event?: {
+							type?: unknown;
+							assistantMessageEvent?: { type?: unknown; delta?: unknown };
+						};
 					};
-				};
-				const delta = candidate.event?.assistantMessageEvent;
-				if (
-					candidate.type !== "event" ||
-					typeof candidate.sessionHandle !== "string" ||
-					candidate.event?.type !== "message_update" ||
-					delta?.type !== "text_delta" ||
-					typeof delta.delta !== "string"
-				) {
-					return;
-				}
-				const observed = sessionFrames.get(candidate.sessionHandle);
-				if (!observed) return;
-				const now = performance.now();
-				if (observed.lastArrivalAt !== null) {
-					observed.maxFrameGapMs = Math.max(observed.maxFrameGapMs, now - observed.lastArrivalAt);
-				}
-				observed.deltaFrames += 1;
-				observed.deltaChars += delta.delta.length;
-				observed.firstArrivalAt ??= now;
-				observed.lastArrivalAt = now;
-			});
+					const delta = candidate.event?.assistantMessageEvent;
+					if (
+						candidate.type !== "event" ||
+						typeof candidate.sessionHandle !== "string" ||
+						candidate.event?.type !== "message_update" ||
+						delta?.type !== "text_delta" ||
+						typeof delta.delta !== "string"
+					) {
+						return;
+					}
+					const observed = sessionFrames.get(candidate.sessionHandle);
+					if (!observed) return;
+					const now = performance.now();
+					if (observed.lastArrivalAt !== null) {
+						observed.maxFrameGapMs = Math.max(observed.maxFrameGapMs, now - observed.lastArrivalAt);
+					}
+					observed.deltaFrames += 1;
+					observed.deltaChars += delta.delta.length;
+					observed.firstArrivalAt ??= now;
+					observed.lastArrivalAt = now;
+				});
+			},
 		};
 		const BenchmarkWebSocket = new Proxy(window.WebSocket, {
 			construct(target, args) {
 				const socket = Reflect.construct(target, args) as WebSocket;
-				observeSocket(socket);
+				socketObserver.observe(socket);
 				return socket;
 			},
 		});
@@ -378,7 +536,7 @@ export async function installBrowserBenchmarkObserver(page: Page): Promise<void>
 			// Capability is represented by empty long-task data on unsupported browsers.
 		}
 		const api = {
-			resetSessionFrames: (sessionHandles: string[]) => {
+			resetSessionFrames(sessionHandles: string[]) {
 				sessionFrames.clear();
 				for (const sessionHandle of sessionHandles) {
 					sessionFrames.set(sessionHandle, {
@@ -390,32 +548,28 @@ export async function installBrowserBenchmarkObserver(page: Page): Promise<void>
 					});
 				}
 			},
-			sessionFrameSnapshot: (sessionHandle: string): BrowserSessionFrameSnapshot | null => {
+			sessionFrameSnapshot(sessionHandle: string): BrowserSessionFrameSnapshot | null {
 				const observed = sessionFrames.get(sessionHandle);
 				return observed ? { ...observed } : null;
 			},
-			start: () => {
-				collectGarbage();
+			start() {
 				state.active = true;
 				state.startedAt = performance.now();
 				state.firstPublicationAt = null;
 				state.firstPaintAt = null;
 				state.streamEndedAt = null;
 				state.settledAt = null;
-				state.heapStartedAt = getUsedHeap();
 				state.publicationBatches = 0;
 				state.longTasks.length = 0;
 			},
-			markStreamEnd: () => {
+			markStreamEnd() {
 				state.streamEndedAt = performance.now();
 			},
-			markSettled: () => {
+			markSettled() {
 				state.settledAt = performance.now();
 				state.active = false;
 			},
-			snapshot: (): BrowserBenchmarkSnapshot => {
-				collectGarbage();
-				const heapNow = getUsedHeap();
+			snapshot(): BrowserBenchmarkSnapshot {
 				const streamEnd = state.streamEndedAt ?? performance.now();
 				const liveLongTasks = state.longTasks.filter(
 					(entry) => entry.startTime >= state.startedAt && entry.startTime < streamEnd,
@@ -432,8 +586,6 @@ export async function installBrowserBenchmarkObserver(page: Page): Promise<void>
 					totalCompletionMs: state.settledAt === null ? null : state.settledAt - state.startedAt,
 					liveLongTaskMaxMs: Math.max(0, ...liveLongTasks.map((entry) => entry.duration)),
 					liveLongTasksOver50Ms: liveLongTasks.filter((entry) => entry.duration > 50).length,
-					heapDeltaBytes:
-						state.heapStartedAt === null || heapNow === null ? null : heapNow - state.heapStartedAt,
 					publicationBatches: state.publicationBatches,
 					turnNodes: document.querySelectorAll("[data-turn-id]").length,
 				};
@@ -485,8 +637,11 @@ export async function finishBrowserMeasurement(page: Page): Promise<BrowserBench
 	await page.evaluate(
 		() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))),
 	);
-	await page.evaluate(() => (window as BenchmarkWindow).__piwebBenchmark.markSettled());
-	return page.evaluate(() => (window as BenchmarkWindow).__piwebBenchmark.snapshot());
+	return page.evaluate(() => {
+		const benchmarkWindow = window as BenchmarkWindow;
+		benchmarkWindow.__piwebBenchmark.markSettled();
+		return benchmarkWindow.__piwebBenchmark.snapshot();
+	});
 }
 
 export function correctnessFailureCount(trials: BenchmarkTrial[]): number {

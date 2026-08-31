@@ -1,0 +1,60 @@
+{
+	"schemaVersion": 2,
+	"id": "history",
+	"requiredCapabilities": ["browser", "cdp", "precise-memory"],
+	"tiers": {
+		"representative": {
+			"scenarios": [
+				{
+					"id": "history-65m",
+					"kind": "history",
+					"sourceBytes": 68157440,
+					"turns": 96,
+					"historyReadMode": "verified_nonempty_native",
+					"warmups": 0,
+					"samples": 1
+				}
+			]
+		},
+		"stress": {
+			"scenarios": [
+				{
+					"id": "history-small",
+					"kind": "history",
+					"sourceBytes": 1048576,
+					"turns": 96,
+					"historyReadMode": "verified_nonempty_native",
+					"warmups": 0,
+					"samples": 1
+				},
+				{
+					"id": "history-below-64m",
+					"kind": "history",
+					"sourceBytes": 66060288,
+					"turns": 96,
+					"historyReadMode": "verified_nonempty_native",
+					"warmups": 0,
+					"samples": 1
+				},
+				{
+					"id": "history-at-64m",
+					"kind": "history",
+					"sourceBytes": 67108864,
+					"turns": 96,
+					"historyReadMode": "verified_nonempty_native",
+					"warmups": 0,
+					"samples": 1
+				},
+				{
+					"id": "history-above-64m",
+					"kind": "history",
+					"sourceBytes": 68157440,
+					"turns": 96,
+					"historyReadMode": "verified_nonempty_native",
+					"warmups": 0,
+					"samples": 1
+				}
+			]
+		}
+	}
+}

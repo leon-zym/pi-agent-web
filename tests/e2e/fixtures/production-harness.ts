@@ -1,4 +1,5 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +12,8 @@ const cliPath = path.join(repositoryRoot, "packages/cli/dist/cli.js");
 const LISTENING_PATTERN = /listening on (http:\/\/127\.0\.0\.1:\d+)/;
 const CREDENTIAL_ENV_PATTERN =
 	/(api[_-]?key|token|secret|password|credential|openai|anthropic|gemini|deepseek)/i;
+// Product readiness is bounded at 10s and its detached Pi-group stop is bounded at 1.1s.
+const PRODUCT_BOUNDED_SHUTDOWN_WAIT_MS = 12_000;
 
 export interface HarnessWorkspace {
 	workspaceHandle: string;
@@ -68,12 +71,115 @@ export interface ProductionHarness {
 export interface StartHarnessOptions {
 	fakePiPath?: string;
 	extraEnv?: NodeJS.ProcessEnv;
+	/** Launch the benchmark-only child entry against the run-owned server/UI outputs. */
+	benchmarkGateway?: boolean;
 	seedHistoricalSession?: {
 		userText: string;
 		assistantText: string;
 		turnCount?: number;
 		/** Pad ASCII assistant content so the native JSONL has this exact byte length. */
 		targetSourceBytes?: number;
+	};
+}
+
+interface BenchmarkBuildPaths {
+	buildRoot: string;
+	serverDirectory: string;
+	serverEntry: string;
+	serverEntryHash: string;
+	serverTreeHash: string;
+	staticDir: string;
+	uiTreeHash: string;
+}
+
+function sha256(value: Buffer | string): string {
+	return createHash("sha256").update(value).digest("hex");
+}
+
+function hashTree(directory: string): string {
+	const files: string[] = [];
+	const visit = (current: string) => {
+		for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+			const entryPath = path.join(current, entry.name);
+			if (entry.isDirectory()) visit(entryPath);
+			else if (entry.isFile()) files.push(entryPath);
+		}
+	};
+	visit(directory);
+	const hash = createHash("sha256");
+	for (const filePath of files.sort((left, right) => left.localeCompare(right))) {
+		hash.update(path.relative(directory, filePath).replaceAll(path.sep, "/"));
+		hash.update("\0");
+		hash.update(sha256(fs.readFileSync(filePath)));
+		hash.update("\n");
+	}
+	return hash.digest("hex");
+}
+
+function isPathInside(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return (
+		relative.length > 0 &&
+		!relative.startsWith(`..${path.sep}`) &&
+		relative !== ".." &&
+		!path.isAbsolute(relative)
+	);
+}
+
+export function benchmarkBuildPathsFromEnvironment(): BenchmarkBuildPaths {
+	const buildRoot = process.env.PI_WEB_BENCHMARK_VARIANT_BUILD_DIR;
+	const serverEntry = process.env.PI_WEB_BENCHMARK_SERVER_ENTRY;
+	const staticDir = process.env.PI_WEB_BENCHMARK_STATIC_DIR;
+	const serverEntryHash = process.env.PI_WEB_BENCHMARK_SERVER_ENTRY_HASH;
+	const serverTreeHash = process.env.PI_WEB_BENCHMARK_SERVER_TREE_HASH;
+	const uiTreeHash = process.env.PI_WEB_BENCHMARK_UI_TREE_HASH;
+	if (
+		!buildRoot ||
+		!serverEntry ||
+		!staticDir ||
+		!serverEntryHash ||
+		!serverTreeHash ||
+		!uiTreeHash ||
+		!path.isAbsolute(buildRoot) ||
+		!path.isAbsolute(serverEntry) ||
+		!path.isAbsolute(staticDir) ||
+		!/^[a-f0-9]{64}$/.test(serverEntryHash) ||
+		!/^[a-f0-9]{64}$/.test(serverTreeHash) ||
+		!/^[a-f0-9]{64}$/.test(uiTreeHash)
+	) {
+		throw new Error("benchmark harness requires exact run-owned server/UI paths and hashes");
+	}
+	const resolvedBuildRoot = fs.realpathSync(buildRoot);
+	const resolvedEntry = fs.realpathSync(serverEntry);
+	const resolvedStaticDir = fs.realpathSync(staticDir);
+	if (!fs.statSync(resolvedEntry).isFile() || !fs.statSync(resolvedStaticDir).isDirectory()) {
+		throw new Error("benchmark harness build paths must resolve to a server entry and static directory");
+	}
+	const resolvedServerDirectory = path.dirname(resolvedEntry);
+	if (
+		!isPathInside(resolvedBuildRoot, resolvedEntry) ||
+		!isPathInside(resolvedBuildRoot, resolvedStaticDir) ||
+		!isPathInside(resolvedBuildRoot, resolvedServerDirectory)
+	) {
+		throw new Error("benchmark harness refuses executable output outside its run-owned variant directory");
+	}
+	if (
+		sha256(fs.readFileSync(resolvedEntry)) !== serverEntryHash ||
+		hashTree(resolvedServerDirectory) !== serverTreeHash ||
+		hashTree(resolvedStaticDir) !== uiTreeHash
+	) {
+		throw new Error(
+			"benchmark harness build hashes do not match the run manifest; refusing stale or mixed output",
+		);
+	}
+	return {
+		buildRoot: resolvedBuildRoot,
+		serverDirectory: resolvedServerDirectory,
+		serverEntry: resolvedEntry,
+		serverEntryHash,
+		serverTreeHash,
+		staticDir: resolvedStaticDir,
+		uiTreeHash,
 	};
 }
 
@@ -97,7 +203,7 @@ function seedHistoricalSession(
 	];
 	const assistantMessages: Array<{ content: Array<{ type: "text"; text: string }> }> = [];
 	let parentId: string | null = null;
-	for (let index = 0; index < turnCount; index++) {
+	for (let index = 0; index < turnCount; index += 1) {
 		const userId = `${nativeSessionId}-user-${String(index + 1)}`;
 		const assistantId = `${nativeSessionId}-assistant-${String(index + 1)}`;
 		const userTimestamp = Date.parse(timestamp) + index * 2_000;
@@ -217,15 +323,56 @@ function waitForListening(child: ChildProcessWithoutNullStreams, output: () => s
 
 async function terminate(child: ChildProcessWithoutNullStreams): Promise<void> {
 	if (child.exitCode !== null || child.signalCode !== null) return;
-	const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+	const waitForExit = (timeoutMs: number): Promise<boolean> =>
+		new Promise((resolve) => {
+			if (child.exitCode !== null || child.signalCode !== null) {
+				resolve(true);
+				return;
+			}
+			let settled = false;
+			const finish = (value: boolean) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timeout);
+				child.off("exit", onExit);
+				resolve(value);
+			};
+			const onExit = () => finish(true);
+			const timeout = setTimeout(() => finish(false), timeoutMs);
+			child.once("exit", onExit);
+			if (child.exitCode !== null || child.signalCode !== null) finish(true);
+		});
+	const exited = waitForExit(PRODUCT_BOUNDED_SHUTDOWN_WAIT_MS);
 	child.kill("SIGTERM");
-	const graceful = await Promise.race([
-		exited.then(() => true),
-		new Promise<false>((resolve) => setTimeout(() => resolve(false), 5_000)),
-	]);
-	if (graceful) return;
+	if (await exited) return;
+	const forceExited = waitForExit(PRODUCT_BOUNDED_SHUTDOWN_WAIT_MS);
 	child.kill("SIGKILL");
-	await exited;
+	await forceExited;
+}
+
+function delay(milliseconds: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function bootstrapGateway(origin: string, output: () => string): Promise<string> {
+	const deadline = Date.now() + 15_000;
+	let lastFailure = "not attempted";
+	while (Date.now() < deadline) {
+		try {
+			const bootstrap = await fetch(`${origin}/api/v1/bootstrap`, { headers: { Origin: origin } });
+			if (bootstrap.ok) {
+				const cookie = bootstrap.headers.get("set-cookie")?.split(";", 1)[0];
+				if (cookie) return cookie;
+				lastFailure = "bootstrap did not issue a session cookie";
+			} else {
+				lastFailure = `bootstrap failed with ${String(bootstrap.status)}`;
+			}
+		} catch (error) {
+			lastFailure = error instanceof Error ? error.message : String(error);
+		}
+		await delay(25);
+	}
+	throw new Error(`pi-web did not become ready (${lastFailure}):\n${output()}`);
 }
 
 export async function startProductionHarness(options: StartHarnessOptions = {}): Promise<ProductionHarness> {
@@ -249,57 +396,85 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 	);
 
 	let output = "";
-	const child = spawn(
-		process.execPath,
-		[
-			cliPath,
-			"--pi-path",
-			options.fakePiPath ?? defaultFakePiPath,
-			"--host",
-			"127.0.0.1",
-			"--port",
-			"0",
-			"--no-open",
-		],
-		{
-			cwd: repositoryRoot,
-			stdio: ["pipe", "pipe", "pipe"],
-			env: childEnvironment({
-				...options.extraEnv,
-				PI_CODING_AGENT_DIR: agentDir,
-				PI_CODING_AGENT_SESSION_DIR: sessionDir,
-				PI_WEB_DATA_DIR: webDataDir,
-				PI_WEB_E2E_MARKER: markerPath,
-				PI_WEB_E2E_CONTROL_DIR: controlDir,
-			}),
-		},
-	);
-	child.stdout.setEncoding("utf8");
-	child.stderr.setEncoding("utf8");
-	child.stdout.on("data", (chunk) => {
-		output += String(chunk);
-	});
-	child.stderr.on("data", (chunk) => {
-		output += String(chunk);
-	});
-
+	let child: ChildProcessWithoutNullStreams | undefined;
 	try {
+		const benchmarkGateway = options.benchmarkGateway === true;
+		const benchmarkBuild = benchmarkGateway ? benchmarkBuildPathsFromEnvironment() : undefined;
+		child = (
+			benchmarkGateway
+				? spawn(
+						process.execPath,
+						[
+							benchmarkBuild!.serverEntry,
+							"--pi-path",
+							options.fakePiPath ?? defaultFakePiPath,
+							"--host",
+							"127.0.0.1",
+							"--port",
+							"0",
+							"--no-open",
+						],
+						{
+							cwd: repositoryRoot,
+							// The private IPC channel is only a parent-disconnect fence for benchmark-main.
+							stdio: ["pipe", "pipe", "pipe", "ipc"],
+							env: childEnvironment({
+								...options.extraEnv,
+								PI_CODING_AGENT_DIR: agentDir,
+								PI_CODING_AGENT_SESSION_DIR: sessionDir,
+								PI_WEB_DATA_DIR: webDataDir,
+								PI_WEB_E2E_MARKER: markerPath,
+								PI_WEB_E2E_CONTROL_DIR: controlDir,
+								PI_WEB_BENCHMARK_STATIC_DIR: benchmarkBuild!.staticDir,
+							}),
+						},
+					)
+				: spawn(
+						process.execPath,
+						[
+							cliPath,
+							"--pi-path",
+							options.fakePiPath ?? defaultFakePiPath,
+							"--host",
+							"127.0.0.1",
+							"--port",
+							"0",
+							"--no-open",
+						],
+						{
+							cwd: repositoryRoot,
+							stdio: ["pipe", "pipe", "pipe"],
+							env: childEnvironment({
+								...options.extraEnv,
+								PI_CODING_AGENT_DIR: agentDir,
+								PI_CODING_AGENT_SESSION_DIR: sessionDir,
+								PI_WEB_DATA_DIR: webDataDir,
+								PI_WEB_E2E_MARKER: markerPath,
+								PI_WEB_E2E_CONTROL_DIR: controlDir,
+							}),
+						},
+					)
+		) as ChildProcessWithoutNullStreams;
+		child.stdout.setEncoding("utf8");
+		child.stderr.setEncoding("utf8");
+		child.stdout.on("data", (chunk) => {
+			output += String(chunk);
+		});
+		child.stderr.on("data", (chunk) => {
+			output += String(chunk);
+		});
 		const origin = await waitForListening(child, () => output);
-		const bootstrap = await fetch(`${origin}/api/v1/bootstrap`, { headers: { Origin: origin } });
-		if (!bootstrap.ok) throw new Error(`bootstrap failed with ${String(bootstrap.status)}`);
-		const cookie = bootstrap.headers.get("set-cookie")?.split(";", 1)[0];
-		if (!cookie) throw new Error("bootstrap did not issue a session cookie");
+		const cookie = await bootstrapGateway(origin, () => output);
 
 		const requestJson = async <T>(pathname: string, init: RequestInit = {}): Promise<T> => {
 			const headers = new Headers(init.headers);
 			headers.set("Origin", origin);
 			headers.set("Cookie", cookie);
-			if (init.body !== undefined && !headers.has("Content-Type"))
+			if (init.body !== undefined && !headers.has("Content-Type")) {
 				headers.set("Content-Type", "application/json");
+			}
 			const response = await fetch(`${origin}${pathname}`, { ...init, headers });
-			const body = (await response.json()) as T & {
-				error?: string | { message?: string };
-			};
+			const body = (await response.json()) as T & { error?: string | { message?: string } };
 			if (!response.ok) {
 				const detail = typeof body.error === "string" ? body.error : (body.error?.message ?? "unknown error");
 				throw new Error(
@@ -332,9 +507,7 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 		} else {
 			const created = await requestJson<{ session: HarnessSession }>(
 				`/api/v1/workspaces/${encodeURIComponent(workspace.workspaceHandle)}/sessions`,
-				{
-					method: "POST",
-				},
+				{ method: "POST" },
 			);
 			session = created.session;
 			if (!fs.existsSync(markerPath)) throw new Error("deterministic fake Pi was not started");
@@ -357,7 +530,6 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 					try {
 						events.push(JSON.parse(line) as PiFixtureEvent);
 					} catch (error) {
-						// A reader can observe only the final line while another Pi process appends it.
 						if (index === lines.length - 1 && !content.endsWith("\n")) continue;
 						throw new Error(`invalid deterministic Pi marker line ${String(index + 1)}`, {
 							cause: error,
@@ -377,12 +549,12 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 			},
 			requestJson,
 			stop: async () => {
-				await terminate(child);
+				await terminate(child!);
 				fs.rmSync(rootDir, { recursive: true, force: true });
 			},
 		};
 	} catch (error) {
-		await terminate(child);
+		if (child) await terminate(child);
 		fs.rmSync(rootDir, { recursive: true, force: true });
 		throw error;
 	}

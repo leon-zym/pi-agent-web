@@ -20,6 +20,7 @@
 		"test:browser": "pnpm build && playwright test --config tests/e2e/playwright.config.ts",
 		"bench:representative": "node scripts/run-performance-benchmarks.mjs representative",
 		"bench:stress": "node scripts/run-performance-benchmarks.mjs stress",
+		"test:bench-runner": "node --test scripts/run-performance-benchmarks.test.mjs",
 		"test:bench-validator": "node --test scripts/performance-benchmark-validator.test.mjs",
 		"lint": "pnpm -r lint && biome check package.json scripts tests/e2e && node scripts/check-style.mjs && node scripts/check-docs.mjs",
 		"check:bundle": "node scripts/check-ui-bundle-budget.mjs",
@@ -27,7 +28,7 @@
 		"check:docs": "node scripts/check-docs.mjs",
 		"typecheck": "pnpm --filter @pi-agent-web/protocol build && pnpm --filter @pi-agent-web/server build && pnpm -r typecheck && pnpm typecheck:e2e",
 		"typecheck:e2e": "tsc -p tests/e2e/tsconfig.json --noEmit",
-		"verify": "pnpm lint && pnpm typecheck && pnpm test:bench-validator && pnpm test && pnpm build",
+		"verify": "pnpm lint && pnpm typecheck && pnpm test:bench-validator && pnpm test:bench-runner && pnpm test && pnpm build",
 		"test:pack": "node scripts/pack-smoke.mjs",
 		"start": "pnpm --filter @pi-agent-web/cli start"
 	},

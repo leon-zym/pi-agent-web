@@ -28,8 +28,14 @@ type ProjectionSessionEvent = PiSessionEventDto | ProductSessionEventDto;
 let initialized = false;
 const directoryReloadTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const activeMessageIdentities = new Map<string, { generation: number; identity: string }>();
+const publicationMode =
+	import.meta.env.VITE_PI_WEB_BENCHMARK_BUILD === "1" &&
+	import.meta.env.VITE_PI_WEB_BENCHMARK_VARIANT === "sequential"
+		? "sequential"
+		: "coalesced";
 
 const projectionEventScheduler = new SessionEventScheduler({
+	publicationMode,
 	onFlush: (sessionHandle, generation, events) => {
 		const channel = sessionTransport.store.getState().sessions[sessionHandle];
 		if (

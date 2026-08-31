@@ -5,14 +5,15 @@ import { defineConfig, devices } from "@playwright/test";
 const configDir = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(configDir, "../../..");
 const artifactRoot = process.env.PI_WEB_BENCHMARK_ARTIFACT_DIR;
-if (!artifactRoot || !path.isAbsolute(artifactRoot)) {
+const playwrightRoot = process.env.PI_WEB_BENCHMARK_PLAYWRIGHT_DIR;
+if (!artifactRoot || !path.isAbsolute(artifactRoot) || !playwrightRoot || !path.isAbsolute(playwrightRoot)) {
 	throw new Error("PI_WEB_BENCHMARK_ARTIFACT_DIR must be an absolute path");
 }
 
 export default defineConfig({
 	testDir: configDir,
 	testMatch: "*.spec.ts",
-	outputDir: path.join(artifactRoot, "playwright"),
+	outputDir: playwrightRoot,
 	fullyParallel: false,
 	forbidOnly: true,
 	retries: 0,
@@ -29,5 +30,9 @@ export default defineConfig({
 		trace: "retain-on-failure",
 	},
 	projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
-	metadata: { repositoryRoot },
+	metadata: {
+		repositoryRoot,
+		runId: process.env.PI_WEB_BENCHMARK_RUN_ID,
+		variant: process.env.PI_WEB_BENCHMARK_VARIANT,
+	},
 });
