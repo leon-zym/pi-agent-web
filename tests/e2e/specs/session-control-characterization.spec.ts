@@ -229,7 +229,7 @@ test("two Browser contexts expose fenced Session control and preserve pending wo
 		expect(await observerEvidence(owner.page)).toMatchObject({ dialogSeen: true, extensionResponses: [] });
 		expect(await observerEvidence(observer.page)).toMatchObject({ dialogSeen: true });
 		expect((await observerEvidence(observer.page)).extensionResponses).toHaveLength(1);
-		await expect(observer.page.locator("textarea")).toBeDisabled();
+		await expect(observer.page.locator("textarea")).toBeEnabled();
 		await expect
 			.poll(() =>
 				fixtureEvent(

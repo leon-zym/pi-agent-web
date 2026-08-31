@@ -159,11 +159,11 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 					/>
 				)}
 
-				{secondsLeft !== null ? (
+				{secondsLeft !== null && (
 					<p className="text-[12px] text-ink-3">{tt("ext.dialogDeadline", { seconds: secondsLeft })}</p>
-				) : (
-					"timeout" in request &&
-					request.timeout !== undefined && <p className="text-[12px] text-ink-3">{tt("ext.timeoutHint")}</p>
+				)}
+				{"timeout" in request && request.timeout !== undefined && (
+					<p className="text-[12px] text-ink-3">{tt("ext.timeoutHint")}</p>
 				)}
 
 				<DialogFooter>
