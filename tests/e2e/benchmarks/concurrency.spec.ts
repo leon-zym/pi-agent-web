@@ -7,13 +7,11 @@ import {
 	addValueGate,
 	browserSessionFrameSnapshot,
 	correctnessFailureCount,
-	finishBrowserMeasurement,
 	installBrowserBenchmarkObserver,
 	markBrowserStreamEnd,
 	resetBrowserSessionFrames,
 	runBenchmarkScenario,
 	scenariosFor,
-	startBrowserMeasurement,
 } from "./benchmark-support";
 
 test.use({ harnessOptions: { benchmarkGateway: true } });
@@ -63,7 +61,7 @@ for (const scenario of scenariosFor("concurrency")) {
 		harness,
 	}, testInfo) => {
 		test.slow();
-		await runBenchmarkScenario(page, testInfo, scenario, async (outcome) => {
+		await runBenchmarkScenario(page, testInfo, harness, scenario, async (outcome, trials) => {
 			const sessionCount = scenario.sessions;
 			const targetBytes = scenario.targetBytes;
 			const chunkBytes = scenario.chunkBytes;
@@ -87,211 +85,207 @@ for (const scenario of scenariosFor("concurrency")) {
 			await page.goto(harness.origin, { waitUntil: "domcontentloaded" });
 			await expect(page.locator("#root > div")).toBeVisible();
 			await expect(page.locator("textarea")).toBeEnabled();
-			const cdp = await page.context().newCDPSession(page);
 			const sessionIdentityPrompts: Array<string | undefined> = Array.from({ length: sessionCount });
 			const trialCount = scenario.warmups + scenario.samples;
 
 			for (let index = 0; index < trialCount; index += 1) {
-				const prompts = Array.from({ length: sessionCount }, (_, sessionIndex) =>
-					[
-						"E2E_BENCH_STREAM",
-						String(targetBytes),
-						String(chunkBytes),
-						String(chunkDelayMs),
-						`g${index.toString(36)}${sessionIndex.toString(36)}s${String(sessionCount)}`,
-					].join(":"),
-				);
-				await cdp.send("HeapProfiler.collectGarbage");
-				await startBrowserMeasurement(page);
-
-				for (const [sessionIndex, prompt] of prompts.entries()) {
-					const identityPrompt = sessionIdentityPrompts[sessionIndex];
-					if (identityPrompt) {
-						const row = page.locator("[data-session-row]").filter({ hasText: identityPrompt });
-						await expect(row).toHaveCount(1);
-						await row.getByRole("button").first().click();
-						await expect(page.locator("textarea")).toBeEnabled();
-					}
-					await sendPrompt(page, prompt);
-					await expect.poll(() => eventFor(harness, "prompt", prompt), { timeout: 30_000 }).toBeTruthy();
-					sessionIdentityPrompts[sessionIndex] ??= prompt;
-					if (index === 0 && sessionIndex < sessionCount - 1) {
-						await page
-							.getByRole("navigation", { name: /^(Sidebar|侧栏)$/ })
-							.getByRole("button", { name: /^(New session|新建会话)$/ })
-							.first()
-							.click();
-						await expect(page.locator("textarea")).toBeEnabled();
-					}
-				}
-				const sessionHandles = await sessionHandlesForPrompts(harness, prompts);
-				await resetBrowserSessionFrames(page, sessionHandles);
-				for (const prompt of prompts) harness.startPrompt(prompt);
-				await expect
-					.poll(() => prompts.every((prompt) => eventFor(harness, "delta", prompt) !== undefined), {
-						timeout: 30_000,
-					})
-					.toBe(true);
-
-				const expectedDeltas = Math.ceil(targetBytes / chunkBytes);
-				const checkpoints = [
-					Math.min(16, Math.max(1, expectedDeltas - 1)),
-					Math.min(64, Math.max(2, Math.floor(expectedDeltas / 2))),
-				].filter((checkpoint, checkpointIndex, values) => values.indexOf(checkpoint) === checkpointIndex);
-				const observations = prompts.map(
-					() =>
-						[] as Array<{
-							background: boolean;
-							backgroundProgress: boolean;
-							deltaFrames: number;
-							projectionLagMs: number;
-							maxFrameGapMs: number;
-						}>,
-				);
-				let selectedSessionIndex = sessionCount - 1;
-				const backgroundBaselines: Array<number | null> = prompts.map((_, sessionIndex) =>
-					sessionIndex === selectedSessionIndex ? null : 0,
-				);
-
-				for (const checkpoint of checkpoints) {
+				await trials.run(index, async ({ finishBrowserMeasurement }) => {
+					const prompts = Array.from({ length: sessionCount }, (_, sessionIndex) =>
+						[
+							"E2E_BENCH_STREAM",
+							String(targetBytes),
+							String(chunkBytes),
+							String(chunkDelayMs),
+							`g${index.toString(36)}${sessionIndex.toString(36)}s${String(sessionCount)}`,
+						].join(":"),
+					);
 					for (const [sessionIndex, prompt] of prompts.entries()) {
-						const previous = observations[sessionIndex]?.at(-1)?.deltaFrames ?? 0;
-						const backgroundBaseline = backgroundBaselines[sessionIndex];
-						if (backgroundBaseline === undefined) throw new Error("Background baseline is missing");
-						const minimumFrames = Math.min(
-							expectedDeltas,
-							Math.max(checkpoint, previous + 1, backgroundBaseline === null ? 0 : backgroundBaseline + 1),
-						);
-						await expect
-							.poll(
-								async () =>
-									(await browserSessionFrameSnapshot(page, sessionHandles[sessionIndex] ?? "")).deltaFrames,
-								{ timeout: 30_000 },
-							)
-							.toBeGreaterThanOrEqual(minimumFrames);
-						const arrival = await browserSessionFrameSnapshot(page, sessionHandles[sessionIndex] ?? "");
+						const identityPrompt = sessionIdentityPrompts[sessionIndex];
+						if (identityPrompt) {
+							const row = page.locator("[data-session-row]").filter({ hasText: identityPrompt });
+							await expect(row).toHaveCount(1);
+							await row.getByRole("button").first().click();
+							await expect(page.locator("textarea")).toBeEnabled();
+						}
+						await sendPrompt(page, prompt);
+						await expect.poll(() => eventFor(harness, "prompt", prompt), { timeout: 30_000 }).toBeTruthy();
+						sessionIdentityPrompts[sessionIndex] ??= prompt;
+						if (index === 0 && sessionIndex < sessionCount - 1) {
+							await page
+								.getByRole("navigation", { name: /^(Sidebar|侧栏)$/ })
+								.getByRole("button", { name: /^(New session|新建会话)$/ })
+								.first()
+								.click();
+							await expect(page.locator("textarea")).toBeEnabled();
+						}
+					}
+					const sessionHandles = await sessionHandlesForPrompts(harness, prompts);
+					await resetBrowserSessionFrames(page, sessionHandles);
+					for (const prompt of prompts) harness.startPrompt(prompt);
+					await expect
+						.poll(() => prompts.every((prompt) => eventFor(harness, "delta", prompt) !== undefined), {
+							timeout: 30_000,
+						})
+						.toBe(true);
+
+					const expectedDeltas = Math.ceil(targetBytes / chunkBytes);
+					const checkpoints = [
+						Math.min(16, Math.max(1, expectedDeltas - 1)),
+						Math.min(64, Math.max(2, Math.floor(expectedDeltas / 2))),
+					].filter((checkpoint, checkpointIndex, values) => values.indexOf(checkpoint) === checkpointIndex);
+					const observations = prompts.map(
+						() =>
+							[] as Array<{
+								background: boolean;
+								backgroundProgress: boolean;
+								deltaFrames: number;
+								projectionLagMs: number;
+								maxFrameGapMs: number;
+							}>,
+					);
+					let selectedSessionIndex = sessionCount - 1;
+					const backgroundBaselines: Array<number | null> = prompts.map((_, sessionIndex) =>
+						sessionIndex === selectedSessionIndex ? null : 0,
+					);
+
+					for (const checkpoint of checkpoints) {
+						for (const [sessionIndex, prompt] of prompts.entries()) {
+							const previous = observations[sessionIndex]?.at(-1)?.deltaFrames ?? 0;
+							const backgroundBaseline = backgroundBaselines[sessionIndex];
+							if (backgroundBaseline === undefined) throw new Error("Background baseline is missing");
+							const minimumFrames = Math.min(
+								expectedDeltas,
+								Math.max(checkpoint, previous + 1, backgroundBaseline === null ? 0 : backgroundBaseline + 1),
+							);
+							await expect
+								.poll(
+									async () =>
+										(await browserSessionFrameSnapshot(page, sessionHandles[sessionIndex] ?? "")).deltaFrames,
+									{ timeout: 30_000 },
+								)
+								.toBeGreaterThanOrEqual(minimumFrames);
+							const arrival = await browserSessionFrameSnapshot(page, sessionHandles[sessionIndex] ?? "");
+							const identityPrompt = sessionIdentityPrompts[sessionIndex];
+							if (!identityPrompt) throw new Error("Session identity prompt was not captured");
+							const row = page.locator("[data-session-row]").filter({ hasText: identityPrompt });
+							const wasBackground = (await row.getAttribute("data-current")) === "false";
+							if (selectedSessionIndex !== sessionIndex) {
+								const previousSelected = selectedSessionIndex;
+								await row.getByRole("button").first().click();
+								const previousHandle = sessionHandles[previousSelected];
+								if (!previousHandle) throw new Error("Selected Session handle is missing");
+								backgroundBaselines[previousSelected] = (
+									await browserSessionFrameSnapshot(page, previousHandle)
+								).deltaFrames;
+								backgroundBaselines[sessionIndex] = null;
+								selectedSessionIndex = sessionIndex;
+							}
+							const turn = page
+								.getByRole("region", { name: /^(Conversation turn|对话轮次)$/ })
+								.filter({ hasText: prompt });
+							const streaming = turn.locator('[data-markdown-streaming="true"]');
+							await expect(streaming).toHaveCount(1);
+							await expect
+								.poll(() => streaming.evaluate((element) => element.textContent?.length ?? 0), {
+									timeout: 30_000,
+								})
+								.toBeGreaterThanOrEqual(arrival.deltaChars);
+							const projectedAt = await page.evaluate(() => performance.now());
+							observations[sessionIndex]?.push({
+								background: sessionCount === 1 || wasBackground,
+								backgroundProgress:
+									sessionCount === 1 ||
+									arrival.deltaFrames >= expectedDeltas ||
+									(backgroundBaseline !== null && arrival.deltaFrames > backgroundBaseline),
+								deltaFrames: arrival.deltaFrames,
+								projectionLagMs:
+									arrival.lastArrivalAt === null
+										? Number.POSITIVE_INFINITY
+										: projectedAt - arrival.lastArrivalAt,
+								maxFrameGapMs: arrival.maxFrameGapMs,
+							});
+						}
+					}
+
+					await expect
+						.poll(() => prompts.every((prompt) => eventFor(harness, "stream_end", prompt) !== undefined), {
+							timeout: 90_000,
+						})
+						.toBe(true);
+					await markBrowserStreamEnd(page);
+					for (const prompt of prompts) harness.releasePrompt(prompt);
+					await expect
+						.poll(() => prompts.every((prompt) => eventFor(harness, "settled", prompt) !== undefined), {
+							timeout: 90_000,
+						})
+						.toBe(true);
+
+					let projectedSessions = 0;
+					for (const [sessionIndex] of prompts.entries()) {
 						const identityPrompt = sessionIdentityPrompts[sessionIndex];
 						if (!identityPrompt) throw new Error("Session identity prompt was not captured");
 						const row = page.locator("[data-session-row]").filter({ hasText: identityPrompt });
-						const wasBackground = (await row.getAttribute("data-current")) === "false";
-						if (selectedSessionIndex !== sessionIndex) {
-							const previousSelected = selectedSessionIndex;
-							await row.getByRole("button").first().click();
-							const previousHandle = sessionHandles[previousSelected];
-							if (!previousHandle) throw new Error("Selected Session handle is missing");
-							backgroundBaselines[previousSelected] = (
-								await browserSessionFrameSnapshot(page, previousHandle)
-							).deltaFrames;
-							backgroundBaselines[sessionIndex] = null;
-							selectedSessionIndex = sessionIndex;
-						}
-						const turn = page
-							.getByRole("region", { name: /^(Conversation turn|对话轮次)$/ })
-							.filter({ hasText: prompt });
-						const streaming = turn.locator('[data-markdown-streaming="true"]');
-						await expect(streaming).toHaveCount(1);
-						await expect
-							.poll(() => streaming.evaluate((element) => element.textContent?.length ?? 0), {
-								timeout: 30_000,
-							})
-							.toBeGreaterThanOrEqual(arrival.deltaChars);
-						const projectedAt = await page.evaluate(() => performance.now());
-						observations[sessionIndex]?.push({
-							background: sessionCount === 1 || wasBackground,
-							backgroundProgress:
-								sessionCount === 1 ||
-								arrival.deltaFrames >= expectedDeltas ||
-								(backgroundBaseline !== null && arrival.deltaFrames > backgroundBaseline),
-							deltaFrames: arrival.deltaFrames,
-							projectionLagMs:
-								arrival.lastArrivalAt === null
-									? Number.POSITIVE_INFINITY
-									: projectedAt - arrival.lastArrivalAt,
-							maxFrameGapMs: arrival.maxFrameGapMs,
-						});
+						await expect(row).toHaveCount(1);
+						await row.getByRole("button").first().click();
+						const settled = page.locator('[data-markdown-settled="true"]').last();
+						await expect(settled).toContainText("STREAM_BUDGET_END", { timeout: 30_000 });
+						projectedSessions += 1;
 					}
-				}
-
-				await expect
-					.poll(() => prompts.every((prompt) => eventFor(harness, "stream_end", prompt) !== undefined), {
-						timeout: 90_000,
-					})
-					.toBe(true);
-				await markBrowserStreamEnd(page);
-				for (const prompt of prompts) harness.releasePrompt(prompt);
-				await expect
-					.poll(() => prompts.every((prompt) => eventFor(harness, "settled", prompt) !== undefined), {
-						timeout: 90_000,
-					})
-					.toBe(true);
-
-				let projectedSessions = 0;
-				for (const [sessionIndex] of prompts.entries()) {
-					const identityPrompt = sessionIdentityPrompts[sessionIndex];
-					if (!identityPrompt) throw new Error("Session identity prompt was not captured");
-					const row = page.locator("[data-session-row]").filter({ hasText: identityPrompt });
-					await expect(row).toHaveCount(1);
-					await row.getByRole("button").first().click();
-					const settled = page.locator('[data-markdown-settled="true"]').last();
-					await expect(settled).toContainText("STREAM_BUDGET_END", { timeout: 30_000 });
-					projectedSessions += 1;
-				}
-				await cdp.send("HeapProfiler.collectGarbage");
-				const browserMetrics = await finishBrowserMeasurement(page);
-				const events = harness.piEvents();
-				const starts = prompts.map(
-					(prompt) => eventFor(harness, "benchmark_start_observed", prompt)?.at ?? 0,
-				);
-				const ends = prompts.map((prompt) => eventFor(harness, "stream_end", prompt)?.at ?? 0);
-				const durations = starts.map((startedAt, index) => (ends[index] ?? 0) - startedAt);
-				const deltaCount = prompts.reduce(
-					(total, prompt) => total + (eventFor(harness, "stream_end", prompt)?.deltaCount ?? 0),
-					0,
-				);
-				const overlapMs = Math.max(...ends) - Math.min(...starts);
-				const flatObservations = observations.flat();
-				const minimumProjectionCheckpoints = Math.min(
-					...observations.map((sessionObservations) => sessionObservations.length),
-				);
-				const minimumBackgroundCheckpoints =
-					sessionCount === 1
-						? 0
-						: Math.min(
-								...observations.map(
-									(sessionObservations) =>
-										sessionObservations.filter(
-											(observation) => observation.background && observation.backgroundProgress,
-										).length,
-								),
-							);
-				outcome.trials.push({
-					index,
-					warmup: index < scenario.warmups,
-					metrics: {
-						...browserMetrics,
-						producerProgressGapMs: Math.max(...prompts.map((prompt) => maxProgressGap(events, prompt))),
-						browserProjectionLagMs: Math.max(
-							...flatObservations.map((observation) => observation.projectionLagMs),
-						),
-						browserFrameArrivalGapMs: Math.max(
-							...flatObservations.map((observation) => observation.maxFrameGapMs),
-						),
-						browserProjectionCheckpointDeficit: Math.max(0, 2 - minimumProjectionCheckpoints),
-						backgroundIngestCheckpointDeficit:
-							sessionCount === 1 ? 0 : Math.max(0, 2 - minimumBackgroundCheckpoints),
-						completionSkewMs: Math.max(...ends) - Math.min(...ends),
-						durationSkewMs: Math.max(...durations) - Math.min(...durations),
-						aggregateDeltaPerSecond: overlapMs > 0 ? (deltaCount * 1_000) / overlapMs : null,
-					},
-					correctness: {
-						allSessionsStarted: starts.every((at) => at > 0),
-						allSessionsSettled: ends.every((at) => at > 0),
-						allBackgroundProjectionsRecovered: projectedSessions === sessionCount,
-						allSessionsObservedTwice: minimumProjectionCheckpoints >= 2,
-						backgroundSessionsIngestedBetweenSwitches:
-							sessionCount === 1 || minimumBackgroundCheckpoints >= 2,
-						singleMultiplexedSocket: sockets.length === 1 && closedSockets.length === 0,
-					},
+					const measurement = await finishBrowserMeasurement();
+					const browserMetrics = measurement.browser;
+					const events = harness.piEvents();
+					const starts = prompts.map(
+						(prompt) => eventFor(harness, "benchmark_start_observed", prompt)?.at ?? 0,
+					);
+					const ends = prompts.map((prompt) => eventFor(harness, "stream_end", prompt)?.at ?? 0);
+					const durations = starts.map((startedAt, index) => (ends[index] ?? 0) - startedAt);
+					const deltaCount = prompts.reduce(
+						(total, prompt) => total + (eventFor(harness, "stream_end", prompt)?.deltaCount ?? 0),
+						0,
+					);
+					const overlapMs = Math.max(...ends) - Math.min(...starts);
+					const flatObservations = observations.flat();
+					const minimumProjectionCheckpoints = Math.min(
+						...observations.map((sessionObservations) => sessionObservations.length),
+					);
+					const minimumBackgroundCheckpoints =
+						sessionCount === 1
+							? 0
+							: Math.min(
+									...observations.map(
+										(sessionObservations) =>
+											sessionObservations.filter(
+												(observation) => observation.background && observation.backgroundProgress,
+											).length,
+									),
+								);
+					return {
+						metrics: {
+							...browserMetrics,
+							producerProgressGapMs: Math.max(...prompts.map((prompt) => maxProgressGap(events, prompt))),
+							browserProjectionLagMs: Math.max(
+								...flatObservations.map((observation) => observation.projectionLagMs),
+							),
+							browserFrameArrivalGapMs: Math.max(
+								...flatObservations.map((observation) => observation.maxFrameGapMs),
+							),
+							browserProjectionCheckpointDeficit: Math.max(0, 2 - minimumProjectionCheckpoints),
+							backgroundIngestCheckpointDeficit:
+								sessionCount === 1 ? 0 : Math.max(0, 2 - minimumBackgroundCheckpoints),
+							completionSkewMs: Math.max(...ends) - Math.min(...ends),
+							durationSkewMs: Math.max(...durations) - Math.min(...durations),
+							aggregateDeltaPerSecond: overlapMs > 0 ? (deltaCount * 1_000) / overlapMs : null,
+						},
+						correctness: {
+							allSessionsStarted: starts.every((at) => at > 0),
+							allSessionsSettled: ends.every((at) => at > 0),
+							allBackgroundProjectionsRecovered: projectedSessions === sessionCount,
+							allSessionsObservedTwice: minimumProjectionCheckpoints >= 2,
+							backgroundSessionsIngestedBetweenSwitches:
+								sessionCount === 1 || minimumBackgroundCheckpoints >= 2,
+							singleMultiplexedSocket: sockets.length === 1 && closedSockets.length === 0,
+						},
+					};
 				});
 			}
 

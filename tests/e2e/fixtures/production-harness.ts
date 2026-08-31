@@ -1,21 +1,35 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import type { Page } from "@playwright/test";
 
 const fixturesDir = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(fixturesDir, "../../..");
 const defaultFakePiPath = path.join(fixturesDir, "deterministic-pi.mjs");
 const cliPath = path.join(repositoryRoot, "packages/cli/dist/cli.js");
-const benchmarkMainPath = path.join(repositoryRoot, "packages/server/dist-benchmark/benchmark-main.js");
-const benchmarkStaticDir = path.join(repositoryRoot, "packages/ui/dist");
 const LISTENING_PATTERN = /listening on (http:\/\/127\.0\.0\.1:\d+)/;
 const CREDENTIAL_ENV_PATTERN =
 	/(api[_-]?key|token|secret|password|credential|openai|anthropic|gemini|deepseek)/i;
 const BENCHMARK_GATEWAY_COUNTER_MESSAGE = "piweb-benchmark-gateway-counters";
-const BENCHMARK_COUNTER_KEYS = ["maxHeapUsedBytes", "maxRssBytes", "publicationCount", "snapshotBuildCount"];
+const BENCHMARK_GATEWAY_TRIAL_CONTROL_MESSAGE = "piweb-benchmark-gateway-trial";
+const BENCHMARK_COUNTER_KEYS = [
+	"maxHeapUsedBytes",
+	"maxRssBytes",
+	"memorySampleCount",
+	"memorySampleIntervalMs",
+	"memorySamplerOverheadMs",
+	"publicationCount",
+	"snapshotBuildCount",
+	"trialEpoch",
+];
+const BENCHMARK_MESSAGE_KEYS = ["counters", "generation", "trial", "type"];
+const BENCHMARK_TRIAL_KEYS = ["epoch", "id", "state"];
+// Product readiness is bounded at 10s and its detached Pi-group stop is bounded at 1.1s.
+const PRODUCT_BOUNDED_SHUTDOWN_WAIT_MS = 12_000;
 
 export interface HarnessWorkspace {
 	workspaceHandle: string;
@@ -67,8 +81,12 @@ export interface ProductionHarness {
 	releasePrompt: (text: string) => void;
 	startPrompt: (text: string) => void;
 	triggerReplayGap: (text: string) => void;
+	beginBenchmarkTrial: (trialId: string) => Promise<Readonly<BenchmarkGatewaySnapshot>>;
+	endBenchmarkTrial: (trialId: string) => Promise<Readonly<BenchmarkGatewaySnapshot>>;
+	abortBenchmarkTrial: (trialId: string) => Promise<Readonly<BenchmarkGatewaySnapshot>>;
 	gatewayObservation: () => GatewayObservation;
-	restartGateway: () => Promise<GatewayObservation>;
+	refreshBrowserAuthentication: (page: Page) => Promise<void>;
+	restartGateway: (page?: Page) => Promise<GatewayObservation>;
 	requestJson: <T>(pathname: string, init?: RequestInit) => Promise<T>;
 	stop: () => Promise<void>;
 }
@@ -97,40 +115,297 @@ export interface GatewayObservation {
 	pid: number;
 	restartCount: number;
 	benchmarkCounters?: Readonly<BenchmarkGatewayCounters>;
+	benchmarkSnapshot?: Readonly<BenchmarkGatewaySnapshot>;
 }
 
-interface BenchmarkGatewayCounters {
+export interface BenchmarkGatewayCounters {
 	maxHeapUsedBytes: number;
 	maxRssBytes: number;
+	memorySampleCount: number;
+	memorySampleIntervalMs: number;
+	memorySamplerOverheadMs: number;
 	publicationCount: number;
 	snapshotBuildCount: number;
+	trialEpoch: number;
 }
 
-interface BenchmarkGatewayCounterMessage {
-	type: typeof BENCHMARK_GATEWAY_COUNTER_MESSAGE;
-	counters: BenchmarkGatewayCounters;
+export interface BenchmarkGatewayTrial {
+	epoch: number;
+	id: string | null;
+	state: "aborted" | "active" | "ended" | "idle";
 }
+
+export interface BenchmarkGatewaySnapshot {
+	counters: Readonly<BenchmarkGatewayCounters>;
+	generation: string;
+	trial: Readonly<BenchmarkGatewayTrial>;
+}
+
+interface BenchmarkGatewayCounterMessage extends BenchmarkGatewaySnapshot {
+	type: typeof BENCHMARK_GATEWAY_COUNTER_MESSAGE;
+}
+
+interface BenchmarkGatewayTrialControlMessage {
+	action: "abort" | "begin" | "end";
+	trialId: string;
+	type: typeof BENCHMARK_GATEWAY_TRIAL_CONTROL_MESSAGE;
+}
+
+interface BenchmarkBuildPaths {
+	buildRoot: string;
+	serverDirectory: string;
+	serverEntry: string;
+	serverEntryHash: string;
+	serverTreeHash: string;
+	staticDir: string;
+	uiTreeHash: string;
+}
+
+type BenchmarkIpcChild = ChildProcessWithoutNullStreams & {
+	connected: boolean;
+	send: (message: BenchmarkGatewayTrialControlMessage, callback?: (error: Error | null) => void) => boolean;
+};
 
 function isSafeCounter(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
+function isFiniteCounter(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function isValidBenchmarkId(value: unknown): value is string {
+	return typeof value === "string" && /^[a-z0-9][a-z0-9._-]{0,127}$/i.test(value);
+}
+
+function exactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+	return Object.keys(value).sort().join(",") === [...expected].sort().join(",");
+}
+
+function isBenchmarkGatewayTrial(value: unknown): value is BenchmarkGatewayTrial {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const trial = value as Record<string, unknown>;
+	return (
+		exactKeys(trial, BENCHMARK_TRIAL_KEYS) &&
+		isSafeCounter(trial.epoch) &&
+		(trial.id === null || isValidBenchmarkId(trial.id)) &&
+		["aborted", "active", "ended", "idle"].includes(String(trial.state)) &&
+		((trial.state === "idle" && trial.id === null && trial.epoch === 0) ||
+			(trial.state !== "idle" && trial.id !== null && trial.epoch > 0))
+	);
+}
+
 function isBenchmarkGatewayCounterMessage(value: unknown): value is BenchmarkGatewayCounterMessage {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const message = value as Record<string, unknown>;
-	if (Object.keys(message).sort().join(",") !== "counters,type") return false;
+	if (!exactKeys(message, BENCHMARK_MESSAGE_KEYS)) return false;
 	if (message.type !== BENCHMARK_GATEWAY_COUNTER_MESSAGE) return false;
+	if (!isValidBenchmarkId(message.generation) || !isBenchmarkGatewayTrial(message.trial)) return false;
 	if (typeof message.counters !== "object" || message.counters === null || Array.isArray(message.counters)) {
 		return false;
 	}
 	const counters = message.counters as Record<string, unknown>;
 	return (
-		Object.keys(counters).sort().join(",") === BENCHMARK_COUNTER_KEYS.join(",") &&
+		exactKeys(counters, BENCHMARK_COUNTER_KEYS) &&
 		isSafeCounter(counters.maxHeapUsedBytes) &&
 		isSafeCounter(counters.maxRssBytes) &&
+		isSafeCounter(counters.memorySampleCount) &&
+		isSafeCounter(counters.memorySampleIntervalMs) &&
+		isFiniteCounter(counters.memorySamplerOverheadMs) &&
 		isSafeCounter(counters.publicationCount) &&
-		isSafeCounter(counters.snapshotBuildCount)
+		isSafeCounter(counters.snapshotBuildCount) &&
+		isSafeCounter(counters.trialEpoch) &&
+		counters.trialEpoch === (message.trial as BenchmarkGatewayTrial).epoch
 	);
+}
+
+function benchmarkTrialControl(action: BenchmarkGatewayTrialControlMessage["action"], trialId: string) {
+	return {
+		type: BENCHMARK_GATEWAY_TRIAL_CONTROL_MESSAGE,
+		action,
+		trialId,
+	} satisfies BenchmarkGatewayTrialControlMessage;
+}
+
+export interface BenchmarkGatewayIpcFence {
+	expect: (control: BenchmarkGatewayTrialControlMessage) => void;
+	error: () => string | undefined;
+	fail: (message: string) => void;
+	generation: () => string | undefined;
+	receive: (message: unknown) => void;
+	reset: () => void;
+	snapshot: () => Readonly<BenchmarkGatewaySnapshot> | undefined;
+}
+
+/**
+ * A benchmark child may publish only strict, generation-bound counter snapshots. This fence is
+ * deliberately separate from the child-process identity check so a stale child can be discarded
+ * before it reaches the active generation's trial state.
+ */
+export function createBenchmarkGatewayIpcFence(): BenchmarkGatewayIpcFence {
+	let latest: Readonly<BenchmarkGatewaySnapshot> | undefined;
+	let generation: string | undefined;
+	let expected: BenchmarkGatewayTrialControlMessage | undefined;
+	let failure: string | undefined;
+	const fail = (message: string) => {
+		failure ??= message;
+	};
+	return Object.freeze({
+		expect: (control: BenchmarkGatewayTrialControlMessage) => {
+			expected = control;
+		},
+		error: () => failure,
+		fail,
+		generation: () => generation,
+		receive: (message: unknown) => {
+			if (!isBenchmarkGatewayCounterMessage(message)) {
+				fail("benchmark Gateway sent malformed or unexpected IPC after launch");
+				return;
+			}
+			if (!generation) generation = message.generation;
+			if (message.generation !== generation) {
+				fail("benchmark Gateway IPC generation changed without a harness restart");
+				return;
+			}
+			const previous = latest;
+			const expectedBegin =
+				expected?.action === "begin" &&
+				expected.trialId === message.trial.id &&
+				message.trial.state === "active";
+			if (expected) {
+				const requiredState =
+					expected.action === "begin" ? "active" : expected.action === "end" ? "ended" : "aborted";
+				if (message.trial.id === expected.trialId && message.trial.state === requiredState) {
+					expected = undefined;
+				} else if (
+					message.trial.state !== "idle" &&
+					(!previous ||
+						message.trial.id !== previous.trial.id ||
+						message.trial.epoch !== previous.trial.epoch ||
+						message.trial.state !== previous.trial.state)
+				) {
+					fail("benchmark Gateway IPC does not match the requested trial lifecycle transition");
+					return;
+				}
+			}
+			if (previous && message.trial.epoch < previous.trial.epoch) {
+				fail("benchmark Gateway IPC trial epoch regressed");
+				return;
+			}
+			if (
+				previous &&
+				message.trial.epoch > previous.trial.epoch &&
+				message.trial.state === "active" &&
+				!expectedBegin
+			) {
+				fail("benchmark Gateway activated an unrequested trial");
+				return;
+			}
+			latest = Object.freeze({
+				generation: message.generation,
+				trial: Object.freeze({ ...message.trial }),
+				counters: Object.freeze({ ...message.counters }),
+			});
+		},
+		reset: () => {
+			latest = undefined;
+			generation = undefined;
+			expected = undefined;
+			failure = undefined;
+		},
+		snapshot: () => latest,
+	});
+}
+
+function sha256(value: Buffer | string): string {
+	return createHash("sha256").update(value).digest("hex");
+}
+
+function hashTree(directory: string): string {
+	const files: string[] = [];
+	const visit = (current: string) => {
+		for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+			const entryPath = path.join(current, entry.name);
+			if (entry.isDirectory()) visit(entryPath);
+			else if (entry.isFile()) files.push(entryPath);
+		}
+	};
+	visit(directory);
+	const hash = createHash("sha256");
+	for (const filePath of files.sort((left, right) => left.localeCompare(right))) {
+		hash.update(path.relative(directory, filePath).replaceAll(path.sep, "/"));
+		hash.update("\0");
+		hash.update(sha256(fs.readFileSync(filePath)));
+		hash.update("\n");
+	}
+	return hash.digest("hex");
+}
+
+function isPathInside(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return (
+		relative.length > 0 &&
+		!relative.startsWith(`..${path.sep}`) &&
+		relative !== ".." &&
+		!path.isAbsolute(relative)
+	);
+}
+
+function benchmarkBuildPathsFromEnvironment(): BenchmarkBuildPaths {
+	const buildRoot = process.env.PI_WEB_BENCHMARK_VARIANT_BUILD_DIR;
+	const serverEntry = process.env.PI_WEB_BENCHMARK_SERVER_ENTRY;
+	const staticDir = process.env.PI_WEB_BENCHMARK_STATIC_DIR;
+	const serverEntryHash = process.env.PI_WEB_BENCHMARK_SERVER_ENTRY_HASH;
+	const serverTreeHash = process.env.PI_WEB_BENCHMARK_SERVER_TREE_HASH;
+	const uiTreeHash = process.env.PI_WEB_BENCHMARK_UI_TREE_HASH;
+	if (
+		!buildRoot ||
+		!serverEntry ||
+		!staticDir ||
+		!serverEntryHash ||
+		!serverTreeHash ||
+		!uiTreeHash ||
+		!path.isAbsolute(buildRoot) ||
+		!path.isAbsolute(serverEntry) ||
+		!path.isAbsolute(staticDir) ||
+		!/^[a-f0-9]{64}$/.test(serverEntryHash) ||
+		!/^[a-f0-9]{64}$/.test(serverTreeHash) ||
+		!/^[a-f0-9]{64}$/.test(uiTreeHash)
+	) {
+		throw new Error("benchmark harness requires exact run-owned server/UI paths and hashes");
+	}
+	const resolvedBuildRoot = fs.realpathSync(buildRoot);
+	const resolvedEntry = fs.realpathSync(serverEntry);
+	const resolvedStaticDir = fs.realpathSync(staticDir);
+	if (!fs.statSync(resolvedEntry).isFile() || !fs.statSync(resolvedStaticDir).isDirectory()) {
+		throw new Error("benchmark harness build paths must resolve to a server entry and static directory");
+	}
+	const resolvedServerDirectory = path.dirname(resolvedEntry);
+	if (
+		!isPathInside(resolvedBuildRoot, resolvedEntry) ||
+		!isPathInside(resolvedBuildRoot, resolvedStaticDir) ||
+		!isPathInside(resolvedBuildRoot, resolvedServerDirectory)
+	) {
+		throw new Error("benchmark harness refuses executable output outside its run-owned variant directory");
+	}
+	if (
+		sha256(fs.readFileSync(resolvedEntry)) !== serverEntryHash ||
+		hashTree(resolvedServerDirectory) !== serverTreeHash ||
+		hashTree(resolvedStaticDir) !== uiTreeHash
+	) {
+		throw new Error(
+			"benchmark harness build hashes do not match the run manifest; refusing stale or mixed output",
+		);
+	}
+	return {
+		buildRoot: resolvedBuildRoot,
+		serverDirectory: resolvedServerDirectory,
+		serverEntry: resolvedEntry,
+		serverEntryHash,
+		serverTreeHash,
+		staticDir: resolvedStaticDir,
+		uiTreeHash,
+	};
 }
 
 function seedHistoricalSession(
@@ -273,15 +548,32 @@ function waitForListening(child: ChildProcessWithoutNullStreams, output: () => s
 
 async function terminate(child: ChildProcessWithoutNullStreams): Promise<void> {
 	if (child.exitCode !== null || child.signalCode !== null) return;
-	const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+	const waitForExit = (timeoutMs: number): Promise<boolean> =>
+		new Promise((resolve) => {
+			if (child.exitCode !== null || child.signalCode !== null) {
+				resolve(true);
+				return;
+			}
+			let settled = false;
+			const finish = (value: boolean) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timeout);
+				child.off("exit", onExit);
+				resolve(value);
+			};
+			const onExit = () => finish(true);
+			const timeout = setTimeout(() => finish(false), timeoutMs);
+			child.once("exit", onExit);
+			if (child.exitCode !== null || child.signalCode !== null) finish(true);
+		});
+	const exited = waitForExit(PRODUCT_BOUNDED_SHUTDOWN_WAIT_MS);
 	child.kill("SIGTERM");
-	const graceful = await Promise.race([
-		exited.then(() => true),
-		new Promise<false>((resolve) => setTimeout(() => resolve(false), 5_000)),
-	]);
+	const graceful = await exited;
 	if (graceful) return;
+	const forceExited = waitForExit(PRODUCT_BOUNDED_SHUTDOWN_WAIT_MS);
 	child.kill("SIGKILL");
-	await exited;
+	await forceExited;
 }
 
 function delay(milliseconds: number): Promise<void> {
@@ -346,20 +638,21 @@ async function bootstrapGateway(origin: string, output: () => string): Promise<s
 	throw new Error(`pi-web did not become ready (${lastFailure}):\n${output()}`);
 }
 
-async function waitForBenchmarkCounters(
-	read: () => Readonly<BenchmarkGatewayCounters> | undefined,
+async function waitForBenchmarkSnapshot(
+	read: () => Readonly<BenchmarkGatewaySnapshot> | undefined,
 	readError: () => string | undefined,
 	output: () => string,
-): Promise<Readonly<BenchmarkGatewayCounters>> {
+	predicate: (snapshot: Readonly<BenchmarkGatewaySnapshot>) => boolean = () => true,
+): Promise<Readonly<BenchmarkGatewaySnapshot>> {
 	const deadline = Date.now() + 15_000;
 	while (Date.now() < deadline) {
 		const error = readError();
 		if (error) throw new Error(`${error}\n${output()}`);
-		const counters = read();
-		if (counters) return counters;
+		const snapshot = read();
+		if (snapshot && predicate(snapshot)) return snapshot;
 		await delay(25);
 	}
-	throw new Error(`benchmark Gateway did not publish strict aggregate counters:\n${output()}`);
+	throw new Error(`benchmark Gateway did not publish the required strict aggregate snapshot:\n${output()}`);
 }
 
 export async function startProductionHarness(options: StartHarnessOptions = {}): Promise<ProductionHarness> {
@@ -392,25 +685,43 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 	let activeChild: ChildProcessWithoutNullStreams | undefined;
 	let cookie = "";
 	let restartCount = 0;
-	let latestBenchmarkCounters: Readonly<BenchmarkGatewayCounters> | undefined;
-	let benchmarkIpcError: string | undefined;
 	const benchmarkGateway = options.benchmarkGateway === true;
+	const benchmarkBuild = benchmarkGateway ? benchmarkBuildPathsFromEnvironment() : undefined;
+	let benchmarkChild: BenchmarkIpcChild | undefined;
+	let benchmarkTerminationInProgress = false;
+	const benchmarkIpcFence = createBenchmarkGatewayIpcFence();
+	const clearBenchmarkIpcState = () => {
+		benchmarkChild = undefined;
+		benchmarkTerminationInProgress = false;
+		benchmarkIpcFence.reset();
+	};
+	const recordBenchmarkSnapshot = (child: BenchmarkIpcChild, message: unknown) => {
+		if (activeChild !== child || benchmarkChild !== child) return;
+		benchmarkIpcFence.receive(message);
+	};
+	const terminateGatewayChild = async (
+		child: ChildProcessWithoutNullStreams,
+	): Promise<string | undefined> => {
+		if (benchmarkChild === child) benchmarkTerminationInProgress = true;
+		try {
+			await terminate(child);
+			return benchmarkIpcFence.error();
+		} finally {
+			if (activeChild === child) activeChild = undefined;
+			if (benchmarkChild === child) benchmarkChild = undefined;
+			benchmarkTerminationInProgress = false;
+		}
+	};
 
 	const startGateway = async (): Promise<void> => {
 		let childOutput = "";
-		latestBenchmarkCounters = undefined;
-		benchmarkIpcError = undefined;
-		if (benchmarkGateway && (!fs.existsSync(benchmarkMainPath) || !fs.existsSync(benchmarkStaticDir))) {
-			throw new Error(
-				"benchmark Gateway entry or built UI is missing; refusing to fall back to the standard CLI",
-			);
-		}
+		clearBenchmarkIpcState();
 		const child = (
 			benchmarkGateway
 				? spawn(
 						process.execPath,
 						[
-							benchmarkMainPath,
+							benchmarkBuild!.serverEntry,
 							"--pi-path",
 							options.fakePiPath ?? defaultFakePiPath,
 							"--host",
@@ -430,7 +741,7 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 								PI_WEB_DATA_DIR: webDataDir,
 								PI_WEB_E2E_MARKER: markerPath,
 								PI_WEB_E2E_CONTROL_DIR: controlDir,
-								PI_WEB_BENCHMARK_STATIC_DIR: benchmarkStaticDir,
+								PI_WEB_BENCHMARK_STATIC_DIR: benchmarkBuild!.staticDir,
 								...(options.benchmarkSeed ? { PI_WEB_BENCHMARK_SEED: options.benchmarkSeed } : {}),
 							}),
 						},
@@ -474,12 +785,14 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 		child.stdout.on("data", recordOutput);
 		child.stderr.on("data", recordOutput);
 		if (benchmarkGateway) {
-			child.on("message", (message: unknown) => {
-				if (!isBenchmarkGatewayCounterMessage(message)) {
-					benchmarkIpcError = "benchmark Gateway sent a non-counter IPC payload";
-					return;
+			const ipcChild = child as BenchmarkIpcChild;
+			benchmarkChild = ipcChild;
+			ipcChild.on("message", (message: unknown) => recordBenchmarkSnapshot(ipcChild, message));
+			ipcChild.once("exit", () => {
+				if (activeChild === ipcChild && !benchmarkTerminationInProgress && !benchmarkIpcFence.error()) {
+					benchmarkIpcFence.fail("benchmark Gateway exited before the harness completed its lifecycle");
 				}
-				latestBenchmarkCounters = Object.freeze({ ...message.counters });
+				if (benchmarkChild === ipcChild) benchmarkChild = undefined;
 			});
 		}
 		try {
@@ -489,15 +802,17 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 			}
 			cookie = await bootstrapGateway(origin, () => childOutput);
 			if (benchmarkGateway) {
-				await waitForBenchmarkCounters(
-					() => latestBenchmarkCounters,
-					() => benchmarkIpcError,
+				await waitForBenchmarkSnapshot(
+					() => benchmarkIpcFence.snapshot(),
+					() => benchmarkIpcFence.error(),
 					() => childOutput,
+					(snapshot) => snapshot.trial.state === "idle" && snapshot.trial.epoch === 0,
 				);
 			}
 		} catch (error) {
-			await terminate(child);
-			if (activeChild === child) activeChild = undefined;
+			const ipcFailure = await terminateGatewayChild(child);
+			if (benchmarkChild === child) clearBenchmarkIpcState();
+			if (ipcFailure) throw new Error(ipcFailure, { cause: error });
 			throw error;
 		}
 	};
@@ -505,15 +820,95 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 	const observation = (): GatewayObservation => {
 		if (!activeChild?.pid) throw new Error("production harness gateway is not running");
 		if (!benchmarkGateway) return { origin, port, pid: activeChild.pid, restartCount };
-		if (benchmarkIpcError) throw new Error(benchmarkIpcError);
-		if (!latestBenchmarkCounters) throw new Error("benchmark Gateway counters are unavailable");
+		const latestBenchmarkSnapshot = benchmarkIpcFence.snapshot();
+		const ipcError = benchmarkIpcFence.error();
+		if (ipcError) throw new Error(ipcError);
+		if (!latestBenchmarkSnapshot) throw new Error("benchmark Gateway counters are unavailable");
 		return {
 			origin,
 			port,
 			pid: activeChild.pid,
 			restartCount,
-			benchmarkCounters: Object.freeze({ ...latestBenchmarkCounters }),
+			benchmarkCounters: Object.freeze({ ...latestBenchmarkSnapshot.counters }),
+			benchmarkSnapshot: Object.freeze({
+				generation: latestBenchmarkSnapshot.generation,
+				trial: Object.freeze({ ...latestBenchmarkSnapshot.trial }),
+				counters: Object.freeze({ ...latestBenchmarkSnapshot.counters }),
+			}),
 		};
+	};
+	const controlBenchmarkTrial = async (
+		action: BenchmarkGatewayTrialControlMessage["action"],
+		trialId: string,
+	): Promise<Readonly<BenchmarkGatewaySnapshot>> => {
+		const latestBenchmarkSnapshot = benchmarkIpcFence.snapshot();
+		const benchmarkGeneration = benchmarkIpcFence.generation();
+		if (!benchmarkGateway || !benchmarkChild || !benchmarkGeneration || !latestBenchmarkSnapshot) {
+			throw new Error("benchmark trial lifecycle is unavailable on the normal production harness");
+		}
+		const ipcError = benchmarkIpcFence.error();
+		if (ipcError) throw new Error(ipcError);
+		if (!isValidBenchmarkId(trialId)) throw new Error("benchmark trial id is invalid");
+		const current = latestBenchmarkSnapshot.trial;
+		if (action === "begin" && current.state === "active") {
+			throw new Error("benchmark harness refuses to overlap trials");
+		}
+		if (action !== "begin" && (current.state !== "active" || current.id !== trialId)) {
+			throw new Error("benchmark harness trial lifecycle does not match the active child trial");
+		}
+		const control = benchmarkTrialControl(action, trialId);
+		benchmarkIpcFence.expect(control);
+		await new Promise<void>((resolve, reject) => {
+			if (!benchmarkChild?.connected) {
+				reject(new Error("benchmark Gateway IPC channel is disconnected"));
+				return;
+			}
+			const sent = benchmarkChild.send(control, (error) => {
+				if (error) reject(error);
+				else resolve();
+			});
+			if (!sent) reject(new Error("benchmark Gateway refused a trial lifecycle IPC message"));
+		});
+		const expectedState = action === "begin" ? "active" : action === "end" ? "ended" : "aborted";
+		const snapshot = await waitForBenchmarkSnapshot(
+			() => benchmarkIpcFence.snapshot(),
+			() => benchmarkIpcFence.error(),
+			() => output,
+			(candidate) =>
+				candidate.generation === benchmarkGeneration &&
+				candidate.trial.id === trialId &&
+				candidate.trial.state === expectedState,
+		);
+		return Object.freeze({
+			generation: snapshot.generation,
+			trial: Object.freeze({ ...snapshot.trial }),
+			counters: Object.freeze({ ...snapshot.counters }),
+		});
+	};
+	const refreshBrowserAuthentication = async (page: Page): Promise<void> => {
+		await page.evaluate(async () => {
+			const response = await fetch("/api/v1/bootstrap", { credentials: "include" });
+			if (!response.ok) throw new Error(`Browser bootstrap failed with ${String(response.status)}`);
+		});
+		await page.evaluate(async (gatewayOrigin) => {
+			const websocketOrigin = gatewayOrigin.replace(/^http/, "ws");
+			await new Promise<void>((resolve, reject) => {
+				const socket = new WebSocket(`${websocketOrigin}/api/v1/ws`);
+				const timeout = window.setTimeout(() => {
+					socket.close();
+					reject(new Error("authenticated WebSocket did not open after Gateway restart"));
+				}, 10_000);
+				socket.addEventListener("open", () => {
+					window.clearTimeout(timeout);
+					socket.close();
+					resolve();
+				});
+				socket.addEventListener("error", () => {
+					window.clearTimeout(timeout);
+					reject(new Error("authenticated WebSocket failed after Gateway restart"));
+				});
+			});
+		}, origin);
 	};
 
 	try {
@@ -605,27 +1000,38 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 			triggerReplayGap: (text) => {
 				fs.writeFileSync(path.join(controlDir, `${encodeURIComponent(text)}.gap`), "gap\n", "utf8");
 			},
+			beginBenchmarkTrial: (trialId) => controlBenchmarkTrial("begin", trialId),
+			endBenchmarkTrial: (trialId) => controlBenchmarkTrial("end", trialId),
+			abortBenchmarkTrial: (trialId) => controlBenchmarkTrial("abort", trialId),
 			gatewayObservation: observation,
-			restartGateway: async () => {
+			refreshBrowserAuthentication,
+			restartGateway: async (page) => {
 				const previous = activeChild;
 				if (!previous) throw new Error("production harness gateway is not running");
-				await terminate(previous);
-				if (activeChild === previous) activeChild = undefined;
+				const ipcFailure = await terminateGatewayChild(previous);
+				clearBenchmarkIpcState();
+				if (ipcFailure) throw new Error(ipcFailure);
 				await waitForLoopbackPortRelease(port, () => output);
 				await startGateway();
 				restartCount += 1;
+				if (page) await refreshBrowserAuthentication(page);
 				return observation();
 			},
 			requestJson,
 			stop: async () => {
-				if (activeChild) await terminate(activeChild);
-				activeChild = undefined;
+				const child = activeChild;
+				const ipcFailure = child ? await terminateGatewayChild(child) : benchmarkIpcFence.error();
+				clearBenchmarkIpcState();
 				fs.rmSync(rootDir, { recursive: true, force: true });
+				if (ipcFailure) throw new Error(ipcFailure);
 			},
 		};
 	} catch (error) {
-		if (activeChild) await terminate(activeChild);
+		const child = activeChild;
+		const ipcFailure = child ? await terminateGatewayChild(child) : benchmarkIpcFence.error();
+		clearBenchmarkIpcState();
 		fs.rmSync(rootDir, { recursive: true, force: true });
+		if (ipcFailure) throw new Error(ipcFailure, { cause: error });
 		throw error;
 	}
 }

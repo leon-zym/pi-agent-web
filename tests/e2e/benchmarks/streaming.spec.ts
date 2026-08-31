@@ -4,12 +4,10 @@ import {
 	addSummaryGate,
 	addValueGate,
 	correctnessFailureCount,
-	finishBrowserMeasurement,
 	installBrowserBenchmarkObserver,
 	markBrowserStreamEnd,
 	runBenchmarkScenario,
 	scenariosFor,
-	startBrowserMeasurement,
 } from "./benchmark-support";
 
 test.use({ harnessOptions: { benchmarkGateway: true } });
@@ -20,7 +18,7 @@ for (const scenario of scenariosFor("streaming")) {
 		harness,
 	}, testInfo) => {
 		test.slow();
-		await runBenchmarkScenario(page, testInfo, scenario, async (outcome) => {
+		await runBenchmarkScenario(page, testInfo, harness, scenario, async (outcome, trials) => {
 			const targetBytes = scenario.targetBytes;
 			const chunkBytes = scenario.chunkBytes;
 			const chunkDelayMs = scenario.chunkDelayMs;
@@ -32,91 +30,91 @@ for (const scenario of scenariosFor("streaming")) {
 			await page.goto(harness.origin, { waitUntil: "domcontentloaded" });
 			await expect(page.locator("#root > div")).toBeVisible();
 			await expect(page.locator("textarea")).toBeEnabled();
-			const cdp = await page.context().newCDPSession(page);
 			const trialCount = scenario.warmups + scenario.samples;
 
 			for (let index = 0; index < trialCount; index += 1) {
-				const prompt = [
-					"E2E_BENCH_STREAM",
-					String(targetBytes),
-					String(chunkBytes),
-					String(chunkDelayMs),
-					`${scenario.id}-${String(index)}`,
-				].join(":");
-				await cdp.send("HeapProfiler.collectGarbage");
-				await startBrowserMeasurement(page);
-				await page.locator("textarea").fill(prompt);
-				await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
+				await trials.run(index, async ({ finishBrowserMeasurement }) => {
+					const prompt = [
+						"E2E_BENCH_STREAM",
+						String(targetBytes),
+						String(chunkBytes),
+						String(chunkDelayMs),
+						`${scenario.id}-${String(index)}`,
+					].join(":");
+					await page.locator("textarea").fill(prompt);
+					await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
 
-				await expect
-					.poll(() => harness.piEvents().some((event) => event.type === "delta" && event.text === prompt))
-					.toBe(true);
-				const streaming = page.locator('[data-markdown-streaming="true"]');
-				await expect(streaming).toHaveCount(1);
-				await expect
-					.poll(() => streaming.evaluate((element) => element.textContent?.length ?? 0))
-					.toBeGreaterThan(0);
-				const liveRichNodes = await streaming.locator("h1,h2,h3,strong,em,pre,table,ul,ol").count();
-				await expect
-					.poll(
-						() => harness.piEvents().find((event) => event.type === "stream_end" && event.text === prompt),
-						{ timeout: 30_000 },
-					)
-					.toBeTruthy();
-				const streamEnd = harness
-					.piEvents()
-					.find((event) => event.type === "stream_end" && event.text === prompt);
-				if (streamEnd?.markdownChars === undefined || streamEnd.deltaCount === undefined) {
-					throw new Error("stream fixture did not record its final character and delta counts");
-				}
-				await expect
-					.poll(() => streaming.evaluate((element) => element.textContent?.length ?? 0))
-					.toBe(streamEnd.markdownChars);
-				const turn = page
-					.getByRole("region", { name: /^(Conversation turn|对话轮次)$/ })
-					.filter({ hasText: prompt });
-				const settled = turn.locator('[data-markdown-settled="true"]');
-				const streamingDomBeforeRelease = await streaming.count();
-				const settledDomBeforeRelease = await settled.count();
-				await markBrowserStreamEnd(page);
-				const structuralTransitionStarted = await page.evaluate(() => performance.now());
-				harness.releasePrompt(prompt);
-				await expect
-					.poll(() => harness.piEvents().some((event) => event.type === "settled" && event.text === prompt), {
-						timeout: 30_000,
-					})
-					.toBe(true);
-				await expect(streaming).toHaveCount(0, { timeout: 30_000 });
-				await expect(settled).toHaveCount(1, { timeout: 30_000 });
-				await expect(settled).toBeVisible({ timeout: 30_000 });
-				const structuralTransitionFinished = await page.evaluate(() => performance.now());
-				const settledText = await settled.textContent();
-				const largeFrames = harness
-					.piEvents()
-					.filter((event) => event.type === "large_frame" && event.text === prompt);
-				await cdp.send("HeapProfiler.collectGarbage");
-				const metrics = await finishBrowserMeasurement(page);
-				outcome.trials.push({
-					index,
-					warmup: index < scenario.warmups,
-					metrics: {
-						...metrics,
-						deltaCount: streamEnd.deltaCount,
-						publicationRatio: metrics.publicationBatches / streamEnd.deltaCount,
-						structuralDomTransitionMs: structuralTransitionFinished - structuralTransitionStarted,
-					},
-					correctness: {
-						liveTailStayedPlain: liveRichNodes === 0,
-						structuralReleaseHeldInStreamingDom:
-							streamingDomBeforeRelease === 1 && settledDomBeforeRelease === 0,
-						structuralReleasePublishedSettledDom:
-							(await streaming.count()) === 0 && (await settled.count()) === 1,
-						settledEndSentinel: settledText?.includes("STREAM_BUDGET_END") ?? false,
-						settledUnicode: settledText?.includes("🧪") ?? false,
-						structuralFramesEmittedInOrder:
-							largeFrames.map((event) => event.eventType).join(",") === "text_end,message_end",
-						frameBudgetPreserved: largeFrames.every((event) => (event.frameBytes ?? 0) > targetBytes),
-					},
+					await expect
+						.poll(() => harness.piEvents().some((event) => event.type === "delta" && event.text === prompt))
+						.toBe(true);
+					const streaming = page.locator('[data-markdown-streaming="true"]');
+					await expect(streaming).toHaveCount(1);
+					await expect
+						.poll(() => streaming.evaluate((element) => element.textContent?.length ?? 0))
+						.toBeGreaterThan(0);
+					const liveRichNodes = await streaming.locator("h1,h2,h3,strong,em,pre,table,ul,ol").count();
+					await expect
+						.poll(
+							() => harness.piEvents().find((event) => event.type === "stream_end" && event.text === prompt),
+							{ timeout: 30_000 },
+						)
+						.toBeTruthy();
+					const streamEnd = harness
+						.piEvents()
+						.find((event) => event.type === "stream_end" && event.text === prompt);
+					if (streamEnd?.markdownChars === undefined || streamEnd.deltaCount === undefined) {
+						throw new Error("stream fixture did not record its final character and delta counts");
+					}
+					await expect
+						.poll(() => streaming.evaluate((element) => element.textContent?.length ?? 0))
+						.toBe(streamEnd.markdownChars);
+					const turn = page
+						.getByRole("region", { name: /^(Conversation turn|对话轮次)$/ })
+						.filter({ hasText: prompt });
+					const settled = turn.locator('[data-markdown-settled="true"]');
+					const streamingDomBeforeRelease = await streaming.count();
+					const settledDomBeforeRelease = await settled.count();
+					await markBrowserStreamEnd(page);
+					const structuralTransitionStarted = await page.evaluate(() => performance.now());
+					harness.releasePrompt(prompt);
+					await expect
+						.poll(
+							() => harness.piEvents().some((event) => event.type === "settled" && event.text === prompt),
+							{
+								timeout: 30_000,
+							},
+						)
+						.toBe(true);
+					await expect(streaming).toHaveCount(0, { timeout: 30_000 });
+					await expect(settled).toHaveCount(1, { timeout: 30_000 });
+					await expect(settled).toBeVisible({ timeout: 30_000 });
+					const structuralTransitionFinished = await page.evaluate(() => performance.now());
+					const settledText = await settled.textContent();
+					const largeFrames = harness
+						.piEvents()
+						.filter((event) => event.type === "large_frame" && event.text === prompt);
+					const measurement = await finishBrowserMeasurement();
+					const metrics = measurement.browser;
+					return {
+						metrics: {
+							...metrics,
+							deltaCount: streamEnd.deltaCount,
+							publicationRatio: metrics.publicationBatches / streamEnd.deltaCount,
+							structuralDomTransitionMs: structuralTransitionFinished - structuralTransitionStarted,
+						},
+						correctness: {
+							liveTailStayedPlain: liveRichNodes === 0,
+							structuralReleaseHeldInStreamingDom:
+								streamingDomBeforeRelease === 1 && settledDomBeforeRelease === 0,
+							structuralReleasePublishedSettledDom:
+								(await streaming.count()) === 0 && (await settled.count()) === 1,
+							settledEndSentinel: settledText?.includes("STREAM_BUDGET_END") ?? false,
+							settledUnicode: settledText?.includes("🧪") ?? false,
+							structuralFramesEmittedInOrder:
+								largeFrames.map((event) => event.eventType).join(",") === "text_end,message_end",
+							frameBudgetPreserved: largeFrames.every((event) => (event.frameBytes ?? 0) > targetBytes),
+						},
+					};
 				});
 			}
 

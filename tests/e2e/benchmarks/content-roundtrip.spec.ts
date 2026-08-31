@@ -6,6 +6,7 @@ import {
 	addSummaryGate,
 	addValueGate,
 	correctnessFailureCount,
+	installBrowserBenchmarkObserver,
 	runBenchmarkScenario,
 	scenariosFor,
 } from "./benchmark-support";
@@ -97,7 +98,7 @@ for (const scenario of scenariosFor("content-roundtrip")) {
 		harness,
 	}, testInfo) => {
 		test.slow();
-		await runBenchmarkScenario(page, testInfo, scenario, async (outcome) => {
+		await runBenchmarkScenario(page, testInfo, harness, scenario, async (outcome, trials) => {
 			if (scenario.inputBytes === undefined) throw new Error("content scenario is missing inputBytes");
 			const input = validPng(scenario.inputBytes);
 			const inputBase64Chars = input.toString("base64").length;
@@ -117,111 +118,109 @@ for (const scenario of scenariosFor("content-roundtrip")) {
 					if (parsed) wire.push({ direction: "received", ...parsed });
 				});
 			});
+			await installBrowserBenchmarkObserver(page);
 			await page.goto(harness.origin, { waitUntil: "domcontentloaded" });
 			await expect(page.locator("#root > div")).toBeVisible();
 			await expect(page.locator("textarea")).toBeEnabled();
-			const cdp = await page.context().newCDPSession(page);
 			const trialCount = scenario.warmups + scenario.samples;
 			let authenticatedAttachmentFetch = false;
 
 			for (let index = 0; index < trialCount; index += 1) {
-				await cdp.send("HeapProfiler.collectGarbage");
-				const heapBefore = await page.evaluate(
-					() =>
-						(performance as Performance & { memory?: { usedJSHeapSize: number } }).memory?.usedJSHeapSize ??
-						null,
-				);
-				const selectionStarted = await page.evaluate(() => performance.now());
-				await page.locator("#piweb-image-input").setInputFiles({
-					name: `near-limit-${String(index)}.png`,
-					mimeType: "image/png",
-					buffer: input,
-				});
-				await expect(page.getByAltText(/^(Attachment 1|附件 1)$/)).toBeVisible({ timeout: 30_000 });
-				const selectionFinished = await page.evaluate(() => performance.now());
-				const wireStart = wire.length;
-				const roundTripStarted = await page.evaluate(() => performance.now());
-				const attachmentResponse =
-					index === 0
-						? page.waitForResponse((response) =>
-								new URL(response.url()).pathname.startsWith("/api/v1/attachments/"),
-							)
-						: null;
-				await page.locator("textarea").fill(PROMPT);
-				await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
-				await expect
-					.poll(
+				await trials.run(index, async () => {
+					const heapBefore = await page.evaluate(
 						() =>
-							harness
-								.piEvents()
-								.filter((event) => event.type === "prompt" && event.text === PROMPT)
-								.at(-1),
-						{ timeout: 30_000 },
-					)
-					.toMatchObject({ imageCount: 1, imageChars: inputBase64Chars });
-				await expect
-					.poll(() => wire.slice(wireStart).filter((event) => hasAttachmentRef(event.frame)).length)
-					.toBeGreaterThanOrEqual(2);
-				const image = page.getByAltText(/^(Attachment image 1|附件图片 1)$/).last();
-				await expect(image).toBeVisible({ timeout: 30_000 });
-				await expect
-					.poll(() =>
-						image.evaluate((element) => {
-							const target = element as HTMLImageElement;
-							return target.complete && target.naturalWidth > 0;
-						}),
-					)
-					.toBe(true);
-				if (attachmentResponse) {
-					const response = await attachmentResponse;
-					authenticatedAttachmentFetch =
-						response.status() === 200 &&
-						response.request().method() === "GET" &&
-						(await response.request().allHeaders()).cookie?.includes("pi_web_session=") === true;
-				}
-				const roundTripFinished = await page.evaluate(() => performance.now());
-				await cdp.send("HeapProfiler.collectGarbage");
-				const heapAfter = await page.evaluate(
-					() =>
-						(performance as Performance & { memory?: { usedJSHeapSize: number } }).memory?.usedJSHeapSize ??
-						null,
-				);
-				const trialWire = wire.slice(wireStart);
-				const sentBytes = trialWire
-					.filter((event) => event.direction === "sent")
-					.map((event) => Buffer.byteLength(event.raw, "utf8"));
-				const receivedBytes = trialWire
-					.filter((event) => event.direction === "received")
-					.map((event) => Buffer.byteLength(event.raw, "utf8"));
-				const receivedRaw = trialWire
-					.filter((event) => event.direction === "received")
-					.map((event) => event.raw)
-					.join("\n");
-				outcome.trials.push({
-					index,
-					warmup: index < scenario.warmups,
-					metrics: {
-						selectionMs: selectionFinished - selectionStarted,
-						roundTripMs: roundTripFinished - roundTripStarted,
-						inputBase64Chars,
-						maxSentFrameBytes: Math.max(0, ...sentBytes),
-						maxReceivedFrameBytes: Math.max(0, ...receivedBytes),
-						heapDeltaBytes: heapBefore === null || heapAfter === null ? null : heapAfter - heapBefore,
-					},
-					correctness: {
-						inputReachedPiAtExpectedSize:
-							harness
-								.piEvents()
-								.filter((event) => event.type === "prompt" && event.text === PROMPT)
-								.at(-1)?.imageChars === inputBase64Chars,
-						typedOutputRefsObserved: trialWire.filter((event) => hasAttachmentRef(event.frame)).length >= 2,
-						outputBlobResolved: await image.evaluate((element) => {
-							const target = element as HTMLImageElement;
-							return target.complete && target.naturalWidth > 0;
-						}),
-						largeOutputStayedOffWebSocket: !receivedRaw.includes("iVBORw0KGgo"),
-						socketRemainedUsable: sockets.length === 1 && closedSockets.length === 0,
-					},
+							(performance as Performance & { memory?: { usedJSHeapSize: number } }).memory?.usedJSHeapSize ??
+							null,
+					);
+					const selectionStarted = await page.evaluate(() => performance.now());
+					await page.locator("#piweb-image-input").setInputFiles({
+						name: `near-limit-${String(index)}.png`,
+						mimeType: "image/png",
+						buffer: input,
+					});
+					await expect(page.getByAltText(/^(Attachment 1|附件 1)$/)).toBeVisible({ timeout: 30_000 });
+					const selectionFinished = await page.evaluate(() => performance.now());
+					const wireStart = wire.length;
+					const roundTripStarted = await page.evaluate(() => performance.now());
+					const attachmentResponse =
+						index === 0
+							? page.waitForResponse((response) =>
+									new URL(response.url()).pathname.startsWith("/api/v1/attachments/"),
+								)
+							: null;
+					await page.locator("textarea").fill(PROMPT);
+					await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
+					await expect
+						.poll(
+							() =>
+								harness
+									.piEvents()
+									.filter((event) => event.type === "prompt" && event.text === PROMPT)
+									.at(-1),
+							{ timeout: 30_000 },
+						)
+						.toMatchObject({ imageCount: 1, imageChars: inputBase64Chars });
+					await expect
+						.poll(() => wire.slice(wireStart).filter((event) => hasAttachmentRef(event.frame)).length)
+						.toBeGreaterThanOrEqual(2);
+					const image = page.getByAltText(/^(Attachment image 1|附件图片 1)$/).last();
+					await expect(image).toBeVisible({ timeout: 30_000 });
+					await expect
+						.poll(() =>
+							image.evaluate((element) => {
+								const target = element as HTMLImageElement;
+								return target.complete && target.naturalWidth > 0;
+							}),
+						)
+						.toBe(true);
+					if (attachmentResponse) {
+						const response = await attachmentResponse;
+						authenticatedAttachmentFetch =
+							response.status() === 200 &&
+							response.request().method() === "GET" &&
+							(await response.request().allHeaders()).cookie?.includes("pi_web_session=") === true;
+					}
+					const roundTripFinished = await page.evaluate(() => performance.now());
+					const heapAfter = await page.evaluate(
+						() =>
+							(performance as Performance & { memory?: { usedJSHeapSize: number } }).memory?.usedJSHeapSize ??
+							null,
+					);
+					const trialWire = wire.slice(wireStart);
+					const sentBytes = trialWire
+						.filter((event) => event.direction === "sent")
+						.map((event) => Buffer.byteLength(event.raw, "utf8"));
+					const receivedBytes = trialWire
+						.filter((event) => event.direction === "received")
+						.map((event) => Buffer.byteLength(event.raw, "utf8"));
+					const receivedRaw = trialWire
+						.filter((event) => event.direction === "received")
+						.map((event) => event.raw)
+						.join("\n");
+					return {
+						metrics: {
+							selectionMs: selectionFinished - selectionStarted,
+							roundTripMs: roundTripFinished - roundTripStarted,
+							inputBase64Chars,
+							maxSentFrameBytes: Math.max(0, ...sentBytes),
+							maxReceivedFrameBytes: Math.max(0, ...receivedBytes),
+							heapDeltaBytes: heapBefore === null || heapAfter === null ? null : heapAfter - heapBefore,
+						},
+						correctness: {
+							inputReachedPiAtExpectedSize:
+								harness
+									.piEvents()
+									.filter((event) => event.type === "prompt" && event.text === PROMPT)
+									.at(-1)?.imageChars === inputBase64Chars,
+							typedOutputRefsObserved: trialWire.filter((event) => hasAttachmentRef(event.frame)).length >= 2,
+							outputBlobResolved: await image.evaluate((element) => {
+								const target = element as HTMLImageElement;
+								return target.complete && target.naturalWidth > 0;
+							}),
+							largeOutputStayedOffWebSocket: !receivedRaw.includes("iVBORw0KGgo"),
+							socketRemainedUsable: sockets.length === 1 && closedSockets.length === 0,
+						},
+					};
 				});
 			}
 			addValueGate(
