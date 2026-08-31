@@ -34,6 +34,7 @@ function resetStores(): void {
 		submitState: "plain",
 		activeSubmitId: null,
 		attachmentWorkCount: 0,
+		fileReferences: [],
 		attachmentWorkIds: [],
 		deliveryMode: "auto",
 		queue: { steering: [], followUp: [] },

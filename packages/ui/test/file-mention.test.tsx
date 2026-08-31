@@ -61,6 +61,9 @@ describe("FileMentionMenu component markup", () => {
 		const html = renderToStaticMarkup(
 			createElement(FileMentionMenu, {
 				workspaceHandle: "ws-test",
+				onCapture: async () => {
+					throw new Error("not called during server render");
+				},
 				onSelect: () => undefined,
 			}),
 		);

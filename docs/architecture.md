@@ -136,6 +136,15 @@ The Browser retrieves referenced content through authenticated same-origin GET r
 command images remain bounded inline ingress. There is no public upload endpoint for the derived
 store.
 
+Workspace file references are Host-owned prompt ingress. Search exposes bounded metadata and safe
+preview text; capture revalidates the canonical Workspace, resolved target, and file identity around
+a no-follow read. The owning Session keeps the captured bytes until submission, and file-reference
+expansion does not ask Pi RPC to reopen the path. Ordinary agent tools remain a separate boundary.
+
+Risk policy covers ignore state, hidden or generated paths, credential patterns, size, binary data,
+and images. Uncertainty fails closed, no file index or content cache is durable, and the expanded Pi
+user message remains native JSONL truth.
+
 ## Lifecycle and recovery
 
 - Recoverable process crashes use bounded restart policy and preserve exact generation semantics.

@@ -15,6 +15,7 @@ beforeEach(() => {
 		activeSessionHandle: null,
 		draft: "",
 		images: [],
+		fileReferences: [],
 		trigger: null,
 		command: null,
 		submitState: "plain",
@@ -74,6 +75,27 @@ describe("composer interactions", () => {
 		);
 		expect(serializeComposerMessage(skillToken, "")).toBe("/skill:review");
 		expect(serializeComposerMessage(null, "  ordinary prompt  ")).toBe("ordinary prompt");
+	});
+
+	it("serializes Host-captured file bytes instead of asking Pi to reopen a path", () => {
+		const text = serializeComposerMessage(null, "Review @src/example.ts", [
+			{
+				metadata: {
+					path: 'src/a"&b.ts',
+					canonicalIdentity: "1:2:3:4",
+					byteSize: 18,
+					kind: "text",
+					estimatedTokens: 5,
+					risks: [],
+					availability: "ready",
+					previewTruncated: false,
+				},
+				content: { type: "text", text: "export const x = 1;" },
+			},
+		]);
+
+		expect(text).toContain('Review @src/example.ts\n<file name="src/a&quot;&amp;b.ts">');
+		expect(text).toContain("export const x = 1;");
 	});
 
 	it("removes the whole token on an empty-body Backspace and via the remove action", () => {
@@ -201,6 +223,31 @@ describe("composer interactions", () => {
 			images: [],
 			attachmentWorkCount: 0,
 		});
+	});
+
+	it("keeps captured file bytes on their Session across navigation and canonical rekey", () => {
+		const composer = useComposerStore.getState();
+		const reference = {
+			metadata: {
+				path: "src/reference.ts",
+				canonicalIdentity: "1:2:3:4",
+				byteSize: 8,
+				kind: "text" as const,
+				estimatedTokens: 2,
+				risks: [],
+				availability: "ready" as const,
+				previewTruncated: false,
+			},
+			content: { type: "text" as const, text: "captured" },
+		};
+
+		composer.addFileReferenceForSession("session-a", reference);
+		composer.beginSession("session-b");
+		composer.rekeySession("session-a", "session-a-canonical");
+
+		expect(useComposerStore.getState().fileReferences).toEqual([]);
+		expect(useComposerStore.getState().bySession["session-a"]).toBeUndefined();
+		expect(useComposerStore.getState().bySession["session-a-canonical"]?.fileReferences).toEqual([reference]);
 	});
 
 	it("restores drafts and queues when the visible Session changes", () => {

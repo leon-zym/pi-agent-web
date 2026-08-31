@@ -74,6 +74,7 @@ export * from "./pi-product-dto.js";
 export * from "./product-decoders.js";
 export * from "./product-dto.js";
 export * from "./session-history.js";
+export * from "./workspace-file-reference.js";
 
 const MAX_IDENTIFIER_LENGTH = 256;
 const MAX_PATH_LENGTH = 8192;

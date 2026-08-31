@@ -23,6 +23,7 @@ earlier records describe a different implementation.
 | [0011](0011-epoch-scoped-typed-content-references.md) | Epoch-scoped typed content references for UTF-8 text and JSON |
 | [0012](0012-schema-backed-boundary-decoders.md) | Superseded schema-backed Pi and product boundary decoders |
 | [0013](0013-canonical-gateway-and-explicit-boundaries.md) | One canonical Gateway protocol and explicit boundary guards |
+| [0014](0014-host-owned-workspace-file-references.md) | Host-owned Workspace file capture, policy, and prompt expansion |
 
 New ADRs use: Status, Date, Context, Decision, Consequences, Rejected alternatives, Verification.
 Accepted ADRs are amended or superseded by a later ADR; do not silently reverse them in a handoff or
