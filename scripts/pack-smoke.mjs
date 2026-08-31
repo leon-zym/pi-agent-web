@@ -1,141 +1,34 @@
-import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import {
+	closeChild,
+	inspectPackageTarballs,
+	installedBin,
+	installTarballs,
+	launchInstalledCli,
+	packWorkspacePackages,
+	run,
+	waitForOutput,
+	waitForSocket,
+} from "./lib/package-smoke.mjs";
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-pack-smoke-"));
 const tarballDir = path.join(tempRoot, "tarballs");
 const installDir = path.join(tempRoot, "install");
 fs.mkdirSync(tarballDir);
 fs.mkdirSync(installDir);
 
-function run(command, args, cwd = root) {
-	const result = spawnSync(command, args, { cwd, encoding: "utf8", stdio: "pipe", timeout: 120_000 });
-	if (result.status !== 0) {
-		throw new Error(`${command} ${args.join(" ")} failed:\n${result.stdout}\n${result.stderr}`);
-	}
-	return result.stdout;
-}
-
-function packageManifest(tarball) {
-	return JSON.parse(run("tar", ["-xOf", tarball, "package/package.json"]));
-}
-
-function waitForOutput(child, pattern, timeoutMs = 10_000) {
-	return new Promise((resolve, reject) => {
-		let output = "";
-		const timer = setTimeout(
-			() => reject(new Error(`CLI did not print ${String(pattern)}:\n${output}`)),
-			timeoutMs,
-		);
-		const onData = (chunk) => {
-			output += chunk.toString();
-			const match = output.match(pattern);
-			if (!match) return;
-			clearTimeout(timer);
-			child.stdout.off("data", onData);
-			resolve(match);
-		};
-		child.stdout.on("data", onData);
-		child.stderr.on("data", (chunk) => {
-			output += chunk.toString();
-		});
-		child.once("error", reject);
-	});
-}
-
-function waitForChildExit(child, timeoutMs) {
-	if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
-	return new Promise((resolve) => {
-		const onExit = () => finish(true);
-		const timer = setTimeout(() => finish(false), timeoutMs);
-		const finish = (exited) => {
-			clearTimeout(timer);
-			child.off("exit", onExit);
-			resolve(exited);
-		};
-		child.once("exit", onExit);
-	});
-}
-
-async function closeChild(child) {
-	if (child.exitCode !== null || child.signalCode !== null) return;
-	child.kill("SIGTERM");
-	if (await waitForChildExit(child, 2_000)) return;
-	child.kill("SIGKILL");
-	if (!(await waitForChildExit(child, 2_000))) throw new Error("Packaged CLI did not exit after SIGKILL");
-}
-
-function waitForSocket(socket, setup, timeoutMessage, timeoutMs = 10_000) {
-	return new Promise((resolve, reject) => {
-		let settled = false;
-		const finish = (error) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timer);
-			if (error) reject(error);
-			else resolve();
-		};
-		const timer = setTimeout(() => {
-			try {
-				socket.terminate();
-			} finally {
-				finish(new Error(timeoutMessage));
-			}
-		}, timeoutMs);
-		setup(finish);
-	});
-}
-
 try {
-	const packageNames = [
-		"@pi-agent-web/protocol",
-		"@pi-agent-web/server",
-		"@pi-agent-web/ui",
-		"@pi-agent-web/cli",
-	];
-	for (const packageName of packageNames) {
-		run("pnpm", ["--filter", packageName, "pack", "--pack-destination", tarballDir]);
-	}
-	const tarballs = fs
-		.readdirSync(tarballDir)
-		.filter((entry) => entry.endsWith(".tgz"))
-		.map((entry) => path.join(tarballDir, entry));
-	if (tarballs.length !== 4) throw new Error(`Expected four tarballs, found ${String(tarballs.length)}`);
-	for (const tarball of tarballs) {
-		const files = run("tar", ["-tzf", tarball]);
-		if (!files.includes("package/dist/"))
-			throw new Error(`Missing dist directory in ${path.basename(tarball)}`);
-		if (!files.includes("package/LICENSE")) throw new Error(`Missing LICENSE in ${path.basename(tarball)}`);
-		if (files.includes("package/src/"))
-			throw new Error(`Source directory leaked into ${path.basename(tarball)}`);
-		const manifest = packageManifest(tarball);
-		if (
-			manifest.license !== "MIT" ||
-			manifest.repository?.url !== "git+https://github.com/leon-zym/pi-agent-web.git"
-		) {
-			throw new Error(`Missing publish metadata in ${path.basename(tarball)}`);
-		}
-		if (JSON.stringify(manifest).includes("workspace:*")) {
-			throw new Error(`Workspace dependency leaked into ${path.basename(tarball)}`);
-		}
-	}
-	fs.writeFileSync(path.join(installDir, "package.json"), '{"name":"piweb-pack-smoke","private":true}\n');
-	run("npm", ["install", "--ignore-scripts", ...tarballs], installDir);
+	const tarballs = packWorkspacePackages({ tarballDir });
+	inspectPackageTarballs(tarballs);
+	installTarballs({ tarballs, installDir });
 
-	const bin = path.join(
-		installDir,
-		"node_modules",
-		".bin",
-		process.platform === "win32" ? "pi-web.cmd" : "pi-web",
-	);
-	run(bin, ["--help"], installDir);
-	run("npx", ["--prefix", installDir, "--no-install", "pi-web", "--help"], installDir);
+	const bin = installedBin(installDir);
+	run(bin, ["--help"], { cwd: installDir });
+	run("npx", ["--prefix", installDir, "--no-install", "pi-web", "--help"], { cwd: installDir });
 
-	const cliEntry = path.join(installDir, "node_modules", "@pi-agent-web", "cli", "dist", "cli.js");
 	const externalWorkspace = path.join(tempRoot, "external-workspace");
 	const emptyBinDir = path.join(tempRoot, "empty-bin");
 	fs.mkdirSync(externalWorkspace);
@@ -148,9 +41,10 @@ try {
 		PI_WEB_DATA_DIR: path.join(tempRoot, "web-data"),
 	};
 	delete packagedEnv.PI_PATH;
-	const child = spawn(process.execPath, [cliEntry, "--host", "127.0.0.1", "--port", "0", "--no-open"], {
+	const child = launchInstalledCli({
+		installDir,
+		args: ["--host", "127.0.0.1", "--port", "0", "--no-open"],
 		cwd: externalWorkspace,
-		stdio: ["ignore", "pipe", "pipe"],
 		env: packagedEnv,
 	});
 	try {
