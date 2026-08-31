@@ -10,7 +10,7 @@ import {
 	controlledNpxEnvironment,
 	extractBundleArchive,
 	installBundle,
-	launchInstalledNpx,
+	launchInstalledCli,
 	run,
 	terminateChildWithin,
 	waitForOutput,
@@ -395,7 +395,8 @@ async function runBundledRuntimeSmoke({ bundleRoot, expectedPiVersion, tempRoot 
 		PI_WEB_DATA_DIR: path.join(tempRoot, "bundled-web-data"),
 	};
 	delete env.PI_PATH;
-	const child = launchInstalledNpx({
+	const child = launchInstalledCli({
+		installDir: bundleRoot,
 		args: ["--host", "127.0.0.1", "--port", "0", "--no-open"],
 		cwd: workspacePath,
 		detached: process.platform !== "win32",
@@ -432,7 +433,8 @@ async function runDeterministicConversationSmoke({ bundleRoot, expectedPiVersion
 		PI_WEB_FIXTURE_LIFECYCLE_MARKER: lifecycleMarker,
 	};
 	delete env.PI_PATH;
-	const child = launchInstalledNpx({
+	const child = launchInstalledCli({
+		installDir: bundleRoot,
 		args: ["--pi-path", fixturePath, "--host", "127.0.0.1", "--port", "0", "--no-open"],
 		cwd: workspacePath,
 		detached: process.platform !== "win32",

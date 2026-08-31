@@ -118,9 +118,10 @@ export function installedCliEntry(installDir) {
 	return path.join(installDir, "node_modules", "@pi-agent-web", "cli", "dist", "cli.js");
 }
 
-export function launchInstalledCli({ installDir, args, cwd, env }) {
+export function launchInstalledCli({ installDir, args, cwd, detached = false, env }) {
 	return spawn(process.execPath, [installedCliEntry(installDir), ...args], {
 		cwd,
+		detached,
 		stdio: ["ignore", "pipe", "pipe"],
 		env,
 	});
@@ -280,16 +281,6 @@ export function controlledNpxEnvironment({ emptyBinDir, baseEnv = process.env })
 	const npxPath = resolveExecutable("npx", baseEnv.PATH);
 	const pathEntries = [path.dirname(npxPath), path.dirname(process.execPath), emptyBinDir];
 	return { ...baseEnv, PATH: [...new Set(pathEntries)].join(path.delimiter) };
-}
-
-export function launchInstalledNpx({ args, cwd, detached = false, env }) {
-	const npxPath = resolveExecutable("npx");
-	return spawn(npxPath, ["--no-install", "pi-web", ...args], {
-		cwd,
-		detached,
-		stdio: ["ignore", "pipe", "pipe"],
-		env,
-	});
 }
 
 export async function terminateChildWithin(child, timeoutMs = 2_000, options = {}) {
