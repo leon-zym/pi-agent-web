@@ -217,7 +217,7 @@ try {
 					socket.send(
 						JSON.stringify({
 							type: "client_hello",
-							protocol: { major: 1, minor: 3 },
+							protocol: { major: 1, minor: 4 },
 							clientBuild: "pack-smoke",
 							capabilities: [
 								"rpc.commands",
@@ -225,6 +225,7 @@ try {
 								"rpc.extension_ui",
 								"session.multiplex",
 								"session.hot_runtime_inventory",
+								"session.fenced_takeover",
 								"payload.epoch_attachment_refs",
 								"payload.epoch_content_refs",
 							],

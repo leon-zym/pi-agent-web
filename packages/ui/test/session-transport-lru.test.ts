@@ -40,7 +40,7 @@ function open(socket: FakeSocket | undefined): void {
 	socket.onmessage?.({
 		data: JSON.stringify({
 			type: "server_hello",
-			protocol: { major: 1, minor: 3 },
+			protocol: { major: 1, minor: 4 },
 			serverBuild: "test-server",
 			serverEpoch: "test-epoch",
 			piVersion: "0.84.2",
@@ -81,7 +81,7 @@ function harness(options: { maxActiveSubscriptions?: number } = {}): Harness {
 			return socket;
 		},
 		url: () => "ws://test/ws",
-		protocolVersion: { major: 1, minor: 3 },
+		protocolVersion: { major: 1, minor: 4 },
 		...options,
 	});
 	controllers.push(controller);

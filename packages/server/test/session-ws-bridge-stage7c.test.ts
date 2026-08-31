@@ -107,19 +107,30 @@ function futureSupervisor(): SessionWsBridgeOptions["supervisor"] {
 			observationToken: { kind: "hot_runtime_subscription" },
 		}),
 		revalidateHotExactSubscription: () => true,
-		claim: async () => ({
-			serverEpoch: SERVER_EPOCH,
-			sessionHandle: currentRuntime.sessionHandle,
-			generation: currentRuntime.generation,
-			isController: false,
+		claimWithTransition: async () => ({
+			lease: {
+				serverEpoch: SERVER_EPOCH,
+				sessionHandle: currentRuntime.sessionHandle,
+				generation: currentRuntime.generation,
+				leaseRevision: 0,
+				controlState: "free" as const,
+				transition: "baseline" as const,
+				isController: false,
+			},
 		}),
-		release: () => true,
-		releaseExact: () => true,
-		releaseConnection: () => [],
+		releaseWithTransition: async () => ({ released: false }),
+		releaseExactWithTransition: async () => ({ released: false }),
+		releaseConnectionWithTransitions: async () => ({ released: [], transitions: [] }),
+		takeover: async () => {
+			throw new Error("takeover is not exercised by the future bridge fixture");
+		},
 		leaseFor: () => ({
 			serverEpoch: SERVER_EPOCH,
 			sessionHandle: currentRuntime.sessionHandle,
 			generation: currentRuntime.generation,
+			leaseRevision: 0,
+			controlState: "free" as const,
+			transition: "baseline" as const,
 			isController: false,
 		}),
 		restart: async () => currentRuntime,

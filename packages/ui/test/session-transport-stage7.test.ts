@@ -434,6 +434,9 @@ describe("Stage 7B projected history materialization", () => {
 			serverEpoch: PROJECTED_EPOCH,
 			sessionHandle: "session-parent",
 			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "parent-token",
 		});

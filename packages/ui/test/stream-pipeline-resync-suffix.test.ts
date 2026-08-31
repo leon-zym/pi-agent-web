@@ -49,7 +49,7 @@ class FakeSocket implements SessionWebSocket {
 		this.onopen?.();
 		this.receive({
 			type: "server_hello",
-			protocol: { major: 1, minor: 3 },
+			protocol: { major: 1, minor: 4 },
 			serverBuild: "test",
 			serverEpoch: SERVER_EPOCH,
 			piVersion: "test",
@@ -144,7 +144,7 @@ async function setup() {
 			return socket;
 		},
 		url: () => "ws://pipeline.test",
-		protocolVersion: { major: 1, minor: 3 },
+		protocolVersion: { major: 1, minor: 4 },
 	});
 	controllers.push(controller);
 	vi.doMock("../src/stores/session-transport", async () => ({

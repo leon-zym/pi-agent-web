@@ -86,7 +86,7 @@ const controllers: SessionTransportController[] = [];
 function serverHello(serverEpoch: string): GatewayServerHelloDto {
 	return {
 		type: "server_hello",
-		protocol: { major: 1, minor: 3 },
+		protocol: { major: 1, minor: 4 },
 		serverBuild: "lazy-content-test-server",
 		serverEpoch,
 		piVersion: "0.84.2",
@@ -179,7 +179,7 @@ function harness(
 		},
 		url: () => "ws://lazy-content.test/api/v1/ws",
 		reconnectBaseMs: 0,
-		protocolVersion: { major: 1, minor: 3 },
+		protocolVersion: { major: 1, minor: 4 },
 		contentAdapter,
 		onResyncRequired,
 	});

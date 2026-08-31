@@ -166,6 +166,9 @@ describe("authoritative snapshot hidden lifecycle ordering", () => {
 			serverEpoch: "epoch-a",
 			sessionHandle: SESSION_HANDLE,
 			generation: 4,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "fresh-fence",
 		});
@@ -196,8 +199,42 @@ describe("authoritative snapshot hidden lifecycle ordering", () => {
 			serverEpoch: "epoch-stale",
 			sessionHandle: SESSION_HANDLE,
 			generation: 4,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "stale-fence",
+		});
+		await Promise.resolve();
+
+		expect(abandon).not.toHaveBeenCalled();
+		expect(releaseSession).not.toHaveBeenCalled();
+		expect(unsubscribeSession).not.toHaveBeenCalled();
+	});
+
+	it("never reconciles hidden lifecycle from a remote controller lease view", async () => {
+		const { abandon, releaseSession, unsubscribeSession } = prepareHiddenRecovery();
+		initPipeline();
+		sessionTransport.store.setState((state) => ({
+			sessions: {
+				...state.sessions,
+				[SESSION_HANDLE]: {
+					...state.sessions[SESSION_HANDLE]!,
+					baselineAuthoritative: true,
+					resync: null,
+				},
+			},
+		}));
+
+		sessionTransport.ingestServerMessage({
+			type: "lease_status",
+			serverEpoch: "epoch-a",
+			sessionHandle: SESSION_HANDLE,
+			generation: 4,
+			leaseRevision: 2,
+			controlState: "held",
+			transition: "takeover",
+			isController: false,
 		});
 		await Promise.resolve();
 
@@ -270,6 +307,9 @@ describe("authoritative snapshot hidden lifecycle ordering", () => {
 			serverEpoch: "epoch-a",
 			sessionHandle: SESSION_HANDLE,
 			generation: 4,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "fresh-visible-fence",
 		});
@@ -292,6 +332,9 @@ describe("authoritative snapshot hidden lifecycle ordering", () => {
 			serverEpoch: "epoch-a",
 			sessionHandle: SESSION_HANDLE,
 			generation: 4,
+			leaseRevision: 2,
+			controlState: "held",
+			transition: "rekey",
 			isController: true,
 			fencingToken: "fresh-rekey-fence",
 		});

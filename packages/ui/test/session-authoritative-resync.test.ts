@@ -35,7 +35,7 @@ class FakeSocket implements SessionWebSocket {
 		this.onopen?.();
 		this.receive({
 			type: "server_hello",
-			protocol: { major: 1, minor: 3 },
+			protocol: { major: 1, minor: 4 },
 			serverBuild: "test",
 			serverEpoch: SERVER_EPOCH,
 			piVersion: "test",
@@ -124,7 +124,7 @@ function setup() {
 			return socket;
 		},
 		url: () => "ws://test",
-		protocolVersion: { major: 1, minor: 3 },
+		protocolVersion: { major: 1, minor: 4 },
 	});
 	controllers.push(controller);
 	controller.store.getState().connect();
@@ -175,6 +175,9 @@ describe("authoritative Session snapshot transport", () => {
 			serverEpoch: SERVER_EPOCH,
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "fence-a",
 		});

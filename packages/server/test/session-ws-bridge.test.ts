@@ -13,6 +13,7 @@ import type {
 } from "@pi-agent-web/protocol";
 import {
 	GATEWAY_CONTENT_REF_CAPABILITY,
+	GATEWAY_FENCED_TAKEOVER_CAPABILITY,
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 	GATEWAY_SESSION_HISTORY_CAPABILITY,
@@ -472,7 +473,7 @@ async function openClient(
 	ws.send(
 		JSON.stringify({
 			type: "client_hello",
-			protocol: { major: 1, minor: 3 },
+			protocol: { major: 1, minor: 4 },
 			clientBuild: "0.1.0-test",
 			capabilities: [
 				"rpc.commands",
@@ -480,6 +481,7 @@ async function openClient(
 				"rpc.extension_ui",
 				"session.multiplex",
 				GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+				GATEWAY_FENCED_TAKEOVER_CAPABILITY,
 				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 				GATEWAY_CONTENT_REF_CAPABILITY,
 				...(options.historyCapability ? [GATEWAY_SESSION_HISTORY_CAPABILITY] : []),
@@ -511,13 +513,14 @@ async function openInventoryClient(
 	ws.send(
 		JSON.stringify({
 			type: "client_hello",
-			protocol: { major: 1, minor: overrides.minor ?? 3 },
+			protocol: { major: 1, minor: overrides.minor ?? 4 },
 			clientBuild: "0.1.0-inventory-test",
 			capabilities: [
 				"rpc.commands",
 				"rpc.events",
 				"rpc.extension_ui",
 				"session.multiplex",
+				GATEWAY_FENCED_TAKEOVER_CAPABILITY,
 				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 				GATEWAY_CONTENT_REF_CAPABILITY,
 				...(overrides.capability === false ? [] : [GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY]),
@@ -1513,7 +1516,7 @@ describe("SessionWsBridge", () => {
 		expect(frames.slice(0, 2).map((frame) => frame.type)).toEqual(["server_hello", "hot_runtime_inventory"]);
 		expect(frames[0]).toMatchObject({
 			type: "server_hello",
-			protocol: { major: 1, minor: 3 },
+			protocol: { major: 1, minor: 4 },
 			capabilities: expect.arrayContaining([GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY]),
 		});
 		expect(inventory).toMatchObject({
@@ -3521,7 +3524,7 @@ describe("SessionWsBridge", () => {
 		const harness = await createHarness([parent]);
 		const client = await openClient(harness);
 		const subscription = await subscribe(client, parent.sessionHandle);
-		const originalClaim = harness.supervisor.claim.bind(harness.supervisor);
+		const originalClaim = harness.supervisor.claimWithTransition.bind(harness.supervisor);
 		let claimedConnectionId: string | undefined;
 		let claimedFencingToken: string | undefined;
 		let claimAcquired: (() => void) | undefined;
@@ -3536,14 +3539,15 @@ describe("SessionWsBridge", () => {
 		const returned = new Promise<void>((resolve) => {
 			claimReturned = resolve;
 		});
-		harness.supervisor.claim = async (sessionHandle, connectionId) => {
-			const lease = await originalClaim(sessionHandle, connectionId);
+		harness.supervisor.claimWithTransition = async (sessionHandle, connectionId) => {
+			const claimed = await originalClaim(sessionHandle, connectionId);
+			const { lease } = claimed;
 			claimedConnectionId = connectionId;
 			claimedFencingToken = lease.fencingToken;
 			claimAcquired?.();
 			await gate;
 			claimReturned?.();
-			return lease;
+			return claimed;
 		};
 
 		client.send({ type: "session_claim", sessionHandle: parent.sessionHandle });
@@ -3566,7 +3570,7 @@ describe("SessionWsBridge", () => {
 		await new Promise<void>((resolve) => setImmediate(resolve));
 		expect(harness.supervisor.leaseFor(child.sessionHandle, claimedConnectionId).isController).toBe(false);
 
-		harness.supervisor.claim = originalClaim;
+		harness.supervisor.claimWithTransition = originalClaim;
 		const successor = await openClient(harness);
 		await subscribe(successor, child.sessionHandle);
 		const successorLease = await claim(successor, child.sessionHandle);
@@ -3581,7 +3585,7 @@ describe("SessionWsBridge", () => {
 		const harness = await createHarness([target]);
 		const client = await openClient(harness);
 		await subscribe(client, target.sessionHandle);
-		const originalClaim = harness.supervisor.claim.bind(harness.supervisor);
+		const originalClaim = harness.supervisor.claimWithTransition.bind(harness.supervisor);
 		let acquired: (() => void) | undefined;
 		const acquiredPromise = new Promise<void>((resolve) => {
 			acquired = resolve;
@@ -3591,14 +3595,14 @@ describe("SessionWsBridge", () => {
 			returnClaim = resolve;
 		});
 		let claimCalls = 0;
-		harness.supervisor.claim = async (...args) => {
-			const lease = await originalClaim(...args);
+		harness.supervisor.claimWithTransition = async (...args) => {
+			const claimed = await originalClaim(...args);
 			claimCalls += 1;
 			if (claimCalls === 1) {
 				acquired?.();
 				await returnGate;
 			}
-			return lease;
+			return claimed;
 		};
 
 		const mark = client.mark();
@@ -3668,7 +3672,7 @@ describe("SessionWsBridge", () => {
 		const harness = await createHarness([target]);
 		const abandoned = await openClient(harness);
 		await subscribe(abandoned, target.sessionHandle);
-		const originalClaim = harness.supervisor.claim.bind(harness.supervisor);
+		const originalClaim = harness.supervisor.claimWithTransition.bind(harness.supervisor);
 		let claimStarted: (() => void) | undefined;
 		const started = new Promise<void>((resolve) => {
 			claimStarted = resolve;
@@ -3681,12 +3685,12 @@ describe("SessionWsBridge", () => {
 		const returned = new Promise<void>((resolve) => {
 			claimReturned = resolve;
 		});
-		harness.supervisor.claim = async (sessionHandle, connectionId) => {
+		harness.supervisor.claimWithTransition = async (sessionHandle, connectionId) => {
 			claimStarted?.();
 			await claimGate;
-			const lease = await originalClaim(sessionHandle, connectionId);
+			const claimed = await originalClaim(sessionHandle, connectionId);
 			claimReturned?.();
-			return lease;
+			return claimed;
 		};
 
 		abandoned.send({ type: "session_claim", sessionHandle: target.sessionHandle });
@@ -3797,6 +3801,9 @@ describe("SessionWsBridge", () => {
 			serverEpoch: TEST_SERVER_EPOCH,
 			sessionHandle: target.sessionHandle,
 			generation: subscription.runtime.generation,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
 			isController: false,
 		});
 		const response = await command(client, target.sessionHandle, subscription.runtime.generation, {
@@ -3809,6 +3816,122 @@ describe("SessionWsBridge", () => {
 			success: false,
 			error: "session_read_only",
 		});
+	});
+
+	it("fences takeover over two real WebSocket clients without leaking either controller token", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "fenced-takeover-two-sockets");
+		const harness = await createHarness([target]);
+		const owner = await openClient(harness);
+		const observer = await openClient(harness);
+		const ownerSubscription = await subscribe(owner, target.sessionHandle);
+		await subscribe(observer, target.sessionHandle);
+
+		const observerClaimMark = observer.mark();
+		const ownerLease = await claim(owner, target.sessionHandle);
+		if (!ownerLease.fencingToken) throw new Error("owner did not receive a private controller fence");
+		const observerClaim = await observer.waitForFrame(
+			(frame): frame is LeaseFrame =>
+				frame.type === "lease_status" &&
+				frame.sessionHandle === target.sessionHandle &&
+				frame.leaseRevision === ownerLease.leaseRevision,
+			observerClaimMark,
+		);
+		expect(observerClaim).toMatchObject({
+			isController: false,
+			controlState: "held",
+			transition: "claim",
+		});
+		expect(Object.hasOwn(observerClaim, "fencingToken")).toBe(false);
+
+		const beforeTakeover = harness.supervisor.getRuntime(target.sessionHandle);
+		if (!beforeTakeover) throw new Error("takeover fixture runtime was not active");
+		const ownerTakeoverMark = owner.mark();
+		const observerTakeoverMark = observer.mark();
+		observer.send({
+			type: "session_takeover",
+			sessionHandle: target.sessionHandle,
+			expectedGeneration: ownerSubscription.runtime.generation,
+			expectedLeaseRevision: ownerLease.leaseRevision,
+		});
+		const revoked = await owner.waitForFrame(
+			(frame): frame is LeaseFrame =>
+				frame.type === "lease_status" &&
+				frame.sessionHandle === target.sessionHandle &&
+				frame.leaseRevision === ownerLease.leaseRevision + 1 &&
+				frame.transition === "takeover",
+			ownerTakeoverMark,
+		);
+		const granted = await observer.waitForFrame(
+			(frame): frame is LeaseFrame =>
+				frame.type === "lease_status" &&
+				frame.sessionHandle === target.sessionHandle &&
+				frame.leaseRevision === ownerLease.leaseRevision + 1 &&
+				frame.transition === "takeover",
+			observerTakeoverMark,
+		);
+		if (!granted.fencingToken) throw new Error("takeover recipient did not receive a new private fence");
+		expect(revoked).toMatchObject({ isController: false, controlState: "held" });
+		expect(Object.hasOwn(revoked, "fencingToken")).toBe(false);
+		expect(granted).toMatchObject({ isController: true, controlState: "held" });
+		expect(granted.fencingToken).not.toBe(ownerLease.fencingToken);
+		expect(harness.supervisor.getRuntime(target.sessionHandle)).toMatchObject({
+			generation: beforeTakeover.generation,
+			state: beforeTakeover.state,
+			lastSeq: beforeTakeover.lastSeq,
+		});
+
+		const observerRequesterMark = observer.mark();
+		const oldMutation = await command(
+			owner,
+			target.sessionHandle,
+			ownerSubscription.runtime.generation,
+			{ id: "old-owner-after-takeover", type: "set_session_name", name: "must remain fenced" },
+			ownerLease.fencingToken,
+		);
+		expect(oldMutation.response).toMatchObject({
+			id: "old-owner-after-takeover",
+			success: false,
+			error: "session_read_only",
+		});
+		const oldExtensionMark = owner.mark();
+		owner.send({
+			type: "extension_ui_response",
+			sessionHandle: target.sessionHandle,
+			expectedGeneration: ownerSubscription.runtime.generation,
+			fencingToken: ownerLease.fencingToken,
+			response: { type: "extension_ui_response", id: "old-owner-dialog", confirmed: true },
+		});
+		await owner.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+				frame.type === "session_error" &&
+				frame.operation === "extension_ui_response" &&
+				frame.code === "session_read_only",
+			oldExtensionMark,
+		);
+		expect(
+			observer.frames
+				.slice(observerRequesterMark)
+				.filter(
+					(frame) =>
+						(frame.type === "response" && frame.response.id === "old-owner-after-takeover") ||
+						(frame.type === "session_error" && frame.operation === "extension_ui_response"),
+				),
+		).toEqual([]);
+
+		await owner.close();
+		await eventually(() => harness.connectionEvents.some((message) => message.startsWith("ws disconnected")));
+		await expect(
+			command(
+				observer,
+				target.sessionHandle,
+				ownerSubscription.runtime.generation,
+				{ id: "takeover-owner-survives-old-disconnect", type: "set_session_name", name: "new controller" },
+				granted.fencingToken,
+			),
+		).resolves.toMatchObject({ response: { success: true } });
 	});
 
 	it("isolates leases per Session and fences a second controller for the same Session", async () => {
@@ -3948,14 +4071,37 @@ describe("SessionWsBridge", () => {
 			ownerLease.fencingToken,
 		);
 
-		const releaseMark = owner.mark();
+		// A stale parent release is accepted only as a cleanup operation. The child
+		// remains action-blocked until its own authoritative baseline arrives.
+		const resubscribeMark = owner.mark();
 		owner.send({ type: "session_release", sessionHandle: parent.sessionHandle });
+		await subscribe(owner, child.sessionHandle);
 		const released = await owner.waitForFrame(
 			(frame): frame is LeaseFrame =>
-				frame.type === "lease_status" && frame.sessionHandle === child.sessionHandle,
-			releaseMark,
+				frame.type === "lease_status" &&
+				frame.sessionHandle === child.sessionHandle &&
+				frame.transition === "release",
+			resubscribeMark,
 		);
+		const childFrames = owner.frames
+			.slice(resubscribeMark)
+			.filter((frame) =>
+				frame.type === "runtime_state"
+					? frame.runtime.sessionHandle === child.sessionHandle
+					: "sessionHandle" in frame && frame.sessionHandle === child.sessionHandle,
+			);
+		const snapshotIndex = childFrames.findIndex((frame) => frame.type === "session_snapshot");
+		const leaseIndices = childFrames.flatMap((frame, index) =>
+			frame.type === "lease_status" ? [index] : [],
+		);
+		expect(childFrames.slice(0, snapshotIndex + 1).map((frame) => frame.type)).toEqual([
+			"runtime_state",
+			"resync_required",
+			"session_snapshot",
+		]);
+		expect(leaseIndices.every((index) => index > snapshotIndex)).toBe(true);
 		expect(released.isController).toBe(false);
+		expect(released).toMatchObject({ transition: "release", controlState: "free" });
 
 		await subscribe(successor, child.sessionHandle);
 		expect((await claim(successor, child.sessionHandle)).isController).toBe(true);
@@ -4166,9 +4312,9 @@ describe("SessionWsBridge", () => {
 			const owner = await openClient(harness);
 			const successor = await openClient(harness);
 			const subscription = await subscribe(owner, parent.sessionHandle);
-			const originalClaim = harness.supervisor.claim.bind(harness.supervisor);
+			const originalClaim = harness.supervisor.claimWithTransition.bind(harness.supervisor);
 			let ownerConnectionId: string | undefined;
-			harness.supervisor.claim = async (sessionHandle, connectionId) => {
+			harness.supervisor.claimWithTransition = async (sessionHandle, connectionId) => {
 				ownerConnectionId = connectionId;
 				return originalClaim(sessionHandle, connectionId);
 			};

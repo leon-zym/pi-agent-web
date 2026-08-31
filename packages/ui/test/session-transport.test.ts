@@ -1,11 +1,11 @@
 import {
 	type ExtensionUiRequestDto,
+	GATEWAY_FENCED_TAKEOVER_CAPABILITY,
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
 	GATEWAY_SESSION_HISTORY_CAPABILITY,
 	type GatewayClientHelloDto,
-	type GatewayProtocolErrorDto,
 	type GatewayServerHelloDto,
 	type InlineSessionHistoryPageChunkDto,
 	type InlineSessionReplayFrameDto,
@@ -56,6 +56,51 @@ const EXPECTED_RESYNC_FRAME_LIMIT = 1_024;
 const EXPECTED_RESYNC_BYTE_LIMIT = 1024 * 1024;
 const EXPECTED_PENDING_EXTENSION_LIMIT = 256;
 
+interface TestLeaseRevision {
+	revision: number;
+	signature: string;
+}
+
+/** Upgrade pre-1.4 test fixtures into one strict, revisioned Gateway wire shape. */
+function normalizeTestLeaseStatus(message: object, revisions: Map<string, TestLeaseRevision>): object {
+	if (typeof message !== "object" || message === null || Array.isArray(message)) return message;
+	const candidate = message as Record<string, unknown>;
+	if (candidate.type !== "lease_status" || typeof candidate.isController !== "boolean") return message;
+	const serverEpoch = typeof candidate.serverEpoch === "string" ? candidate.serverEpoch : "";
+	const sessionHandle = typeof candidate.sessionHandle === "string" ? candidate.sessionHandle : "";
+	const generation = typeof candidate.generation === "number" ? candidate.generation : -1;
+	const key = `${serverEpoch}:${sessionHandle}:${String(generation)}`;
+	const controlState =
+		candidate.controlState === "held" || candidate.controlState === "free"
+			? candidate.controlState
+			: candidate.isController
+				? "held"
+				: "free";
+	const fencingToken = typeof candidate.fencingToken === "string" ? candidate.fencingToken : "";
+	const signature = `${controlState}:${String(candidate.isController)}:${fencingToken}`;
+	const known = revisions.get(key);
+	const explicitRevision =
+		typeof candidate.leaseRevision === "number" && Number.isSafeInteger(candidate.leaseRevision)
+			? candidate.leaseRevision
+			: undefined;
+	const revision = explicitRevision ?? (known ? known.revision + (known.signature === signature ? 0 : 1) : 0);
+	const transition =
+		candidate.transition === "baseline" ||
+		candidate.transition === "claim" ||
+		candidate.transition === "release" ||
+		candidate.transition === "takeover" ||
+		candidate.transition === "disconnect" ||
+		candidate.transition === "rekey"
+			? candidate.transition
+			: known && known.signature !== signature
+				? controlState === "held"
+					? "claim"
+					: "release"
+				: "baseline";
+	revisions.set(key, { revision, signature });
+	return { ...candidate, leaseRevision: revision, controlState, transition };
+}
+
 class FakeSocket implements SessionWebSocket {
 	readyState = 0;
 	onopen: (() => void) | null = null;
@@ -63,6 +108,7 @@ class FakeSocket implements SessionWebSocket {
 	onerror: (() => void) | null = null;
 	onmessage: ((event: { data: unknown }) => void) | null = null;
 	readonly sent: Array<SessionWsClientMessage | GatewayClientHelloDto> = [];
+	private readonly leaseRevisions = new Map<string, TestLeaseRevision>();
 	throwOnSend = false;
 
 	send(data: string): void {
@@ -80,10 +126,8 @@ class FakeSocket implements SessionWebSocket {
 		}
 	}
 
-	serverMessage(
-		message: InlineSessionWsServerMessage | GatewayServerHelloDto | GatewayProtocolErrorDto,
-	): void {
-		this.onmessage?.({ data: JSON.stringify(message) });
+	serverMessage(message: object): void {
+		this.onmessage?.({ data: JSON.stringify(normalizeTestLeaseStatus(message, this.leaseRevisions)) });
 	}
 
 	serverClose(): void {
@@ -104,7 +148,7 @@ type ServerHelloOverrides = Omit<Partial<GatewayServerHelloDto>, "protocol"> & {
 function serverHello(overrides: ServerHelloOverrides = {}): GatewayServerHelloDto {
 	return {
 		type: "server_hello",
-		protocol: { major: 1, minor: 3 },
+		protocol: { major: 1, minor: 4 },
 		serverBuild: "9.7.0-independent-server",
 		serverEpoch: "test-server-epoch",
 		piVersion: "0.84.2",
@@ -532,10 +576,11 @@ function completeWithSnapshot(
 	generation: number,
 	asOfSeq?: number,
 	pendingExtensionRequests: InlineSessionSnapshotDto["pendingExtensionRequests"] = [],
+	runtimeOverride?: SessionRuntimeDto,
 ): void {
 	const channel = h.controller.store.getState().sessions[sessionHandle];
 	const seq = asOfSeq ?? channel?.resync?.barrierSeq ?? 0;
-	const runtimeValue = runtime(sessionHandle, generation, seq);
+	const runtimeValue = runtimeOverride ?? runtime(sessionHandle, generation, seq);
 	h.controller.ingestServerMessage({
 		type: "session_snapshot",
 		snapshotId: `snapshot-${sessionHandle}-${String(generation)}-${String(seq)}`,
@@ -711,7 +756,7 @@ describe("session transport Gateway negotiation", () => {
 		socket.open(false);
 		expect(socket.sent[0]).toEqual({
 			type: "client_hello",
-			protocol: { major: 1, minor: 3 },
+			protocol: { major: 1, minor: 4 },
 			clientBuild: "2.4.1-independent-ui",
 			capabilities: [
 				"rpc.commands",
@@ -719,6 +764,7 @@ describe("session transport Gateway negotiation", () => {
 				"rpc.extension_ui",
 				"session.multiplex",
 				GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+				GATEWAY_FENCED_TAKEOVER_CAPABILITY,
 				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 				"payload.epoch_content_refs",
 				GATEWAY_SESSION_HISTORY_CAPABILITY,
@@ -1038,6 +1084,9 @@ describe("session transport Gateway negotiation", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "hot-a",
 			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "old-fence",
 		});
@@ -1542,7 +1591,7 @@ describe("session transport Gateway negotiation", () => {
 		const socket = h.sockets[0];
 		if (!socket) throw new Error("transport did not create a socket");
 		socket.open(false);
-		socket.serverMessage(serverHello({ protocol: { major: 1, minor: 4 } }));
+		socket.serverMessage(serverHello({ protocol: { major: 1, minor: 5 } }));
 
 		expect(h.controller.store.getState().connectionState).toBe("incompatible");
 	});
@@ -1782,6 +1831,9 @@ describe("session transport multiplexing", () => {
 			serverEpoch: "test-server-epoch",
 			sessionHandle: "session-a",
 			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
 			isController: true,
 			fencingToken: "token-a",
 		});
@@ -2171,7 +2223,7 @@ describe("session transport replay and recovery", () => {
 		expect(h.controller.store.getState().sessions["session-a"]?.projectedSeq).toBe(0);
 		expect(h.controller.store.getState().sessions["session-a"]?.resync).toBeNull();
 		expect(h.controller.store.getState().sessions["session-a"]?.lease).toEqual({ isController: false });
-		expect(leaseStates).toEqual([true, false]);
+		expect(leaseStates).toEqual([true]);
 		expect(
 			sessionDeleteCapability(
 				{ persisted: true, runtime: runtime("session-a") } as NativeSessionDto,
@@ -3019,6 +3071,22 @@ describe("session transport replay and recovery", () => {
 		expect(h.controller.store.getState().sessions["session-a"]?.recovery?.phase).toBe("degraded");
 
 		expect(h.controller.store.getState().manualRetryResync("session-a")).toBe(true);
+		expect(socket.sent.at(-1)).toEqual({ type: "session_subscribe", sessionHandle: "session-a" });
+		completeWithSnapshot(
+			h,
+			overflowed.sessionHandle,
+			overflowed.generation,
+			overflowed.lastSeq,
+			[],
+			overflowed,
+		);
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: overflowed.serverEpoch,
+			sessionHandle: overflowed.sessionHandle,
+			generation: overflowed.generation,
+			isController: false,
+		});
 		expect(socket.sent.at(-1)).toEqual({ type: "session_claim", sessionHandle: "session-a" });
 		socket.serverMessage({
 			type: "lease_status",
@@ -3397,8 +3465,8 @@ describe("session transport commands and identity", () => {
 			"session-resolved:session_rekeyed",
 			"session-resolved:runtime_state",
 			"session-resolved:resync_required",
-			"session-resolved:lease_status",
 			"session-resolved:session_snapshot",
+			"session-resolved:lease_status",
 			"session-resolved:extension_ui_snapshot",
 		]);
 		expect(notices).toEqual([{ sessionHandle: "session-resolved", reason: "initial" }]);
@@ -3605,8 +3673,11 @@ describe("session transport commands and identity", () => {
 		expect(h.controller.store.getState().releaseSession("session-a")).toBe(true);
 		expect(h.controller.store.getState().sessions["session-a"]?.lease).toEqual({
 			isController: false,
+			leaseRevision: 0,
+			controlState: "held",
+			transition: "baseline",
 		});
-		expect(leaseFrames).toEqual([false]);
+		expect(leaseFrames).toEqual([]);
 		expect(
 			h.controller.store.getState().sendExtensionUiResponse("session-a", {
 				type: "extension_ui_response",
@@ -3625,6 +3696,149 @@ describe("session transport commands and identity", () => {
 			h.controller.store.getState().sessions["session-a"]?.pendingExtensionRequests.map(({ id }) => id),
 		).toEqual(["dialog-one"]);
 		expect(socket.sent).toContainEqual({ type: "session_release", sessionHandle: "session-a" });
+	});
+
+	it("defers takeover until the authoritative baseline, then sends one revision-fenced request", () => {
+		const h = harness();
+		const socket = connect(h);
+		const sessionHandle = "session-takeover";
+		h.controller.store.getState().subscribeSession(sessionHandle);
+		const initial = runtime(sessionHandle, 3, 0);
+		h.controller.ingestServerMessage({ type: "runtime_state", runtime: initial });
+		h.controller.ingestServerMessage({
+			type: "resync_required",
+			serverEpoch: initial.serverEpoch,
+			sessionHandle,
+			runtime: initial,
+			reason: "initial",
+		});
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: initial.serverEpoch,
+			sessionHandle,
+			generation: initial.generation,
+			leaseRevision: 7,
+			controlState: "held",
+			transition: "claim",
+			isController: false,
+		});
+		expect(h.controller.store.getState().takeoverSession(sessionHandle)).toBe(false);
+
+		completeWithSnapshot(h, sessionHandle, initial.generation, initial.lastSeq);
+		expect(h.controller.store.getState().sessions[sessionHandle]).toMatchObject({
+			baselineAuthoritative: true,
+			lease: {
+				isController: false,
+				leaseRevision: 7,
+				controlState: "held",
+				transition: "claim",
+			},
+		});
+		expect(h.controller.store.getState().takeoverSession(sessionHandle)).toBe(true);
+		expect(h.controller.store.getState().takeoverSession(sessionHandle)).toBe(false);
+		expect(socket.sent.at(-1)).toEqual({
+			type: "session_takeover",
+			sessionHandle,
+			expectedGeneration: 3,
+			expectedLeaseRevision: 7,
+		});
+
+		socket.serverMessage({
+			type: "session_error",
+			serverEpoch: initial.serverEpoch,
+			sessionHandle,
+			operation: "takeover",
+			error: "session_lease_revision_stale",
+			code: "session_lease_revision_stale",
+			retryable: true,
+		});
+		expect(h.controller.store.getState().takeoverSession(sessionHandle)).toBe(false);
+		expect(socket.sent.filter((message) => message.type === "session_takeover")).toHaveLength(1);
+
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: initial.serverEpoch,
+			sessionHandle,
+			generation: initial.generation,
+			leaseRevision: 8,
+			controlState: "held",
+			transition: "takeover",
+			isController: false,
+		});
+		expect(h.controller.store.getState().takeoverSession(sessionHandle)).toBe(true);
+		expect(socket.sent.at(-1)).toEqual({
+			type: "session_takeover",
+			sessionHandle,
+			expectedGeneration: 3,
+			expectedLeaseRevision: 8,
+		});
+	});
+
+	it("fails closed on same-revision lease contradictions until a newer authoritative status arrives", async () => {
+		const h = harness();
+		const socket = connect(h);
+		const sessionHandle = "session-lease-conflict";
+		subscribeAndPrime(h, sessionHandle);
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: "test-server-epoch",
+			sessionHandle,
+			generation: 1,
+			leaseRevision: 4,
+			controlState: "held",
+			transition: "claim",
+			isController: false,
+		});
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: "test-server-epoch",
+			sessionHandle,
+			generation: 1,
+			leaseRevision: 4,
+			controlState: "held",
+			transition: "takeover",
+			isController: false,
+		});
+
+		expect(h.controller.store.getState().sessions[sessionHandle]).toMatchObject({
+			freshLeaseBaseline: null,
+			lease: {
+				isController: false,
+				leaseRevision: 4,
+				controlState: "held",
+				transition: "takeover",
+				conflicted: true,
+			},
+		});
+		expect(h.controller.store.getState().takeoverSession(sessionHandle)).toBe(false);
+		await expect(
+			h.controller.store.getState().sendCommand(sessionHandle, {
+				id: "conflicted-observer-mutation",
+				type: "prompt",
+				message: "must stay fenced",
+			}),
+		).rejects.toMatchObject({ code: "session_read_only" });
+
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: "test-server-epoch",
+			sessionHandle,
+			generation: 1,
+			leaseRevision: 5,
+			controlState: "held",
+			transition: "takeover",
+			isController: false,
+		});
+		expect(h.controller.store.getState().sessions[sessionHandle]).toMatchObject({
+			lease: {
+				isController: false,
+				leaseRevision: 5,
+				controlState: "held",
+				transition: "takeover",
+			},
+		});
+		expect(h.controller.store.getState().sessions[sessionHandle]?.lease.conflicted).toBeUndefined();
+		expect(h.controller.store.getState().takeoverSession(sessionHandle)).toBe(true);
 	});
 
 	it("retains a waiting Extension request while observer controls are fenced", async () => {
