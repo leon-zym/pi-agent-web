@@ -75,6 +75,11 @@ Required behavior:
 - Input-history navigation runs only when it does not steal normal caret movement.
 - Slash and skill commands remain atomic while composing and deleting.
 - Workspace file mentions use the selected Workspace and remain keyboard accessible.
+- File mention results show type, size, estimated context cost, policy flags, and a bounded safe
+  preview. Risky content requires confirmation; blocked, unavailable, truncated, and changed files
+  remain visible with a reason.
+- Captured references are Session-scoped attachments. Navigation, rekey, failure, and removal cannot
+  leak bytes across Sessions or discard unrelated draft work.
 - Image-only prompts are valid; failed submission preserves text and attachments.
 - Steering, follow-up, abort, and queued state are explicit rather than inferred from optimistic UI.
 
