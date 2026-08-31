@@ -5,7 +5,8 @@ const MIB = 1024 * 1024;
 const PAYLOAD_CAPABILITY = "payload.epoch_attachment_refs";
 const CONTENT_REF_CAPABILITY = "payload.epoch_content_refs";
 const SESSION_HISTORY_CAPABILITY = "session.chunked_history";
-const CONTENT_REF_PROTOCOL_MINOR = 3;
+const FENCED_TAKEOVER_CAPABILITY = "session.fenced_takeover";
+const CONTENT_REF_PROTOCOL_MINOR = 4;
 const MAX_SERVER_FRAME_BYTES = 65 * MIB;
 const CONTENT_REF_BUDGET = {
 	maxContentBlobBytes: 48 * MIB,
@@ -117,6 +118,7 @@ test("a real browser negotiates an independently versioned client hello", async 
 				"rpc.extension_ui",
 				"session.multiplex",
 				"session.hot_runtime_inventory",
+				FENCED_TAKEOVER_CAPABILITY,
 				SESSION_HISTORY_CAPABILITY,
 				PAYLOAD_CAPABILITY,
 				CONTENT_REF_CAPABILITY,
@@ -131,6 +133,22 @@ test("a real browser negotiates an independently versioned client hello", async 
 		protocol: { major: 1, minor: CONTENT_REF_PROTOCOL_MINOR },
 		limits: { maxServerFrameBytes: MAX_SERVER_FRAME_BYTES },
 	});
+});
+
+test("a real browser treats protocol 1.3 as a terminal incompatibility", async ({ page, harness }) => {
+	await overrideClientHello(page, { clientBuild: "1.3-browser-test", major: 1, minor: 3 });
+	const observed = observeSockets(page);
+
+	await page.goto(harness.origin, { waitUntil: "domcontentloaded" });
+	await expect
+		.poll(() => observed.received.find((frame) => frame.type === "protocol_error"))
+		.toMatchObject({
+			type: "protocol_error",
+			code: "invalid_hello",
+			supported: { major: 1, minMinor: 4, maxMinor: 4 },
+		});
+	await expect.poll(() => observed.closed.length).toBe(1);
+	expect(observed.received.some((frame) => frame.type === "server_hello")).toBe(false);
 });
 
 test("a real browser treats a protocol-major mismatch as terminal", async ({ page, harness }) => {
