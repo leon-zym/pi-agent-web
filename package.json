@@ -29,7 +29,7 @@
 		"check:docs": "node scripts/check-docs.mjs",
 		"typecheck": "pnpm --filter @pi-agent-web/protocol build && pnpm --filter @pi-agent-web/server build && pnpm -r typecheck && pnpm typecheck:e2e",
 		"typecheck:e2e": "tsc -p tests/e2e/tsconfig.json --noEmit",
-		"verify": "pnpm lint && pnpm typecheck && pnpm test:bench-validator && pnpm test && pnpm build",
+		"verify": "pnpm lint && pnpm typecheck && pnpm test:bench-validator && pnpm test:release-bundle && pnpm test && pnpm build",
 		"test:pack": "node scripts/pack-smoke.mjs",
 		"start": "pnpm --filter @pi-agent-web/cli start"
 	},
