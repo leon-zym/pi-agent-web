@@ -3,16 +3,29 @@ import type { Root } from "react-dom/client";
 
 export type BenchmarkPublicationVariant = "coalesced" | "sequential";
 
-interface BenchmarkCommit {
-	actualDuration: number;
-	baseDuration: number;
-	commitTime: number;
-	phase: "mount" | "nested-update" | "update";
+export interface BenchmarkReactTrialSnapshot {
+	actualDurationMs: number;
+	baseDurationMs: number;
+	commitCount: number;
+	maxCommitDurationMs: number;
+	epoch: number;
+}
+
+interface BenchmarkReactTrialState extends BenchmarkReactTrialSnapshot {
+	active: boolean;
 }
 
 interface BenchmarkBrowserRuntime {
-	commits: BenchmarkCommit[];
+	abortTrial: () => Readonly<BenchmarkReactTrialSnapshot>;
+	beginTrial: () => number;
+	endTrial: () => Readonly<BenchmarkReactTrialSnapshot>;
 	publicationVariant: BenchmarkPublicationVariant;
+	trialSnapshot: () => Readonly<BenchmarkReactTrialSnapshot>;
+}
+
+interface InstalledBenchmarkRuntime {
+	recordCommit: (actualDuration: number, baseDuration: number) => void;
+	runtime: BenchmarkBrowserRuntime;
 }
 
 declare global {
@@ -27,56 +40,74 @@ function benchmarkVariant(): BenchmarkPublicationVariant {
 	throw new Error("A benchmark Browser build requires a supported publication variant");
 }
 
-function installSequentialFrameClock(): void {
-	const scheduled = new Map<number, () => void>();
-	const requestFrame = window.requestAnimationFrame.bind(window);
-	const cancelFrame = window.cancelAnimationFrame.bind(window);
-	let nextHandle = 1;
-	window.requestAnimationFrame = (callback) => {
-		const handle = nextHandle;
-		nextHandle += 1;
-		scheduled.set(handle, () => callback(performance.now()));
-		queueMicrotask(() => {
-			const pending = scheduled.get(handle);
-			if (!pending) return;
-			scheduled.delete(handle);
-			pending();
-		});
-		return handle;
-	};
-	window.cancelAnimationFrame = (handle) => {
-		if (scheduled.delete(handle)) return;
-		cancelFrame(handle);
-	};
-	// Keep both native bindings reachable for a debugger without exposing a product API.
-	void requestFrame;
+function immutableSnapshot(state: BenchmarkReactTrialState): Readonly<BenchmarkReactTrialSnapshot> {
+	return Object.freeze({
+		actualDurationMs: state.actualDurationMs,
+		baseDurationMs: state.baseDurationMs,
+		commitCount: state.commitCount,
+		maxCommitDurationMs: state.maxCommitDurationMs,
+		epoch: state.epoch,
+	});
 }
 
-function installBenchmarkRuntime(): BenchmarkBrowserRuntime {
+function installBenchmarkRuntime(): InstalledBenchmarkRuntime {
 	if (import.meta.env.VITE_PI_WEB_BENCHMARK_BUILD !== "1") {
 		throw new Error("Benchmark instrumentation cannot run outside a benchmark build");
 	}
-	const runtime: BenchmarkBrowserRuntime = {
-		commits: [],
-		publicationVariant: benchmarkVariant(),
+	const trial: BenchmarkReactTrialState = {
+		active: false,
+		actualDurationMs: 0,
+		baseDurationMs: 0,
+		commitCount: 0,
+		epoch: 0,
+		maxCommitDurationMs: 0,
 	};
-	if (runtime.publicationVariant === "sequential") installSequentialFrameClock();
+	const runtime: BenchmarkBrowserRuntime = {
+		publicationVariant: benchmarkVariant(),
+		beginTrial: () => {
+			trial.active = true;
+			trial.actualDurationMs = 0;
+			trial.baseDurationMs = 0;
+			trial.commitCount = 0;
+			trial.maxCommitDurationMs = 0;
+			trial.epoch += 1;
+			return trial.epoch;
+		},
+		endTrial: () => {
+			trial.active = false;
+			return immutableSnapshot(trial);
+		},
+		abortTrial: () => {
+			trial.active = false;
+			return immutableSnapshot(trial);
+		},
+		trialSnapshot: () => immutableSnapshot(trial),
+	};
 	window.__piwebBenchmarkRuntime = runtime;
-	return runtime;
+	return {
+		runtime,
+		recordCommit: (actualDuration, baseDuration) => {
+			if (!trial.active) return;
+			trial.actualDurationMs += actualDuration;
+			trial.baseDurationMs += baseDuration;
+			trial.commitCount += 1;
+			trial.maxCommitDurationMs = Math.max(trial.maxCommitDurationMs, actualDuration);
+		},
+	};
 }
 
 /**
  * This root exists only in a Vite benchmark build. The normal production entry never imports the
- * module, so profiler collection and the sequential publication clock do not enter that bundle.
+ * module, so profiling collection and its Browser-only runtime do not enter the standard bundle.
  */
 export function renderBenchmarkRoot(root: Root, children: ReactNode): void {
-	const runtime = installBenchmarkRuntime();
+	const { recordCommit } = installBenchmarkRuntime();
 	root.render(
 		<StrictMode>
 			<Profiler
 				id="piweb-benchmark-root"
-				onRender={(_id, phase, actualDuration, baseDuration, _startTime, commitTime) => {
-					runtime.commits.push({ actualDuration, baseDuration, commitTime, phase });
+				onRender={(_id, _phase, actualDuration, baseDuration) => {
+					recordCommit(actualDuration, baseDuration);
 				}}
 			>
 				{children}

@@ -125,6 +125,34 @@ describe("SessionEventScheduler", () => {
 		});
 	});
 
+	it("limits sequential benchmark behavior to scheduler publication without replacing the native frame seam", () => {
+		const clock = createClock();
+		const commits: CoalescibleMessageUpdate[][] = [];
+		const scheduler = new SessionEventScheduler({
+			onFlush: (_sessionHandle, _generation, events) => commits.push(events),
+			publicationMode: "sequential",
+			...clock,
+		});
+
+		expect(scheduler.enqueue("session-a", 1, "message-1", delta("text_delta", 0, "a"))).toBe("flushed");
+		expect(scheduler.enqueue("session-a", 1, "message-1", delta("text_delta", 0, "b"))).toBe("flushed");
+		expect(commits.map((events) => inner(events[0] as CoalescibleMessageUpdate).delta)).toEqual(["a", "b"]);
+		expect(clock.frames.size).toBe(0);
+		expect(clock.timers.size).toBe(0);
+		expect(scheduler.getPendingSnapshot()).toEqual({
+			sessions: 0,
+			sourceEvents: 0,
+			reducerEvents: 0,
+			characters: 0,
+		});
+		expect(scheduler.getMetrics()).toMatchObject({
+			sourceEvents: 2,
+			reducerEvents: 2,
+			commits: 2,
+			mergedEvents: 0,
+		});
+	});
+
 	it("preserves order across content indexes, delta types, and message identities", () => {
 		const output: CoalescibleMessageUpdate[] = [];
 		const scheduler = new SessionEventScheduler({

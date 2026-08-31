@@ -1,9 +1,20 @@
+import path from "node:path";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig, type ProxyOptions } from "vite";
 
 // Dev: vite serves the SPA on 5173 and proxies REST + WS to the gateway on 3000.
 export const DEV_GATEWAY_ORIGIN = "http://127.0.0.1:3000";
+const benchmarkBuild = process.env.VITE_PI_WEB_BENCHMARK_BUILD === "1";
+
+function buildOutputDirectory(): string {
+	if (!benchmarkBuild) return "dist";
+	const outputDirectory = process.env.PI_WEB_BENCHMARK_UI_OUT_DIR;
+	if (!outputDirectory || !path.isAbsolute(outputDirectory)) {
+		throw new Error("A benchmark UI build requires an absolute PI_WEB_BENCHMARK_UI_OUT_DIR");
+	}
+	return outputDirectory;
+}
 
 function isLoopbackHost(hostname: string): boolean {
 	return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
@@ -71,12 +82,15 @@ export function createGatewayProxy(gatewayOrigin: string): Record<string, ProxyO
 
 export default defineConfig({
 	plugins: [react(), tailwindcss()],
+	resolve: {
+		alias: benchmarkBuild ? { "react-dom/client": "react-dom/profiling" } : {},
+	},
 	server: {
 		port: 5173,
 		proxy: createGatewayProxy(DEV_GATEWAY_ORIGIN),
 	},
 	build: {
-		outDir: "dist",
+		outDir: buildOutputDirectory(),
 		sourcemap: true,
 		chunkSizeWarningLimit: 900,
 	},
