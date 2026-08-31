@@ -684,6 +684,6 @@ describe("private future payload Gateway vertical integration", () => {
 		expect(badClient.socket.sent).toHaveLength(0);
 		await badBridge.close();
 
-		expect(GATEWAY_PROTOCOL_VERSION).toEqual({ major: 1, minor: 3 });
+		expect(GATEWAY_PROTOCOL_VERSION).toEqual({ major: 1, minor: 4 });
 	});
 });

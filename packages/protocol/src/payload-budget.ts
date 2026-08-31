@@ -19,14 +19,14 @@ export const SESSION_REPLAY_MAX_BYTES = 16 * MIB;
 export const SESSION_OUTBOUND_QUEUE_MAX_BYTES = MIB;
 export const SESSION_CATCH_UP_MAX_BYTES = MIB;
 export const SESSION_ATTACHMENT_BLOB_MAX_BYTES = 8 * MIB;
-/** Protocol 1.3 ceiling for one externalized UTF-8 text or JSON payload. */
+/** Protocol 1.4 ceiling for one externalized UTF-8 text or JSON payload. */
 export const SESSION_CONTENT_BLOB_MAX_BYTES = 48 * MIB;
-/** Protocol 1.3 switches supported UTF-8 roots to references at this encoded byte size. */
+/** Protocol 1.4 switches supported UTF-8 roots to references at this encoded byte size. */
 export const SESSION_CONTENT_INLINE_THRESHOLD_BYTES = 256 * 1024;
 export const SESSION_ATTACHMENT_CACHE_MAX_BYTES = 64 * MIB;
 export const SESSION_ATTACHMENT_CACHE_MAX_ITEMS = 256;
 
-/** Protocol 1.3 budget. */
+/** Protocol 1.4 budget. */
 export interface SessionContentRefBudgetDto {
 	maxContentBlobBytes: number;
 	inlineContentThresholdBytes: number;

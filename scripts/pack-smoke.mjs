@@ -217,7 +217,7 @@ try {
 					socket.send(
 						JSON.stringify({
 							type: "client_hello",
-							protocol: { major: 1, minor: 3 },
+							protocol: { major: 1, minor: 4 },
 							clientBuild: "pack-smoke",
 							capabilities: [
 								"rpc.commands",
@@ -225,6 +225,7 @@ try {
 								"rpc.extension_ui",
 								"session.multiplex",
 								"session.hot_runtime_inventory",
+								"session.fenced_takeover",
 								"payload.epoch_attachment_refs",
 								"payload.epoch_content_refs",
 							],
@@ -237,8 +238,9 @@ try {
 					if (
 						hello.type !== "server_hello" ||
 						hello.protocol?.major !== 1 ||
-						hello.protocol?.minor !== 3 ||
+						hello.protocol?.minor !== 4 ||
 						hello.serverEpoch === undefined ||
+						!hello.capabilities?.includes("session.fenced_takeover") ||
 						!hello.capabilities?.includes("payload.epoch_attachment_refs") ||
 						!hello.capabilities?.includes("payload.epoch_content_refs") ||
 						hello.payloadBudget?.maxServerFrameBytes !== 65 * 1024 * 1024 ||
@@ -254,6 +256,56 @@ try {
 				socket.once("error", finish);
 			},
 			"Packaged WebSocket hello timed out",
+		);
+		const legacyProtocolSocket = new WebSocket(`${origin.replace("http", "ws")}/api/v1/ws`, {
+			headers: { Origin: origin, Cookie: cookie },
+		});
+		await waitForSocket(
+			legacyProtocolSocket,
+			(finish) => {
+				const socket = legacyProtocolSocket;
+				let rejected = false;
+				socket.once("open", () => {
+					socket.send(
+						JSON.stringify({
+							type: "client_hello",
+							protocol: { major: 1, minor: 3 },
+							clientBuild: "pack-smoke-legacy",
+							capabilities: [
+								"rpc.commands",
+								"rpc.events",
+								"rpc.extension_ui",
+								"session.multiplex",
+								"session.hot_runtime_inventory",
+								"session.fenced_takeover",
+								"payload.epoch_attachment_refs",
+								"payload.epoch_content_refs",
+							],
+							limits: { maxServerFrameBytes: 68 * 1024 * 1024 },
+						}),
+					);
+				});
+				socket.once("message", (raw) => {
+					const error = JSON.parse(raw.toString());
+					if (
+						error.type !== "protocol_error" ||
+						error.code !== "invalid_hello" ||
+						error.supported?.major !== 1 ||
+						error.supported?.minMinor !== 4 ||
+						error.supported?.maxMinor !== 4
+					) {
+						finish(new Error(`Packaged WebSocket accepted protocol 1.3: ${raw.toString()}`));
+						return;
+					}
+					rejected = true;
+				});
+				socket.once("close", () => {
+					if (rejected) finish();
+					else finish(new Error("Packaged WebSocket closed protocol 1.3 without a terminal error"));
+				});
+				socket.once("error", finish);
+			},
+			"Packaged WebSocket protocol 1.3 rejection timed out",
 		);
 		const rejectedSocket = new WebSocket(`${origin.replace("http", "ws")}/api/v1/ws`, {
 			headers: { Origin: "http://localhost:5173", Cookie: cookie },

@@ -13,6 +13,7 @@ import type {
 } from "@pi-agent-web/protocol";
 import {
 	GATEWAY_CONTENT_REF_CAPABILITY,
+	GATEWAY_FENCED_TAKEOVER_CAPABILITY,
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 	GATEWAY_SESSION_HISTORY_CAPABILITY,
@@ -472,7 +473,7 @@ async function openClient(
 	ws.send(
 		JSON.stringify({
 			type: "client_hello",
-			protocol: { major: 1, minor: 3 },
+			protocol: { major: 1, minor: 4 },
 			clientBuild: "0.1.0-test",
 			capabilities: [
 				"rpc.commands",
@@ -480,6 +481,7 @@ async function openClient(
 				"rpc.extension_ui",
 				"session.multiplex",
 				GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+				GATEWAY_FENCED_TAKEOVER_CAPABILITY,
 				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 				GATEWAY_CONTENT_REF_CAPABILITY,
 				...(options.historyCapability ? [GATEWAY_SESSION_HISTORY_CAPABILITY] : []),
@@ -511,13 +513,14 @@ async function openInventoryClient(
 	ws.send(
 		JSON.stringify({
 			type: "client_hello",
-			protocol: { major: 1, minor: overrides.minor ?? 3 },
+			protocol: { major: 1, minor: overrides.minor ?? 4 },
 			clientBuild: "0.1.0-inventory-test",
 			capabilities: [
 				"rpc.commands",
 				"rpc.events",
 				"rpc.extension_ui",
 				"session.multiplex",
+				GATEWAY_FENCED_TAKEOVER_CAPABILITY,
 				GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 				GATEWAY_CONTENT_REF_CAPABILITY,
 				...(overrides.capability === false ? [] : [GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY]),
@@ -1513,7 +1516,7 @@ describe("SessionWsBridge", () => {
 		expect(frames.slice(0, 2).map((frame) => frame.type)).toEqual(["server_hello", "hot_runtime_inventory"]);
 		expect(frames[0]).toMatchObject({
 			type: "server_hello",
-			protocol: { major: 1, minor: 3 },
+			protocol: { major: 1, minor: 4 },
 			capabilities: expect.arrayContaining([GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY]),
 		});
 		expect(inventory).toMatchObject({
@@ -2722,12 +2725,14 @@ describe("SessionWsBridge", () => {
 			{ id: "fork-child-during-catch-up", type: "fork", entryId: "entry-child" },
 			ownerLease.fencingToken,
 		);
+		await subscribe(owner, child.sessionHandle);
+		const childLease = await claim(owner, child.sessionHandle);
 		const grandchild = await command(
 			owner,
 			child.sessionHandle,
 			child.generation,
 			{ id: "fork-grandchild-during-catch-up", type: "fork", entryId: "entry-grandchild" },
-			ownerLease.fencingToken,
+			childLease.fencingToken,
 		);
 		releaseParentBaseline?.();
 		await observer.waitForFrame(
@@ -2745,7 +2750,9 @@ describe("SessionWsBridge", () => {
 			);
 		});
 
-		expect(subscribeCalls).toBe(2);
+		// The owner must establish the new child baseline before it can acquire a
+		// fresh child fence; the observer still receives one final child catch-up.
+		expect(subscribeCalls).toBe(3);
 		expect(sessionFrames.map((frame) => frame.type)).toEqual([
 			"session_rekeyed",
 			"runtime_state",
@@ -2817,12 +2824,14 @@ describe("SessionWsBridge", () => {
 			{ id: "fork-child-for-concurrent-catch-up", type: "fork", entryId: "entry-child" },
 			ownerLease.fencingToken,
 		);
+		await subscribe(owner, child.sessionHandle);
+		const childLease = await claim(owner, child.sessionHandle);
 		const grandchild = await command(
 			owner,
 			child.sessionHandle,
 			child.generation,
 			{ id: "fork-grandchild-for-concurrent-catch-up", type: "fork", entryId: "entry-grandchild" },
-			ownerLease.fencingToken,
+			childLease.fencingToken,
 		);
 		releaseParentBaselines?.();
 
@@ -2877,6 +2886,8 @@ describe("SessionWsBridge", () => {
 			{ id: "fork-before-parent-reopen", type: "fork", entryId: "entry-reopen" },
 			childLease.fencingToken,
 		);
+		await subscribe(client, child.sessionHandle);
+		const currentChildLease = await claim(client, child.sessionHandle);
 
 		const activationMark = client.mark();
 		await harness.supervisor.activate(parent.sessionHandle);
@@ -2899,7 +2910,7 @@ describe("SessionWsBridge", () => {
 				child.sessionHandle,
 				child.generation,
 				{ id: "prompt-fork-child", type: "prompt", message: "child" },
-				childLease.fencingToken,
+				currentChildLease.fencingToken,
 			),
 			command(
 				client,
@@ -2946,6 +2957,8 @@ describe("SessionWsBridge", () => {
 			{ id: "fork-historical-child", type: "fork", entryId: "entry-historical-child" },
 			childLease.fencingToken,
 		);
+		await subscribe(childOwner, child.sessionHandle);
+		const currentChildLease = await claim(childOwner, child.sessionHandle);
 		const reopenedParent = await subscribe(parentOwner, parent.sessionHandle);
 		const parentLease = await claim(parentOwner, parent.sessionHandle);
 		const childMark = childOwner.mark();
@@ -2971,7 +2984,7 @@ describe("SessionWsBridge", () => {
 			child.sessionHandle,
 			child.generation,
 			{ id: "prompt-still-owned-child", type: "prompt", message: "still-child" },
-			childLease.fencingToken,
+			currentChildLease.fencingToken,
 		);
 		const childUpdate = await childOwner.waitForFrame(
 			(frame): frame is Extract<SessionWsServerMessage, { type: "event" }> =>
@@ -3513,7 +3526,7 @@ describe("SessionWsBridge", () => {
 		expect(socket.sentBytes).toHaveLength(1);
 	});
 
-	it("releases a delayed parent claim from the child identity after a rekey", async () => {
+	it("keeps a delayed parent claim out of a rekeyed child generation", async () => {
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace");
 		fs.mkdirSync(cwd);
@@ -3521,7 +3534,7 @@ describe("SessionWsBridge", () => {
 		const harness = await createHarness([parent]);
 		const client = await openClient(harness);
 		const subscription = await subscribe(client, parent.sessionHandle);
-		const originalClaim = harness.supervisor.claim.bind(harness.supervisor);
+		const originalClaim = harness.supervisor.claimWithTransition.bind(harness.supervisor);
 		let claimedConnectionId: string | undefined;
 		let claimedFencingToken: string | undefined;
 		let claimAcquired: (() => void) | undefined;
@@ -3536,14 +3549,15 @@ describe("SessionWsBridge", () => {
 		const returned = new Promise<void>((resolve) => {
 			claimReturned = resolve;
 		});
-		harness.supervisor.claim = async (sessionHandle, connectionId) => {
-			const lease = await originalClaim(sessionHandle, connectionId);
+		harness.supervisor.claimWithTransition = async (sessionHandle, connectionId) => {
+			const claimed = await originalClaim(sessionHandle, connectionId);
+			const { lease } = claimed;
 			claimedConnectionId = connectionId;
 			claimedFencingToken = lease.fencingToken;
 			claimAcquired?.();
 			await gate;
 			claimReturned?.();
-			return lease;
+			return claimed;
 		};
 
 		client.send({ type: "session_claim", sessionHandle: parent.sessionHandle });
@@ -3560,13 +3574,22 @@ describe("SessionWsBridge", () => {
 				fencingToken: claimedFencingToken,
 			},
 		);
-		expect(harness.supervisor.leaseFor(child.sessionHandle, claimedConnectionId).isController).toBe(true);
+		expect(harness.supervisor.leaseFor(child.sessionHandle, claimedConnectionId)).toMatchObject({
+			generation: child.generation,
+			leaseRevision: 0,
+			controlState: "free",
+			isController: false,
+		});
 		releaseClaim?.();
 		await returned;
-		await new Promise<void>((resolve) => setImmediate(resolve));
-		expect(harness.supervisor.leaseFor(child.sessionHandle, claimedConnectionId).isController).toBe(false);
+		expect(harness.supervisor.leaseFor(child.sessionHandle, claimedConnectionId)).toMatchObject({
+			generation: child.generation,
+			leaseRevision: 0,
+			controlState: "free",
+			isController: false,
+		});
 
-		harness.supervisor.claim = originalClaim;
+		harness.supervisor.claimWithTransition = originalClaim;
 		const successor = await openClient(harness);
 		await subscribe(successor, child.sessionHandle);
 		const successorLease = await claim(successor, child.sessionHandle);
@@ -3581,7 +3604,7 @@ describe("SessionWsBridge", () => {
 		const harness = await createHarness([target]);
 		const client = await openClient(harness);
 		await subscribe(client, target.sessionHandle);
-		const originalClaim = harness.supervisor.claim.bind(harness.supervisor);
+		const originalClaim = harness.supervisor.claimWithTransition.bind(harness.supervisor);
 		let acquired: (() => void) | undefined;
 		const acquiredPromise = new Promise<void>((resolve) => {
 			acquired = resolve;
@@ -3591,14 +3614,14 @@ describe("SessionWsBridge", () => {
 			returnClaim = resolve;
 		});
 		let claimCalls = 0;
-		harness.supervisor.claim = async (...args) => {
-			const lease = await originalClaim(...args);
+		harness.supervisor.claimWithTransition = async (...args) => {
+			const claimed = await originalClaim(...args);
 			claimCalls += 1;
 			if (claimCalls === 1) {
 				acquired?.();
 				await returnGate;
 			}
-			return lease;
+			return claimed;
 		};
 
 		const mark = client.mark();
@@ -3668,7 +3691,22 @@ describe("SessionWsBridge", () => {
 		const harness = await createHarness([target]);
 		const abandoned = await openClient(harness);
 		await subscribe(abandoned, target.sessionHandle);
-		const originalClaim = harness.supervisor.claim.bind(harness.supervisor);
+		const successor = await openClient(harness);
+		await subscribe(successor, target.sessionHandle);
+		const originalClaim = harness.supervisor.claimWithTransition.bind(harness.supervisor);
+		let abandonedConnectionId: string | undefined;
+		let disconnectCleanupFinished: (() => void) | undefined;
+		const disconnectCleanup = new Promise<void>((resolve) => {
+			disconnectCleanupFinished = resolve;
+		});
+		const originalReleaseConnection = harness.supervisor.releaseConnectionWithTransitions.bind(
+			harness.supervisor,
+		);
+		harness.supervisor.releaseConnectionWithTransitions = async (connectionId) => {
+			const result = await originalReleaseConnection(connectionId);
+			if (connectionId === abandonedConnectionId) disconnectCleanupFinished?.();
+			return result;
+		};
 		let claimStarted: (() => void) | undefined;
 		const started = new Promise<void>((resolve) => {
 			claimStarted = resolve;
@@ -3681,26 +3719,126 @@ describe("SessionWsBridge", () => {
 		const returned = new Promise<void>((resolve) => {
 			claimReturned = resolve;
 		});
-		harness.supervisor.claim = async (sessionHandle, connectionId) => {
+		harness.supervisor.claimWithTransition = async (sessionHandle, connectionId) => {
+			abandonedConnectionId = connectionId;
 			claimStarted?.();
 			await claimGate;
-			const lease = await originalClaim(sessionHandle, connectionId);
+			const claimed = await originalClaim(sessionHandle, connectionId);
 			claimReturned?.();
-			return lease;
+			return claimed;
 		};
 
 		abandoned.send({ type: "session_claim", sessionHandle: target.sessionHandle });
 		await started;
+		const successorMark = successor.mark();
 		await abandoned.close();
-		await eventually(() => harness.connectionEvents.some((message) => message.startsWith("ws disconnected")));
+		await disconnectCleanup;
 		releaseClaim?.();
 		await returned;
-		await new Promise<void>((resolve) => setImmediate(resolve));
-
-		const successor = await openClient(harness);
-		await subscribe(successor, target.sessionHandle);
+		const disconnected = await successor.waitForFrame(
+			(frame): frame is LeaseFrame =>
+				frame.type === "lease_status" &&
+				frame.sessionHandle === target.sessionHandle &&
+				frame.transition === "disconnect" &&
+				frame.controlState === "free" &&
+				frame.isController === false,
+			successorMark,
+		);
+		expect(disconnected).toMatchObject({ leaseRevision: 2, controlState: "free", transition: "disconnect" });
 		const successorLease = await claim(successor, target.sessionHandle);
-		expect(successorLease.isController).toBe(true);
+		expect(successorLease).toMatchObject({
+			isController: true,
+			leaseRevision: disconnected.leaseRevision + 1,
+		});
+	});
+
+	it("releases a takeover acquired after its socket already closed as a disconnect", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "takeover-after-close");
+		const harness = await createHarness([target]);
+		const owner = await openClient(harness);
+		const requester = await openClient(harness);
+		const ownerSubscription = await subscribe(owner, target.sessionHandle);
+		await subscribe(requester, target.sessionHandle);
+		const ownerLease = await claim(owner, target.sessionHandle);
+		const originalTakeover = harness.supervisor.takeover.bind(harness.supervisor);
+		const originalReleaseConnection = harness.supervisor.releaseConnectionWithTransitions.bind(
+			harness.supervisor,
+		);
+		let requesterConnectionId: string | undefined;
+		let takeoverStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			takeoverStarted = resolve;
+		});
+		let releaseTakeover: (() => void) | undefined;
+		const takeoverGate = new Promise<void>((resolve) => {
+			releaseTakeover = resolve;
+		});
+		let takeoverReturned: (() => void) | undefined;
+		const returned = new Promise<void>((resolve) => {
+			takeoverReturned = resolve;
+		});
+		let disconnectCleanupFinished: (() => void) | undefined;
+		const disconnectCleanup = new Promise<void>((resolve) => {
+			disconnectCleanupFinished = resolve;
+		});
+		harness.supervisor.takeover = async (
+			sessionHandle,
+			expectedGeneration,
+			expectedLeaseRevision,
+			connectionId,
+		) => {
+			requesterConnectionId = connectionId;
+			takeoverStarted?.();
+			await takeoverGate;
+			const transition = await originalTakeover(
+				sessionHandle,
+				expectedGeneration,
+				expectedLeaseRevision,
+				connectionId,
+			);
+			takeoverReturned?.();
+			return transition;
+		};
+		harness.supervisor.releaseConnectionWithTransitions = async (connectionId) => {
+			const result = await originalReleaseConnection(connectionId);
+			if (connectionId === requesterConnectionId) disconnectCleanupFinished?.();
+			return result;
+		};
+
+		requester.send({
+			type: "session_takeover",
+			sessionHandle: target.sessionHandle,
+			expectedGeneration: ownerSubscription.runtime.generation,
+			expectedLeaseRevision: ownerLease.leaseRevision,
+		});
+		await started;
+		const ownerMark = owner.mark();
+		await requester.close();
+		await disconnectCleanup;
+		releaseTakeover?.();
+		await returned;
+		const disconnected = await owner.waitForFrame(
+			(frame): frame is LeaseFrame =>
+				frame.type === "lease_status" &&
+				frame.sessionHandle === target.sessionHandle &&
+				frame.transition === "disconnect" &&
+				frame.controlState === "free" &&
+				frame.isController === false,
+			ownerMark,
+		);
+		expect(disconnected).toMatchObject({
+			leaseRevision: ownerLease.leaseRevision + 2,
+			controlState: "free",
+			transition: "disconnect",
+		});
+		const reclaimed = await claim(owner, target.sessionHandle);
+		expect(reclaimed).toMatchObject({
+			isController: true,
+			leaseRevision: disconnected.leaseRevision + 1,
+		});
 	});
 
 	it("multiplexes independent Session event streams over one socket", async () => {
@@ -3797,6 +3935,9 @@ describe("SessionWsBridge", () => {
 			serverEpoch: TEST_SERVER_EPOCH,
 			sessionHandle: target.sessionHandle,
 			generation: subscription.runtime.generation,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
 			isController: false,
 		});
 		const response = await command(client, target.sessionHandle, subscription.runtime.generation, {
@@ -3809,6 +3950,182 @@ describe("SessionWsBridge", () => {
 			success: false,
 			error: "session_read_only",
 		});
+	});
+
+	it("fences takeover over two real WebSocket clients without leaking either controller token", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "fenced-takeover-two-sockets");
+		const harness = await createHarness([target]);
+		const owner = await openClient(harness);
+		const observer = await openClient(harness);
+		const ownerSubscription = await subscribe(owner, target.sessionHandle);
+		await subscribe(observer, target.sessionHandle);
+
+		const observerClaimMark = observer.mark();
+		const ownerLease = await claim(owner, target.sessionHandle);
+		if (!ownerLease.fencingToken) throw new Error("owner did not receive a private controller fence");
+		const observerClaim = await observer.waitForFrame(
+			(frame): frame is LeaseFrame =>
+				frame.type === "lease_status" &&
+				frame.sessionHandle === target.sessionHandle &&
+				frame.leaseRevision === ownerLease.leaseRevision,
+			observerClaimMark,
+		);
+		expect(observerClaim).toMatchObject({
+			isController: false,
+			controlState: "held",
+			transition: "claim",
+		});
+		expect(Object.hasOwn(observerClaim, "fencingToken")).toBe(false);
+
+		const beforeTakeover = harness.supervisor.getRuntime(target.sessionHandle);
+		if (!beforeTakeover) throw new Error("takeover fixture runtime was not active");
+		const ownerTakeoverMark = owner.mark();
+		const observerTakeoverMark = observer.mark();
+		observer.send({
+			type: "session_takeover",
+			sessionHandle: target.sessionHandle,
+			expectedGeneration: ownerSubscription.runtime.generation,
+			expectedLeaseRevision: ownerLease.leaseRevision,
+		});
+		const revoked = await owner.waitForFrame(
+			(frame): frame is LeaseFrame =>
+				frame.type === "lease_status" &&
+				frame.sessionHandle === target.sessionHandle &&
+				frame.leaseRevision === ownerLease.leaseRevision + 1 &&
+				frame.transition === "takeover",
+			ownerTakeoverMark,
+		);
+		const granted = await observer.waitForFrame(
+			(frame): frame is LeaseFrame =>
+				frame.type === "lease_status" &&
+				frame.sessionHandle === target.sessionHandle &&
+				frame.leaseRevision === ownerLease.leaseRevision + 1 &&
+				frame.transition === "takeover",
+			observerTakeoverMark,
+		);
+		if (!granted.fencingToken) throw new Error("takeover recipient did not receive a new private fence");
+		expect(revoked).toMatchObject({ isController: false, controlState: "held" });
+		expect(Object.hasOwn(revoked, "fencingToken")).toBe(false);
+		expect(granted).toMatchObject({ isController: true, controlState: "held" });
+		expect(granted.fencingToken).not.toBe(ownerLease.fencingToken);
+		expect(harness.supervisor.getRuntime(target.sessionHandle)).toMatchObject({
+			generation: beforeTakeover.generation,
+			state: beforeTakeover.state,
+			lastSeq: beforeTakeover.lastSeq,
+		});
+
+		const observerRequesterMark = observer.mark();
+		const oldMutation = await command(
+			owner,
+			target.sessionHandle,
+			ownerSubscription.runtime.generation,
+			{ id: "old-owner-after-takeover", type: "set_session_name", name: "must remain fenced" },
+			ownerLease.fencingToken,
+		);
+		expect(oldMutation.response).toMatchObject({
+			id: "old-owner-after-takeover",
+			success: false,
+			error: "session_read_only",
+		});
+		const oldExtensionMark = owner.mark();
+		owner.send({
+			type: "extension_ui_response",
+			sessionHandle: target.sessionHandle,
+			expectedGeneration: ownerSubscription.runtime.generation,
+			fencingToken: ownerLease.fencingToken,
+			response: { type: "extension_ui_response", id: "old-owner-dialog", confirmed: true },
+		});
+		await owner.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+				frame.type === "session_error" &&
+				frame.operation === "extension_ui_response" &&
+				frame.code === "session_read_only",
+			oldExtensionMark,
+		);
+		expect(
+			observer.frames
+				.slice(observerRequesterMark)
+				.filter(
+					(frame) =>
+						(frame.type === "response" && frame.response.id === "old-owner-after-takeover") ||
+						(frame.type === "session_error" && frame.operation === "extension_ui_response"),
+				),
+		).toEqual([]);
+
+		await owner.close();
+		await expect(
+			command(
+				observer,
+				target.sessionHandle,
+				ownerSubscription.runtime.generation,
+				{ id: "takeover-owner-survives-old-disconnect", type: "set_session_name", name: "new controller" },
+				granted.fencingToken,
+			),
+		).resolves.toMatchObject({ response: { success: true } });
+	});
+
+	it("starts a rekeyed child free and rejects the parent fence for commands and Extension responses", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const parent = createNativeSession(root, cwd, "rekey-fence-isolation");
+		const harness = await createHarness([parent]);
+		const owner = await openClient(harness);
+		const observer = await openClient(harness);
+		const ownerSubscription = await subscribe(owner, parent.sessionHandle);
+		await subscribe(observer, parent.sessionHandle);
+		const parentLease = await claim(owner, parent.sessionHandle);
+		if (!parentLease.fencingToken) throw new Error("parent controller did not receive a fence");
+
+		const child = await command(
+			owner,
+			parent.sessionHandle,
+			ownerSubscription.runtime.generation,
+			{ id: "fork-for-fence-isolation", type: "fork", entryId: "entry-fence-isolation" },
+			parentLease.fencingToken,
+		);
+		const ownerBaseline = await subscribe(owner, child.sessionHandle);
+		const observerBaseline = await subscribe(observer, child.sessionHandle);
+		for (const baseline of [ownerBaseline.lease, observerBaseline.lease]) {
+			expect(baseline).toMatchObject({
+				generation: child.generation,
+				leaseRevision: 0,
+				controlState: "free",
+				transition: "rekey",
+				isController: false,
+			});
+			expect(Object.hasOwn(baseline, "fencingToken")).toBe(false);
+		}
+
+		const rejectedCommand = await command(
+			owner,
+			child.sessionHandle,
+			child.generation,
+			{ id: "parent-fence-child-command", type: "set_session_name", name: "must-not-admit" },
+			parentLease.fencingToken,
+		);
+		expect(rejectedCommand.response).toMatchObject({ success: false, error: "session_read_only" });
+		const extensionMark = owner.mark();
+		owner.send({
+			type: "extension_ui_response",
+			sessionHandle: child.sessionHandle,
+			expectedGeneration: child.generation,
+			fencingToken: parentLease.fencingToken,
+			response: { type: "extension_ui_response", id: "parent-fence-child-dialog", confirmed: true },
+		});
+		await owner.waitForFrame(
+			(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+				frame.type === "session_error" &&
+				frame.operation === "extension_ui_response" &&
+				frame.code === "session_read_only",
+			extensionMark,
+		);
+		const childLease = await claim(owner, child.sessionHandle);
+		expect(childLease).toMatchObject({ isController: true, leaseRevision: 1 });
+		expect(childLease.fencingToken).not.toBe(parentLease.fencingToken);
 	});
 
 	it("isolates leases per Session and fences a second controller for the same Session", async () => {
@@ -3930,7 +4247,7 @@ describe("SessionWsBridge", () => {
 		expect(loser.fencingToken).toBeUndefined();
 	});
 
-	it("releases controller ownership on unsubscribe and through a stale pre-rekey handle", async () => {
+	it("starts a rekeyed child ownerless before stale-alias and unsubscribe releases", async () => {
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace");
 		fs.mkdirSync(cwd);
@@ -3948,21 +4265,78 @@ describe("SessionWsBridge", () => {
 			ownerLease.fencingToken,
 		);
 
-		const releaseMark = owner.mark();
+		const childBaseline = await subscribe(owner, child.sessionHandle);
+		expect(childBaseline.lease).toMatchObject({
+			generation: child.generation,
+			leaseRevision: 0,
+			controlState: "free",
+			isController: false,
+		});
+		expect(Object.hasOwn(childBaseline.lease, "fencingToken")).toBe(false);
+
+		const childLease = await claim(owner, child.sessionHandle);
+		expect(childLease).toMatchObject({
+			generation: child.generation,
+			leaseRevision: 1,
+			controlState: "held",
+			isController: true,
+		});
+		expect(childLease.fencingToken).not.toBe(ownerLease.fencingToken);
+
+		// Once the child has an authoritative baseline, the pre-rekey parent
+		// handle is no longer a lease alias. Its release response is a separate
+		// ownerless baseline and cannot erase the new child fence.
+		const staleReleaseMark = owner.mark();
 		owner.send({ type: "session_release", sessionHandle: parent.sessionHandle });
-		const released = await owner.waitForFrame(
+		await owner.waitForFrame(
 			(frame): frame is LeaseFrame =>
-				frame.type === "lease_status" && frame.sessionHandle === child.sessionHandle,
-			releaseMark,
+				frame.type === "lease_status" &&
+				frame.sessionHandle === parent.sessionHandle &&
+				frame.leaseRevision === 0 &&
+				frame.controlState === "free" &&
+				frame.transition === "baseline" &&
+				frame.isController === false,
+			staleReleaseMark,
 		);
-		expect(released.isController).toBe(false);
+		await expect(
+			command(
+				owner,
+				child.sessionHandle,
+				child.generation,
+				{ id: "fresh-child-fence-after-stale-parent-release", type: "set_session_name", name: "still-held" },
+				childLease.fencingToken,
+			),
+		).resolves.toMatchObject({ response: { success: true } });
 
 		await subscribe(successor, child.sessionHandle);
-		expect((await claim(successor, child.sessionHandle)).isController).toBe(true);
-		successor.send({ type: "session_unsubscribe", sessionHandle: child.sessionHandle });
-		await new Promise<void>((resolve) => setImmediate(resolve));
+		const ownerUnsubscribeMark = successor.mark();
+		owner.send({ type: "session_unsubscribe", sessionHandle: child.sessionHandle });
+		await successor.waitForFrame(
+			(frame): frame is LeaseFrame =>
+				frame.type === "lease_status" &&
+				frame.sessionHandle === child.sessionHandle &&
+				frame.transition === "release" &&
+				frame.leaseRevision === 2 &&
+				frame.controlState === "free" &&
+				frame.isController === false,
+			ownerUnsubscribeMark,
+		);
+		const successorLease = await claim(successor, child.sessionHandle);
+		expect(successorLease).toMatchObject({ isController: true, leaseRevision: 3 });
 		const third = await openClient(harness);
 		await subscribe(third, child.sessionHandle);
+		const successorUnsubscribeMark = third.mark();
+		successor.send({ type: "session_unsubscribe", sessionHandle: child.sessionHandle });
+		await third.waitForFrame(
+			(frame): frame is LeaseFrame =>
+				frame.type === "lease_status" &&
+				frame.sessionHandle === child.sessionHandle &&
+				frame.transition === "release" &&
+				frame.leaseRevision === 4 &&
+				frame.controlState === "free" &&
+				frame.isController === false,
+			successorUnsubscribeMark,
+		);
 		expect((await claim(third, child.sessionHandle)).isController).toBe(true);
 	});
 
@@ -4166,9 +4540,9 @@ describe("SessionWsBridge", () => {
 			const owner = await openClient(harness);
 			const successor = await openClient(harness);
 			const subscription = await subscribe(owner, parent.sessionHandle);
-			const originalClaim = harness.supervisor.claim.bind(harness.supervisor);
+			const originalClaim = harness.supervisor.claimWithTransition.bind(harness.supervisor);
 			let ownerConnectionId: string | undefined;
-			harness.supervisor.claim = async (sessionHandle, connectionId) => {
+			harness.supervisor.claimWithTransition = async (sessionHandle, connectionId) => {
 				ownerConnectionId = connectionId;
 				return originalClaim(sessionHandle, connectionId);
 			};
@@ -4410,8 +4784,18 @@ describe("SessionWsBridge", () => {
 		const originalLease = await claim(owner, target.sessionHandle);
 		expect(originalLease.isController).toBe(true);
 
+		const successorMark = successor.mark();
 		await owner.close();
-		await eventually(() => harness.connectionEvents.some((message) => message.startsWith("ws disconnected")));
+		const disconnected = await successor.waitForFrame(
+			(frame): frame is LeaseFrame =>
+				frame.type === "lease_status" &&
+				frame.sessionHandle === target.sessionHandle &&
+				frame.transition === "disconnect" &&
+				frame.controlState === "free" &&
+				frame.isController === false,
+			successorMark,
+		);
+		expect(disconnected.leaseRevision).toBe(originalLease.leaseRevision + 1);
 		const successorLease = await claim(successor, target.sessionHandle);
 		expect(successorLease.isController).toBe(true);
 		expect(successorLease.fencingToken).not.toBe(originalLease.fencingToken);

@@ -1,11 +1,11 @@
 # ADR 0007: Versioned Pi host and Gateway negotiation
 
-- Status: Accepted; Browser/Gateway compatibility policy amended by ADR 0013
+- Status: Accepted; Browser/Gateway compatibility policy amended by ADRs 0013 and 0015
 - Date: 2026-08-25
 
 The Pi host and runtime-resolution decisions remain active. The Browser/Gateway minor-negotiation
 details below are historical pre-activation rationale; ADR 0013 and `docs/protocol.md` define the
-current single-version 1.3 contract and the terminal mismatch behavior.
+current single-version contract and the terminal mismatch behavior.
 
 ## Context
 

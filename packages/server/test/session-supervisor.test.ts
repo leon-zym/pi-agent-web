@@ -663,13 +663,21 @@ describe("SessionSupervisor", () => {
 				),
 		);
 		const restarted = supervisor.getRuntime(first.sessionHandle)!;
+		const restartedLease = await supervisor.claim(first.sessionHandle, "hot-controller");
+		expect(restartedLease).toMatchObject({
+			generation: restarted.generation,
+			leaseRevision: 1,
+			controlState: "held",
+			isController: true,
+		});
+		expect(restartedLease.fencingToken).not.toBe(lease.fencingToken);
 		await supervisor.sendCommand(
 			first.sessionHandle,
 			{ type: "prompt", message: "slow" },
 			{
 				connectionId: "hot-controller",
 				expectedGeneration: restarted.generation,
-				fencingToken: lease.fencingToken,
+				fencingToken: restartedLease.fencingToken,
 			},
 		);
 		await waitFor(() =>
@@ -2923,7 +2931,7 @@ describe("SessionSupervisor", () => {
 
 		const first = await supervisor.claim(target.sessionHandle, "connection-a");
 		expect((await supervisor.claim(target.sessionHandle, "connection-b")).isController).toBe(false);
-		expect(supervisor.release(target.sessionHandle, "connection-a")).toBe(true);
+		expect(await supervisor.release(target.sessionHandle, "connection-a")).toBe(true);
 		const second = await supervisor.claim(target.sessionHandle, "connection-b");
 		expect(second.fencingToken).not.toBe(first.fencingToken);
 		const runtime = supervisor.getRuntime(target.sessionHandle)!;
@@ -2939,6 +2947,256 @@ describe("SessionSupervisor", () => {
 				},
 			),
 		).rejects.toThrow("session_read_only");
+	});
+
+	it("serializes same-revision takeover races and leaves a late old-owner disconnect harmless", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "takeover-race");
+		const { supervisor } = createHarness({ targets: [target] });
+		const owner = await supervisor.claim(target.sessionHandle, "owner");
+		const runtime = supervisor.getRuntime(target.sessionHandle)!;
+
+		const outcomes = await Promise.allSettled([
+			supervisor.takeover(target.sessionHandle, runtime.generation, owner.leaseRevision, "observer-a"),
+			supervisor.takeover(target.sessionHandle, runtime.generation, owner.leaseRevision, "observer-b"),
+		]);
+		const winner = outcomes.find(
+			(outcome): outcome is PromiseFulfilledResult<Awaited<ReturnType<typeof supervisor.takeover>>> =>
+				outcome.status === "fulfilled",
+		);
+		const loser = outcomes.find((outcome) => outcome.status === "rejected");
+		if (!winner || !loser) throw new Error("exactly one takeover contender must win");
+		expect(winner.value).toMatchObject({
+			transition: "takeover",
+			leaseRevision: owner.leaseRevision + 1,
+			controlState: "held",
+		});
+		expect(winner.value.fencingToken).not.toBe(owner.fencingToken);
+		expect(String(loser.reason)).toContain("session_lease_revision_stale");
+		const winnerConnectionId = winner.value.ownerConnectionId;
+		if (!winnerConnectionId) throw new Error("takeover winner must retain a private owner identity");
+
+		await expect(
+			supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "set_session_name", name: "old-owner-mutation" },
+				{
+					connectionId: "owner",
+					expectedGeneration: runtime.generation,
+					fencingToken: owner.fencingToken,
+				},
+			),
+		).rejects.toThrow("session_read_only");
+		await expect(
+			supervisor.sendExtensionUiResponse(
+				target.sessionHandle,
+				{ type: "extension_ui_response", id: "old-owner-dialog", confirmed: true },
+				{
+					connectionId: "owner",
+					expectedGeneration: runtime.generation,
+					fencingToken: owner.fencingToken,
+				},
+			),
+		).rejects.toThrow("session_read_only");
+
+		await supervisor.releaseConnection("owner");
+		expect(supervisor.leaseFor(target.sessionHandle, winnerConnectionId)).toMatchObject({
+			isController: true,
+			fencingToken: winner.value.fencingToken,
+			leaseRevision: owner.leaseRevision + 1,
+		});
+	});
+
+	it("keeps already admitted work running while takeover fences later old-token mutations", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		const checkpointDir = path.join(root, "takeover-checkpoints");
+		fs.mkdirSync(cwd);
+		fs.mkdirSync(checkpointDir);
+		const target = createNativeSession(root, cwd, "takeover-admission");
+		const { supervisor } = createHarness({
+			targets: [target],
+			env: { PI_WEB_FIXTURE_CHECKPOINT_DIR: checkpointDir },
+		});
+		const owner = await supervisor.claim(target.sessionHandle, "owner");
+		if (!owner.fencingToken) throw new Error("owner lease was not granted");
+		const runtime = supervisor.getRuntime(target.sessionHandle)!;
+		const admitted = await supervisor.sendCommand(
+			target.sessionHandle,
+			{ id: "admitted-before-takeover", type: "prompt", message: "snapshot-checkpoint:thinking" },
+			{
+				connectionId: "owner",
+				expectedGeneration: runtime.generation,
+				fencingToken: owner.fencingToken,
+			},
+		);
+		expect(admitted.response).toMatchObject({ command: "prompt", success: true });
+		expect(supervisor.getRuntime(target.sessionHandle)?.state).toBe("running");
+
+		const takeover = await supervisor.takeover(
+			target.sessionHandle,
+			runtime.generation,
+			owner.leaseRevision,
+			"observer",
+		);
+		expect(takeover.transition).toBe("takeover");
+		expect(supervisor.getRuntime(target.sessionHandle)?.state).toBe("running");
+		await expect(
+			supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "set_session_name", name: "fenced-after-takeover" },
+				{
+					connectionId: "owner",
+					expectedGeneration: runtime.generation,
+					fencingToken: owner.fencingToken,
+				},
+			),
+		).rejects.toThrow("session_read_only");
+		fs.writeFileSync(path.join(checkpointDir, `${target.nativeSessionId}-thinking.release`), "");
+		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "idle");
+	});
+
+	it("does not activate a dormant Session for takeover and terminalizes lease revision overflow", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const dormant = createNativeSession(root, cwd, "takeover-dormant");
+		const { supervisor } = createHarness({ targets: [dormant] });
+
+		await expect(supervisor.takeover(dormant.sessionHandle, 0, 0, "observer")).rejects.toThrow(
+			"session_takeover_not_available",
+		);
+		expect(supervisor.getRuntime(dormant.sessionHandle)).toBeUndefined();
+		const unverified = await supervisor.createSession({
+			workspaceId: "workspace",
+			cwd,
+			sessionDir: path.join(root, "unverified-sessions"),
+			requestedNativeSessionId: "takeover-unverified",
+		});
+		await expect(
+			supervisor.takeover(unverified.sessionHandle, unverified.generation, 0, "observer"),
+		).rejects.toThrow("session_identity_uncertain");
+
+		const owner = await supervisor.claim(dormant.sessionHandle, "owner");
+		const internal = supervisor as unknown as {
+			leases: Map<string, { generation: number; revision: number; owner?: unknown; terminal: boolean }>;
+		};
+		const lease = internal.leases.get(dormant.sessionHandle);
+		if (!lease) throw new Error("lease state was not created");
+		lease.revision = Number.MAX_SAFE_INTEGER;
+		await expect(supervisor.release(dormant.sessionHandle, "owner")).rejects.toThrow(
+			"session_lease_revision_exhausted",
+		);
+		expect(supervisor.leaseFor(dormant.sessionHandle, "owner")).toMatchObject({
+			isController: false,
+			controlState: "free",
+			leaseRevision: Number.MAX_SAFE_INTEGER,
+		});
+		await expect(supervisor.claim(dormant.sessionHandle, "observer")).rejects.toThrow(
+			"session_lease_revision_exhausted",
+		);
+		expect(owner.fencingToken).toBeDefined();
+	});
+
+	it("starts a rekeyed generation free and rejects every parent fence", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const parent = createNativeSession(root, cwd, "takeover-rekey-parent");
+		const { supervisor } = createHarness({ targets: [parent] });
+		const owner = await supervisor.claim(parent.sessionHandle, "owner");
+		if (!owner.fencingToken) throw new Error("rekey fixture owner did not receive a fence");
+		const parentRuntime = supervisor.getRuntime(parent.sessionHandle)!;
+		const child = await supervisor.sendCommand(
+			parent.sessionHandle,
+			{ id: "takeover-rekey-clone", type: "clone" },
+			{
+				connectionId: "owner",
+				expectedGeneration: parentRuntime.generation,
+				fencingToken: owner.fencingToken,
+			},
+		);
+		const childLease = supervisor.leaseFor(child.sessionHandle, "owner");
+		expect(childLease).toMatchObject({
+			generation: child.generation,
+			leaseRevision: 0,
+			controlState: "free",
+			isController: false,
+		});
+		expect(Object.hasOwn(childLease, "fencingToken")).toBe(false);
+		await expect(
+			supervisor.takeover(
+				child.sessionHandle,
+				parentRuntime.generation,
+				childLease.leaseRevision,
+				"observer",
+			),
+		).rejects.toThrow("session_generation_stale");
+		await expect(
+			supervisor.takeover(child.sessionHandle, child.generation, childLease.leaseRevision, "observer"),
+		).rejects.toThrow("session_takeover_not_available");
+		await expect(
+			supervisor.sendCommand(
+				child.sessionHandle,
+				{ type: "set_session_name", name: "parent-fence-must-not-cross" },
+				{
+					connectionId: "owner",
+					expectedGeneration: child.generation,
+					fencingToken: owner.fencingToken,
+				},
+			),
+		).rejects.toThrow("session_read_only");
+		await expect(
+			supervisor.sendExtensionUiResponse(
+				child.sessionHandle,
+				{ type: "extension_ui_response", id: "parent-fence-dialog", confirmed: true },
+				{
+					connectionId: "owner",
+					expectedGeneration: child.generation,
+					fencingToken: owner.fencingToken,
+				},
+			),
+		).rejects.toThrow("session_read_only");
+		const observerLease = await supervisor.claim(child.sessionHandle, "observer");
+		if (!observerLease.fencingToken) throw new Error("child observer did not receive a fresh fence");
+		const takeover = await supervisor.takeover(
+			child.sessionHandle,
+			child.generation,
+			observerLease.leaseRevision,
+			"successor",
+		);
+		expect(takeover).toMatchObject({
+			transition: "takeover",
+			leaseRevision: 2,
+			ownerConnectionId: "successor",
+		});
+		expect(await supervisor.release(child.sessionHandle, "owner")).toBe(false);
+		expect(await supervisor.release(child.sessionHandle, "observer")).toBe(false);
+		expect(await supervisor.release(child.sessionHandle, "successor")).toBe(true);
+		expect(supervisor.leaseFor(child.sessionHandle, "successor")).toMatchObject({
+			leaseRevision: 3,
+			controlState: "free",
+			isController: false,
+		});
+
+		const unverified = await supervisor.createSession({
+			workspaceId: "workspace",
+			cwd,
+			sessionDir: path.join(root, "pending-sessions"),
+			requestedNativeSessionId: "takeover-old-alias",
+		});
+		const aliases = (
+			supervisor as unknown as {
+				aliases: Map<string, { next: string }>;
+			}
+		).aliases;
+		const oldAlias = [...aliases].find(([, alias]) => alias.next === unverified.sessionHandle)?.[0];
+		if (!oldAlias) throw new Error("new Session did not retain its pending handle as a stale alias");
+		await expect(supervisor.takeover(oldAlias, unverified.generation, 0, "observer")).rejects.toThrow(
+			"session_handle_stale",
+		);
 	});
 
 	it("keeps admitted work alive but fences later mutations after the controller releases", async () => {
@@ -2968,7 +3226,7 @@ describe("SessionSupervisor", () => {
 		expect(accepted.response).toMatchObject({ command: "prompt", success: true });
 		expect(supervisor.getRuntime(target.sessionHandle)?.state).toBe("running");
 
-		expect(supervisor.release(target.sessionHandle, "controller")).toBe(true);
+		expect(await supervisor.release(target.sessionHandle, "controller")).toBe(true);
 		await expect(
 			supervisor.sendCommand(
 				target.sessionHandle,
@@ -3698,6 +3956,34 @@ describe("SessionSupervisor", () => {
 		const after = supervisor.getRuntime(target.sessionHandle)!;
 		expect(after.sessionFile).toBe(target.sessionFile);
 		expect(after.nativeSessionId).toBe(target.nativeSessionId);
+		expect(supervisor.leaseFor(target.sessionHandle, "connection")).toMatchObject({
+			generation: after.generation,
+			leaseRevision: 0,
+			controlState: "free",
+			isController: false,
+		});
+		await expect(
+			supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "set_session_name", name: "restart-must-drop-parent-fence" },
+				{
+					connectionId: "connection",
+					expectedGeneration: after.generation,
+					fencingToken: lease.fencingToken,
+				},
+			),
+		).rejects.toThrow("session_read_only");
+		await expect(
+			supervisor.sendExtensionUiResponse(
+				target.sessionHandle,
+				{ type: "extension_ui_response", id: "restart-parent-fence", confirmed: true },
+				{
+					connectionId: "connection",
+					expectedGeneration: after.generation,
+					fencingToken: lease.fencingToken,
+				},
+			),
+		).rejects.toThrow("session_read_only");
 	});
 
 	it("rebuilds an overflowed runtime on manual restart without an unhandled rejection", async () => {
@@ -3953,7 +4239,7 @@ describe("SessionSupervisor", () => {
 		await expect(supervisor.activate(second.sessionHandle)).rejects.toThrow("session_runtime_capacity");
 		expect(supervisor.getRuntime(first.sessionHandle)?.state).toBe("idle");
 
-		expect(supervisor.release(first.sessionHandle, "controller")).toBe(true);
+		expect(await supervisor.release(first.sessionHandle, "controller")).toBe(true);
 		await expect(supervisor.activate(second.sessionHandle)).resolves.toMatchObject({ state: "idle" });
 		expect(supervisor.getRuntime(first.sessionHandle)?.state).toBe("dormant");
 	});
@@ -3970,7 +4256,7 @@ describe("SessionSupervisor", () => {
 		await reapIdle();
 		expect(supervisor.getRuntime(target.sessionHandle)?.state).toBe("idle");
 
-		expect(supervisor.release(target.sessionHandle, "controller")).toBe(true);
+		expect(await supervisor.release(target.sessionHandle, "controller")).toBe(true);
 		await reapIdle();
 		expect(supervisor.getRuntime(target.sessionHandle)?.state).toBe("dormant");
 	});
@@ -4049,6 +4335,9 @@ describe("SessionSupervisor", () => {
 			serverEpoch: supervisor.serverEpoch,
 			sessionHandle: created.sessionHandle,
 			generation: 0,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
 			isController: false,
 		});
 		expect(messages).toContainEqual({ type: "session_directory_changed", workspaceId: "workspace" });
@@ -4238,7 +4527,7 @@ describe("SessionSupervisor", () => {
 					fencingToken: lease.fencingToken,
 				},
 			);
-			expect(supervisor.release(created.sessionHandle, connectionId)).toBe(true);
+			expect(await supervisor.release(created.sessionHandle, connectionId)).toBe(true);
 			await reapIdle();
 			expect(supervisor.getRuntime(created.sessionHandle)).toBeUndefined();
 		}
@@ -4968,6 +5257,14 @@ describe("SessionSupervisor", () => {
 		expect(child.sessionFile).toBeTruthy();
 		expect(fs.existsSync(child.sessionFile!)).toBe(false);
 		expect(child.state).toBe("idle");
+		const childLease = await supervisor.claim(result.sessionHandle, "connection");
+		expect(childLease).toMatchObject({
+			generation: child.generation,
+			leaseRevision: 1,
+			controlState: "held",
+			isController: true,
+		});
+		expect(childLease.fencingToken).not.toBe(lease.fencingToken);
 
 		await supervisor.sendCommand(
 			result.sessionHandle,
@@ -4975,7 +5272,7 @@ describe("SessionSupervisor", () => {
 			{
 				connectionId: "connection",
 				expectedGeneration: child.generation,
-				fencingToken: lease.fencingToken,
+				fencingToken: childLease.fencingToken,
 			},
 		);
 		await waitFor(() => supervisor.getRuntime(result.sessionHandle)?.recoverable === true);

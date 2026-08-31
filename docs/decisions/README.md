@@ -24,6 +24,7 @@ earlier records describe a different implementation.
 | [0012](0012-schema-backed-boundary-decoders.md) | Superseded schema-backed Pi and product boundary decoders |
 | [0013](0013-canonical-gateway-and-explicit-boundaries.md) | One canonical Gateway protocol and explicit boundary guards |
 | [0014](0014-host-owned-workspace-file-references.md) | Host-owned Workspace file capture, policy, and prompt expansion |
+| [0015](0015-atomic-gateway-1-4-fenced-session-takeover.md) | Atomic Gateway 1.4 fenced Session takeover contract |
 
 New ADRs use: Status, Date, Context, Decision, Consequences, Rejected alternatives, Verification.
 Accepted ADRs are amended or superseded by a later ADR; do not silently reverse them in a handoff or

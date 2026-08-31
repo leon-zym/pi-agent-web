@@ -7,14 +7,14 @@ this project and does not expose upstream Pi types.
 ## Protocol boundaries
 
 ```text
-Pi RPC JSONL <-> PiRpcAdapter <-> product DTOs <-> Gateway 1.3 <-> Browser
+Pi RPC JSONL <-> PiRpcAdapter <-> product DTOs <-> Gateway 1.4 <-> Browser
 ```
 
 These are separate compatibility concerns:
 
 - Pi RPC has no advertised wire-version field. `PiRpcAdapter` supports only exact Pi versions backed
   by fixtures and conformance tests.
-- Browser/Gateway protocol 1.3 is the sole production WebSocket contract. There is no production
+- Browser/Gateway protocol 1.4 is the sole production WebSocket contract. There is no production
   compatibility mode for an older Browser/Gateway minor.
 
 ## Pi RPC
@@ -109,7 +109,8 @@ remain distinct.
 The endpoint is `/api/v1/ws`. The first Browser frame must be `client_hello` within the hello
 deadline. The Gateway replies with `server_hello` before accepting Session traffic.
 
-Both peers require exact protocol `{major: 1, minor: 3}` and the production capability set. The
+Both peers require exact protocol `{major: 1, minor: 4}`, including
+`session.fenced_takeover`, and the production capability set. The
 server hello binds:
 
 - server build and server epoch;
@@ -128,7 +129,7 @@ Every Session-scoped message carries the canonical Session handle and exact iden
 by its operation. The primary Browser operations are:
 
 - subscribe and unsubscribe;
-- claim and release controller ownership;
+- claim, release, and explicitly take over controller ownership;
 - request replay, snapshot resync, or paged history;
 - send a Pi command;
 - respond to Extension UI;
@@ -139,6 +140,15 @@ Extension response requires the exact generation and current fencing token. The 
 generation, stale token, ambiguous identity, duplicate command ownership, and payload admission
 failure before privileged work.
 
+Controller lease views are revisioned by the exact `(serverEpoch, canonicalSessionHandle,
+generation)` identity. A `lease_status` reports the global `leaseRevision`, free-or-held control
+state, and transition provenance. The fencing token is present only in the controlling recipient's
+view. A takeover carries the caller's exact generation and observed lease revision; the Gateway
+performs one compare-and-swap that replaces the owner and fencing token without cancelling already
+admitted work or changing Pi process ownership. An old handle, generation, revision, token, or
+identity window fails closed. During catch-up or rekey the Bridge holds only the newest lease view
+until the recipient has an authoritative baseline.
+
 ## Gateway publication
 
 The Gateway publishes:
@@ -148,7 +158,7 @@ The Gateway publishes:
 - subscription snapshots and history chunks;
 - normalized sequenced events;
 - command responses with a `barrierSeq`;
-- controller, rekey, recovery, directory, auth, and terminal Session state changes.
+- revisioned controller, rekey, recovery, directory, auth, and terminal Session state changes.
 
 Sequence is scoped to server epoch, Session handle, and generation. The Browser applies events in
 order. A command is complete only when the response is received and projection covers its barrier.

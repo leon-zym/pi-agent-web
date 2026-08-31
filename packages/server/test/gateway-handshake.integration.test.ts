@@ -135,22 +135,22 @@ describe("Gateway WebSocket hello negotiation", () => {
 	it("rejects an incompatible major with one terminal diagnostic", async () => {
 		const ws = await openSocket((await createHarness()).url);
 		const frame = nextJson(ws);
-		sendHello(ws, { protocol: { major: 99, minor: 3 } });
+		sendHello(ws, { protocol: { major: 99, minor: 4 } });
 		await expect(frame).resolves.toMatchObject({
 			type: "protocol_error",
 			code: "protocol_major_unsupported",
-			supported: { major: 1, minMinor: 3, maxMinor: 3 },
+			supported: { major: 1, minMinor: 4, maxMinor: 4 },
 		});
 	});
 
-	it("rejects protocol 1.2 instead of activating a compatibility path", async () => {
+	it("rejects protocol 1.3 instead of activating a compatibility path", async () => {
 		const ws = await openSocket((await createHarness()).url);
 		const frame = nextJson(ws);
-		sendHello(ws, { protocol: { major: 1, minor: 2 } });
+		sendHello(ws, { protocol: { major: 1, minor: 3 } });
 		await expect(frame).resolves.toMatchObject({
 			type: "protocol_error",
 			code: "invalid_hello",
-			supported: { major: 1, minMinor: 3, maxMinor: 3 },
+			supported: { major: 1, minMinor: 4, maxMinor: 4 },
 		});
 	});
 
@@ -175,7 +175,7 @@ describe("Gateway WebSocket hello negotiation", () => {
 		});
 	});
 
-	it("negotiates only exact protocol 1.3 with both payload budgets", async () => {
+	it("negotiates only exact protocol 1.4 with both payload budgets", async () => {
 		const ws = await openSocket((await createHarness()).url);
 		const frame = nextJson(ws);
 		sendHello(ws);

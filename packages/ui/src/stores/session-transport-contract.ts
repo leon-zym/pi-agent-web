@@ -37,6 +37,13 @@ export type SessionTransportConnectionState = "idle" | "connecting" | "online" |
 export interface SessionLeaseState {
 	isController: boolean;
 	fencingToken?: string;
+	/** The authoritative Session-scoped lease revision, never a connection-local intent counter. */
+	leaseRevision?: number;
+	/** Global ownership state, which is deliberately distinct from this recipient's control token. */
+	controlState?: "free" | "held";
+	transition?: "baseline" | "claim" | "release" | "takeover" | "disconnect" | "rekey";
+	/** A same-revision contradiction cleared the local fence until a newer authoritative revision arrives. */
+	conflicted?: boolean;
 }
 
 export interface SessionResyncState {
@@ -188,9 +195,9 @@ export interface SessionTransportOptions {
 	onResyncRequired?: (message: Extract<InlineSessionWsServerMessage, { type: "resync_required" }>) => void;
 	resyncClock?: SessionResyncClock;
 	resyncRandom?: () => number;
-	/** Protocol 1.3 content adapter; production installs the default from the trusted hello context. */
+	/** Protocol 1.4 content adapter; production installs the default from the trusted hello context. */
 	contentAdapter?: SessionContentAdapter;
-	/** Protocol 1.3 hello-scoped adapter install; custom factories are validated before activation. */
+	/** Protocol 1.4 hello-scoped adapter install; custom factories are validated before activation. */
 	contentAdapterFactory?: SessionContentAdapterFactory;
 }
 
@@ -218,6 +225,8 @@ export interface SessionTransportState {
 	invalidateSessionSnapshot: (sessionHandle: string) => boolean;
 	claimSession: (sessionHandle: string) => boolean;
 	releaseSession: (sessionHandle: string) => boolean;
+	/** Issue one explicit, revision-fenced takeover request for an already subscribed hot Session. */
+	takeoverSession: (sessionHandle: string) => boolean;
 	sendCommand: (
 		sessionHandle: string,
 		command: SessionCommandDto,
@@ -253,7 +262,7 @@ export interface SessionTransportController {
 	) => Promise<T>;
 	/** Public for deterministic protocol tests and non-WebSocket adapters. */
 	ingestServerMessage: (message: InlineSessionWsServerMessage) => void;
-	/** Queue one already-guarded private protocol 1.3 frame for exact-identity materialization. */
+	/** Queue one already-guarded private protocol 1.4 frame for exact-identity materialization. */
 	ingestFrameMessage: (message: SessionTransportFrameMessage, rawWireBytes: number) => boolean;
 	/** Confirm that deferred projection work has applied every retained frame through lastSeq. */
 	confirmProjectionDelivery: (sessionHandle: string, generation: number) => boolean;

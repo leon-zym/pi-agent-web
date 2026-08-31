@@ -67,6 +67,7 @@ export type SessionSupervisorMessage<
 			previousSessionHandle: string;
 			runtime: SessionRuntimeSnapshot;
 	  }
+	| { type: "lease_transition"; transition: SessionLeaseTransition }
 	| { type: "session_directory_changed"; workspaceId: string }
 	| { type: "auth_changed"; workspaceId?: string };
 
@@ -126,8 +127,27 @@ export interface SessionLeaseSnapshot {
 	serverEpoch: string;
 	sessionHandle: string;
 	generation: number;
+	leaseRevision: number;
+	controlState: "free" | "held";
+	transition: "baseline" | "claim" | "release" | "takeover" | "disconnect" | "rekey";
 	isController: boolean;
 	/** Present only for the controlling connection. */
+	fencingToken?: string;
+}
+
+/**
+ * Supervisor-private committed lease state. The Bridge constructs a separate
+ * public lease DTO for every recipient so this owner identity and token never
+ * become a shared WebSocket payload.
+ */
+export interface SessionLeaseTransition {
+	serverEpoch: string;
+	sessionHandle: string;
+	generation: number;
+	leaseRevision: number;
+	controlState: "free" | "held";
+	transition: "claim" | "release" | "takeover" | "disconnect" | "rekey";
+	ownerConnectionId?: string;
 	fencingToken?: string;
 }
 

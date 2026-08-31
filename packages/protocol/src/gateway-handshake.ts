@@ -6,11 +6,12 @@ import {
 	type SessionPayloadBudgetDto,
 } from "./payload-budget.js";
 
-export const GATEWAY_PROTOCOL_VERSION = { major: 1, minor: 3 } as const;
+export const GATEWAY_PROTOCOL_VERSION = { major: 1, minor: 4 } as const;
 export const MAX_GATEWAY_HELLO_CAPABILITIES = 64;
 export const MAX_GATEWAY_HELLO_CAPABILITY_LENGTH = 128;
 export const MIN_GATEWAY_SERVER_FRAME_BYTES = 1024;
 export const GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY = "session.hot_runtime_inventory";
+export const GATEWAY_FENCED_TAKEOVER_CAPABILITY = "session.fenced_takeover";
 export const GATEWAY_PAYLOAD_BUDGET_CAPABILITY = "payload.epoch_attachment_refs";
 export const GATEWAY_CONTENT_REF_CAPABILITY = "payload.epoch_content_refs";
 
@@ -24,6 +25,7 @@ const GATEWAY_BASE_CAPABILITIES = [
 /** Capabilities the Gateway requires before accepting a Browser connection. */
 export const GATEWAY_CLIENT_REQUIRED_CAPABILITIES = [
 	...GATEWAY_BASE_CAPABILITIES,
+	GATEWAY_FENCED_TAKEOVER_CAPABILITY,
 	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 	GATEWAY_CONTENT_REF_CAPABILITY,
 ] as const;
@@ -32,6 +34,7 @@ export const GATEWAY_CLIENT_REQUIRED_CAPABILITIES = [
 export const GATEWAY_SERVER_REQUIRED_CAPABILITIES = [
 	...GATEWAY_BASE_CAPABILITIES,
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+	GATEWAY_FENCED_TAKEOVER_CAPABILITY,
 	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 	GATEWAY_CONTENT_REF_CAPABILITY,
 ] as const;
@@ -236,7 +239,7 @@ function isGatewayServerHelloShape(value: unknown): value is GatewayServerHelloD
 	}
 }
 
-/** Guard the only supported Browser hello: protocol 1.3 with content references. */
+/** Guard the only supported Browser hello: protocol 1.4 with fenced takeover. */
 export function isGatewayClientHello(value: unknown): value is GatewayClientHelloDto {
 	return (
 		isGatewayClientHelloShape(value) &&
@@ -244,7 +247,7 @@ export function isGatewayClientHello(value: unknown): value is GatewayClientHell
 	);
 }
 
-/** Guard the only supported Gateway hello: protocol 1.3 with both negotiated budgets. */
+/** Guard the only supported Gateway hello: protocol 1.4 with fenced takeover and both budgets. */
 export function isGatewayServerHello(value: unknown): value is GatewayServerHelloDto {
 	return (
 		isGatewayServerHelloShape(value) &&
@@ -310,7 +313,7 @@ export function negotiateGatewayHello(clientHello: unknown, serverHello: unknown
 	};
 }
 
-/** Parse terminal negotiation errors, including the response sent to a protocol 1.2 client. */
+/** Parse terminal negotiation errors, including the response sent to an older protocol client. */
 export function isGatewayProtocolError(value: unknown): value is GatewayProtocolErrorDto {
 	if (!isCanonicalRecord(value, ["type", "code", "supported"])) return false;
 	return (

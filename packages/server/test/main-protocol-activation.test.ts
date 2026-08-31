@@ -19,8 +19,8 @@ afterEach(async () => {
 	await Promise.all(temporaryRoots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
 });
 
-describe("production protocol 1.3 Main activation", () => {
-	it("uses one canonical payload activation and rejects protocol 1.2", async () => {
+describe("production protocol 1.4 Main activation", () => {
+	it("uses one canonical payload activation and rejects protocol 1.3", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-web-main-future-"));
 		temporaryRoots.push(root);
 		const handle = await startServer({
@@ -68,8 +68,8 @@ describe("production protocol 1.3 Main activation", () => {
 				);
 				const value = await hello;
 				expect(isGatewayServerHello(value)).toBe(true);
-				if (!isGatewayServerHello(value)) throw new Error("Gateway did not activate protocol 1.3");
-				expect(value.protocol).toEqual({ major: 1, minor: 3 });
+				if (!isGatewayServerHello(value)) throw new Error("Gateway did not activate protocol 1.4");
+				expect(value.protocol).toEqual({ major: 1, minor: 4 });
 				expect(value.capabilities).toEqual(expect.arrayContaining([...GATEWAY_SERVER_REQUIRED_CAPABILITIES]));
 				expect(value.payloadBudget).toEqual(SESSION_PAYLOAD_BUDGET);
 				expect(value.contentRefBudget).toEqual(SESSION_CONTENT_REF_BUDGET);
@@ -96,7 +96,7 @@ describe("production protocol 1.3 Main activation", () => {
 				legacyWs.send(
 					JSON.stringify({
 						type: "client_hello",
-						protocol: { major: 1, minor: 2 },
+						protocol: { major: 1, minor: 3 },
 						clientBuild: "legacy-compatibility-test",
 						capabilities: [
 							"rpc.commands",

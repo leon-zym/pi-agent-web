@@ -334,6 +334,12 @@ export type SessionWsClientMessage =
 	| { type: "session_claim"; sessionHandle: string }
 	| { type: "session_release"; sessionHandle: string }
 	| {
+			type: "session_takeover";
+			sessionHandle: string;
+			expectedGeneration: number;
+			expectedLeaseRevision: number;
+	  }
+	| {
 			type: "session_restart";
 			sessionHandle: string;
 			expectedGeneration: number;
@@ -414,6 +420,12 @@ export function isSessionWsClientMessage(value: unknown): value is SessionWsClie
 		case "session_claim":
 		case "session_release":
 			return hasOnlyKeys(value, ["type", "sessionHandle"]);
+		case "session_takeover":
+			return (
+				hasOnlyKeys(value, ["type", "sessionHandle", "expectedGeneration", "expectedLeaseRevision"]) &&
+				isGeneration(value.expectedGeneration) &&
+				isGeneration(value.expectedLeaseRevision)
+			);
 		case "session_restart":
 			return (
 				hasOnlyKeys(value, ["type", "sessionHandle", "expectedGeneration", "fencingToken"]) &&
@@ -630,11 +642,11 @@ export function negotiateHotRuntimeInventory(
 	) {
 		return { negotiated: false, reason: "protocol_major_unsupported" };
 	}
-	if (clientHello.protocol.minor < 1 || serverHello.protocol.minor < 1) {
+	if (
+		clientHello.protocol.minor !== GATEWAY_PROTOCOL_VERSION.minor ||
+		serverHello.protocol.minor !== GATEWAY_PROTOCOL_VERSION.minor
+	) {
 		return { negotiated: false, reason: "protocol_minor_unsupported" };
-	}
-	if (serverHello.protocol.minor !== Math.min(clientHello.protocol.minor, GATEWAY_PROTOCOL_VERSION.minor)) {
-		return { negotiated: false, reason: "protocol_selection_invalid" };
 	}
 	if (!clientHello.capabilities.includes(GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY)) {
 		return { negotiated: false, reason: "capability_missing" };
@@ -799,6 +811,9 @@ export interface SessionLeaseStatusDto {
 	serverEpoch: string;
 	sessionHandle: string;
 	generation: number;
+	leaseRevision: number;
+	controlState: "free" | "held";
+	transition: "baseline" | "claim" | "release" | "takeover" | "disconnect" | "rekey";
 	isController: boolean;
 	fencingToken?: string;
 }
@@ -829,7 +844,14 @@ export interface SessionErrorDto {
 	type: "session_error";
 	serverEpoch: string;
 	sessionHandle: string;
-	operation: "subscribe" | "claim" | "release" | "restart" | "extension_ui_response" | "history_page";
+	operation:
+		| "subscribe"
+		| "claim"
+		| "release"
+		| "takeover"
+		| "restart"
+		| "extension_ui_response"
+		| "history_page";
 	error: string;
 	/** Stable machine-readable code; optional for backwards-compatible peers. */
 	code?: string;
@@ -1770,14 +1792,24 @@ export function isInlineSessionWsServerMessage(
 					"serverEpoch",
 					"sessionHandle",
 					"generation",
+					"leaseRevision",
+					"controlState",
+					"transition",
 					"isController",
 					"fencingToken",
 				]) &&
 				isString(value.serverEpoch, 128) &&
 				isString(value.sessionHandle) &&
 				isGeneration(value.generation) &&
+				isGeneration(value.leaseRevision) &&
+				["free", "held"].includes(String(value.controlState)) &&
+				["baseline", "claim", "release", "takeover", "disconnect", "rekey"].includes(
+					String(value.transition),
+				) &&
 				typeof value.isController === "boolean" &&
-				(value.fencingToken === undefined || isString(value.fencingToken))
+				(value.isController
+					? value.controlState === "held" && isString(value.fencingToken)
+					: value.fencingToken === undefined)
 			);
 		case "resync_required":
 			return (
@@ -1823,9 +1855,15 @@ export function isInlineSessionWsServerMessage(
 				]) ||
 				!isString(value.serverEpoch, 128) ||
 				!isString(value.sessionHandle) ||
-				!["subscribe", "claim", "release", "restart", "extension_ui_response", "history_page"].includes(
-					String(value.operation),
-				) ||
+				![
+					"subscribe",
+					"claim",
+					"release",
+					"takeover",
+					"restart",
+					"extension_ui_response",
+					"history_page",
+				].includes(String(value.operation)) ||
 				!isBoundedString(value.error, SESSION_TEXT_MAX_BYTES)
 			) {
 				return false;

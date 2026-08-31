@@ -1,9 +1,9 @@
 # ADR 0011: Epoch-scoped typed content references
 
-- Status: Accepted and activated; compatibility wording amended by ADR 0013
+- Status: Accepted and activated; compatibility wording amended by ADRs 0013 and 0015
 - Date: 2026-08-28
 
-Protocol 1.3 activation is part of the same release change as this document update. The accepted
+The protocol 1.3 activation was part of the release change recorded by this document. The accepted
 design below is unchanged; the activation state records the production contract after the atomic
 Main, Supervisor, Bridge, route, Browser, and documentation switch.
 
@@ -75,8 +75,8 @@ atomicity protocol to every hold, download, materialization, and recovery path.
    JSON or referenced UTF-8 JSON bytes, while the containing field still owns the product meaning
    and runs its field-specific guard after materialization. Media type is therefore a typed-slot
    concern, not blob identity or singleton manifest metadata.
-4. Protocol 1.2 DTOs and guards remain frozen as a historical compatibility surface. Protocol 1.3
-   defines the active parallel full-frame message, entry, tree, event, response, replay, and snapshot
+4. Protocol 1.2 DTOs and guards remain frozen as a historical compatibility surface. At activation,
+   protocol 1.3 defined the parallel full-frame message, entry, tree, event, response, replay, and snapshot
    DTOs. Their guards accept content wrappers
    only with a complete trusted content-reference context containing the exact epoch, attachment
    budget, and generic-content budget. Server projection, replay, and Runtime code use
@@ -175,7 +175,7 @@ atomicity protocol to every hold, download, materialization, and recovery path.
     and reruns the slot guard. A 404, 410, decode failure, or guard failure reports one failure for
     the exact Session and generation and requests a cursorless authoritative resync. Stale identity
     or uncommitted-baseline failures do not affect the current channel.
-14. Protocol version 1.3 is the active Gateway contract. Both directions require
+14. At this decision's activation, protocol version 1.3 was the Gateway contract. Both directions require
     `payload.epoch_attachment_refs` and `payload.epoch_content_refs`, and `server_hello` carries the
     complete `payloadBudget` and `contentRefBudget`. A missing capability, incomplete budget,
     incompatible frame ceiling, or non-1.3 peer terminates the connection before Session subscription.
@@ -220,7 +220,7 @@ Materialization moves some work from WebSocket parsing to authenticated GET and 
 JSON consumers may temporarily hold encoded text and the parsed value within the 48 MiB ceiling.
 Components that do not need the value can retain the small reference instead of parsing it.
 
-Protocol version 1.3 is an atomic compatibility boundary. Independently updated version 1.2 clients
+Protocol version 1.3 was an atomic compatibility boundary. Independently updated version 1.2 clients
 and servers cannot guess the wrapper, budget, or materialization rules and fail hello rather than
 receive a mixed inline/reference stream.
 
@@ -251,7 +251,7 @@ receive a mixed inline/reference stream.
 
 ## Verification
 
-- Protocol tests cover version 1.2 compatibility, active version 1.3 required capability negotiation,
+- Protocol tests cover version 1.2 compatibility, the then-active version 1.3 required capability negotiation,
   parallel full-frame guards, exact canonical budgets, strict wrappers,
   epoch fences, root-only provenance, and closed-slot logical-byte accounting.
 - Store tests prove that text and JSON wrappers for the same UTF-8 bytes use one namespaced blob,
@@ -266,7 +266,7 @@ receive a mixed inline/reference stream.
   ceilings, startup history, event ordering, active-turn logical and serialized projection budgets,
   compaction, replay, snapshots, fork, clone, rekey, transition rollback, mixed crash retention, and
   cleanup-failure replacement fences.
-- Browser tests cover trusted version 1.3 context, lazy tool materialization, ordered Extension editor
+- Browser tests cover the activation-era trusted version 1.3 context, lazy tool materialization, ordered Extension editor
   and widget materialization, exact field guards, authenticated GET, one-shot resync, stale identity,
   and recovery without an inline fallback.
 - The activation gate includes a faithful large tool result, replay and snapshot recovery, a large

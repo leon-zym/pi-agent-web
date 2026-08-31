@@ -119,6 +119,9 @@ describe("epoch-aware Session resync protocol", () => {
 				serverEpoch,
 				sessionHandle: "session-a",
 				generation: 2,
+				leaseRevision: 0,
+				controlState: "free",
+				transition: "baseline",
 				isController: false,
 			},
 			{
@@ -221,6 +224,30 @@ describe("epoch-aware Session resync protocol", () => {
 		expect(isInlineSessionWsServerMessage({ ...error, code: undefined })).toBe(false);
 		expect(isInlineSessionWsServerMessage({ ...error, retryable: "yes" })).toBe(false);
 		expect(isInlineSessionWsServerMessage({ ...error, code: "" })).toBe(false);
+		expect(isInlineSessionWsServerMessage({ ...error, operation: "takeover" })).toBe(true);
+	});
+
+	it("requires a revisioned recipient-specific lease view", () => {
+		const heldObserver = {
+			type: "lease_status",
+			serverEpoch,
+			sessionHandle: "session-a",
+			generation: 2,
+			leaseRevision: 4,
+			controlState: "held",
+			transition: "takeover",
+			isController: false,
+		} as const;
+		expect(isInlineSessionWsServerMessage(heldObserver)).toBe(true);
+		expect(
+			isInlineSessionWsServerMessage({ ...heldObserver, isController: true, fencingToken: "fence-a" }),
+		).toBe(true);
+		expect(isInlineSessionWsServerMessage({ ...heldObserver, fencingToken: "fence-a" })).toBe(false);
+		expect(isInlineSessionWsServerMessage({ ...heldObserver, leaseRevision: -1 })).toBe(false);
+		expect(
+			isInlineSessionWsServerMessage({ ...heldObserver, controlState: "free", isController: true }),
+		).toBe(false);
+		expect(isInlineSessionWsServerMessage({ ...heldObserver, transition: "unknown" })).toBe(false);
 	});
 
 	it("strictly rejects unknown runtime and envelope fields", () => {

@@ -40,6 +40,7 @@ import {
 	type ReplayResult,
 	type SessionCommandResult,
 	type SessionLeaseSnapshot,
+	type SessionLeaseTransition,
 	type SessionRuntimeSnapshot,
 	type SessionSupervisorMessage,
 } from "./session-runtime-types.js";
@@ -134,9 +135,26 @@ type SupervisorRuntimeOptions<M extends SessionRuntimeProductMode> = Omit<
 	"productAdapter" | "payloadCustody"
 >;
 
-interface Lease {
+interface LeaseOwner {
 	connectionId: string;
 	fencingToken: string;
+}
+
+interface LeaseState {
+	generation: number;
+	revision: number;
+	owner?: LeaseOwner;
+	terminal: boolean;
+}
+
+interface LeaseClaimResult {
+	lease: SessionLeaseSnapshot;
+	transition?: SessionLeaseTransition;
+}
+
+interface LeaseReleaseResult {
+	released: boolean;
+	transition?: SessionLeaseTransition;
 }
 
 interface Alias {
@@ -176,7 +194,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 	private readonly runtimeFactory: (options: SupervisorRuntimeOptions<M>) => SessionRuntimeCore<M>;
 	private runtimes = new Map<string, SessionRuntimeCore<M>>();
 	private activationPromises = new Map<string, Promise<SessionRuntimeCore<M>>>();
-	private leases = new Map<string, Lease>();
+	private leases = new Map<string, LeaseState>();
 	private aliases = new Map<string, Alias>();
 	private crashTimes = new Map<string, number[]>();
 	private restartTimers = new Map<string, NodeJS.Timeout>();
@@ -186,6 +204,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 	private workspaceCreations = new Map<string, number>();
 	private reaper: NodeJS.Timeout;
 	private poolTail: Promise<void> = Promise.resolve();
+	private leaseTail: Promise<void> = Promise.resolve();
 	private hotInventoryRevision = 0;
 	private hotInventoryEntries: HotRuntimeInventoryEntryDto[] = [];
 	private hotInventorySignature = "[]";
@@ -304,6 +323,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 			});
 			throw error;
 		}
+		let leaseTransition: SessionLeaseTransition | undefined;
 		try {
 			await this.withPoolLock(async () => {
 				this.assertOpen();
@@ -314,7 +334,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 				if (collision && collision !== runtime) {
 					throw new RpcError("new_session", "canonical_session_already_active");
 				}
-				this.rekeyRuntime(temporaryHandle, runtime, true);
+				leaseTransition = await this.rekeyRuntime(temporaryHandle, runtime, true);
 				this.commitHotRuntimeInventoryIfChanged();
 				this.safeBroadcast({ type: "session_directory_changed", workspaceId: request.workspaceId });
 			});
@@ -326,6 +346,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 			});
 			throw error;
 		}
+		if (leaseTransition) this.safeBroadcast({ type: "lease_transition", transition: leaseTransition });
 		return runtime.snapshot();
 	}
 
@@ -390,6 +411,10 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 	}
 
 	async claim(sessionHandle: string, connectionId: string): Promise<SessionLeaseSnapshot> {
+		return (await this.claimWithTransition(sessionHandle, connectionId)).lease;
+	}
+
+	async claimWithTransition(sessionHandle: string, connectionId: string): Promise<LeaseClaimResult> {
 		const handle = this.resolveAlias(sessionHandle);
 		const tracked = this.runtimes.get(handle);
 		const runtime =
@@ -398,73 +423,155 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 				: await this.ensureRuntime(handle);
 		return this.withPoolLock(async () => {
 			this.assertOpen();
-			const handle = runtime.sessionHandle;
-			if (this.deletionReservations.has(handle)) throw new RpcError("claim", "session_deleting");
-			if (this.runtimes.get(handle) !== runtime) {
+			const canonicalHandle = runtime.sessionHandle;
+			if (this.deletionReservations.has(canonicalHandle)) throw new RpcError("claim", "session_deleting");
+			if (this.runtimes.get(canonicalHandle) !== runtime) {
 				throw new RpcError("claim", "session_runtime_not_tracked");
 			}
-			const existing = this.leases.get(handle);
-			if (existing && existing.connectionId !== connectionId) {
+			return this.withLeaseActor(() => {
+				const state = this.leaseStateFor(canonicalHandle, runtime.generation);
+				if (state.terminal) throw new RpcError("claim", "session_lease_revision_exhausted");
+				if (state.owner && state.owner.connectionId !== connectionId) {
+					return { lease: this.leaseSnapshot(canonicalHandle, runtime.generation, state, connectionId) };
+				}
+				if (state.owner) {
+					return { lease: this.leaseSnapshot(canonicalHandle, runtime.generation, state, connectionId) };
+				}
+				const transition = this.commitLeaseTransition(canonicalHandle, runtime.generation, state, "claim", {
+					connectionId,
+					fencingToken: randomUUID(),
+				});
 				return {
-					serverEpoch: this.serverEpoch,
-					sessionHandle: handle,
-					generation: runtime.generation,
-					isController: false,
+					lease: this.leaseSnapshot(
+						canonicalHandle,
+						runtime.generation,
+						this.leases.get(canonicalHandle),
+						connectionId,
+						"claim",
+					),
+					transition,
 				};
-			}
-			const lease = existing ?? { connectionId, fencingToken: randomUUID() };
-			this.leases.set(handle, lease);
-			return {
-				serverEpoch: this.serverEpoch,
-				sessionHandle: handle,
-				generation: runtime.generation,
-				isController: true,
-				fencingToken: lease.fencingToken,
-			};
+			});
 		});
 	}
 
-	release(sessionHandle: string, connectionId: string): boolean {
-		const handle = this.resolveAlias(sessionHandle);
-		const lease = this.leases.get(handle);
-		if (!lease || lease.connectionId !== connectionId) return false;
-		this.leases.delete(handle);
-		return true;
+	async release(sessionHandle: string, connectionId: string): Promise<boolean> {
+		return (await this.releaseWithTransition(sessionHandle, connectionId)).released;
 	}
 
-	releaseExact(sessionHandle: string, connectionId: string, fencingToken: string): boolean {
+	async releaseWithTransition(sessionHandle: string, connectionId: string): Promise<LeaseReleaseResult> {
 		const handle = this.resolveAlias(sessionHandle);
-		const lease = this.leases.get(handle);
-		if (!lease || lease.connectionId !== connectionId || lease.fencingToken !== fencingToken) {
-			return false;
-		}
-		this.leases.delete(handle);
-		return true;
+		return this.withLeaseActor(() => {
+			const runtime = this.runtimes.get(handle);
+			const generation = runtime?.generation ?? this.leases.get(handle)?.generation;
+			if (generation === undefined) return { released: false };
+			const state = this.leaseStateFor(handle, generation);
+			if (state.terminal || !state.owner || state.owner.connectionId !== connectionId) {
+				return { released: false };
+			}
+			const transition = this.commitLeaseTransition(handle, generation, state, "release");
+			return { released: true, transition };
+		});
 	}
 
-	releaseConnection(connectionId: string): string[] {
-		const released: string[] = [];
-		for (const [handle, lease] of this.leases) {
-			if (lease.connectionId !== connectionId) continue;
-			this.leases.delete(handle);
-			released.push(handle);
-		}
-		return released;
+	async releaseExact(sessionHandle: string, connectionId: string, fencingToken: string): Promise<boolean> {
+		return (await this.releaseExactWithTransition(sessionHandle, connectionId, fencingToken)).released;
+	}
+
+	async releaseExactWithTransition(
+		sessionHandle: string,
+		connectionId: string,
+		fencingToken: string,
+		releaseTransition: "release" | "disconnect" = "release",
+	): Promise<LeaseReleaseResult> {
+		const handle = this.resolveAlias(sessionHandle);
+		return this.withLeaseActor(() => {
+			const runtime = this.runtimes.get(handle);
+			const generation = runtime?.generation ?? this.leases.get(handle)?.generation;
+			if (generation === undefined) return { released: false };
+			const state = this.leaseStateFor(handle, generation);
+			if (
+				state.terminal ||
+				!state.owner ||
+				state.owner.connectionId !== connectionId ||
+				state.owner.fencingToken !== fencingToken
+			) {
+				return { released: false };
+			}
+			const transition = this.commitLeaseTransition(handle, generation, state, releaseTransition);
+			return { released: true, transition };
+		});
+	}
+
+	async releaseConnection(connectionId: string): Promise<string[]> {
+		return (await this.releaseConnectionWithTransitions(connectionId)).released;
+	}
+
+	async releaseConnectionWithTransitions(
+		connectionId: string,
+	): Promise<{ released: string[]; transitions: SessionLeaseTransition[] }> {
+		return this.withLeaseActor(() => {
+			const released: string[] = [];
+			const transitions: SessionLeaseTransition[] = [];
+			for (const [handle, state] of this.leases) {
+				if (state.terminal || state.owner?.connectionId !== connectionId) continue;
+				transitions.push(this.commitLeaseTransition(handle, state.generation, state, "disconnect"));
+				released.push(handle);
+			}
+			return { released, transitions };
+		});
+	}
+
+	async takeover(
+		sessionHandle: string,
+		expectedGeneration: number,
+		expectedLeaseRevision: number,
+		connectionId: string,
+	): Promise<SessionLeaseTransition> {
+		return this.withPoolLock(async () => {
+			this.assertOpen();
+			if (this.aliases.has(sessionHandle) || this.resolveAlias(sessionHandle) !== sessionHandle) {
+				throw new RpcError("takeover", "session_handle_stale");
+			}
+			const runtime = this.runtimes.get(sessionHandle);
+			if (!runtime || runtime.sessionHandle !== sessionHandle || runtime.state === "dormant") {
+				throw new RpcError("takeover", "session_takeover_not_available");
+			}
+			if (this.deletionReservations.has(sessionHandle)) throw new RpcError("takeover", "session_deleting");
+			if (
+				runtime.transitioning ||
+				this.workspaceHasPendingIdentity(runtime.workspaceId) ||
+				!runtime.recoverable ||
+				!runtime.sessionFile ||
+				sessionHandle.startsWith("pending_")
+			) {
+				throw new RpcError("takeover", "session_identity_uncertain");
+			}
+			this.assertGeneration(runtime, "takeover", expectedGeneration);
+			return this.withLeaseActor(() => {
+				const state = this.leaseStateFor(sessionHandle, runtime.generation);
+				if (state.terminal) throw new RpcError("takeover", "session_takeover_not_available");
+				if (state.revision !== expectedLeaseRevision) {
+					throw new RpcError("takeover", "session_lease_revision_stale");
+				}
+				if (!state.owner || state.owner.connectionId === connectionId) {
+					throw new RpcError("takeover", "session_takeover_not_available");
+				}
+				return this.commitLeaseTransition(sessionHandle, runtime.generation, state, "takeover", {
+					connectionId,
+					fencingToken: randomUUID(),
+				});
+			});
+		});
 	}
 
 	leaseFor(sessionHandle: string, connectionId: string): SessionLeaseSnapshot {
 		const handle = this.resolveAlias(sessionHandle);
-		const lease = this.leases.get(handle);
-		const generation = this.runtimes.get(handle)?.generation ?? 0;
-		return lease?.connectionId === connectionId
-			? {
-					serverEpoch: this.serverEpoch,
-					sessionHandle: handle,
-					generation,
-					isController: true,
-					fencingToken: lease.fencingToken,
-				}
-			: { serverEpoch: this.serverEpoch, sessionHandle: handle, generation, isController: false };
+		const runtime = this.runtimes.get(handle);
+		const state = this.leases.get(handle);
+		const generation = runtime?.generation ?? state?.generation ?? 0;
+		const activeState = state?.generation === generation ? state : undefined;
+		return this.leaseSnapshot(handle, generation, activeState, connectionId);
 	}
 
 	async sendCommand(
@@ -562,7 +669,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 				throw new RpcError("restart", "session_restart_requires_inactive_runtime");
 			}
 			if (context) {
-				const lease = this.leases.get(handle);
+				const lease = this.leaseOwnerFor(handle, existing.generation);
 				if (
 					!lease ||
 					lease.connectionId !== context.connectionId ||
@@ -595,6 +702,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 		try {
 			if (!starting) throw new RpcError("restart", "session_restart_not_started");
 			await starting;
+			await this.withLeaseActor(() => this.reconcileLeaseGeneration(runtime));
 			return runtime.snapshot();
 		} finally {
 			release?.();
@@ -691,7 +799,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 				throw new RpcError("abandon", "session_control_required");
 			}
 			this.assertGeneration(runtime, "abandon", context.expectedGeneration);
-			const lease = this.leases.get(handle);
+			const lease = this.leaseOwnerFor(handle, runtime.generation);
 			if (!lease || lease.fencingToken !== context.fencingToken) {
 				throw new RpcError("abandon", "session_read_only");
 			}
@@ -714,7 +822,9 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 				}
 				this.clearRestart(handle);
 				this.runtimes.delete(handle);
-				this.leases.delete(handle);
+				await this.withLeaseActor(() => {
+					this.leases.delete(handle);
+				});
 				this.crashTimes.delete(handle);
 				for (const [alias, entry] of this.aliases) {
 					if (alias === handle || entry.next === handle) this.aliases.delete(alias);
@@ -751,7 +861,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 				throw new RpcError("delete", "session_control_required");
 			}
 			this.assertGeneration(runtime, "delete", context.expectedGeneration);
-			const lease = this.leases.get(handle);
+			const lease = this.leaseOwnerFor(handle, runtime.generation);
 			if (!lease || lease.fencingToken !== context.fencingToken) {
 				throw new RpcError("delete", "session_read_only");
 			}
@@ -779,7 +889,9 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 				if (!succeeded) return;
 				this.clearRestart(handle);
 				this.runtimes.delete(handle);
-				this.leases.delete(handle);
+				await this.withLeaseActor(() => {
+					this.leases.delete(handle);
+				});
 				for (const [alias, entry] of this.aliases) {
 					if (alias === handle || entry.next === handle) this.aliases.delete(alias);
 				}
@@ -821,7 +933,9 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 				if (!succeeded) return;
 				this.clearRestart(handle);
 				this.runtimes.delete(handle);
-				this.leases.delete(handle);
+				await this.withLeaseActor(() => {
+					this.leases.delete(handle);
+				});
 				for (const [alias, entry] of this.aliases) {
 					if (alias === handle || entry.next === handle) this.aliases.delete(alias);
 				}
@@ -845,7 +959,9 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 		await this.withPoolLock(async () => {});
 		await Promise.all([...new Set(this.runtimes.values())].map((runtime) => runtime.stop()));
 		await this.withPoolLock(async () => {
-			this.leases.clear();
+			await this.withLeaseActor(() => {
+				this.leases.clear();
+			});
 			this.aliases.clear();
 			this.deletionReservations.clear();
 			this.workspaceTransitions.clear();
@@ -953,6 +1069,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 		});
 		try {
 			if (!(runtime.state === "crashed" && !runtime.recoverable)) await runtime.start();
+			await this.withLeaseActor(() => this.reconcileLeaseGeneration(runtime));
 			return { runtime, release: release! };
 		} catch (error) {
 			release?.();
@@ -984,6 +1101,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 		});
 		try {
 			await runtime.start();
+			await this.withLeaseActor(() => this.reconcileLeaseGeneration(runtime));
 		} finally {
 			release?.();
 		}
@@ -1027,57 +1145,62 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 			SessionRuntimeProductExtensionRequest<M>
 		>,
 	): Promise<void> {
-		await this.withPoolLock(async () => {
-			this.assertOpen();
-			const { previousSessionHandle, nextTarget } = transition;
-			if (!this.workspaceTransitions.has(runtime.workspaceId)) {
-				throw new RpcError("session_transition", "workspace_transition_reservation_lost");
-			}
-			if (this.runtimes.get(previousSessionHandle) !== runtime) {
-				throw new RpcError("session_transition", "parent_runtime_ownership_changed");
-			}
-			if (
-				this.deletionReservations.has(previousSessionHandle) ||
-				this.deletionReservations.has(nextTarget.sessionHandle)
-			) {
-				throw new RpcError("session_transition", "session_deleting");
-			}
-			const collision = this.runtimes.get(nextTarget.sessionHandle);
-			if (collision && collision !== runtime) {
-				throw new RpcError("session_transition", "canonical_session_already_active");
-			}
+		let leaseTransition: SessionLeaseTransition | undefined;
+		try {
+			await this.withPoolLock(async () => {
+				this.assertOpen();
+				const { previousSessionHandle, nextTarget } = transition;
+				if (!this.workspaceTransitions.has(runtime.workspaceId)) {
+					throw new RpcError("session_transition", "workspace_transition_reservation_lost");
+				}
+				if (this.runtimes.get(previousSessionHandle) !== runtime) {
+					throw new RpcError("session_transition", "parent_runtime_ownership_changed");
+				}
+				if (
+					this.deletionReservations.has(previousSessionHandle) ||
+					this.deletionReservations.has(nextTarget.sessionHandle)
+				) {
+					throw new RpcError("session_transition", "session_deleting");
+				}
+				const collision = this.runtimes.get(nextTarget.sessionHandle);
+				if (collision && collision !== runtime) {
+					throw new RpcError("session_transition", "canonical_session_already_active");
+				}
 
-			transition.apply();
-			this.rekeyRuntime(previousSessionHandle, runtime, false);
-			const committedRuntime = runtime.snapshot();
-			let stagedMessages: SessionSupervisorMessage<
-				SessionRuntimeProductEvent<M>,
-				SessionRuntimeProductExtensionRequest<M>
-			>[];
-			try {
-				stagedMessages = transition.commitStaged();
-			} catch (error) {
+				transition.apply();
+				leaseTransition = await this.rekeyRuntime(previousSessionHandle, runtime, false);
+				const committedRuntime = runtime.snapshot();
+				let stagedMessages: SessionSupervisorMessage<
+					SessionRuntimeProductEvent<M>,
+					SessionRuntimeProductExtensionRequest<M>
+				>[];
+				try {
+					stagedMessages = transition.commitStaged();
+				} catch (error) {
+					this.safeBroadcast({
+						type: "session_rekeyed",
+						serverEpoch: this.serverEpoch,
+						previousSessionHandle,
+						runtime: committedRuntime,
+					});
+					this.commitHotRuntimeInventoryIfChanged();
+					this.safeBroadcast({ type: "runtime_state", runtime: runtime.snapshot() });
+					this.safeBroadcast({ type: "session_directory_changed", workspaceId: runtime.workspaceId });
+					throw error;
+				}
 				this.safeBroadcast({
 					type: "session_rekeyed",
 					serverEpoch: this.serverEpoch,
 					previousSessionHandle,
-					runtime: committedRuntime,
+					runtime: runtime.snapshot(),
 				});
 				this.commitHotRuntimeInventoryIfChanged();
-				this.safeBroadcast({ type: "runtime_state", runtime: runtime.snapshot() });
+				for (const message of stagedMessages) this.safeBroadcast(message);
 				this.safeBroadcast({ type: "session_directory_changed", workspaceId: runtime.workspaceId });
-				throw error;
-			}
-			this.safeBroadcast({
-				type: "session_rekeyed",
-				serverEpoch: this.serverEpoch,
-				previousSessionHandle,
-				runtime: runtime.snapshot(),
 			});
-			this.commitHotRuntimeInventoryIfChanged();
-			for (const message of stagedMessages) this.safeBroadcast(message);
-			this.safeBroadcast({ type: "session_directory_changed", workspaceId: runtime.workspaceId });
-		});
+		} finally {
+			if (leaseTransition) this.safeBroadcast({ type: "lease_transition", transition: leaseTransition });
+		}
 	}
 
 	private async reserveWorkspaceTransition(workspaceId: string): Promise<() => Promise<void>> {
@@ -1144,7 +1267,117 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 		);
 	}
 
-	private rekeyRuntime(previousHandle: string, runtime: SessionRuntimeCore<M>, keepAlias: boolean): void {
+	private leaseStateFor(sessionHandle: string, generation: number): LeaseState {
+		const existing = this.leases.get(sessionHandle);
+		if (existing && existing.generation === generation) return existing;
+		// A generation is an identity fence, not a continuation of the previous
+		// process. Never carry an owner or its fence across this boundary: a
+		// restarted, forked, or cloned runtime starts free at revision zero.
+		const state: LeaseState = {
+			generation,
+			revision: 0,
+			terminal: false,
+		};
+		this.leases.set(sessionHandle, state);
+		return state;
+	}
+
+	private reconcileLeaseGeneration(runtime: SessionRuntimeCore<M>): void {
+		this.leaseStateFor(runtime.sessionHandle, runtime.generation);
+	}
+
+	private leaseOwnerFor(sessionHandle: string, generation?: number): LeaseOwner | undefined {
+		const state = this.leases.get(sessionHandle);
+		if (!state || state.terminal || (generation !== undefined && state.generation !== generation))
+			return undefined;
+		return state.owner;
+	}
+
+	private hasLease(sessionHandle: string, generation?: number): boolean {
+		return this.leaseOwnerFor(sessionHandle, generation) !== undefined;
+	}
+
+	private leaseSnapshot(
+		sessionHandle: string,
+		generation: number,
+		state: LeaseState | undefined,
+		connectionId: string,
+		transition: SessionLeaseSnapshot["transition"] = "baseline",
+	): SessionLeaseSnapshot {
+		const owner = state?.terminal ? undefined : state?.owner;
+		const isController = owner?.connectionId === connectionId;
+		return {
+			serverEpoch: this.serverEpoch,
+			sessionHandle,
+			generation,
+			leaseRevision: state?.generation === generation ? state.revision : 0,
+			controlState: owner ? "held" : "free",
+			transition,
+			isController,
+			...(isController ? { fencingToken: owner.fencingToken } : {}),
+		};
+	}
+
+	private commitLeaseTransition(
+		sessionHandle: string,
+		generation: number,
+		state: LeaseState,
+		transition: SessionLeaseTransition["transition"],
+		owner?: LeaseOwner,
+	): SessionLeaseTransition {
+		if (state.terminal || state.generation !== generation) {
+			throw new RpcError(transition, "session_lease_revision_exhausted");
+		}
+		if (state.revision >= Number.MAX_SAFE_INTEGER) {
+			this.leases.set(sessionHandle, {
+				generation,
+				revision: state.revision,
+				terminal: true,
+			});
+			throw new RpcError(transition, "session_lease_revision_exhausted");
+		}
+		const next: LeaseState = {
+			generation,
+			revision: state.revision + 1,
+			...(owner ? { owner } : {}),
+			terminal: false,
+		};
+		// Replacing the map entry is the ownership CAS linearization point. No
+		// observer can see the old owner after this synchronous actor operation.
+		this.leases.set(sessionHandle, next);
+		return Object.freeze({
+			serverEpoch: this.serverEpoch,
+			sessionHandle,
+			generation,
+			leaseRevision: next.revision,
+			controlState: owner ? "held" : "free",
+			transition,
+			...(owner ? { ownerConnectionId: owner.connectionId, fencingToken: owner.fencingToken } : {}),
+		});
+	}
+
+	private leaseTransitionForState(
+		sessionHandle: string,
+		state: LeaseState,
+		transition: "rekey",
+	): SessionLeaseTransition {
+		const owner = state.terminal ? undefined : state.owner;
+		return Object.freeze({
+			serverEpoch: this.serverEpoch,
+			sessionHandle,
+			generation: state.generation,
+			leaseRevision: state.revision,
+			controlState: owner ? "held" : "free",
+			transition,
+			...(owner ? { ownerConnectionId: owner.connectionId, fencingToken: owner.fencingToken } : {}),
+		});
+	}
+
+	private async rekeyRuntime(
+		previousHandle: string,
+		runtime: SessionRuntimeCore<M>,
+		keepAlias: boolean,
+	): Promise<SessionLeaseTransition> {
 		const nextHandle = runtime.sessionHandle;
 		const collision = this.runtimes.get(nextHandle);
 		if (collision && collision !== runtime) {
@@ -1153,16 +1386,32 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 		this.runtimes.delete(previousHandle);
 		this.runtimes.set(nextHandle, runtime);
 		if (keepAlias) this.aliases.set(previousHandle, { next: nextHandle, expiresAt: Date.now() + 5 * 60_000 });
-		const lease = this.leases.get(previousHandle);
-		if (lease) {
+		const leaseTransition = await this.withLeaseActor(() => {
+			const previous = this.leases.get(previousHandle);
 			this.leases.delete(previousHandle);
-			this.leases.set(nextHandle, lease);
-		}
+			this.leases.delete(nextHandle);
+			if (!previous || previous.generation !== runtime.generation) {
+				// The child/restarted runtime has a distinct generation. Its lease
+				// domain begins ownerless, so a prior controller cannot reuse either
+				// a connection identity or a fencing token on the new process.
+				const next: LeaseState = {
+					generation: runtime.generation,
+					revision: 0,
+					terminal: false,
+				};
+				this.leases.set(nextHandle, next);
+				return this.leaseTransitionForState(nextHandle, next, "rekey");
+			}
+			this.leases.set(nextHandle, previous);
+			if (!previous.owner) return this.leaseTransitionForState(nextHandle, previous, "rekey");
+			return this.commitLeaseTransition(nextHandle, runtime.generation, previous, "rekey", previous.owner);
+		});
 		const crashes = this.crashTimes.get(previousHandle);
 		if (crashes) {
 			this.crashTimes.delete(previousHandle);
 			this.crashTimes.set(nextHandle, crashes);
 		}
+		return leaseTransition;
 	}
 
 	private resolveAlias(sessionHandle: string): string {
@@ -1188,7 +1437,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 	}
 
 	private assertLease(runtime: SessionRuntimeCore<M>, command: string, context: SessionCommandContext): void {
-		const lease = this.leases.get(runtime.sessionHandle);
+		const lease = this.leaseOwnerFor(runtime.sessionHandle, runtime.generation);
 		if (
 			!lease ||
 			lease.connectionId !== context.connectionId ||
@@ -1285,7 +1534,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 				(runtime) =>
 					runtime.lastActivityAt <= transientCutoff &&
 					runtime.canAbandon &&
-					!this.leases.has(runtime.sessionHandle) &&
+					!this.hasLease(runtime.sessionHandle, runtime.generation) &&
 					!this.deletionReservations.has(runtime.sessionHandle) &&
 					!this.workspaceHasPendingIdentity(runtime.workspaceId),
 			);
@@ -1293,7 +1542,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 				const handle = runtime.sessionHandle;
 				if (
 					this.runtimes.get(handle) !== runtime ||
-					this.leases.has(handle) ||
+					this.hasLease(handle, runtime.generation) ||
 					this.deletionReservations.has(handle) ||
 					this.workspaceHasPendingIdentity(runtime.workspaceId) ||
 					!runtime.canAbandon ||
@@ -1313,7 +1562,9 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 					}
 					this.clearRestart(handle);
 					this.runtimes.delete(handle);
-					this.leases.delete(handle);
+					await this.withLeaseActor(() => {
+						this.leases.delete(handle);
+					});
 					this.crashTimes.delete(handle);
 					for (const [alias, entry] of this.aliases) {
 						if (alias === handle || entry.next === handle) this.aliases.delete(alias);
@@ -1340,7 +1591,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 	}
 
 	private isEvictable(runtime: SessionRuntimeCore<M>): boolean {
-		return runtime.canEvict && !this.leases.has(runtime.sessionHandle);
+		return runtime.canEvict && !this.hasLease(runtime.sessionHandle, runtime.generation);
 	}
 
 	private matchesHotRuntimeIdentity(
@@ -1416,6 +1667,25 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 		const previous = this.poolTail;
 		let release: () => void;
 		this.poolTail = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		await previous;
+		try {
+			return await operation();
+		} finally {
+			release!();
+		}
+	}
+
+	/**
+	 * The sole linearization domain for Session lease ownership. Pool callers
+	 * always enter this actor after the pool lock; actor work never awaits the
+	 * pool lock, so the ordering cannot deadlock.
+	 */
+	private async withLeaseActor<T>(operation: () => T | Promise<T>): Promise<T> {
+		const previous = this.leaseTail;
+		let release: () => void;
+		this.leaseTail = new Promise<void>((resolve) => {
 			release = resolve;
 		});
 		await previous;

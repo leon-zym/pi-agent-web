@@ -6,6 +6,7 @@ import path from "node:path";
 import { deflateSync } from "node:zlib";
 import {
 	GATEWAY_CONTENT_REF_CAPABILITY,
+	GATEWAY_FENCED_TAKEOVER_CAPABILITY,
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 	type GatewayClientHelloDto,
@@ -172,7 +173,7 @@ async function openClient(
 	});
 	client.sendRaw({
 		type: "client_hello",
-		protocol: { major: 1, minor: 3 },
+		protocol: { major: 1, minor: 4 },
 		clientBuild: "payload-reference-gateway-integration",
 		capabilities: [
 			"rpc.commands",
@@ -180,6 +181,7 @@ async function openClient(
 			"rpc.extension_ui",
 			"session.multiplex",
 			GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
+			GATEWAY_FENCED_TAKEOVER_CAPABILITY,
 			GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 			GATEWAY_CONTENT_REF_CAPABILITY,
 		],
@@ -268,7 +270,7 @@ describe("payload reference production Gateway vertical integration", () => {
 
 		// Activation is intentionally required: no inline compatibility fallback may reach the Browser.
 		expect(hello).toMatchObject({
-			protocol: { major: 1, minor: 3 },
+			protocol: { major: 1, minor: 4 },
 			serverEpoch: harness.handle.serverEpoch,
 			capabilities: expect.arrayContaining([GATEWAY_PAYLOAD_BUDGET_CAPABILITY]),
 			payloadBudget: SESSION_PAYLOAD_BUDGET,

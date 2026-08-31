@@ -1,4 +1,4 @@
-/** Protocol 1.3 content-reference product DTOs. */
+/** Protocol 1.4 content-reference product DTOs. */
 
 import type {
 	ExtensionErrorEventDto,
