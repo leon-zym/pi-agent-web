@@ -482,6 +482,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 		sessionHandle: string,
 		connectionId: string,
 		fencingToken: string,
+		releaseTransition: "release" | "disconnect" = "release",
 	): Promise<LeaseReleaseResult> {
 		const handle = this.resolveAlias(sessionHandle);
 		return this.withLeaseActor(() => {
@@ -497,7 +498,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 			) {
 				return { released: false };
 			}
-			const transition = this.commitLeaseTransition(handle, generation, state, "release");
+			const transition = this.commitLeaseTransition(handle, generation, state, releaseTransition);
 			return { released: true, transition };
 		});
 	}

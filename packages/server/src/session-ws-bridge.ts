@@ -1679,6 +1679,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 						canonicalHandle,
 						connection.connectionId,
 						lease.fencingToken,
+						connectionExpired ? "disconnect" : "release",
 					);
 					if (release.transition) this.broadcastLeaseTransition(release.transition);
 				}
@@ -1736,17 +1737,15 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				message.expectedLeaseRevision,
 				connection.connectionId,
 			);
-			if (
-				connection.closed ||
-				connection.epoch !== lifecycleEpoch ||
-				!this.connections.has(connection) ||
-				!this.isSubscribed(connection, transition.sessionHandle)
-			) {
+			const connectionExpired =
+				connection.closed || connection.epoch !== lifecycleEpoch || !this.connections.has(connection);
+			if (connectionExpired || !this.isSubscribed(connection, transition.sessionHandle)) {
 				if (transition.fencingToken) {
 					const release = await this.supervisor.releaseExactWithTransition(
 						transition.sessionHandle,
 						connection.connectionId,
 						transition.fencingToken,
+						connectionExpired ? "disconnect" : "release",
 					);
 					if (release.transition) this.broadcastLeaseTransition(release.transition);
 				}
