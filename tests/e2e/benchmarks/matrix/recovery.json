@@ -1,0 +1,39 @@
+{
+	"schemaVersion": 2,
+	"id": "recovery",
+	"requiredCapabilities": ["browser", "websocket"],
+	"tiers": {
+		"representative": {
+			"scenarios": [
+				{
+					"id": "recovery-disconnect-gap",
+					"kind": "recovery-disconnect",
+					"warmups": 1,
+					"samples": 10
+				},
+				{
+					"id": "recovery-pi-crash",
+					"kind": "recovery-crash",
+					"warmups": 1,
+					"samples": 10
+				}
+			]
+		},
+		"stress": {
+			"scenarios": [
+				{
+					"id": "recovery-disconnect-gap",
+					"kind": "recovery-disconnect",
+					"warmups": 2,
+					"samples": 100
+				},
+				{
+					"id": "recovery-pi-crash",
+					"kind": "recovery-crash",
+					"warmups": 2,
+					"samples": 100
+				}
+			]
+		}
+	}
+}

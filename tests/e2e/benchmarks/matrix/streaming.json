@@ -1,0 +1,69 @@
+{
+	"schemaVersion": 2,
+	"id": "streaming",
+	"requiredCapabilities": ["browser", "cdp", "longtask", "precise-memory", "websocket"],
+	"tiers": {
+		"representative": {
+			"scenarios": [
+				{
+					"id": "stream-120k",
+					"kind": "streaming",
+					"targetBytes": 122880,
+					"chunkBytes": 256,
+					"chunkDelayMs": 1,
+					"warmups": 1,
+					"samples": 3
+				},
+				{
+					"id": "stream-1m",
+					"kind": "streaming",
+					"targetBytes": 1048576,
+					"chunkBytes": 4096,
+					"chunkDelayMs": 4,
+					"warmups": 1,
+					"samples": 3
+				}
+			]
+		},
+		"stress": {
+			"scenarios": [
+				{
+					"id": "stream-10k",
+					"kind": "streaming",
+					"targetBytes": 10240,
+					"chunkBytes": 128,
+					"chunkDelayMs": 1,
+					"warmups": 2,
+					"samples": 7
+				},
+				{
+					"id": "stream-64k",
+					"kind": "streaming",
+					"targetBytes": 65536,
+					"chunkBytes": 256,
+					"chunkDelayMs": 1,
+					"warmups": 2,
+					"samples": 7
+				},
+				{
+					"id": "stream-120k",
+					"kind": "streaming",
+					"targetBytes": 122880,
+					"chunkBytes": 256,
+					"chunkDelayMs": 1,
+					"warmups": 2,
+					"samples": 7
+				},
+				{
+					"id": "stream-1m",
+					"kind": "streaming",
+					"targetBytes": 1048576,
+					"chunkBytes": 512,
+					"chunkDelayMs": 1,
+					"warmups": 2,
+					"samples": 7
+				}
+			]
+		}
+	}
+}

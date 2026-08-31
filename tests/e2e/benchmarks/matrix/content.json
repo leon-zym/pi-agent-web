@@ -1,0 +1,29 @@
+{
+	"schemaVersion": 2,
+	"id": "content",
+	"requiredCapabilities": ["browser", "cdp", "precise-memory", "websocket"],
+	"tiers": {
+		"representative": {
+			"scenarios": [
+				{
+					"id": "content-roundtrip",
+					"kind": "content-roundtrip",
+					"inputBytes": 1120000,
+					"warmups": 1,
+					"samples": 3
+				}
+			]
+		},
+		"stress": {
+			"scenarios": [
+				{
+					"id": "content-roundtrip",
+					"kind": "content-roundtrip",
+					"inputBytes": 1120000,
+					"warmups": 2,
+					"samples": 10
+				}
+			]
+		}
+	}
+}
