@@ -260,6 +260,19 @@ test("refuses an omitted-directory-header extraction through a symlinked ancesto
 	assert.equal(fs.existsSync(path.join(outside, "owned-extraction", "bundle", "payload.txt")), false);
 });
 
+test("requires a newly created empty extraction root", (t) => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-extraction-root-test-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const destination = path.join(root, "already-owned");
+	fs.mkdirSync(destination);
+	fs.writeFileSync(path.join(destination, "sentinel.txt"), "unchanged\n");
+	const entries = readGzipTarEntries(
+		createDeterministicTarGz([{ path: "bundle/payload.txt", type: "file", content: "payload\n" }]),
+	);
+	assert.throws(() => extractTarEntries(entries, destination), /newly created/);
+	assert.equal(fs.readFileSync(path.join(destination, "sentinel.txt"), "utf8"), "unchanged\n");
+});
+
 test("contains output roots after resolving symlink ancestors", (t) => {
 	if (process.platform === "win32") {
 		t.skip("symlink fixture requires a privileged Windows test environment");
@@ -514,6 +527,9 @@ test("validates only a complete v3 frozen graph with exact local edges and publi
 		"@aws-sdk/credential-provider-node": "3.0.0",
 	};
 	assert.doesNotThrow(() => validateBundleLockfile(credentialNamedDependency, rootManifest));
+	const externalLink = bundledLockfile(rootManifest);
+	externalLink.packages["node_modules/ws"].link = false;
+	assert.throws(() => validateBundleLockfile(externalLink, rootManifest), /must not link/);
 	const internalAlias = bundledLockfile(rootManifest);
 	internalAlias.packages["node_modules/ws"].dependencies = {
 		"pi-web-alias": "npm:@pi-agent-web/cli@0.1.0",

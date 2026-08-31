@@ -345,7 +345,7 @@ export function validateBundleLockfile(
 			if (!expected || packagePath !== `node_modules/${pathPackageName}`) {
 				throw new Error(`unexpected internal package lock entry ${packagePath}`);
 			}
-			if (value.link === true || value.resolved !== expected || value.version !== rootManifest.version) {
+			if (value.link !== undefined || value.resolved !== expected || value.version !== rootManifest.version) {
 				throw new Error(`internal package lock entry ${packagePath} is not its bundled tarball`);
 			}
 			assertSha512Integrity(packagePath, value.integrity);
@@ -357,7 +357,7 @@ export function validateBundleLockfile(
 			observedEntries.add(packagePath);
 			continue;
 		}
-		if (value.link === true) {
+		if (value.link !== undefined) {
 			throw new Error(`external package lock entry ${packagePath} must not link outside the bundle`);
 		}
 		assertExternalPackageLockEntry(packagePath, value, expectedDependencies, {

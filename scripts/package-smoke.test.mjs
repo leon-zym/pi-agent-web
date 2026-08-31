@@ -95,7 +95,12 @@ function appendDuplicateFileMember(archive, entryPath, replacementContent) {
 }
 
 function writePackageTarball(root, name, manifest = {}, options = {}) {
-	const { includeDistFile = true, extraEntries = [], omittedDirectoryHeaders = [] } = options;
+	const {
+		includeDistFile = true,
+		distFileName = "index.js",
+		extraEntries = [],
+		omittedDirectoryHeaders = [],
+	} = options;
 	fs.mkdirSync(root, { recursive: true });
 	const packageManifest = {
 		name,
@@ -108,7 +113,9 @@ function writePackageTarball(root, name, manifest = {}, options = {}) {
 		{ path: "package", type: "directory" },
 		{ path: "package/LICENSE", type: "file", content: "MIT\n" },
 		{ path: "package/dist", type: "directory" },
-		...(includeDistFile ? [{ path: "package/dist/index.js", type: "file", content: "export {};\n" }] : []),
+		...(includeDistFile
+			? [{ path: `package/dist/${distFileName}`, type: "file", content: "export {};\n" }]
+			: []),
 		...extraEntries,
 		{ path: "package/package.json", type: "file", content: `${JSON.stringify(packageManifest)}\n` },
 	]);
@@ -226,14 +233,19 @@ test("rejects source file entries without an explicit source directory header", 
 
 test("rejects a duplicate packaged CLI member before installation", () => {
 	const root = tempRoot();
-	const tarballs = PACKAGE_NAMES.map((name) => writePackageTarball(root, name));
+	const tarballs = PACKAGE_NAMES.map((name) =>
+		writePackageTarball(root, name, {}, name === "@pi-agent-web/cli" ? { distFileName: "cli.js" } : {}),
+	);
 	const cliTarball = tarballs.find((tarball) => tarball.includes("pi-agent-web-cli"));
 	const duplicate = appendDuplicateFileMember(
 		fs.readFileSync(cliTarball),
-		"package/dist/index.js",
+		"package/dist/cli.js",
 		Buffer.from("last-last!\n"),
 	);
 	fs.writeFileSync(cliTarball, duplicate);
+	// Before the canonical reader existed, a real npm install accepted this
+	// archive and installed the last duplicate payload. This assertion runs
+	// before any install side effect can occur.
 	assert.throws(() => inspectPackageTarballs(tarballs), /duplicated|duplicate/i);
 });
 
