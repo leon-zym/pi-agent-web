@@ -12,6 +12,7 @@ import {
 	controlledNpxEnvironment,
 	createOwnedProcessTree,
 	inspectPackageTarballs,
+	installedNpxCommand,
 	PACKAGE_NAMES,
 	resolvePackageManagerCommand,
 	resolveTrustedPackageManagerToolchain,
@@ -372,6 +373,21 @@ test("selects a Windows npm-family wrapper through its Node entrypoint without a
 	});
 	assert.equal(invocation.command, process.execPath);
 	assert.deepEqual(invocation.argsPrefix, [entryPath]);
+});
+
+test("uses the captured canonical npx invocation for the installed command lifecycle", () => {
+	const invocation = { command: process.execPath, argsPrefix: ["/trusted/npm/bin/npx-cli.js"] };
+	assert.deepEqual(
+		installedNpxCommand({
+			args: ["--host", "127.0.0.1", "--port", "0"],
+			env: { PATH: "/untrusted" },
+			invocation,
+		}),
+		{
+			command: process.execPath,
+			args: ["/trusted/npm/bin/npx-cli.js", "--no-install", "pi-web", "--host", "127.0.0.1", "--port", "0"],
+		},
+	);
 });
 
 test("keeps system command paths while excluding inherited node_modules bins for npx", () => {

@@ -607,11 +607,13 @@ test("isolates npm config precedence from hostile scoped registries without netw
 	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
 	const hostileUserConfig = path.join(root, "hostile-user.npmrc");
 	const hostileGlobalConfig = path.join(root, "hostile-global.npmrc");
+	const hostileBin = path.join(root, "hostile-bin");
+	fs.mkdirSync(hostileBin);
 	fs.writeFileSync(hostileUserConfig, "@earendil-works:registry=https://example.invalid/\n");
 	fs.writeFileSync(hostileGlobalConfig, "registry=https://example.invalid/\n");
 	fs.writeFileSync(path.join(root, ".npmrc"), "@earendil-works:registry=https://example.invalid/\n");
 	const inheritedEnvironment = {
-		PATH: process.env.PATH ?? "",
+		PATH: [hostileBin, process.env.PATH].filter(Boolean).join(path.delimiter),
 		...(process.platform === "win32" && process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
 		NPM_CONFIG_CACHE: path.join(root, "hostile-cache"),
 		NPM_CONFIG_GLOBALCONFIG: hostileGlobalConfig,
@@ -634,6 +636,7 @@ test("isolates npm config precedence from hostile scoped registries without netw
 	assert.equal(environment.HTTPS_PROXY, undefined);
 	assert.equal(environment.PNPM_CONFIG_REGISTRY, undefined);
 	assert.notEqual(environment.HOME, inheritedEnvironment.HOME);
+	assert.ok(!environment.PATH.split(path.delimiter).includes(fs.realpathSync(hostileBin)));
 	assert.deepEqual(
 		Object.keys(environment)
 			.filter((key) => /^(?:npm|pnpm)_config_/i.test(key))

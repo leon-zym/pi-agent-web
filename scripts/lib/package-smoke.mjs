@@ -355,11 +355,19 @@ export function launchInstalledCli({ installDir, args, cwd, detached = false, en
 	});
 }
 
-export function launchInstalledNpx({ args, cwd, detached = false, env, invocation }) {
+export function installedNpxCommand({ args, env, invocation }) {
 	const npxInvocation = invocation ?? resolvePackageManagerCommand("npx", { env });
-	return spawnOwnedProcess({
+	return {
 		command: npxInvocation.command,
 		args: [...npxInvocation.argsPrefix, "--no-install", "pi-web", ...args],
+	};
+}
+
+export function launchInstalledNpx({ args, cwd, detached = false, env, invocation }) {
+	const command = installedNpxCommand({ args, env, invocation });
+	return spawnOwnedProcess({
+		command: command.command,
+		args: command.args,
 		cwd,
 		detached,
 		env,

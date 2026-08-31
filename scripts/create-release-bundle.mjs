@@ -684,7 +684,6 @@ function createOwnedDirectory(directory) {
 }
 
 const SAFE_BUILD_ENVIRONMENT_KEYS = new Set([
-	"PATH",
 	"LANG",
 	"LC_ALL",
 	"TZ",
@@ -695,6 +694,32 @@ const SAFE_BUILD_ENVIRONMENT_KEYS = new Set([
 	"PATHEXT",
 	"WINDIR",
 ]);
+
+function safeBuildRuntimePath() {
+	const candidates =
+		process.platform === "win32"
+			? [path.dirname(process.execPath), path.join(process.env.SystemRoot ?? "C:\\Windows", "System32")]
+			: [
+					path.dirname(process.execPath),
+					"/opt/homebrew/bin",
+					"/usr/local/bin",
+					"/System/Cryptexes/App/usr/bin",
+					"/usr/bin",
+					"/bin",
+					"/usr/sbin",
+					"/sbin",
+				];
+	return [
+		...new Set(
+			candidates
+				.map((candidate) => {
+					const stat = lstatOrNull(candidate);
+					return stat?.isDirectory() && !stat.isSymbolicLink() ? fs.realpathSync(candidate) : null;
+				})
+				.filter(Boolean),
+		),
+	].join(path.delimiter);
+}
 
 function isForbiddenBuildEnvironmentKey(key) {
 	const normalized = key.toLowerCase();
@@ -732,8 +757,19 @@ export function createSanitizedNpmEnvironment({ tempRoot, baseEnv = process.env 
 	const cachePath = path.join(configRoot, "npm-cache");
 	const prefixPath = path.join(configRoot, "npm-prefix");
 	const pnpmStorePath = path.join(configRoot, "pnpm-store");
+	const pnpmHomePath = path.join(configRoot, "pnpm-home");
+	const corepackHomePath = path.join(configRoot, "corepack-home");
 	const xdgConfigPath = path.join(configRoot, "xdg-config");
-	for (const directory of [configRoot, homePath, cachePath, prefixPath, pnpmStorePath, xdgConfigPath]) {
+	for (const directory of [
+		configRoot,
+		homePath,
+		cachePath,
+		prefixPath,
+		pnpmStorePath,
+		pnpmHomePath,
+		corepackHomePath,
+		xdgConfigPath,
+	]) {
 		createOwnedDirectory(directory);
 	}
 	const registryConfig = `registry=${PUBLIC_NPM_REGISTRY}\n`;
@@ -746,7 +782,10 @@ export function createSanitizedNpmEnvironment({ tempRoot, baseEnv = process.env 
 	}
 	return {
 		...environment,
+		PATH: safeBuildRuntimePath(),
+		COREPACK_HOME: corepackHomePath,
 		HOME: homePath,
+		PNPM_HOME: pnpmHomePath,
 		XDG_CACHE_HOME: cachePath,
 		XDG_CONFIG_HOME: xdgConfigPath,
 		npm_config_cache: cachePath,
