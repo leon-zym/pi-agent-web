@@ -21,6 +21,8 @@
 		"bench:representative": "node scripts/run-performance-benchmarks.mjs representative",
 		"bench:stress": "node scripts/run-performance-benchmarks.mjs stress",
 		"test:bench-validator": "node --test scripts/performance-benchmark-validator.test.mjs",
+		"test:release-bundle": "node --test scripts/release-bundle.test.mjs scripts/package-smoke.test.mjs",
+		"bundle:candidate": "node scripts/create-release-bundle.mjs --candidate",
 		"lint": "pnpm -r lint && biome check package.json scripts tests/e2e && node scripts/check-style.mjs && node scripts/check-docs.mjs",
 		"check:bundle": "node scripts/check-ui-bundle-budget.mjs",
 		"check:style": "node scripts/check-style.mjs",
