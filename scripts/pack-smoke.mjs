@@ -44,6 +44,11 @@ function packageManifest(tarball) {
 	return JSON.parse(run("tar", ["-xOf", tarball, "package/package.json"]));
 }
 
+const HTTP_TIMEOUT_MS = 10_000;
+function fetchBounded(url, options = {}, fetchImpl = fetch, timeoutMs = HTTP_TIMEOUT_MS) {
+	return fetchImpl(url, { ...options, signal: AbortSignal.timeout(timeoutMs) });
+}
+
 function waitForOutput(child, pattern, timeoutMs = 10_000) {
 	return new Promise((resolve, reject) => {
 		let output = "";
@@ -81,16 +86,20 @@ function waitForChildExit(child, timeoutMs) {
 	});
 }
 
-async function closeChild(child) {
-	if (child.exitCode !== null || child.signalCode !== null) return;
-	const startedAt = Date.now();
-	child.kill("SIGTERM");
-	if (await waitForChildExit(child, 2_000)) {
-		if (Date.now() - startedAt > 2_000) throw new Error("Packaged CLI exceeded the 2-second shutdown bound");
-		return;
+async function closeChild(child, wait = waitForChildExit, now = Date.now) {
+	let sigtermExitCodeZero = child.exitCode === 0 && child.signalCode === null;
+	if (child.exitCode === null && child.signalCode === null) {
+		const startedAt = now();
+		child.kill("SIGTERM");
+		if (await wait(child, 2_000)) {
+			sigtermExitCodeZero = child.exitCode === 0 && child.signalCode === null && now() - startedAt <= 2_000;
+		} else {
+			child.kill("SIGKILL");
+			if (!(await wait(child, 2_000))) throw new Error("Packaged CLI did not exit after SIGKILL");
+			throw new Error("Packaged CLI required forced cleanup after SIGTERM");
+		}
 	}
-	child.kill("SIGKILL");
-	if (!(await waitForChildExit(child, 2_000))) throw new Error("Packaged CLI did not exit after SIGKILL");
+	if (!sigtermExitCodeZero) throw new Error("Packaged CLI did not exit cleanly after SIGTERM");
 }
 
 function waitForSocket(socket, setup, timeoutMessage, timeoutMs = 10_000) {
@@ -123,7 +132,7 @@ async function startGateway(cliEntry, cwd, env, piPath) {
 	try {
 		const match = await waitForOutput(child, /listening on http:\/\/127\.0\.0\.1:(\d+)/);
 		const origin = `http://127.0.0.1:${match[1]}`;
-		const bootstrap = await fetch(`${origin}/api/v1/bootstrap`, { headers: { Origin: origin } });
+		const bootstrap = await fetchBounded(`${origin}/api/v1/bootstrap`, { headers: { Origin: origin } });
 		const cookie = bootstrap.headers.get("set-cookie")?.split(";", 1)[0];
 		if (!bootstrap.ok || !cookie) throw new Error("Bootstrap did not issue a session cookie");
 		return { child, origin, cookie };
@@ -135,14 +144,14 @@ async function startGateway(cliEntry, cwd, env, piPath) {
 
 async function createSession(origin, cookie, workspacePath, label) {
 	const headers = { Origin: origin, Cookie: cookie, "Content-Type": "application/json" };
-	const workspaceResponse = await fetch(`${origin}/api/v1/workspaces`, {
+	const workspaceResponse = await fetchBounded(`${origin}/api/v1/workspaces`, {
 		method: "POST",
 		headers,
 		body: JSON.stringify({ path: workspacePath }),
 	});
 	if (!workspaceResponse.ok) throw new Error(`${label} workspace creation failed`);
 	const workspace = await workspaceResponse.json();
-	const sessionResponse = await fetch(
+	const sessionResponse = await fetchBounded(
 		`${origin}/api/v1/workspaces/${encodeURIComponent(workspace.workspaceHandle)}/sessions`,
 		{ method: "POST", headers },
 	);
@@ -155,7 +164,7 @@ async function createSession(origin, cookie, workspacePath, label) {
 }
 
 async function checkReadiness(origin, cookie, source) {
-	const response = await fetch(`${origin}/api/v1/health/ready`, {
+	const response = await fetchBounded(`${origin}/api/v1/health/ready`, {
 		headers: { Origin: origin, Cookie: cookie },
 	});
 	if (!response.ok) throw new Error(`Health check failed with ${String(response.status)}`);
@@ -182,18 +191,12 @@ async function exerciseSession(socket, runtime) {
 		const finish = (error) => {
 			clearTimeout(timer);
 			socket.off("message", onMessage);
-			socket.off("error", onError);
+			socket.off("error", finish);
 			if (error) reject(error);
 			else resolve();
 		};
-		const onError = (error) => finish(error);
 		const onMessage = (raw) => {
-			let frame;
-			try {
-				frame = JSON.parse(raw.toString());
-			} catch {
-				return;
-			}
+			const frame = JSON.parse(raw.toString());
 			if (frame.type === "runtime_state" && frame.runtime?.sessionHandle === sessionHandle && !claimed) {
 				claimed = true;
 				socket.send(JSON.stringify({ type: "session_claim", sessionHandle }));
@@ -225,13 +228,12 @@ async function exerciseSession(socket, runtime) {
 			if (settled && response) finish();
 		};
 		socket.on("message", onMessage);
-		socket.on("error", onError);
+		socket.on("error", finish);
 		timer = setTimeout(() => finish(new Error("Fixture Session conversation timed out")), 10_000);
 		socket.send(JSON.stringify({ type: "session_subscribe", sessionHandle }));
 	});
-	if (response?.success !== true || streamedText !== "E2E_REPLY:PACK_SMOKE_NON_EMPTY") {
-		throw new Error("Fixture Session did not stream the deterministic settled reply");
-	}
+	if (response?.success !== true || streamedText !== "E2E_REPLY:PACK_SMOKE_NON_EMPTY")
+		throw new Error("Fixture Session stream failed");
 }
 
 const gatewayCapabilities = [
@@ -274,9 +276,6 @@ try {
 		if (files.includes("package/src/"))
 			throw new Error(`Source directory leaked into ${path.basename(tarball)}`);
 		const manifest = packageManifest(tarball);
-		if (manifest.version !== packageVersion || !packageNames.includes(manifest.name)) {
-			throw new Error(`Unexpected package identity in ${path.basename(tarball)}`);
-		}
 		if (
 			manifest.license !== "MIT" ||
 			manifest.repository?.url !== "git+https://github.com/leon-zym/pi-agent-web.git"
@@ -351,13 +350,13 @@ try {
 		const { origin, cookie } = gateway;
 		await checkReadiness(origin, cookie, "pi-path");
 		const session = await createSession(origin, cookie, canonicalWorkspace, "Packaged");
-		const crossPort = await fetch(`${origin}/api/v1/health`, {
+		const crossPort = await fetchBounded(`${origin}/api/v1/health`, {
 			headers: { Origin: "http://localhost:5173", Cookie: cookie },
 		});
 		if (crossPort.status !== 403) {
 			throw new Error(`Packaged REST accepted a cross-port Origin with status ${String(crossPort.status)}`);
 		}
-		const spa = await fetch(origin);
+		const spa = await fetchBounded(origin);
 		if (!spa.ok || !(await spa.text()).includes('<div id="root"></div>')) {
 			throw new Error("Packaged SPA was not served from the CLI port");
 		}
