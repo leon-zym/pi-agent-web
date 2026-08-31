@@ -374,15 +374,6 @@ for (const scenario of scenariosFor("concurrency")) {
 			);
 			addSummaryGate(
 				outcome,
-				"heapDeltaBytes",
-				"p95",
-				"lte",
-				256 * 1024 * 1024,
-				"observe",
-				"Cross-platform GC makes this a recorded trend until reference-host baselines exist.",
-			);
-			addSummaryGate(
-				outcome,
 				"aggregateDeltaPerSecond",
 				"median",
 				"gte",

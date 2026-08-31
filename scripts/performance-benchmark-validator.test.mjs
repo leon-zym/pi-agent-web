@@ -307,6 +307,12 @@ test("fails closed on malformed evidence and missing required capabilities", () 
 		errorText(validate({ results: missing, rawArtifacts: missing.flatMap(rawFor) })),
 		/metrics must be a non-empty record/,
 	);
+	const staleGate = validResults();
+	staleGate[0].gates[0].metric = "heapDeltaBytes";
+	assert.match(
+		errorText(validate({ results: staleGate, rawArtifacts: staleGate.flatMap(rawFor) })),
+		/gated metric heapDeltaBytes must be finite in every measured trial/,
+	);
 	const unavailable = validResults();
 	unavailable[0].capabilities.websocket = false;
 	assert.match(

@@ -180,15 +180,6 @@ for (const scenario of scenariosFor("streaming")) {
 			);
 			addSummaryGate(
 				outcome,
-				"heapDeltaBytes",
-				"p95",
-				"lte",
-				96 * 1024 * 1024,
-				"observe",
-				"Heap p95 is retained for trend evidence, not shared release gating before calibration.",
-			);
-			addSummaryGate(
-				outcome,
 				"structuralDomTransitionMs",
 				"p95",
 				"lte",

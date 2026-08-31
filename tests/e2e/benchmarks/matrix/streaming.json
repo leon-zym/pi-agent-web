@@ -1,7 +1,7 @@
 {
 	"schemaVersion": 2,
 	"id": "streaming",
-	"requiredCapabilities": ["browser", "cdp", "longtask", "precise-memory", "websocket"],
+	"requiredCapabilities": ["browser", "cdp", "longtask", "websocket"],
 	"tiers": {
 		"representative": {
 			"scenarios": [
