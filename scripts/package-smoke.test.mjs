@@ -8,6 +8,7 @@ import { gunzipSync, gzipSync } from "node:zlib";
 import { createDeterministicTarGz } from "./create-release-bundle.mjs";
 import {
 	assertInstalledProductIsolation,
+	cleanupOwnedProcessTree,
 	controlledNpxEnvironment,
 	createOwnedProcessTree,
 	inspectPackageTarballs,
@@ -220,6 +221,29 @@ test("cleans a live owned POSIX group with TERM", async () => {
 	assert.deepEqual(state.signals, ["SIGTERM"]);
 });
 
+test("cleans an owned group before failing a deterministic smoke with no recorded child", async () => {
+	const { tree, state } = ownedTreeFixture({
+		onSignal: ({ child, signal, state: fixtureState }) => {
+			if (signal === "SIGTERM") {
+				fixtureState.groupAlive = false;
+				fixtureState.leaderAlive = false;
+				child.exit();
+			}
+		},
+	});
+	await assert.rejects(
+		() =>
+			cleanupOwnedProcessTree(tree, {
+				requireFixtureProcess: true,
+				termTimeoutMs: 10,
+				killTimeoutMs: 10,
+				pollIntervalMs: 1,
+			}),
+		/did not record a child process/,
+	);
+	assert.deepEqual(state.signals, ["SIGTERM"]);
+});
+
 test("cleans an early-exited owned group but fails the smoke", async () => {
 	const { child, tree, state } = ownedTreeFixture({
 		onSignal: ({ signal, state: fixtureState }) => {
@@ -272,6 +296,17 @@ test("uses bounded Windows tree cleanup only while the root identity is live", a
 	});
 	await terminateOwnedProcessTree(tree, { termTimeoutMs: 10, killTimeoutMs: 10, pollIntervalMs: 1 });
 	assert.equal(state.taskkills, 1);
+});
+
+test("fails Windows cleanup explicitly after an early root exit", async () => {
+	const { child, tree, state } = ownedTreeFixture({ platform: "win32" });
+	state.leaderAlive = false;
+	child.exit(1);
+	await assert.rejects(
+		() => terminateOwnedProcessTree(tree, { termTimeoutMs: 10, killTimeoutMs: 10, pollIntervalMs: 1 }),
+		/cannot prove Windows process-tree cleanup after early root exit/,
+	);
+	assert.equal(state.taskkills, 0);
 });
 
 test("selects a Windows npm-family wrapper through its Node entrypoint without a shell string", () => {

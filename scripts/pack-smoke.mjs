@@ -11,15 +11,14 @@ import {
 } from "./create-release-bundle.mjs";
 import {
 	assertInstalledProductIsolation,
+	cleanupOwnedProcessTree,
 	controlledNpxEnvironment,
 	extractBundleArchive,
 	installBundle,
 	launchInstalledCli,
 	launchInstalledNpx,
 	run,
-	terminateOwnedProcessTree,
 	waitForOutput,
-	waitForProcessesToExit,
 	waitForSocket,
 } from "./lib/package-smoke.mjs";
 
@@ -370,29 +369,6 @@ function assertExtractedBundleLockfile(bundleRoot) {
 	validateBundleLockfile(lockfile, rootManifest);
 }
 
-async function terminatePackagedProcess(tree, fixturePids = []) {
-	let terminationError;
-	try {
-		await terminateOwnedProcessTree(tree, { termTimeoutMs: 2_000, killTimeoutMs: 2_000 });
-	} catch (error) {
-		terminationError = error;
-	}
-	let fixtureError;
-	try {
-		if (fixturePids.length > 0) await waitForProcessesToExit(fixturePids, 2_000);
-	} catch (error) {
-		fixtureError = error;
-	}
-	if (terminationError && fixtureError) {
-		throw new AggregateError(
-			[terminationError, fixtureError],
-			"packaged process and fixture cleanup both failed",
-		);
-	}
-	if (terminationError) throw terminationError;
-	if (fixtureError) throw fixtureError;
-}
-
 async function runBundledRuntimeSmoke({ bundleRoot, expectedPiVersion, tempRoot, npmEnvironment }) {
 	const emptyBinDir = path.join(tempRoot, "bundled-empty-bin");
 	const workspacePath = path.join(tempRoot, "bundled-external-workspace");
@@ -415,7 +391,7 @@ async function runBundledRuntimeSmoke({ bundleRoot, expectedPiVersion, tempRoot,
 	try {
 		await verifyBundledReadiness({ bundleRoot, child: tree.child, expectedPiVersion, workspacePath });
 	} finally {
-		await terminatePackagedProcess(tree);
+		await cleanupOwnedProcessTree(tree);
 	}
 }
 
@@ -494,9 +470,10 @@ async function runDeterministicConversationSmoke({
 		recordFixtureProcessIds();
 		let cleanupError;
 		try {
-			if (processIds.size === 0)
-				cleanupError = new Error("Explicit deterministic Pi did not record a child process");
-			else await terminatePackagedProcess(tree, [...processIds]);
+			await cleanupOwnedProcessTree(tree, {
+				fixtureProcessIds: [...processIds],
+				requireFixtureProcess: true,
+			});
 		} catch (error) {
 			cleanupError = error;
 		}

@@ -553,3 +553,36 @@ export async function waitForProcessesToExit(processIds, timeoutMs = 2_000) {
 		await new Promise((resolve) => setTimeout(resolve, 25));
 	}
 }
+
+/**
+ * Always terminates the captured tree before evaluating whether a deterministic
+ * fixture supplied a child identity. That ordering prevents a failed readiness
+ * path with an empty marker from skipping cleanup of the npx wrapper group.
+ */
+export async function cleanupOwnedProcessTree(
+	tree,
+	{
+		fixtureProcessIds = [],
+		requireFixtureProcess = false,
+		termTimeoutMs = 2_000,
+		killTimeoutMs = 2_000,
+		pollIntervalMs = 25,
+	} = {},
+) {
+	const errors = [];
+	try {
+		await terminateOwnedProcessTree(tree, { termTimeoutMs, killTimeoutMs, pollIntervalMs });
+	} catch (error) {
+		errors.push(error);
+	}
+	try {
+		if (fixtureProcessIds.length > 0) await waitForProcessesToExit(fixtureProcessIds, termTimeoutMs);
+	} catch (error) {
+		errors.push(error);
+	}
+	if (requireFixtureProcess && fixtureProcessIds.length === 0) {
+		errors.push(new Error("Explicit deterministic Pi did not record a child process"));
+	}
+	if (errors.length === 1) throw errors[0];
+	if (errors.length > 1) throw new AggregateError(errors, "owned packaged process cleanup failed");
+}
