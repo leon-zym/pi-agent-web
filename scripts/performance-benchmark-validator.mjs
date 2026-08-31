@@ -52,8 +52,11 @@ const ROOT_MATRIX_KEYS = ["domains", "knownCoverageGaps", "schemaVersion", "scop
 const DOMAIN_MATRIX_KEYS = ["id", "requiredCapabilities", "schemaVersion", "tiers"];
 const MATRIX_SCOPE_KEYS = ["issue", "label", "phase", "status"];
 const MANIFEST_KEYS = [
+	"buildIdentity",
 	"buildVariants",
+	"canonicalVariants",
 	"capabilities",
+	"executionOrder",
 	"expectedScenarioSet",
 	"fixtureHashes",
 	"lockfileHash",
@@ -101,7 +104,29 @@ const MEMORY_KEYS = ["totalBytes"];
 const SUMMARY_STATISTICS = new Set(["median", "p95", "max"]);
 const COMPARISONS = new Set(["lte", "gte", "eq"]);
 const GATE_MODES = new Set(["hard", "observe"]);
-const BENCHMARK_VARIANTS = new Set(["coalesced", "sequential"]);
+const FORMAL_BENCHMARK_VARIANTS = Object.freeze(["coalesced", "sequential"]);
+const BENCHMARK_VARIANTS = new Set(FORMAL_BENCHMARK_VARIANTS);
+const BUILD_VARIANT_KEYS = ["serverEntry", "serverEntryHash", "serverTreeHash", "uiDirectory", "uiTreeHash"];
+const STANDARD_BUILD_IDENTITY_KEYS = ["cliTreeHash", "serverTreeHash", "uiTreeHash"];
+const REQUIRED_TRIAL_CAPABILITIES = ["browser-memory-sampler", "gateway-trial-telemetry", "react-profiler"];
+const REQUIRED_TRIAL_METRICS = [
+	"browserHeapPeakBytes",
+	"browserHeapSampleCount",
+	"browserHeapSampleIntervalMs",
+	"browserHeapSamplerOverheadMs",
+	"gatewayHeapPeakBytes",
+	"gatewayMemorySampleCount",
+	"gatewayMemorySampleIntervalMs",
+	"gatewayMemorySamplerOverheadMs",
+	"gatewayPublicationCount",
+	"gatewayRssPeakBytes",
+	"gatewaySnapshotBuildCount",
+	"gatewayTrialEpoch",
+	"reactActualDurationMs",
+	"reactBaseDurationMs",
+	"reactCommitCount",
+	"reactCommitMaxDurationMs",
+];
 
 function isRecord(value) {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -130,6 +155,40 @@ function validHash(value) {
 
 function validRunId(value) {
 	return typeof value === "string" && /^[a-z0-9][a-z0-9._-]{0,127}$/i.test(value);
+}
+
+function validRelativeArtifactPath(value) {
+	return relativeDomainPath(value) && !value.startsWith("./");
+}
+
+function seededVariantOrder(seed) {
+	return [...FORMAL_BENCHMARK_VARIANTS].sort((left, right) => {
+		const leftHash = sha256(`${seed}\0${left}`);
+		const rightHash = sha256(`${seed}\0${right}`);
+		return leftHash.localeCompare(rightHash) || left.localeCompare(right);
+	});
+}
+
+function canonicalExpectedScenarioSet(matrix, tier, errors) {
+	return matrixScenarios(matrix, tier, errors).flatMap((scenario) =>
+		FORMAL_BENCHMARK_VARIANTS.map((variant) => ({
+			id: scenario.id,
+			domain: scenario.domain,
+			kind: scenario.kind,
+			variant,
+			warmups: scenario.warmups,
+			measured: scenario.samples,
+			requiredCapabilities: scenario.requiredCapabilities,
+		})),
+	);
+}
+
+/** The formal matrix × variant set is one contract shared by the producer and validator. */
+export function canonicalFormalExpectedScenarioSet(matrix, tier) {
+	const errors = [];
+	const expected = canonicalExpectedScenarioSet(matrix, tier, errors);
+	if (errors.length > 0) throw new Error(errors.join("\n"));
+	return expected;
 }
 
 function percentile(sorted, percentileValue) {
@@ -415,6 +474,46 @@ function validateTrials(result, definition, errors) {
 			for (const [metric, value] of Object.entries(trial.metrics)) {
 				if (!isFiniteNumber(value)) errors.push(`trial ${String(index)} metrics.${metric} must be finite`);
 			}
+			for (const metric of REQUIRED_TRIAL_METRICS) {
+				if (!isFiniteNumber(trial.metrics[metric])) {
+					errors.push(`trial ${String(index)} is missing required telemetry metric: ${metric}`);
+				}
+			}
+			for (const metric of [
+				"browserHeapPeakBytes",
+				"browserHeapSampleCount",
+				"browserHeapSampleIntervalMs",
+				"browserHeapSamplerOverheadMs",
+				"gatewayHeapPeakBytes",
+				"gatewayMemorySampleCount",
+				"gatewayMemorySampleIntervalMs",
+				"gatewayMemorySamplerOverheadMs",
+				"gatewayPublicationCount",
+				"gatewayRssPeakBytes",
+				"gatewaySnapshotBuildCount",
+				"gatewayTrialEpoch",
+				"reactActualDurationMs",
+				"reactBaseDurationMs",
+				"reactCommitCount",
+				"reactCommitMaxDurationMs",
+			]) {
+				if (isFiniteNumber(trial.metrics[metric]) && trial.metrics[metric] < 0) {
+					errors.push(`trial ${String(index)} metrics.${metric} must be non-negative`);
+				}
+			}
+			for (const metric of [
+				"browserHeapSampleCount",
+				"gatewayMemorySampleCount",
+				"gatewayTrialEpoch",
+				"reactCommitCount",
+			]) {
+				if (
+					isFiniteNumber(trial.metrics[metric]) &&
+					(!Number.isSafeInteger(trial.metrics[metric]) || trial.metrics[metric] <= 0)
+				) {
+					errors.push(`trial ${String(index)} metrics.${metric} must be a positive safe integer`);
+				}
+			}
 		}
 		if (!isRecord(trial.correctness) || Object.keys(trial.correctness).length === 0) {
 			errors.push(`trial ${String(index)} correctness must be a non-empty record`);
@@ -427,6 +526,9 @@ function validateTrials(result, definition, errors) {
 			for (const [name, value] of Object.entries(trial.correctness)) {
 				if (typeof value !== "boolean")
 					errors.push(`trial ${String(index)} correctness.${name} must be boolean`);
+			}
+			if (trial.correctness.complete !== true) {
+				errors.push(`trial ${String(index)} correctness.complete must be true`);
 			}
 		}
 	}
@@ -540,6 +642,9 @@ function validateGates(result, trials, expectedSummaries, errors) {
 				? compare(expectedActual, gate.comparison, gate.threshold)
 				: null;
 		if (gate.passed !== expectedPassed) errors.push(`gate ${key} passed must be ${String(expectedPassed)}`);
+		if (gate.mode === "hard" && expectedPassed !== true) {
+			errors.push(`hard gate ${key} must pass in a complete formal result`);
+		}
 		validated.push({ ...gate, recomputedPassed: expectedPassed });
 	}
 	return validated;
@@ -565,7 +670,12 @@ function validateResult(result, definition, tier, runId) {
 	if (typeof result.browserVersion !== "string" || result.browserVersion.length === 0) {
 		errors.push("browserVersion must be a non-empty string");
 	}
-	validateCapabilities(result.capabilities, definition.requiredCapabilities ?? [], errors, "result");
+	validateCapabilities(
+		result.capabilities,
+		[...(definition.requiredCapabilities ?? []), ...REQUIRED_TRIAL_CAPABILITIES],
+		errors,
+		"result",
+	);
 	const startedAt = Date.parse(result.startedAt);
 	const finishedAt = Date.parse(result.finishedAt);
 	if (!Number.isFinite(startedAt)) errors.push("startedAt must be an ISO timestamp");
@@ -584,13 +694,11 @@ function validateResult(result, definition, tier, runId) {
 	validateSummaries(result, summaries, errors);
 	const gates = validateGates(result, trials, summaries, errors);
 	const recordedErrors = Array.isArray(result.errors) ? result.errors : [];
-	const expectedStatus =
-		recordedErrors.length > 0 || gates.some((gate) => gate.mode === "hard" && gate.recomputedPassed !== true)
-			? "failed"
-			: "passed";
-	if (result.status !== expectedStatus) {
-		errors.push(`status must be ${expectedStatus} when errors and hard gates are evaluated`);
+	if (recordedErrors.length > 0) errors.push("result errors must be empty in a complete formal result");
+	if (gates.some((gate) => gate.mode === "hard" && gate.recomputedPassed !== true)) {
+		errors.push("all hard correctness gates must pass in a complete formal result");
 	}
+	if (result.status !== "passed") errors.push("status must be passed in a complete formal result");
 	return errors;
 }
 
@@ -677,6 +785,12 @@ function validateManifest(manifest, matrix, tier, runId, results, errors) {
 	if (manifest.runId !== runId || !validRunId(manifest.runId)) errors.push(`manifest runId must be ${runId}`);
 	if (typeof manifest.seed !== "string" || manifest.seed.length === 0)
 		errors.push("manifest seed must be non-empty");
+	if (!isDeepStrictEqual(manifest.canonicalVariants, FORMAL_BENCHMARK_VARIANTS)) {
+		errors.push(`manifest canonicalVariants must be exactly ${FORMAL_BENCHMARK_VARIANTS.join(", ")}`);
+	}
+	if (!isDeepStrictEqual(manifest.executionOrder, seededVariantOrder(manifest.seed))) {
+		errors.push("manifest executionOrder must be the deterministic seeded formal variant order");
+	}
 	if (!exactKeys(manifest.source, SOURCE_KEYS)) {
 		errors.push(`manifest source must contain exactly ${SOURCE_KEYS.join(", ")}`);
 	} else {
@@ -699,16 +813,44 @@ function validateManifest(manifest, matrix, tier, runId, results, errors) {
 			errors.push("manifest matrix.rootHash must match the loaded root matrix hash");
 		}
 	}
-	for (const [label, hashes] of [
-		["fixtureHashes", manifest.fixtureHashes],
-		["buildVariants", manifest.buildVariants],
-	]) {
-		if (!isRecord(hashes) || Object.keys(hashes).length === 0) {
-			errors.push(`manifest ${label} must be a non-empty record`);
-			continue;
+	if (!isRecord(manifest.fixtureHashes) || Object.keys(manifest.fixtureHashes).length === 0) {
+		errors.push("manifest fixtureHashes must be a non-empty record");
+	} else {
+		for (const [name, value] of Object.entries(manifest.fixtureHashes)) {
+			if (!validHash(value)) errors.push(`manifest fixtureHashes.${name} must be a SHA-256 hash`);
 		}
-		for (const [name, value] of Object.entries(hashes)) {
-			if (!validHash(value)) errors.push(`manifest ${label}.${name} must be a SHA-256 hash`);
+	}
+	if (!exactKeys(manifest.buildIdentity, STANDARD_BUILD_IDENTITY_KEYS)) {
+		errors.push(`manifest buildIdentity must contain exactly ${STANDARD_BUILD_IDENTITY_KEYS.join(", ")}`);
+	} else {
+		for (const key of STANDARD_BUILD_IDENTITY_KEYS) {
+			if (!validHash(manifest.buildIdentity[key])) {
+				errors.push(`manifest buildIdentity.${key} must be a SHA-256 hash`);
+			}
+		}
+	}
+	if (!isRecord(manifest.buildVariants) || !exactKeys(manifest.buildVariants, FORMAL_BENCHMARK_VARIANTS)) {
+		errors.push(`manifest buildVariants must contain exactly ${FORMAL_BENCHMARK_VARIANTS.join(", ")}`);
+	} else {
+		for (const variant of FORMAL_BENCHMARK_VARIANTS) {
+			const build = manifest.buildVariants[variant];
+			if (!exactKeys(build, BUILD_VARIANT_KEYS)) {
+				errors.push(
+					`manifest buildVariants.${variant} must contain exactly ${BUILD_VARIANT_KEYS.join(", ")}`,
+				);
+				continue;
+			}
+			if (!validRelativeArtifactPath(build.uiDirectory)) {
+				errors.push(`manifest buildVariants.${variant}.uiDirectory must be a normalized run-relative path`);
+			}
+			if (!validRelativeArtifactPath(build.serverEntry)) {
+				errors.push(`manifest buildVariants.${variant}.serverEntry must be a normalized run-relative path`);
+			}
+			for (const key of ["serverEntryHash", "serverTreeHash", "uiTreeHash"]) {
+				if (!validHash(build[key])) {
+					errors.push(`manifest buildVariants.${variant}.${key} must be a SHA-256 hash`);
+				}
+			}
 		}
 	}
 	if (!validHash(manifest.lockfileHash)) errors.push("manifest lockfileHash must be a SHA-256 hash");
@@ -718,6 +860,10 @@ function validateManifest(manifest, matrix, tier, runId, results, errors) {
 	if (!Array.isArray(manifest.expectedScenarioSet) || manifest.expectedScenarioSet.length === 0) {
 		errors.push("manifest expectedScenarioSet must be a non-empty array");
 		return;
+	}
+	const canonicalExpected = canonicalExpectedScenarioSet(matrix, tier, errors);
+	if (!isDeepStrictEqual(manifest.expectedScenarioSet, canonicalExpected)) {
+		errors.push("manifest expectedScenarioSet must be the complete canonical matrix × formal variant set");
 	}
 	const expectedDefinitions = matrixScenarios(matrix, tier, errors);
 	const expectedKeys = new Set();
@@ -747,13 +893,33 @@ function validateManifest(manifest, matrix, tier, runId, results, errors) {
 		if (manifest.measuredCounts?.[key] !== entry.measured)
 			errors.push(`manifest measuredCounts.${key} must match expected scenario`);
 	}
-	const variants = new Set(manifest.expectedScenarioSet.map((entry) => entry?.variant));
-	for (const variant of variants) {
-		if (!validHash(manifest.buildVariants?.[variant])) {
-			errors.push(`manifest buildVariants must include expected variant: ${String(variant)}`);
-		}
+	const canonicalKeys = new Set(canonicalExpected.map((entry) => scenarioKey(entry)));
+	if (!isDeepStrictEqual(expectedKeys, canonicalKeys)) {
+		errors.push("manifest expected scenario keys must exactly match the canonical formal set");
 	}
-	validateCapabilities(manifest.capabilities, [], errors, "manifest");
+	const canonicalWarmups = Object.fromEntries(
+		canonicalExpected.map((entry) => [scenarioKey(entry), entry.warmups]),
+	);
+	const canonicalMeasured = Object.fromEntries(
+		canonicalExpected.map((entry) => [scenarioKey(entry), entry.measured]),
+	);
+	if (!isDeepStrictEqual(manifest.warmupCounts, canonicalWarmups)) {
+		errors.push("manifest warmupCounts must exactly match the canonical formal scenario set");
+	}
+	if (!isDeepStrictEqual(manifest.measuredCounts, canonicalMeasured)) {
+		errors.push("manifest measuredCounts must exactly match the canonical formal scenario set");
+	}
+	validateCapabilities(
+		manifest.capabilities,
+		[
+			...new Set([
+				...canonicalExpected.flatMap((entry) => entry.requiredCapabilities),
+				...REQUIRED_TRIAL_CAPABILITIES,
+			]),
+		],
+		errors,
+		"manifest",
+	);
 	for (const result of results) {
 		const key = scenarioKey({ domain: result.domain, id: result.scenarioId, variant: result.variant });
 		if (!expectedKeys.has(key)) errors.push(`result is not in manifest expectedScenarioSet: ${key}`);
@@ -852,13 +1018,7 @@ export function validateBenchmarkArtifacts({
 			artifactKeys.push(scenarioKey({ domain: value.domain, id: value.scenarioId, variant: value.variant }));
 		}
 	}
-	const variants = new Set(
-		Array.isArray(manifest?.expectedScenarioSet)
-			? manifest.expectedScenarioSet
-					.map((entry) => entry?.variant)
-					.filter((variant) => typeof variant === "string")
-			: [],
-	);
+	const variants = new Set(FORMAL_BENCHMARK_VARIANTS);
 	for (const definition of definitions.values()) {
 		for (const variant of variants) {
 			const key = scenarioKey({ domain: definition.domain, id: definition.id, variant });
