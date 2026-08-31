@@ -21,7 +21,14 @@ const fixturePaths = [
 	"tests/e2e/fixtures/production-harness.ts",
 	"tests/e2e/fixtures/test.ts",
 ];
-const buildOutputPaths = ["packages/cli/dist", "packages/server/dist", "packages/ui/dist"];
+const buildOutputPaths = [
+	"packages/cli/dist",
+	"packages/server/dist",
+	"packages/server/dist-benchmark",
+	"packages/ui/dist",
+];
+const benchmarkServerOutput = path.join(repositoryRoot, "packages/server/dist-benchmark");
+const benchmarkServerEntry = path.join(benchmarkServerOutput, "benchmark-main.js");
 const allowedVariants = new Set(["coalesced", "sequential"]);
 
 function usage() {
@@ -102,6 +109,24 @@ function combinedBuildHash() {
 		hash.update("\n");
 	}
 	return hash.digest("hex");
+}
+
+function cleanBenchmarkServerOutput() {
+	if (path.relative(repositoryRoot, benchmarkServerOutput) !== "packages/server/dist-benchmark") {
+		throw new Error("Refusing to clean an unexpected benchmark server output path");
+	}
+	fs.rmSync(benchmarkServerOutput, { recursive: true, force: true });
+}
+
+function buildBenchmarkServer(environment, logDirectory, variant) {
+	cleanBenchmarkServerOutput();
+	return runCommand(
+		`build-server-${variant}`,
+		"pnpm",
+		["--filter", "@pi-agent-web/server", "exec", "tsc", "-p", "tsconfig.benchmark.json"],
+		environment,
+		logDirectory,
+	);
 }
 
 function fixtureHashes() {
@@ -388,6 +413,16 @@ function main() {
 		);
 		statuses.push({ variant, buildStatus });
 		if (buildStatus !== 0) continue;
+		const benchmarkServerBuildStatus = buildBenchmarkServer(benchmarkEnvironment, logsDirectory, variant);
+		statuses.push({ variant, benchmarkServerBuildStatus });
+		if (benchmarkServerBuildStatus !== 0) continue;
+		if (!fs.existsSync(benchmarkServerEntry)) {
+			statuses.push({
+				variant,
+				benchmarkEntryError: "benchmark server build did not emit benchmark-main.js",
+			});
+			continue;
+		}
 		try {
 			manifest.buildVariants[variant] = combinedBuildHash();
 		} catch (error) {
@@ -423,7 +458,12 @@ function main() {
 		.filter((status) => Number.isInteger(status));
 	const buildFailures =
 		statuses.some((status) => status.buildStatus !== undefined && status.buildStatus !== 0) ||
-		statuses.some((status) => status.buildHashError !== undefined);
+		statuses.some(
+			(status) => status.benchmarkServerBuildStatus !== undefined && status.benchmarkServerBuildStatus !== 0,
+		) ||
+		statuses.some(
+			(status) => status.buildHashError !== undefined || status.benchmarkEntryError !== undefined,
+		);
 	const playwrightExitCode =
 		buildFailures || playwrightStatuses.length !== variants.length ? -1 : Math.max(...playwrightStatuses);
 	const validated = validateBenchmarkArtifacts({

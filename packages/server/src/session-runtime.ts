@@ -1987,6 +1987,11 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 
 	sessionSnapshot(): SessionRuntimeProductSnapshot<M> {
 		if (this.snapshotCache?.version === this.snapshotVersion) return this.snapshotCache.snapshot;
+		try {
+			this.onSnapshotBuild();
+		} catch {
+			// Observation is optional and must never interfere with the canonical snapshot path.
+		}
 		const snapshot = this.buildSessionSnapshot();
 		if (!this.isProductSnapshot(snapshot)) {
 			this.terminalizeSnapshotOverflow();
@@ -2003,6 +2008,9 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 		this.snapshotCache = { version, snapshot: frozenSnapshot };
 		return frozenSnapshot;
 	}
+
+	/** Internal lifecycle seam for non-product runtime compositions. */
+	protected onSnapshotBuild(): void {}
 
 	private buildSessionSnapshot(
 		source: SessionLiveProjection<

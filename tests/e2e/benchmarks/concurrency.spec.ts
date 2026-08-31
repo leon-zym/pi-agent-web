@@ -16,6 +16,8 @@ import {
 	startBrowserMeasurement,
 } from "./benchmark-support";
 
+test.use({ harnessOptions: { benchmarkGateway: true } });
+
 async function sendPrompt(page: Page, prompt: string): Promise<void> {
 	await page.locator("textarea").fill(prompt);
 	await page.getByRole("button", { name: /^(Send|发送)$/ }).click();

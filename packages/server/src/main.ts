@@ -24,7 +24,13 @@ import { RecoverableSessionTrash } from "./recoverable-session-trash.js";
 import { type ProbedPiRuntime, resolvePiRuntime } from "./resolver.js";
 import { createApp } from "./routes.js";
 import { SessionLayoutResolver } from "./session-layout-resolver.js";
-import { SessionSupervisor } from "./session-supervisor.js";
+import type { SessionRuntimePiPayloadServices } from "./session-runtime.js";
+import type { SessionSupervisorMessage } from "./session-runtime-types.js";
+import {
+	SessionSupervisor,
+	type SessionSupervisorBaseOptions,
+	SessionSupervisorCore,
+} from "./session-supervisor.js";
 import { SessionWsBridge } from "./session-ws-bridge.js";
 import { WorkspacePreferences } from "./workspace-preferences.js";
 
@@ -61,6 +67,17 @@ interface ServerHandleBase<S, B> {
 /** Production handle for the single canonical Browser/Gateway protocol. */
 export interface ServerHandle extends ServerHandleBase<SessionSupervisor, SessionWsBridge> {}
 
+type RuntimeFactory = ConstructorParameters<typeof SessionSupervisorCore>[1];
+
+/**
+ * Deliberately not re-exported from the package root. This is a process-local composition seam
+ * for alternate runtime ownership while preserving the canonical public server API.
+ */
+interface ServerRuntimeComposition {
+	createRuntimeFactory: (services: SessionRuntimePiPayloadServices) => RuntimeFactory;
+	onPublication?: (message: SessionSupervisorMessage) => void;
+}
+
 function log(level: "info" | "warn" | "error", message: string): void {
 	const prefix = level === "error" ? "[pi-web] ERROR" : level === "warn" ? "[pi-web] WARN" : "[pi-web]";
 	const line = `${prefix} ${message}`;
@@ -93,6 +110,14 @@ function openBrowser(host: string, port: number): void {
 }
 
 export async function startServer(options: StartServerOptions = {}): Promise<ServerHandle> {
+	return startServerWithRuntimeComposition(options);
+}
+
+/** Module-internal composition entry; packages/server/src/index.ts intentionally does not export it. */
+export async function startServerWithRuntimeComposition(
+	options: StartServerOptions = {},
+	composition?: ServerRuntimeComposition,
+): Promise<ServerHandle> {
 	const mergedConfig: ServerConfig = { ...loadConfig(), ...options.config };
 	const config: ServerConfig = { ...mergedConfig, webDataDir: path.resolve(mergedConfig.webDataDir) };
 	assertLoopbackHost(config.host);
@@ -139,7 +164,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 		const payloadActivation = createGatewayPayloadActivation(activeContentStore, serverEpoch);
 
 		let activeBridge!: SessionWsBridge;
-		const activeSupervisor = new SessionSupervisor({
+		const supervisorOptions: SessionSupervisorBaseOptions = {
 			serverEpoch,
 			resolved: runtime,
 			envForWorkspace: (cwd) => layoutResolver.normalizedChildEnvForWorkspace(cwd),
@@ -168,14 +193,32 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 					nativeSessionId: session.nativeSessionId,
 				};
 			},
-			broadcast: (message) => activeBridge.broadcast(message),
+			broadcast: (message: SessionSupervisorMessage) => {
+				try {
+					composition?.onPublication?.(message);
+				} catch {
+					// Optional observation must not change the canonical broadcast path.
+				}
+				activeBridge.broadcast(message);
+			},
 			onHotRuntimeInventory: (inventory) => activeBridge.broadcastHotRuntimeInventory(inventory),
 			log,
-			piPayloadServices: payloadActivation.supervisorServices,
-		});
-		supervisor = activeSupervisor;
+		};
+		const activeSupervisor = composition
+			? new SessionSupervisorCore(
+					supervisorOptions,
+					composition.createRuntimeFactory(payloadActivation.supervisorServices),
+				)
+			: new SessionSupervisor({
+					...supervisorOptions,
+					piPayloadServices: payloadActivation.supervisorServices,
+				});
+		// The alternate Core receives the canonical content_ref runtime factory and implements the same
+		// gateway-consumed supervisor surface. Keep this local: package-root consumers only receive SessionSupervisor.
+		const productSupervisor = activeSupervisor as SessionSupervisor;
+		supervisor = productSupervisor;
 		activeBridge = new SessionWsBridge({
-			supervisor: activeSupervisor,
+			supervisor: productSupervisor,
 			log,
 			serverBuild: "0.1.0",
 			runtime: {
@@ -202,7 +245,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Ser
 			catalog,
 			layoutResolver,
 			preferences: activePreferences,
-			supervisor: activeSupervisor,
+			supervisor: productSupervisor,
 			trash,
 			readiness: {
 				ready: true,

@@ -23,6 +23,7 @@ for (const scenario of scenariosFor("history")) {
 	test.describe(scenario.id, () => {
 		test.use({
 			harnessOptions: {
+				benchmarkGateway: true,
 				seedHistoricalSession: {
 					userText: HISTORY_PROMPT,
 					assistantText: HISTORY_REPLY,

@@ -9,9 +9,13 @@ const fixturesDir = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(fixturesDir, "../../..");
 const defaultFakePiPath = path.join(fixturesDir, "deterministic-pi.mjs");
 const cliPath = path.join(repositoryRoot, "packages/cli/dist/cli.js");
+const benchmarkMainPath = path.join(repositoryRoot, "packages/server/dist-benchmark/benchmark-main.js");
+const benchmarkStaticDir = path.join(repositoryRoot, "packages/ui/dist");
 const LISTENING_PATTERN = /listening on (http:\/\/127\.0\.0\.1:\d+)/;
 const CREDENTIAL_ENV_PATTERN =
 	/(api[_-]?key|token|secret|password|credential|openai|anthropic|gemini|deepseek)/i;
+const BENCHMARK_GATEWAY_COUNTER_MESSAGE = "piweb-benchmark-gateway-counters";
+const BENCHMARK_COUNTER_KEYS = ["maxHeapUsedBytes", "maxRssBytes", "publicationCount", "snapshotBuildCount"];
 
 export interface HarnessWorkspace {
 	workspaceHandle: string;
@@ -72,6 +76,8 @@ export interface ProductionHarness {
 export interface StartHarnessOptions {
 	fakePiPath?: string;
 	extraEnv?: NodeJS.ProcessEnv;
+	/** Explicitly launch the benchmark-only Gateway entry and receive aggregate counters over IPC. */
+	benchmarkGateway?: boolean;
 	/** A deterministic seed exposed only to benchmark fixture processes. */
 	benchmarkSeed?: string;
 	/** Tests may reserve an explicit loopback port; the default finds one once and reuses it on restart. */
@@ -90,6 +96,41 @@ export interface GatewayObservation {
 	port: number;
 	pid: number;
 	restartCount: number;
+	benchmarkCounters?: Readonly<BenchmarkGatewayCounters>;
+}
+
+interface BenchmarkGatewayCounters {
+	maxHeapUsedBytes: number;
+	maxRssBytes: number;
+	publicationCount: number;
+	snapshotBuildCount: number;
+}
+
+interface BenchmarkGatewayCounterMessage {
+	type: typeof BENCHMARK_GATEWAY_COUNTER_MESSAGE;
+	counters: BenchmarkGatewayCounters;
+}
+
+function isSafeCounter(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isBenchmarkGatewayCounterMessage(value: unknown): value is BenchmarkGatewayCounterMessage {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const message = value as Record<string, unknown>;
+	if (Object.keys(message).sort().join(",") !== "counters,type") return false;
+	if (message.type !== BENCHMARK_GATEWAY_COUNTER_MESSAGE) return false;
+	if (typeof message.counters !== "object" || message.counters === null || Array.isArray(message.counters)) {
+		return false;
+	}
+	const counters = message.counters as Record<string, unknown>;
+	return (
+		Object.keys(counters).sort().join(",") === BENCHMARK_COUNTER_KEYS.join(",") &&
+		isSafeCounter(counters.maxHeapUsedBytes) &&
+		isSafeCounter(counters.maxRssBytes) &&
+		isSafeCounter(counters.publicationCount) &&
+		isSafeCounter(counters.snapshotBuildCount)
+	);
 }
 
 function seedHistoricalSession(
@@ -305,6 +346,22 @@ async function bootstrapGateway(origin: string, output: () => string): Promise<s
 	throw new Error(`pi-web did not become ready (${lastFailure}):\n${output()}`);
 }
 
+async function waitForBenchmarkCounters(
+	read: () => Readonly<BenchmarkGatewayCounters> | undefined,
+	readError: () => string | undefined,
+	output: () => string,
+): Promise<Readonly<BenchmarkGatewayCounters>> {
+	const deadline = Date.now() + 15_000;
+	while (Date.now() < deadline) {
+		const error = readError();
+		if (error) throw new Error(`${error}\n${output()}`);
+		const counters = read();
+		if (counters) return counters;
+		await delay(25);
+	}
+	throw new Error(`benchmark Gateway did not publish strict aggregate counters:\n${output()}`);
+}
+
 export async function startProductionHarness(options: StartHarnessOptions = {}): Promise<ProductionHarness> {
 	const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-browser-e2e-"));
 	const agentDir = path.join(rootDir, "agent");
@@ -335,36 +392,77 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 	let activeChild: ChildProcessWithoutNullStreams | undefined;
 	let cookie = "";
 	let restartCount = 0;
+	let latestBenchmarkCounters: Readonly<BenchmarkGatewayCounters> | undefined;
+	let benchmarkIpcError: string | undefined;
+	const benchmarkGateway = options.benchmarkGateway === true;
 
 	const startGateway = async (): Promise<void> => {
 		let childOutput = "";
-		const child = spawn(
-			process.execPath,
-			[
-				cliPath,
-				"--pi-path",
-				options.fakePiPath ?? defaultFakePiPath,
-				"--host",
-				"127.0.0.1",
-				"--port",
-				String(port),
-				"--no-open",
-			],
-			{
-				cwd: repositoryRoot,
-				stdio: ["pipe", "pipe", "pipe"],
-				env: childEnvironment({
-					...options.extraEnv,
-					// These isolated roots deliberately replace all default Pi roots for every launch.
-					PI_CODING_AGENT_DIR: agentDir,
-					PI_CODING_AGENT_SESSION_DIR: sessionDir,
-					PI_WEB_DATA_DIR: webDataDir,
-					PI_WEB_E2E_MARKER: markerPath,
-					PI_WEB_E2E_CONTROL_DIR: controlDir,
-					...(options.benchmarkSeed ? { PI_WEB_BENCHMARK_SEED: options.benchmarkSeed } : {}),
-				}),
-			},
-		);
+		latestBenchmarkCounters = undefined;
+		benchmarkIpcError = undefined;
+		if (benchmarkGateway && (!fs.existsSync(benchmarkMainPath) || !fs.existsSync(benchmarkStaticDir))) {
+			throw new Error(
+				"benchmark Gateway entry or built UI is missing; refusing to fall back to the standard CLI",
+			);
+		}
+		const child = (
+			benchmarkGateway
+				? spawn(
+						process.execPath,
+						[
+							benchmarkMainPath,
+							"--pi-path",
+							options.fakePiPath ?? defaultFakePiPath,
+							"--host",
+							"127.0.0.1",
+							"--port",
+							String(port),
+							"--no-open",
+						],
+						{
+							cwd: repositoryRoot,
+							stdio: ["pipe", "pipe", "pipe", "ipc"],
+							env: childEnvironment({
+								...options.extraEnv,
+								// These isolated roots deliberately replace all default Pi roots for every launch.
+								PI_CODING_AGENT_DIR: agentDir,
+								PI_CODING_AGENT_SESSION_DIR: sessionDir,
+								PI_WEB_DATA_DIR: webDataDir,
+								PI_WEB_E2E_MARKER: markerPath,
+								PI_WEB_E2E_CONTROL_DIR: controlDir,
+								PI_WEB_BENCHMARK_STATIC_DIR: benchmarkStaticDir,
+								...(options.benchmarkSeed ? { PI_WEB_BENCHMARK_SEED: options.benchmarkSeed } : {}),
+							}),
+						},
+					)
+				: spawn(
+						process.execPath,
+						[
+							cliPath,
+							"--pi-path",
+							options.fakePiPath ?? defaultFakePiPath,
+							"--host",
+							"127.0.0.1",
+							"--port",
+							String(port),
+							"--no-open",
+						],
+						{
+							cwd: repositoryRoot,
+							stdio: ["pipe", "pipe", "pipe"],
+							env: childEnvironment({
+								...options.extraEnv,
+								// These isolated roots deliberately replace all default Pi roots for every launch.
+								PI_CODING_AGENT_DIR: agentDir,
+								PI_CODING_AGENT_SESSION_DIR: sessionDir,
+								PI_WEB_DATA_DIR: webDataDir,
+								PI_WEB_E2E_MARKER: markerPath,
+								PI_WEB_E2E_CONTROL_DIR: controlDir,
+								...(options.benchmarkSeed ? { PI_WEB_BENCHMARK_SEED: options.benchmarkSeed } : {}),
+							}),
+						},
+					)
+		) as ChildProcessWithoutNullStreams;
 		activeChild = child;
 		child.stdout.setEncoding("utf8");
 		child.stderr.setEncoding("utf8");
@@ -375,12 +473,28 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 		};
 		child.stdout.on("data", recordOutput);
 		child.stderr.on("data", recordOutput);
+		if (benchmarkGateway) {
+			child.on("message", (message: unknown) => {
+				if (!isBenchmarkGatewayCounterMessage(message)) {
+					benchmarkIpcError = "benchmark Gateway sent a non-counter IPC payload";
+					return;
+				}
+				latestBenchmarkCounters = Object.freeze({ ...message.counters });
+			});
+		}
 		try {
 			const observedOrigin = await waitForListening(child, () => childOutput);
 			if (observedOrigin !== origin) {
 				throw new Error(`gateway listened on ${observedOrigin}, expected stable origin ${origin}`);
 			}
 			cookie = await bootstrapGateway(origin, () => childOutput);
+			if (benchmarkGateway) {
+				await waitForBenchmarkCounters(
+					() => latestBenchmarkCounters,
+					() => benchmarkIpcError,
+					() => childOutput,
+				);
+			}
 		} catch (error) {
 			await terminate(child);
 			if (activeChild === child) activeChild = undefined;
@@ -390,7 +504,16 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 
 	const observation = (): GatewayObservation => {
 		if (!activeChild?.pid) throw new Error("production harness gateway is not running");
-		return { origin, port, pid: activeChild.pid, restartCount };
+		if (!benchmarkGateway) return { origin, port, pid: activeChild.pid, restartCount };
+		if (benchmarkIpcError) throw new Error(benchmarkIpcError);
+		if (!latestBenchmarkCounters) throw new Error("benchmark Gateway counters are unavailable");
+		return {
+			origin,
+			port,
+			pid: activeChild.pid,
+			restartCount,
+			benchmarkCounters: Object.freeze({ ...latestBenchmarkCounters }),
+		};
 	};
 
 	try {

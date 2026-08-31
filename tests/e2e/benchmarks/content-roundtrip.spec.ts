@@ -10,6 +10,8 @@ import {
 	scenariosFor,
 } from "./benchmark-support";
 
+test.use({ harnessOptions: { benchmarkGateway: true } });
+
 const PROMPT = "E2E_PAYLOAD_ATTACHMENT";
 
 interface WireFrame extends Record<string, unknown> {

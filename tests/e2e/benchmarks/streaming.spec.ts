@@ -12,6 +12,8 @@ import {
 	startBrowserMeasurement,
 } from "./benchmark-support";
 
+test.use({ harnessOptions: { benchmarkGateway: true } });
+
 for (const scenario of scenariosFor("streaming")) {
 	test(`${scenario.id} emits a reproducible Chromium streaming profile`, async ({
 		page,

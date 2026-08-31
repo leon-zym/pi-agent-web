@@ -14,6 +14,8 @@ import {
 	scenariosFor,
 } from "./benchmark-support";
 
+test.use({ harnessOptions: { benchmarkGateway: true } });
+
 interface WireFrame extends Record<string, unknown> {
 	type?: string;
 	sessionHandle?: string;
