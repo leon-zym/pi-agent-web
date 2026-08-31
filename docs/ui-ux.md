@@ -38,8 +38,11 @@ One connection carries all active Session channels. Connection state is global; 
 controller ownership, generation, recovery, and errors are displayed per Session.
 
 Read-only observers can inspect and follow a Session without claiming control. A mutation claims or
-uses the current controller lease and exact fence. If another Browser owns control, the UI explains
-the conflict and offers an explicit claim path. It never retries an uncertain mutation silently.
+uses the current controller lease and exact fence. If another Browser owns control, the UI shows a
+per-Session view-only state, explains the conflict, and offers an explicit `Take over` action when
+the authoritative lease permits it. The confirmation names the current Session, keeps the Agent
+running, makes the previous page read-only, and preserves already-admitted work. It never retries an
+uncertain mutation silently.
 
 Command completion waits for both the response and its projection barrier. Disconnect, identity
 change, stale fence, or sequence uncertainty preserves the user's draft when safe and presents an
@@ -114,8 +117,10 @@ Ordered Extension requests belong to one Session and generation. Dialogs, questi
 widgets, notifications, and status updates keep that identity even when the user navigates away.
 
 Blocking requests remain discoverable. A minimized request uses a visible dock rather than
-disappearing. Question choices, free text, confirmation, cancel, and keyboard focus are accessible.
-Submitting, replacing, aborting, or settling a request closes its obsolete UI synchronously.
+disappearing. An observer still sees the pending request and its deadline read-only, with the same
+Session-scoped takeover action; only the current controller can answer or cancel it. Question choices,
+free text, confirmation, cancel, and keyboard focus are accessible. Submitting, replacing, aborting,
+or settling a request closes its obsolete UI synchronously.
 
 ## Details and destructive actions
 

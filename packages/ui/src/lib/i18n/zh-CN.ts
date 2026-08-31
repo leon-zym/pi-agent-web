@@ -310,6 +310,7 @@ export const zhCN = {
 	"ext.confirm": "确认",
 	"ext.dockTitle": "待处理扩展交互",
 	"ext.dockDeadline": "剩余 {seconds} 秒",
+	"ext.dialogDeadline": "{seconds} 秒后超时",
 	"ext.other": "其他…",
 	"ext.customInput": "自定义输入",
 	"ext.recommended": "推荐",
@@ -372,8 +373,23 @@ export const zhCN = {
 	"transport.commandTimeout": "命令超时：{command}",
 
 	// Session controller lease
-	"lease.readOnly": "另一标签页正在控制此会话；关闭它后重新选择此 Session 即可接管",
-	"lease.observer": "当前为只读模式；关闭原控制标签页后，请重新选择此会话以接管。",
+	"lease.controller": "当前页面拥有控制权",
+	"lease.viewOnly": "只读观察",
+	"lease.reconnecting": "正在连接控制权",
+	"lease.takeOver": "接管 Session",
+	"lease.takeOverPending": "正在接管…",
+	"lease.takeOverTitle": "接管此 Session？",
+	"lease.takeOverDescription":
+		"这只会影响当前 Session。不会停止 Agent；之前的页面会变为只读，已经接纳的工作会继续执行。",
+	"lease.observerBanner": "另一个页面正在控制此 Session。当前输入已禁用；你可以接管控制权。",
+	"lease.reconnectingDescription": "正在重新连接此 Session 的控制状态；输入和扩展响应暂时不可用。",
+	"lease.revoked": "此页面已失去当前 Session 的控制权。Agent 不会停止，已经接纳的工作会继续执行。",
+	"lease.takeoverFailed": "接管失败；请等待最新控制状态后重试。",
+	"lease.takeoverStale": "接管请求基于旧的控制状态；请等待同步后重试。",
+	"lease.takeoverGenerationStale": "此 Session 已变化；请等待同步后重试。",
+	"lease.takeoverUnavailable": "此 Session 当前不可接管。",
+	"lease.readOnly": "另一页面正在控制此 Session；当前输入为只读，可使用“接管 Session”获取控制权",
+	"lease.observer": "当前为只读模式；另一个页面拥有控制权。",
 	"lease.observerPlaceholder": "当前标签页为只读模式",
 
 	// System status rows

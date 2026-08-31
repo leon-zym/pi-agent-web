@@ -758,7 +758,14 @@ test("a reopened observer restores seven hot Runtimes but only the controller an
 		await observerDialogRow.getByRole("button").first().click();
 		await expect(observerPage.locator("textarea")).toBeDisabled();
 		await expect(observerPage.locator("header").getByText(/^(Waiting for input|等待输入)$/)).toBeVisible();
-		await expect(observerPage.getByRole("dialog", { name: "Synthetic approval" })).toHaveCount(0);
+		const observerDialog = observerPage.getByRole("dialog", { name: "Synthetic approval" });
+		await expect(observerDialog).toBeVisible();
+		await expect(observerDialog.getByRole("button", { name: /^(Confirm|确认)$/ })).toBeDisabled();
+		await expect(
+			observerDialog
+				.getByTestId("extension-session-control")
+				.getByRole("button", { name: /^(Take over Session|接管 Session)$/ }),
+		).toBeVisible();
 		await expect
 			.poll(
 				() =>

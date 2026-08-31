@@ -1118,6 +1118,7 @@ function streamExtensionPrompt(command, text, user, userEntryId) {
 			method: "confirm",
 			title: "Synthetic approval",
 			message: "Continue the synthetic run?",
+			timeout: 30_000,
 		});
 		record("extension_request", { commandId: command.id, text, requestId });
 	});

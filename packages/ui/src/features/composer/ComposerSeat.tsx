@@ -25,15 +25,16 @@ import { stripAnsi } from "../../lib/format";
 import { tt, useT } from "../../lib/i18n";
 import { ImageAttachmentError, prepareImageAttachments } from "../../lib/image-attachments";
 import { runtimeIsBusy } from "../../lib/runtime-state";
-import { isSessionControlReady } from "../../lib/session-capabilities";
 import { abortCurrentRun, submitDraft } from "../../lib/session-controller";
 import { cn } from "../../lib/utils";
 import { type SlashCommandToken, serializeComposerMessage, useComposerStore } from "../../stores/composer";
 import { selectActiveTurnId, useProjectionStore } from "../../stores/projection";
+import { useSessionControlStatus } from "../../stores/session-control";
 import { reconcileHiddenSessionLifecycle, useSessionDirectoryStore } from "../../stores/session-directory";
 import { useSessionTransportStore } from "../../stores/session-transport";
 import { useSlashCommandsStore } from "../../stores/slash-commands";
 import { ChatDock } from "../extension-ui/ChatDock";
+import { SessionControlStatus } from "../session-control/SessionControlStatus";
 import { ContextMeter } from "./ContextMeter";
 import {
 	detectMentionTrigger,
@@ -123,10 +124,8 @@ export function ComposerSeat() {
 	const setDeliveryMode = useComposerStore((s) => s.setDeliveryMode);
 	const setIsExpanded = useComposerStore((s) => s.setIsExpanded);
 
-	const canControl = useSessionTransportStore((state) => {
-		const channel = sessionHandle ? state.sessions[sessionHandle] : undefined;
-		return isSessionControlReady(channel);
-	});
+	const controlStatus = useSessionControlStatus(sessionHandle);
+	const canControl = controlStatus.canControl;
 	const runtimeBusy = useSessionTransportStore((state) => {
 		const runtime = sessionHandle ? state.sessions[sessionHandle]?.runtime : undefined;
 		return runtimeIsBusy(runtime);
@@ -328,10 +327,8 @@ export function ComposerSeat() {
 		<div className="relative mx-auto w-full max-w-[780px] px-3 pb-3 sm:px-4">
 			<ChatDock />
 			<QueueDock />
-			{hasWorkspace && !canControl && (
-				<p className="mb-2 rounded-sm bg-surface-2 px-3 py-2 text-[12px] text-ink-3">
-					{tt("lease.readOnly")}
-				</p>
+			{hasWorkspace && sessionHandle && (
+				<SessionControlStatus sessionHandle={sessionHandle} surface="composer" />
 			)}
 			{trigger && (
 				<SlashMenu

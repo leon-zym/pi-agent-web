@@ -1,5 +1,5 @@
 import { Minus } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Button } from "../../components/ui/button";
 import {
 	Dialog,
@@ -15,9 +15,9 @@ import { Textarea } from "../../components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../components/ui/tooltip";
 import { displayLabel, stripAnsi } from "../../lib/format";
 import { tt } from "../../lib/i18n";
-import { isSessionControlReady } from "../../lib/session-capabilities";
 import { type PendingDialog, useExtensionUiStore } from "../../stores/extension-ui";
-import { useSessionTransportStore } from "../../stores/session-transport";
+import { useSessionControlStatus } from "../../stores/session-control";
+import { SessionControlStatus } from "../session-control/SessionControlStatus";
 import { QuestionCard } from "./QuestionCard";
 
 /**
@@ -29,11 +29,7 @@ export function ExtensionDialogs() {
 	const dialogs = useExtensionUiStore((s) => s.dialogs);
 	const minimizedDialogIds = useExtensionUiStore((s) => s.minimizedDialogIds);
 	const dialog = dialogs.find((d) => !minimizedDialogIds[d.request.id]);
-	const canControl = useSessionTransportStore((state) => {
-		const channel = dialog ? state.sessions[dialog.sessionHandle] : undefined;
-		return isSessionControlReady(channel);
-	});
-	if (!dialog || !canControl) return null;
+	if (!dialog) return null;
 	return <DialogView key={dialog.request.id} dialog={dialog} />;
 }
 
@@ -47,12 +43,25 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 
 	const respond = useExtensionUiStore((s) => s.respond);
 	const minimize = useExtensionUiStore((s) => s.minimize);
-	const canControl = useSessionTransportStore((state) => {
-		const channel = state.sessions[dialog.sessionHandle];
-		return isSessionControlReady(channel);
+	const controlStatus = useSessionControlStatus(dialog.sessionHandle);
+	const canControl = controlStatus.canControl;
+	const [secondsLeft, setSecondsLeft] = useState<number | null>(() => {
+		if (!dialog.deadlineAt) return null;
+		return Math.max(0, Math.ceil((dialog.deadlineAt - Date.now()) / 1000));
 	});
 
+	useEffect(() => {
+		if (!dialog.deadlineAt) return;
+		const update = () => {
+			setSecondsLeft(Math.max(0, Math.ceil((dialog.deadlineAt! - Date.now()) / 1000)));
+		};
+		update();
+		const interval = setInterval(update, 1000);
+		return () => clearInterval(interval);
+	}, [dialog.deadlineAt]);
+
 	const cancel = () => {
+		if (!canControl) return;
 		if (useExtensionUiStore.getState().minimizedDialogIds[request.id]) return;
 		if (useExtensionUiStore.getState().dialogs.some((d) => d.request.id === request.id)) {
 			respond(dialog, { type: "extension_ui_response", id: request.id, cancelled: true });
@@ -60,6 +69,7 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 	};
 
 	const confirm = () => {
+		if (!canControl) return;
 		if (request.method === "select") {
 			if (selected === null) return;
 			respond(dialog, { type: "extension_ui_response", id: request.id, value: selected });
@@ -85,8 +95,9 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 		>
 			<DialogContent
 				className={request.method === "editor" ? "max-w-2xl" : "max-w-md"}
+				showCloseButton={canControl}
 				onInteractOutside={(event) => {
-					if (request.method === "editor") event.preventDefault();
+					if (request.method === "editor" || !canControl) event.preventDefault();
 				}}
 			>
 				<DialogHeader>
@@ -109,6 +120,7 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 					</div>
 					{body && <DialogDescription>{body}</DialogDescription>}
 				</DialogHeader>
+				<SessionControlStatus sessionHandle={dialog.sessionHandle} surface="extension" showNotice={false} />
 
 				{request.method === "select" && (
 					<QuestionCard
@@ -124,7 +136,7 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 						<Label htmlFor="ext-input">{tt("ext.input")}</Label>
 						<Input
 							id="ext-input"
-							autoFocus
+							autoFocus={canControl}
 							value={value}
 							placeholder={request.placeholder ? displayLabel(request.placeholder) : undefined}
 							onChange={(event) => setValue(event.target.value)}
@@ -138,7 +150,7 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 
 				{request.method === "editor" && (
 					<Textarea
-						autoFocus
+						autoFocus={canControl}
 						value={editorText}
 						onChange={(event) => setEditorText(event.target.value)}
 						disabled={!canControl || dialog.responding}
@@ -147,8 +159,11 @@ function DialogView({ dialog }: { dialog: PendingDialog }) {
 					/>
 				)}
 
-				{"timeout" in request && request.timeout !== undefined && (
-					<p className="text-[12px] text-ink-3">{tt("ext.timeoutHint")}</p>
+				{secondsLeft !== null ? (
+					<p className="text-[12px] text-ink-3">{tt("ext.dialogDeadline", { seconds: secondsLeft })}</p>
+				) : (
+					"timeout" in request &&
+					request.timeout !== undefined && <p className="text-[12px] text-ink-3">{tt("ext.timeoutHint")}</p>
 				)}
 
 				<DialogFooter>

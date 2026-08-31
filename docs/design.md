@@ -120,8 +120,9 @@ language. Only one surface owns focus at a time. Layering must remain predictabl
 details panel, and mobile sheets.
 
 Blocking Extension requests remain discoverable if minimized. Questions use clear choice states and
-a separate confirmation action. Notifications and audio are supplemental feedback, never the only
-feedback.
+a separate confirmation action. Observers see the request and deadline without response authority,
+and receive the same Session takeover action used by the composer. Notifications and audio are
+supplemental feedback, never the only feedback.
 
 ## Motion and feedback
 

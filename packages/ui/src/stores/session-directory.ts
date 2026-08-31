@@ -14,6 +14,7 @@ import { useComposerStore } from "./composer";
 import { useExtensionUiStore } from "./extension-ui";
 import { useModelDirectoryStore } from "./model-directory";
 import { useProjectionStore } from "./projection";
+import { useSessionControlStore } from "./session-control";
 import { useSessionStatsStore } from "./session-stats";
 import { hasFreshLeaseBaseline, sessionTransport } from "./session-transport";
 import { useSlashCommandsStore } from "./slash-commands";
@@ -1071,6 +1072,7 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 		useSlashCommandsStore.getState().forgetSession(sessionHandle);
 		useSessionStatsStore.getState().forgetSession(sessionHandle);
 		useExtensionUiStore.getState().forgetSession(sessionHandle);
+		useSessionControlStore.getState().forgetSession(sessionHandle);
 		useProjectionStore.getState().resetSession(sessionHandle);
 	},
 

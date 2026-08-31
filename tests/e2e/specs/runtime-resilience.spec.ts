@@ -192,7 +192,14 @@ test("a second BrowserContext observes one Session without acquiring mutation co
 			/^(Read-only in this tab|当前标签页为只读模式)$/,
 		);
 		await expect(
-			observer.page.getByText(/^(Another tab controls this Session|另一标签页正在控制此会话)/),
+			observer.page
+				.getByTestId("composer-session-control")
+				.getByText(/(Another page controls this Session|另一个页面正在控制此 Session)/),
+		).toBeVisible();
+		await expect(
+			observer.page
+				.getByTestId("composer-session-control")
+				.getByRole("button", { name: /^(Take over Session|接管 Session)$/ }),
 		).toBeVisible();
 		await expect(observer.page.getByRole("button", { name: /^(Steer send|插队发送)$/ })).toBeDisabled();
 
