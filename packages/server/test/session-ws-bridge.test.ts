@@ -3863,6 +3863,62 @@ describe("SessionWsBridge", () => {
 		).resolves.toMatchObject({ response: { success: false, error: "session_read_only" } });
 	});
 
+	it("characterizes first-claim-wins observer races without leaking requester responses", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "observer-race");
+		const harness = await createHarness([target]);
+		const owner = await openClient(harness);
+		const leftObserver = await openClient(harness);
+		const rightObserver = await openClient(harness);
+		const ownerSubscription = await subscribe(owner, target.sessionHandle);
+		await subscribe(leftObserver, target.sessionHandle);
+		await subscribe(rightObserver, target.sessionHandle);
+		expect((await claim(owner, target.sessionHandle)).isController).toBe(true);
+
+		const rightObserverMark = rightObserver.mark();
+		await expect(
+			command(leftObserver, target.sessionHandle, ownerSubscription.runtime.generation, {
+				id: "observer-read-only-response",
+				type: "get_state",
+			}),
+		).resolves.toMatchObject({ response: { success: true } });
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(
+			rightObserver.frames
+				.slice(rightObserverMark)
+				.filter((frame) => frame.type === "response" && frame.response.id === "observer-read-only-response"),
+		).toEqual([]);
+
+		const deniedRacers = await Promise.all([
+			claim(leftObserver, target.sessionHandle),
+			claim(rightObserver, target.sessionHandle),
+		]);
+		for (const lease of deniedRacers) {
+			expect(lease.isController).toBe(false);
+			expect(lease.fencingToken).toBeUndefined();
+		}
+
+		owner.send({ type: "session_release", sessionHandle: target.sessionHandle });
+		await owner.waitForFrame(
+			(frame): frame is LeaseFrame =>
+				frame.type === "lease_status" &&
+				frame.sessionHandle === target.sessionHandle &&
+				frame.isController === false,
+		);
+		const successors = await Promise.all([
+			claim(leftObserver, target.sessionHandle),
+			claim(rightObserver, target.sessionHandle),
+		]);
+		const winner = successors.find((lease) => lease.isController);
+		const loser = successors.find((lease) => !lease.isController);
+		if (!winner?.fencingToken || !loser)
+			throw new Error("observer claim race did not settle to one controller");
+		expect(successors.filter((lease) => lease.isController)).toHaveLength(1);
+		expect(loser.fencingToken).toBeUndefined();
+	});
+
 	it("releases controller ownership on unsubscribe and through a stale pre-rekey handle", async () => {
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace");

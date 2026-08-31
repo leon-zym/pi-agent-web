@@ -2941,6 +2941,51 @@ describe("SessionSupervisor", () => {
 		).rejects.toThrow("session_read_only");
 	});
 
+	it("keeps admitted work alive but fences later mutations after the controller releases", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		const checkpointDir = path.join(root, "checkpoints");
+		fs.mkdirSync(cwd);
+		fs.mkdirSync(checkpointDir);
+		const target = createNativeSession(root, cwd, "lease-admission-boundary");
+		const { supervisor } = createHarness({
+			targets: [target],
+			env: { PI_WEB_FIXTURE_CHECKPOINT_DIR: checkpointDir },
+		});
+		const lease = await supervisor.claim(target.sessionHandle, "controller");
+		if (!lease.fencingToken) throw new Error("controller lease was not granted");
+		const runtime = supervisor.getRuntime(target.sessionHandle)!;
+
+		const accepted = await supervisor.sendCommand(
+			target.sessionHandle,
+			{ id: "admitted-before-release", type: "prompt", message: "snapshot-checkpoint:thinking" },
+			{
+				connectionId: "controller",
+				expectedGeneration: runtime.generation,
+				fencingToken: lease.fencingToken,
+			},
+		);
+		expect(accepted.response).toMatchObject({ command: "prompt", success: true });
+		expect(supervisor.getRuntime(target.sessionHandle)?.state).toBe("running");
+
+		expect(supervisor.release(target.sessionHandle, "controller")).toBe(true);
+		await expect(
+			supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "set_session_name", name: "must-not-admit-after-release" },
+				{
+					connectionId: "controller",
+					expectedGeneration: runtime.generation,
+					fencingToken: lease.fencingToken,
+				},
+			),
+		).rejects.toThrow("session_read_only");
+		expect(supervisor.getRuntime(target.sessionHandle)?.state).toBe("running");
+
+		fs.writeFileSync(path.join(checkpointDir, `${target.nativeSessionId}-thinking.release`), "");
+		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "idle");
+	});
+
 	it("returns replay gaps explicitly instead of silently dropping events", async () => {
 		const root = temporaryRoot();
 		const cwd = path.join(root, "workspace");

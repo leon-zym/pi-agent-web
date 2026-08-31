@@ -3627,6 +3627,52 @@ describe("session transport commands and identity", () => {
 		expect(socket.sent).toContainEqual({ type: "session_release", sessionHandle: "session-a" });
 	});
 
+	it("retains a waiting Extension request while observer controls are fenced", async () => {
+		const h = harness();
+		const socket = connect(h);
+		subscribeAndPrime(h, "session-a");
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "session-a",
+			generation: 1,
+			isController: true,
+			fencingToken: "owner-token",
+		});
+		socket.serverMessage(extensionFrame("session-a", 1, 1, extensionRequest("waiting-observer-dialog")));
+		await flushPromises();
+		expect(h.controller.store.getState().sessions["session-a"]?.pendingExtensionRequests).toMatchObject([
+			{ id: "waiting-observer-dialog" },
+		]);
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "session-a",
+			generation: 1,
+			isController: false,
+		});
+		await flushPromises();
+
+		expect(h.controller.store.getState().sessions["session-a"]).toMatchObject({
+			lease: { isController: false },
+			pendingExtensionRequests: [{ id: "waiting-observer-dialog" }],
+		});
+		expect(
+			h.controller.store.getState().sendExtensionUiResponse("session-a", {
+				type: "extension_ui_response",
+				id: "waiting-observer-dialog",
+				confirmed: true,
+			}),
+		).toBe(false);
+		await expect(
+			h.controller.store.getState().sendCommand("session-a", {
+				id: "observer-prompt",
+				type: "prompt",
+				message: "must remain read-only",
+			}),
+		).rejects.toMatchObject({ code: "session_read_only" });
+	});
+
 	it("rejects a late controller acknowledgement after the release intent changed", () => {
 		const h = harness();
 		const socket = connect(h);
