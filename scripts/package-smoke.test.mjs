@@ -57,6 +57,41 @@ function omitTarDirectoryHeaders(archive, paths) {
 	return compressed;
 }
 
+function appendDuplicateFileMember(archive, entryPath, replacementContent) {
+	const unpacked = gunzipSync(archive);
+	let offset = 0;
+	let sourceRecord;
+	while (offset + TAR_BLOCK_BYTES <= unpacked.byteLength) {
+		const header = unpacked.subarray(offset, offset + TAR_BLOCK_BYTES);
+		if (header.every((byte) => byte === 0)) break;
+		const recordLength = archiveEntryByteLength(header);
+		if (archiveEntryPath(header).replace(/\/$/, "") === entryPath) {
+			sourceRecord = Buffer.from(unpacked.subarray(offset, offset + recordLength));
+			break;
+		}
+		offset += recordLength;
+	}
+	if (!sourceRecord) throw new Error(`archive has no ${entryPath} member`);
+	const originalSize = Number.parseInt(
+		sourceRecord.subarray(124, 136).toString("utf8").replace(/\0.*$/, "").trim(),
+		8,
+	);
+	if (replacementContent.byteLength !== originalSize) {
+		throw new Error("duplicate fixture content must preserve the original tar member size");
+	}
+	replacementContent.copy(sourceRecord, TAR_BLOCK_BYTES);
+	const terminator = unpacked.subarray(unpacked.byteLength - TAR_BLOCK_BYTES * 2);
+	const duplicated = Buffer.concat([
+		unpacked.subarray(0, unpacked.byteLength - TAR_BLOCK_BYTES * 2),
+		sourceRecord,
+		terminator,
+	]);
+	const compressed = gzipSync(duplicated, { level: 9 });
+	compressed.writeUInt32LE(0, 4);
+	compressed[9] = 255;
+	return compressed;
+}
+
 function writePackageTarball(root, name, manifest = {}, options = {}) {
 	const { includeDistFile = true, extraEntries = [], omittedDirectoryHeaders = [] } = options;
 	fs.mkdirSync(root, { recursive: true });
@@ -185,6 +220,19 @@ test("rejects source file entries without an explicit source directory header", 
 		),
 	);
 	assert.throws(() => inspectPackageTarballs(tarballs), /Source directory leaked/);
+});
+
+test("rejects a duplicate packaged CLI member before installation", () => {
+	const root = tempRoot();
+	const tarballs = PACKAGE_NAMES.map((name) => writePackageTarball(root, name));
+	const cliTarball = tarballs.find((tarball) => tarball.includes("pi-agent-web-cli"));
+	const duplicate = appendDuplicateFileMember(
+		fs.readFileSync(cliTarball),
+		"package/dist/index.js",
+		Buffer.from("last-last!\n"),
+	);
+	fs.writeFileSync(cliTarball, duplicate);
+	assert.throws(() => inspectPackageTarballs(tarballs), /duplicated|duplicate/i);
 });
 
 test("requires installed product packages to be real paths outside the workspace", () => {

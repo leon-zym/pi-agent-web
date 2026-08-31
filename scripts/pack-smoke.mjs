@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
+	assertCommittedBundleOutput,
 	createReleaseBundle,
 	createSanitizedNpmEnvironment,
 	inspectDeterministicTarGz,
@@ -491,6 +492,10 @@ const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-pack-smoke-"));
 try {
 	const bundleOutput = path.join(tempRoot, "bundle-output");
 	const bundle = createReleaseBundle({ mode: "candidate", outputDir: bundleOutput });
+	assertCommittedBundleOutput({
+		outputRoot: bundle.outputRoot,
+		archiveName: path.basename(bundle.archivePath),
+	});
 	const archive = fs.readFileSync(bundle.archivePath);
 	const entries = inspectDeterministicTarGz(archive, { rootName: bundle.manifest.bundle.name });
 	if (entries.some((entry) => entry.path.includes("..")))

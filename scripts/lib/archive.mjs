@@ -211,6 +211,7 @@ function assertHarmlessGlobalPaxHeader(content) {
 
 function parseTarEntries(unpacked, { allowHarmlessGlobalPax = false } = {}) {
 	const entries = [];
+	const seenPaths = new Set();
 	let offset = 0;
 	let terminated = false;
 	while (offset + ARCHIVE_BLOCK_BYTES <= unpacked.byteLength) {
@@ -259,6 +260,10 @@ function parseTarEntries(unpacked, { allowHarmlessGlobalPax = false } = {}) {
 			offset = contentEnd + archivePadding(size);
 			continue;
 		}
+		if (seenPaths.has(archivePath)) {
+			throw new Error(`archive entry is duplicated: ${archivePath}`);
+		}
+		seenPaths.add(archivePath);
 		entries.push({
 			path: archivePath,
 			type,
@@ -354,49 +359,131 @@ function isWithin(candidate, parent) {
 	return candidate === parent || candidate.startsWith(`${parent}${path.sep}`);
 }
 
-function lstatOrNull(filePath) {
+function lstatOrNull(filePath, operations = fs) {
 	try {
-		return fs.lstatSync(filePath);
+		return operations.lstatSync(filePath);
 	} catch (error) {
 		if (error?.code === "ENOENT") return null;
 		throw error;
 	}
 }
 
-function assertRealDirectory(directory, root) {
-	const stat = fs.lstatSync(directory);
+function assertRealDirectory(directory, root, operations = fs) {
+	const stat = operations.lstatSync(directory);
 	if (stat.isSymbolicLink() || !stat.isDirectory())
 		throw new Error(`archive extraction path is not a real directory: ${directory}`);
-	const realDirectory = fs.realpathSync(directory);
+	const realDirectory = operations.realpathSync(directory);
 	if (!isWithin(realDirectory, root)) throw new Error("archive extraction path escapes its root");
 	return realDirectory;
 }
 
-/** Extracts only parsed regular files/directories into a caller-owned empty tree. */
-export function extractTarEntries(entries, destinationRoot) {
+function assertNoSymlinkAncestors(directory, operations) {
+	const immediateParent = path.resolve(directory);
+	for (let candidate = immediateParent; ; candidate = path.dirname(candidate)) {
+		const stat = lstatOrNull(candidate, operations);
+		if (stat) {
+			if (stat.isSymbolicLink() && candidate === immediateParent) {
+				throw new Error(`archive extraction ancestor must not be a symlink: ${candidate}`);
+			}
+			if (!stat.isDirectory() && !stat.isSymbolicLink()) {
+				throw new Error(`archive extraction ancestor is not a directory: ${candidate}`);
+			}
+		}
+		if (path.dirname(candidate) === candidate) return;
+	}
+}
+
+function createOwnedExtractionRoot(destinationRoot, operations = fs) {
 	const resolvedRoot = path.resolve(destinationRoot);
-	fs.mkdirSync(resolvedRoot, { recursive: true, mode: DIRECTORY_MODE });
-	const realRoot = fs.realpathSync(resolvedRoot);
+	if (lstatOrNull(resolvedRoot, operations)) {
+		throw new Error(`archive extraction root must be newly created: ${resolvedRoot}`);
+	}
+	const parent = path.dirname(resolvedRoot);
+	assertNoSymlinkAncestors(parent, operations);
+	const parentStat = operations.lstatSync(parent);
+	if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {
+		throw new Error(`archive extraction parent must be a real directory: ${parent}`);
+	}
+	const realParent = operations.realpathSync(parent);
+	const canonicalRoot = path.join(realParent, path.basename(resolvedRoot));
+	if (lstatOrNull(canonicalRoot, operations)) {
+		throw new Error(`archive extraction root must be newly created: ${resolvedRoot}`);
+	}
+	try {
+		operations.mkdirSync(canonicalRoot, { mode: DIRECTORY_MODE });
+	} catch (error) {
+		if (error?.code === "EEXIST") {
+			throw new Error(`archive extraction root must be newly created: ${resolvedRoot}`);
+		}
+		throw error;
+	}
+	const rootStat = operations.lstatSync(canonicalRoot);
+	if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+		throw new Error(`archive extraction root is not a real directory: ${canonicalRoot}`);
+	}
+	const realRoot = operations.realpathSync(canonicalRoot);
+	if (path.dirname(realRoot) !== realParent || operations.readdirSync(realRoot).length !== 0) {
+		throw new Error("archive extraction root changed while it was being created");
+	}
+	return realRoot;
+}
+
+function createOwnedDirectory(root, segments, mode, operations) {
+	let current = root;
+	for (const segment of segments) {
+		const candidate = path.join(current, segment);
+		const existing = lstatOrNull(candidate, operations);
+		if (!existing) {
+			try {
+				operations.mkdirSync(candidate, { mode });
+			} catch (error) {
+				if (error?.code === "EEXIST") {
+					throw new Error(`archive extraction directory was concurrently created: ${candidate}`);
+				}
+				throw error;
+			}
+		}
+		current = assertRealDirectory(candidate, root, operations);
+	}
+	return current;
+}
+
+/** Extracts only parsed regular files/directories into a caller-owned empty tree. */
+export function extractTarEntries(entries, destinationRoot, { operations = fs } = {}) {
+	if (!Array.isArray(entries)) throw new Error("archive extraction requires parsed entries");
+	const realRoot = createOwnedExtractionRoot(destinationRoot, operations);
 	for (const entry of entries) {
-		const destination = path.resolve(resolvedRoot, ...entry.path.split("/"));
-		if (!isWithin(destination, resolvedRoot))
-			throw new Error(`archive entry escapes extraction root: ${entry.path}`);
-		const parent = path.dirname(destination);
-		fs.mkdirSync(parent, { recursive: true, mode: DIRECTORY_MODE });
-		assertRealDirectory(parent, realRoot);
+		const segments = assertSafeArchivePath(entry.path).split("/");
+		const parent = createOwnedDirectory(realRoot, segments.slice(0, -1), DIRECTORY_MODE, operations);
+		const destination = path.join(parent, segments.at(-1));
 		if (entry.type === "directory") {
-			const existing = lstatOrNull(destination);
+			const existing = lstatOrNull(destination, operations);
 			if (existing) {
-				assertRealDirectory(destination, realRoot);
+				assertRealDirectory(destination, realRoot, operations);
 				continue;
 			}
-			fs.mkdirSync(destination, { mode: entry.mode });
-			fs.chmodSync(destination, entry.mode);
+			try {
+				operations.mkdirSync(destination, { mode: entry.mode });
+			} catch (error) {
+				if (error?.code === "EEXIST") {
+					throw new Error(`archive extraction directory was concurrently created: ${destination}`);
+				}
+				throw error;
+			}
+			assertRealDirectory(destination, realRoot, operations);
+			operations.chmodSync(destination, entry.mode);
 			continue;
 		}
 		if (entry.type !== "file") throw new Error(`archive entry ${entry.path} has an unsupported type`);
-		fs.writeFileSync(destination, entry.content, { flag: "wx", mode: entry.mode });
-		fs.chmodSync(destination, entry.mode);
+		try {
+			operations.writeFileSync(destination, entry.content, { flag: "wx", mode: entry.mode });
+		} catch (error) {
+			if (error?.code === "EEXIST") {
+				throw new Error(`archive extraction file was concurrently created: ${destination}`);
+			}
+			throw error;
+		}
+		operations.chmodSync(destination, entry.mode);
 	}
 	return realRoot;
 }

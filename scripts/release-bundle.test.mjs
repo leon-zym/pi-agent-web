@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { gunzipSync, gzipSync } from "node:zlib";
 import {
+	assertCommittedBundleOutput,
 	createBundleRootManifest,
 	createDeterministicTarGz,
 	createImmutableSourceSnapshot,
@@ -20,6 +22,7 @@ import {
 	validateBundleLockfile,
 	verifyReleaseTag,
 } from "./create-release-bundle.mjs";
+import { extractTarEntries, readGzipTarEntries } from "./lib/archive.mjs";
 
 function rewriteChecksum(header) {
 	header.fill(0x20, 148, 156);
@@ -221,6 +224,27 @@ test("rejects file entries that are ancestors of other archive entries", () => {
 	assert.throws(() => inspectDeterministicTarGz(corrupted), /cannot be an ancestor/);
 });
 
+test("refuses an omitted-directory-header extraction through a symlinked ancestor before side effects", (t) => {
+	if (process.platform === "win32") {
+		t.skip("symlink fixture requires a privileged Windows test environment");
+		return;
+	}
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-extraction-containment-test-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const outside = path.join(root, "outside");
+	const linkedParent = path.join(root, "linked-parent");
+	const destination = path.join(linkedParent, "owned-extraction");
+	fs.mkdirSync(outside);
+	fs.symlinkSync(outside, linkedParent);
+	const archive = createDeterministicTarGz([
+		{ path: "bundle/payload.txt", type: "file", content: "payload\n" },
+	]);
+	const entries = readGzipTarEntries(archive);
+	assert.throws(() => extractTarEntries(entries, destination), /symlink|owned|extraction/i);
+	assert.equal(fs.existsSync(path.join(outside, "owned-extraction")), false);
+	assert.equal(fs.existsSync(path.join(outside, "owned-extraction", "bundle", "payload.txt")), false);
+});
+
 test("contains output roots after resolving symlink ancestors", (t) => {
 	if (process.platform === "win32") {
 		t.skip("symlink fixture requires a privileged Windows test environment");
@@ -243,11 +267,14 @@ test("contains output roots after resolving symlink ancestors", (t) => {
 	assert.equal(fs.existsSync(path.join(repositoryRoot, "candidate")), false);
 });
 
-test("publishes archive and checksum atomically without following occupied outputs", (t) => {
+test("commits archive and checksum without replacing occupied or raced output directories", (t) => {
 	const outputParent = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-output-publication-test-"));
 	t.after(() => fs.rmSync(outputParent, { recursive: true, force: true }));
 	const outputRoot = path.join(outputParent, "published-bundle");
 	const archiveName = "bundle.tar.gz";
+	const archive = Buffer.from("archive");
+	const checksum = `${createHash("sha256").update(archive).digest("hex")}  ${archiveName}\n`;
+	const canonicalOutputRoot = path.join(fs.realpathSync(outputParent), "published-bundle");
 	const archivePath = path.join(outputRoot, archiveName);
 	const checksumPath = `${archivePath}.sha256`;
 	fs.symlinkSync(path.join(outputParent, "missing-target"), outputRoot);
@@ -256,8 +283,8 @@ test("publishes archive and checksum atomically without following occupied outpu
 			publishBundleOutputs({
 				outputRoot,
 				archiveName,
-				archive: Buffer.from("archive"),
-				checksum: "checksum\n",
+				archive,
+				checksum,
 			}),
 		/refusing to overwrite existing bundle output/,
 	);
@@ -269,29 +296,22 @@ test("publishes archive and checksum atomically without following occupied outpu
 			publishBundleOutputs({
 				outputRoot,
 				archiveName,
-				archive: Buffer.from("archive"),
-				checksum: "checksum\n",
+				archive,
+				checksum,
 			}),
 		/refusing to overwrite existing bundle output/,
 	);
 	fs.rmdirSync(outputRoot);
-	fs.mkdirSync(`${outputRoot}.staging`);
-	assert.throws(
-		() =>
-			publishBundleOutputs({
-				outputRoot,
-				archiveName,
-				archive: Buffer.from("archive"),
-				checksum: "checksum\n",
-			}),
-		/concurrently/,
-	);
-	fs.rmdirSync(`${outputRoot}.staging`);
-
-	const operations = {
+	let racedDestinationCreated = false;
+	const raceOperations = {
 		...fs,
-		renameSync() {
-			throw new Error("injected final publication failure");
+		mkdirSync(target, options) {
+			if (!racedDestinationCreated && target === canonicalOutputRoot) {
+				racedDestinationCreated = true;
+				fs.mkdirSync(canonicalOutputRoot);
+				fs.writeFileSync(path.join(canonicalOutputRoot, "foreign.txt"), "foreign\n");
+			}
+			return fs.mkdirSync(target, options);
 		},
 	};
 	assert.throws(
@@ -299,11 +319,34 @@ test("publishes archive and checksum atomically without following occupied outpu
 			publishBundleOutputs({
 				outputRoot,
 				archiveName,
-				archive: Buffer.from("archive"),
-				checksum: "checksum\n",
+				archive,
+				checksum,
+				operations: raceOperations,
+			}),
+		/refusing to overwrite existing bundle output/,
+	);
+	assert.equal(fs.readFileSync(path.join(canonicalOutputRoot, "foreign.txt"), "utf8"), "foreign\n");
+	fs.rmSync(canonicalOutputRoot, { recursive: true, force: true });
+
+	let publishedMembers = 0;
+	const operations = {
+		...fs,
+		linkSync(source, destination) {
+			publishedMembers += 1;
+			if (publishedMembers === 2) throw new Error("injected second publication failure");
+			return fs.linkSync(source, destination);
+		},
+	};
+	assert.throws(
+		() =>
+			publishBundleOutputs({
+				outputRoot,
+				archiveName,
+				archive,
+				checksum,
 				operations,
 			}),
-		/injected final publication failure/,
+		/injected second publication failure/,
 	);
 	assert.equal(lstatOrNull(outputRoot), null);
 	assert.equal(lstatOrNull(archivePath), null);
@@ -324,14 +367,59 @@ test("publishes archive and checksum atomically without following occupied outpu
 			publishBundleOutputs({
 				outputRoot,
 				archiveName,
-				archive: Buffer.from("archive"),
-				checksum: "checksum\n",
+				archive,
+				checksum,
 				operations: fsyncOperations,
 			}),
 		/injected post-rename fsync failure/,
 	);
 	assert.equal(lstatOrNull(outputRoot), null);
 	assert.deepEqual(fs.readdirSync(outputParent), []);
+});
+
+test("binds publication to the canonical parent across an ancestor symlink swap", (t) => {
+	if (process.platform === "win32") {
+		t.skip("symlink fixture requires a privileged Windows test environment");
+		return;
+	}
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-output-symlink-swap-test-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const safeParent = path.join(root, "safe-output");
+	const repositoryRoot = path.join(root, "repository");
+	const linkedParent = path.join(root, "linked-output");
+	fs.mkdirSync(safeParent);
+	fs.mkdirSync(repositoryRoot);
+	fs.writeFileSync(path.join(repositoryRoot, "sentinel.txt"), "unchanged\n");
+	fs.symlinkSync(safeParent, linkedParent);
+	const archiveName = "bundle.tar.gz";
+	const archive = Buffer.from("archive");
+	const checksum = `${createHash("sha256").update(archive).digest("hex")}  ${archiveName}\n`;
+	const lexicalOutput = path.join(linkedParent, "published-bundle");
+	const canonicalOutput = path.join(fs.realpathSync(safeParent), "published-bundle");
+	let swapped = false;
+	const operations = {
+		...fs,
+		mkdirSync(target, options) {
+			if (!swapped && target === canonicalOutput) {
+				swapped = true;
+				fs.unlinkSync(linkedParent);
+				fs.symlinkSync(repositoryRoot, linkedParent);
+			}
+			return fs.mkdirSync(target, options);
+		},
+	};
+	const published = publishBundleOutputs({
+		outputRoot: lexicalOutput,
+		archiveName,
+		archive,
+		checksum,
+		repositoryRoot,
+		operations,
+	});
+	assert.equal(published.outputRoot, canonicalOutput);
+	assertCommittedBundleOutput({ outputRoot: published.outputRoot, archiveName });
+	assert.equal(fs.existsSync(path.join(repositoryRoot, "published-bundle")), false);
+	assert.equal(fs.readFileSync(path.join(repositoryRoot, "sentinel.txt"), "utf8"), "unchanged\n");
 });
 
 test("maps every internal package edge to a bundle-local tgz and rejects version drift", () => {

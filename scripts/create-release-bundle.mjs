@@ -4,8 +4,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { gzipSync } from "node:zlib";
-import { extractTarEntries, readGzipTarEntries, readTarEntries } from "./lib/archive.mjs";
+import {
+	createDeterministicTarGz,
+	extractTarEntries,
+	inspectDeterministicTarGz,
+	readTarEntries,
+} from "./lib/archive.mjs";
 import {
 	inspectPackageTarballs,
 	PACKAGE_NAMES,
@@ -16,9 +20,12 @@ import {
 	sha256File,
 } from "./lib/package-smoke.mjs";
 
-const ARCHIVE_BLOCK_BYTES = 512;
-const ARCHIVE_END_BYTES = ARCHIVE_BLOCK_BYTES * 2;
-const ARCHIVE_MTIME = 0;
+export {
+	assertSafeArchivePath,
+	createDeterministicTarGz,
+	inspectDeterministicTarGz,
+} from "./lib/archive.mjs";
+
 const FILE_MODE = 0o644;
 const DIRECTORY_MODE = 0o755;
 const PUBLIC_NPM_REGISTRY = "https://registry.npmjs.org/";
@@ -27,206 +34,6 @@ const INTERNAL_PACKAGE_PREFIX = "@pi-agent-web/";
 
 function comparePaths(left, right) {
 	return left < right ? -1 : left > right ? 1 : 0;
-}
-
-function asBuffer(value, label) {
-	if (Buffer.isBuffer(value)) return value;
-	if (value instanceof Uint8Array) return Buffer.from(value);
-	if (typeof value === "string") return Buffer.from(value, "utf8");
-	throw new Error(`${label} must be a Buffer, Uint8Array, or string`);
-}
-
-export function assertSafeArchivePath(value, label = "archive entry") {
-	if (typeof value !== "string" || value.length === 0 || value.includes("\0") || value.includes("\\")) {
-		throw new Error(`${label} has an invalid path`);
-	}
-	if (value.startsWith("/") || value.endsWith("/")) throw new Error(`${label} must be a relative file path`);
-	const segments = value.split("/");
-	if (segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")) {
-		throw new Error(`${label} escapes the bundle root: ${value}`);
-	}
-	return value;
-}
-
-function writeString(buffer, offset, byteLength, value, label) {
-	const bytes = Buffer.from(value, "utf8");
-	if (bytes.byteLength > byteLength) throw new Error(`${label} is too long for ustar`);
-	bytes.copy(buffer, offset);
-}
-
-function writeOctal(buffer, offset, byteLength, value, label) {
-	if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${label} must be a non-negative integer`);
-	const octal = value.toString(8);
-	if (octal.length > byteLength - 1) throw new Error(`${label} does not fit in ustar`);
-	writeString(buffer, offset, byteLength, `${octal.padStart(byteLength - 1, "0")}\0`, label);
-}
-
-function writeChecksum(buffer) {
-	buffer.fill(0x20, 148, 156);
-	let sum = 0;
-	for (const byte of buffer) sum += byte;
-	const octal = sum.toString(8);
-	if (octal.length > 6) throw new Error("ustar checksum does not fit");
-	writeString(buffer, 148, 8, `${octal.padStart(6, "0")}\0 `, "ustar checksum");
-}
-
-function splitUstarPath(entryPath) {
-	const bytes = Buffer.from(entryPath, "utf8");
-	if (bytes.byteLength <= 100) return { name: entryPath, prefix: "" };
-	for (let index = entryPath.length - 1; index >= 0; index -= 1) {
-		if (entryPath[index] !== "/") continue;
-		const prefix = entryPath.slice(0, index);
-		const name = entryPath.slice(index + 1);
-		if (Buffer.byteLength(prefix) <= 155 && Buffer.byteLength(name) <= 100) return { name, prefix };
-	}
-	throw new Error(`archive entry path is too long for ustar: ${entryPath}`);
-}
-
-function createUstarHeader(entry) {
-	const header = Buffer.alloc(ARCHIVE_BLOCK_BYTES);
-	const archivePath = entry.type === "directory" ? `${entry.path}/` : entry.path;
-	const { name, prefix } = splitUstarPath(archivePath);
-	writeString(header, 0, 100, name, "ustar name");
-	writeOctal(header, 100, 8, entry.mode, "ustar mode");
-	writeOctal(header, 108, 8, 0, "ustar uid");
-	writeOctal(header, 116, 8, 0, "ustar gid");
-	writeOctal(header, 124, 12, entry.content.byteLength, "ustar size");
-	writeOctal(header, 136, 12, ARCHIVE_MTIME, "ustar mtime");
-	header[156] = entry.type === "directory" ? "5".charCodeAt(0) : 0;
-	writeString(header, 257, 6, "ustar\0", "ustar magic");
-	writeString(header, 263, 2, "00", "ustar version");
-	writeString(header, 345, 155, prefix, "ustar prefix");
-	writeChecksum(header);
-	return header;
-}
-
-function archivePadding(size) {
-	const remainder = size % ARCHIVE_BLOCK_BYTES;
-	return remainder === 0 ? 0 : ARCHIVE_BLOCK_BYTES - remainder;
-}
-
-function normaliseArchiveEntries(entries) {
-	if (!Array.isArray(entries) || entries.length === 0) throw new Error("archive requires at least one entry");
-	const byPath = new Map();
-	for (const candidate of entries) {
-		if (!candidate || typeof candidate !== "object") throw new Error("archive entry must be an object");
-		const entryPath = assertSafeArchivePath(candidate.path);
-		if (candidate.type !== "file" && candidate.type !== "directory") {
-			throw new Error(`archive entry ${entryPath} has an unsupported type`);
-		}
-		const mode = candidate.type === "directory" ? DIRECTORY_MODE : FILE_MODE;
-		if (candidate.mode !== undefined && candidate.mode !== mode) {
-			throw new Error(`archive entry ${entryPath} has a non-canonical mode`);
-		}
-		if (byPath.has(entryPath)) throw new Error(`archive entry is duplicated: ${entryPath}`);
-		byPath.set(entryPath, {
-			path: entryPath,
-			type: candidate.type,
-			mode,
-			content:
-				candidate.type === "file"
-					? asBuffer(candidate.content ?? Buffer.alloc(0), entryPath)
-					: Buffer.alloc(0),
-		});
-	}
-	for (const entry of [...byPath.values()]) {
-		let parent = path.posix.dirname(entry.path);
-		while (parent !== ".") {
-			if (!byPath.has(parent)) {
-				byPath.set(parent, {
-					path: parent,
-					type: "directory",
-					mode: DIRECTORY_MODE,
-					content: Buffer.alloc(0),
-				});
-			}
-			parent = path.posix.dirname(parent);
-		}
-	}
-	const normalised = [...byPath.values()].sort((left, right) => comparePaths(left.path, right.path));
-	assertNoFileEntryAncestors(normalised, "archive");
-	return normalised;
-}
-
-function assertNoFileEntryAncestors(entries, label) {
-	const files = new Set(entries.filter((entry) => entry.type === "file").map((entry) => entry.path));
-	for (const entry of entries) {
-		let parent = path.posix.dirname(entry.path);
-		while (parent !== ".") {
-			if (files.has(parent)) {
-				throw new Error(`${label} file entry ${parent} cannot be an ancestor of ${entry.path}`);
-			}
-			parent = path.posix.dirname(parent);
-		}
-	}
-}
-
-export function createDeterministicTarGz(entries) {
-	const normalised = normaliseArchiveEntries(entries);
-	const parts = [];
-	for (const entry of normalised) {
-		parts.push(createUstarHeader(entry));
-		if (entry.content.byteLength > 0) parts.push(entry.content);
-		const padding = archivePadding(entry.content.byteLength);
-		if (padding > 0) parts.push(Buffer.alloc(padding));
-	}
-	parts.push(Buffer.alloc(ARCHIVE_END_BYTES));
-	const compressed = gzipSync(Buffer.concat(parts), { level: 9 });
-	compressed.writeUInt32LE(ARCHIVE_MTIME, 4);
-	compressed[9] = 255;
-	return compressed;
-}
-
-export function inspectDeterministicTarGz(archive, options = {}) {
-	const compressed = asBuffer(archive, "archive");
-	if (
-		compressed.byteLength < 10 ||
-		compressed[0] !== 0x1f ||
-		compressed[1] !== 0x8b ||
-		compressed[2] !== 8 ||
-		compressed[3] !== 0 ||
-		compressed.readUInt32LE(4) !== ARCHIVE_MTIME ||
-		compressed[8] !== 2 ||
-		compressed[9] !== 255
-	) {
-		throw new Error("archive gzip header is not deterministic");
-	}
-	const entries = readGzipTarEntries(compressed);
-	for (const entry of entries) {
-		const { archivePath, gid, mode, mtime, size, type, uid, user, group } = {
-			archivePath: entry.path,
-			...entry,
-		};
-		if (uid !== 0 || gid !== 0)
-			throw new Error(`archive entry ${archivePath} has non-root numeric ownership`);
-		if (user || group) {
-			throw new Error(`archive entry ${archivePath} has named ownership`);
-		}
-		if (mode !== (type === "directory" ? DIRECTORY_MODE : FILE_MODE)) {
-			throw new Error(`archive entry ${archivePath} has a non-canonical mode`);
-		}
-		if (mtime !== ARCHIVE_MTIME)
-			throw new Error(`archive entry ${archivePath} has a non-deterministic mtime`);
-		if (type === "directory" && size !== 0) throw new Error(`archive directory ${archivePath} must be empty`);
-	}
-	assertNoFileEntryAncestors(entries, "archive");
-	let previousPath;
-	for (const entry of entries) {
-		if (previousPath !== undefined && comparePaths(previousPath, entry.path) >= 0) {
-			throw new Error("archive entries are not in deterministic path order");
-		}
-		previousPath = entry.path;
-	}
-	if (options.rootName) {
-		const rootName = assertSafeArchivePath(options.rootName, "bundle root");
-		if (entries[0]?.path !== rootName || entries[0]?.type !== "directory") {
-			throw new Error("archive is missing its canonical bundle root");
-		}
-		if (entries.some((entry) => entry.path !== rootName && !entry.path.startsWith(`${rootName}/`))) {
-			throw new Error("archive has entries outside its bundle root");
-		}
-	}
-	return entries;
 }
 
 function readJson(filePath, label) {
@@ -494,26 +301,42 @@ function lstatOrNull(filePath, operations = fs) {
 	}
 }
 
-function assertOutputTargetIsSafe(destination, realRepositoryRoot, operations) {
-	const ancestors = [];
-	for (let candidate = destination; ; candidate = path.dirname(candidate)) {
-		ancestors.push(candidate);
+function bindOutputLocation(destination, realRepositoryRoot, operations) {
+	const resolvedDestination = path.resolve(destination);
+	if (lstatOrNull(resolvedDestination, operations)) {
+		throw new Error(`refusing to overwrite existing bundle output: ${resolvedDestination}`);
+	}
+	const lexicalParent = path.dirname(resolvedDestination);
+	const parentStat = lstatOrNull(lexicalParent, operations);
+	if (!parentStat) {
+		throw new Error("bundle output parent must already exist");
+	}
+	if (!parentStat.isDirectory() && !parentStat.isSymbolicLink()) {
+		throw new Error(`bundle output ancestor is not a directory: ${lexicalParent}`);
+	}
+	for (let candidate = lexicalParent; ; candidate = path.dirname(candidate)) {
+		const stat = lstatOrNull(candidate, operations);
+		if (stat) {
+			if (!stat.isDirectory() && !stat.isSymbolicLink()) {
+				throw new Error(`bundle output ancestor is not a directory: ${candidate}`);
+			}
+			const realCandidate = operations.realpathSync(candidate);
+			if (isSameOrDescendant(realCandidate, realRepositoryRoot)) {
+				throw new Error("bundle output must stay outside the repository");
+			}
+		}
 		if (path.dirname(candidate) === candidate) break;
 	}
-	for (const candidate of ancestors) {
-		const stat = lstatOrNull(candidate, operations);
-		if (!stat) continue;
-		const realCandidate = operations.realpathSync(candidate);
-		if (isSameOrDescendant(realCandidate, realRepositoryRoot)) {
-			throw new Error("bundle output must stay outside the repository");
-		}
-		if (candidate === destination) {
-			throw new Error(`refusing to overwrite existing bundle output: ${destination}`);
-		}
-		if (!stat.isDirectory() && !stat.isSymbolicLink()) {
-			throw new Error(`bundle output ancestor is not a directory: ${candidate}`);
-		}
+	const canonicalParent = operations.realpathSync(lexicalParent);
+	const canonicalParentStat = operations.lstatSync(canonicalParent);
+	if (canonicalParentStat.isSymbolicLink() || !canonicalParentStat.isDirectory()) {
+		throw new Error("bundle output parent must resolve to a real directory");
 	}
+	return {
+		destination: path.join(canonicalParent, path.basename(resolvedDestination)),
+		parent: canonicalParent,
+		parentIdentity: canonicalParentStat,
+	};
 }
 
 function writeGeneratedFile(filePath, content) {
@@ -560,9 +383,21 @@ function sameNodeIdentity(left, right) {
 	return left.dev === right.dev && left.ino === right.ino;
 }
 
-function removeOwnedDirectory(directory, identity, operations) {
+function assertBoundOutputParent(location, operations) {
+	const current = operations.lstatSync(location.parent);
+	if (
+		!sameNodeIdentity(current, location.parentIdentity) ||
+		current.isSymbolicLink() ||
+		!current.isDirectory()
+	) {
+		throw new Error("bundle output parent changed while publishing");
+	}
+}
+
+function removeOwnedDirectory(directory, identity, location, operations) {
 	if (!identity) return;
 	try {
+		assertBoundOutputParent(location, operations);
 		const current = operations.lstatSync(directory);
 		if (sameNodeIdentity(current, identity)) operations.rmSync(directory, { recursive: true, force: true });
 	} catch (error) {
@@ -573,10 +408,56 @@ function removeOwnedDirectory(directory, identity, operations) {
 	}
 }
 
+function assertArchiveName(archiveName) {
+	if (
+		typeof archiveName !== "string" ||
+		archiveName.length === 0 ||
+		archiveName !== path.basename(archiveName) ||
+		archiveName.includes("\0")
+	) {
+		throw new Error("bundle archive name must be a plain filename");
+	}
+}
+
+function publishStagedFile(stagedPath, finalPath, operations) {
+	if (lstatOrNull(finalPath, operations)) {
+		throw new Error(`refusing to overwrite an occupied bundle member: ${finalPath}`);
+	}
+	// link+unlink provides portable no-replace publication for a file within
+	// our exclusively-created directory. Unlike rename(2), it cannot replace a
+	// name created by a concurrent writer between the check and publication.
+	operations.linkSync(stagedPath, finalPath);
+	operations.unlinkSync(stagedPath);
+	fsyncFile(finalPath, operations);
+}
+
+export const BUNDLE_READY_MARKER = "READY";
+
+export function assertCommittedBundleOutput({ outputRoot, archiveName, operations = fs }) {
+	assertArchiveName(archiveName);
+	const destination = path.resolve(outputRoot);
+	const destinationStat = operations.lstatSync(destination);
+	if (destinationStat.isSymbolicLink() || !destinationStat.isDirectory()) {
+		throw new Error("bundle output is not a real directory");
+	}
+	const archivePath = path.join(destination, archiveName);
+	const checksumPath = `${archivePath}.sha256`;
+	const readyPath = path.join(destination, BUNDLE_READY_MARKER);
+	const archive = operations.readFileSync(archivePath);
+	const expectedChecksum = `${sha256(archive)}  ${archiveName}\n`;
+	if (operations.readFileSync(checksumPath, "utf8") !== expectedChecksum) {
+		throw new Error("bundle output checksum does not match its archive");
+	}
+	if (operations.readFileSync(readyPath, "utf8") !== expectedChecksum) {
+		throw new Error("bundle output is not committed");
+	}
+	return { archivePath, checksumPath, outputRoot: destination };
+}
+
 /**
- * Publishes the archive/checksum set by renaming one fully written sibling
- * directory. The final target must not exist; dangling symlinks count as
- * occupied and no pre-existing target is ever removed during rollback.
+ * Reserves the final directory with mkdir(O_EXCL semantics), stages members
+ * inside it, and writes READY only after the checksum/archive pair is durable.
+ * No pre-existing destination is renamed over or removed.
  */
 export function publishBundleOutputs({
 	outputRoot,
@@ -584,55 +465,55 @@ export function publishBundleOutputs({
 	archive,
 	checksum,
 	validate,
+	repositoryRoot = REPOSITORY_ROOT,
 	operations = fs,
 }) {
-	const destination = path.resolve(outputRoot);
-	if (lstatOrNull(destination, operations)) {
-		throw new Error(`refusing to overwrite existing bundle output: ${destination}`);
-	}
-	const outputParent = path.dirname(destination);
-	const parentStat = operations.lstatSync(outputParent);
-	if (parentStat.isSymbolicLink() || !parentStat.isDirectory()) {
-		throw new Error("bundle output parent must be a real directory");
-	}
-	const stageRoot = `${destination}.staging`;
-	if (lstatOrNull(stageRoot, operations)) {
-		throw new Error(`refusing to publish concurrently to bundle output: ${destination}`);
-	}
+	assertArchiveName(archiveName);
+	const realRepositoryRoot = operations.realpathSync(repositoryRoot);
+	const location = bindOutputLocation(outputRoot, realRepositoryRoot, operations);
+	const { destination } = location;
+	assertBoundOutputParent(location, operations);
 	try {
-		operations.mkdirSync(stageRoot, { mode: DIRECTORY_MODE });
+		operations.mkdirSync(destination, { mode: DIRECTORY_MODE });
 	} catch (error) {
 		if (error?.code === "EEXIST") {
-			throw new Error(`refusing to publish concurrently to bundle output: ${destination}`);
+			throw new Error(`refusing to overwrite existing bundle output: ${destination}`);
 		}
 		throw error;
 	}
-	const stageIdentity = operations.lstatSync(stageRoot);
-	const stagedArchivePath = path.join(stageRoot, archiveName);
-	const stagedChecksumPath = `${stagedArchivePath}.sha256`;
-	let publishedIdentity;
+	const publishedIdentity = operations.lstatSync(destination);
+	if (publishedIdentity.isSymbolicLink() || !publishedIdentity.isDirectory()) {
+		throw new Error("bundle output reservation is not a real directory");
+	}
+	if (
+		operations.realpathSync(destination) !== destination ||
+		operations.readdirSync(destination).length !== 0
+	) {
+		removeOwnedDirectory(destination, publishedIdentity, location, operations);
+		throw new Error("bundle output reservation changed while it was being created");
+	}
+	const archivePath = path.join(destination, archiveName);
+	const checksumPath = `${archivePath}.sha256`;
+	const stagedArchivePath = path.join(destination, `.${archiveName}.archive-stage`);
+	const stagedChecksumPath = path.join(destination, `.${archiveName}.checksum-stage`);
+	const readyPath = path.join(destination, BUNDLE_READY_MARKER);
 	try {
 		writeStagedFile(stagedArchivePath, archive, operations);
 		writeStagedFile(stagedChecksumPath, checksum, operations);
 		validate?.({ archivePath: stagedArchivePath, checksumPath: stagedChecksumPath });
-		fsyncDirectory(stageRoot, operations);
-		if (lstatOrNull(destination, operations)) {
-			throw new Error(`refusing to overwrite existing bundle output: ${destination}`);
-		}
-		operations.renameSync(stageRoot, destination);
-		publishedIdentity = operations.lstatSync(destination);
 		fsyncDirectory(destination, operations);
-		fsyncDirectory(outputParent, operations);
-		return {
-			archivePath: path.join(destination, archiveName),
-			checksumPath: `${path.join(destination, archiveName)}.sha256`,
-			outputRoot: destination,
-		};
+		assertBoundOutputParent(location, operations);
+		publishStagedFile(stagedArchivePath, archivePath, operations);
+		publishStagedFile(stagedChecksumPath, checksumPath, operations);
+		fsyncDirectory(destination, operations);
+		writeStagedFile(readyPath, `${sha256(archive)}  ${archiveName}\n`, operations);
+		fsyncDirectory(destination, operations);
+		assertBoundOutputParent(location, operations);
+		fsyncDirectory(location.parent, operations);
+		return assertCommittedBundleOutput({ outputRoot: destination, archiveName, operations });
 	} catch (error) {
-		removeOwnedDirectory(destination, publishedIdentity, operations);
+		removeOwnedDirectory(destination, publishedIdentity, location, operations);
 		throw error;
-	} finally {
-		removeOwnedDirectory(stageRoot, stageIdentity, operations);
 	}
 }
 
@@ -932,11 +813,7 @@ export function prepareOutputDirectory(outputDir, root = REPOSITORY_ROOT, operat
 		outputDir === undefined
 			? path.join(os.tmpdir(), `piweb-release-bundle-${randomUUID()}`)
 			: path.resolve(outputDir);
-	// Validate all existing ancestors before creating either the output target or
-	// its sibling stage. This prevents a symlinked parent from creating files in
-	// the repository before containment can be checked.
-	assertOutputTargetIsSafe(destination, realRepositoryRoot, operations);
-	return destination;
+	return bindOutputLocation(destination, realRepositoryRoot, operations).destination;
 }
 
 export function createReleaseBundle({
