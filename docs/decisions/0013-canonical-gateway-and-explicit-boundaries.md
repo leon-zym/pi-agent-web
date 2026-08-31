@@ -1,6 +1,6 @@
 # ADR 0013: Keep one canonical Gateway and explicit boundaries
 
-- Status: Accepted
+- Status: Accepted; Browser/Gateway version and control wording amended by ADR 0015
 - Date: 2026-08-30
 - Supersedes: ADR 0012 and the Browser/Gateway compatibility wording in ADRs 0007, 0010, and 0011
 
@@ -18,9 +18,9 @@ the parallel architecture.
 
 ## Decision
 
-1. Browser/Gateway protocol 1.3 is the only production implementation. Both peers require the exact
-   version and capability set. Protocol 1.2 remains only as a terminal mismatch fixture; it is not a
-   second transport, DTO family, server pipeline, or Browser mode.
+1. At adoption, Browser/Gateway protocol 1.3 was the only production implementation. Both peers
+   required the exact version and capability set. Protocol 1.2 remained only as a terminal mismatch
+   fixture; it was not a second transport, DTO family, server pipeline, or Browser mode.
 2. Pi RPC remains a separate upstream compatibility boundary. Its implementation is named
    `PiRpcAdapter` with stable diagnostic id `pi-rpc`. It supports exact Pi versions only after fixture
    and conformance review. The name does not imply imminent removal or invent an upstream protocol
@@ -56,8 +56,8 @@ the parallel architecture.
 
 ## Verification
 
-- Protocol and compatibility suites cover exact Gateway 1.3 negotiation, terminal mismatch, strict
-  guards, current and reviewed Pi fixtures, and `PiRpcAdapter` diagnostics.
+- At adoption, protocol and compatibility suites covered exact Gateway 1.3 negotiation, terminal
+  mismatch, strict guards, current and reviewed Pi fixtures, and `PiRpcAdapter` diagnostics.
 - Server tests cover the single production pipeline, authenticated content reads, internal staged
   publication, cancellation, ownership, recovery, and terminal protocol failure.
 - UI typechecking and focused transport tests cover the canonical hello, Session channels, typed

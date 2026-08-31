@@ -43,8 +43,9 @@ perform a repository-wide rename between them.
   deletes a file.
 - One authenticated WebSocket multiplexes isolated Session channels. Generation, sequence,
   subscription, lease, fencing token, command id, recovery, and Extension UI state are per Session.
-- Browser/Gateway protocol 1.3 is the sole production contract. Version mismatch is terminal. Pi
-  RPC is a separate upstream boundary named `PiRpcAdapter` with exact-version fixtures.
+- Browser/Gateway protocol 1.4 is the sole production contract. Both peers require
+  `session.fenced_takeover`; version mismatch is terminal with no fallback. Pi RPC is a separate
+  upstream boundary named `PiRpcAdapter` with exact-version fixtures.
 - Read-only commands do not require a controller lease. Mutations and Extension responses require
   the exact generation and current fence. Uncertain identity or ordering fails closed.
 - Events are authoritative. A command resolves in the UI only after projection reaches its
