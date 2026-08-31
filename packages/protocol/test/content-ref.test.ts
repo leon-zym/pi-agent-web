@@ -18,7 +18,7 @@ import {
 	SESSION_PAYLOAD_BUDGET,
 } from "../src/index.js";
 
-describe("protocol 1.3 content references", () => {
+describe("protocol 1.4 content references", () => {
 	const contentRef = {
 		type: "content_ref",
 		serverEpoch: "epoch-a",
@@ -33,7 +33,7 @@ describe("protocol 1.3 content references", () => {
 	};
 
 	it("publishes the active capability in the production protocol", () => {
-		expect(GATEWAY_PROTOCOL_VERSION).toEqual({ major: 1, minor: 3 });
+		expect(GATEWAY_PROTOCOL_VERSION).toEqual({ major: 1, minor: 4 });
 		expect(GATEWAY_CONTENT_REF_CAPABILITY).toBe("payload.epoch_content_refs");
 		expect(GATEWAY_CLIENT_REQUIRED_CAPABILITIES).toContain(GATEWAY_CONTENT_REF_CAPABILITY);
 		expect(GATEWAY_SERVER_REQUIRED_CAPABILITIES).toContain(GATEWAY_CONTENT_REF_CAPABILITY);

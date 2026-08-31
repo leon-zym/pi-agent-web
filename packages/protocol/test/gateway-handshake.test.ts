@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
 	GATEWAY_CLIENT_REQUIRED_CAPABILITIES,
 	GATEWAY_CONTENT_REF_CAPABILITY,
+	GATEWAY_FENCED_TAKEOVER_CAPABILITY,
 	GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY,
 	GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
 	GATEWAY_PROTOCOL_VERSION,
@@ -48,21 +49,27 @@ function serverHello(): GatewayServerHelloDto {
 
 describe("Gateway hello DTOs", () => {
 	it("publishes one exact protocol and directional capability contract", () => {
-		expect(GATEWAY_PROTOCOL_VERSION).toEqual({ major: 1, minor: 3 });
+		expect(GATEWAY_PROTOCOL_VERSION).toEqual({ major: 1, minor: 4 });
 		expect(GATEWAY_CLIENT_REQUIRED_CAPABILITIES).not.toContain(GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY);
 		expect(GATEWAY_SERVER_REQUIRED_CAPABILITIES).toContain(GATEWAY_HOT_RUNTIME_INVENTORY_CAPABILITY);
-		for (const capability of [GATEWAY_PAYLOAD_BUDGET_CAPABILITY, GATEWAY_CONTENT_REF_CAPABILITY]) {
+		for (const capability of [
+			GATEWAY_PAYLOAD_BUDGET_CAPABILITY,
+			GATEWAY_CONTENT_REF_CAPABILITY,
+			GATEWAY_FENCED_TAKEOVER_CAPABILITY,
+		]) {
 			expect(GATEWAY_CLIENT_REQUIRED_CAPABILITIES).toContain(capability);
 			expect(GATEWAY_SERVER_REQUIRED_CAPABILITIES).toContain(capability);
 		}
 	});
 
-	it("accepts only canonical protocol 1.3 hello shapes", () => {
+	it("accepts only canonical protocol 1.4 hello shapes", () => {
 		expect(isGatewayClientHello(clientHello())).toBe(true);
 		expect(isGatewayServerHello(serverHello())).toBe(true);
+		expect(isGatewayClientHello({ ...clientHello(), protocol: { major: 1, minor: 3 } })).toBe(false);
+		expect(isGatewayServerHello({ ...serverHello(), protocol: { major: 1, minor: 3 } })).toBe(false);
 		expect(isGatewayClientHello({ ...clientHello(), protocol: { major: 1, minor: 2 } })).toBe(false);
 		expect(isGatewayServerHello({ ...serverHello(), protocol: { major: 1, minor: 2 } })).toBe(false);
-		expect(hasUnsupportedGatewayProtocolMajor({ ...clientHello(), protocol: { major: 99, minor: 3 } })).toBe(
+		expect(hasUnsupportedGatewayProtocolMajor({ ...clientHello(), protocol: { major: 99, minor: 4 } })).toBe(
 			true,
 		);
 		expect(hasUnsupportedGatewayProtocolMajor({ ...clientHello(), protocol: { major: 1, minor: 2 } })).toBe(
@@ -78,6 +85,14 @@ describe("Gateway hello DTOs", () => {
 				...client,
 				capabilities: client.capabilities.filter(
 					(capability) => capability !== GATEWAY_CONTENT_REF_CAPABILITY,
+				),
+			}),
+		).toBe(false);
+		expect(
+			isGatewayServerHello({
+				...server,
+				capabilities: server.capabilities.filter(
+					(capability) => capability !== GATEWAY_FENCED_TAKEOVER_CAPABILITY,
 				),
 			}),
 		).toBe(false);
@@ -121,16 +136,19 @@ describe("Gateway hello DTOs", () => {
 			negotiateGatewayHello({ ...clientHello(), limits: { maxServerFrameBytes: 1024 } }, serverHello()),
 		).toEqual({ negotiated: false, reason: "server_frame_selection_invalid" });
 		expect(
+			negotiateGatewayHello({ ...clientHello(), protocol: { major: 1, minor: 3 } }, serverHello()),
+		).toEqual({ negotiated: false, reason: "protocol_minor_unsupported" });
+		expect(
 			negotiateGatewayHello({ ...clientHello(), protocol: { major: 1, minor: 2 } }, serverHello()),
 		).toEqual({ negotiated: false, reason: "protocol_minor_unsupported" });
 	});
 
-	it("parses the terminal error returned to a protocol 1.2 Browser", () => {
+	it("parses the terminal error returned to a protocol 1.3 Browser", () => {
 		expect(
 			isGatewayProtocolError({
 				type: "protocol_error",
 				code: "invalid_hello",
-				supported: { major: 1, minMinor: 3, maxMinor: 3 },
+				supported: { major: 1, minMinor: 4, maxMinor: 4 },
 			}),
 		).toBe(true);
 	});

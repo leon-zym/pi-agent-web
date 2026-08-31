@@ -299,7 +299,7 @@ describe("Session runtime browser frame guard", () => {
 		).toBe(true);
 	});
 
-	it("keeps protocol 1.3 control frames limited to claim and release", () => {
+	it("requires a revisioned protocol 1.4 takeover frame", () => {
 		expect(isSessionWsClientMessage({ type: "session_claim", sessionHandle: "session-native-a" })).toBe(true);
 		expect(isSessionWsClientMessage({ type: "session_release", sessionHandle: "session-native-a" })).toBe(
 			true,
@@ -309,6 +309,22 @@ describe("Session runtime browser frame guard", () => {
 				type: "session_takeover",
 				sessionHandle: "session-native-a",
 				expectedGeneration: 2,
+				expectedLeaseRevision: 7,
+			}),
+		).toBe(true);
+		expect(
+			isSessionWsClientMessage({
+				type: "session_takeover",
+				sessionHandle: "session-native-a",
+				expectedGeneration: 2,
+			}),
+		).toBe(false);
+		expect(
+			isSessionWsClientMessage({
+				type: "session_takeover",
+				sessionHandle: "session-native-a",
+				expectedGeneration: 2,
+				expectedLeaseRevision: -1,
 			}),
 		).toBe(false);
 	});
