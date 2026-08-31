@@ -189,8 +189,17 @@ describe("Session controller leases", () => {
 			{ response: { success: true } },
 		);
 
+		const released = frameFor(
+			right,
+			(frame) =>
+				frame.type === "lease_status" &&
+				frame.sessionHandle === sessions[0].sessionHandle &&
+				frame.transition === "disconnect" &&
+				frame.controlState === "free" &&
+				frame.isController === false,
+		);
 		await closeSocket(left);
-		await new Promise<void>((resolve) => setImmediate(resolve));
+		await released;
 		const reclaimed = await claim(right, sessions[0].sessionHandle);
 		expect(reclaimed).toMatchObject({ isController: true, fencingToken: expect.any(String) });
 		await expect(command(right, sessions[0], "reclaimed", reclaimed.fencingToken)).resolves.toMatchObject({
