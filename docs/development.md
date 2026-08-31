@@ -153,6 +153,13 @@ The main CI workflow has three independent jobs:
 Pi compatibility has a separate exact-version workflow. The stress matrix is manual. Real-Pi
 acceptance is never an implicit CI dependency.
 
+The active `protect main` ruleset requires pull requests, an up-to-date branch, and the exact checks
+`Deterministic verification` and `Packaged browser E2E`; it also blocks deletion and non-fast-forward
+updates. The jobs are credential-free. Representative performance remains non-required evidence.
+
+While the repository has one maintainer, required approvals are zero and there is no bypass actor.
+Raise the count to one when a second maintainer becomes active.
+
 ## Packaging
 
 The workspace contains protocol, server, UI, and CLI packages. `pnpm test:pack` creates local
@@ -178,6 +185,7 @@ pnpm bench:representative
 Also inspect the final diff, repository status, package contents, Browser artifacts, benchmark
 artifact, and documentation links. Report the exact real-Pi outcome. Do not close a tracked issue
 until its accepted behavior is on the shipped branch and deferred work is explicitly recorded.
+Confirm the ruleset, exact required checks, and current maintainer-count exception.
 
 ## Code and commit conventions
 
