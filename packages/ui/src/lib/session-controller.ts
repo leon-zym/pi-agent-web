@@ -22,11 +22,16 @@ import { tt } from "./i18n";
 import { runtimeIsBusy } from "./runtime-state";
 import type { SessionBrowserEffect } from "./session-browser-effects";
 import { isSessionControlReady, sessionDeleteCapability } from "./session-capabilities";
-import { sendControlCommand } from "./session-command";
+import { sendControlCommand, sendControlCommandWithIdentity } from "./session-command";
 import { type SessionLifecycleIdentity, sessionIdentityKey } from "./session-lifecycle-registry";
 import { sessionLifecycleIdentityForRuntime, sessionStateOwners } from "./session-state-owners";
 
-export { sendControlCommand, sendControlExtensionUiResponse, sendReadCommand } from "./session-command";
+export {
+	sendControlCommand,
+	sendControlCommandWithIdentity,
+	sendControlExtensionUiResponse,
+	sendReadCommand,
+} from "./session-command";
 
 function currentWorkspaceHandle(): string {
 	const handle = useSessionDirectoryStore.getState().currentWorkspaceHandle;
@@ -566,19 +571,19 @@ export async function abortCurrentRun(): Promise<void> {
 export async function forkFromEntry(entryId: string, sessionHandle: string): Promise<void> {
 	const sessionIdentity = controllerEffectIdentity(sessionHandle);
 	try {
-		const response = await sendControlCommand(sessionHandle, { type: "fork", entryId });
-		const data = expectCommandData(response, "fork");
+		const completion = await sendControlCommandWithIdentity(sessionHandle, { type: "fork", entryId });
+		const data = expectCommandData(completion.response, "fork");
 		if (data.cancelled) {
 			controllerToast("info", tt("session.forkCancelled"), {
-				sessionHandle,
-				identity: sessionIdentity,
+				sessionHandle: completion.identity.sessionHandle,
+				identity: completion.identity,
 				key: "fork-cancelled",
 			});
 			return;
 		}
 		controllerToast("success", tt("session.forked"), {
-			sessionHandle,
-			identity: sessionIdentity,
+			sessionHandle: completion.identity.sessionHandle,
+			identity: completion.identity,
 			key: "forked",
 		});
 	} catch (error) {

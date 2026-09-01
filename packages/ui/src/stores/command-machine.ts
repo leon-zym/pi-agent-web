@@ -38,6 +38,10 @@ export interface SessionCommandMachineResolvedResponse {
 	previousSessionHandle?: string;
 }
 
+export interface SessionCommandMachineCompletion extends SessionCommandMachineResolvedResponse {
+	workspaceId: string;
+}
+
 export interface SessionCommandMachinePending {
 	id: string;
 	token: number;
@@ -51,6 +55,7 @@ export interface SessionCommandMachinePending {
 	responseKey?: string;
 	materializing: boolean;
 	resolve: (response: PiSessionCommandResponseDto) => void;
+	resolveWithIdentity?: (completion: SessionCommandMachineCompletion) => void;
 	reject: (error: Error) => void;
 }
 
@@ -77,6 +82,7 @@ export type SessionCommandMachineEvent =
 			isController: boolean;
 			fencingToken?: string;
 			resolve: (response: PiSessionCommandResponseDto) => void;
+			resolveWithIdentity?: (completion: SessionCommandMachineCompletion) => void;
 			reject: (error: Error) => void;
 	  }
 	| { type: "send_failed"; id: string; token: number; error: SessionCommandMachineError }
@@ -118,6 +124,8 @@ export type SessionCommandMachineIntent =
 			token: number;
 			resolve: (response: PiSessionCommandResponseDto) => void;
 			response: PiSessionCommandResponseDto;
+			resolveWithIdentity?: (completion: SessionCommandMachineCompletion) => void;
+			completion: SessionCommandMachineCompletion;
 	  }
 	| {
 			type: "reject";
@@ -204,11 +212,19 @@ function rejectIntents(
 
 function resolveIntents(
 	pending: SessionCommandMachinePending,
-	response: PiSessionCommandResponseDto,
+	completion: SessionCommandMachineCompletion,
 ): SessionCommandMachineIntent[] {
 	return [
 		{ type: "clear_timer", id: pending.id, token: pending.token },
-		{ type: "resolve", id: pending.id, token: pending.token, resolve: pending.resolve, response },
+		{
+			type: "resolve",
+			id: pending.id,
+			token: pending.token,
+			resolve: pending.resolve,
+			resolveWithIdentity: pending.resolveWithIdentity,
+			response: completion.response,
+			completion,
+		},
 	];
 }
 
@@ -229,7 +245,10 @@ function settleResolve(
 	if (!pending.response) return transition(state);
 	const pendingState = { ...state.pending };
 	delete pendingState[pending.id];
-	return transition({ ...state, pending: pendingState }, resolveIntents(pending, pending.response.response));
+	return transition(
+		{ ...state, pending: pendingState },
+		resolveIntents(pending, { ...pending.response, workspaceId: pending.workspaceId }),
+	);
 }
 
 function gateError(code: SessionCommandMachineErrorCode, message?: string): SessionCommandMachineError {
@@ -281,6 +300,7 @@ export function reduceSessionCommandMachine(
 				commandType: event.command.type,
 				materializing: false,
 				resolve: event.resolve,
+				resolveWithIdentity: event.resolveWithIdentity,
 				reject: event.reject,
 			};
 			const nextPending = { ...nextState.pending, [id]: pending };

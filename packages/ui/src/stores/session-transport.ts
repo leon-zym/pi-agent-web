@@ -63,6 +63,7 @@ import { SessionHistoryStreamAssembler } from "../lib/session-history-stream";
 import type { SessionResyncAttemptContext, SessionResyncCompletion } from "../lib/session-resync";
 import {
 	createSessionCommandMachine,
+	type SessionCommandMachineCompletion,
 	type SessionCommandMachineError,
 	type SessionCommandMachineEvent,
 	type SessionCommandMachineIntent,
@@ -113,6 +114,7 @@ import {
 	type HotRuntimeInventoryToken,
 	hasFreshLeaseBaseline,
 	type SessionChannelState,
+	type SessionCommandCompletion,
 	type SessionContentAdapterFactory,
 	type SessionContentAdapterInstallation,
 	type SessionHistoryState,
@@ -141,6 +143,7 @@ export {
 	type HotRuntimeInventoryToken,
 	hasFreshLeaseBaseline,
 	type SessionChannelState,
+	type SessionCommandCompletion,
 	type SessionContentAdapterFactory,
 	type SessionContentAdapterInstallation,
 	type SessionHistoryState,
@@ -419,6 +422,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		releaseSession,
 		takeoverSession,
 		sendCommand,
+		sendCommandWithIdentity,
 		sendExtensionUiResponse,
 		manualRetryResync,
 		retrySessionSubscription,
@@ -613,6 +617,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				return;
 			case "resolve":
 				intent.resolve(intent.response);
+				intent.resolveWithIdentity?.(intent.completion);
 				return;
 			case "reject":
 				intent.reject(
@@ -1482,13 +1487,13 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		return resyncCoordinator.manualRetry(sessionHandle);
 	}
 
-	function sendCommand(
+	function sendCommandWithIdentity(
 		sessionHandle: string,
 		command: SessionCommandDto,
 		timeoutMs = commandTimeoutMs(command.type),
-	): Promise<PiSessionCommandResponseDto> {
+	): Promise<SessionCommandCompletion> {
 		const channel = store.getState().sessions[sessionHandle];
-		return new Promise<PiSessionCommandResponseDto>((resolve, reject) => {
+		return new Promise<SessionCommandCompletion>((resolve, reject) => {
 			const transition = transitionCommand({
 				type: "request",
 				sessionHandle,
@@ -1504,7 +1509,21 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				freshLeaseBaseline: channel?.freshLeaseBaseline ?? null,
 				isController: channel?.lease.isController === true,
 				fencingToken: channel?.lease.fencingToken,
-				resolve,
+				resolve: () => {},
+				resolveWithIdentity: (completion: SessionCommandMachineCompletion) =>
+					resolve({
+						identity: {
+							serverEpoch: completion.serverEpoch,
+							workspaceId: completion.workspaceId,
+							sessionHandle: completion.sessionHandle,
+							generation: completion.generation,
+						},
+						barrierSeq: completion.barrierSeq,
+						response: completion.response,
+						...(completion.previousSessionHandle
+							? { previousSessionHandle: completion.previousSessionHandle }
+							: {}),
+					}),
 				reject,
 			});
 			if (!transition.accepted) {
@@ -1516,6 +1535,16 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				);
 			}
 		});
+	}
+
+	function sendCommand(
+		sessionHandle: string,
+		command: SessionCommandDto,
+		timeoutMs = commandTimeoutMs(command.type),
+	): Promise<PiSessionCommandResponseDto> {
+		return sendCommandWithIdentity(sessionHandle, command, timeoutMs).then(
+			(completion) => completion.response,
+		);
 	}
 
 	function sendExtensionUiResponse(sessionHandle: string, response: ExtensionUiResponseDto): boolean {

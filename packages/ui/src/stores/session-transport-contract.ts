@@ -105,6 +105,13 @@ export type SessionLazyIdentity = Readonly<
 	Pick<SessionRuntimeIdentityDto, "serverEpoch" | "workspaceId" | "sessionHandle" | "generation">
 >;
 
+export interface SessionCommandCompletion {
+	identity: SessionLazyIdentity;
+	barrierSeq: number;
+	response: PiSessionCommandResponseDto;
+	previousSessionHandle?: string;
+}
+
 export interface SessionChannelState {
 	sessionHandle: string;
 	subscribed: boolean;
@@ -232,6 +239,11 @@ export interface SessionTransportState {
 		command: SessionCommandDto,
 		timeoutMs?: number,
 	) => Promise<PiSessionCommandResponseDto>;
+	sendCommandWithIdentity: (
+		sessionHandle: string,
+		command: SessionCommandDto,
+		timeoutMs?: number,
+	) => Promise<SessionCommandCompletion>;
 	sendExtensionUiResponse: (sessionHandle: string, response: ExtensionUiResponseDto) => boolean;
 	manualRetryResync: (sessionHandle: string) => boolean;
 	/** Retry a rejected background subscription without changing the visible Session. */

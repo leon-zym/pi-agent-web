@@ -5,6 +5,7 @@ import {
 	type SessionCommandDto,
 } from "@pi-agent-web/protocol";
 import { sessionTransport } from "../stores/session-transport";
+import type { SessionCommandCompletion } from "../stores/session-transport-contract";
 
 /** Read commands are Session-addressed and never require a controller lease. */
 export async function sendReadCommand(
@@ -22,6 +23,15 @@ export async function sendControlCommand(
 	timeoutMs = commandTimeoutMs(command.type),
 ): Promise<PiSessionCommandResponseDto> {
 	return sessionTransport.store.getState().sendCommand(sessionHandle, command, timeoutMs);
+}
+
+/** Identity transitions resolve with the authoritative resulting Session identity. */
+export async function sendControlCommandWithIdentity(
+	sessionHandle: string,
+	command: SessionCommandDto,
+	timeoutMs = commandTimeoutMs(command.type),
+): Promise<SessionCommandCompletion> {
+	return sessionTransport.store.getState().sendCommandWithIdentity(sessionHandle, command, timeoutMs);
 }
 
 export function sendControlExtensionUiResponse(
