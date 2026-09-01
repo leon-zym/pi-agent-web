@@ -1,6 +1,9 @@
 import {
 	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
 	type GatewayClientHelloDto,
+	type HotRuntimeInventoryEntryDto,
+	type InlineSessionReplayFrameDto,
+	type PiExtensionUiRequestDto,
 	type PiSessionCommandResponseDto,
 	SESSION_PAYLOAD_BUDGET,
 	type SessionCommandDto,
@@ -19,6 +22,9 @@ import {
 	type SessionConnectionMachineOptions,
 } from "../src/stores/connection-machine";
 import { createSessionControlMachine } from "../src/stores/control-machine";
+import { createSessionExtensionMachine, extensionNotifyKey } from "../src/stores/extension-machine";
+import { createSessionRecoveryMachine } from "../src/stores/recovery-machine";
+import { createSessionRetentionMachine, retentionCandidate } from "../src/stores/retention-machine";
 
 const identity: SessionRuntimeIdentityDto = {
 	serverEpoch: "epoch-a",
@@ -435,5 +441,265 @@ describe("Session command machine", () => {
 			}),
 		);
 		expect(gated.error?.code).toBe("session_read_only");
+	});
+});
+
+function extensionRequest(id: string, method: PiExtensionUiRequestDto["method"]): PiExtensionUiRequestDto {
+	switch (method) {
+		case "confirm":
+			return { type: "extension_ui_request", id, method, title: id, message: id };
+		case "notify":
+			return { type: "extension_ui_request", id, method, message: id };
+		case "setStatus":
+			return { type: "extension_ui_request", id, method, statusKey: "branch", statusText: id };
+		case "setWidget":
+			return { type: "extension_ui_request", id, method, widgetKey: "tests", widgetLines: [id] };
+		case "setTitle":
+			return { type: "extension_ui_request", id, method, title: id };
+		case "set_editor_text":
+			return { type: "extension_ui_request", id, method, text: id };
+		case "select":
+			return { type: "extension_ui_request", id, method, title: id, options: [id] };
+		case "input":
+			return { type: "extension_ui_request", id, method, title: id };
+		case "editor":
+			return { type: "extension_ui_request", id, method, title: id };
+	}
+}
+
+function replayEvent(identityValue: SessionRuntimeIdentityDto, seq: number): InlineSessionReplayFrameDto {
+	return {
+		type: "event",
+		...identityValue,
+		seq,
+		event: {} as InlineSessionReplayFrameDto extends { type: "event"; event: infer Event } ? Event : never,
+	} as InlineSessionReplayFrameDto;
+}
+
+describe("Session recovery machine", () => {
+	it("bounds replay buffers, rejects duplicates, and retains only current inventory revisions", () => {
+		const machine = createSessionRecoveryMachine({
+			attemptResync: () => Promise.reject(new Error("unused")),
+		});
+		const first = { message: replayEvent(identity, 8), representation: "wire" as const };
+		const second = { message: replayEvent(identity, 9), representation: "wire" as const };
+		expect(
+			machine.transition({
+				type: "buffer_replay",
+				key: identityKey(identity),
+				frame: first,
+				maxFrames: 1,
+				maxBytes: 10_000,
+			}),
+		).toMatchObject({ result: "buffered", accepted: true });
+		expect(
+			machine.transition({
+				type: "buffer_replay",
+				key: identityKey(identity),
+				frame: first,
+				maxFrames: 1,
+				maxBytes: 10_000,
+			}),
+		).toMatchObject({ result: "duplicate", accepted: false });
+		expect(
+			machine.transition({
+				type: "buffer_replay",
+				key: identityKey(identity),
+				frame: second,
+				maxFrames: 1,
+				maxBytes: 10_000,
+			}),
+		).toMatchObject({ result: "overflow", accepted: false, intents: [{ type: "replay_overflow" }] });
+
+		const hot: HotRuntimeInventoryEntryDto = {
+			...identity,
+			state: "idle",
+		};
+		expect(machine.transition({ type: "set_hot_inventory", revision: 3, runtimes: [hot] }).accepted).toBe(
+			true,
+		);
+		expect(machine.transition({ type: "set_hot_inventory", revision: 2, runtimes: [] }).accepted).toBe(false);
+		expect(machine.getState().hotRuntimeByHandle.get(identity.sessionHandle)).toEqual(hot);
+	});
+
+	it("requires both exact-hot baseline and lease before releasing a captured identity", () => {
+		const machine = createSessionRecoveryMachine({
+			attemptResync: () => Promise.reject(new Error("unused")),
+		});
+		machine.transition({ type: "queue_exact_hot", sessionHandle: identity.sessionHandle });
+		machine.transition({ type: "dequeue_exact_hot", sessionHandle: identity.sessionHandle });
+		machine.transition({
+			type: "set_active_exact_hot",
+			active: { identity, baselineReady: false, leaseReady: false, recoveryStarted: false },
+		});
+		expect(
+			machine.transition({
+				type: "advance_exact_hot",
+				identity: { ...identity, generation: 8 },
+				kind: "baseline",
+			}).accepted,
+		).toBe(false);
+		expect(machine.transition({ type: "advance_exact_hot", identity, kind: "baseline" }).intents).toEqual([]);
+		const released = machine.transition({ type: "advance_exact_hot", identity, kind: "lease" });
+		expect(released.intents).toEqual([{ type: "exact_hot_advanced", identity }]);
+		expect(machine.getState().activeExactHotRecovery).toBeNull();
+	});
+});
+
+describe("Session extension machine", () => {
+	it("replaces authoritative sticky state, closes requests, and deduplicates notifications per identity", () => {
+		const machine = createSessionExtensionMachine();
+		const blocking = extensionRequest("dialog-a", "confirm");
+		const status = extensionRequest("status-a", "setStatus");
+		machine.transition({ type: "hydrate", identity, pending: [blocking, status] });
+		machine.transition({
+			type: "replay",
+			identity,
+			frame: {
+				type: "extension_ui_request",
+				...identity,
+				seq: 5,
+				request: extensionRequest("status-b", "setStatus"),
+			},
+		});
+		expect(machine.getSession(identity.sessionHandle)?.pending.map((request) => request.id)).toEqual([
+			"dialog-a",
+			"status-b",
+		]);
+		machine.transition({
+			type: "replay",
+			identity,
+			frame: {
+				type: "extension_ui_closed",
+				...identity,
+				seq: 6,
+				requestId: "dialog-a",
+				reason: "answered",
+			},
+		});
+		expect(machine.getSession(identity.sessionHandle)?.pending.map((request) => request.id)).toEqual([
+			"status-b",
+		]);
+
+		const notifyFrame = {
+			type: "extension_ui_request",
+			...identity,
+			seq: 7,
+			request: extensionRequest("notice", "notify"),
+		} as Extract<InlineSessionReplayFrameDto, { type: "extension_ui_request" }>;
+		expect(extensionNotifyKey(notifyFrame)).toBe("7:notice");
+		expect(machine.transition({ type: "replay", identity, frame: notifyFrame }).intents).toEqual([
+			{ type: "notify_delivered", sessionHandle: identity.sessionHandle, key: "7:notice" },
+		]);
+		expect(machine.transition({ type: "replay", identity, frame: notifyFrame }).intents).toEqual([
+			{ type: "notify_deduped", sessionHandle: identity.sessionHandle, key: "7:notice" },
+		]);
+
+		machine.transition({ type: "result", identity, requestId: "status-b", resyncing: true });
+		expect(machine.getSession(identity.sessionHandle)?.acknowledgedRequestIds).toEqual(["status-b"]);
+		machine.transition({ type: "replace_snapshot", identity, requests: [blocking] });
+		expect(machine.getSession(identity.sessionHandle)?.pending.map((request) => request.id)).toEqual([
+			"dialog-a",
+		]);
+		machine.transition({
+			type: "rekey",
+			previousSessionHandle: identity.sessionHandle,
+			identity: { ...identity, sessionHandle: "session-b" },
+		});
+		expect(machine.getSession(identity.sessionHandle)).toBeUndefined();
+	});
+
+	it("evicts only old notification dedupe state while retaining pending requests and acknowledgements", () => {
+		const machine = createSessionExtensionMachine();
+		const oldestIdentity = { ...identity, sessionHandle: "oldest-notify-session" };
+		const pendingRequest = extensionRequest("blocking-request", "confirm");
+		const acknowledgedRequest = extensionRequest("acknowledged-request", "confirm");
+		machine.transition({
+			type: "hydrate",
+			identity: oldestIdentity,
+			pending: [pendingRequest, acknowledgedRequest],
+		});
+		machine.transition({
+			type: "result",
+			identity: oldestIdentity,
+			requestId: acknowledgedRequest.id,
+			resyncing: true,
+		});
+		const notify = (notifyIdentity: SessionRuntimeIdentityDto, seq: number) =>
+			machine.transition({
+				type: "replay",
+				identity: notifyIdentity,
+				frame: {
+					type: "extension_ui_request",
+					...notifyIdentity,
+					seq,
+					request: extensionRequest(`notify-${notifyIdentity.sessionHandle}`, "notify") as Extract<
+						PiExtensionUiRequestDto,
+						{ method: "notify" }
+					>,
+				},
+			});
+
+		notify(oldestIdentity, 1);
+		for (let index = 1; index <= 64; index += 1) {
+			notify({ ...identity, sessionHandle: `notify-session-${String(index)}` }, index + 1);
+		}
+
+		expect(machine.getSession(oldestIdentity.sessionHandle)).toMatchObject({
+			pending: [pendingRequest],
+			acknowledgedRequestIds: [acknowledgedRequest.id],
+			deliveredNotifyKeys: [],
+		});
+		expect(notify(oldestIdentity, 1).intents).toEqual([
+			{
+				type: "notify_delivered",
+				sessionHandle: oldestIdentity.sessionHandle,
+				key: "1:notify-oldest-notify-session",
+			},
+		]);
+	});
+});
+
+describe("Session retention machine", () => {
+	it("evicts the oldest safe subscription, protects hot sessions, and enforces raw-event bounds", () => {
+		const machine = createSessionRetentionMachine({
+			maxActiveSubscriptions: 2,
+			rawEventLimit: 2,
+			rawEventMaxBytes: 10_000,
+			rawEventGlobalLimit: 2,
+			rawEventGlobalMaxBytes: 10_000,
+		});
+		machine.transition({ type: "touch_subscription", sessionHandle: "a" });
+		machine.transition({ type: "touch_subscription", sessionHandle: "b" });
+		const candidate = retentionCandidate("a", { ...runtime, sessionHandle: "a" }, false, false);
+		expect(
+			machine.transition({
+				type: "admit_subscription",
+				sessionHandle: "c",
+				subscribedCount: 2,
+				candidates: [candidate, { sessionHandle: "b", subscribed: true, canEvict: true, protected: true }],
+			}).intents,
+		).toEqual([{ type: "evict_subscription", sessionHandle: "a" }]);
+
+		const raw = (seq: number) => ({
+			identityKey: identityKey(identity),
+			sessionHandle: identity.sessionHandle,
+			record: {
+				receivedAt: seq,
+				serverEpoch: identity.serverEpoch,
+				workspaceId: identity.workspaceId,
+				generation: identity.generation,
+				seq,
+				eventType: "message_start",
+				payload: {} as never,
+			},
+			bytes: 1,
+		});
+		machine.transition({ type: "retain_raw", entry: raw(1) });
+		machine.transition({ type: "retain_raw", entry: raw(2) });
+		const bounded = machine.transition({ type: "retain_raw", entry: raw(3) });
+		expect(bounded.intents).toHaveLength(1);
+		expect(bounded.intents[0]).toMatchObject({ type: "raw_events_evicted" });
+		expect(machine.getRawEvents(identity.sessionHandle).map((entry) => entry.record.seq)).toEqual([2, 3]);
 	});
 });

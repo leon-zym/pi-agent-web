@@ -244,6 +244,52 @@ describe("Active WebSocket Subscription LRU admission target with liveness guard
 		expect(unsubs?.length).toBeGreaterThan(0);
 	});
 
+	it("ignores an unsubscribed stale member and evicts a valid subscribed candidate", () => {
+		const { controller, sockets } = harness({ maxActiveSubscriptions: 1 });
+		controller.store.getState().connect();
+		open(sockets[0]);
+		const socket = sockets[0];
+		if (!socket) throw new Error("transport did not create a socket");
+
+		controller.store.getState().subscribeSession("stale");
+		controller.ingestServerMessage({
+			type: "runtime_state",
+			runtime: idlePersistedRuntime("stale"),
+		});
+		socket.onmessage?.({
+			data: JSON.stringify({
+				type: "session_error",
+				serverEpoch: "test-epoch",
+				sessionHandle: "stale",
+				operation: "subscribe",
+				error: "session_snapshot_unavailable",
+			}),
+		});
+		expect(controller.store.getState().sessions.stale?.subscribed).toBe(false);
+
+		controller.store.getState().subscribeSession("active");
+		controller.ingestServerMessage({
+			type: "runtime_state",
+			runtime: idlePersistedRuntime("active"),
+		});
+		controller.store.getState().subscribeSession("incoming");
+		controller.ingestServerMessage({
+			type: "runtime_state",
+			runtime: idlePersistedRuntime("incoming"),
+		});
+
+		const sessions = controller.store.getState().sessions;
+		expect(Object.values(sessions).filter(({ subscribed }) => subscribed)).toHaveLength(1);
+		expect(sessions.stale?.subscribed).toBe(false);
+		expect(sessions.active?.subscribed).toBe(false);
+		expect(sessions.incoming?.subscribed).toBe(true);
+		expect(
+			socket.sent.filter(
+				(message) => message.type === "session_unsubscribe" && message.sessionHandle === "active",
+			),
+		).toHaveLength(1);
+	});
+
 	it("does not evict running sessions even if they are LRU (Liveness Guard)", () => {
 		const { controller, sockets } = harness();
 		controller.store.getState().connect();

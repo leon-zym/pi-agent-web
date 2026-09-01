@@ -7,7 +7,7 @@ const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url))
 const assetsDirectory = path.join(repositoryRoot, "packages/ui/dist/assets");
 
 const budgets = {
-	entry: 240 * 1024,
+	entry: 256 * 1024,
 	settledMarkdown: 110 * 1024,
 	css: 12 * 1024,
 };

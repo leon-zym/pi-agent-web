@@ -1695,6 +1695,74 @@ describe("session transport Gateway negotiation", () => {
 		});
 	});
 
+	it("continues the exact-hot queue when runtime_state precedes resync_required after reconnect", () => {
+		const h = harness();
+		let socket = connect(h);
+		const hot = (sessionHandle: string, generation: number) => ({
+			serverEpoch: "test-server-epoch",
+			sessionHandle,
+			workspaceId: "workspace-a",
+			generation,
+			state: "idle" as const,
+		});
+		const initial = runtime("hot-a", 1, 0);
+		socket.serverMessage(hotInventory({ revision: 1, runtimes: [hot("hot-a", 1)] }));
+		socket.serverMessage({ type: "runtime_state", runtime: initial });
+		socket.serverMessage({
+			type: "resync_required",
+			serverEpoch: initial.serverEpoch,
+			sessionHandle: initial.sessionHandle,
+			runtime: initial,
+			reason: "initial",
+		});
+		completeWithSnapshot(h, initial.sessionHandle, initial.generation, initial.lastSeq);
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: initial.serverEpoch,
+			sessionHandle: initial.sessionHandle,
+			generation: initial.generation,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
+			isController: false,
+		});
+
+		h.controller.store.getState().disconnect();
+		h.controller.store.getState().connect();
+		socket = h.sockets.at(-1)!;
+		socket.open(false);
+		socket.serverMessage(serverHello());
+		socket.serverMessage(hotInventory({ revision: 1, runtimes: [hot("hot-a", 2), hot("hot-b", 1)] }));
+		const exactSubscriptionHandles = () =>
+			socket.sent.flatMap((message) =>
+				message.type === "session_subscribe" && message.expectedHotRuntime ? [message.sessionHandle] : [],
+			);
+		expect(exactSubscriptionHandles()).toEqual(["hot-a"]);
+
+		const next = runtime("hot-a", 2, 0);
+		socket.serverMessage({ type: "runtime_state", runtime: next });
+		socket.serverMessage({
+			type: "resync_required",
+			serverEpoch: next.serverEpoch,
+			sessionHandle: next.sessionHandle,
+			runtime: next,
+			reason: "generation_changed",
+		});
+		completeWithSnapshot(h, next.sessionHandle, next.generation, next.lastSeq);
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: next.serverEpoch,
+			sessionHandle: next.sessionHandle,
+			generation: next.generation,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
+			isController: false,
+		});
+
+		expect(exactSubscriptionHandles()).toEqual(["hot-a", "hot-b"]);
+	});
+
 	it("ignores stale inventory revisions and releases a removed observer without reopening history", () => {
 		const h = harness();
 		const socket = connect(h);
