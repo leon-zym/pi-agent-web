@@ -553,6 +553,36 @@ function completeWithSnapshot(
 	} satisfies InlineSessionSnapshotDto);
 }
 
+function rejectSubscriptionDuringResync(h: Harness, socket: FakeSocket, sessionHandle = "session-a"): void {
+	subscribeAndPrime(h, sessionHandle);
+	const resyncRuntime = runtime(sessionHandle, 1, 0);
+	socket.serverMessage({
+		type: "resync_required",
+		serverEpoch: resyncRuntime.serverEpoch,
+		sessionHandle,
+		runtime: resyncRuntime,
+		reason: "gap",
+	});
+	socket.serverMessage({
+		type: "session_error",
+		serverEpoch: resyncRuntime.serverEpoch,
+		sessionHandle,
+		operation: "subscribe",
+		error: "session_subscription_capacity",
+		code: "session_subscription_capacity",
+		retryable: true,
+	});
+	expect(h.controller.store.getState().sessions[sessionHandle]).toMatchObject({
+		subscribed: true,
+		baselineAuthoritative: false,
+		subscriptionAdmission: {
+			kind: "rejected",
+			code: "session_subscription_capacity",
+			retryable: true,
+		},
+	});
+}
+
 function historySnapshotFrames(
 	sessionHandle: string,
 	generation = 1,
@@ -869,6 +899,214 @@ describe("session transport Gateway negotiation", () => {
 			),
 		).toEqual(["hot-a", "hot-b"]);
 		expect(h.controller.store.getState().sessions["hot-a"]?.subscribed).toBe(true);
+	});
+
+	it("releases the next exact hot subscription after a deferred lease commits with an async snapshot", async () => {
+		let releaseSnapshot!: () => void;
+		const snapshotGate = new Promise<void>((resolve) => {
+			releaseSnapshot = resolve;
+		});
+		let snapshotProjectionStarted = false;
+		const adapter = projectedAdapter(async (request: ExtensionUiRequestDto) => {
+			if (request.id === "hot-existing-snapshot") {
+				snapshotProjectionStarted = true;
+				await snapshotGate;
+			}
+			if (request.method !== "set_editor_text") throw new Error("unexpected fixture request");
+			return { ...request, text: `resolved:${request.id}` };
+		});
+		const h = harness({ contentAdapter: adapter });
+		const socket = connect(h);
+		const existing = {
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "hot-existing",
+			workspaceId: "workspace-a",
+			generation: 1,
+			state: "idle" as const,
+		};
+		const existingRuntime = runtime(existing.sessionHandle, existing.generation, 0);
+		socket.serverMessage(hotInventory({ revision: 1, runtimes: [existing] }));
+		socket.serverMessage({ type: "runtime_state", runtime: existingRuntime });
+		socket.serverMessage({
+			type: "resync_required",
+			serverEpoch: existingRuntime.serverEpoch,
+			sessionHandle: existingRuntime.sessionHandle,
+			runtime: existingRuntime,
+			reason: "initial",
+		});
+		expect(
+			ingest(
+				h.controller,
+				projectedSnapshot(existing.sessionHandle, existing.generation, "hot-existing-snapshot"),
+			),
+		).toBe(true);
+		await vi.waitFor(() => expect(snapshotProjectionStarted).toBe(true));
+
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: existingRuntime.serverEpoch,
+			sessionHandle: existingRuntime.sessionHandle,
+			generation: existingRuntime.generation,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
+			isController: false,
+		});
+		const late = {
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "hot-late",
+			workspaceId: "workspace-a",
+			generation: 1,
+			state: "idle" as const,
+		};
+		socket.serverMessage(hotInventory({ revision: 2, runtimes: [existing, late] }));
+		const exactSubscriptions = (sessionHandle: string) =>
+			socket.sent.filter(
+				(message) =>
+					message.type === "session_subscribe" &&
+					message.sessionHandle === sessionHandle &&
+					message.expectedHotRuntime !== undefined,
+			);
+		expect(exactSubscriptions(existing.sessionHandle)).toHaveLength(1);
+		expect(exactSubscriptions(late.sessionHandle)).toHaveLength(0);
+
+		releaseSnapshot();
+		await vi.waitFor(() => {
+			expect(h.controller.store.getState().sessions[existing.sessionHandle]).toMatchObject({
+				baselineAuthoritative: true,
+				freshLeaseBaseline: expect.objectContaining({
+					serverEpoch: existing.serverEpoch,
+					sessionHandle: existing.sessionHandle,
+					workspaceId: existing.workspaceId,
+					generation: existing.generation,
+				}),
+				lease: { isController: false, leaseRevision: 0, controlState: "free" },
+			});
+			expect(exactSubscriptions(late.sessionHandle)).toHaveLength(1);
+		});
+
+		const lateRuntime = runtime(late.sessionHandle, late.generation, 0);
+		socket.serverMessage({ type: "runtime_state", runtime: lateRuntime });
+		socket.serverMessage({
+			type: "resync_required",
+			serverEpoch: lateRuntime.serverEpoch,
+			sessionHandle: lateRuntime.sessionHandle,
+			runtime: lateRuntime,
+			reason: "initial",
+		});
+		expect(h.controller.store.getState().claimSession(late.sessionHandle)).toBe(true);
+		completeWithSnapshot(h, late.sessionHandle, late.generation, 0);
+		expect(h.controller.store.getState().sessions[late.sessionHandle]).toMatchObject({
+			baselineAuthoritative: true,
+			freshLeaseBaseline: null,
+		});
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: lateRuntime.serverEpoch,
+			sessionHandle: lateRuntime.sessionHandle,
+			generation: lateRuntime.generation,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
+			isController: false,
+		});
+
+		expect(h.controller.store.getState().sessions[late.sessionHandle]).toMatchObject({
+			baselineAuthoritative: true,
+			freshLeaseBaseline: expect.objectContaining({
+				serverEpoch: late.serverEpoch,
+				sessionHandle: late.sessionHandle,
+				workspaceId: late.workspaceId,
+				generation: late.generation,
+			}),
+			lease: { isController: false, leaseRevision: 0, controlState: "free" },
+		});
+		expect(
+			socket.sent.filter(
+				(message) => message.type === "session_claim" && message.sessionHandle === late.sessionHandle,
+			),
+		).toEqual([{ type: "session_claim", sessionHandle: late.sessionHandle }]);
+	});
+
+	it("migrates an uncertain rekey while the parent baseline subscription is in flight", () => {
+		const h = harness();
+		const socket = connect(h);
+		const parent = runtime("session-parent", 1, 0);
+		h.controller.store.getState().subscribeSession(parent.sessionHandle);
+		socket.serverMessage({ type: "runtime_state", runtime: parent });
+		socket.serverMessage({
+			type: "resync_required",
+			serverEpoch: parent.serverEpoch,
+			sessionHandle: parent.sessionHandle,
+			runtime: parent,
+			reason: "initial",
+		});
+		expect(h.controller.store.getState().claimSession(parent.sessionHandle)).toBe(true);
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: parent.serverEpoch,
+			sessionHandle: parent.sessionHandle,
+			generation: parent.generation,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
+			isController: false,
+		});
+
+		const child = runtime("session-child", 2, 0);
+		socket.serverMessage({
+			type: "session_rekeyed",
+			serverEpoch: child.serverEpoch,
+			previousSessionHandle: parent.sessionHandle,
+			runtime: child,
+		});
+		expect(
+			socket.sent.filter(
+				(message) => message.type === "session_subscribe" && message.sessionHandle === child.sessionHandle,
+			),
+		).toHaveLength(0);
+
+		socket.serverMessage({
+			type: "resync_required",
+			serverEpoch: child.serverEpoch,
+			sessionHandle: child.sessionHandle,
+			runtime: child,
+			reason: "generation_changed",
+		});
+		expect(
+			socket.sent.filter(
+				(message) => message.type === "session_subscribe" && message.sessionHandle === child.sessionHandle,
+			),
+		).toHaveLength(0);
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: child.serverEpoch,
+			sessionHandle: child.sessionHandle,
+			generation: child.generation,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "rekey",
+			isController: false,
+		});
+		completeWithSnapshot(h, child.sessionHandle, child.generation, 0);
+
+		expect(h.controller.store.getState().sessions[parent.sessionHandle]?.subscribed).toBe(false);
+		expect(h.controller.store.getState().sessions[child.sessionHandle]).toMatchObject({
+			controllerIntent: true,
+			baselineAuthoritative: true,
+			freshLeaseBaseline: expect.objectContaining({
+				serverEpoch: child.serverEpoch,
+				sessionHandle: child.sessionHandle,
+				workspaceId: child.workspaceId,
+				generation: child.generation,
+			}),
+			lease: { isController: false, leaseRevision: 0, controlState: "free" },
+		});
+		expect(
+			socket.sent.filter(
+				(message) => message.type === "session_claim" && message.sessionHandle === child.sessionHandle,
+			),
+		).toEqual([{ type: "session_claim", sessionHandle: child.sessionHandle }]);
 	});
 
 	it("returns an epoch and revision token only after the initial inventory", async () => {
@@ -5201,5 +5439,267 @@ describe("ordered session frame bus", () => {
 		bus.emit("session-child", { type: "runtime_state", runtime: runtime("session-child", 2, 0) }, 1);
 
 		expect(listener).not.toHaveBeenCalled();
+	});
+});
+
+describe("Session transport characterization before machine extraction", () => {
+	it("keeps the connection hello, terminal mismatch, reconnect, and epoch sequence", () => {
+		vi.useFakeTimers();
+		const h = harness({ reconnectBaseMs: 5 });
+		h.controller.store.getState().subscribeSession("session-a");
+		h.controller.store.getState().connect();
+		const first = h.sockets[0];
+		if (!first) throw new Error("first transport socket was not created");
+
+		expect(h.controller.store.getState().connectionState).toBe("connecting");
+		first.open(false);
+		expect(first.sent[0]?.type).toBe("client_hello");
+		first.serverMessage(serverHello({ serverEpoch: "epoch-a" }));
+		expect(h.controller.store.getState().connectionState).toBe("connecting");
+		first.serverMessage(hotInventory({ serverEpoch: "epoch-a", revision: 1 }));
+		expect(h.controller.store.getState().connectionState).toBe("online");
+		expect(h.controller.store.getState().hotRuntimeInventory?.serverEpoch).toBe("epoch-a");
+
+		first.serverClose();
+		expect(h.controller.store.getState().connectionState).toBe("offline");
+		vi.advanceTimersByTime(5);
+		const second = h.sockets[1];
+		if (!second) throw new Error("transport did not schedule its reconnect");
+		second.open(false);
+		second.serverMessage(serverHello({ serverEpoch: "epoch-b" }));
+		second.serverMessage(hotInventory({ serverEpoch: "epoch-b", revision: 0 }));
+		expect(h.controller.store.getState().connectionState).toBe("online");
+		expect(h.controller.store.getState().hotRuntimeInventory?.serverEpoch).toBe("epoch-b");
+
+		const terminal = harness();
+		terminal.controller.store.getState().connect();
+		const terminalSocket = terminal.sockets[0];
+		if (!terminalSocket) throw new Error("terminal transport socket was not created");
+		terminalSocket.open(false);
+		terminalSocket.serverMessage(serverHello({ protocol: { major: 2, minor: 0 } }));
+		expect(terminal.controller.store.getState().connectionState).toBe("incompatible");
+		vi.advanceTimersByTime(60_000);
+		expect(terminal.sockets).toHaveLength(1);
+	});
+
+	it("keeps retryable subscription admission through a deferred matching lease status", () => {
+		const h = harness();
+		const socket = connect(h);
+		rejectSubscriptionDuringResync(h, socket);
+
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "session-a",
+			generation: 1,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
+			isController: false,
+		});
+
+		expect(h.controller.store.getState().sessions["session-a"]?.subscriptionAdmission).toEqual({
+			kind: "rejected",
+			code: "session_subscription_capacity",
+			retryable: true,
+		});
+		expect(h.controller.store.getState().retrySessionSubscription?.("session-a")).toBe(true);
+	});
+
+	it("keeps retryable subscription admission through stale lower-revision lease status", () => {
+		const h = harness();
+		const socket = connect(h);
+		rejectSubscriptionDuringResync(h, socket);
+
+		for (const leaseRevision of [4, 3]) {
+			socket.serverMessage({
+				type: "lease_status",
+				serverEpoch: "test-server-epoch",
+				sessionHandle: "session-a",
+				generation: 1,
+				leaseRevision,
+				controlState: "free",
+				transition: "baseline",
+				isController: false,
+			});
+		}
+
+		expect(h.controller.store.getState().sessions["session-a"]?.subscriptionAdmission).toEqual({
+			kind: "rejected",
+			code: "session_subscription_capacity",
+			retryable: true,
+		});
+		expect(h.controller.store.getState().retrySessionSubscription?.("session-a")).toBe(true);
+	});
+
+	it("keeps retryable subscription admission through same-revision contradictory lease status", () => {
+		const h = harness();
+		const socket = connect(h);
+		rejectSubscriptionDuringResync(h, socket);
+
+		for (const lease of [
+			{ controlState: "free" as const, isController: false },
+			{ controlState: "held" as const, isController: true },
+		]) {
+			socket.serverMessage({
+				type: "lease_status",
+				serverEpoch: "test-server-epoch",
+				sessionHandle: "session-a",
+				generation: 1,
+				leaseRevision: 4,
+				controlState: lease.controlState,
+				transition: "baseline",
+				isController: lease.isController,
+				...(lease.isController ? { fencingToken: "contradictory-fence" } : {}),
+			});
+		}
+
+		expect(h.controller.store.getState().sessions["session-a"]?.lease.conflicted).toBe(true);
+		expect(h.controller.store.getState().sessions["session-a"]?.subscriptionAdmission).toEqual({
+			kind: "rejected",
+			code: "session_subscription_capacity",
+			retryable: true,
+		});
+		expect(h.controller.store.getState().retrySessionSubscription?.("session-a")).toBe(true);
+	});
+
+	it("clears retryable subscription admission only after an authoritative resync baseline", async () => {
+		const clock = new ResyncClock();
+		const h = harness({ resyncClock: clock, resyncRandom: () => 0.5 });
+		const socket = connect(h);
+		rejectSubscriptionDuringResync(h, socket);
+
+		await flushPromises();
+		expect(h.controller.store.getState().sessions["session-a"]?.subscriptionAdmission).toMatchObject({
+			kind: "rejected",
+		});
+
+		clock.advanceBy(500);
+		expect(socket.sent.at(-1)).toEqual({ type: "session_subscribe", sessionHandle: "session-a" });
+		completeWithSnapshot(h, "session-a", 1, 0);
+
+		expect(h.controller.store.getState().sessions["session-a"]).toMatchObject({
+			baselineAuthoritative: true,
+			subscriptionAdmission: null,
+		});
+	});
+
+	it("keeps revisioned control transitions fenced through claim, release, takeover, and conflict", () => {
+		const h = harness();
+		const socket = connect(h);
+		subscribeAndPrime(h, "session-a");
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "session-a",
+			generation: 1,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
+			isController: false,
+		});
+		expect(h.controller.store.getState().claimSession("session-a")).toBe(true);
+		expect(socket.sent.at(-1)).toEqual({ type: "session_claim", sessionHandle: "session-a" });
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "session-a",
+			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
+			isController: true,
+			fencingToken: "fence-1",
+		});
+		expect(h.controller.store.getState().sessions["session-a"]?.lease).toMatchObject({
+			isController: true,
+			leaseRevision: 1,
+			fencingToken: "fence-1",
+		});
+
+		expect(h.controller.store.getState().releaseSession("session-a")).toBe(true);
+		expect(h.controller.store.getState().sessions["session-a"]?.lease).toMatchObject({
+			isController: false,
+			leaseRevision: 1,
+		});
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "session-a",
+			generation: 1,
+			leaseRevision: 2,
+			controlState: "held",
+			transition: "takeover",
+			isController: false,
+		});
+		expect(h.controller.store.getState().takeoverSession("session-a")).toBe(true);
+		expect(socket.sent.at(-1)).toEqual({
+			type: "session_takeover",
+			sessionHandle: "session-a",
+			expectedGeneration: 1,
+			expectedLeaseRevision: 2,
+		});
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "session-a",
+			generation: 1,
+			leaseRevision: 2,
+			controlState: "held",
+			transition: "takeover",
+			isController: true,
+			fencingToken: "foreign-fence",
+		});
+		expect(h.controller.store.getState().sessions["session-a"]?.lease).toMatchObject({
+			isController: false,
+			conflicted: true,
+		});
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "session-a",
+			generation: 1,
+			leaseRevision: 3,
+			controlState: "free",
+			transition: "release",
+			isController: false,
+		});
+		expect(h.controller.store.getState().sessions["session-a"]?.lease).toMatchObject({
+			leaseRevision: 3,
+		});
+		expect(h.controller.store.getState().sessions["session-a"]?.lease.conflicted).toBeUndefined();
+	});
+
+	it("correlates commands by captured identity, waits for barrier delivery, and ignores timeout-late responses", async () => {
+		vi.useFakeTimers();
+		const h = harness({ reconnectBaseMs: 5 });
+		const socket = connect(h);
+		subscribeAndPrime(h, "session-a");
+		const barrier = h.controller.store
+			.getState()
+			.sendCommand("session-a", { id: "barrier-command", type: "get_state" });
+		socket.serverMessage(successResponse("session-a", 1, "barrier-command", "get_state", 1));
+		let barrierSettled = false;
+		void barrier.then(() => {
+			barrierSettled = true;
+		});
+		await Promise.resolve();
+		expect(barrierSettled).toBe(false);
+		h.controller.ingestServerMessage(eventFrame("session-a", 1, 1));
+		await expect(barrier).resolves.toMatchObject({ id: "barrier-command" });
+
+		const timedOut = h.controller.store
+			.getState()
+			.sendCommand("session-a", { id: "timeout-command", type: "get_state" }, 10);
+		vi.advanceTimersByTime(10);
+		await expect(timedOut).rejects.toMatchObject({ code: "timeout" });
+		socket.serverMessage(successResponse("session-a", 1, "timeout-command", "get_state"));
+
+		const captured = h.controller.store
+			.getState()
+			.sendCommand("session-a", { id: "captured-command", type: "get_state" });
+		h.controller.ingestServerMessage({ type: "runtime_state", runtime: runtime("session-a", 2, 1) });
+		socket.serverMessage(successResponse("session-a", 1, "captured-command", "get_state"));
+		await expect(captured).rejects.toMatchObject({ code: "response_mismatch" });
 	});
 });
