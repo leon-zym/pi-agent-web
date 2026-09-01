@@ -8,7 +8,6 @@ import type {
 } from "@pi-agent-web/protocol";
 import { create } from "zustand";
 import { api } from "../lib/api";
-import { displayLabel } from "../lib/format";
 import { runtimeIsBusy, runtimeIsReady, runtimeStateForDisplay } from "../lib/runtime-state";
 import { useComposerStore } from "./composer";
 import { useExtensionUiStore } from "./extension-ui";
@@ -51,19 +50,57 @@ export interface SessionDirectoryState {
 	selectWorkspace: (workspaceHandle: string) => Promise<void>;
 	reloadSessions: (workspaceHandle?: string, options?: { force?: boolean }) => Promise<NativeSessionDto[]>;
 	selectSession: (session: NativeSessionDto | null) => void;
+	/** Activate transport ownership after a composition-level visible-state commit. */
+	activateSessionTransport: (session: NativeSessionDto | null, previousSessionHandle?: string) => void;
+	/** Directory-only selection commit used by the Session lifecycle composition. */
+	selectSessionState: (session: NativeSessionDto | null) => void;
 	resumeTransientSession: (workspaceHandle: string) => boolean;
 	hotTransientResumeStatus: (workspaceHandle: string) => HotTransientResumeStatus;
 	beginSessionCreation: (workspaceHandle: string) => number;
 	completeSessionCreation: (token: number, session: NativeSessionDto) => boolean;
+	/** Complete the directory portion of creation before lifecycle owners attach the Session. */
+	completeSessionCreationState: (token: number, session: NativeSessionDto) => boolean;
 	failSessionCreation: (token: number) => boolean;
 	upsertSession: (session: NativeSessionDto) => void;
 	applyRuntime: (runtime: SessionRuntimeDto) => void;
 	applyHotRuntimeInventory: (inventory: HotRuntimeInventoryDto) => void;
 	rekeySession: (previousSessionHandle: string, sessionHandle: string, runtime: SessionRuntimeDto) => void;
+	/** Directory-only rekey commit used by the Session lifecycle composition. */
+	rekeySessionState: (
+		previousSessionHandle: string,
+		sessionHandle: string,
+		runtime: SessionRuntimeDto,
+	) => boolean;
 	removeSession: (workspaceHandle: string, sessionHandle: string) => void;
+	/** Directory-only removal commit used by the Session lifecycle composition. */
+	removeSessionState: (workspaceHandle: string, sessionHandle: string) => boolean;
 	markSessionUnread: (sessionHandle: string) => void;
 	markSessionRead: (sessionHandle: string) => void;
 	setSearchQuery: (query: string) => void;
+}
+
+export type SessionDirectoryLifecycleOutcome = "unavailable" | "committed" | "rejected";
+
+/**
+ * The directory keeps its legacy store facade, but delegates Session lifecycle mutations to the
+ * composition-level coordinator once one is installed. Transport ownership remains a separate
+ * callback so Browser navigation never implies a Pi session switch.
+ */
+export interface SessionDirectoryLifecycleCoordinator {
+	readonly selectSession: (session: NativeSessionDto | null) => boolean;
+	readonly activateSessionTransport: (
+		session: NativeSessionDto | null,
+		previousSessionHandle?: string,
+	) => void;
+	readonly rekeySession: (
+		previousSessionHandle: string,
+		sessionHandle: string,
+		runtime: SessionRuntimeDto,
+	) => SessionDirectoryLifecycleOutcome;
+	readonly disposeSession: (
+		workspaceHandle: string,
+		sessionHandle: string,
+	) => SessionDirectoryLifecycleOutcome;
 }
 
 export interface SessionCreationIntent {
@@ -81,11 +118,22 @@ const transientAbandons = new Set<string>();
 let sessionRequestCounter = 0;
 let navigationTokenCounter = 0;
 let cancelPendingVisibleSessionClaim: (() => void) | null = null;
+let lifecycleCoordinator: SessionDirectoryLifecycleCoordinator | null = null;
 
 const TRANSIENT_CONTROL_WAIT_MS = 5_000;
 
 export function isSessionBeingAbandoned(sessionHandle: string): boolean {
 	return transientAbandons.has(sessionHandle);
+}
+
+/** Install the one composition-level lifecycle coordinator used by the directory facade. */
+export function installSessionDirectoryLifecycleCoordinator(
+	coordinator: SessionDirectoryLifecycleCoordinator,
+): void {
+	if (lifecycleCoordinator && lifecycleCoordinator !== coordinator) {
+		throw new Error("Session directory lifecycle coordinator is already installed");
+	}
+	lifecycleCoordinator = coordinator;
 }
 
 function nextSessionRequest(): number {
@@ -234,12 +282,6 @@ function selectVisibleSessionState(sessionHandle: string | null): void {
 	useSlashCommandsStore.getState().beginSession(sessionHandle);
 	useSessionStatsStore.getState().beginSession(sessionHandle);
 	useExtensionUiStore.getState().beginSession(sessionHandle);
-	if (typeof document !== "undefined") {
-		const extensionTitle = sessionHandle
-			? useExtensionUiStore.getState().bySession[sessionHandle]?.title
-			: null;
-		document.title = extensionTitle ? `${displayLabel(extensionTitle)} · Pi Agent Web` : "Pi Agent Web";
-	}
 	useViewStore.getState().clearSession();
 }
 
@@ -271,9 +313,23 @@ function claimVisibleSessionWhenFree(sessionHandle: string): void {
 }
 
 function activateSessionView(session: NativeSessionDto | null): void {
+	selectVisibleSessionState(session?.sessionHandle ?? null);
+	activateSessionTransport(session);
+}
+
+function activateVisibleSession(session: NativeSessionDto | null, previousSessionHandle?: string): void {
+	const coordinator = lifecycleCoordinator;
+	if (coordinator) {
+		if (coordinator.selectSession(session))
+			coordinator.activateSessionTransport(session, previousSessionHandle);
+		return;
+	}
+	activateSessionView(session);
+}
+
+function activateSessionTransport(session: NativeSessionDto | null): void {
 	cancelPendingVisibleSessionClaim?.();
 	const sessionHandle = session?.sessionHandle ?? null;
-	selectVisibleSessionState(sessionHandle);
 	if (!sessionHandle) return;
 	const transport = sessionTransport.store.getState();
 	if (!useProjectionStore.getState().projections[sessionHandle]) {
@@ -554,7 +610,7 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 				retainedTransientByWorkspace,
 			});
 			releaseDormantView(previousSessionHandle, null);
-			activateSessionView(null);
+			activateVisibleSession(null, previousSessionHandle);
 			if (preferred) await get().reloadSessions(preferred.workspaceHandle);
 		} catch (error) {
 			set({ loadingWorkspaces: false, error: error instanceof Error ? error.message : String(error) });
@@ -635,7 +691,7 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 				hotRuntimeIdentityBySession,
 				locallyCreatedTransientSessions,
 			});
-			activateSessionView(null);
+			activateVisibleSession(null, undefined);
 		} else {
 			set({
 				sessionsByWorkspace,
@@ -672,7 +728,7 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 			retainedTransientByWorkspace,
 		});
 		releaseDormantView(previousSessionHandle, null);
-		activateSessionView(null);
+		activateVisibleSession(null, previousSessionHandle);
 		const activation = api
 			.activateWorkspace(workspaceHandle)
 			.then((activatedWorkspace) => {
@@ -761,10 +817,9 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 		return completion;
 	},
 
-	selectSession: (session) => {
+	selectSessionState: (session) => {
 		const previousSession = get().currentSession;
 		const workspaceHandle = session?.workspaceHandle ?? get().currentWorkspaceHandle;
-		const previousSessionHandle = previousSession?.sessionHandle;
 		const retainedTransientByWorkspace = retainLocalTransient(
 			get().retainedTransientByWorkspace,
 			previousSession,
@@ -792,8 +847,24 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 			unreadBySession,
 			retainedTransientByWorkspace,
 		});
+	},
+
+	selectSession: (session) => {
+		const previousSessionHandle = get().currentSession?.sessionHandle;
+		if (lifecycleCoordinator) {
+			if (lifecycleCoordinator.selectSession(session)) {
+				lifecycleCoordinator.activateSessionTransport(session, previousSessionHandle);
+			}
+			return;
+		}
+		get().selectSessionState(session);
 		releaseDormantView(previousSessionHandle, session?.sessionHandle ?? null);
 		activateSessionView(session);
+	},
+
+	activateSessionTransport: (session, previousSessionHandle) => {
+		releaseDormantView(previousSessionHandle, session?.sessionHandle ?? null);
+		activateSessionTransport(session);
 	},
 
 	resumeTransientSession: (workspaceHandle) => {
@@ -838,11 +909,14 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 			error: undefined,
 		});
 		releaseDormantView(previousSessionHandle, null);
-		activateSessionView(null);
+		activateVisibleSession(null, previousSessionHandle);
+		// The lifecycle selection clears transient view state, but creation keeps its navigation
+		// fence until the asynchronous native Session response is accepted.
+		set({ navigationToken: token, sessionCreation: { token, workspaceHandle } });
 		return token;
 	},
 
-	completeSessionCreation: (token, session) => {
+	completeSessionCreationState: (token, session) => {
 		if (!session.persisted) {
 			set({
 				locallyCreatedTransientSessions: {
@@ -862,6 +936,17 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 			return false;
 		}
 		set({ sessionCreation: null });
+		return true;
+	},
+
+	completeSessionCreation: (token, session) => {
+		if (!get().completeSessionCreationState(token, session)) return false;
+		if (lifecycleCoordinator) {
+			const previousSessionHandle = get().currentSession?.sessionHandle;
+			if (!lifecycleCoordinator.selectSession(session)) return false;
+			lifecycleCoordinator.activateSessionTransport(session, previousSessionHandle);
+			return true;
+		}
 		get().selectSession(session);
 		return true;
 	},
@@ -987,7 +1072,7 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 		set({ hotSessionsByWorkspace: next, hotRuntimeStateBySession, hotRuntimeIdentityBySession });
 	},
 
-	rekeySession: (previousSessionHandle, sessionHandle, runtime) => {
+	rekeySessionState: (previousSessionHandle, sessionHandle, runtime) => {
 		const workspaceHandle = runtime.workspaceId;
 		const sessions = get().sessionsByWorkspace[workspaceHandle] ?? [];
 		const previous = sessions.find((session) => session.sessionHandle === previousSessionHandle);
@@ -1056,12 +1141,17 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 			hotRuntimeIdentityBySession,
 			...(wasCurrent ? { currentSession: replacement } : {}),
 		});
-		if (wasCurrent) {
-			selectVisibleSessionState(sessionHandle);
-		}
+		return wasCurrent;
 	},
 
-	removeSession: (workspaceHandle, sessionHandle) => {
+	rekeySession: (previousSessionHandle, sessionHandle, runtime) => {
+		const coordinated = lifecycleCoordinator?.rekeySession(previousSessionHandle, sessionHandle, runtime);
+		if (coordinated && coordinated !== "unavailable") return;
+		const wasCurrent = get().rekeySessionState(previousSessionHandle, sessionHandle, runtime);
+		if (wasCurrent) selectVisibleSessionState(sessionHandle);
+	},
+
+	removeSessionState: (workspaceHandle, sessionHandle) => {
 		const sessions = (get().sessionsByWorkspace[workspaceHandle] ?? []).filter(
 			(session) => session.sessionHandle !== sessionHandle,
 		);
@@ -1099,6 +1189,18 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 			hotRuntimeIdentityBySession,
 			...(wasCurrent ? { currentSession: null } : {}),
 		});
+		return wasCurrent;
+	},
+
+	removeSession: (workspaceHandle, sessionHandle) => {
+		const coordinated = lifecycleCoordinator?.disposeSession(workspaceHandle, sessionHandle);
+		if (coordinated && coordinated !== "unavailable") {
+			if (coordinated === "committed") {
+				lifecycleCoordinator?.activateSessionTransport(null, sessionHandle);
+			}
+			return;
+		}
+		const wasCurrent = get().removeSessionState(workspaceHandle, sessionHandle);
 		if (wasCurrent) activateSessionView(null);
 		useComposerStore.getState().forgetSession(sessionHandle);
 		useModelDirectoryStore.getState().forgetSession(sessionHandle);

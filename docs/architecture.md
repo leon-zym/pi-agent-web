@@ -172,6 +172,18 @@ started, even if another Session is now visible.
 Compatible delta-only updates may be coalesced. Structural, settled, error, rekey, recovery, and
 dialog-close boundaries flush synchronously. Background subscribed Sessions continue ingesting.
 
+### Session lifecycle ownership
+
+Session-scoped lifecycle changes are coordinated synchronously by the UI lifecycle registry. The
+directory/current-view, composer, projection, model, slash-command, stats, and Extension owners
+register one explicit `migrate`, `preserve`, `reset`, or `rebuild` policy for create, snapshot, rekey,
+and dispose. Owners prepare before any commit; a failed commit restores owners already committed in
+reverse order and reports projection recovery. Browser effects are typed intents with the complete
+Session identity and a dedupe key, and run only after a successful state commit. Toasts, audio,
+titles, tab badges, scheduled directory refreshes, and navigation use the injected
+`SessionBrowserEffects` adapter, so stale incarnations and failed effect sinks cannot mutate a newer
+Session.
+
 ## Resource and security boundary
 
 The Gateway accepts only loopback listeners. Except for bootstrap-cookie issuance, REST and

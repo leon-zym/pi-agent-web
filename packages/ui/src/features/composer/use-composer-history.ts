@@ -29,12 +29,23 @@ export function saveComposerHistory(
 	sessionHandle: string | null | undefined,
 	history: string[],
 ): void {
-	if (typeof localStorage === "undefined") return;
+	writeComposerHistory(workspaceHandle, sessionHandle, history);
+}
+
+function writeComposerHistory(
+	workspaceHandle: string | null | undefined,
+	sessionHandle: string | null | undefined,
+	history: string[],
+): boolean {
+	if (typeof localStorage === "undefined") return false;
 	try {
 		const key = getComposerHistoryKey(workspaceHandle, sessionHandle);
-		const capped = history.slice(-HISTORY_CAP);
-		localStorage.setItem(key, JSON.stringify(capped));
-	} catch {}
+		const serialized = JSON.stringify(history.slice(-HISTORY_CAP));
+		localStorage.setItem(key, serialized);
+		return localStorage.getItem(key) === serialized;
+	} catch {
+		return false;
+	}
 }
 
 export function appendComposerHistory(
@@ -63,11 +74,20 @@ export function migrateComposerHistory(
 	if (typeof localStorage === "undefined") return;
 	if (fromSessionHandle === toSessionHandle) return;
 	const existing = loadComposerHistory(workspaceHandle, fromSessionHandle);
-	if (existing.length > 0) {
-		saveComposerHistory(workspaceHandle, toSessionHandle, existing);
-		try {
-			localStorage.removeItem(getComposerHistoryKey(workspaceHandle, fromSessionHandle));
-		} catch {}
+	if (existing.length === 0) return;
+	const destination = loadComposerHistory(workspaceHandle, toSessionHandle);
+	const merged = [...destination, ...existing.filter((entry) => !destination.includes(entry))].slice(
+		-HISTORY_CAP,
+	);
+	// The source is disposable only after the destination write has been verified. A failed
+	// localStorage write therefore leaves the pending Session history recoverable.
+	const alreadyMigrated =
+		merged.length === destination.length && merged.every((entry, index) => entry === destination[index]);
+	if (!alreadyMigrated && !writeComposerHistory(workspaceHandle, toSessionHandle, merged)) return;
+	try {
+		localStorage.removeItem(getComposerHistoryKey(workspaceHandle, fromSessionHandle));
+	} catch {
+		// A duplicate source is safer than losing the only copy of the history.
 	}
 }
 
