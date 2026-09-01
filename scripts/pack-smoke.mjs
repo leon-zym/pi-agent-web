@@ -5,12 +5,32 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-pack-smoke-"));
+const root = fs.realpathSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."));
+const tempAlias = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-pack-smoke-"));
+const tempRoot = fs.realpathSync(tempAlias);
 const tarballDir = path.join(tempRoot, "tarballs");
 const installDir = path.join(tempRoot, "install");
 fs.mkdirSync(tarballDir);
 fs.mkdirSync(installDir);
+const packageVersion = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version;
+
+function isInside(canonicalRoot, canonicalCandidate) {
+	const relative = path.relative(canonicalRoot, canonicalCandidate);
+	return (
+		Boolean(relative) &&
+		relative !== ".." &&
+		!relative.startsWith(`..${path.sep}`) &&
+		!path.isAbsolute(relative)
+	);
+}
+
+if (
+	fs.realpathSync(tempAlias) !== tempRoot ||
+	!isInside(tempRoot, path.join(tempRoot, "canonical-alias")) ||
+	isInside(tempRoot, path.dirname(tempRoot))
+) {
+	throw new Error("Canonical temp-root path seam failed");
+}
 
 function run(command, args, cwd = root) {
 	const result = spawnSync(command, args, { cwd, encoding: "utf8", stdio: "pipe", timeout: 120_000 });
@@ -22,6 +42,11 @@ function run(command, args, cwd = root) {
 
 function packageManifest(tarball) {
 	return JSON.parse(run("tar", ["-xOf", tarball, "package/package.json"]));
+}
+
+const HTTP_TIMEOUT_MS = 10_000;
+function fetchBounded(url, options = {}, fetchImpl = fetch, timeoutMs = HTTP_TIMEOUT_MS) {
+	return fetchImpl(url, { ...options, signal: AbortSignal.timeout(timeoutMs) });
 }
 
 function waitForOutput(child, pattern, timeoutMs = 10_000) {
@@ -61,12 +86,20 @@ function waitForChildExit(child, timeoutMs) {
 	});
 }
 
-async function closeChild(child) {
-	if (child.exitCode !== null || child.signalCode !== null) return;
-	child.kill("SIGTERM");
-	if (await waitForChildExit(child, 2_000)) return;
-	child.kill("SIGKILL");
-	if (!(await waitForChildExit(child, 2_000))) throw new Error("Packaged CLI did not exit after SIGKILL");
+async function closeChild(child, wait = waitForChildExit, now = Date.now) {
+	let sigtermExitCodeZero = child.exitCode === 0 && child.signalCode === null;
+	if (child.exitCode === null && child.signalCode === null) {
+		const startedAt = now();
+		child.kill("SIGTERM");
+		if (await wait(child, 2_000)) {
+			sigtermExitCodeZero = child.exitCode === 0 && child.signalCode === null && now() - startedAt <= 2_000;
+		} else {
+			child.kill("SIGKILL");
+			if (!(await wait(child, 2_000))) throw new Error("Packaged CLI did not exit after SIGKILL");
+			throw new Error("Packaged CLI required forced cleanup after SIGTERM");
+		}
+	}
+	if (!sigtermExitCodeZero) throw new Error("Packaged CLI did not exit cleanly after SIGTERM");
 }
 
 function waitForSocket(socket, setup, timeoutMessage, timeoutMs = 10_000) {
@@ -90,6 +123,142 @@ function waitForSocket(socket, setup, timeoutMessage, timeoutMs = 10_000) {
 	});
 }
 
+function readSocketFrame(raw, finish, label) {
+	try {
+		const frame = JSON.parse(raw.toString());
+		if (!frame || typeof frame !== "object" || Array.isArray(frame)) throw new Error("not an object");
+		return frame;
+	} catch {
+		finish(new Error(`${label} sent an invalid JSON frame`));
+		return null;
+	}
+}
+
+async function startGateway(cliEntry, cwd, env, piPath) {
+	const child = spawn(
+		process.execPath,
+		[cliEntry, ...(piPath ? ["--pi-path", piPath] : []), "--host", "127.0.0.1", "--port", "0", "--no-open"],
+		{ cwd, stdio: ["ignore", "pipe", "pipe"], env },
+	);
+	try {
+		const match = await waitForOutput(child, /listening on http:\/\/127\.0\.0\.1:(\d+)/);
+		const origin = `http://127.0.0.1:${match[1]}`;
+		const bootstrap = await fetchBounded(`${origin}/api/v1/bootstrap`, { headers: { Origin: origin } });
+		const cookie = bootstrap.headers.get("set-cookie")?.split(";", 1)[0];
+		if (!bootstrap.ok || !cookie) throw new Error("Bootstrap did not issue a session cookie");
+		return { child, origin, cookie };
+	} catch (error) {
+		await closeChild(child);
+		throw error;
+	}
+}
+
+async function createSession(origin, cookie, workspacePath, label) {
+	const headers = { Origin: origin, Cookie: cookie, "Content-Type": "application/json" };
+	const workspaceResponse = await fetchBounded(`${origin}/api/v1/workspaces`, {
+		method: "POST",
+		headers,
+		body: JSON.stringify({ path: workspacePath }),
+	});
+	if (!workspaceResponse.ok) throw new Error(`${label} workspace creation failed`);
+	const workspace = await workspaceResponse.json();
+	const sessionResponse = await fetchBounded(
+		`${origin}/api/v1/workspaces/${encodeURIComponent(workspace.workspaceHandle)}/sessions`,
+		{ method: "POST", headers },
+	);
+	if (!sessionResponse.ok) throw new Error(`${label} Session activation failed`);
+	const session = await sessionResponse.json();
+	if (session?.runtime?.state !== "idle") {
+		throw new Error(`${label} Session did not complete Pi readiness: ${JSON.stringify(session)}`);
+	}
+	return session;
+}
+
+async function checkReadiness(origin, cookie, source) {
+	const response = await fetchBounded(`${origin}/api/v1/health/ready`, {
+		headers: { Origin: origin, Cookie: cookie },
+	});
+	if (!response.ok) throw new Error(`Health check failed with ${String(response.status)}`);
+	const readiness = await response.json();
+	if (
+		readiness?.ready !== true ||
+		readiness?.runtime?.source !== source ||
+		readiness?.runtime?.version !== "0.84.2" ||
+		readiness?.runtime?.adapterId !== "pi-rpc"
+	) {
+		throw new Error(`Packaged Gateway selected an unexpected runtime: ${JSON.stringify(readiness)}`);
+	}
+}
+
+async function exerciseSession(socket, runtime) {
+	const { sessionHandle, generation } = runtime;
+	let fencingToken;
+	let claimed = false;
+	let streamedText = "";
+	let settled = false;
+	let response;
+	await new Promise((resolve, reject) => {
+		let timer;
+		const finish = (error) => {
+			clearTimeout(timer);
+			socket.off("message", onMessage);
+			socket.off("error", finish);
+			if (error) reject(error);
+			else resolve();
+		};
+		const onMessage = (raw) => {
+			const frame = readSocketFrame(raw, finish, "Fixture Session");
+			if (!frame) return;
+			if (frame.type === "runtime_state" && frame.runtime?.sessionHandle === sessionHandle && !claimed) {
+				claimed = true;
+				socket.send(JSON.stringify({ type: "session_claim", sessionHandle }));
+			}
+			if (
+				frame.type === "lease_status" &&
+				frame.sessionHandle === sessionHandle &&
+				frame.isController === true &&
+				!fencingToken &&
+				typeof frame.fencingToken === "string"
+			) {
+				fencingToken = frame.fencingToken;
+				socket.send(
+					JSON.stringify({
+						type: "command",
+						sessionHandle,
+						expectedGeneration: generation,
+						fencingToken,
+						command: { id: "pack-smoke-prompt", type: "prompt", message: "PACK_SMOKE_NON_EMPTY" },
+					}),
+				);
+			}
+			const event = frame.type === "event" && frame.sessionHandle === sessionHandle ? frame.event : null;
+			if (event?.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
+				streamedText += event.assistantMessageEvent.delta;
+			}
+			if (event?.type === "agent_settled") settled = true;
+			if (frame.type === "response" && frame.response?.id === "pack-smoke-prompt") response = frame.response;
+			if (settled && response) finish();
+		};
+		socket.on("message", onMessage);
+		socket.on("error", finish);
+		timer = setTimeout(() => finish(new Error("Fixture Session conversation timed out")), 10_000);
+		socket.send(JSON.stringify({ type: "session_subscribe", sessionHandle }));
+	});
+	if (response?.success !== true || streamedText !== "E2E_REPLY:PACK_SMOKE_NON_EMPTY")
+		throw new Error("Fixture Session stream failed");
+}
+
+const gatewayCapabilities = [
+	"rpc.commands",
+	"rpc.events",
+	"rpc.extension_ui",
+	"session.multiplex",
+	"session.hot_runtime_inventory",
+	"session.fenced_takeover",
+	"payload.epoch_attachment_refs",
+	"payload.epoch_content_refs",
+];
+
 try {
 	const packageNames = [
 		"@pi-agent-web/protocol",
@@ -97,6 +266,12 @@ try {
 		"@pi-agent-web/ui",
 		"@pi-agent-web/cli",
 	];
+	const localEdges = {
+		"@pi-agent-web/protocol": [],
+		"@pi-agent-web/server": ["@pi-agent-web/protocol"],
+		"@pi-agent-web/ui": ["@pi-agent-web/protocol"],
+		"@pi-agent-web/cli": ["@pi-agent-web/server", "@pi-agent-web/ui"],
+	};
 	for (const packageName of packageNames) {
 		run("pnpm", ["--filter", packageName, "pack", "--pack-destination", tarballDir]);
 	}
@@ -105,6 +280,7 @@ try {
 		.filter((entry) => entry.endsWith(".tgz"))
 		.map((entry) => path.join(tarballDir, entry));
 	if (tarballs.length !== 4) throw new Error(`Expected four tarballs, found ${String(tarballs.length)}`);
+	const packedNames = new Set();
 	for (const tarball of tarballs) {
 		const files = run("tar", ["-tzf", tarball]);
 		if (!files.includes("package/dist/"))
@@ -113,6 +289,14 @@ try {
 		if (files.includes("package/src/"))
 			throw new Error(`Source directory leaked into ${path.basename(tarball)}`);
 		const manifest = packageManifest(tarball);
+		if (
+			!packageNames.includes(manifest.name) ||
+			manifest.version !== packageVersion ||
+			packedNames.has(manifest.name)
+		) {
+			throw new Error(`Unexpected package identity in ${path.basename(tarball)}`);
+		}
+		packedNames.add(manifest.name);
 		if (
 			manifest.license !== "MIT" ||
 			manifest.repository?.url !== "git+https://github.com/leon-zym/pi-agent-web.git"
@@ -123,11 +307,36 @@ try {
 			throw new Error(`Workspace dependency leaked into ${path.basename(tarball)}`);
 		}
 	}
+	if (packedNames.size !== packageNames.length) throw new Error("Packed package set was incomplete");
 	fs.writeFileSync(path.join(installDir, "package.json"), '{"name":"piweb-pack-smoke","private":true}\n');
 	run("npm", ["install", "--ignore-scripts", ...tarballs], installDir);
 
+	const installRoot = fs.realpathSync(installDir);
+	for (const packageName of packageNames) {
+		const packageRoot = fs.realpathSync(path.join(installRoot, "node_modules", ...packageName.split("/")));
+		if (!isInside(installRoot, packageRoot) || isInside(root, packageRoot)) {
+			throw new Error(`Installed package escaped the isolated install root: ${packageName}`);
+		}
+		const manifest = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"));
+		if (
+			manifest.name !== packageName ||
+			manifest.version !== packageVersion ||
+			localEdges[packageName].length !==
+				Object.keys(manifest.dependencies ?? {}).filter((dependency) => packageNames.includes(dependency))
+					.length ||
+			localEdges[packageName].some((dependency) => manifest.dependencies?.[dependency] !== packageVersion)
+		) {
+			throw new Error(`Installed local dependency graph is not exact for ${packageName}`);
+		}
+	}
+	const cliEntry = fs.realpathSync(
+		path.join(installRoot, "node_modules", "@pi-agent-web", "cli", "dist", "cli.js"),
+	);
+	if (!isInside(installRoot, cliEntry) || isInside(root, cliEntry)) {
+		throw new Error("Installed CLI escaped the isolated install root");
+	}
 	const bin = path.join(
-		installDir,
+		installRoot,
 		"node_modules",
 		".bin",
 		process.platform === "win32" ? "pi-web.cmd" : "pi-web",
@@ -135,11 +344,11 @@ try {
 	run(bin, ["--help"], installDir);
 	run("npx", ["--prefix", installDir, "--no-install", "pi-web", "--help"], installDir);
 
-	const cliEntry = path.join(installDir, "node_modules", "@pi-agent-web", "cli", "dist", "cli.js");
 	const externalWorkspace = path.join(tempRoot, "external-workspace");
 	const emptyBinDir = path.join(tempRoot, "empty-bin");
 	fs.mkdirSync(externalWorkspace);
 	fs.mkdirSync(emptyBinDir);
+	const canonicalWorkspace = fs.realpathSync(externalWorkspace);
 	const packagedEnv = {
 		...process.env,
 		PATH: emptyBinDir,
@@ -148,63 +357,33 @@ try {
 		PI_WEB_DATA_DIR: path.join(tempRoot, "web-data"),
 	};
 	delete packagedEnv.PI_PATH;
-	const child = spawn(process.execPath, [cliEntry, "--host", "127.0.0.1", "--port", "0", "--no-open"], {
-		cwd: externalWorkspace,
-		stdio: ["ignore", "pipe", "pipe"],
-		env: packagedEnv,
-	});
+	const bundled = await startGateway(cliEntry, canonicalWorkspace, packagedEnv);
 	try {
-		const match = await waitForOutput(child, /listening on http:\/\/127\.0\.0\.1:(\d+)/);
-		const origin = `http://127.0.0.1:${match[1]}`;
-		const bootstrap = await fetch(`${origin}/api/v1/bootstrap`, { headers: { Origin: origin } });
-		const cookie = bootstrap.headers.get("set-cookie")?.split(";", 1)[0];
-		if (!bootstrap.ok || !cookie) throw new Error("Bootstrap did not issue a session cookie");
-		const response = await fetch(`${origin}/api/v1/health/ready`, {
-			headers: { Origin: origin, Cookie: cookie },
-		});
-		if (!response.ok) throw new Error(`Health check failed with ${String(response.status)}`);
-		const readiness = await response.json();
-		if (
-			readiness?.ready !== true ||
-			readiness?.runtime?.source !== "bundled" ||
-			readiness?.runtime?.version !== "0.84.2" ||
-			readiness?.runtime?.adapterId !== "pi-rpc"
-		) {
-			throw new Error(`Packaged Gateway selected an unexpected runtime: ${JSON.stringify(readiness)}`);
-		}
-		const workspaceResponse = await fetch(`${origin}/api/v1/workspaces`, {
-			method: "POST",
-			headers: { Origin: origin, Cookie: cookie, "Content-Type": "application/json" },
-			body: JSON.stringify({ path: externalWorkspace }),
-		});
-		if (!workspaceResponse.ok) {
-			throw new Error(`Packaged workspace creation failed with ${String(workspaceResponse.status)}`);
-		}
-		const workspace = await workspaceResponse.json();
-		const sessionResponse = await fetch(
-			`${origin}/api/v1/workspaces/${encodeURIComponent(workspace.workspaceHandle)}/sessions`,
-			{ method: "POST", headers: { Origin: origin, Cookie: cookie } },
-		);
-		if (!sessionResponse.ok) {
-			throw new Error(
-				`Packaged Session activation failed with ${String(sessionResponse.status)}: ${await sessionResponse.text()}`,
-			);
-		}
-		const session = await sessionResponse.json();
-		if (session?.runtime?.state !== "idle") {
-			throw new Error(`Packaged Session did not complete Pi readiness: ${JSON.stringify(session)}`);
-		}
-		const crossPort = await fetch(`${origin}/api/v1/health`, {
+		await checkReadiness(bundled.origin, bundled.cookie, "bundled");
+	} finally {
+		await closeChild(bundled.child);
+	}
+	const gateway = await startGateway(
+		cliEntry,
+		canonicalWorkspace,
+		packagedEnv,
+		path.join(root, "tests/e2e/fixtures/deterministic-pi.mjs"),
+	);
+	try {
+		const { origin, cookie } = gateway;
+		await checkReadiness(origin, cookie, "pi-path");
+		const session = await createSession(origin, cookie, canonicalWorkspace, "Packaged");
+		const crossPort = await fetchBounded(`${origin}/api/v1/health`, {
 			headers: { Origin: "http://localhost:5173", Cookie: cookie },
 		});
 		if (crossPort.status !== 403) {
 			throw new Error(`Packaged REST accepted a cross-port Origin with status ${String(crossPort.status)}`);
 		}
-		const spa = await fetch(origin);
+		const spa = await fetchBounded(origin);
 		if (!spa.ok || !(await spa.text()).includes('<div id="root"></div>')) {
 			throw new Error("Packaged SPA was not served from the CLI port");
 		}
-		const requireFromInstall = createRequire(path.join(installDir, "package.json"));
+		const requireFromInstall = createRequire(path.join(installRoot, "package.json"));
 		const WebSocket = requireFromInstall("ws");
 		const helloSocket = new WebSocket(`${origin.replace("http", "ws")}/api/v1/ws`, {
 			headers: { Origin: origin, Cookie: cookie },
@@ -219,27 +398,20 @@ try {
 							type: "client_hello",
 							protocol: { major: 1, minor: 4 },
 							clientBuild: "pack-smoke",
-							capabilities: [
-								"rpc.commands",
-								"rpc.events",
-								"rpc.extension_ui",
-								"session.multiplex",
-								"session.hot_runtime_inventory",
-								"session.fenced_takeover",
-								"payload.epoch_attachment_refs",
-								"payload.epoch_content_refs",
-							],
+							capabilities: gatewayCapabilities,
 							limits: { maxServerFrameBytes: 68 * 1024 * 1024 },
 						}),
 					);
 				});
 				socket.once("message", (raw) => {
-					const hello = JSON.parse(raw.toString());
+					const hello = readSocketFrame(raw, finish, "Packaged WebSocket hello");
+					if (!hello) return;
 					if (
 						hello.type !== "server_hello" ||
 						hello.protocol?.major !== 1 ||
 						hello.protocol?.minor !== 4 ||
 						hello.serverEpoch === undefined ||
+						!Array.isArray(hello.capabilities) ||
 						!hello.capabilities?.includes("session.fenced_takeover") ||
 						!hello.capabilities?.includes("payload.epoch_attachment_refs") ||
 						!hello.capabilities?.includes("payload.epoch_content_refs") ||
@@ -250,7 +422,6 @@ try {
 						finish(new Error(`Packaged WebSocket did not negotiate hello: ${raw.toString()}`));
 						return;
 					}
-					socket.close();
 					finish();
 				});
 				socket.once("error", finish);
@@ -271,22 +442,14 @@ try {
 							type: "client_hello",
 							protocol: { major: 1, minor: 3 },
 							clientBuild: "pack-smoke-legacy",
-							capabilities: [
-								"rpc.commands",
-								"rpc.events",
-								"rpc.extension_ui",
-								"session.multiplex",
-								"session.hot_runtime_inventory",
-								"session.fenced_takeover",
-								"payload.epoch_attachment_refs",
-								"payload.epoch_content_refs",
-							],
+							capabilities: gatewayCapabilities,
 							limits: { maxServerFrameBytes: 68 * 1024 * 1024 },
 						}),
 					);
 				});
 				socket.once("message", (raw) => {
-					const error = JSON.parse(raw.toString());
+					const error = readSocketFrame(raw, finish, "Packaged WebSocket protocol error");
+					if (!error) return;
 					if (
 						error.type !== "protocol_error" ||
 						error.code !== "invalid_hello" ||
@@ -324,8 +487,10 @@ try {
 			},
 			"Packaged cross-origin WebSocket check timed out",
 		);
+		await exerciseSession(helloSocket, session.runtime);
+		helloSocket.close();
 	} finally {
-		await closeChild(child);
+		await closeChild(gateway.child);
 	}
 	console.log("PACK SMOKE OK");
 } finally {
