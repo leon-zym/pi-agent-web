@@ -23,6 +23,7 @@ import type {
 	SessionSnapshotEndDto,
 } from "@pi-agent-web/protocol";
 import type { StoreApi } from "zustand/vanilla";
+import type { SessionBrowserEffects } from "../lib/session-browser-effects";
 import type {
 	SessionContentAdapter,
 	SessionJsonFieldGuard,
@@ -104,6 +105,13 @@ export type SessionTransportFrameMessage =
 export type SessionLazyIdentity = Readonly<
 	Pick<SessionRuntimeIdentityDto, "serverEpoch" | "workspaceId" | "sessionHandle" | "generation">
 >;
+
+export interface SessionCommandCompletion {
+	identity: SessionLazyIdentity;
+	barrierSeq: number;
+	response: PiSessionCommandResponseDto;
+	previousSessionHandle?: string;
+}
 
 export interface SessionChannelState {
 	sessionHandle: string;
@@ -199,6 +207,8 @@ export interface SessionTransportOptions {
 	contentAdapter?: SessionContentAdapter;
 	/** Protocol 1.4 hello-scoped adapter install; custom factories are validated before activation. */
 	contentAdapterFactory?: SessionContentAdapterFactory;
+	/** Optional injectable sink for deterministic Session Browser effects. */
+	browserEffects?: SessionBrowserEffects;
 }
 
 export interface SessionContentAdapterInstallation {
@@ -232,6 +242,11 @@ export interface SessionTransportState {
 		command: SessionCommandDto,
 		timeoutMs?: number,
 	) => Promise<PiSessionCommandResponseDto>;
+	sendCommandWithIdentity: (
+		sessionHandle: string,
+		command: SessionCommandDto,
+		timeoutMs?: number,
+	) => Promise<SessionCommandCompletion>;
 	sendExtensionUiResponse: (sessionHandle: string, response: ExtensionUiResponseDto) => boolean;
 	manualRetryResync: (sessionHandle: string) => boolean;
 	/** Retry a rejected background subscription without changing the visible Session. */

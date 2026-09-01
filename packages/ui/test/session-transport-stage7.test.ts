@@ -440,7 +440,7 @@ describe("Stage 7B projected history materialization", () => {
 			isController: true,
 			fencingToken: "parent-token",
 		});
-		const pending = harness.controller.store.getState().sendCommand("session-parent", {
+		const pending = harness.controller.store.getState().sendCommandWithIdentity("session-parent", {
 			id: "projected-fork",
 			type: "fork",
 			entryId: "entry-1",
@@ -475,7 +475,16 @@ describe("Stage 7B projected history materialization", () => {
 		expect(settled).toBe(false);
 
 		expect(ingest(harness.controller, projectedBaselineSnapshot("session-child", 2))).toBe(true);
-		await expect(pending).resolves.toMatchObject({ id: "projected-fork", success: true });
+		await expect(pending).resolves.toMatchObject({
+			identity: {
+				serverEpoch: PROJECTED_EPOCH,
+				workspaceId: "workspace-projected",
+				sessionHandle: "session-child",
+				generation: 2,
+			},
+			previousSessionHandle: "session-parent",
+			response: { id: "projected-fork", success: true },
+		});
 	});
 
 	it("rejects exact projected history and starts one cursorless recovery on content failure", async () => {

@@ -17,7 +17,6 @@ import {
 	Wrench,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { toast } from "sonner";
 import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
 import { Skeleton } from "../../components/ui/skeleton";
@@ -26,6 +25,7 @@ import { displayError, displayLabel } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { runtimeIsReady } from "../../lib/runtime-state";
 import { isSessionControlReady } from "../../lib/session-capabilities";
+import { forkFromEntry } from "../../lib/session-controller";
 import { presentUserMessage, serializePresentedUserMessage } from "../../lib/user-message-presentation";
 import { cn } from "../../lib/utils";
 import { useProjectionStore } from "../../stores/projection";
@@ -469,23 +469,9 @@ function TreeView() {
 	const fork = async (entryId: string) => {
 		const targetSessionHandle = sessionHandle;
 		if (!targetSessionHandle || !canFork) return;
-		try {
-			const response = await sessionTransport.store
-				.getState()
-				.sendCommand(targetSessionHandle, { type: "fork", entryId });
-			const data = expectCommandData(response, "fork");
-			if (data.cancelled) {
-				toast.info(tt("session.forkCancelled"));
-				return;
-			}
-			toast.success(tt("session.forked"));
-			if (useSessionDirectoryStore.getState().currentSession?.sessionHandle === targetSessionHandle) {
-				await load(targetSessionHandle);
-			}
-		} catch (error) {
-			toast.error(tt("session.forkFailed"), {
-				description: displayError(error),
-			});
+		const forked = await forkFromEntry(entryId, targetSessionHandle);
+		if (forked && useSessionDirectoryStore.getState().currentSession?.sessionHandle === targetSessionHandle) {
+			await load(targetSessionHandle);
 		}
 	};
 
