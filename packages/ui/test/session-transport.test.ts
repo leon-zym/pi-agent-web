@@ -5203,3 +5203,163 @@ describe("ordered session frame bus", () => {
 		expect(listener).not.toHaveBeenCalled();
 	});
 });
+
+describe("Session transport characterization before machine extraction", () => {
+	it("keeps the connection hello, terminal mismatch, reconnect, and epoch sequence", () => {
+		vi.useFakeTimers();
+		const h = harness({ reconnectBaseMs: 5 });
+		h.controller.store.getState().subscribeSession("session-a");
+		h.controller.store.getState().connect();
+		const first = h.sockets[0];
+		if (!first) throw new Error("first transport socket was not created");
+
+		expect(h.controller.store.getState().connectionState).toBe("connecting");
+		first.open(false);
+		expect(first.sent[0]?.type).toBe("client_hello");
+		first.serverMessage(serverHello({ serverEpoch: "epoch-a" }));
+		expect(h.controller.store.getState().connectionState).toBe("connecting");
+		first.serverMessage(hotInventory({ serverEpoch: "epoch-a", revision: 1 }));
+		expect(h.controller.store.getState().connectionState).toBe("online");
+		expect(h.controller.store.getState().hotRuntimeInventory?.serverEpoch).toBe("epoch-a");
+
+		first.serverClose();
+		expect(h.controller.store.getState().connectionState).toBe("offline");
+		vi.advanceTimersByTime(5);
+		const second = h.sockets[1];
+		if (!second) throw new Error("transport did not schedule its reconnect");
+		second.open(false);
+		second.serverMessage(serverHello({ serverEpoch: "epoch-b" }));
+		second.serverMessage(hotInventory({ serverEpoch: "epoch-b", revision: 0 }));
+		expect(h.controller.store.getState().connectionState).toBe("online");
+		expect(h.controller.store.getState().hotRuntimeInventory?.serverEpoch).toBe("epoch-b");
+
+		const terminal = harness();
+		terminal.controller.store.getState().connect();
+		const terminalSocket = terminal.sockets[0];
+		if (!terminalSocket) throw new Error("terminal transport socket was not created");
+		terminalSocket.open(false);
+		terminalSocket.serverMessage(serverHello({ protocol: { major: 2, minor: 0 } }));
+		expect(terminal.controller.store.getState().connectionState).toBe("incompatible");
+		vi.advanceTimersByTime(60_000);
+		expect(terminal.sockets).toHaveLength(1);
+	});
+
+	it("keeps revisioned control transitions fenced through claim, release, takeover, and conflict", () => {
+		const h = harness();
+		const socket = connect(h);
+		subscribeAndPrime(h, "session-a");
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "session-a",
+			generation: 1,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
+			isController: false,
+		});
+		expect(h.controller.store.getState().claimSession("session-a")).toBe(true);
+		expect(socket.sent.at(-1)).toEqual({ type: "session_claim", sessionHandle: "session-a" });
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "session-a",
+			generation: 1,
+			leaseRevision: 1,
+			controlState: "held",
+			transition: "claim",
+			isController: true,
+			fencingToken: "fence-1",
+		});
+		expect(h.controller.store.getState().sessions["session-a"]?.lease).toMatchObject({
+			isController: true,
+			leaseRevision: 1,
+			fencingToken: "fence-1",
+		});
+
+		expect(h.controller.store.getState().releaseSession("session-a")).toBe(true);
+		expect(h.controller.store.getState().sessions["session-a"]?.lease).toMatchObject({
+			isController: false,
+			leaseRevision: 1,
+		});
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "session-a",
+			generation: 1,
+			leaseRevision: 2,
+			controlState: "held",
+			transition: "takeover",
+			isController: false,
+		});
+		expect(h.controller.store.getState().takeoverSession("session-a")).toBe(true);
+		expect(socket.sent.at(-1)).toEqual({
+			type: "session_takeover",
+			sessionHandle: "session-a",
+			expectedGeneration: 1,
+			expectedLeaseRevision: 2,
+		});
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "session-a",
+			generation: 1,
+			leaseRevision: 2,
+			controlState: "held",
+			transition: "takeover",
+			isController: true,
+			fencingToken: "foreign-fence",
+		});
+		expect(h.controller.store.getState().sessions["session-a"]?.lease).toMatchObject({
+			isController: false,
+			conflicted: true,
+		});
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "session-a",
+			generation: 1,
+			leaseRevision: 3,
+			controlState: "free",
+			transition: "release",
+			isController: false,
+		});
+		expect(h.controller.store.getState().sessions["session-a"]?.lease).toMatchObject({
+			leaseRevision: 3,
+		});
+		expect(h.controller.store.getState().sessions["session-a"]?.lease.conflicted).toBeUndefined();
+	});
+
+	it("correlates commands by captured identity, waits for barrier delivery, and ignores timeout-late responses", async () => {
+		vi.useFakeTimers();
+		const h = harness({ reconnectBaseMs: 5 });
+		const socket = connect(h);
+		subscribeAndPrime(h, "session-a");
+		const barrier = h.controller.store
+			.getState()
+			.sendCommand("session-a", { id: "barrier-command", type: "get_state" });
+		socket.serverMessage(successResponse("session-a", 1, "barrier-command", "get_state", 1));
+		let barrierSettled = false;
+		void barrier.then(() => {
+			barrierSettled = true;
+		});
+		await Promise.resolve();
+		expect(barrierSettled).toBe(false);
+		h.controller.ingestServerMessage(eventFrame("session-a", 1, 1));
+		await expect(barrier).resolves.toMatchObject({ id: "barrier-command" });
+
+		const timedOut = h.controller.store
+			.getState()
+			.sendCommand("session-a", { id: "timeout-command", type: "get_state" }, 10);
+		vi.advanceTimersByTime(10);
+		await expect(timedOut).rejects.toMatchObject({ code: "timeout" });
+		socket.serverMessage(successResponse("session-a", 1, "timeout-command", "get_state"));
+
+		const captured = h.controller.store
+			.getState()
+			.sendCommand("session-a", { id: "captured-command", type: "get_state" });
+		h.controller.ingestServerMessage({ type: "runtime_state", runtime: runtime("session-a", 2, 1) });
+		socket.serverMessage(successResponse("session-a", 1, "captured-command", "get_state"));
+		await expect(captured).rejects.toMatchObject({ code: "response_mismatch" });
+	});
+});
