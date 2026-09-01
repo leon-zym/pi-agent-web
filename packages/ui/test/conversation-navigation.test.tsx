@@ -24,6 +24,7 @@ vi.mock("../src/stores/projection", () => ({
 vi.mock("../src/stores/session-directory", () => ({
 	useSessionDirectoryStore: (selector: (state: typeof storeHarness.directory) => unknown) =>
 		selector(storeHarness.directory),
+	installSessionDirectoryLifecycleCoordinator: vi.fn(),
 }));
 
 import { ChatViewport } from "../src/features/conversation/ChatViewport";

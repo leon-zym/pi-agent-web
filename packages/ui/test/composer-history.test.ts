@@ -13,12 +13,15 @@ import {
 
 describe("composer shell-style prompt history", () => {
 	const storage = new Map<string, string>();
+	let rejectWrites = false;
 
 	beforeEach(() => {
 		storage.clear();
+		rejectWrites = false;
 		globalThis.localStorage = {
 			getItem: (key: string) => storage.get(key) ?? null,
 			setItem: (key: string, value: string) => {
+				if (rejectWrites && key.includes("canonical-sess")) throw new Error("storage full");
 				storage.set(key, value);
 			},
 			removeItem: (key: string) => {
@@ -69,6 +72,26 @@ describe("composer shell-style prompt history", () => {
 
 		expect(loadComposerHistory("ws-1", "pending-sess")).toEqual([]);
 		expect(loadComposerHistory("ws-1", "canonical-sess")).toEqual(["prompt a", "prompt b"]);
+	});
+
+	it("keeps the pending source when the destination storage write fails", () => {
+		saveComposerHistory("ws-1", "pending-sess", ["prompt a"]);
+		rejectWrites = true;
+
+		migrateComposerHistory("ws-1", "pending-sess", "canonical-sess");
+
+		expect(loadComposerHistory("ws-1", "pending-sess")).toEqual(["prompt a"]);
+		expect(loadComposerHistory("ws-1", "canonical-sess")).toEqual([]);
+	});
+
+	it("merges an existing destination without duplicating migrated prompts", () => {
+		saveComposerHistory("ws-1", "pending-sess", ["prompt a", "prompt b"]);
+		saveComposerHistory("ws-1", "canonical-sess", ["prompt b", "prompt c"]);
+
+		migrateComposerHistory("ws-1", "pending-sess", "canonical-sess");
+
+		expect(loadComposerHistory("ws-1", "pending-sess")).toEqual([]);
+		expect(loadComposerHistory("ws-1", "canonical-sess")).toEqual(["prompt b", "prompt c", "prompt a"]);
 	});
 
 	it("detects whether cursor is at first line or last line", () => {

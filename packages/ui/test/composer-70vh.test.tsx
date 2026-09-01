@@ -74,6 +74,7 @@ vi.mock("../src/stores/session-directory", () => ({
 		{ getState: () => storeHarness.directory },
 	),
 	reconcileHiddenSessionLifecycle: vi.fn(),
+	installSessionDirectoryLifecycleCoordinator: vi.fn(),
 }));
 
 vi.mock("../src/stores/projection", () => ({
