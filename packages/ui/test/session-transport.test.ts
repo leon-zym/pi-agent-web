@@ -901,6 +901,214 @@ describe("session transport Gateway negotiation", () => {
 		expect(h.controller.store.getState().sessions["hot-a"]?.subscribed).toBe(true);
 	});
 
+	it("releases the next exact hot subscription after a deferred lease commits with an async snapshot", async () => {
+		let releaseSnapshot!: () => void;
+		const snapshotGate = new Promise<void>((resolve) => {
+			releaseSnapshot = resolve;
+		});
+		let snapshotProjectionStarted = false;
+		const adapter = projectedAdapter(async (request: ExtensionUiRequestDto) => {
+			if (request.id === "hot-existing-snapshot") {
+				snapshotProjectionStarted = true;
+				await snapshotGate;
+			}
+			if (request.method !== "set_editor_text") throw new Error("unexpected fixture request");
+			return { ...request, text: `resolved:${request.id}` };
+		});
+		const h = harness({ contentAdapter: adapter });
+		const socket = connect(h);
+		const existing = {
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "hot-existing",
+			workspaceId: "workspace-a",
+			generation: 1,
+			state: "idle" as const,
+		};
+		const existingRuntime = runtime(existing.sessionHandle, existing.generation, 0);
+		socket.serverMessage(hotInventory({ revision: 1, runtimes: [existing] }));
+		socket.serverMessage({ type: "runtime_state", runtime: existingRuntime });
+		socket.serverMessage({
+			type: "resync_required",
+			serverEpoch: existingRuntime.serverEpoch,
+			sessionHandle: existingRuntime.sessionHandle,
+			runtime: existingRuntime,
+			reason: "initial",
+		});
+		expect(
+			ingest(
+				h.controller,
+				projectedSnapshot(existing.sessionHandle, existing.generation, "hot-existing-snapshot"),
+			),
+		).toBe(true);
+		await vi.waitFor(() => expect(snapshotProjectionStarted).toBe(true));
+
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: existingRuntime.serverEpoch,
+			sessionHandle: existingRuntime.sessionHandle,
+			generation: existingRuntime.generation,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
+			isController: false,
+		});
+		const late = {
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "hot-late",
+			workspaceId: "workspace-a",
+			generation: 1,
+			state: "idle" as const,
+		};
+		socket.serverMessage(hotInventory({ revision: 2, runtimes: [existing, late] }));
+		const exactSubscriptions = (sessionHandle: string) =>
+			socket.sent.filter(
+				(message) =>
+					message.type === "session_subscribe" &&
+					message.sessionHandle === sessionHandle &&
+					message.expectedHotRuntime !== undefined,
+			);
+		expect(exactSubscriptions(existing.sessionHandle)).toHaveLength(1);
+		expect(exactSubscriptions(late.sessionHandle)).toHaveLength(0);
+
+		releaseSnapshot();
+		await vi.waitFor(() => {
+			expect(h.controller.store.getState().sessions[existing.sessionHandle]).toMatchObject({
+				baselineAuthoritative: true,
+				freshLeaseBaseline: expect.objectContaining({
+					serverEpoch: existing.serverEpoch,
+					sessionHandle: existing.sessionHandle,
+					workspaceId: existing.workspaceId,
+					generation: existing.generation,
+				}),
+				lease: { isController: false, leaseRevision: 0, controlState: "free" },
+			});
+			expect(exactSubscriptions(late.sessionHandle)).toHaveLength(1);
+		});
+
+		const lateRuntime = runtime(late.sessionHandle, late.generation, 0);
+		socket.serverMessage({ type: "runtime_state", runtime: lateRuntime });
+		socket.serverMessage({
+			type: "resync_required",
+			serverEpoch: lateRuntime.serverEpoch,
+			sessionHandle: lateRuntime.sessionHandle,
+			runtime: lateRuntime,
+			reason: "initial",
+		});
+		expect(h.controller.store.getState().claimSession(late.sessionHandle)).toBe(true);
+		completeWithSnapshot(h, late.sessionHandle, late.generation, 0);
+		expect(h.controller.store.getState().sessions[late.sessionHandle]).toMatchObject({
+			baselineAuthoritative: true,
+			freshLeaseBaseline: null,
+		});
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: lateRuntime.serverEpoch,
+			sessionHandle: lateRuntime.sessionHandle,
+			generation: lateRuntime.generation,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
+			isController: false,
+		});
+
+		expect(h.controller.store.getState().sessions[late.sessionHandle]).toMatchObject({
+			baselineAuthoritative: true,
+			freshLeaseBaseline: expect.objectContaining({
+				serverEpoch: late.serverEpoch,
+				sessionHandle: late.sessionHandle,
+				workspaceId: late.workspaceId,
+				generation: late.generation,
+			}),
+			lease: { isController: false, leaseRevision: 0, controlState: "free" },
+		});
+		expect(
+			socket.sent.filter(
+				(message) => message.type === "session_claim" && message.sessionHandle === late.sessionHandle,
+			),
+		).toEqual([{ type: "session_claim", sessionHandle: late.sessionHandle }]);
+	});
+
+	it("migrates an uncertain rekey while the parent baseline subscription is in flight", () => {
+		const h = harness();
+		const socket = connect(h);
+		const parent = runtime("session-parent", 1, 0);
+		h.controller.store.getState().subscribeSession(parent.sessionHandle);
+		socket.serverMessage({ type: "runtime_state", runtime: parent });
+		socket.serverMessage({
+			type: "resync_required",
+			serverEpoch: parent.serverEpoch,
+			sessionHandle: parent.sessionHandle,
+			runtime: parent,
+			reason: "initial",
+		});
+		expect(h.controller.store.getState().claimSession(parent.sessionHandle)).toBe(true);
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: parent.serverEpoch,
+			sessionHandle: parent.sessionHandle,
+			generation: parent.generation,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
+			isController: false,
+		});
+
+		const child = runtime("session-child", 2, 0);
+		socket.serverMessage({
+			type: "session_rekeyed",
+			serverEpoch: child.serverEpoch,
+			previousSessionHandle: parent.sessionHandle,
+			runtime: child,
+		});
+		expect(
+			socket.sent.filter(
+				(message) => message.type === "session_subscribe" && message.sessionHandle === child.sessionHandle,
+			),
+		).toHaveLength(0);
+
+		socket.serverMessage({
+			type: "resync_required",
+			serverEpoch: child.serverEpoch,
+			sessionHandle: child.sessionHandle,
+			runtime: child,
+			reason: "generation_changed",
+		});
+		expect(
+			socket.sent.filter(
+				(message) => message.type === "session_subscribe" && message.sessionHandle === child.sessionHandle,
+			),
+		).toHaveLength(0);
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: child.serverEpoch,
+			sessionHandle: child.sessionHandle,
+			generation: child.generation,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "rekey",
+			isController: false,
+		});
+		completeWithSnapshot(h, child.sessionHandle, child.generation, 0);
+
+		expect(h.controller.store.getState().sessions[parent.sessionHandle]?.subscribed).toBe(false);
+		expect(h.controller.store.getState().sessions[child.sessionHandle]).toMatchObject({
+			controllerIntent: true,
+			baselineAuthoritative: true,
+			freshLeaseBaseline: expect.objectContaining({
+				serverEpoch: child.serverEpoch,
+				sessionHandle: child.sessionHandle,
+				workspaceId: child.workspaceId,
+				generation: child.generation,
+			}),
+			lease: { isController: false, leaseRevision: 0, controlState: "free" },
+		});
+		expect(
+			socket.sent.filter(
+				(message) => message.type === "session_claim" && message.sessionHandle === child.sessionHandle,
+			),
+		).toEqual([{ type: "session_claim", sessionHandle: child.sessionHandle }]);
+	});
+
 	it("returns an epoch and revision token only after the initial inventory", async () => {
 		const h = harness();
 		const pending = h.controller.waitForInitialHotInventory();

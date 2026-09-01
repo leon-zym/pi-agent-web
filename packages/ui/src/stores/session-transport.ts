@@ -3850,8 +3850,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		clearAcknowledgedExtensionRequests(identity);
 		snapshotWaiters.delete(key);
 		waiter.resolve({ identity, snapshotId, asOfSeq: endpointSeq });
-		transitionControl({ type: "baseline_committed", identity });
+		const baselineCommit = transitionControl({ type: "baseline_committed", identity });
 		advanceExactHotRecovery(identity, "baseline");
+		if (baselineCommit.transition.leaseAccepted) advanceExactHotRecovery(identity, "lease");
 		resolvePendingResponsesForSession(identity.sessionHandle);
 		claimSessionIfReady(identity.sessionHandle);
 		return true;
