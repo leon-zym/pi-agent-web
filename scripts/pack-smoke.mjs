@@ -123,6 +123,17 @@ function waitForSocket(socket, setup, timeoutMessage, timeoutMs = 10_000) {
 	});
 }
 
+function readSocketFrame(raw, finish, label) {
+	try {
+		const frame = JSON.parse(raw.toString());
+		if (!frame || typeof frame !== "object" || Array.isArray(frame)) throw new Error("not an object");
+		return frame;
+	} catch {
+		finish(new Error(`${label} sent an invalid JSON frame`));
+		return null;
+	}
+}
+
 async function startGateway(cliEntry, cwd, env, piPath) {
 	const child = spawn(
 		process.execPath,
@@ -196,7 +207,8 @@ async function exerciseSession(socket, runtime) {
 			else resolve();
 		};
 		const onMessage = (raw) => {
-			const frame = JSON.parse(raw.toString());
+			const frame = readSocketFrame(raw, finish, "Fixture Session");
+			if (!frame) return;
 			if (frame.type === "runtime_state" && frame.runtime?.sessionHandle === sessionHandle && !claimed) {
 				claimed = true;
 				socket.send(JSON.stringify({ type: "session_claim", sessionHandle }));
@@ -268,6 +280,7 @@ try {
 		.filter((entry) => entry.endsWith(".tgz"))
 		.map((entry) => path.join(tarballDir, entry));
 	if (tarballs.length !== 4) throw new Error(`Expected four tarballs, found ${String(tarballs.length)}`);
+	const packedNames = new Set();
 	for (const tarball of tarballs) {
 		const files = run("tar", ["-tzf", tarball]);
 		if (!files.includes("package/dist/"))
@@ -276,6 +289,14 @@ try {
 		if (files.includes("package/src/"))
 			throw new Error(`Source directory leaked into ${path.basename(tarball)}`);
 		const manifest = packageManifest(tarball);
+		if (
+			!packageNames.includes(manifest.name) ||
+			manifest.version !== packageVersion ||
+			packedNames.has(manifest.name)
+		) {
+			throw new Error(`Unexpected package identity in ${path.basename(tarball)}`);
+		}
+		packedNames.add(manifest.name);
 		if (
 			manifest.license !== "MIT" ||
 			manifest.repository?.url !== "git+https://github.com/leon-zym/pi-agent-web.git"
@@ -286,6 +307,7 @@ try {
 			throw new Error(`Workspace dependency leaked into ${path.basename(tarball)}`);
 		}
 	}
+	if (packedNames.size !== packageNames.length) throw new Error("Packed package set was incomplete");
 	fs.writeFileSync(path.join(installDir, "package.json"), '{"name":"piweb-pack-smoke","private":true}\n');
 	run("npm", ["install", "--ignore-scripts", ...tarballs], installDir);
 
@@ -297,6 +319,7 @@ try {
 		}
 		const manifest = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"));
 		if (
+			manifest.name !== packageName ||
 			manifest.version !== packageVersion ||
 			localEdges[packageName].length !==
 				Object.keys(manifest.dependencies ?? {}).filter((dependency) => packageNames.includes(dependency))
@@ -381,12 +404,14 @@ try {
 					);
 				});
 				socket.once("message", (raw) => {
-					const hello = JSON.parse(raw.toString());
+					const hello = readSocketFrame(raw, finish, "Packaged WebSocket hello");
+					if (!hello) return;
 					if (
 						hello.type !== "server_hello" ||
 						hello.protocol?.major !== 1 ||
 						hello.protocol?.minor !== 4 ||
 						hello.serverEpoch === undefined ||
+						!Array.isArray(hello.capabilities) ||
 						!hello.capabilities?.includes("session.fenced_takeover") ||
 						!hello.capabilities?.includes("payload.epoch_attachment_refs") ||
 						!hello.capabilities?.includes("payload.epoch_content_refs") ||
@@ -423,7 +448,8 @@ try {
 					);
 				});
 				socket.once("message", (raw) => {
-					const error = JSON.parse(raw.toString());
+					const error = readSocketFrame(raw, finish, "Packaged WebSocket protocol error");
+					if (!error) return;
 					if (
 						error.type !== "protocol_error" ||
 						error.code !== "invalid_hello" ||
