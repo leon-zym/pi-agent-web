@@ -4,8 +4,6 @@ import type {
 	ProductSessionEventDto,
 	SessionRuntimeDto,
 } from "@pi-agent-web/protocol";
-import { toast } from "sonner";
-import { migrateComposerHistory } from "../features/composer/use-composer-history";
 import { useComposerStore } from "../stores/composer";
 import { useExtensionUiStore } from "../stores/extension-ui";
 import { useModelDirectoryStore } from "../stores/model-directory";
@@ -16,18 +14,17 @@ import type { SessionFrameBusMessage, SessionFrameRepresentation } from "../stor
 import { useSessionStatsStore } from "../stores/session-stats";
 import { hasFreshLeaseBaseline, SESSION_FRAME_DEFERRED, sessionTransport } from "../stores/session-transport";
 import { useSlashCommandsStore } from "../stores/slash-commands";
-import { playAttentionChime, playCompletionChime } from "./audio-feedback";
 import { displayLabel, stripAnsi } from "./format";
 import { tt } from "./i18n";
 import { runtimeIsBusy, runtimeIsSettled, runtimePhase } from "./runtime-state";
+import type { SessionBrowserEffect } from "./session-browser-effects";
 import { isSoftIdempotentError } from "./session-controller";
 import { type CoalescibleMessageUpdate, SessionEventScheduler } from "./session-event-scheduler";
-import { updateTabBadge } from "./tab-badge";
+import { sessionLifecycleIdentityForRuntime, sessionStateOwners } from "./session-state-owners";
 
 type ProjectionSessionEvent = PiSessionEventDto | ProductSessionEventDto;
 
 let initialized = false;
-const directoryReloadTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const activeMessageIdentities = new Map<string, { generation: number; identity: string }>();
 const publicationMode =
 	import.meta.env.VITE_PI_WEB_BENCHMARK_BUILD === "1" &&
@@ -65,6 +62,7 @@ const projectionEventScheduler = new SessionEventScheduler({
  */
 export function initPipeline(): void {
 	if (initialized) return;
+	sessionStateOwners.assertReady();
 	initialized = true;
 
 	sessionTransport.frameBus.subscribeAll((frame) => routeSessionFrame(frame.message, frame.representation));
@@ -72,7 +70,7 @@ export function initPipeline(): void {
 		if (message.type === "hot_runtime_inventory") {
 			useSessionDirectoryStore.getState().applyHotRuntimeInventory(message);
 		} else if (message.type === "session_directory_changed") {
-			scheduleDirectoryReload(message.workspaceId);
+			dispatchDirectoryRefreshForWorkspace(message.workspaceId);
 		} else {
 			void refreshModelsAfterAuthChange();
 		}
@@ -103,7 +101,7 @@ function routeSessionFrame(
 			useExtensionUiStore
 				.getState()
 				.replaceRequestsForSession(message.sessionHandle, message.generation, message.requests);
-			applyVisibleExtensionTitle(message.sessionHandle);
+			dispatchVisibleExtensionTitle(message.sessionHandle, runtimeForSessionHandle(message.sessionHandle));
 			return;
 		case "extension_ui_result":
 			projectionEventScheduler.flushSession(message.sessionHandle, message.generation);
@@ -124,30 +122,37 @@ function routeSessionFrame(
 			projectionEventScheduler.discardSession(message.sessionHandle);
 			activeMessageIdentities.delete(message.sessionHandle);
 			return;
-		case "session_snapshot":
+		case "session_snapshot": {
 			projectionEventScheduler.discardSession(message.sessionHandle);
 			activeMessageIdentities.delete(message.sessionHandle);
-			routeRuntime(message.runtime, false);
-			useProjectionStore.getState().applyAuthoritativeSnapshot(
-				message.sessionHandle,
-				message.settledMessages,
-				message.projectionEvents.map((frame) => frame.event),
+			const snapshotResult = sessionStateOwners.applySnapshot({
+				identity: sessionLifecycleIdentityForRuntime(message.runtime),
+				runtime: message.runtime,
+				settledMessages: message.settledMessages,
+				projectionEvents: message.projectionEvents.map((frame) => frame.event),
 				representation,
-			);
-			useComposerStore.getState().setQueueForSession(message.sessionHandle, {
-				steering: [...message.queue.steering],
-				followUp: [...message.queue.followUp],
+				queue: {
+					steering: [...message.queue.steering],
+					followUp: [...message.queue.followUp],
+				},
+				extensionRequests: [...message.pendingExtensionRequests, ...message.stickyExtensionState],
 			});
-			useExtensionUiStore
-				.getState()
-				.replaceRequestsForSession(message.sessionHandle, message.generation, [
-					...message.pendingExtensionRequests,
-					...message.stickyExtensionState,
-				]);
-			applyVisibleExtensionTitle(message.sessionHandle);
+			if (snapshotResult.status !== "committed") {
+				if (snapshotResult.error.code === "commit_failed") return;
+				if (
+					snapshotResult.error.code === "identity_mismatch" ||
+					snapshotResult.error.code === "invalid_identity"
+				) {
+					return;
+				}
+				throw snapshotResult.error;
+			}
+			dispatchRuntimeEffects(message.runtime);
+			dispatchVisibleExtensionTitle(message.sessionHandle, message.runtime);
 			void refreshSessionMetadata(message.sessionHandle);
 			scheduleHiddenLifecycleAfterSnapshot(message.runtime);
 			return;
+		}
 		case "session_snapshot_begin":
 		case "session_snapshot_chunk":
 		case "session_snapshot_end":
@@ -167,8 +172,6 @@ function routeSessionFrame(
 			projectionEventScheduler.discardSession(message.runtime.sessionHandle);
 			activeMessageIdentities.delete(message.previousSessionHandle);
 			activeMessageIdentities.delete(message.runtime.sessionHandle);
-			useSessionControlStore.getState().resetSession(message.previousSessionHandle);
-			useSessionControlStore.getState().resetSession(message.runtime.sessionHandle);
 			routeRekey(message.previousSessionHandle, message.runtime);
 			return;
 		case "session_error":
@@ -179,31 +182,38 @@ function routeSessionFrame(
 }
 
 function routeRuntime(runtime: SessionRuntimeDto, reconcileHidden = true): void {
-	const phase = runtimePhase(runtime);
 	const settled = runtimeIsSettled(runtime);
-	const busy = runtimeIsBusy(runtime);
 	const identity = activeMessageIdentities.get(runtime.sessionHandle);
 	if (identity && (identity.generation !== runtime.generation || settled)) {
 		activeMessageIdentities.delete(runtime.sessionHandle);
 	}
-	useSessionDirectoryStore.getState().applyRuntime(runtime);
-	useExtensionUiStore.getState().resetSessionForGeneration(runtime.sessionHandle, runtime.generation);
-	if (phase === "crashed") {
-		useProjectionStore.getState().markRuntimeFailure(runtime.sessionHandle, stripAnsi(runtime.error ?? ""));
-	}
+	sessionStateOwners.applyRuntime(runtime);
 	if (reconcileHidden && !isCurrentSession(runtime.sessionHandle) && settled) {
 		reconcileHiddenSessionLifecycle(runtime.sessionHandle);
 	}
+	dispatchRuntimeEffects(runtime);
+}
+
+function dispatchRuntimeEffects(runtime: SessionRuntimeDto): void {
+	const phase = runtimePhase(runtime);
+	const busy = runtimeIsBusy(runtime);
 	if (phase === "crashed" && isCurrentSession(runtime.sessionHandle)) {
-		toast.error(tt("status.crashed"), { description: stripAnsi(runtime.error ?? "") });
+		dispatchEffect({
+			type: "toast",
+			identity: sessionLifecycleIdentityForRuntime(runtime),
+			dedupeKey: `runtime-crashed:${String(runtime.generation)}`,
+			level: "error",
+			message: tt("status.crashed"),
+			description: stripAnsi(runtime.error ?? ""),
+		});
 	}
 	if (isCurrentSession(runtime.sessionHandle)) {
 		if (phase === "waiting_ui") {
-			updateTabBadge("waiting_ui", sessionLabel(runtime.sessionHandle));
+			dispatchTabBadge(runtime, "waiting_ui");
 		} else if (busy) {
-			updateTabBadge("running", sessionLabel(runtime.sessionHandle));
+			dispatchTabBadge(runtime, "running");
 		} else if (phase === "ready" || phase === "dormant") {
-			updateTabBadge("idle", sessionLabel(runtime.sessionHandle));
+			dispatchTabBadge(runtime, "idle");
 		}
 	}
 }
@@ -320,7 +330,7 @@ function routeEvent(
 			useModelDirectoryStore.getState().applyThinkingLevelForSession(sessionHandle, event.level);
 			return;
 		case "session_info_changed":
-			scheduleDirectoryReload(workspaceId);
+			dispatchDirectoryRefresh(message, workspaceId);
 			return;
 		case "message_update":
 			applyLiveUsage(sessionHandle, event);
@@ -328,18 +338,26 @@ function routeEvent(
 		case "agent_settled":
 			useSessionDirectoryStore.getState().markSessionUnread(sessionHandle);
 			void useSessionStatsStore.getState().refresh(sessionHandle);
-			scheduleDirectoryReload(workspaceId);
-			void playCompletionChime();
-			if (isCurrentSession(sessionHandle)) {
-				updateTabBadge("done", sessionLabel(sessionHandle));
-			}
+			dispatchDirectoryRefresh(message, workspaceId);
+			dispatchEffect({
+				type: "audio",
+				identity: sessionIdentityForFrame(message),
+				dedupeKey: `completion:${String(generation)}:${String(seq)}`,
+				sound: "completion",
+			});
+			if (isCurrentSession(sessionHandle)) dispatchTabBadgeForFrame(message, "done");
 			break;
 		case "compaction_end":
 			void useSessionStatsStore.getState().refresh(sessionHandle);
 			break;
 		case "extension_error":
 			if (isCurrentSession(sessionHandle)) {
-				toast.error(tt("ext.error"), {
+				dispatchEffect({
+					type: "toast",
+					identity: sessionIdentityForFrame(message),
+					dedupeKey: `extension-error:${String(generation)}:${String(seq)}`,
+					level: "error",
+					message: tt("ext.error"),
 					description: `${stripAnsi(event.event)}: ${stripAnsi(event.error)}`,
 				});
 			}
@@ -398,38 +416,68 @@ function routeExtensionRequest(
 	if (request.method === "notify") {
 		const prefix = isCurrentSession(sessionHandle) ? "" : `${sessionLabel(sessionHandle)} · `;
 		const text = `${prefix}${stripAnsi(request.message)}`;
-		if (request.notifyType === "error") toast.error(text);
-		else if (request.notifyType === "warning") toast.warning(text);
-		else toast.info(text);
+		dispatchEffect({
+			type: "toast",
+			identity: sessionIdentityForFrame(message),
+			dedupeKey: `notify:${String(message.generation)}:${request.id}`,
+			level: request.notifyType === "error" ? "error" : request.notifyType === "warning" ? "warning" : "info",
+			message: text,
+		});
 		return;
 	}
 	useExtensionUiStore.getState().applyRequestForSession(sessionHandle, request, generation);
-	applyVisibleExtensionTitle(sessionHandle);
-	void playAttentionChime();
+	dispatchVisibleExtensionTitle(sessionHandle, runtimeForSessionHandle(sessionHandle));
+	dispatchEffect({
+		type: "audio",
+		identity: sessionIdentityForFrame(message),
+		dedupeKey: `attention:${String(generation)}:${request.id}`,
+		sound: "attention",
+	});
 	if (isCurrentSession(sessionHandle)) {
-		updateTabBadge("waiting_ui", sessionLabel(sessionHandle));
+		dispatchTabBadgeForFrame(message, "waiting_ui");
 	}
 }
 
 function routeRekey(previousSessionHandle: string, runtime: SessionRuntimeDto): void {
-	useComposerStore.getState().rekeySession(previousSessionHandle, runtime.sessionHandle);
-	migrateComposerHistory(runtime.workspaceId, previousSessionHandle, runtime.sessionHandle);
-	useSessionDirectoryStore.getState().rekeySession(previousSessionHandle, runtime.sessionHandle, runtime);
-	useExtensionUiStore.getState().resetSessionForGeneration(runtime.sessionHandle, runtime.generation);
-	scheduleDirectoryReload(runtime.workspaceId);
+	const previousIdentity =
+		sessionStateOwners.registry.currentIdentity(previousSessionHandle) ??
+		sessionIdentityForHandle(previousSessionHandle, runtime);
+	const result = sessionStateOwners.rekeySession({
+		previousIdentity,
+		identity: sessionLifecycleIdentityForRuntime(runtime),
+		runtime,
+		effects: [directoryRefreshEffect(runtime, "rekey")],
+	});
+	if (result.status !== "committed") {
+		if (result.error.code === "identity_mismatch" || result.error.code === "invalid_identity") return;
+		throw result.error;
+	}
 }
 
 function routeSessionError(message: Extract<InlineSessionWsServerMessage, { type: "session_error" }>): void {
 	useSessionControlStore.getState().recordSessionError(message);
 	if (!isCurrentSession(message.sessionHandle)) return;
 	if (message.operation === "claim") {
-		toast.info(tt("lease.observer"), { description: stripAnsi(message.error) });
+		dispatchEffect({
+			type: "toast",
+			identity: sessionIdentityForHandle(message.sessionHandle, message),
+			dedupeKey: `lease-observer:${message.operation}:${message.error}`,
+			level: "info",
+			message: tt("lease.observer"),
+			description: stripAnsi(message.error),
+		});
 		return;
 	}
 	if (isSoftIdempotentError(message.error)) {
 		return;
 	}
-	toast.error(stripAnsi(message.error));
+	dispatchEffect({
+		type: "toast",
+		identity: sessionIdentityForHandle(message.sessionHandle, message),
+		dedupeKey: `session-error:${message.operation}:${message.error}`,
+		level: "error",
+		message: stripAnsi(message.error),
+	});
 }
 
 async function refreshSessionMetadata(sessionHandle: string): Promise<void> {
@@ -440,32 +488,19 @@ async function refreshSessionMetadata(sessionHandle: string): Promise<void> {
 	]);
 }
 
-function scheduleDirectoryReload(workspaceHandle: string): void {
-	if (directoryReloadTimers.has(workspaceHandle)) return;
-	const timer = setTimeout(() => {
-		directoryReloadTimers.delete(workspaceHandle);
-		const directory = useSessionDirectoryStore.getState();
-		void directory.loadWorkspaces();
-		if (
-			directory.currentWorkspaceHandle === workspaceHandle ||
-			directory.sessionsByWorkspace[workspaceHandle]
-		) {
-			void directory.reloadSessions(workspaceHandle, { force: true });
-		}
-	}, 100);
-	directoryReloadTimers.set(workspaceHandle, timer);
-}
-
 async function refreshModelsAfterAuthChange(): Promise<void> {
 	const sessionHandle = useSessionDirectoryStore.getState().currentSession?.sessionHandle;
 	if (!sessionHandle) return;
-	const deadline = Date.now() + 20_000;
+	const deadline = sessionStateOwners.effects.now() + 20_000;
 	for (;;) {
 		await useModelDirectoryStore.getState().refresh(sessionHandle);
-		if (useModelDirectoryStore.getState().bySession[sessionHandle]?.models.length || Date.now() >= deadline) {
+		if (
+			useModelDirectoryStore.getState().bySession[sessionHandle]?.models.length ||
+			sessionStateOwners.effects.now() >= deadline
+		) {
 			return;
 		}
-		await new Promise((resolve) => setTimeout(resolve, 2_500));
+		await new Promise((resolve) => globalThis.setTimeout(resolve, 2_500));
 	}
 }
 
@@ -482,8 +517,118 @@ function sessionLabel(sessionHandle: string): string {
 	return tt("header.unnamed");
 }
 
-function applyVisibleExtensionTitle(sessionHandle: string): void {
-	if (typeof document === "undefined" || !isCurrentSession(sessionHandle)) return;
+function sessionIdentityForFrame(
+	message: Extract<SessionFrameBusMessage, { type: "event" | "extension_ui_request" }>,
+): ReturnType<typeof sessionLifecycleIdentityForRuntime> {
+	const runtime = sessionTransport.store.getState().sessions[message.sessionHandle]?.runtime;
+	return runtime
+		? sessionLifecycleIdentityForRuntime(runtime)
+		: {
+				serverEpoch: message.serverEpoch,
+				workspaceId: message.workspaceId,
+				sessionHandle: message.sessionHandle,
+				generation: message.generation,
+			};
+}
+
+function sessionIdentityForHandle(
+	sessionHandle: string,
+	fallback: { serverEpoch: string; workspaceId?: string; generation?: number },
+): ReturnType<typeof sessionLifecycleIdentityForRuntime> {
+	const runtime = sessionTransport.store.getState().sessions[sessionHandle]?.runtime;
+	return runtime
+		? sessionLifecycleIdentityForRuntime(runtime)
+		: {
+				serverEpoch: fallback.serverEpoch,
+				workspaceId:
+					fallback.workspaceId ??
+					useSessionDirectoryStore.getState().currentSession?.workspaceHandle ??
+					"unknown-workspace",
+				sessionHandle,
+				generation: fallback.generation ?? null,
+			};
+}
+
+function dispatchEffect(effect: SessionBrowserEffect): void {
+	if (!sessionStateOwners.effects.isCurrent(effect.identity)) return;
+	sessionStateOwners.effects.dispatch(effect);
+}
+
+function runtimeForSessionHandle(sessionHandle: string): SessionRuntimeDto | null {
+	return sessionTransport.store.getState().sessions[sessionHandle]?.runtime ?? null;
+}
+
+function dispatchDirectoryRefreshForWorkspace(workspaceHandle: string): void {
+	const identity = {
+		serverEpoch: null,
+		workspaceId: workspaceHandle,
+		sessionHandle: `workspace:${workspaceHandle}`,
+		generation: null,
+	} as const;
+	sessionStateOwners.effects.setCurrentIdentity(identity);
+	dispatchEffect({
+		type: "directory_refresh",
+		identity,
+		dedupeKey: `directory:${workspaceHandle}:global`,
+		workspaceHandle,
+		force: true,
+		delayMs: 100,
+	});
+}
+
+function dispatchDirectoryRefresh(
+	message: Extract<SessionFrameBusMessage, { type: "event" }>,
+	workspaceHandle: string,
+): void {
+	dispatchEffect({
+		type: "directory_refresh",
+		identity: sessionIdentityForFrame(message),
+		dedupeKey: `directory:${workspaceHandle}`,
+		workspaceHandle,
+		force: true,
+		delayMs: 100,
+	});
+}
+
+function directoryRefreshEffect(runtime: SessionRuntimeDto, reason: string): SessionBrowserEffect {
+	return {
+		type: "directory_refresh",
+		identity: sessionLifecycleIdentityForRuntime(runtime),
+		dedupeKey: `directory:${runtime.workspaceId}:${reason}`,
+		workspaceHandle: runtime.workspaceId,
+		force: true,
+		delayMs: 100,
+	};
+}
+
+function dispatchTabBadge(
+	runtime: SessionRuntimeDto,
+	status: "running" | "waiting_ui" | "idle" | "done",
+): void {
+	dispatchEffect({
+		type: "tab_badge",
+		identity: sessionLifecycleIdentityForRuntime(runtime),
+		dedupeKey: `tab-badge:${status}:${String(runtime.generation)}:${String(runtime.lastSeq)}:${String(useSessionDirectoryStore.getState().navigationToken)}`,
+		status,
+		label: sessionLabel(runtime.sessionHandle),
+	});
+}
+
+function dispatchTabBadgeForFrame(
+	message: Extract<SessionFrameBusMessage, { type: "event" | "extension_ui_request" }>,
+	status: "running" | "waiting_ui" | "idle" | "done",
+): void {
+	const runtime = runtimeForSessionHandle(message.sessionHandle);
+	if (runtime) dispatchTabBadge(runtime, status);
+}
+
+function dispatchVisibleExtensionTitle(sessionHandle: string, runtime: SessionRuntimeDto | null): void {
+	if (!runtime || !isCurrentSession(sessionHandle)) return;
 	const title = useExtensionUiStore.getState().bySession[sessionHandle]?.title;
-	document.title = title ? `${displayLabel(title)} · Pi Agent Web` : "Pi Agent Web";
+	dispatchEffect({
+		type: "title",
+		identity: sessionLifecycleIdentityForRuntime(runtime),
+		dedupeKey: `title:${title ?? "default"}:${String(runtime.generation)}:${String(useSessionDirectoryStore.getState().navigationToken)}:${String(runtime.lastSeq)}`,
+		title: title ? `${displayLabel(title)} · Pi Agent Web` : "Pi Agent Web",
+	});
 }

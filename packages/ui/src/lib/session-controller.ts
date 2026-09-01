@@ -6,7 +6,6 @@ import {
 	SESSION_IMAGE_MAX_COUNT,
 	SESSION_IMAGE_TOTAL_MAX_BASE64_CHARS,
 } from "@pi-agent-web/protocol";
-import { toast } from "sonner";
 import { serializeComposerMessage, useComposerStore, workspaceFileImages } from "../stores/composer";
 import { useProjectionStore } from "../stores/projection";
 import {
@@ -21,8 +20,11 @@ import { api } from "./api";
 import { displayCommandResponseError, displayError, stripAnsi } from "./format";
 import { tt } from "./i18n";
 import { runtimeIsBusy } from "./runtime-state";
+import type { SessionBrowserEffect } from "./session-browser-effects";
 import { isSessionControlReady, sessionDeleteCapability } from "./session-capabilities";
 import { sendControlCommand } from "./session-command";
+import { type SessionLifecycleIdentity, sessionIdentityKey } from "./session-lifecycle-registry";
+import { sessionLifecycleIdentityForRuntime, sessionStateOwners } from "./session-state-owners";
 
 export { sendControlCommand, sendControlExtensionUiResponse, sendReadCommand } from "./session-command";
 
@@ -40,6 +42,70 @@ function currentSession(): NativeSessionDto {
 
 function currentSessionHandle(): string {
 	return currentSession().sessionHandle;
+}
+
+function controllerEffectIdentity(sessionHandle?: string, workspaceHandle?: string) {
+	if (sessionHandle) {
+		const runtime = sessionTransport.store.getState().sessions[sessionHandle]?.runtime;
+		if (runtime) return sessionLifecycleIdentityForRuntime(runtime);
+		const registered = sessionStateOwners.registry.currentIdentity(sessionHandle);
+		if (registered) return registered;
+	}
+	const workspace =
+		workspaceHandle ??
+		(sessionHandle ? useSessionDirectoryStore.getState().currentSession?.workspaceHandle : undefined) ??
+		useSessionDirectoryStore.getState().currentWorkspaceHandle ??
+		"unknown-workspace";
+	return {
+		serverEpoch: null,
+		workspaceId: workspace,
+		sessionHandle: sessionHandle ?? `workspace:${workspace}`,
+		generation: null,
+	} as const;
+}
+
+function dispatchControllerEffect(effect: SessionBrowserEffect): void {
+	if (!sessionStateOwners.effects.isCurrent(effect.identity)) {
+		const registered = sessionStateOwners.registry.currentIdentity(effect.identity.sessionHandle);
+		if (registered && sessionIdentityKey(registered) === sessionIdentityKey(effect.identity)) {
+			sessionStateOwners.effects.setCurrentIdentity(effect.identity);
+		} else if (effect.identity.sessionHandle.startsWith("workspace:")) {
+			sessionStateOwners.effects.setCurrentIdentity(effect.identity);
+		} else {
+			const visible = useSessionDirectoryStore.getState().currentSession;
+			if (
+				visible?.sessionHandle !== effect.identity.sessionHandle ||
+				(visible.workspaceHandle !== undefined && visible.workspaceHandle !== effect.identity.workspaceId)
+			) {
+				return;
+			}
+			sessionStateOwners.effects.setCurrentIdentity(effect.identity);
+		}
+	}
+	sessionStateOwners.effects.dispatch(effect);
+}
+
+function controllerToast(
+	level: Extract<SessionBrowserEffect, { type: "toast" }>["level"],
+	message: string,
+	options: {
+		description?: string;
+		sessionHandle?: string;
+		workspaceHandle?: string;
+		identity?: SessionLifecycleIdentity;
+		key?: string;
+	} = {},
+): void {
+	const identity =
+		options.identity ?? controllerEffectIdentity(options.sessionHandle, options.workspaceHandle);
+	dispatchControllerEffect({
+		type: "toast",
+		identity,
+		dedupeKey: `controller:${options.key ?? level}:${message}:${options.description ?? ""}`,
+		level,
+		message,
+		...(options.description ? { description: options.description } : {}),
+	});
 }
 
 const initialSessionByWorkspace = new Map<string, Promise<void>>();
@@ -144,7 +210,15 @@ function controllerChannel(sessionHandle: string) {
 export async function openSession(session: NativeSessionDto): Promise<void> {
 	if (isSessionBeingAbandoned(session.sessionHandle)) return;
 	const directory = useSessionDirectoryStore.getState();
-	directory.selectSession(session);
+	const previousSessionHandle = directory.currentSession?.sessionHandle;
+	if (!sessionStateOwners.selectSession(session)) {
+		controllerToast("error", tt("session.openFailed"), {
+			workspaceHandle: session.workspaceHandle,
+			key: "open",
+		});
+		return;
+	}
+	directory.activateSessionTransport(session, previousSessionHandle);
 	const activation = api
 		.activateWorkspace(session.workspaceHandle)
 		.then((activatedWorkspace) => {
@@ -174,7 +248,11 @@ async function performSessionCreation(
 		onCreationIntent(creationToken);
 		const created = await api.createSession(workspaceHandle);
 		const directory = useSessionDirectoryStore.getState();
-		directory.completeSessionCreation(creationToken, created.session);
+		if (!directory.completeSessionCreationState(creationToken, created.session)) return;
+		if (!sessionStateOwners.selectSession(created.session)) {
+			throw new Error("Session lifecycle creation was rejected");
+		}
+		directory.activateSessionTransport(created.session);
 		void directory.reloadSessions(workspaceHandle);
 	} catch (error) {
 		if (
@@ -183,8 +261,10 @@ async function performSessionCreation(
 		) {
 			return;
 		}
-		toast.error(tt("session.newFailed"), {
+		controllerToast("error", tt("session.newFailed"), {
 			description: displayError(error),
+			workspaceHandle,
+			key: "new",
 		});
 	}
 }
@@ -195,8 +275,9 @@ export function newSession(): Promise<void> {
 	try {
 		workspaceHandle = currentWorkspaceHandle();
 	} catch (error) {
-		toast.error(tt("session.newFailed"), {
+		controllerToast("error", tt("session.newFailed"), {
 			description: displayError(error),
+			key: "new",
 		});
 		return Promise.resolve();
 	}
@@ -285,12 +366,29 @@ export async function deleteSession(session: NativeSessionDto): Promise<void> {
 		transport.releaseSession(session.sessionHandle);
 		transport.unsubscribeSession(session.sessionHandle);
 		const directory = useSessionDirectoryStore.getState();
-		directory.removeSession(session.workspaceHandle, session.sessionHandle);
+		const identity = sessionStateOwners.registry.currentIdentity(session.sessionHandle);
+		if (identity) {
+			const result = sessionStateOwners.disposeSession({
+				identity,
+				workspaceHandle: session.workspaceHandle,
+			});
+			if (result.status !== "committed") throw result.error;
+			directory.activateSessionTransport(null, session.sessionHandle);
+		} else {
+			// Compatibility for a Session restored before the lifecycle registry was installed.
+			directory.removeSession(session.workspaceHandle, session.sessionHandle);
+		}
 		void directory.loadWorkspaces();
-		toast.success(tt("session.deleted"));
+		controllerToast("success", tt("session.deleted"), {
+			workspaceHandle: session.workspaceHandle,
+			key: "deleted",
+		});
 	} catch (error) {
-		toast.error(tt("session.deleteFailed"), {
+		controllerToast("error", tt("session.deleteFailed"), {
 			description: displayError(error),
+			sessionHandle: session.sessionHandle,
+			workspaceHandle: session.workspaceHandle,
+			key: "delete",
 		});
 	}
 }
@@ -304,8 +402,11 @@ export async function renameSession(session: NativeSessionDto, name: string): Pr
 		await sendControlCommand(session.sessionHandle, { type: "set_session_name", name });
 		await useSessionDirectoryStore.getState().reloadSessions(session.workspaceHandle);
 	} catch (error) {
-		toast.error(tt("session.renameFailed"), {
+		controllerToast("error", tt("session.renameFailed"), {
 			description: displayError(error),
+			sessionHandle: session.sessionHandle,
+			workspaceHandle: session.workspaceHandle,
+			key: "rename",
 		});
 	}
 }
@@ -325,9 +426,10 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 	try {
 		sessionHandle = currentSessionHandle();
 	} catch {
-		toast.error(tt("session.needWorkspace"));
+		controllerToast("error", tt("session.needWorkspace"), { key: "need-workspace" });
 		return;
 	}
+	const sessionIdentity = controllerEffectIdentity(sessionHandle);
 	const composer = useComposerStore.getState();
 	const initial = composer.bySession[sessionHandle];
 	let text: string;
@@ -338,7 +440,12 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 			initial?.fileReferences ?? [],
 		);
 	} catch (error) {
-		toast.error(tt("composer.fileReferenceBudgetExceeded"), { description: displayError(error) });
+		controllerToast("error", tt("composer.fileReferenceBudgetExceeded"), {
+			description: displayError(error),
+			sessionHandle,
+			identity: sessionIdentity,
+			key: "file-reference-budget",
+		});
 		return;
 	}
 	if (!text && (initial?.images.length ?? 0) === 0 && (initial?.fileReferences.length ?? 0) === 0) return;
@@ -358,7 +465,11 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 		allImages.some((image) => image.data.length > SESSION_IMAGE_MAX_BASE64_CHARS) ||
 		allImages.reduce((total, image) => total + image.data.length, 0) > SESSION_IMAGE_TOTAL_MAX_BASE64_CHARS
 	) {
-		toast.error(tt("composer.fileReferenceBudgetExceeded"));
+		controllerToast("error", tt("composer.fileReferenceBudgetExceeded"), {
+			sessionHandle,
+			identity: sessionIdentity,
+			key: "file-reference-budget",
+		});
 		composer.finishSubmitForSession(sessionHandle, submitted.activeSubmitId);
 		return;
 	}
@@ -376,7 +487,12 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 			response = await sendControlCommand(sessionHandle, { type: "prompt", message: text, images });
 		}
 		if (response.success === false) {
-			toast.error(tt("session.sendFailed"), { description: displayCommandResponseError(response) });
+			controllerToast("error", tt("session.sendFailed"), {
+				description: displayCommandResponseError(response),
+				sessionHandle,
+				identity: sessionIdentity,
+				key: "send",
+			});
 		} else {
 			useComposerStore
 				.getState()
@@ -390,8 +506,11 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 				);
 		}
 	} catch (error) {
-		toast.error(tt("session.sendFailed"), {
+		controllerToast("error", tt("session.sendFailed"), {
 			description: displayError(error),
+			sessionHandle,
+			identity: sessionIdentity,
+			key: "send",
 		});
 	} finally {
 		useComposerStore.getState().finishSubmitForSession(sessionHandle, submitted.activeSubmitId);
@@ -419,34 +538,55 @@ export function isSoftIdempotentError(error: unknown): boolean {
 export async function abortCurrentRun(): Promise<void> {
 	const session = useSessionDirectoryStore.getState().currentSession;
 	if (!session) return;
+	const sessionIdentity = controllerEffectIdentity(session.sessionHandle, session.workspaceHandle);
 	try {
 		const response = await sendControlCommand(session.sessionHandle, { type: "abort" });
 		if (response.success === false && !isSoftIdempotentError(response.error)) {
-			toast.error(tt("session.abortFailed"), {
+			controllerToast("error", tt("session.abortFailed"), {
 				description: stripAnsi(response.error),
+				sessionHandle: session.sessionHandle,
+				workspaceHandle: session.workspaceHandle,
+				identity: sessionIdentity,
+				key: "abort",
 			});
 		}
 	} catch (error) {
 		if (!isSoftIdempotentError(error)) {
-			toast.error(tt("session.abortFailed"), {
+			controllerToast("error", tt("session.abortFailed"), {
 				description: displayError(error),
+				sessionHandle: session.sessionHandle,
+				workspaceHandle: session.workspaceHandle,
+				identity: sessionIdentity,
+				key: "abort",
 			});
 		}
 	}
 }
 
 export async function forkFromEntry(entryId: string, sessionHandle: string): Promise<void> {
+	const sessionIdentity = controllerEffectIdentity(sessionHandle);
 	try {
 		const response = await sendControlCommand(sessionHandle, { type: "fork", entryId });
 		const data = expectCommandData(response, "fork");
 		if (data.cancelled) {
-			toast.info(tt("session.forkCancelled"));
+			controllerToast("info", tt("session.forkCancelled"), {
+				sessionHandle,
+				identity: sessionIdentity,
+				key: "fork-cancelled",
+			});
 			return;
 		}
-		toast.success(tt("session.forked"));
+		controllerToast("success", tt("session.forked"), {
+			sessionHandle,
+			identity: sessionIdentity,
+			key: "forked",
+		});
 	} catch (error) {
-		toast.error(tt("session.forkFailed"), {
+		controllerToast("error", tt("session.forkFailed"), {
 			description: displayError(error),
+			sessionHandle,
+			identity: sessionIdentity,
+			key: "fork",
 		});
 	}
 }
