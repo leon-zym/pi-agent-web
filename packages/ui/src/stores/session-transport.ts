@@ -3612,9 +3612,6 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		) {
 			return;
 		}
-		if (current.subscriptionAdmission?.kind === "rejected") {
-			setChannel(message.sessionHandle, (channel) => ({ ...channel, subscriptionAdmission: null }));
-		}
 		const transition = transitionControl({
 			type: "lease_status",
 			sessionHandle: message.sessionHandle,
@@ -3627,6 +3624,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			pendingOverflowRestarts.delete(message.sessionHandle);
 		}
 		if (!transition.transition.leaseAccepted) return;
+		if (current.subscriptionAdmission?.kind === "rejected") {
+			setChannel(message.sessionHandle, (channel) => ({ ...channel, subscriptionAdmission: null }));
+		}
 		if (current.runtime) advanceExactHotRecovery(current.runtime, "lease");
 		if (message.isController && message.fencingToken) {
 			const pendingRestart = pendingOverflowRestarts.get(message.sessionHandle);

@@ -553,6 +553,36 @@ function completeWithSnapshot(
 	} satisfies InlineSessionSnapshotDto);
 }
 
+function rejectSubscriptionDuringResync(h: Harness, socket: FakeSocket, sessionHandle = "session-a"): void {
+	subscribeAndPrime(h, sessionHandle);
+	const resyncRuntime = runtime(sessionHandle, 1, 0);
+	socket.serverMessage({
+		type: "resync_required",
+		serverEpoch: resyncRuntime.serverEpoch,
+		sessionHandle,
+		runtime: resyncRuntime,
+		reason: "gap",
+	});
+	socket.serverMessage({
+		type: "session_error",
+		serverEpoch: resyncRuntime.serverEpoch,
+		sessionHandle,
+		operation: "subscribe",
+		error: "session_subscription_capacity",
+		code: "session_subscription_capacity",
+		retryable: true,
+	});
+	expect(h.controller.store.getState().sessions[sessionHandle]).toMatchObject({
+		subscribed: true,
+		baselineAuthoritative: false,
+		subscriptionAdmission: {
+			kind: "rejected",
+			code: "session_subscription_capacity",
+			retryable: true,
+		},
+	});
+}
+
 function historySnapshotFrames(
 	sessionHandle: string,
 	generation = 1,
@@ -5242,6 +5272,108 @@ describe("Session transport characterization before machine extraction", () => {
 		expect(terminal.controller.store.getState().connectionState).toBe("incompatible");
 		vi.advanceTimersByTime(60_000);
 		expect(terminal.sockets).toHaveLength(1);
+	});
+
+	it("keeps retryable subscription admission through a deferred matching lease status", () => {
+		const h = harness();
+		const socket = connect(h);
+		rejectSubscriptionDuringResync(h, socket);
+
+		socket.serverMessage({
+			type: "lease_status",
+			serverEpoch: "test-server-epoch",
+			sessionHandle: "session-a",
+			generation: 1,
+			leaseRevision: 0,
+			controlState: "free",
+			transition: "baseline",
+			isController: false,
+		});
+
+		expect(h.controller.store.getState().sessions["session-a"]?.subscriptionAdmission).toEqual({
+			kind: "rejected",
+			code: "session_subscription_capacity",
+			retryable: true,
+		});
+		expect(h.controller.store.getState().retrySessionSubscription?.("session-a")).toBe(true);
+	});
+
+	it("keeps retryable subscription admission through stale lower-revision lease status", () => {
+		const h = harness();
+		const socket = connect(h);
+		rejectSubscriptionDuringResync(h, socket);
+
+		for (const leaseRevision of [4, 3]) {
+			socket.serverMessage({
+				type: "lease_status",
+				serverEpoch: "test-server-epoch",
+				sessionHandle: "session-a",
+				generation: 1,
+				leaseRevision,
+				controlState: "free",
+				transition: "baseline",
+				isController: false,
+			});
+		}
+
+		expect(h.controller.store.getState().sessions["session-a"]?.subscriptionAdmission).toEqual({
+			kind: "rejected",
+			code: "session_subscription_capacity",
+			retryable: true,
+		});
+		expect(h.controller.store.getState().retrySessionSubscription?.("session-a")).toBe(true);
+	});
+
+	it("keeps retryable subscription admission through same-revision contradictory lease status", () => {
+		const h = harness();
+		const socket = connect(h);
+		rejectSubscriptionDuringResync(h, socket);
+
+		for (const lease of [
+			{ controlState: "free" as const, isController: false },
+			{ controlState: "held" as const, isController: true },
+		]) {
+			socket.serverMessage({
+				type: "lease_status",
+				serverEpoch: "test-server-epoch",
+				sessionHandle: "session-a",
+				generation: 1,
+				leaseRevision: 4,
+				controlState: lease.controlState,
+				transition: "baseline",
+				isController: lease.isController,
+				...(lease.isController ? { fencingToken: "contradictory-fence" } : {}),
+			});
+		}
+
+		expect(h.controller.store.getState().sessions["session-a"]?.lease.conflicted).toBe(true);
+		expect(h.controller.store.getState().sessions["session-a"]?.subscriptionAdmission).toEqual({
+			kind: "rejected",
+			code: "session_subscription_capacity",
+			retryable: true,
+		});
+		expect(h.controller.store.getState().retrySessionSubscription?.("session-a")).toBe(true);
+	});
+
+	it("clears retryable subscription admission only after an authoritative resync baseline", async () => {
+		const clock = new ResyncClock();
+		const h = harness({ resyncClock: clock, resyncRandom: () => 0.5 });
+		const socket = connect(h);
+		rejectSubscriptionDuringResync(h, socket);
+
+		await flushPromises();
+		expect(h.controller.store.getState().sessions["session-a"]?.subscriptionAdmission).toMatchObject({
+			kind: "rejected",
+		});
+
+		clock.advanceBy(500);
+		expect(socket.sent.at(-1)).toEqual({ type: "session_subscribe", sessionHandle: "session-a" });
+		completeWithSnapshot(h, "session-a", 1, 0);
+
+		expect(h.controller.store.getState().sessions["session-a"]).toMatchObject({
+			baselineAuthoritative: true,
+			subscriptionAdmission: null,
+		});
 	});
 
 	it("keeps revisioned control transitions fenced through claim, release, takeover, and conflict", () => {
