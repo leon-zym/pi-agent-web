@@ -76,6 +76,11 @@ import {
 	type SessionResyncCompletion,
 } from "../lib/session-resync";
 import {
+	createSessionConnectionMachine,
+	type SessionConnectionMachineEvent,
+	type SessionConnectionMachineIntent,
+} from "./connection-machine";
+import {
 	OrderedSessionFrameBus,
 	type SessionHistoryPageLoadedFrame,
 	SessionTransportGlobalBus,
@@ -630,8 +635,6 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	let socket: SessionWebSocket | null = null;
 	let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	let helloTimer: ReturnType<typeof setTimeout> | null = null;
-	let reconnectAttempt = 0;
-	let reconnectEnabled = false;
 	let commandCounter = 0;
 	let historyRequestCounter = 0;
 	let nextPendingToken = 1;
@@ -639,7 +642,6 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	let disposed = false;
 	let negotiatedMaxClientFrameBytes = SESSION_WS_CLIENT_MAX_BYTES;
 	let negotiatedMaxServerFrameBytes = SESSION_WS_SERVER_MAX_BYTES;
-	let negotiatedServerEpoch: string | null = null;
 	let historyNegotiated = false;
 	let attachmentGuardContext: Readonly<SessionAttachmentGuardContext> | null = null;
 	let contentRefGuardContext: Readonly<SessionContentRefGuardContext> | null = null;
@@ -655,6 +657,12 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	const exactHotRecoveryQueue: string[] = [];
 	const queuedExactHotRecoveries = new Set<string>();
 	let activeExactHotRecovery: ActiveExactHotRecovery | null = null;
+	const connectionMachine = createSessionConnectionMachine({
+		clientHello,
+		helloTimeoutMs,
+		reconnectBaseMs,
+		reconnectMaxMs,
+	});
 
 	const resyncCoordinator = createSessionResyncCoordinator({
 		attempt: attemptResync,
@@ -681,6 +689,61 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		manualRetryResync,
 		retrySessionSubscription,
 	}));
+
+	function transitionConnection(event: SessionConnectionMachineEvent): void {
+		const transition = connectionMachine.transition(event);
+		store.setState({ connectionState: transition.state.observableState });
+		for (const intent of transition.intents) applyConnectionIntent(intent);
+	}
+
+	function applyConnectionIntent(intent: SessionConnectionMachineIntent): void {
+		switch (intent.type) {
+			case "open_socket":
+				openSocket(intent.socketEpoch);
+				return;
+			case "send_client_hello": {
+				const current = socket;
+				if (
+					!current ||
+					connectionMachine.getState().socketEpoch !== intent.socketEpoch ||
+					current.readyState !== SOCKET_OPEN
+				) {
+					return;
+				}
+				try {
+					current.send(JSON.stringify(intent.hello));
+				} catch {
+					transitionConnection({ type: "socket_failed", socketEpoch: intent.socketEpoch });
+					handleDisconnected();
+				}
+				return;
+			}
+			case "start_hello_timeout":
+				clearHelloTimer();
+				helloTimer = setTimeout(() => {
+					if (socket && socket === socketForEpoch(intent.socketEpoch)) {
+						enterIncompatible(socket);
+					}
+				}, intent.delayMs);
+				return;
+			case "clear_hello_timeout":
+				clearHelloTimer();
+				return;
+			case "schedule_reconnect":
+				scheduleReconnect(intent.socketEpoch, intent.delayMs);
+				return;
+			case "clear_reconnect_timer":
+				clearReconnectTimer();
+				return;
+			case "close_socket":
+				closeSocket(intent.socketEpoch);
+				return;
+		}
+	}
+
+	function socketForEpoch(socketEpoch: number): SessionWebSocket | null {
+		return connectionMachine.getState().socketEpoch === socketEpoch ? socket : null;
+	}
 
 	function waitForInitialHotInventory(): Promise<HotRuntimeInventoryToken> {
 		if (disposed || store.getState().connectionState === "incompatible") {
@@ -738,7 +801,6 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		historyNegotiated =
 			message.capabilities.includes(GATEWAY_SESSION_HISTORY_CAPABILITY) &&
 			clientHello.capabilities.includes(GATEWAY_SESSION_HISTORY_CAPABILITY);
-		negotiatedServerEpoch = message.serverEpoch;
 		negotiatedMaxClientFrameBytes = Math.min(SESSION_WS_CLIENT_MAX_BYTES, message.limits.maxClientFrameBytes);
 		negotiatedMaxServerFrameBytes = message.limits.maxSnapshotFrameBytes;
 		hotRuntimeRevision = -1;
@@ -959,44 +1021,37 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	}
 
 	function connect(): void {
-		if (disposed || store.getState().connectionState === "incompatible") return;
-		reconnectEnabled = true;
-		openSocket();
+		if (disposed || connectionMachine.getState().phase === "terminal") return;
+		transitionConnection({ type: "connect" });
 	}
 
-	function openSocket(): void {
-		if (disposed || !reconnectEnabled) return;
+	function openSocket(socketEpoch: number): void {
+		if (
+			disposed ||
+			!connectionMachine.getState().reconnectEnabled ||
+			connectionMachine.getState().socketEpoch !== socketEpoch
+		) {
+			return;
+		}
 		if (socket && (socket.readyState === SOCKET_OPEN || socket.readyState === SOCKET_CONNECTING)) return;
-		store.setState({ connectionState: "connecting" });
 		let next: SessionWebSocket;
 		try {
 			next = createSocket(socketUrl());
 		} catch {
-			store.setState({ connectionState: "offline" });
-			scheduleReconnect();
+			transitionConnection({ type: "socket_failed", socketEpoch });
+			handleDisconnected();
 			return;
 		}
 		socket = next;
 		next.onopen = () => {
 			if (socket !== next || disposed) return;
-			try {
-				next.send(JSON.stringify(clientHello));
-				helloTimer = setTimeout(() => enterIncompatible(next), helloTimeoutMs);
-			} catch {
-				socket = null;
-				try {
-					next.close();
-				} finally {
-					handleDisconnected();
-					if (reconnectEnabled) scheduleReconnect();
-				}
-			}
+			transitionConnection({ type: "socket_open", socketEpoch });
 		};
 		next.onclose = () => {
 			if (socket !== next) return;
 			socket = null;
+			transitionConnection({ type: "socket_closed", socketEpoch });
 			handleDisconnected();
-			if (reconnectEnabled) scheduleReconnect();
 		};
 		next.onerror = () => {
 			// The close event owns connection cleanup and retry.
@@ -1023,12 +1078,18 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			if (contentRefGuardContext === null) {
 				if (
 					!isGatewayServerHello(value) ||
-					store.getState().connectionState !== "connecting" ||
+					connectionMachine.getState().phase !== "awaiting-hello" ||
 					!installContentForHello(value)
 				) {
 					enterIncompatible(next);
 					return;
 				}
+				transitionConnection({
+					type: "server_hello",
+					socketEpoch,
+					serverEpoch: value.serverEpoch,
+					accepted: true,
+				});
 				return;
 			}
 			const negotiatedContentRefContext = contentRefGuardContext;
@@ -1036,19 +1097,28 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				enterIncompatible(next);
 				return;
 			}
-			if (store.getState().connectionState === "connecting" && negotiatedServerEpoch !== null) {
+			if (
+				connectionMachine.getState().phase === "awaiting-hello" &&
+				connectionMachine.getState().serverEpoch !== null
+			) {
 				if (
 					!isSessionWsServerMessage(value, negotiatedContentRefContext) ||
 					value.type !== "hot_runtime_inventory" ||
-					value.serverEpoch !== negotiatedServerEpoch
+					value.serverEpoch !== connectionMachine.getState().serverEpoch
 				) {
 					enterIncompatible(next);
 					return;
 				}
+				transitionConnection({
+					type: "initial_inventory",
+					socketEpoch,
+					serverEpoch: value.serverEpoch,
+					accepted: true,
+				});
 				handleHotRuntimeInventory(value, true);
 				return;
 			}
-			if (store.getState().connectionState !== "online") {
+			if (connectionMachine.getState().phase !== "ready") {
 				enterIncompatible(next);
 				return;
 			}
@@ -1101,52 +1171,41 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	}
 
 	function enterIncompatible(current: SessionWebSocket): void {
-		reconnectEnabled = false;
-		clearReconnectTimer();
-		clearHelloTimer();
-		if (socket === current) socket = null;
-		current.onopen = null;
-		current.onclose = null;
-		current.onerror = null;
-		current.onmessage = null;
+		if (socket !== current) return;
+		const socketEpoch = connectionMachine.getState().socketEpoch;
+		transitionConnection({ type: "protocol_failure", socketEpoch });
 		const error = new SessionTransportError("unavailable", "Gateway protocol is incompatible");
 		rejectAllPending(error);
 		rejectInitialInventoryWaiters(error);
 		resetDisconnectedState("incompatible");
-		try {
-			current.close();
-		} catch {
-			// The terminal state is already recorded.
-		}
 	}
 
-	function scheduleReconnect(): void {
-		if (disposed || !reconnectEnabled || reconnectTimer) return;
-		const delay = Math.min(reconnectBaseMs * 2 ** reconnectAttempt, reconnectMaxMs);
-		reconnectAttempt += 1;
+	function scheduleReconnect(socketEpoch: number, delay: number): void {
+		if (disposed || !connectionMachine.getState().reconnectEnabled || reconnectTimer) return;
 		reconnectTimer = setTimeout(() => {
 			reconnectTimer = null;
-			openSocket();
+			transitionConnection({ type: "reconnect_timer", socketEpoch });
 		}, delay);
 	}
 
-	function disconnect(): void {
-		reconnectEnabled = false;
-		clearReconnectTimer();
-		clearHelloTimer();
-		const current = socket;
+	function closeSocket(socketEpoch: number): void {
+		const current = socketForEpoch(socketEpoch);
+		if (!current) return;
 		socket = null;
-		if (current) {
-			current.onopen = null;
-			current.onclose = null;
-			current.onerror = null;
-			current.onmessage = null;
-			try {
-				current.close();
-			} catch {
-				// The socket may already be closed.
-			}
+		current.onopen = null;
+		current.onclose = null;
+		current.onerror = null;
+		current.onmessage = null;
+		try {
+			current.close();
+		} catch {
+			// The connection fence is already recorded.
 		}
+	}
+
+	function disconnect(): void {
+		const socketEpoch = socket ? connectionMachine.getState().socketEpoch : null;
+		transitionConnection({ type: "disconnect", socketEpoch });
 		handleDisconnected();
 	}
 
@@ -1176,7 +1235,6 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		clearHelloTimer();
 		negotiatedMaxClientFrameBytes = SESSION_WS_CLIENT_MAX_BYTES;
 		negotiatedMaxServerFrameBytes = SESSION_WS_SERVER_MAX_BYTES;
-		negotiatedServerEpoch = null;
 		historyNegotiated = false;
 		attachmentGuardContext = null;
 		hotRuntimeRevision = -1;
@@ -1867,6 +1925,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	}
 
 	function handleHotRuntimeInventory(message: HotRuntimeInventoryDto, initial = false): void {
+		const negotiatedServerEpoch = connectionMachine.getState().serverEpoch;
 		if (negotiatedServerEpoch !== null && message.serverEpoch !== negotiatedServerEpoch) return;
 		if (message.revision <= hotRuntimeRevision) return;
 		const previous = hotRuntimeByHandle;
@@ -1884,9 +1943,6 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			if (channel?.subscribed) unsubscribeSession(sessionHandle);
 		}
 		if (initial) {
-			clearHelloTimer();
-			reconnectAttempt = 0;
-			store.setState({ connectionState: "online" });
 			resyncCoordinator.reconnect();
 		}
 		for (const runtime of message.runtimes) queueHotRuntimeRecovery(runtime);
