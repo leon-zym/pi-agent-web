@@ -14,6 +14,7 @@ import { useComposerStore } from "./composer";
 import { useExtensionUiStore } from "./extension-ui";
 import { useModelDirectoryStore } from "./model-directory";
 import { useProjectionStore } from "./projection";
+import { useSessionControlStore } from "./session-control";
 import { useSessionStatsStore } from "./session-stats";
 import { hasFreshLeaseBaseline, sessionTransport } from "./session-transport";
 import { useSlashCommandsStore } from "./slash-commands";
@@ -79,6 +80,7 @@ const sessionRequestByWorkspace = new Map<string, SessionRequest>();
 const transientAbandons = new Set<string>();
 let sessionRequestCounter = 0;
 let navigationTokenCounter = 0;
+let cancelPendingVisibleSessionClaim: (() => void) | null = null;
 
 const TRANSIENT_CONTROL_WAIT_MS = 5_000;
 
@@ -241,7 +243,35 @@ function selectVisibleSessionState(sessionHandle: string | null): void {
 	useViewStore.getState().clearSession();
 }
 
+/** Wait for an authoritative lease before claiming a persisted visible Session. */
+function claimVisibleSessionWhenFree(sessionHandle: string): void {
+	cancelPendingVisibleSessionClaim?.();
+
+	let cancelled = false;
+	let unsubscribe = () => {};
+	const cancel = () => {
+		if (cancelled) return;
+		cancelled = true;
+		unsubscribe();
+		if (cancelPendingVisibleSessionClaim === cancel) cancelPendingVisibleSessionClaim = null;
+	};
+	const inspect = () => {
+		if (cancelled) return;
+		const transport = sessionTransport.store.getState();
+		const channel = transport.sessions[sessionHandle];
+		if (!channel?.subscribed || !channel.baselineAuthoritative || !hasFreshLeaseBaseline(channel)) return;
+		if (channel.lease.controlState !== "free") return;
+		cancel();
+		transport.claimSession(sessionHandle);
+	};
+
+	cancelPendingVisibleSessionClaim = cancel;
+	unsubscribe = sessionTransport.store.subscribe(inspect);
+	inspect();
+}
+
 function activateSessionView(session: NativeSessionDto | null): void {
+	cancelPendingVisibleSessionClaim?.();
 	const sessionHandle = session?.sessionHandle ?? null;
 	selectVisibleSessionState(sessionHandle);
 	if (!sessionHandle) return;
@@ -250,7 +280,11 @@ function activateSessionView(session: NativeSessionDto | null): void {
 		transport.invalidateSessionSnapshot(sessionHandle);
 	}
 	transport.subscribeSession(sessionHandle);
-	transport.claimSession(sessionHandle);
+	if (session?.runtime?.recoverable === false) {
+		transport.claimSession(sessionHandle);
+	} else {
+		claimVisibleSessionWhenFree(sessionHandle);
+	}
 }
 
 function releasableSessionState(sessionHandle: string): boolean {
@@ -1071,6 +1105,7 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 		useSlashCommandsStore.getState().forgetSession(sessionHandle);
 		useSessionStatsStore.getState().forgetSession(sessionHandle);
 		useExtensionUiStore.getState().forgetSession(sessionHandle);
+		useSessionControlStore.getState().forgetSession(sessionHandle);
 		useProjectionStore.getState().resetSession(sessionHandle);
 	},
 

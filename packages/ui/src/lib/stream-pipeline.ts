@@ -10,6 +10,7 @@ import { useComposerStore } from "../stores/composer";
 import { useExtensionUiStore } from "../stores/extension-ui";
 import { useModelDirectoryStore } from "../stores/model-directory";
 import { useProjectionStore } from "../stores/projection";
+import { useSessionControlStore } from "../stores/session-control";
 import { reconcileHiddenSessionLifecycle, useSessionDirectoryStore } from "../stores/session-directory";
 import type { SessionFrameBusMessage, SessionFrameRepresentation } from "../stores/session-frame-bus";
 import { useSessionStatsStore } from "../stores/session-stats";
@@ -116,6 +117,7 @@ function routeSessionFrame(
 			return;
 		case "lease_status":
 			projectionEventScheduler.flushSession(message.sessionHandle);
+			useSessionControlStore.getState().observeLeaseStatus(message);
 			scheduleHiddenLifecycleAfterLease(message);
 			return;
 		case "resync_required":
@@ -165,6 +167,8 @@ function routeSessionFrame(
 			projectionEventScheduler.discardSession(message.runtime.sessionHandle);
 			activeMessageIdentities.delete(message.previousSessionHandle);
 			activeMessageIdentities.delete(message.runtime.sessionHandle);
+			useSessionControlStore.getState().resetSession(message.previousSessionHandle);
+			useSessionControlStore.getState().resetSession(message.runtime.sessionHandle);
 			routeRekey(message.previousSessionHandle, message.runtime);
 			return;
 		case "session_error":
@@ -416,6 +420,7 @@ function routeRekey(previousSessionHandle: string, runtime: SessionRuntimeDto): 
 }
 
 function routeSessionError(message: Extract<InlineSessionWsServerMessage, { type: "session_error" }>): void {
+	useSessionControlStore.getState().recordSessionError(message);
 	if (!isCurrentSession(message.sessionHandle)) return;
 	if (message.operation === "claim") {
 		toast.info(tt("lease.observer"), { description: stripAnsi(message.error) });

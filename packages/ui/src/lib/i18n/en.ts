@@ -309,6 +309,7 @@ export const en: typeof zhCN = {
 	"ext.confirm": "Confirm",
 	"ext.dockTitle": "Pending extension request",
 	"ext.dockDeadline": "{seconds}s remaining",
+	"ext.dialogDeadline": "Expires in {seconds}s",
 	"ext.other": "Other…",
 	"ext.customInput": "Custom input",
 	"ext.recommended": "Recommended",
@@ -376,10 +377,27 @@ export const en: typeof zhCN = {
 	"transport.commandTimeout": "Command timed out: {command}",
 
 	// Session controller lease
+	"lease.controller": "This page controls the Session",
+	"lease.viewOnly": "View only",
+	"lease.reconnecting": "Reconnecting control",
+	"lease.takeOver": "Take over Session",
+	"lease.takeOverPending": "Taking over…",
+	"lease.takeOverTitle": "Take over this Session?",
+	"lease.takeOverDescription":
+		"This affects only the current Session. It does not stop the Agent; the previous page becomes read-only, and work already admitted continues.",
+	"lease.observerBanner":
+		"Another page controls this Session. Input is disabled here; you can take over control.",
+	"lease.reconnectingDescription":
+		"Reconnecting this Session's control state; input and extension responses are temporarily unavailable.",
+	"lease.revoked":
+		"This page lost control of the current Session. The Agent does not stop, and work already admitted continues.",
+	"lease.takeoverFailed": "Takeover failed. Wait for the latest control state, then try again.",
+	"lease.takeoverStale": "The takeover request used an old control state. Wait for sync, then try again.",
+	"lease.takeoverGenerationStale": "This Session changed. Wait for sync, then try again.",
+	"lease.takeoverUnavailable": "This Session cannot be taken over right now.",
 	"lease.readOnly":
-		"Another tab controls this Session; close it, then select this Session again to take control",
-	"lease.observer":
-		"Read-only for now. Close the controlling tab, then select this Session again to take control.",
+		"Another page controls this Session; input is read-only. Use ‘Take over Session’ to get control",
+	"lease.observer": "Read-only for now; another page controls this Session.",
 	"lease.observerPlaceholder": "Read-only in this tab",
 
 	// System status rows

@@ -758,20 +758,23 @@ test("a reopened observer restores seven hot Runtimes but only the controller an
 		await observerDialogRow.getByRole("button").first().click();
 		await expect(observerPage.locator("textarea")).toBeDisabled();
 		await expect(observerPage.locator("header").getByText(/^(Waiting for input|等待输入)$/)).toBeVisible();
-		await expect(observerPage.getByRole("dialog", { name: "Synthetic approval" })).toHaveCount(0);
-		await expect
-			.poll(
-				() =>
-					reopenedSocket.sent.filter(
-						(frame) =>
-							frame.type === "session_claim" && frame.sessionHandle === scenario.dialog.sessionHandle,
-					).length,
-			)
-			.toBe(1);
+		const observerDialog = observerPage.getByRole("dialog", { name: "Synthetic approval" });
+		await expect(observerDialog).toBeVisible();
+		await expect(observerDialog.getByRole("button", { name: /^(Confirm|确认)$/ })).toBeDisabled();
+		await expect(
+			observerDialog
+				.getByTestId("extension-session-control")
+				.getByRole("button", { name: /^(Take over Session|接管 Session)$/ }),
+		).toBeVisible();
+		const reopenedClaims = reopenedSocket.sent.filter((frame) => frame.type === "session_claim");
+		const transientHandles = new Set(scenario.transients.map((transient) => transient.sessionHandle));
+		expect(
+			reopenedClaims.filter((frame) => frame.sessionHandle === scenario.dialog.sessionHandle),
+		).toHaveLength(0);
+		expect(reopenedClaims).toHaveLength(1);
+		expect(transientHandles.has(String(reopenedClaims[0]?.sessionHandle))).toBe(true);
 		expect(reopenedSocket.sent.filter((frame) => frame.type === "extension_ui_response")).toEqual([]);
-		const reopenedInitialClaim = String(
-			reopenedSocket.sent.find((frame) => frame.type === "session_claim")?.sessionHandle,
-		);
+		const reopenedInitialClaim = String(reopenedClaims[0]?.sessionHandle);
 		const reopenedAllowedReleases =
 			reopenedInitialClaim === scenario.dialog.sessionHandle
 				? new Set<string>()

@@ -43,15 +43,13 @@ import {
 } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { runtimeStateForDisplay } from "../../lib/runtime-state";
-import {
-	isSessionControlReady,
-	type SessionDeleteBlockReason,
-	sessionDeleteCapability,
-} from "../../lib/session-capabilities";
+import { type SessionDeleteBlockReason, sessionDeleteCapability } from "../../lib/session-capabilities";
 import { deleteSession, renameSession, sendControlCommand } from "../../lib/session-controller";
+import { useSessionControlStatus } from "../../stores/session-control";
 import { useSessionDirectoryStore } from "../../stores/session-directory";
 import { useSessionTransportStore } from "../../stores/session-transport";
 import { useViewStore } from "../../stores/view";
+import { SessionControlStatus } from "../session-control/SessionControlStatus";
 
 function sessionTitle(name: string | undefined, firstMessage: string | undefined, fallback: string): string {
 	return displayLabel(name || firstMessage || fallback);
@@ -106,7 +104,8 @@ export function SessionHeader() {
 	const channel = useSessionTransportStore((state) =>
 		sessionHandle ? state.sessions[sessionHandle] : undefined,
 	);
-	const canControl = isSessionControlReady(channel);
+	const controlStatus = useSessionControlStatus(sessionHandle);
+	const canControl = controlStatus.canControl;
 	const processStatus = channel?.runtime;
 	const processDisplayState = runtimeStateForDisplay(processStatus);
 	const setRightPanelMode = useViewStore((s) => s.setRightPanelMode);
@@ -281,6 +280,7 @@ export function SessionHeader() {
 												: tt("status.dormant")}
 						</span>
 					</Badge>
+					<SessionControlStatus sessionHandle={sessionHandle} surface="header" />
 					<Tooltip>
 						<TooltipTrigger asChild>
 							<Button
