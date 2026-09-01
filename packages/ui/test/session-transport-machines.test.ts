@@ -608,6 +608,56 @@ describe("Session extension machine", () => {
 		});
 		expect(machine.getSession(identity.sessionHandle)).toBeUndefined();
 	});
+
+	it("evicts only old notification dedupe state while retaining pending requests and acknowledgements", () => {
+		const machine = createSessionExtensionMachine();
+		const oldestIdentity = { ...identity, sessionHandle: "oldest-notify-session" };
+		const pendingRequest = extensionRequest("blocking-request", "confirm");
+		const acknowledgedRequest = extensionRequest("acknowledged-request", "confirm");
+		machine.transition({
+			type: "hydrate",
+			identity: oldestIdentity,
+			pending: [pendingRequest, acknowledgedRequest],
+		});
+		machine.transition({
+			type: "result",
+			identity: oldestIdentity,
+			requestId: acknowledgedRequest.id,
+			resyncing: true,
+		});
+		const notify = (notifyIdentity: SessionRuntimeIdentityDto, seq: number) =>
+			machine.transition({
+				type: "replay",
+				identity: notifyIdentity,
+				frame: {
+					type: "extension_ui_request",
+					...notifyIdentity,
+					seq,
+					request: extensionRequest(`notify-${notifyIdentity.sessionHandle}`, "notify") as Extract<
+						PiExtensionUiRequestDto,
+						{ method: "notify" }
+					>,
+				},
+			});
+
+		notify(oldestIdentity, 1);
+		for (let index = 1; index <= 64; index += 1) {
+			notify({ ...identity, sessionHandle: `notify-session-${String(index)}` }, index + 1);
+		}
+
+		expect(machine.getSession(oldestIdentity.sessionHandle)).toMatchObject({
+			pending: [pendingRequest],
+			acknowledgedRequestIds: [acknowledgedRequest.id],
+			deliveredNotifyKeys: [],
+		});
+		expect(notify(oldestIdentity, 1).intents).toEqual([
+			{
+				type: "notify_delivered",
+				sessionHandle: oldestIdentity.sessionHandle,
+				key: "1:notify-oldest-notify-session",
+			},
+		]);
+	});
 });
 
 describe("Session retention machine", () => {
@@ -627,7 +677,7 @@ describe("Session retention machine", () => {
 				type: "admit_subscription",
 				sessionHandle: "c",
 				subscribedCount: 2,
-				candidates: [candidate, { sessionHandle: "b", canEvict: true, protected: true }],
+				candidates: [candidate, { sessionHandle: "b", subscribed: true, canEvict: true, protected: true }],
 			}).intents,
 		).toEqual([{ type: "evict_subscription", sessionHandle: "a" }]);
 

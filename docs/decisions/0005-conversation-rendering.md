@@ -57,12 +57,14 @@ On the same local benchmark fixture:
   parse/highlight/render proxy. This flags a browser long-task risk; it is not itself a Chromium
   mount/layout/paint measurement and is not claimed as solved by lazy loading or the streaming
   circuit breakers.
-- Production Chromium fixtures cover 10 KiB, 64 KiB, 120 KiB, and 1 MiB streamed responses with
-  a 200 ms maximum live long task, 2,000 ms cold / 1,500 ms warm settlement budget, at most 64
-  mounted turns, and a 64 MiB post-GC heap-delta ceiling. The latest full production Chromium run
-  passed these gates. Settlement timing starts at the final stream-delta boundary and ends only
-  after the settled DOM is present; the measurement reads numeric DOM/heap values in the page and
-  does not pull the full text across the Playwright boundary.
+- Production Chromium fixtures cover 10 KiB, 64 KiB, 120 KiB, and 1 MiB streamed responses. They
+  emit live long-task, cold/warm settlement, mounted-turn, and post-GC heap-delta metrics alongside
+  deterministic content, structure, and safety assertions. Host-sensitive numerical metrics are
+  diagnostic observations rather than hard budgets or a latest-pass claim until a calibrated
+  reference-host baseline and variance policy exist. Settlement timing starts at the final
+  stream-delta boundary and ends only after the settled DOM is present; the measurement reads
+  numeric DOM/heap values in the page and does not pull the full text across the Playwright
+  boundary.
 - The exact current-main production build is 243,266 bytes gzip for the entry JavaScript; the
   unmodified 24-S2a candidate is 246,386 bytes gzip. The former 240 KiB entry cap (245,760 bytes)
   consumes about 99.0% of that cap and leaves only 2,494 bytes, so the cap was nearly exhausted and

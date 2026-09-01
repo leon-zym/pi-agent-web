@@ -1198,6 +1198,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				channel.runtime,
 				channel.pendingExtensionRequests.length > 0,
 				recoveryMachine.getState().hotRuntimeByHandle.has(channel.sessionHandle),
+				channel.subscribed,
 			),
 		);
 		const transition = transitionRetention({
@@ -1340,7 +1341,11 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 
 	function unsubscribeSession(sessionHandle: string): void {
 		const channel = store.getState().sessions[sessionHandle];
-		if (!channel?.subscribed) return;
+		if (!channel?.subscribed) {
+			transitionRetention({ type: "remove_subscription", sessionHandle });
+			clearProtectedSubscriptionOverage();
+			return;
+		}
 		cancelSessionHistory(sessionHandle);
 		abortHistoryForSession(sessionHandle);
 		abortProjection(sessionHandle);
@@ -1384,6 +1389,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		transitionControl({ type: "remove", sessionHandle });
 		transitionRecovery({ type: "clear_session", sessionHandle });
 		discardRawEvents(sessionHandle, false);
+		transitionRetention({ type: "remove_subscription", sessionHandle });
 		if (channel) setChannel(sessionHandle, () => emptyChannel(sessionHandle));
 		return true;
 	}
@@ -1712,8 +1718,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			if (next.has(sessionHandle)) continue;
 			transitionRecovery({ type: "clear_connection_observation", sessionHandle });
 			cancelExactHotRecovery(sessionHandle);
-			const channel = store.getState().sessions[sessionHandle];
-			if (channel?.subscribed) unsubscribeSession(sessionHandle);
+			unsubscribeSession(sessionHandle);
 		}
 		if (initial) {
 			resyncCoordinator.reconnect();
@@ -2974,6 +2979,11 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				frameBus.emit(message.sessionHandle, message, now());
 				return;
 			}
+			transitionRetention({
+				type: "remove_subscription",
+				sessionHandle: message.sessionHandle,
+				preserveAdmission: true,
+			});
 			transitionRecovery({ type: "clear_connection_observation", sessionHandle: message.sessionHandle });
 			rejectPendingForSession(
 				message.sessionHandle,
@@ -3036,6 +3046,14 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			return;
 		}
 		const identityChanged = current.runtime !== null && !identitiesMatch(current.runtime, message.runtime);
+		const recoveryBeforeIdentityChange = identityChanged ? recoveryMachine.getState() : null;
+		const activeExactBeforeIdentityChange =
+			recoveryBeforeIdentityChange?.activeExactHotRecovery?.identity.sessionHandle === sessionHandle
+				? recoveryBeforeIdentityChange.activeExactHotRecovery
+				: null;
+		const queuedExactBeforeIdentityChange = Boolean(
+			recoveryBeforeIdentityChange?.queuedExactHotRecoveries.has(sessionHandle),
+		);
 		if (identityChanged) {
 			transitionControl({ type: "runtime_reset", sessionHandle });
 			abortHistoryForSession(sessionHandle);
@@ -3071,6 +3089,23 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			rawEvents: identityChanged ? [] : channel.rawEvents,
 		}));
 		transitionRecovery({ type: "set_connection_observation", sessionHandle, identity: message.runtime });
+		if (identityChanged) {
+			if (activeExactBeforeIdentityChange) {
+				transitionRecovery({
+					type: "set_active_exact_hot",
+					active: {
+						...activeExactBeforeIdentityChange,
+						identity: message.runtime,
+						baselineReady: false,
+						leaseReady: false,
+						recoveryStarted: false,
+					},
+				});
+			} else if (queuedExactBeforeIdentityChange) {
+				transitionRecovery({ type: "queue_exact_hot", sessionHandle });
+			}
+			pumpExactHotRecovery();
+		}
 		const delivery = frameBus.emit(sessionHandle, message, now());
 		if (delivery.errors.length > 0) {
 			reportProjectionFailure(sessionHandle, message.runtime.generation, delivery.errors[0]);

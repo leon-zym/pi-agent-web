@@ -161,6 +161,14 @@ function withSession(
 	return { ...state, sessions };
 }
 
+function clearNotifyKeys(
+	state: SessionExtensionMachineState,
+	sessionHandle: string,
+): SessionExtensionMachineState {
+	const current = state.sessions[sessionHandle];
+	return current ? withSession(state, sessionHandle, { ...current, deliveredNotifyKeys: [] }) : state;
+}
+
 function withPending(
 	state: SessionExtensionMachineState,
 	identity: SessionRuntimeIdentityDto,
@@ -205,7 +213,7 @@ function rememberNotify(
 	});
 	while (identityOrder.length > MAX_DELIVERED_NOTIFY_IDENTITIES) {
 		const oldest = identityOrder.shift();
-		if (oldest && oldest !== identity.sessionHandle) sessions = withSession(sessions, oldest, null);
+		if (oldest && oldest !== identity.sessionHandle) sessions = clearNotifyKeys(sessions, oldest);
 	}
 	return {
 		state: { ...sessions, deliveredNotifyIdentityOrder: identityOrder },
@@ -322,10 +330,7 @@ export function reduceSessionExtensionMachine(
 		case "clear_notify": {
 			const current = state.sessions[event.identity.sessionHandle];
 			if (!current || !extensionIdentityMatches(current.identity, event.identity)) return { state, intents };
-			const next = withSession(state, event.identity.sessionHandle, {
-				...current,
-				deliveredNotifyKeys: [],
-			});
+			const next = clearNotifyKeys(state, event.identity.sessionHandle);
 			return {
 				state: {
 					...next,
@@ -339,10 +344,7 @@ export function reduceSessionExtensionMachine(
 		case "clear_notify_session": {
 			const current = state.sessions[event.sessionHandle];
 			if (!current) return { state, intents };
-			const next = withSession(state, event.sessionHandle, {
-				...current,
-				deliveredNotifyKeys: [],
-			});
+			const next = clearNotifyKeys(state, event.sessionHandle);
 			return {
 				state: {
 					...next,

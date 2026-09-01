@@ -11,6 +11,7 @@ export interface RetainedRawEvent {
 
 export interface RetentionCandidate {
 	sessionHandle: string;
+	subscribed: boolean;
 	canEvict: boolean;
 	protected: boolean;
 }
@@ -39,7 +40,7 @@ export type SessionRetentionMachineEvent =
 			subscribedCount: number;
 			candidates: readonly RetentionCandidate[];
 	  }
-	| { type: "remove_subscription"; sessionHandle: string }
+	| { type: "remove_subscription"; sessionHandle: string; preserveAdmission?: boolean }
 	| { type: "mark_protected_overage"; sessionHandle: string; subscribedCount: number }
 	| { type: "clear_protected_overage"; subscribedCount: number }
 	| { type: "set_admission"; sessionHandle: string; admission: SessionSubscriptionAdmission }
@@ -79,7 +80,7 @@ function touch(order: readonly string[], sessionHandle: string): string[] {
 }
 
 function canEvict(candidate: RetentionCandidate | undefined): boolean {
-	return Boolean(candidate?.canEvict && !candidate.protected);
+	return Boolean(candidate?.subscribed && candidate.canEvict && !candidate.protected);
 }
 
 export function subscriptionAdmissionCode(error: string, code?: string): string {
@@ -122,7 +123,7 @@ export function reduceSessionRetentionMachine(
 		case "remove_subscription": {
 			const admissions = { ...state.admissions };
 			const hadAdmission = event.sessionHandle in admissions;
-			delete admissions[event.sessionHandle];
+			if (!event.preserveAdmission) delete admissions[event.sessionHandle];
 			return {
 				state: {
 					...state,
@@ -130,9 +131,10 @@ export function reduceSessionRetentionMachine(
 					protectedOverage: removeHandle(state.protectedOverage, event.sessionHandle),
 					admissions,
 				},
-				intents: hadAdmission
-					? [{ type: "admission_changed", sessionHandle: event.sessionHandle, admission: null }]
-					: intents,
+				intents:
+					hadAdmission && !event.preserveAdmission
+						? [{ type: "admission_changed", sessionHandle: event.sessionHandle, admission: null }]
+						: intents,
 			};
 		}
 		case "mark_protected_overage": {
@@ -258,6 +260,7 @@ export function retentionCandidate(
 	runtime: SessionRuntimeDto | null | undefined,
 	hasPendingExtension: boolean,
 	hot: boolean,
+	subscribed = true,
 ): RetentionCandidate {
 	const canEvictRuntime = Boolean(
 		runtime && (runtimePhase(runtime) === "ready" || runtimePhase(runtime) === "dormant"),
@@ -265,6 +268,7 @@ export function retentionCandidate(
 	const persisted = runtime?.sessionFile !== null && runtime?.sessionFile !== undefined;
 	return {
 		sessionHandle,
+		subscribed,
 		canEvict: canEvictRuntime && persisted && !hasPendingExtension,
 		protected: hot,
 	};
