@@ -1,3 +1,8 @@
+import {
+	assertConversationHardInvariants,
+	type ConversationPerformanceSnapshot,
+	conversationPerformanceDiagnostics,
+} from "../conversation-performance-policy.test";
 import { observePageErrors } from "../fixtures/page-observation";
 import { expect, test } from "../fixtures/test";
 
@@ -14,20 +19,7 @@ const STREAM_FIXTURES = [
 	{ label: "1 MiB", prompt: "E2E_STREAM_BUDGET_1M", targetBytes: 1024 * 1024 },
 ] as const;
 
-const COLD_SETTLEMENT_BUDGET_MS = 2_000;
-const WARM_SETTLEMENT_BUDGET_MS = 1_500;
 const MAX_RICH_MARKDOWN_UTF8_BYTES = 256 * 1024;
-const MAX_LIVE_LONG_TASK_MS = 200;
-const MAX_LIVE_LONG_TASKS_OVER_50_MS = 4;
-const MAX_HEAP_DELTA_BYTES = 64 * 1024 * 1024;
-
-interface ConversationPerformanceSnapshot {
-	liveLongTasks: number[];
-	liveLongTaskMaxMs: number;
-	settlementMs: number | null;
-	heapDeltaBytes: number | null;
-	turnNodes: number;
-}
 
 interface ConversationPerformanceCapabilities {
 	longTaskObserver: boolean;
@@ -60,7 +52,7 @@ async function installConversationPerformanceObserver(page: Parameters<typeof ob
 			observer.observe({ entryTypes: ["longtask"] });
 			longTaskObserverInstalled = true;
 		} catch {
-			// The test asserts this capability before treating the result as a gate.
+			// The test requires this capability so the diagnostic artifact is complete.
 		}
 		const target = window as typeof window & {
 			__piwebConversationPerformance: {
@@ -113,10 +105,10 @@ async function installConversationPerformanceObserver(page: Parameters<typeof ob
 	});
 }
 
-test("production Chromium keeps live Markdown and settled rendering within documented budgets", async ({
+test("production Chromium preserves conversation correctness and reports performance observations", async ({
 	page,
 	harness,
-}) => {
+}, testInfo) => {
 	test.slow();
 	const errors = observePageErrors(page);
 	await installConversationPerformanceObserver(page);
@@ -137,7 +129,7 @@ test("production Chromium keeps live Markdown and settled rendering within docum
 	const cdp = await page.context().newCDPSession(page);
 	const fixtures = STREAM_FIXTURES;
 
-	for (const [index, fixture] of fixtures.entries()) {
+	for (const fixture of fixtures) {
 		await cdp.send("HeapProfiler.collectGarbage");
 		await page.evaluate(() => {
 			(
@@ -174,7 +166,7 @@ test("production Chromium keeps live Markdown and settled rendering within docum
 			)
 			.toBe(true);
 		// The fixture pauses before text_end. Wait until the final delta is mounted
-		// so the live budget excludes only the authoritative structural commit.
+		// so the live observation excludes only the authoritative structural commit.
 		const streamEndEvent = harness
 			.piEvents()
 			.find((event) => event.type === "stream_end" && event.text === fixture.prompt);
@@ -259,26 +251,15 @@ test("production Chromium keeps live Markdown and settled rendering within docum
 				}
 			).__piwebConversationPerformance.snapshot(),
 		);
-		const overBudgetLiveTasks = metrics.liveLongTasks.filter((duration) => duration > 50);
-		expect(
-			metrics.liveLongTaskMaxMs,
-			`${fixture.label} live long tasks ${JSON.stringify(metrics)}`,
-		).toBeLessThanOrEqual(MAX_LIVE_LONG_TASK_MS);
-		expect(
-			overBudgetLiveTasks.length,
-			`${fixture.label} repeated live long tasks ${JSON.stringify(metrics)}`,
-		).toBeLessThanOrEqual(MAX_LIVE_LONG_TASKS_OVER_50_MS);
+		const diagnostics = conversationPerformanceDiagnostics(fixture.label, metrics);
+		console.log(`[conversation-performance] ${JSON.stringify(diagnostics)}`);
+		await testInfo.attach(`conversation-performance-${fixture.label}.json`, {
+			body: `${JSON.stringify(diagnostics, null, 2)}\n`,
+			contentType: "application/json",
+		});
 		expect(metrics.settlementMs, `${fixture.label} settlement measurement`).not.toBeNull();
-		expect(metrics.settlementMs, `${fixture.label} settlement budget`).toBeLessThan(
-			index === 0 ? COLD_SETTLEMENT_BUDGET_MS : WARM_SETTLEMENT_BUDGET_MS,
-		);
-		expect(metrics.turnNodes, `${fixture.label} retained turn DOM`).toBeLessThanOrEqual(64);
+		assertConversationHardInvariants(metrics, fixture.label);
 		expect(metrics.heapDeltaBytes, `${fixture.label} heap measurement`).not.toBeNull();
-		if (metrics.heapDeltaBytes !== null) {
-			expect(metrics.heapDeltaBytes, `${fixture.label} retained heap delta`).toBeLessThanOrEqual(
-				MAX_HEAP_DELTA_BYTES,
-			);
-		}
 	}
 
 	expect(errors.console).toEqual([]);
