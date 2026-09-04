@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import test from "node:test";
 
 const source = fs.readFileSync(new URL("./pack-smoke.mjs", import.meta.url), "utf8");
 const extract = (start, end) => source.slice(source.indexOf(start), source.indexOf(end));
+const runWithInjectedSpawn = (spawnSyncImpl) =>
+	new Function("spawnSync", `${extract("function run", "function packageManifest")}\nreturn run;`)(
+		spawnSyncImpl,
+	);
 const seams = new Function(
 	"AbortSignal",
 	"fetch",
@@ -118,4 +123,54 @@ test("pack smoke routes identity and asynchronous boundary checks through guards
 	assert.equal((source.match(/\bfetchImpl\(/g) ?? []).length, 1);
 	assert.equal((source.match(/readSocketFrame\(raw, finish/g) ?? []).length, 4);
 	assert.equal((source.match(/await closeChild\(/g) ?? []).length, 3);
+});
+
+test("pack smoke installs local tarballs with audit and scripts disabled", () => {
+	const installArgs = source.match(/run\("npm", \[([^\n]+)\], installDir\);/)?.[1];
+	assert.equal(installArgs, '"install", "--no-audit", "--ignore-scripts", ...tarballs');
+});
+
+test("pack smoke run reports timeout metadata while retaining warning output", () => {
+	const run = runWithInjectedSpawn((command, args, options) =>
+		spawnSync(command, args, { ...options, timeout: 100 }),
+	);
+	assert.throws(
+		() =>
+			run(
+				process.execPath,
+				["-e", "process.stderr.write('PACK_SMOKE_WARNING\\n'); setTimeout(() => {}, 5_000)"],
+				process.cwd(),
+			),
+		(error) => {
+			assert.match(error.message, /status=null/);
+			assert.match(error.message, /signal=SIGTERM/);
+			assert.match(error.message, /error\.code=ETIMEDOUT/);
+			assert.match(error.message, /error\.message=.*ETIMEDOUT/);
+			assert.match(error.message, /PACK_SMOKE_WARNING/);
+			return true;
+		},
+	);
+});
+
+test("pack smoke run keeps normal nonzero exits distinguishable from timeouts", () => {
+	const run = runWithInjectedSpawn((command, args, options) =>
+		spawnSync(command, args, { ...options, timeout: 1_000 }),
+	);
+	assert.throws(
+		() =>
+			run(
+				process.execPath,
+				["-e", "process.stderr.write('PACK_SMOKE_NONZERO\\n'); process.exit(23)"],
+				process.cwd(),
+			),
+		(error) => {
+			assert.match(error.message, /status=23/);
+			assert.match(error.message, /signal=null/);
+			assert.match(error.message, /error\.code=none/);
+			assert.match(error.message, /error\.message=none/);
+			assert.match(error.message, /PACK_SMOKE_NONZERO/);
+			assert.doesNotMatch(error.message, /ETIMEDOUT/);
+			return true;
+		},
+	);
 });

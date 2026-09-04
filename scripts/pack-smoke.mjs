@@ -35,7 +35,11 @@ if (
 function run(command, args, cwd = root) {
 	const result = spawnSync(command, args, { cwd, encoding: "utf8", stdio: "pipe", timeout: 120_000 });
 	if (result.status !== 0) {
-		throw new Error(`${command} ${args.join(" ")} failed:\n${result.stdout}\n${result.stderr}`);
+		const errorCode = result.error?.code ?? "none";
+		const errorMessage = result.error?.message ?? "none";
+		throw new Error(
+			`${command} ${args.join(" ")} failed (status=${String(result.status)}, signal=${String(result.signal)}, error.code=${String(errorCode)}, error.message=${String(errorMessage)}):\n${result.stdout}\n${result.stderr}`,
+		);
 	}
 	return result.stdout;
 }
@@ -309,7 +313,7 @@ try {
 	}
 	if (packedNames.size !== packageNames.length) throw new Error("Packed package set was incomplete");
 	fs.writeFileSync(path.join(installDir, "package.json"), '{"name":"piweb-pack-smoke","private":true}\n');
-	run("npm", ["install", "--ignore-scripts", ...tarballs], installDir);
+	run("npm", ["install", "--no-audit", "--ignore-scripts", ...tarballs], installDir);
 
 	const installRoot = fs.realpathSync(installDir);
 	for (const packageName of packageNames) {
