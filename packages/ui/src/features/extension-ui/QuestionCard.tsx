@@ -1,5 +1,5 @@
 import { Check, Sparkles } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { Badge } from "../../components/ui/badge";
 import { Input } from "../../components/ui/input";
 import { Kbd } from "../../components/ui/kbd";
@@ -54,6 +54,22 @@ export function getQuestionCardShortcutIndex(key: string, optionCount: number): 
 	return index < optionCount ? index : null;
 }
 
+export function getQuestionCardOptionGroupName(instanceId: string): string {
+	return `question-card-options-${instanceId}`;
+}
+
+export interface QuestionCardFocusRoot {
+	contains: (node: Node | null) => boolean;
+}
+
+export function isQuestionCardFocused(
+	root: QuestionCardFocusRoot | null,
+	activeElement: Node | null,
+): boolean {
+	if (!root || activeElement === null || activeElement === undefined) return false;
+	return root.contains(activeElement);
+}
+
 export interface QuestionCardProps {
 	options: string[];
 	selectedValue: string | null;
@@ -78,6 +94,7 @@ export function QuestionCard({
 	allowCustom = true,
 	onDirectSubmit,
 }: QuestionCardProps) {
+	const optionGroupName = getQuestionCardOptionGroupName(useId());
 	const [customInput, setCustomInput] = useState("");
 	const [isCustomSelected, setIsCustomSelected] = useState(false);
 
@@ -90,6 +107,7 @@ export function QuestionCard({
 	);
 	const [activeIndex, setActiveIndex] = useState(initialActiveIndex);
 	const optionRefs = useRef<Array<HTMLInputElement | null>>([]);
+	const cardRef = useRef<HTMLDivElement | null>(null);
 
 	// Auto-detect and pre-select recommended option
 	useEffect(() => {
@@ -160,6 +178,8 @@ export function QuestionCard({
 
 		const handleKeyDown = (event: KeyboardEvent) => {
 			if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
+			const activeElement = typeof document === "undefined" ? null : document.activeElement;
+			if (!isQuestionCardFocused(cardRef.current, activeElement)) return;
 			const target = event.target as HTMLElement | null;
 			if (
 				target &&
@@ -189,7 +209,7 @@ export function QuestionCard({
 	};
 
 	return (
-		<div data-testid="question-card" className="flex flex-col gap-1.5">
+		<div ref={cardRef} data-testid="question-card" className="flex flex-col gap-1.5">
 			<div
 				role="radiogroup"
 				aria-label={tt("ext.choices")}
@@ -203,6 +223,7 @@ export function QuestionCard({
 					return (
 						<label
 							key={opt.raw}
+							data-testid={`question-option-${index}`}
 							className={cn(
 								"flex min-h-9 cursor-pointer items-center justify-between gap-2 rounded-md border border-border px-2.5 py-1.5 text-left text-[13px] transition-colors hover:bg-hover focus-within:ring-2 focus-within:ring-primary/40",
 								isSelected ? "border-primary/50 bg-primary-soft text-ink" : "bg-surface text-ink-2",
@@ -211,7 +232,7 @@ export function QuestionCard({
 						>
 							<input
 								type="radio"
-								name="question-card-options"
+								name={optionGroupName}
 								checked={isSelected}
 								aria-checked={isSelected}
 								aria-keyshortcuts={shortcutNumber === null ? undefined : String(shortcutNumber)}
@@ -219,7 +240,6 @@ export function QuestionCard({
 								ref={(element) => {
 									optionRefs.current[index] = element;
 								}}
-								data-testid={`question-option-${index}`}
 								onChange={() => selectOption(index)}
 								disabled={disabled}
 								className="sr-only"

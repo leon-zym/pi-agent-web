@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
 	formatSessionLiveAnnouncement,
 	SessionLiveAnnouncements,
+	shouldAnnounceSessionLiveAnnouncement,
 } from "../src/features/session-status/SessionLiveAnnouncements";
 import {
 	createSessionLiveAnnouncementController,
@@ -57,6 +58,33 @@ describe("Session live announcement edges", () => {
 		expect(html).toContain('aria-live="polite"');
 		expect(html).toContain('aria-atomic="true"');
 		expect(html).toContain('data-testid="session-live-announcements"');
+	});
+
+	it("suppresses duplicate current-session recovery and takeover announcements", () => {
+		expect(
+			shouldAnnounceSessionLiveAnnouncement(
+				{ kind: "degraded", sessionHandle: "current-session" },
+				"current-session",
+			),
+		).toBe(false);
+		expect(
+			shouldAnnounceSessionLiveAnnouncement(
+				{ kind: "takeover_revoked", sessionHandle: "current-session" },
+				"current-session",
+			),
+		).toBe(false);
+		expect(
+			shouldAnnounceSessionLiveAnnouncement(
+				{ kind: "degraded", sessionHandle: "background-session" },
+				"current-session",
+			),
+		).toBe(true);
+		expect(
+			shouldAnnounceSessionLiveAnnouncement(
+				{ kind: "settled", sessionHandle: "current-session" },
+				"current-session",
+			),
+		).toBe(true);
 	});
 
 	it("announces running to settled once per identity and terminal sequence", () => {

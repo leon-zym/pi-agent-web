@@ -91,6 +91,14 @@ export function formatSessionLiveAnnouncement(
 	}
 }
 
+export function shouldAnnounceSessionLiveAnnouncement(
+	announcement: Pick<SessionLiveAnnouncement, "kind" | "sessionHandle">,
+	currentSessionHandle: string | null,
+): boolean {
+	if (announcement.sessionHandle !== currentSessionHandle) return true;
+	return announcement.kind !== "degraded" && announcement.kind !== "takeover_revoked";
+}
+
 function formatAnnouncement(announcement: SessionLiveAnnouncement): string {
 	return formatSessionLiveAnnouncement(announcement, sessionLabel(announcement.sessionHandle));
 }
@@ -108,7 +116,10 @@ export function SessionLiveAnnouncements() {
 		const observe = () => {
 			scheduled = false;
 			if (disposed) return;
-			const next = controller.observe(readObservations());
+			const currentSessionHandle = useSessionDirectoryStore.getState().currentSession?.sessionHandle ?? null;
+			const next = controller
+				.observe(readObservations())
+				.filter((candidate) => shouldAnnounceSessionLiveAnnouncement(candidate, currentSessionHandle));
 			if (next.length === 0) return;
 			setAnnouncement({
 				key: next.map((candidate) => candidate.key).join("|"),
