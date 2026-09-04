@@ -143,7 +143,7 @@ function dispatchSessionAudio(
 	sound: "attention" | "completion",
 	dedupeKey: string,
 ): void {
-	getSessionBrowserEffects().dispatch({ type: "audio", identity, sound, dedupeKey });
+	getSessionBrowserEffects().dispatch({ type: "audio", identity, sound, dedupeKey, dedupeMode: "event" });
 }
 
 function dispatchSessionTabBadge(identity: SessionBrowserIdentity, status: TabStatus, label: string): void {
@@ -153,6 +153,8 @@ function dispatchSessionTabBadge(identity: SessionBrowserIdentity, status: TabSt
 		status,
 		label,
 		dedupeKey: `tab-badge:${status}:${label}`,
+		dedupeMode: "latest",
+		dedupeGroup: "tab-badge",
 	});
 }
 
@@ -168,6 +170,8 @@ function dispatchSessionDirectoryRefresh(identity: SessionBrowserIdentity, works
 }
 
 function scheduleWorkspaceDirectoryReload(workspaceHandle: string): void {
+	const directory = useSessionDirectoryStore.getState();
+	if (!directory.workspaces.some((workspace) => workspace.workspaceHandle === workspaceHandle)) return;
 	const identity = createWorkspaceBrowserIdentity({ workspaceId: workspaceHandle });
 	const effects = getSessionBrowserEffects();
 	effects.setCurrentWorkspaceIdentity(identity);
@@ -287,6 +291,9 @@ function routeRuntime(runtime: SessionRuntimeDto, reconcileHidden = true): void 
 	}
 	useSessionDirectoryStore.getState().applyRuntime(runtime);
 	useExtensionUiStore.getState().resetSessionForGeneration(runtime.sessionHandle, runtime.generation);
+	if (isCurrentSession(runtime.sessionHandle)) {
+		applyVisibleExtensionTitle(runtime.sessionHandle, browserIdentity);
+	}
 	if (phase === "crashed") {
 		useProjectionStore.getState().markRuntimeFailure(runtime.sessionHandle, stripAnsi(runtime.error ?? ""));
 	}
@@ -435,7 +442,7 @@ function routeEvent(
 			useSessionDirectoryStore.getState().markSessionUnread(sessionHandle);
 			void useSessionStatsStore.getState().refresh(sessionHandle);
 			dispatchSessionDirectoryRefresh(browserIdentity, workspaceId);
-			dispatchSessionAudio(browserIdentity, "completion", "agent-settled");
+			dispatchSessionAudio(browserIdentity, "completion", `agent-settled:${String(seq)}`);
 			if (isCurrentSession(sessionHandle)) {
 				dispatchSessionTabBadge(browserIdentity, "done", sessionLabel(sessionHandle));
 			}
@@ -599,6 +606,8 @@ function applyVisibleExtensionTitle(sessionHandle: string, identity?: SessionBro
 		type: "title",
 		identity: browserIdentity,
 		dedupeKey: `extension-title:${title ?? ""}`,
+		dedupeMode: "latest",
+		dedupeGroup: "session-title",
 		title: title ? `${displayLabel(title)} · Pi Agent Web` : "Pi Agent Web",
 	});
 }

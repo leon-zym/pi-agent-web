@@ -26,89 +26,87 @@ export function createWorkspaceBrowserIdentity(identity: WorkspaceBrowserIdentit
 	return Object.freeze({ workspaceId: identity.workspaceId });
 }
 
-export type SessionBrowserSessionEffect =
+/** Event keys suppress duplicate delivery; latest groups replace their previous value. */
+export type SessionBrowserEffectDedupe =
 	| {
-			type: "toast";
-			identity: SessionBrowserIdentity;
 			dedupeKey: string;
-			level: "info" | "success" | "warning" | "error";
-			message: string;
-			description?: string;
+			dedupeMode?: "event";
 	  }
 	| {
-			type: "audio";
-			identity: SessionBrowserIdentity;
 			dedupeKey: string;
-			sound: "attention" | "completion";
-	  }
-	| {
-			type: "title";
-			identity: SessionBrowserIdentity;
-			dedupeKey: string;
-			title: string;
-	  }
-	| {
-			type: "tab_badge";
-			identity: SessionBrowserIdentity;
-			dedupeKey: string;
-			status: TabStatus;
-			label?: string;
-	  }
-	| {
-			type: "directory_refresh";
-			identity: SessionBrowserIdentity;
-			dedupeKey: string;
-			workspaceHandle: string;
-			force?: boolean;
-			delayMs?: number;
-	  }
-	| {
-			type: "navigation";
-			identity: SessionBrowserIdentity;
-			dedupeKey: string;
-			action: "select_session" | "activate_workspace";
-			workspaceHandle: string;
-			sessionHandle?: string | null;
-	  }
-	| {
-			type: "timer";
-			identity: SessionBrowserIdentity;
-			dedupeKey: string;
-			delayMs: number;
-			run: () => void;
-	  }
-	| {
-			type: "custom";
-			identity: SessionBrowserIdentity;
-			dedupeKey: string;
-			run: () => void | Promise<void>;
+			dedupeMode: "latest";
+			dedupeGroup: string;
 	  };
 
-export type SessionBrowserWorkspaceEffect =
-	| {
+type SessionBrowserSessionEffectBase = {
+	identity: SessionBrowserIdentity;
+} & SessionBrowserEffectDedupe;
+
+type SessionBrowserWorkspaceEffectBase = {
+	workspaceIdentity: WorkspaceBrowserIdentity;
+} & SessionBrowserEffectDedupe;
+
+export type SessionBrowserSessionEffect =
+	| (SessionBrowserSessionEffectBase & {
 			type: "toast";
-			workspaceIdentity: WorkspaceBrowserIdentity;
-			dedupeKey: string;
 			level: "info" | "success" | "warning" | "error";
 			message: string;
 			description?: string;
-	  }
-	| {
+	  })
+	| (SessionBrowserSessionEffectBase & {
+			type: "audio";
+			sound: "attention" | "completion";
+	  })
+	| (SessionBrowserSessionEffectBase & {
+			type: "title";
+			title: string;
+	  })
+	| (SessionBrowserSessionEffectBase & {
+			type: "tab_badge";
+			status: TabStatus;
+			label?: string;
+	  })
+	| (SessionBrowserSessionEffectBase & {
 			type: "directory_refresh";
-			workspaceIdentity: WorkspaceBrowserIdentity;
-			dedupeKey: string;
 			workspaceHandle: string;
 			force?: boolean;
 			delayMs?: number;
-	  }
-	| {
+	  })
+	| (SessionBrowserSessionEffectBase & {
 			type: "navigation";
-			workspaceIdentity: WorkspaceBrowserIdentity;
-			dedupeKey: string;
 			action: "select_session" | "activate_workspace";
 			workspaceHandle: string;
 			sessionHandle?: string | null;
-	  };
+	  })
+	| (SessionBrowserSessionEffectBase & {
+			type: "timer";
+			delayMs: number;
+			run: () => void;
+	  })
+	| (SessionBrowserSessionEffectBase & {
+			type: "custom";
+			run: () => void | Promise<void>;
+	  });
+
+export type SessionBrowserWorkspaceEffect =
+	| (SessionBrowserWorkspaceEffectBase & {
+			type: "toast";
+			level: "info" | "success" | "warning" | "error";
+			message: string;
+			description?: string;
+	  })
+	| (SessionBrowserWorkspaceEffectBase & {
+			type: "directory_refresh";
+			workspaceHandle: string;
+			force?: boolean;
+			delayMs?: number;
+	  })
+	| (SessionBrowserWorkspaceEffectBase & {
+			type: "navigation";
+			action: "select_session" | "activate_workspace";
+			workspaceHandle: string;
+			sessionHandle?: string | null;
+	  });
 
 export type SessionBrowserEffect = SessionBrowserSessionEffect | SessionBrowserWorkspaceEffect;
 
@@ -166,8 +164,16 @@ function workspaceIdentityKey(identity: WorkspaceBrowserIdentity): string {
 	return JSON.stringify(["workspace", identity.workspaceId]);
 }
 
+function effectScopeKey(effect: SessionBrowserEffect): string {
+	return "identity" in effect ? identityKey(effect.identity) : workspaceIdentityKey(effect.workspaceIdentity);
+}
+
 function effectKey(effect: SessionBrowserEffect): string {
-	return `${"identity" in effect ? identityKey(effect.identity) : workspaceIdentityKey(effect.workspaceIdentity)}:${effect.dedupeKey}`;
+	return `${effectScopeKey(effect)}:${effect.dedupeKey}`;
+}
+
+function latestEffectGroupKey(effect: SessionBrowserEffect): string | null {
+	return effect.dedupeMode === "latest" ? `${effectScopeKey(effect)}:group:${effect.dedupeGroup}` : null;
 }
 
 function reportError(
@@ -198,6 +204,7 @@ export function createSessionBrowserEffects(
 	const currentByHandle = new Map<string, SessionBrowserIdentity>();
 	const currentByWorkspace = new Map<string, WorkspaceBrowserIdentity>();
 	const journal = new Map<string, number>();
+	const latestKeyByGroup = new Map<string, string>();
 	const timers = new Map<string, ScheduledTimer>();
 	let nextToken = 0;
 	let disposed = false;
@@ -210,12 +217,25 @@ export function createSessionBrowserEffects(
 	const removeJournalEntry = (key: string, token?: number): void => {
 		if (token !== undefined && journal.get(key) !== token) return;
 		journal.delete(key);
+		for (const [groupKey, latestKey] of latestKeyByGroup) {
+			if (latestKey === key) latestKeyByGroup.delete(groupKey);
+		}
+	};
+
+	const cancelJournalEntry = (key: string, token?: number): void => {
+		if (token !== undefined && journal.get(key) !== token) return;
+		const scheduled = timers.get(key);
+		if (scheduled) {
+			clearTimer(scheduled.timer);
+			timers.delete(key);
+		}
+		removeJournalEntry(key, token);
 	};
 
 	const clearIdentityState = (identity: SessionBrowserIdentity): void => {
 		const prefix = `${identityKey(identity)}:`;
 		for (const key of [...journal.keys()]) {
-			if (key.startsWith(prefix)) journal.delete(key);
+			if (key.startsWith(prefix)) cancelJournalEntry(key);
 		}
 		for (const [key, scheduled] of [...timers]) {
 			if (!key.startsWith(prefix)) continue;
@@ -228,7 +248,7 @@ export function createSessionBrowserEffects(
 	const clearWorkspaceState = (identity: WorkspaceBrowserIdentity): void => {
 		const prefix = `${workspaceIdentityKey(identity)}:`;
 		for (const key of [...journal.keys()]) {
-			if (key.startsWith(prefix)) journal.delete(key);
+			if (key.startsWith(prefix)) cancelJournalEntry(key);
 		}
 		for (const [key, scheduled] of [...timers]) {
 			if (!key.startsWith(prefix)) continue;
@@ -319,17 +339,18 @@ export function createSessionBrowserEffects(
 			return false;
 		const key = effectKey(effect);
 		if (journal.has(key)) return false;
+		const groupKey = latestEffectGroupKey(effect);
+		if (groupKey) {
+			const previousKey = latestKeyByGroup.get(groupKey);
+			if (previousKey) cancelJournalEntry(previousKey);
+		}
 		const token = allocateToken();
 		journal.set(key, token);
+		if (groupKey) latestKeyByGroup.set(groupKey, key);
 		while (journal.size > SESSION_BROWSER_EFFECT_JOURNAL_LIMIT) {
 			const oldest = journal.keys().next().value;
 			if (oldest === undefined) break;
-			const scheduled = timers.get(oldest);
-			if (scheduled) {
-				clearTimer(scheduled.timer);
-				timers.delete(oldest);
-			}
-			journal.delete(oldest);
+			cancelJournalEntry(oldest);
 		}
 		try {
 			const result = options.onEffect?.(effect);
@@ -450,6 +471,7 @@ export function createSessionBrowserEffects(
 			for (const scheduled of timers.values()) clearTimer(scheduled.timer);
 			timers.clear();
 			journal.clear();
+			latestKeyByGroup.clear();
 			currentByHandle.clear();
 			currentByWorkspace.clear();
 		},

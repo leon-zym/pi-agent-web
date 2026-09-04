@@ -60,7 +60,7 @@ function nextBrowserEffectKey(prefix: string): string {
 	return `${prefix}:${String(browserEffectSequence)}`;
 }
 
-function captureSessionBrowserIdentity(sessionHandle: string): SessionBrowserIdentity | null {
+export function captureSessionBrowserIdentity(sessionHandle: string): SessionBrowserIdentity | null {
 	const runtime = sessionTransport.store.getState().sessions[sessionHandle]?.runtime;
 	return runtime ? createSessionBrowserIdentity(runtime) : null;
 }
@@ -91,6 +91,23 @@ function dispatchSessionToast(
 	});
 }
 
+/** Interactive Session feedback also requires the initiating Session to remain visible. */
+export function dispatchCurrentSessionBrowserToast(
+	identity: SessionBrowserIdentity | null,
+	level: "info" | "success" | "warning" | "error",
+	message: string,
+	keyPrefix: string,
+	description?: string,
+): boolean {
+	if (
+		!identity ||
+		useSessionDirectoryStore.getState().currentSession?.sessionHandle !== identity.sessionHandle
+	) {
+		return false;
+	}
+	return dispatchSessionToast(identity, level, message, nextBrowserEffectKey(keyPrefix), description);
+}
+
 function dispatchWorkspaceToast(
 	identity: WorkspaceBrowserIdentity,
 	level: "info" | "success" | "warning" | "error",
@@ -99,7 +116,6 @@ function dispatchWorkspaceToast(
 	description?: string,
 ): boolean {
 	const effects = getSessionBrowserEffects();
-	effects.setCurrentWorkspaceIdentity(identity);
 	return effects.dispatch({
 		type: "toast",
 		workspaceIdentity: identity,
@@ -596,8 +612,11 @@ export async function abortCurrentRun(): Promise<void> {
 	}
 }
 
-export async function forkFromEntry(entryId: string, sessionHandle: string): Promise<boolean> {
-	const parentIdentity = captureSessionBrowserIdentity(sessionHandle);
+export async function forkFromEntry(
+	entryId: string,
+	sessionHandle: string,
+	parentIdentity: SessionBrowserIdentity | null = captureSessionBrowserIdentity(sessionHandle),
+): Promise<boolean> {
 	try {
 		const completion = await sendControlCommandWithIdentity(sessionHandle, { type: "fork", entryId });
 		const data = expectCommandData(completion.response, "fork");
@@ -620,7 +639,7 @@ export async function forkFromEntry(entryId: string, sessionHandle: string): Pro
 		return true;
 	} catch (error) {
 		if (parentIdentity) {
-			dispatchSessionToast(
+			dispatchCurrentSessionBrowserToast(
 				parentIdentity,
 				"error",
 				tt("session.forkFailed"),

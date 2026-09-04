@@ -10,6 +10,11 @@ import { create } from "zustand";
 import { api } from "../lib/api";
 import { displayLabel } from "../lib/format";
 import { runtimeIsBusy, runtimeIsReady, runtimeStateForDisplay } from "../lib/runtime-state";
+import {
+	createSessionBrowserIdentity,
+	createWorkspaceBrowserIdentity,
+	getSessionBrowserEffects,
+} from "../lib/session-browser-effects";
 import { useComposerStore } from "./composer";
 import { useExtensionUiStore } from "./extension-ui";
 import { useModelDirectoryStore } from "./model-directory";
@@ -234,11 +239,27 @@ function selectVisibleSessionState(sessionHandle: string | null): void {
 	useSlashCommandsStore.getState().beginSession(sessionHandle);
 	useSessionStatsStore.getState().beginSession(sessionHandle);
 	useExtensionUiStore.getState().beginSession(sessionHandle);
-	if (typeof document !== "undefined") {
-		const extensionTitle = sessionHandle
-			? useExtensionUiStore.getState().bySession[sessionHandle]?.title
-			: null;
-		document.title = extensionTitle ? `${displayLabel(extensionTitle)} · Pi Agent Web` : "Pi Agent Web";
+	if (sessionHandle) {
+		const runtime =
+			sessionTransport.store.getState().sessions[sessionHandle]?.runtime ??
+			useSessionDirectoryStore.getState().currentSession?.runtime;
+		if (runtime) {
+			const identity = createSessionBrowserIdentity(runtime);
+			const extensionTitle = useExtensionUiStore.getState().bySession[sessionHandle]?.title;
+			const effects = getSessionBrowserEffects();
+			effects.setCurrentIdentity(identity);
+			effects.dispatch({
+				type: "title",
+				identity,
+				dedupeKey: `session-title:${extensionTitle ?? ""}`,
+				dedupeMode: "latest",
+				dedupeGroup: "session-title",
+				title: extensionTitle ? `${displayLabel(extensionTitle)} · Pi Agent Web` : "Pi Agent Web",
+			});
+		}
+	} else if (typeof document !== "undefined") {
+		// The no-Session baseline has no Session identity to carry through the sink.
+		document.title = "Pi Agent Web";
 	}
 	useViewStore.getState().clearSession();
 }
@@ -587,6 +608,12 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 		// Active runtimes remain a supervisor-backed Workspace projection long enough
 		// for the transient abandon request that follows a successful removal.
 		await api.removeWorkspace(workspaceHandle);
+		getSessionBrowserEffects().invalidateWorkspaceIdentity(
+			createWorkspaceBrowserIdentity({ workspaceId: workspaceHandle }),
+		);
+		set({
+			workspaces: get().workspaces.filter((workspace) => workspace.workspaceHandle !== workspaceHandle),
+		});
 		for (const sessionHandle of transientHandles) {
 			await discardTransientForWorkspaceRemoval(workspaceHandle, sessionHandle);
 		}

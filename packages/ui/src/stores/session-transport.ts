@@ -322,6 +322,11 @@ function identityKey(identity: SessionRuntimeIdentityDto): string {
 	]);
 }
 
+function serverEpochForServerMessage(message: InlineSessionWsServerMessage): string | null {
+	if (message.type === "runtime_state") return message.runtime.serverEpoch;
+	return "serverEpoch" in message ? message.serverEpoch : null;
+}
+
 const identitiesMatch = extensionIdentityMatches;
 
 type LeaseStatusMessage = Extract<InlineSessionWsServerMessage, { type: "lease_status" }>;
@@ -1822,6 +1827,18 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	}
 
 	function ingestServerMessage(message: InlineSessionWsServerMessage): void {
+		if (disposed) return;
+		// Direct adapters may be used before hello in deterministic tests; once hello
+		// establishes an epoch, every epoch-bearing message must match it.
+		const negotiatedServerEpoch = connectionMachine.getState().serverEpoch;
+		const messageServerEpoch = serverEpochForServerMessage(message);
+		if (
+			negotiatedServerEpoch !== null &&
+			messageServerEpoch !== null &&
+			messageServerEpoch !== negotiatedServerEpoch
+		) {
+			return;
+		}
 		switch (message.type) {
 			case "hot_runtime_inventory":
 				handleHotRuntimeInventory(message);

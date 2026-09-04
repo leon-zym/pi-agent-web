@@ -5,12 +5,13 @@ import type {
 	SessionRuntimeDto,
 } from "@pi-agent-web/protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { api } from "../src/lib/api";
 import {
 	createRecordingSessionBrowserEffects,
 	getSessionBrowserEffects,
 	setSessionBrowserEffects,
 } from "../src/lib/session-browser-effects";
-import { abortCurrentRun, submitDraft } from "../src/lib/session-controller";
+import { abortCurrentRun, newSession, submitDraft } from "../src/lib/session-controller";
 import { useComposerStore } from "../src/stores/composer";
 import { useSessionDirectoryStore } from "../src/stores/session-directory";
 import { emptySessionHistoryState, sessionTransport } from "../src/stores/session-transport";
@@ -143,5 +144,22 @@ describe("controller Browser effect identity fencing", () => {
 		await pending;
 
 		expect(effects.intents.filter((effect) => effect.type === "toast")).toHaveLength(0);
+	});
+
+	it("does not re-admit a Workspace after a late new-Session failure", async () => {
+		let rejectCreate!: (error: Error) => void;
+		const createPending = new Promise<never>((_resolve, reject) => {
+			rejectCreate = reject;
+		});
+		vi.spyOn(api, "createSession").mockReturnValue(createPending);
+
+		const pending = newSession();
+		await vi.waitFor(() => expect(api.createSession).toHaveBeenCalledWith(identity.workspaceId));
+		effectsForTest.invalidateWorkspaceIdentity({ workspaceId: identity.workspaceId });
+		rejectCreate(new Error("late create failure"));
+		await pending;
+
+		expect(effectsForTest.currentWorkspaceIdentity(identity.workspaceId)).toBeNull();
+		expect(effectsForTest.intents.filter((effect) => effect.type === "toast")).toHaveLength(0);
 	});
 });

@@ -46,6 +46,70 @@ describe("SessionBrowserEffects identity boundary", () => {
 		expect(effects.dispatch(effectFor(parent))).toBe(false);
 	});
 
+	it("replays a changed latest title after it returns to an earlier value", () => {
+		const effects = createRecordingSessionBrowserEffects();
+		effects.setCurrentIdentity(parent);
+
+		const dispatchTitle = (title: string) =>
+			effects.dispatch({
+				type: "title",
+				identity: parent,
+				dedupeKey: `title:${title}`,
+				title,
+				dedupeMode: "latest",
+				dedupeGroup: "session-title",
+			});
+
+		expect(dispatchTitle("A")).toBe(true);
+		expect(dispatchTitle("B")).toBe(true);
+		expect(dispatchTitle("A")).toBe(true);
+		expect(dispatchTitle("A")).toBe(false);
+		expect(effects.intents.filter((effect) => effect.type === "title").map((effect) => effect.title)).toEqual(
+			["A", "B", "A"],
+		);
+	});
+
+	it("replays a changed latest tab badge after it returns to idle", () => {
+		const effects = createRecordingSessionBrowserEffects();
+		effects.setCurrentIdentity(parent);
+
+		const dispatchBadge = (status: "idle" | "running") =>
+			effects.dispatch({
+				type: "tab_badge",
+				identity: parent,
+				dedupeKey: `tab-badge:${status}`,
+				status,
+				dedupeMode: "latest",
+				dedupeGroup: "tab-badge",
+			});
+
+		expect(dispatchBadge("idle")).toBe(true);
+		expect(dispatchBadge("running")).toBe(true);
+		expect(dispatchBadge("idle")).toBe(true);
+		expect(dispatchBadge("idle")).toBe(false);
+		expect(
+			effects.intents.filter((effect) => effect.type === "tab_badge").map((effect) => effect.status),
+		).toEqual(["idle", "running", "idle"]);
+	});
+
+	it("keeps duplicate event delivery idempotent while allowing distinct event identities", () => {
+		const effects = createRecordingSessionBrowserEffects();
+		effects.setCurrentIdentity(parent);
+		const dispatchCompletion = (eventId: string) =>
+			effects.dispatch({
+				type: "audio",
+				identity: parent,
+				dedupeKey: `agent-settled:${eventId}`,
+				dedupeMode: "event",
+				sound: "completion",
+			});
+
+		expect(dispatchCompletion("1")).toBe(true);
+		expect(dispatchCompletion("1")).toBe(false);
+		expect(dispatchCompletion("2")).toBe(true);
+		expect(effects.intents.filter((effect) => effect.type === "audio")).toHaveLength(2);
+	});
+
 	it("requires the complete session identity, while allowing explicit workspace effects", () => {
 		const effects = createRecordingSessionBrowserEffects();
 		effects.setCurrentIdentity(parent);
