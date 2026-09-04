@@ -73,6 +73,17 @@ function controlledTransient(sessionHandle: string) {
 	};
 }
 
+function backgroundSessionChannel(sessionHandle: string) {
+	const runtimeValue = runtime(sessionHandle, true);
+	return {
+		...controlledTransient(sessionHandle),
+		runtime: runtimeValue,
+		freshLeaseBaseline: runtimeValue,
+		controllerIntent: false,
+		lease: { isController: false, controlState: "free" as const },
+	};
+}
+
 afterEach(() => {
 	effectsForTest?.dispose();
 	effectsForTest = null;
@@ -106,6 +117,60 @@ describe("transient Session navigation", () => {
 				identity: expect.objectContaining({ sessionHandle: visible.sessionHandle }),
 			}),
 		]);
+	});
+
+	it("re-emits the title when a visible Session transition returns to an earlier Session", () => {
+		effectsForTest = createRecordingSessionBrowserEffects();
+		setSessionBrowserEffects(effectsForTest);
+		const sessionA = session("session-a", true);
+		const sessionB = session("session-b", true);
+		useExtensionUiStore
+			.getState()
+			.applyRequestForSession(
+				sessionA.sessionHandle,
+				{ type: "extension_ui_request", id: "title-a", method: "setTitle", title: "A" },
+				4,
+			);
+		useExtensionUiStore
+			.getState()
+			.applyRequestForSession(
+				sessionB.sessionHandle,
+				{ type: "extension_ui_request", id: "title-b", method: "setTitle", title: "B" },
+				4,
+			);
+		sessionTransport.store.setState({
+			sessions: {
+				[sessionA.sessionHandle]: backgroundSessionChannel(sessionA.sessionHandle),
+				[sessionB.sessionHandle]: backgroundSessionChannel(sessionB.sessionHandle),
+			},
+			hotRuntimeInventory: {
+				type: "hot_runtime_inventory",
+				serverEpoch: "test-server-epoch",
+				revision: 1,
+				runtimes: [sessionA, sessionB].map((candidate) => ({
+					serverEpoch: "test-server-epoch",
+					sessionHandle: candidate.sessionHandle,
+					workspaceId: "workspace-a",
+					generation: 4,
+					state: "idle" as const,
+				})),
+			},
+		});
+		useSessionDirectoryStore.setState({
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: null,
+			sessionsByWorkspace: { "workspace-a": [sessionA, sessionB] },
+			selectedSessionByWorkspace: {},
+		});
+
+		useSessionDirectoryStore.getState().selectSession(sessionA);
+		useSessionDirectoryStore.getState().selectSession(sessionB);
+		useSessionDirectoryStore.getState().selectSession(sessionA);
+		useSessionDirectoryStore.getState().selectSession(sessionA);
+
+		expect(
+			effectsForTest.intents.filter((effect) => effect.type === "title").map((effect) => effect.title),
+		).toEqual(["A · Pi Agent Web", "B · Pi Agent Web", "A · Pi Agent Web"]);
 	});
 
 	it("keeps a newly created unpersisted Session active without publishing an Empty session directory row", () => {

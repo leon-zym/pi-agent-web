@@ -86,6 +86,8 @@ const transientAbandons = new Set<string>();
 let sessionRequestCounter = 0;
 let navigationTokenCounter = 0;
 let cancelPendingVisibleSessionClaim: (() => void) | null = null;
+let visibleSessionTransitionToken = 0;
+let visibleSessionKey: string | null = null;
 
 const TRANSIENT_CONTROL_WAIT_MS = 5_000;
 
@@ -101,6 +103,14 @@ function nextSessionRequest(): number {
 function nextNavigationToken(): number {
 	navigationTokenCounter += 1;
 	return navigationTokenCounter;
+}
+
+function nextVisibleSessionTransition(sessionKey: string | null): number {
+	if (sessionKey !== visibleSessionKey) {
+		visibleSessionKey = sessionKey;
+		visibleSessionTransitionToken += 1;
+	}
+	return visibleSessionTransitionToken;
 }
 
 function isLatestSessionRequest(workspaceHandle: string, request: number): boolean {
@@ -239,6 +249,10 @@ function selectVisibleSessionState(sessionHandle: string | null): void {
 	useSlashCommandsStore.getState().beginSession(sessionHandle);
 	useSessionStatsStore.getState().beginSession(sessionHandle);
 	useExtensionUiStore.getState().beginSession(sessionHandle);
+	const currentSession = useSessionDirectoryStore.getState().currentSession;
+	const transitionToken = nextVisibleSessionTransition(
+		sessionHandle ? `${currentSession?.workspaceHandle ?? ""}:${sessionHandle}` : null,
+	);
 	if (sessionHandle) {
 		const runtime =
 			sessionTransport.store.getState().sessions[sessionHandle]?.runtime ??
@@ -251,7 +265,7 @@ function selectVisibleSessionState(sessionHandle: string | null): void {
 			effects.dispatch({
 				type: "title",
 				identity,
-				dedupeKey: `session-title:${extensionTitle ?? ""}`,
+				dedupeKey: `session-title:${transitionToken}:${extensionTitle ?? ""}`,
 				dedupeMode: "latest",
 				dedupeGroup: "session-title",
 				title: extensionTitle ? `${displayLabel(extensionTitle)} · Pi Agent Web` : "Pi Agent Web",
