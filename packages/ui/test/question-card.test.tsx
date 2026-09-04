@@ -1,7 +1,12 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
-import { parseOptionText, QuestionCard } from "../src/features/extension-ui/QuestionCard";
+import {
+	getQuestionCardNavigationIndex,
+	getQuestionCardShortcutIndex,
+	parseOptionText,
+	QuestionCard,
+} from "../src/features/extension-ui/QuestionCard";
 
 describe("QuestionCard component and option parsing", () => {
 	it("parses recommendation tags from option strings", () => {
@@ -53,10 +58,36 @@ describe("QuestionCard component and option parsing", () => {
 		expect(html).toContain("Option Beta");
 		expect(html).toContain("Option Gamma");
 		expect(html).toContain('data-testid="recommended-badge"');
+		expect(html).toContain('role="radiogroup"');
+		expect(html).toContain('aria-label="选项"');
+		expect((html.match(/type="radio"/g) ?? []).length).toBe(3);
+		expect(html).toContain('aria-checked="true"');
+		expect(html).toContain('data-testid="question-option-1"');
+		expect(html).toContain('tabindex="-1" data-testid="question-option-0"');
+		expect(html).toContain('tabindex="0" data-testid="question-option-1"');
+		expect(html).toContain('tabindex="-1" data-testid="question-option-2"');
 		expect(html).toContain("<kbd");
 		expect(html).toContain(">1<");
 		expect(html).toContain(">2<");
 		expect(html).toContain(">3<");
+	});
+
+	it("maps radio navigation keys with wrapping and Home/End", () => {
+		expect(getQuestionCardNavigationIndex("ArrowRight", 0, 3)).toBe(1);
+		expect(getQuestionCardNavigationIndex("ArrowDown", 2, 3)).toBe(0);
+		expect(getQuestionCardNavigationIndex("ArrowLeft", 0, 3)).toBe(2);
+		expect(getQuestionCardNavigationIndex("ArrowUp", 0, 3)).toBe(2);
+		expect(getQuestionCardNavigationIndex("Home", 2, 3)).toBe(0);
+		expect(getQuestionCardNavigationIndex("End", 0, 3)).toBe(2);
+		expect(getQuestionCardNavigationIndex("PageDown", 0, 3)).toBeNull();
+	});
+
+	it("maps only the first nine number keys to available choices", () => {
+		expect(getQuestionCardShortcutIndex("1", 3)).toBe(0);
+		expect(getQuestionCardShortcutIndex("9", 9)).toBe(8);
+		expect(getQuestionCardShortcutIndex("9", 8)).toBeNull();
+		expect(getQuestionCardShortcutIndex("0", 3)).toBeNull();
+		expect(getQuestionCardShortcutIndex("a", 3)).toBeNull();
 	});
 
 	it("renders custom write-in input", () => {

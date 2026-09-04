@@ -80,7 +80,7 @@ export function OnboardingWizard() {
 				</DialogHeader>
 				<div className="flex flex-col gap-3">
 					<div className="flex flex-col gap-1.5">
-						<Label htmlFor="onboarding-provider">Provider ID</Label>
+						<Label htmlFor="onboarding-provider">{tt("onboarding.providerLabel")}</Label>
 						<Input
 							id="onboarding-provider"
 							autoFocus
@@ -90,12 +90,12 @@ export function OnboardingWizard() {
 						/>
 					</div>
 					<div className="flex flex-col gap-1.5">
-						<Label htmlFor="onboarding-key">API Key</Label>
+						<Label htmlFor="onboarding-key">{tt("onboarding.apiKeyLabel")}</Label>
 						<Input
 							id="onboarding-key"
 							type="password"
 							value={key}
-							placeholder="sk-…"
+							placeholder={tt("onboarding.apiKeyPlaceholder")}
 							className="font-mono"
 							onChange={(event) => setKey(event.target.value)}
 							onKeyDown={(event) => {

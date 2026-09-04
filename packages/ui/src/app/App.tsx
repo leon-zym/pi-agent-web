@@ -4,6 +4,7 @@ import { Skeleton } from "../components/ui/skeleton";
 import { Toaster } from "../components/ui/toaster";
 import { TooltipProvider } from "../components/ui/tooltip";
 import { ExtensionDialogs, OnboardingWizard, SettingsDialog } from "../features/extension-ui";
+import { SessionLiveAnnouncements } from "../features/session-status/SessionLiveAnnouncements";
 import { api } from "../lib/api";
 import { displayError } from "../lib/format";
 import { tt } from "../lib/i18n";
@@ -91,6 +92,7 @@ export function App() {
 			{bootstrapped ? <AppShell /> : <AppBootstrapSkeleton />}
 			{bootstrapped ? <ExtensionDialogs /> : null}
 			{bootstrapped ? <OnboardingWizard /> : null}
+			{bootstrapped ? <SessionLiveAnnouncements /> : null}
 			<SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
 			<Toaster />
 		</TooltipProvider>

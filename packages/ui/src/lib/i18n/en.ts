@@ -313,12 +313,16 @@ export const en: typeof zhCN = {
 	"ext.other": "Other…",
 	"ext.customInput": "Custom input",
 	"ext.recommended": "Recommended",
+	"ext.choices": "Choices",
 
 	// Onboarding
 	"onboarding.title": "Configure a provider API key",
 	"onboarding.description":
 		"No usable provider credentials were found. Add a provider id and API key to get started.",
 	"onboarding.providerPlaceholder": "e.g. deepseek",
+	"onboarding.providerLabel": "Provider ID",
+	"onboarding.apiKeyLabel": "API Key",
+	"onboarding.apiKeyPlaceholder": "sk-…",
 	"onboarding.securityNote": "The key is written only to ~/.pi/agent/auth.json (mode 600) on this machine.",
 	"onboarding.save": "Save and continue",
 	"onboarding.saving": "Saving…",
@@ -416,6 +420,12 @@ export const en: typeof zhCN = {
 	"resync.degradedDescription": "Automatic recovery stopped after four attempts.",
 	"resync.stale": "The conversation shown here may be out of date until sync completes.",
 	"resync.manualRetry": "Retry sync",
+
+	// Session live announcements
+	"live.sessionSettled": "Session {session} finished.",
+	"live.sessionWaiting": "Session {session} is waiting for input.",
+	"live.sessionDegraded": "Session {session} needs attention because automatic recovery stopped.",
+	"live.sessionRevoked": "This page lost control of Session {session}.",
 
 	// Chat viewport
 	"chatViewport.backToBottom": "Back to latest",
