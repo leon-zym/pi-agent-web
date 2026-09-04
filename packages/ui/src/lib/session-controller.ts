@@ -6,7 +6,6 @@ import {
 	SESSION_IMAGE_MAX_COUNT,
 	SESSION_IMAGE_TOTAL_MAX_BASE64_CHARS,
 } from "@pi-agent-web/protocol";
-import { toast } from "sonner";
 import { serializeComposerMessage, useComposerStore, workspaceFileImages } from "../stores/composer";
 import { useProjectionStore } from "../stores/projection";
 import {
@@ -21,10 +20,22 @@ import { api } from "./api";
 import { displayCommandResponseError, displayError, stripAnsi } from "./format";
 import { tt } from "./i18n";
 import { runtimeIsBusy } from "./runtime-state";
+import {
+	createSessionBrowserIdentity,
+	createWorkspaceBrowserIdentity,
+	getSessionBrowserEffects,
+	type SessionBrowserIdentity,
+	type WorkspaceBrowserIdentity,
+} from "./session-browser-effects";
 import { isSessionControlReady, sessionDeleteCapability } from "./session-capabilities";
-import { sendControlCommand } from "./session-command";
+import { sendControlCommand, sendControlCommandWithIdentity } from "./session-command";
 
-export { sendControlCommand, sendControlExtensionUiResponse, sendReadCommand } from "./session-command";
+export {
+	sendControlCommand,
+	sendControlCommandWithIdentity,
+	sendControlExtensionUiResponse,
+	sendReadCommand,
+} from "./session-command";
 
 function currentWorkspaceHandle(): string {
 	const handle = useSessionDirectoryStore.getState().currentWorkspaceHandle;
@@ -40,6 +51,94 @@ function currentSession(): NativeSessionDto {
 
 function currentSessionHandle(): string {
 	return currentSession().sessionHandle;
+}
+
+let browserEffectSequence = 0;
+
+function nextBrowserEffectKey(prefix: string): string {
+	browserEffectSequence += 1;
+	return `${prefix}:${String(browserEffectSequence)}`;
+}
+
+export function captureSessionBrowserIdentity(sessionHandle: string): SessionBrowserIdentity | null {
+	const runtime = sessionTransport.store.getState().sessions[sessionHandle]?.runtime;
+	return runtime ? createSessionBrowserIdentity(runtime) : null;
+}
+
+function captureWorkspaceBrowserIdentity(
+	workspaceHandle: string | null | undefined,
+): WorkspaceBrowserIdentity | null {
+	if (!workspaceHandle) return null;
+	const identity = createWorkspaceBrowserIdentity({ workspaceId: workspaceHandle });
+	getSessionBrowserEffects().setCurrentWorkspaceIdentity(identity);
+	return identity;
+}
+
+function dispatchSessionToast(
+	identity: SessionBrowserIdentity,
+	level: "info" | "success" | "warning" | "error",
+	message: string,
+	key: string,
+	description?: string,
+): boolean {
+	return getSessionBrowserEffects().dispatch({
+		type: "toast",
+		identity,
+		dedupeKey: key,
+		level,
+		message,
+		...(description ? { description } : {}),
+	});
+}
+
+/** Interactive Session feedback also requires the initiating Session to remain visible. */
+export function dispatchCurrentSessionBrowserToast(
+	identity: SessionBrowserIdentity | null,
+	level: "info" | "success" | "warning" | "error",
+	message: string,
+	keyPrefix: string,
+	description?: string,
+): boolean {
+	if (
+		!identity ||
+		useSessionDirectoryStore.getState().currentSession?.sessionHandle !== identity.sessionHandle
+	) {
+		return false;
+	}
+	return dispatchSessionToast(identity, level, message, nextBrowserEffectKey(keyPrefix), description);
+}
+
+function dispatchWorkspaceToast(
+	identity: WorkspaceBrowserIdentity,
+	level: "info" | "success" | "warning" | "error",
+	message: string,
+	key: string,
+	description?: string,
+): boolean {
+	const effects = getSessionBrowserEffects();
+	return effects.dispatch({
+		type: "toast",
+		workspaceIdentity: identity,
+		dedupeKey: key,
+		level,
+		message,
+		...(description ? { description } : {}),
+	});
+}
+
+function dispatchCapturedToast(
+	identity: SessionBrowserIdentity | null,
+	workspaceIdentity: WorkspaceBrowserIdentity | null,
+	level: "info" | "success" | "warning" | "error",
+	message: string,
+	key: string,
+	description?: string,
+): boolean {
+	return identity
+		? dispatchSessionToast(identity, level, message, key, description)
+		: workspaceIdentity
+			? dispatchWorkspaceToast(workspaceIdentity, level, message, key, description)
+			: false;
 }
 
 const initialSessionByWorkspace = new Map<string, Promise<void>>();
@@ -165,6 +264,7 @@ async function performSessionCreation(
 	workspaceHandle: string,
 	onCreationIntent: (token: number) => void,
 ): Promise<void> {
+	const workspaceIdentity = captureWorkspaceBrowserIdentity(workspaceHandle);
 	let creationToken: number | undefined;
 	try {
 		const directoryBeforeCreation = useSessionDirectoryStore.getState();
@@ -183,9 +283,14 @@ async function performSessionCreation(
 		) {
 			return;
 		}
-		toast.error(tt("session.newFailed"), {
-			description: displayError(error),
-		});
+		dispatchCapturedToast(
+			null,
+			workspaceIdentity,
+			"error",
+			tt("session.newFailed"),
+			nextBrowserEffectKey("session-new-failed"),
+			displayError(error),
+		);
 	}
 }
 
@@ -195,9 +300,14 @@ export function newSession(): Promise<void> {
 	try {
 		workspaceHandle = currentWorkspaceHandle();
 	} catch (error) {
-		toast.error(tt("session.newFailed"), {
-			description: displayError(error),
-		});
+		dispatchCapturedToast(
+			null,
+			captureWorkspaceBrowserIdentity(useSessionDirectoryStore.getState().currentWorkspaceHandle),
+			"error",
+			tt("session.newFailed"),
+			nextBrowserEffectKey("session-new-failed"),
+			displayError(error),
+		);
 		return Promise.resolve();
 	}
 	const existing = sessionCreationByWorkspace.get(workspaceHandle);
@@ -271,6 +381,8 @@ export function ensureInitialSession(): Promise<void> {
 }
 
 export async function deleteSession(session: NativeSessionDto): Promise<void> {
+	const sessionIdentity = captureSessionBrowserIdentity(session.sessionHandle);
+	const workspaceIdentity = captureWorkspaceBrowserIdentity(session.workspaceHandle);
 	try {
 		const transport = sessionTransport.store.getState();
 		const capability = sessionDeleteCapability(session, transport.sessions[session.sessionHandle]);
@@ -282,20 +394,33 @@ export async function deleteSession(session: NativeSessionDto): Promise<void> {
 			generation: channel.generation,
 			fencingToken: channel.fencingToken,
 		});
+		dispatchCapturedToast(
+			sessionIdentity,
+			workspaceIdentity,
+			"success",
+			tt("session.deleted"),
+			nextBrowserEffectKey("session-deleted"),
+		);
 		transport.releaseSession(session.sessionHandle);
 		transport.unsubscribeSession(session.sessionHandle);
 		const directory = useSessionDirectoryStore.getState();
 		directory.removeSession(session.workspaceHandle, session.sessionHandle);
 		void directory.loadWorkspaces();
-		toast.success(tt("session.deleted"));
 	} catch (error) {
-		toast.error(tt("session.deleteFailed"), {
-			description: displayError(error),
-		});
+		dispatchCapturedToast(
+			sessionIdentity,
+			workspaceIdentity,
+			"error",
+			tt("session.deleteFailed"),
+			nextBrowserEffectKey("session-delete-failed"),
+			displayError(error),
+		);
 	}
 }
 
 export async function renameSession(session: NativeSessionDto, name: string): Promise<void> {
+	const sessionIdentity = captureSessionBrowserIdentity(session.sessionHandle);
+	const workspaceIdentity = captureWorkspaceBrowserIdentity(session.workspaceHandle);
 	try {
 		if (useSessionDirectoryStore.getState().currentSession?.sessionHandle !== session.sessionHandle) {
 			throw new Error(tt("session.renameCurrentOnly"));
@@ -304,9 +429,14 @@ export async function renameSession(session: NativeSessionDto, name: string): Pr
 		await sendControlCommand(session.sessionHandle, { type: "set_session_name", name });
 		await useSessionDirectoryStore.getState().reloadSessions(session.workspaceHandle);
 	} catch (error) {
-		toast.error(tt("session.renameFailed"), {
-			description: displayError(error),
-		});
+		dispatchCapturedToast(
+			sessionIdentity,
+			workspaceIdentity,
+			"error",
+			tt("session.renameFailed"),
+			nextBrowserEffectKey("session-rename-failed"),
+			displayError(error),
+		);
 	}
 }
 
@@ -321,13 +451,23 @@ function isRunning(sessionHandle: string): boolean {
 
 /** Submit the active Session's draft with exact generation and fencing handled by the transport. */
 export async function submitDraft(kind: SubmitKind): Promise<void> {
+	const workspaceIdentity = captureWorkspaceBrowserIdentity(
+		useSessionDirectoryStore.getState().currentWorkspaceHandle,
+	);
 	let sessionHandle: string;
 	try {
 		sessionHandle = currentSessionHandle();
 	} catch {
-		toast.error(tt("session.needWorkspace"));
+		dispatchCapturedToast(
+			null,
+			workspaceIdentity,
+			"error",
+			tt("session.needWorkspace"),
+			nextBrowserEffectKey("session-need-workspace"),
+		);
 		return;
 	}
+	const sessionIdentity = captureSessionBrowserIdentity(sessionHandle);
 	const composer = useComposerStore.getState();
 	const initial = composer.bySession[sessionHandle];
 	let text: string;
@@ -338,7 +478,14 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 			initial?.fileReferences ?? [],
 		);
 	} catch (error) {
-		toast.error(tt("composer.fileReferenceBudgetExceeded"), { description: displayError(error) });
+		dispatchCapturedToast(
+			sessionIdentity,
+			workspaceIdentity,
+			"error",
+			tt("composer.fileReferenceBudgetExceeded"),
+			nextBrowserEffectKey("file-reference-budget"),
+			displayError(error),
+		);
 		return;
 	}
 	if (!text && (initial?.images.length ?? 0) === 0 && (initial?.fileReferences.length ?? 0) === 0) return;
@@ -358,7 +505,13 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 		allImages.some((image) => image.data.length > SESSION_IMAGE_MAX_BASE64_CHARS) ||
 		allImages.reduce((total, image) => total + image.data.length, 0) > SESSION_IMAGE_TOTAL_MAX_BASE64_CHARS
 	) {
-		toast.error(tt("composer.fileReferenceBudgetExceeded"));
+		dispatchCapturedToast(
+			sessionIdentity,
+			workspaceIdentity,
+			"error",
+			tt("composer.fileReferenceBudgetExceeded"),
+			nextBrowserEffectKey("file-reference-budget"),
+		);
 		composer.finishSubmitForSession(sessionHandle, submitted.activeSubmitId);
 		return;
 	}
@@ -376,7 +529,14 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 			response = await sendControlCommand(sessionHandle, { type: "prompt", message: text, images });
 		}
 		if (response.success === false) {
-			toast.error(tt("session.sendFailed"), { description: displayCommandResponseError(response) });
+			dispatchCapturedToast(
+				sessionIdentity,
+				workspaceIdentity,
+				"error",
+				tt("session.sendFailed"),
+				nextBrowserEffectKey("session-send-failed"),
+				displayCommandResponseError(response),
+			);
 		} else {
 			useComposerStore
 				.getState()
@@ -390,9 +550,14 @@ export async function submitDraft(kind: SubmitKind): Promise<void> {
 				);
 		}
 	} catch (error) {
-		toast.error(tt("session.sendFailed"), {
-			description: displayError(error),
-		});
+		dispatchCapturedToast(
+			sessionIdentity,
+			workspaceIdentity,
+			"error",
+			tt("session.sendFailed"),
+			nextBrowserEffectKey("session-send-failed"),
+			displayError(error),
+		);
 	} finally {
 		useComposerStore.getState().finishSubmitForSession(sessionHandle, submitted.activeSubmitId);
 		reconcileHiddenSessionLifecycle(sessionHandle);
@@ -419,35 +584,70 @@ export function isSoftIdempotentError(error: unknown): boolean {
 export async function abortCurrentRun(): Promise<void> {
 	const session = useSessionDirectoryStore.getState().currentSession;
 	if (!session) return;
+	const sessionIdentity = captureSessionBrowserIdentity(session.sessionHandle);
+	const workspaceIdentity = captureWorkspaceBrowserIdentity(session.workspaceHandle);
 	try {
 		const response = await sendControlCommand(session.sessionHandle, { type: "abort" });
 		if (response.success === false && !isSoftIdempotentError(response.error)) {
-			toast.error(tt("session.abortFailed"), {
-				description: stripAnsi(response.error),
-			});
+			dispatchCapturedToast(
+				sessionIdentity,
+				workspaceIdentity,
+				"error",
+				tt("session.abortFailed"),
+				nextBrowserEffectKey("session-abort-failed"),
+				stripAnsi(response.error),
+			);
 		}
 	} catch (error) {
 		if (!isSoftIdempotentError(error)) {
-			toast.error(tt("session.abortFailed"), {
-				description: displayError(error),
-			});
+			dispatchCapturedToast(
+				sessionIdentity,
+				workspaceIdentity,
+				"error",
+				tt("session.abortFailed"),
+				nextBrowserEffectKey("session-abort-failed"),
+				displayError(error),
+			);
 		}
 	}
 }
 
-export async function forkFromEntry(entryId: string, sessionHandle: string): Promise<void> {
+export async function forkFromEntry(
+	entryId: string,
+	sessionHandle: string,
+	parentIdentity: SessionBrowserIdentity | null = captureSessionBrowserIdentity(sessionHandle),
+): Promise<boolean> {
 	try {
-		const response = await sendControlCommand(sessionHandle, { type: "fork", entryId });
-		const data = expectCommandData(response, "fork");
+		const completion = await sendControlCommandWithIdentity(sessionHandle, { type: "fork", entryId });
+		const data = expectCommandData(completion.response, "fork");
+		const childIdentity = createSessionBrowserIdentity(completion.identity);
 		if (data.cancelled) {
-			toast.info(tt("session.forkCancelled"));
-			return;
+			dispatchSessionToast(
+				childIdentity,
+				"info",
+				tt("session.forkCancelled"),
+				nextBrowserEffectKey("session-fork-cancelled"),
+			);
+			return false;
 		}
-		toast.success(tt("session.forked"));
+		dispatchSessionToast(
+			childIdentity,
+			"success",
+			tt("session.forked"),
+			nextBrowserEffectKey("session-forked"),
+		);
+		return true;
 	} catch (error) {
-		toast.error(tt("session.forkFailed"), {
-			description: displayError(error),
-		});
+		if (parentIdentity) {
+			dispatchCurrentSessionBrowserToast(
+				parentIdentity,
+				"error",
+				tt("session.forkFailed"),
+				nextBrowserEffectKey("session-fork-failed"),
+				displayError(error),
+			);
+		}
+		return false;
 	}
 }
 

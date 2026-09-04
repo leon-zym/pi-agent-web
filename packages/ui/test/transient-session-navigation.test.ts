@@ -1,6 +1,11 @@
 import type { NativeSessionDto, SessionRuntimeDto } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api } from "../src/lib/api";
+import {
+	createRecordingSessionBrowserEffects,
+	getSessionBrowserEffects,
+	setSessionBrowserEffects,
+} from "../src/lib/session-browser-effects";
 import { newSession } from "../src/lib/session-controller";
 import { useComposerStore } from "../src/stores/composer";
 import { useExtensionUiStore } from "../src/stores/extension-ui";
@@ -13,6 +18,8 @@ const originalDirectory = useSessionDirectoryStore.getState();
 const originalExtension = useExtensionUiStore.getState();
 const originalProjection = useProjectionStore.getState();
 const originalTransport = sessionTransport.store.getState();
+const originalBrowserEffects = getSessionBrowserEffects();
+let effectsForTest: ReturnType<typeof createRecordingSessionBrowserEffects> | null = null;
 
 function runtime(sessionHandle: string, recoverable = false): SessionRuntimeDto {
 	return {
@@ -66,7 +73,21 @@ function controlledTransient(sessionHandle: string) {
 	};
 }
 
+function backgroundSessionChannel(sessionHandle: string) {
+	const runtimeValue = runtime(sessionHandle, true);
+	return {
+		...controlledTransient(sessionHandle),
+		runtime: runtimeValue,
+		freshLeaseBaseline: runtimeValue,
+		controllerIntent: false,
+		lease: { isController: false, controlState: "free" as const },
+	};
+}
+
 afterEach(() => {
+	effectsForTest?.dispose();
+	effectsForTest = null;
+	setSessionBrowserEffects(originalBrowserEffects);
 	vi.useRealTimers();
 	vi.restoreAllMocks();
 	useComposerStore.setState(originalComposer, true);
@@ -77,6 +98,81 @@ afterEach(() => {
 });
 
 describe("transient Session navigation", () => {
+	it("routes visible Session title through the identity-fenced effect sink", () => {
+		effectsForTest = createRecordingSessionBrowserEffects();
+		setSessionBrowserEffects(effectsForTest);
+		const visible = session("session-title", true);
+		useSessionDirectoryStore.setState({
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: null,
+			sessionsByWorkspace: { "workspace-a": [visible] },
+			selectedSessionByWorkspace: {},
+		});
+
+		useSessionDirectoryStore.getState().selectSession(visible);
+
+		expect(effectsForTest.intents.filter((effect) => effect.type === "title")).toEqual([
+			expect.objectContaining({
+				title: "Pi Agent Web",
+				identity: expect.objectContaining({ sessionHandle: visible.sessionHandle }),
+			}),
+		]);
+	});
+
+	it("re-emits the title when a visible Session transition returns to an earlier Session", () => {
+		effectsForTest = createRecordingSessionBrowserEffects();
+		setSessionBrowserEffects(effectsForTest);
+		const sessionA = session("session-a", true);
+		const sessionB = session("session-b", true);
+		useExtensionUiStore
+			.getState()
+			.applyRequestForSession(
+				sessionA.sessionHandle,
+				{ type: "extension_ui_request", id: "title-a", method: "setTitle", title: "A" },
+				4,
+			);
+		useExtensionUiStore
+			.getState()
+			.applyRequestForSession(
+				sessionB.sessionHandle,
+				{ type: "extension_ui_request", id: "title-b", method: "setTitle", title: "B" },
+				4,
+			);
+		sessionTransport.store.setState({
+			sessions: {
+				[sessionA.sessionHandle]: backgroundSessionChannel(sessionA.sessionHandle),
+				[sessionB.sessionHandle]: backgroundSessionChannel(sessionB.sessionHandle),
+			},
+			hotRuntimeInventory: {
+				type: "hot_runtime_inventory",
+				serverEpoch: "test-server-epoch",
+				revision: 1,
+				runtimes: [sessionA, sessionB].map((candidate) => ({
+					serverEpoch: "test-server-epoch",
+					sessionHandle: candidate.sessionHandle,
+					workspaceId: "workspace-a",
+					generation: 4,
+					state: "idle" as const,
+				})),
+			},
+		});
+		useSessionDirectoryStore.setState({
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: null,
+			sessionsByWorkspace: { "workspace-a": [sessionA, sessionB] },
+			selectedSessionByWorkspace: {},
+		});
+
+		useSessionDirectoryStore.getState().selectSession(sessionA);
+		useSessionDirectoryStore.getState().selectSession(sessionB);
+		useSessionDirectoryStore.getState().selectSession(sessionA);
+		useSessionDirectoryStore.getState().selectSession(sessionA);
+
+		expect(
+			effectsForTest.intents.filter((effect) => effect.type === "title").map((effect) => effect.title),
+		).toEqual(["A · Pi Agent Web", "B · Pi Agent Web", "A · Pi Agent Web"]);
+	});
+
 	it("keeps a newly created unpersisted Session active without publishing an Empty session directory row", () => {
 		const created = session("session-transient", false);
 		sessionTransport.store.setState({
@@ -178,6 +274,8 @@ describe("transient Session navigation", () => {
 	});
 
 	it("keeps a persisted Fork parent while publishing the child only after native metadata lands", async () => {
+		effectsForTest = createRecordingSessionBrowserEffects();
+		setSessionBrowserEffects(effectsForTest);
 		const parent = session("session-parent", true);
 		const childRuntime = runtime("session-child", false);
 		const materializedChild = {
@@ -205,6 +303,12 @@ describe("transient Session navigation", () => {
 			sessionHandle: childRuntime.sessionHandle,
 			persisted: false,
 		});
+		expect(effectsForTest.intents.filter((effect) => effect.type === "title")).toEqual([
+			expect.objectContaining({
+				identity: expect.objectContaining({ sessionHandle: childRuntime.sessionHandle }),
+				title: "Pi Agent Web",
+			}),
+		]);
 		expect(useSessionDirectoryStore.getState().sessionsByWorkspace["workspace-a"]).toEqual([parent]);
 
 		useSessionDirectoryStore.getState().applyRuntime(runtime("session-child", true));
@@ -545,6 +649,46 @@ describe("transient Session navigation", () => {
 		expect(unsubscribeSession).toHaveBeenCalledWith(transient.sessionHandle);
 		expect(useSessionDirectoryStore.getState().retainedTransientByWorkspace["workspace-a"]).toBeUndefined();
 		expect(useSessionDirectoryStore.getState().currentWorkspaceHandle).toBeNull();
+	});
+
+	it("invalidates Workspace browser effects and cancels delayed work after removal", async () => {
+		effectsForTest = createRecordingSessionBrowserEffects();
+		setSessionBrowserEffects(effectsForTest);
+		const workspaceIdentity = { workspaceId: "workspace-a" };
+		effectsForTest.setCurrentWorkspaceIdentity(workspaceIdentity);
+		effectsForTest.dispatch({
+			type: "directory_refresh",
+			workspaceIdentity,
+			workspaceHandle: workspaceIdentity.workspaceId,
+			dedupeKey: "directory-refresh",
+			delayMs: 100,
+		});
+		vi.spyOn(api, "removeWorkspace").mockResolvedValue({ ok: true, nativeHistoryRetained: true });
+		vi.spyOn(api, "listWorkspaces").mockResolvedValue([]);
+		useSessionDirectoryStore.setState({
+			workspaces: [
+				{
+					workspaceHandle: workspaceIdentity.workspaceId,
+					path: "/tmp/workspace-a",
+					available: true,
+					pinned: false,
+					displayName: "workspace-a",
+					lastOpenedAt: null,
+					sessionCount: 0,
+					hasNativeHistory: false,
+				},
+			],
+			currentWorkspaceHandle: workspaceIdentity.workspaceId,
+			currentSession: null,
+			sessionsByWorkspace: { [workspaceIdentity.workspaceId]: [] },
+			selectedSessionByWorkspace: {},
+		});
+
+		await useSessionDirectoryStore.getState().removeWorkspace(workspaceIdentity.workspaceId);
+
+		expect(effectsForTest.currentWorkspaceIdentity(workspaceIdentity.workspaceId)).toBeNull();
+		expect(effectsForTest.journalSize()).toBe(0);
+		expect(effectsForTest.pendingTimerCount()).toBe(0);
 	});
 
 	it("abandons every local hot transient while only releasing recovered hot Runtimes", async () => {

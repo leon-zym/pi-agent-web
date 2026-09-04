@@ -12,7 +12,7 @@ import {
 	type SessionRuntimeDto,
 	type SessionRuntimeIdentityDto,
 } from "@pi-agent-web/protocol";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
 	createSessionCommandMachine,
 	type SessionCommandMachineResolvedResponse,
@@ -387,6 +387,65 @@ describe("Session command machine", () => {
 		expect(atBarrier.intents).toHaveLength(2);
 		expect(atBarrier.intents[1]).toMatchObject({ type: "resolve", id, token: pending.token });
 		expect(machine.getPending(id)).toBeUndefined();
+	});
+
+	it("preserves the authoritative child identity for an identity-transition completion", () => {
+		const machine = createSessionCommandMachine();
+		const child = { ...identity, sessionHandle: "session-child", generation: identity.generation + 1 };
+		const resolveWithIdentity = vi.fn();
+		const request = machine.transition(
+			requestEvent(identity, {
+				command: { type: "fork", entryId: "entry-1" },
+				isController: true,
+				fencingToken: "fence-a",
+				resolveWithIdentity,
+			}),
+		);
+		const pending = Object.values(machine.getState().pending)[0];
+		if (!pending) throw new Error("fork request did not create a pending command");
+		const send = request.intents.find((intent) => intent.type === "send");
+		if (send?.type !== "send") throw new Error("fork request was not sent");
+
+		machine.transition({
+			type: "wire_response",
+			message: {
+				...responseFrame(child, send.id, 0, "fork"),
+				previousSessionHandle: identity.sessionHandle,
+			},
+			history: false,
+		});
+		machine.transition({
+			type: "response_materialized",
+			id: send.id,
+			token: pending.token,
+			response: {
+				type: "response",
+				serverEpoch: child.serverEpoch,
+				sessionHandle: child.sessionHandle,
+				generation: child.generation,
+				barrierSeq: 0,
+				previousSessionHandle: identity.sessionHandle,
+				response: commandResponse(send.id, "fork"),
+			},
+		});
+
+		const settled = machine.transition({
+			type: "projection_advanced",
+			sessionHandle: child.sessionHandle,
+			currentIdentity: child,
+			baselineAuthoritative: true,
+			projectedSeq: 0,
+		});
+		const resolve = settled.intents.find((intent) => intent.type === "resolve");
+		expect(resolve).toMatchObject({
+			type: "resolve",
+			completion: {
+				workspaceId: child.workspaceId,
+				sessionHandle: child.sessionHandle,
+				generation: child.generation,
+				previousSessionHandle: identity.sessionHandle,
+			},
+		});
 	});
 
 	it("rejects at timeout, ignores late responses, and fences stale mutation responses", () => {

@@ -1276,6 +1276,47 @@ describe("session transport Gateway negotiation", () => {
 		]);
 	});
 
+	it("rejects direct adapter frames from an old epoch and all frames after disposal", () => {
+		vi.useFakeTimers();
+		const h = harness({ reconnectBaseMs: 5 });
+		const firstSocket = connect(h);
+		subscribeAndPrime(h, "session-a", 1, 0);
+		firstSocket.serverClose();
+		vi.advanceTimersByTime(5);
+		const secondSocket = h.sockets[1];
+		if (!secondSocket) throw new Error("transport did not reconnect");
+		secondSocket.open(false);
+		secondSocket.serverMessage(serverHello({ serverEpoch: "next-server-epoch" }));
+		secondSocket.serverMessage(hotInventory({ serverEpoch: "next-server-epoch", revision: 1 }));
+
+		const beforeOldEpoch = h.controller.store.getState().sessions["session-a"]?.runtime;
+		h.controller.ingestServerMessage({
+			type: "runtime_state",
+			runtime: { ...runtime("session-a", 99, 99), serverEpoch: "test-server-epoch" },
+		});
+		expect(h.controller.store.getState().sessions["session-a"]?.runtime).toEqual(beforeOldEpoch);
+
+		const disposed = harness();
+		connect(disposed);
+		disposed.controller.dispose();
+		const afterDispose = disposed.controller.store.getState().hotRuntimeInventory;
+		disposed.controller.ingestServerMessage(
+			hotInventory({
+				revision: 1,
+				runtimes: [
+					{
+						serverEpoch: "test-server-epoch",
+						sessionHandle: "late-session",
+						workspaceId: "workspace-a",
+						generation: 1,
+						state: "idle",
+					},
+				],
+			}),
+		);
+		expect(disposed.controller.store.getState().hotRuntimeInventory).toEqual(afterDispose);
+	});
+
 	it("keeps one exact request in flight and retries the newest same-handle identity", () => {
 		const h = harness();
 		const socket = connect(h);
@@ -3637,7 +3678,7 @@ describe("session transport replay and recovery", () => {
 		socket.serverMessage(eventFrame("session-a", 1, 1));
 		await flushPromises();
 		expect(h.controller.store.getState().sessions["session-a"]?.rawEvents).toHaveLength(1);
-		const next = { ...runtime("session-a", 2, 0), serverEpoch: "new-epoch" };
+		const next = runtime("session-a", 2, 0);
 		h.controller.ingestServerMessage({ type: "runtime_state", runtime: next });
 
 		expect(h.controller.store.getState().sessions["session-a"]).toMatchObject({

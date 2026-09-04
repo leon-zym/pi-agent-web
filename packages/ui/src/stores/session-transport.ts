@@ -48,6 +48,7 @@ import {
 } from "@pi-agent-web/protocol";
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
+import { getSessionBrowserEffects } from "../lib/session-browser-effects";
 import {
 	createSessionContentAdapter,
 	type ProjectedExtensionUiSnapshot,
@@ -63,6 +64,7 @@ import { SessionHistoryStreamAssembler } from "../lib/session-history-stream";
 import type { SessionResyncAttemptContext, SessionResyncCompletion } from "../lib/session-resync";
 import {
 	createSessionCommandMachine,
+	type SessionCommandMachineCompletion,
 	type SessionCommandMachineError,
 	type SessionCommandMachineEvent,
 	type SessionCommandMachineIntent,
@@ -113,6 +115,7 @@ import {
 	type HotRuntimeInventoryToken,
 	hasFreshLeaseBaseline,
 	type SessionChannelState,
+	type SessionCommandCompletion,
 	type SessionContentAdapterFactory,
 	type SessionContentAdapterInstallation,
 	type SessionHistoryState,
@@ -141,6 +144,7 @@ export {
 	type HotRuntimeInventoryToken,
 	hasFreshLeaseBaseline,
 	type SessionChannelState,
+	type SessionCommandCompletion,
 	type SessionContentAdapterFactory,
 	type SessionContentAdapterInstallation,
 	type SessionHistoryState,
@@ -318,6 +322,11 @@ function identityKey(identity: SessionRuntimeIdentityDto): string {
 	]);
 }
 
+function serverEpochForServerMessage(message: InlineSessionWsServerMessage): string | null {
+	if (message.type === "runtime_state") return message.runtime.serverEpoch;
+	return "serverEpoch" in message ? message.serverEpoch : null;
+}
+
 const identitiesMatch = extensionIdentityMatches;
 
 type LeaseStatusMessage = Extract<InlineSessionWsServerMessage, { type: "lease_status" }>;
@@ -404,6 +413,37 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	});
 	const controlMachine = createSessionControlMachine();
 
+	function browserEffects() {
+		return options.browserEffects ?? getSessionBrowserEffects();
+	}
+
+	function syncBrowserEffectIdentity(identity: SessionRuntimeIdentityDto): void {
+		const effects = browserEffects();
+		const current = effects.currentIdentity(identity.sessionHandle);
+		if (
+			current &&
+			current.serverEpoch === identity.serverEpoch &&
+			current.workspaceId === identity.workspaceId &&
+			identity.generation < current.generation
+		) {
+			return;
+		}
+		if (current && !identitiesMatch(current, identity)) effects.invalidateIdentity(current);
+		effects.setCurrentIdentity(identity);
+	}
+
+	function invalidateBrowserEffectIdentity(
+		identity: SessionRuntimeIdentityDto | null,
+		sessionHandle?: string,
+	): void {
+		const effects = browserEffects();
+		if (sessionHandle) {
+			const current = effects.currentIdentity(sessionHandle);
+			if (current && (!identity || identitiesMatch(current, identity))) effects.invalidateIdentity(current);
+		}
+		if (identity) effects.invalidateIdentity(identity);
+	}
+
 	const store = createStore<SessionTransportState>()(() => ({
 		connectionState: "idle",
 		hotRuntimeInventory: null,
@@ -419,6 +459,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		releaseSession,
 		takeoverSession,
 		sendCommand,
+		sendCommandWithIdentity,
 		sendExtensionUiResponse,
 		manualRetryResync,
 		retrySessionSubscription,
@@ -613,6 +654,17 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				return;
 			case "resolve":
 				intent.resolve(intent.response);
+				if (intent.resolveWithIdentity) {
+					const runtime = store.getState().sessions[intent.completion.sessionHandle]?.runtime;
+					const completion: SessionCommandMachineCompletion =
+						runtime &&
+						runtime.serverEpoch === intent.completion.serverEpoch &&
+						runtime.sessionHandle === intent.completion.sessionHandle &&
+						runtime.generation === intent.completion.generation
+							? { ...intent.completion, workspaceId: runtime.workspaceId }
+							: intent.completion;
+					intent.resolveWithIdentity(completion);
+				}
 				return;
 			case "reject":
 				intent.reject(
@@ -1139,6 +1191,12 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		abortAllLazyOperations();
 		abortAllHistoryOperations();
 		disposeInstalledContent();
+		for (const channel of Object.values(store.getState().sessions)) {
+			invalidateBrowserEffectIdentity(channel.runtime, channel.sessionHandle);
+		}
+		for (const runtime of recoveryMachine.getState().hotRuntimeByHandle.values()) {
+			invalidateBrowserEffectIdentity(runtime, runtime.sessionHandle);
+		}
 		clearHelloTimer();
 		negotiatedMaxClientFrameBytes = SESSION_WS_CLIENT_MAX_BYTES;
 		negotiatedMaxServerFrameBytes = SESSION_WS_SERVER_MAX_BYTES;
@@ -1341,6 +1399,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 
 	function unsubscribeSession(sessionHandle: string): void {
 		const channel = store.getState().sessions[sessionHandle];
+		invalidateBrowserEffectIdentity(channel?.runtime ?? null, sessionHandle);
 		if (!channel?.subscribed) {
 			transitionRetention({ type: "remove_subscription", sessionHandle });
 			clearProtectedSubscriptionOverage();
@@ -1373,6 +1432,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	function invalidateSessionSnapshot(sessionHandle: string): boolean {
 		const channel = store.getState().sessions[sessionHandle];
 		if (channel?.subscribed) return false;
+		invalidateBrowserEffectIdentity(channel?.runtime ?? null, sessionHandle);
 		abortProjection(sessionHandle);
 		abortLazyOperationsForSession(sessionHandle);
 		rejectHistoryForSession(
@@ -1482,13 +1542,13 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		return resyncCoordinator.manualRetry(sessionHandle);
 	}
 
-	function sendCommand(
+	function sendCommandWithIdentity(
 		sessionHandle: string,
 		command: SessionCommandDto,
 		timeoutMs = commandTimeoutMs(command.type),
-	): Promise<PiSessionCommandResponseDto> {
+	): Promise<SessionCommandCompletion> {
 		const channel = store.getState().sessions[sessionHandle];
-		return new Promise<PiSessionCommandResponseDto>((resolve, reject) => {
+		return new Promise<SessionCommandCompletion>((resolve, reject) => {
 			const transition = transitionCommand({
 				type: "request",
 				sessionHandle,
@@ -1504,7 +1564,21 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				freshLeaseBaseline: channel?.freshLeaseBaseline ?? null,
 				isController: channel?.lease.isController === true,
 				fencingToken: channel?.lease.fencingToken,
-				resolve,
+				resolve: () => {},
+				resolveWithIdentity: (completion: SessionCommandMachineCompletion) =>
+					resolve({
+						identity: {
+							serverEpoch: completion.serverEpoch,
+							workspaceId: completion.workspaceId,
+							sessionHandle: completion.sessionHandle,
+							generation: completion.generation,
+						},
+						barrierSeq: completion.barrierSeq,
+						response: completion.response,
+						...(completion.previousSessionHandle
+							? { previousSessionHandle: completion.previousSessionHandle }
+							: {}),
+					}),
 				reject,
 			});
 			if (!transition.accepted) {
@@ -1516,6 +1590,16 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				);
 			}
 		});
+	}
+
+	function sendCommand(
+		sessionHandle: string,
+		command: SessionCommandDto,
+		timeoutMs = commandTimeoutMs(command.type),
+	): Promise<PiSessionCommandResponseDto> {
+		return sendCommandWithIdentity(sessionHandle, command, timeoutMs).then(
+			(completion) => completion.response,
+		);
 	}
 
 	function sendExtensionUiResponse(sessionHandle: string, response: ExtensionUiResponseDto): boolean {
@@ -1716,6 +1800,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 
 		for (const [sessionHandle] of previous) {
 			if (next.has(sessionHandle)) continue;
+			invalidateBrowserEffectIdentity(previous.get(sessionHandle) ?? null, sessionHandle);
 			transitionRecovery({ type: "clear_connection_observation", sessionHandle });
 			cancelExactHotRecovery(sessionHandle);
 			unsubscribeSession(sessionHandle);
@@ -1723,7 +1808,10 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		if (initial) {
 			resyncCoordinator.reconnect();
 		}
-		for (const runtime of message.runtimes) queueHotRuntimeRecovery(runtime);
+		for (const runtime of message.runtimes) {
+			syncBrowserEffectIdentity(runtime);
+			queueHotRuntimeRecovery(runtime);
+		}
 
 		if (initial) {
 			for (const channel of Object.values(store.getState().sessions)) {
@@ -1739,6 +1827,18 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	}
 
 	function ingestServerMessage(message: InlineSessionWsServerMessage): void {
+		if (disposed) return;
+		// Direct adapters may be used before hello in deterministic tests; once hello
+		// establishes an epoch, every epoch-bearing message must match it.
+		const negotiatedServerEpoch = connectionMachine.getState().serverEpoch;
+		const messageServerEpoch = serverEpochForServerMessage(message);
+		if (
+			negotiatedServerEpoch !== null &&
+			messageServerEpoch !== null &&
+			messageServerEpoch !== negotiatedServerEpoch
+		) {
+			return;
+		}
 		switch (message.type) {
 			case "hot_runtime_inventory":
 				handleHotRuntimeInventory(message);
@@ -2265,6 +2365,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	): void {
 		const channel = store.getState().sessions[message.sessionHandle];
 		if (!channel?.subscribed || !channel.resync || !identitiesMatch(channel.runtime, message)) return;
+		syncBrowserEffectIdentity(message);
 		const key = identityKey(message);
 		const waiter = snapshotWaiters.get(key);
 		if (!waiter) return;
@@ -2923,6 +3024,10 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			recordSubscriptionRejection(message.sessionHandle, message.error, message.code, message.retryable);
 			settleExactHotRecoveryError(message.sessionHandle);
 			frameBus.emit(message.sessionHandle, message, now());
+			invalidateBrowserEffectIdentity(
+				store.getState().sessions[message.sessionHandle]?.runtime ?? null,
+				message.sessionHandle,
+			);
 			return;
 		}
 		const current = store.getState().sessions[message.sessionHandle];
@@ -2958,6 +3063,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			frameBus.emit(message.sessionHandle, message, now());
 			return;
 		}
+		let invalidateIdentityAfterDelivery = false;
 		if (message.operation === "subscribe") {
 			recordSubscriptionRejection(message.sessionHandle, message.error, message.code, message.retryable);
 			abortProjection(message.sessionHandle);
@@ -2968,6 +3074,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			);
 			transitionRecovery({ type: "clear_baseline_refresh", sessionHandle: message.sessionHandle });
 			const preserveSubscribed = current.resync !== null && current.runtime !== null;
+			invalidateIdentityAfterDelivery = !preserveSubscribed;
 			transitionControl({
 				type: "subscribe_error",
 				sessionHandle: message.sessionHandle,
@@ -3010,6 +3117,9 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			});
 		}
 		frameBus.emit(message.sessionHandle, message, now());
+		if (invalidateIdentityAfterDelivery) {
+			invalidateBrowserEffectIdentity(current.runtime, message.sessionHandle);
+		}
 	}
 
 	function handleInlineResponse(message: ResponseMessage): void {
@@ -3055,6 +3165,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			recoveryBeforeIdentityChange?.queuedExactHotRecoveries.has(sessionHandle),
 		);
 		if (identityChanged) {
+			invalidateBrowserEffectIdentity(current.runtime, sessionHandle);
 			transitionControl({ type: "runtime_reset", sessionHandle });
 			abortHistoryForSession(sessionHandle);
 			abortProjection(sessionHandle);
@@ -3075,6 +3186,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				new SessionTransportError("response_mismatch", "Session generation changed before response"),
 			);
 		}
+		syncBrowserEffectIdentity(message.runtime);
 		setChannel(sessionHandle, (channel) => ({
 			...channel,
 			runtime: message.runtime,
@@ -3489,6 +3601,10 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		) {
 			return;
 		}
+		if (!identitiesMatch(current.runtime, message.runtime)) {
+			invalidateBrowserEffectIdentity(current.runtime, message.sessionHandle);
+		}
+		syncBrowserEffectIdentity(message.runtime);
 		abortHistoryForSession(message.sessionHandle);
 		abortLazyOperationsForSession(message.sessionHandle);
 		transitionRecovery({
@@ -3700,6 +3816,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		const { message } = snapshotFrame;
 		const channel = store.getState().sessions[message.sessionHandle];
 		if (!channel?.subscribed || !channel.resync || !identitiesMatch(channel.runtime, message)) return;
+		syncBrowserEffectIdentity(message);
 		const key = identityKey(message);
 		const waiter = snapshotWaiters.get(key);
 		if (!waiter) return;
@@ -3890,6 +4007,8 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		const state = store.getState();
 		const previous = state.sessions[previousSessionHandle];
 		if (!previous?.subscribed) return;
+		invalidateBrowserEffectIdentity(previous.runtime, previousSessionHandle);
+		syncBrowserEffectIdentity(message.runtime);
 		abortProjection(previousSessionHandle);
 		abortHistoryForSession(previousSessionHandle);
 		abortLazyOperationsForSession(previousSessionHandle);
@@ -4036,6 +4155,12 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 
 	function dispose(): void {
 		if (disposed) return;
+		for (const channel of Object.values(store.getState().sessions)) {
+			invalidateBrowserEffectIdentity(channel.runtime, channel.sessionHandle);
+		}
+		for (const runtime of recoveryMachine.getState().hotRuntimeByHandle.values()) {
+			invalidateBrowserEffectIdentity(runtime, runtime.sessionHandle);
+		}
 		abortAllProjections();
 		abortAllLazyOperations();
 		disconnect();

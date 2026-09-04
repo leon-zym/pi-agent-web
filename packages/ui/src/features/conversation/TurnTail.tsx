@@ -1,11 +1,15 @@
 import { expectCommandData } from "@pi-agent-web/protocol";
 import { Check, CircleAlert, Copy, GitFork, OctagonX } from "lucide-react";
 import { useState } from "react";
-import { toast } from "sonner";
 import { displayError, formatCost, formatDuration, formatTokens, stripAnsi } from "../../lib/format";
 import { tt } from "../../lib/i18n";
 import { isSessionControlReady } from "../../lib/session-capabilities";
-import { forkFromEntry, sendReadCommand } from "../../lib/session-controller";
+import {
+	captureSessionBrowserIdentity,
+	dispatchCurrentSessionBrowserToast,
+	forkFromEntry,
+	sendReadCommand,
+} from "../../lib/session-controller";
 import { useSessionTransportStore } from "../../stores/session-transport";
 import type { ProductTurn } from "../../types/view-models";
 
@@ -14,6 +18,33 @@ import type { ProductTurn } from "../../types/view-models";
  * aborted markers live here, not on every assistant fragment. Fork acts on
  * the newest forkable user message of the session (get_fork_messages).
  */
+export async function forkLastTurn(sessionHandle: string): Promise<void> {
+	const initiatingIdentity = captureSessionBrowserIdentity(sessionHandle);
+	try {
+		const response = await sendReadCommand(sessionHandle, { type: "get_fork_messages" });
+		const { messages } = expectCommandData(response, "get_fork_messages");
+		const last = messages[messages.length - 1];
+		if (!last) {
+			dispatchCurrentSessionBrowserToast(
+				initiatingIdentity,
+				"info",
+				tt("tail.noForkMessages"),
+				"turn-tail-no-fork-messages",
+			);
+			return;
+		}
+		await forkFromEntry(last.entryId, sessionHandle, initiatingIdentity);
+	} catch (error) {
+		dispatchCurrentSessionBrowserToast(
+			initiatingIdentity,
+			"error",
+			tt("tail.forkFailed"),
+			"turn-tail-fork-failed",
+			displayError(error),
+		);
+	}
+}
+
 export function TurnTail({ turn, sessionHandle }: { turn: ProductTurn; sessionHandle: string | null }) {
 	const [copied, setCopied] = useState(false);
 	const canControl = useSessionTransportStore((state) => {
@@ -33,25 +64,6 @@ export function TurnTail({ turn, sessionHandle }: { turn: ProductTurn; sessionHa
 		await navigator.clipboard.writeText(text);
 		setCopied(true);
 		setTimeout(() => setCopied(false), 1500);
-	};
-
-	const forkLast = async () => {
-		if (!sessionHandle) return;
-		const targetSessionHandle = sessionHandle;
-		try {
-			const response = await sendReadCommand(targetSessionHandle, { type: "get_fork_messages" });
-			const { messages } = expectCommandData(response, "get_fork_messages");
-			const last = messages[messages.length - 1];
-			if (!last) {
-				toast.info(tt("tail.noForkMessages"));
-				return;
-			}
-			await forkFromEntry(last.entryId, targetSessionHandle);
-		} catch (error) {
-			toast.error(tt("tail.forkFailed"), {
-				description: displayError(error),
-			});
-		}
 	};
 
 	const totalTokens = turn.usage?.totalTokens ?? sumStepTokens(turn);
@@ -94,7 +106,9 @@ export function TurnTail({ turn, sessionHandle }: { turn: ProductTurn; sessionHa
 			<button
 				type="button"
 				className="inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-ink-3 transition-colors hover:bg-hover hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40 [@media(hover:none)]:min-h-10 [@media(hover:none)]:px-2"
-				onClick={() => void forkLast()}
+				onClick={() => {
+					if (sessionHandle) void forkLastTurn(sessionHandle);
+				}}
 				disabled={!canControl}
 			>
 				<GitFork className="size-3" />

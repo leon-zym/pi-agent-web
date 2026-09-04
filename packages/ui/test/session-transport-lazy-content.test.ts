@@ -256,6 +256,7 @@ function isAnswer(value: unknown): value is { answer: string } {
 }
 
 afterEach(() => {
+	vi.useRealTimers();
 	for (const controller of controllers.splice(0)) controller.dispose();
 });
 
@@ -362,6 +363,7 @@ describe("Session transport lazy projected content facade", () => {
 	it.each(["disconnect", "rekey", "generation", "epoch", "dispose"] as const)(
 		"aborts a lazy operation on %s and ignores its late settlement without resync",
 		async (transition) => {
+			if (transition === "epoch") vi.useFakeTimers();
 			let signal: AbortSignal | undefined;
 			let release!: () => void;
 			const gate = new Promise<string>((resolve) => {
@@ -397,10 +399,9 @@ describe("Session transport lazy projected content facade", () => {
 					runtime: runtimeFor(identity(value.sessionHandle, 2)),
 				});
 			} else if (transition === "epoch") {
-				h.controller.ingestServerMessage({
-					type: "runtime_state",
-					runtime: runtimeFor(identity(value.sessionHandle, 1, "new-lazy-content-epoch")),
-				});
+				socket.serverClose();
+				vi.advanceTimersByTime(0);
+				h.sockets.at(-1)?.open("new-lazy-content-epoch");
 			} else {
 				h.controller.dispose();
 			}

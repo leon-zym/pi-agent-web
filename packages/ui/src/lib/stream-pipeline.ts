@@ -3,8 +3,8 @@ import type {
 	PiSessionEventDto,
 	ProductSessionEventDto,
 	SessionRuntimeDto,
+	SessionRuntimeIdentityDto,
 } from "@pi-agent-web/protocol";
-import { toast } from "sonner";
 import { migrateComposerHistory } from "../features/composer/use-composer-history";
 import { useComposerStore } from "../stores/composer";
 import { useExtensionUiStore } from "../stores/extension-ui";
@@ -16,18 +16,24 @@ import type { SessionFrameBusMessage, SessionFrameRepresentation } from "../stor
 import { useSessionStatsStore } from "../stores/session-stats";
 import { hasFreshLeaseBaseline, SESSION_FRAME_DEFERRED, sessionTransport } from "../stores/session-transport";
 import { useSlashCommandsStore } from "../stores/slash-commands";
-import { playAttentionChime, playCompletionChime } from "./audio-feedback";
 import { displayLabel, stripAnsi } from "./format";
 import { tt } from "./i18n";
 import { runtimeIsBusy, runtimeIsSettled, runtimePhase } from "./runtime-state";
+import {
+	createSessionBrowserIdentity,
+	createWorkspaceBrowserIdentity,
+	getSessionBrowserEffects,
+	type SessionBrowserEffects,
+	type SessionBrowserIdentity,
+	setSessionBrowserEffects,
+} from "./session-browser-effects";
 import { isSoftIdempotentError } from "./session-controller";
 import { type CoalescibleMessageUpdate, SessionEventScheduler } from "./session-event-scheduler";
-import { updateTabBadge } from "./tab-badge";
+import type { TabStatus } from "./tab-badge";
 
 type ProjectionSessionEvent = PiSessionEventDto | ProductSessionEventDto;
 
 let initialized = false;
-const directoryReloadTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const activeMessageIdentities = new Map<string, { generation: number; identity: string }>();
 const publicationMode =
 	import.meta.env.VITE_PI_WEB_BENCHMARK_BUILD === "1" &&
@@ -63,7 +69,8 @@ const projectionEventScheduler = new SessionEventScheduler({
  * Selection is only a display pointer; background Sessions never depend on it
  * for event ingestion.
  */
-export function initPipeline(): void {
+export function initPipeline(options: { effects?: SessionBrowserEffects } = {}): void {
+	if (options.effects) setSessionBrowserEffects(options.effects);
 	if (initialized) return;
 	initialized = true;
 
@@ -72,7 +79,7 @@ export function initPipeline(): void {
 		if (message.type === "hot_runtime_inventory") {
 			useSessionDirectoryStore.getState().applyHotRuntimeInventory(message);
 		} else if (message.type === "session_directory_changed") {
-			scheduleDirectoryReload(message.workspaceId);
+			scheduleWorkspaceDirectoryReload(message.workspaceId);
 		} else {
 			void refreshModelsAfterAuthChange();
 		}
@@ -81,6 +88,101 @@ export function initPipeline(): void {
 		document.addEventListener("visibilitychange", () => projectionEventScheduler.handleVisibilityChange());
 	}
 	sessionTransport.store.getState().connect();
+}
+
+function sameBrowserIdentity(left: SessionBrowserIdentity, right: SessionBrowserIdentity): boolean {
+	return (
+		left.serverEpoch === right.serverEpoch &&
+		left.workspaceId === right.workspaceId &&
+		left.sessionHandle === right.sessionHandle &&
+		left.generation === right.generation
+	);
+}
+
+function syncBrowserEffectIdentity(identity: SessionRuntimeIdentityDto): SessionBrowserIdentity {
+	const effects = getSessionBrowserEffects();
+	const next = createSessionBrowserIdentity(identity);
+	const current = effects.currentIdentity(next.sessionHandle);
+	if (
+		current &&
+		current.serverEpoch === next.serverEpoch &&
+		current.workspaceId === next.workspaceId &&
+		next.generation < current.generation
+	) {
+		return current;
+	}
+	if (current && !sameBrowserIdentity(current, next)) effects.invalidateIdentity(current);
+	effects.setCurrentIdentity(next);
+	return next;
+}
+
+function sessionBrowserIdentityForHandle(sessionHandle: string): SessionBrowserIdentity | null {
+	const runtime = sessionTransport.store.getState().sessions[sessionHandle]?.runtime;
+	return runtime ? createSessionBrowserIdentity(runtime) : null;
+}
+
+function dispatchSessionToast(
+	identity: SessionBrowserIdentity,
+	level: "info" | "success" | "warning" | "error",
+	message: string,
+	dedupeKey: string,
+	description?: string,
+): void {
+	getSessionBrowserEffects().dispatch({
+		type: "toast",
+		identity,
+		level,
+		message,
+		dedupeKey,
+		...(description ? { description } : {}),
+	});
+}
+
+function dispatchSessionAudio(
+	identity: SessionBrowserIdentity,
+	sound: "attention" | "completion",
+	dedupeKey: string,
+): void {
+	getSessionBrowserEffects().dispatch({ type: "audio", identity, sound, dedupeKey, dedupeMode: "event" });
+}
+
+function dispatchSessionTabBadge(identity: SessionBrowserIdentity, status: TabStatus, label: string): void {
+	getSessionBrowserEffects().dispatch({
+		type: "tab_badge",
+		identity,
+		status,
+		label,
+		dedupeKey: `tab-badge:${status}:${label}`,
+		dedupeMode: "latest",
+		dedupeGroup: "tab-badge",
+	});
+}
+
+function dispatchSessionDirectoryRefresh(identity: SessionBrowserIdentity, workspaceHandle: string): void {
+	getSessionBrowserEffects().dispatch({
+		type: "directory_refresh",
+		identity,
+		workspaceHandle,
+		force: true,
+		delayMs: 100,
+		dedupeKey: "directory-refresh",
+	});
+}
+
+function scheduleWorkspaceDirectoryReload(workspaceHandle: string): void {
+	const directory = useSessionDirectoryStore.getState();
+	if (!directory.workspaces.some((workspace) => workspace.workspaceHandle === workspaceHandle)) return;
+	const identity = createWorkspaceBrowserIdentity({ workspaceId: workspaceHandle });
+	const effects = getSessionBrowserEffects();
+	effects.setCurrentWorkspaceIdentity(identity);
+	effects.dispatch({
+		type: "directory_refresh",
+		workspaceIdentity: identity,
+		workspaceHandle,
+		force: true,
+		delayMs: 100,
+		dedupeKey: "directory-refresh",
+	});
 }
 
 function routeSessionFrame(
@@ -144,7 +246,7 @@ function routeSessionFrame(
 					...message.pendingExtensionRequests,
 					...message.stickyExtensionState,
 				]);
-			applyVisibleExtensionTitle(message.sessionHandle);
+			applyVisibleExtensionTitle(message.sessionHandle, message);
 			void refreshSessionMetadata(message.sessionHandle);
 			scheduleHiddenLifecycleAfterSnapshot(message.runtime);
 			return;
@@ -182,12 +284,16 @@ function routeRuntime(runtime: SessionRuntimeDto, reconcileHidden = true): void 
 	const phase = runtimePhase(runtime);
 	const settled = runtimeIsSettled(runtime);
 	const busy = runtimeIsBusy(runtime);
+	const browserIdentity = syncBrowserEffectIdentity(runtime);
 	const identity = activeMessageIdentities.get(runtime.sessionHandle);
 	if (identity && (identity.generation !== runtime.generation || settled)) {
 		activeMessageIdentities.delete(runtime.sessionHandle);
 	}
 	useSessionDirectoryStore.getState().applyRuntime(runtime);
 	useExtensionUiStore.getState().resetSessionForGeneration(runtime.sessionHandle, runtime.generation);
+	if (isCurrentSession(runtime.sessionHandle)) {
+		applyVisibleExtensionTitle(runtime.sessionHandle, browserIdentity);
+	}
 	if (phase === "crashed") {
 		useProjectionStore.getState().markRuntimeFailure(runtime.sessionHandle, stripAnsi(runtime.error ?? ""));
 	}
@@ -195,15 +301,21 @@ function routeRuntime(runtime: SessionRuntimeDto, reconcileHidden = true): void 
 		reconcileHiddenSessionLifecycle(runtime.sessionHandle);
 	}
 	if (phase === "crashed" && isCurrentSession(runtime.sessionHandle)) {
-		toast.error(tt("status.crashed"), { description: stripAnsi(runtime.error ?? "") });
+		dispatchSessionToast(
+			browserIdentity,
+			"error",
+			tt("status.crashed"),
+			"runtime-crashed",
+			stripAnsi(runtime.error ?? ""),
+		);
 	}
 	if (isCurrentSession(runtime.sessionHandle)) {
 		if (phase === "waiting_ui") {
-			updateTabBadge("waiting_ui", sessionLabel(runtime.sessionHandle));
+			dispatchSessionTabBadge(browserIdentity, "waiting_ui", sessionLabel(runtime.sessionHandle));
 		} else if (busy) {
-			updateTabBadge("running", sessionLabel(runtime.sessionHandle));
+			dispatchSessionTabBadge(browserIdentity, "running", sessionLabel(runtime.sessionHandle));
 		} else if (phase === "ready" || phase === "dormant") {
-			updateTabBadge("idle", sessionLabel(runtime.sessionHandle));
+			dispatchSessionTabBadge(browserIdentity, "idle", sessionLabel(runtime.sessionHandle));
 		}
 	}
 }
@@ -279,6 +391,7 @@ function routeEvent(
 	representation: SessionFrameRepresentation,
 ): void | typeof SESSION_FRAME_DEFERRED {
 	const { event, generation, seq, sessionHandle, workspaceId } = message;
+	const browserIdentity = createSessionBrowserIdentity(message);
 	const coalescible = coalescibleMessageUpdate(event);
 	if (coalescible) {
 		const enqueueResult = projectionEventScheduler.enqueue(
@@ -320,7 +433,7 @@ function routeEvent(
 			useModelDirectoryStore.getState().applyThinkingLevelForSession(sessionHandle, event.level);
 			return;
 		case "session_info_changed":
-			scheduleDirectoryReload(workspaceId);
+			dispatchSessionDirectoryRefresh(browserIdentity, workspaceId);
 			return;
 		case "message_update":
 			applyLiveUsage(sessionHandle, event);
@@ -328,10 +441,10 @@ function routeEvent(
 		case "agent_settled":
 			useSessionDirectoryStore.getState().markSessionUnread(sessionHandle);
 			void useSessionStatsStore.getState().refresh(sessionHandle);
-			scheduleDirectoryReload(workspaceId);
-			void playCompletionChime();
+			dispatchSessionDirectoryRefresh(browserIdentity, workspaceId);
+			dispatchSessionAudio(browserIdentity, "completion", `agent-settled:${String(seq)}`);
 			if (isCurrentSession(sessionHandle)) {
-				updateTabBadge("done", sessionLabel(sessionHandle));
+				dispatchSessionTabBadge(browserIdentity, "done", sessionLabel(sessionHandle));
 			}
 			break;
 		case "compaction_end":
@@ -339,9 +452,13 @@ function routeEvent(
 			break;
 		case "extension_error":
 			if (isCurrentSession(sessionHandle)) {
-				toast.error(tt("ext.error"), {
-					description: `${stripAnsi(event.event)}: ${stripAnsi(event.error)}`,
-				});
+				dispatchSessionToast(
+					browserIdentity,
+					"error",
+					tt("ext.error"),
+					`extension-error:${String(seq)}`,
+					`${stripAnsi(event.event)}: ${stripAnsi(event.error)}`,
+				);
 			}
 			return;
 		case "bash_execution_update":
@@ -395,41 +512,55 @@ function routeExtensionRequest(
 	message: Extract<InlineSessionWsServerMessage, { type: "extension_ui_request" }>,
 ): void {
 	const { request, sessionHandle, generation } = message;
+	const browserIdentity = createSessionBrowserIdentity(message);
 	if (request.method === "notify") {
 		const prefix = isCurrentSession(sessionHandle) ? "" : `${sessionLabel(sessionHandle)} · `;
 		const text = `${prefix}${stripAnsi(request.message)}`;
-		if (request.notifyType === "error") toast.error(text);
-		else if (request.notifyType === "warning") toast.warning(text);
-		else toast.info(text);
+		const level = request.notifyType ?? "info";
+		dispatchSessionToast(browserIdentity, level, text, `extension-notify:${request.id}`);
 		return;
 	}
 	useExtensionUiStore.getState().applyRequestForSession(sessionHandle, request, generation);
-	applyVisibleExtensionTitle(sessionHandle);
-	void playAttentionChime();
+	applyVisibleExtensionTitle(sessionHandle, browserIdentity);
+	dispatchSessionAudio(browserIdentity, "attention", `extension-attention:${request.id}`);
 	if (isCurrentSession(sessionHandle)) {
-		updateTabBadge("waiting_ui", sessionLabel(sessionHandle));
+		dispatchSessionTabBadge(browserIdentity, "waiting_ui", sessionLabel(sessionHandle));
 	}
 }
 
 function routeRekey(previousSessionHandle: string, runtime: SessionRuntimeDto): void {
+	const browserIdentity = syncBrowserEffectIdentity(runtime);
 	useComposerStore.getState().rekeySession(previousSessionHandle, runtime.sessionHandle);
 	migrateComposerHistory(runtime.workspaceId, previousSessionHandle, runtime.sessionHandle);
 	useSessionDirectoryStore.getState().rekeySession(previousSessionHandle, runtime.sessionHandle, runtime);
 	useExtensionUiStore.getState().resetSessionForGeneration(runtime.sessionHandle, runtime.generation);
-	scheduleDirectoryReload(runtime.workspaceId);
+	dispatchSessionDirectoryRefresh(browserIdentity, runtime.workspaceId);
 }
 
 function routeSessionError(message: Extract<InlineSessionWsServerMessage, { type: "session_error" }>): void {
 	useSessionControlStore.getState().recordSessionError(message);
 	if (!isCurrentSession(message.sessionHandle)) return;
+	const browserIdentity = sessionBrowserIdentityForHandle(message.sessionHandle);
+	if (!browserIdentity) return;
 	if (message.operation === "claim") {
-		toast.info(tt("lease.observer"), { description: stripAnsi(message.error) });
+		dispatchSessionToast(
+			browserIdentity,
+			"info",
+			tt("lease.observer"),
+			`session-error:claim:${message.code ?? message.error}`,
+			stripAnsi(message.error),
+		);
 		return;
 	}
 	if (isSoftIdempotentError(message.error)) {
 		return;
 	}
-	toast.error(stripAnsi(message.error));
+	dispatchSessionToast(
+		browserIdentity,
+		"error",
+		stripAnsi(message.error),
+		`session-error:${message.operation}:${message.code ?? message.error}`,
+	);
 }
 
 async function refreshSessionMetadata(sessionHandle: string): Promise<void> {
@@ -438,22 +569,6 @@ async function refreshSessionMetadata(sessionHandle: string): Promise<void> {
 		useModelDirectoryStore.getState().refresh(sessionHandle),
 		useSessionStatsStore.getState().refresh(sessionHandle),
 	]);
-}
-
-function scheduleDirectoryReload(workspaceHandle: string): void {
-	if (directoryReloadTimers.has(workspaceHandle)) return;
-	const timer = setTimeout(() => {
-		directoryReloadTimers.delete(workspaceHandle);
-		const directory = useSessionDirectoryStore.getState();
-		void directory.loadWorkspaces();
-		if (
-			directory.currentWorkspaceHandle === workspaceHandle ||
-			directory.sessionsByWorkspace[workspaceHandle]
-		) {
-			void directory.reloadSessions(workspaceHandle, { force: true });
-		}
-	}, 100);
-	directoryReloadTimers.set(workspaceHandle, timer);
 }
 
 async function refreshModelsAfterAuthChange(): Promise<void> {
@@ -482,8 +597,17 @@ function sessionLabel(sessionHandle: string): string {
 	return tt("header.unnamed");
 }
 
-function applyVisibleExtensionTitle(sessionHandle: string): void {
-	if (typeof document === "undefined" || !isCurrentSession(sessionHandle)) return;
+function applyVisibleExtensionTitle(sessionHandle: string, identity?: SessionBrowserIdentity): void {
+	if (!isCurrentSession(sessionHandle)) return;
+	const browserIdentity = identity ?? sessionBrowserIdentityForHandle(sessionHandle);
+	if (!browserIdentity) return;
 	const title = useExtensionUiStore.getState().bySession[sessionHandle]?.title;
-	document.title = title ? `${displayLabel(title)} · Pi Agent Web` : "Pi Agent Web";
+	getSessionBrowserEffects().dispatch({
+		type: "title",
+		identity: browserIdentity,
+		dedupeKey: `extension-title:${title ?? ""}`,
+		dedupeMode: "latest",
+		dedupeGroup: "session-title",
+		title: title ? `${displayLabel(title)} · Pi Agent Web` : "Pi Agent Web",
+	});
 }
