@@ -14,6 +14,7 @@ const CREDENTIAL_ENV_PATTERN =
 	/(api[_-]?key|token|secret|password|credential|openai|anthropic|gemini|deepseek)/i;
 // Product readiness is bounded at 10s and its detached Pi-group stop is bounded at 1.1s.
 const PRODUCT_BOUNDED_SHUTDOWN_WAIT_MS = 12_000;
+export const MAX_HARNESS_ROOT_ENTRIES = 8;
 
 export interface HarnessWorkspace {
 	workspaceHandle: string;
@@ -28,6 +29,22 @@ export interface HarnessSession {
 	persisted: boolean;
 	firstMessage: string;
 	messageCount: number;
+}
+
+export interface HarnessLifecycleSnapshot {
+	gatewayStarts: number;
+	activeGatewayCount: number;
+	activeGatewayPid: number | null;
+	rootExists: boolean;
+	rootEntryCount: number;
+}
+
+export function isBoundedHarnessLifecycle(snapshot: HarnessLifecycleSnapshot): boolean {
+	return (
+		snapshot.activeGatewayCount === 1 &&
+		snapshot.rootExists &&
+		snapshot.rootEntryCount <= MAX_HARNESS_ROOT_ENTRIES
+	);
 }
 
 export interface PiFixtureEvent {
@@ -54,7 +71,7 @@ export interface PiFixtureEvent {
 }
 
 export interface ProductionHarness {
-	origin: string;
+	readonly origin: string;
 	rootDir: string;
 	workspacePath: string;
 	workspace: HarnessWorkspace;
@@ -65,6 +82,8 @@ export interface ProductionHarness {
 	startPrompt: (text: string) => void;
 	triggerReplayGap: (text: string) => void;
 	requestJson: <T>(pathname: string, init?: RequestInit) => Promise<T>;
+	restart: () => Promise<void>;
+	lifecycle: () => HarnessLifecycleSnapshot;
 	stop: () => Promise<void>;
 }
 
@@ -181,6 +200,30 @@ export function benchmarkBuildPathsFromEnvironment(): BenchmarkBuildPaths {
 		staticDir: resolvedStaticDir,
 		uiTreeHash,
 	};
+}
+
+export function assertPreservedHarnessIdentity(
+	expectedWorkspace: HarnessWorkspace,
+	expectedSession: HarnessSession,
+	workspaces: HarnessWorkspace[],
+	sessions: HarnessSession[],
+): void {
+	const preservedWorkspace = workspaces.find(
+		(candidate) => candidate.workspaceHandle === expectedWorkspace.workspaceHandle,
+	);
+	if (!preservedWorkspace || preservedWorkspace.path !== expectedWorkspace.path) {
+		throw new Error("Gateway restart did not preserve the owned Workspace root");
+	}
+	const preservedSession = sessions.find(
+		(candidate) => candidate.sessionHandle === expectedSession.sessionHandle,
+	);
+	if (
+		!preservedSession ||
+		preservedSession.nativeSessionId !== expectedSession.nativeSessionId ||
+		preservedSession.sessionFile !== expectedSession.sessionFile
+	) {
+		throw new Error("Gateway restart did not preserve the owned Session identity");
+	}
 }
 
 function seedHistoricalSession(
@@ -397,74 +440,87 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 
 	let output = "";
 	let child: ChildProcessWithoutNullStreams | undefined;
+	let origin = "";
+	let cookie = "";
+	let gatewayStarts = 0;
 	try {
 		const benchmarkGateway = options.benchmarkGateway === true;
 		const benchmarkBuild = benchmarkGateway ? benchmarkBuildPathsFromEnvironment() : undefined;
-		child = (
-			benchmarkGateway
-				? spawn(
-						process.execPath,
-						[
-							benchmarkBuild!.serverEntry,
-							"--pi-path",
-							options.fakePiPath ?? defaultFakePiPath,
-							"--host",
-							"127.0.0.1",
-							"--port",
-							"0",
-							"--no-open",
-						],
-						{
-							cwd: repositoryRoot,
-							// The private IPC channel is only a parent-disconnect fence for benchmark-main.
-							stdio: ["pipe", "pipe", "pipe", "ipc"],
-							env: childEnvironment({
-								...options.extraEnv,
-								PI_CODING_AGENT_DIR: agentDir,
-								PI_CODING_AGENT_SESSION_DIR: sessionDir,
-								PI_WEB_DATA_DIR: webDataDir,
-								PI_WEB_E2E_MARKER: markerPath,
-								PI_WEB_E2E_CONTROL_DIR: controlDir,
-								PI_WEB_BENCHMARK_STATIC_DIR: benchmarkBuild!.staticDir,
-							}),
-						},
-					)
-				: spawn(
-						process.execPath,
-						[
-							cliPath,
-							"--pi-path",
-							options.fakePiPath ?? defaultFakePiPath,
-							"--host",
-							"127.0.0.1",
-							"--port",
-							"0",
-							"--no-open",
-						],
-						{
-							cwd: repositoryRoot,
-							stdio: ["pipe", "pipe", "pipe"],
-							env: childEnvironment({
-								...options.extraEnv,
-								PI_CODING_AGENT_DIR: agentDir,
-								PI_CODING_AGENT_SESSION_DIR: sessionDir,
-								PI_WEB_DATA_DIR: webDataDir,
-								PI_WEB_E2E_MARKER: markerPath,
-								PI_WEB_E2E_CONTROL_DIR: controlDir,
-							}),
-						},
-					)
-		) as ChildProcessWithoutNullStreams;
-		child.stdout.setEncoding("utf8");
-		child.stderr.setEncoding("utf8");
-		child.stdout.on("data", (chunk) => {
-			output += String(chunk);
-		});
-		child.stderr.on("data", (chunk) => {
-			output += String(chunk);
-		});
-		const origin = await waitForListening(child, () => output);
-		const cookie = await bootstrapGateway(origin, () => output);
+		const startGateway = async (): Promise<void> => {
+			let startupOutput = "";
+			const nextChild = (
+				benchmarkGateway
+					? spawn(
+							process.execPath,
+							[
+								benchmarkBuild!.serverEntry,
+								"--pi-path",
+								options.fakePiPath ?? defaultFakePiPath,
+								"--host",
+								"127.0.0.1",
+								"--port",
+								"0",
+								"--no-open",
+							],
+							{
+								cwd: repositoryRoot,
+								// The private IPC channel is only a parent-disconnect fence for benchmark-main.
+								stdio: ["pipe", "pipe", "pipe", "ipc"],
+								env: childEnvironment({
+									...options.extraEnv,
+									PI_CODING_AGENT_DIR: agentDir,
+									PI_CODING_AGENT_SESSION_DIR: sessionDir,
+									PI_WEB_DATA_DIR: webDataDir,
+									PI_WEB_E2E_MARKER: markerPath,
+									PI_WEB_E2E_CONTROL_DIR: controlDir,
+									PI_WEB_BENCHMARK_STATIC_DIR: benchmarkBuild!.staticDir,
+								}),
+							},
+						)
+					: spawn(
+							process.execPath,
+							[
+								cliPath,
+								"--pi-path",
+								options.fakePiPath ?? defaultFakePiPath,
+								"--host",
+								"127.0.0.1",
+								"--port",
+								"0",
+								"--no-open",
+							],
+							{
+								cwd: repositoryRoot,
+								stdio: ["pipe", "pipe", "pipe"],
+								env: childEnvironment({
+									...options.extraEnv,
+									PI_CODING_AGENT_DIR: agentDir,
+									PI_CODING_AGENT_SESSION_DIR: sessionDir,
+									PI_WEB_DATA_DIR: webDataDir,
+									PI_WEB_E2E_MARKER: markerPath,
+									PI_WEB_E2E_CONTROL_DIR: controlDir,
+								}),
+							},
+						)
+			) as ChildProcessWithoutNullStreams;
+			child = nextChild;
+			gatewayStarts += 1;
+			nextChild.stdout.setEncoding("utf8");
+			nextChild.stderr.setEncoding("utf8");
+			nextChild.stdout.on("data", (chunk) => {
+				const text = String(chunk);
+				output += text;
+				startupOutput += text;
+			});
+			nextChild.stderr.on("data", (chunk) => {
+				const text = String(chunk);
+				output += text;
+				startupOutput += text;
+			});
+			origin = await waitForListening(nextChild, () => startupOutput);
+			cookie = await bootstrapGateway(origin, () => startupOutput);
+		};
+		await startGateway();
 
 		const requestJson = async <T>(pathname: string, init: RequestInit = {}): Promise<T> => {
 			const headers = new Headers(init.headers);
@@ -513,8 +569,41 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 			if (!fs.existsSync(markerPath)) throw new Error("deterministic fake Pi was not started");
 		}
 
+		const restart = async (): Promise<void> => {
+			const previousChild = child;
+			if (!previousChild) throw new Error("production harness Gateway is not running");
+			await terminate(previousChild);
+			if (previousChild.exitCode === null && previousChild.signalCode === null) {
+				throw new Error("production harness Gateway did not terminate before restart");
+			}
+			child = undefined;
+			try {
+				await startGateway();
+			} catch (error) {
+				if (child) await terminate(child);
+				child = undefined;
+				throw error;
+			}
+			const workspaces = await requestJson<HarnessWorkspace[]>("/api/v1/workspaces");
+			const directory = await requestJson<{ sessions: HarnessSession[] }>(
+				`/api/v1/workspaces/${encodeURIComponent(workspace.workspaceHandle)}/sessions?refresh=1`,
+			);
+			assertPreservedHarnessIdentity(workspace, session, workspaces, directory.sessions);
+		};
+
+		const lifecycle = (): HarnessLifecycleSnapshot => ({
+			gatewayStarts,
+			activeGatewayCount: child && child.exitCode === null && child.signalCode === null ? 1 : 0,
+			activeGatewayPid:
+				child && child.exitCode === null && child.signalCode === null ? (child.pid ?? null) : null,
+			rootExists: fs.existsSync(rootDir),
+			rootEntryCount: fs.existsSync(rootDir) ? fs.readdirSync(rootDir).length : 0,
+		});
+
 		return {
-			origin,
+			get origin() {
+				return origin;
+			},
 			rootDir,
 			workspacePath,
 			workspace,
@@ -548,8 +637,11 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 				fs.writeFileSync(path.join(controlDir, `${encodeURIComponent(text)}.gap`), "gap\n", "utf8");
 			},
 			requestJson,
+			restart,
+			lifecycle,
 			stop: async () => {
-				await terminate(child!);
+				if (child) await terminate(child);
+				child = undefined;
 				fs.rmSync(rootDir, { recursive: true, force: true });
 			},
 		};

@@ -116,7 +116,7 @@ The representative matrix targets high-value risks:
 - concurrent Session publication and Browser fairness;
 - long streaming with structural flush boundaries;
 - large native history and incremental Browser loading;
-- replay, resync, crash recovery, and stale mutation rejection;
+- replay, resync, crash recovery, Session rekey, Gateway restart, and stale mutation rejection;
 - large typed content references near declared limits;
 - bounded projection, queue, and materialization behavior.
 

@@ -11,7 +11,10 @@ export type BenchmarkKind =
 	| "concurrency"
 	| "history"
 	| "recovery-disconnect"
+	| "recovery-gap"
 	| "recovery-crash"
+	| "recovery-rekey"
+	| "recovery-gateway-restart"
 	| "content-roundtrip";
 
 export interface BenchmarkScenario {

@@ -4,7 +4,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { benchmarkBuildPathsFromEnvironment } from "./production-harness";
+import {
+	assertPreservedHarnessIdentity,
+	benchmarkBuildPathsFromEnvironment,
+	type HarnessSession,
+	type HarnessWorkspace,
+	isBoundedHarnessLifecycle,
+	MAX_HARNESS_ROOT_ENTRIES,
+} from "./production-harness";
 
 const buildEnvironmentKeys = [
 	"PI_WEB_BENCHMARK_VARIANT_BUILD_DIR",
@@ -74,4 +81,53 @@ test("accepts only exact run-owned benchmark executables", () => {
 		}
 		fs.rmSync(root, { recursive: true, force: true });
 	}
+});
+
+test("keeps restart identity and lifecycle cleanup checks deterministic", () => {
+	const workspace: HarnessWorkspace = { workspaceHandle: "workspace-1", path: "/tmp/piweb/workspace" };
+	const session: HarnessSession = {
+		sessionHandle: "session-1",
+		workspaceHandle: workspace.workspaceHandle,
+		nativeSessionId: "native-1",
+		sessionFile: "/tmp/piweb/sessions/native-1.jsonl",
+		persisted: true,
+		firstMessage: "before",
+		messageCount: 2,
+	};
+	assert.doesNotThrow(() => assertPreservedHarnessIdentity(workspace, session, [workspace], [session]));
+	assert.throws(
+		() =>
+			assertPreservedHarnessIdentity(
+				workspace,
+				session,
+				[{ ...workspace, path: "/tmp/piweb/other-workspace" }],
+				[session],
+			),
+		/Workspace root/,
+	);
+	assert.throws(
+		() =>
+			assertPreservedHarnessIdentity(
+				workspace,
+				session,
+				[workspace],
+				[{ ...session, nativeSessionId: "native-other" }],
+			),
+		/Session identity/,
+	);
+
+	const healthy = {
+		gatewayStarts: 2,
+		activeGatewayCount: 1,
+		activeGatewayPid: 123,
+		rootExists: true,
+		rootEntryCount: MAX_HARNESS_ROOT_ENTRIES,
+	};
+	assert.equal(isBoundedHarnessLifecycle(healthy), true);
+	assert.equal(isBoundedHarnessLifecycle({ ...healthy, activeGatewayCount: 2 }), false);
+	assert.equal(
+		isBoundedHarnessLifecycle({ ...healthy, rootEntryCount: MAX_HARNESS_ROOT_ENTRIES + 1 }),
+		false,
+	);
+	assert.equal(isBoundedHarnessLifecycle({ ...healthy, rootExists: false }), false);
 });
