@@ -6,6 +6,7 @@ import {
 	addSummaryGate,
 	addValueGate,
 	correctnessFailureCount,
+	createTrialEvidence,
 	installBrowserBenchmarkObserver,
 	runBenchmarkScenario,
 	scenariosFor,
@@ -127,6 +128,7 @@ for (const scenario of scenariosFor("content-roundtrip")) {
 
 			for (let index = 0; index < trialCount; index += 1) {
 				await trials.run(index, async () => {
+					const errorStart = { console: errors.console.length, page: errors.page.length };
 					const heapBefore = await page.evaluate(
 						() =>
 							(performance as Performance & { memory?: { usedJSHeapSize: number } }).memory?.usedJSHeapSize ??
@@ -197,29 +199,44 @@ for (const scenario of scenariosFor("content-roundtrip")) {
 						.filter((event) => event.direction === "received")
 						.map((event) => event.raw)
 						.join("\n");
+					const maxSentFrameBytes = Math.max(0, ...sentBytes);
+					const maxReceivedFrameBytes = Math.max(0, ...receivedBytes);
+					const correctness = {
+						inputReachedPiAtExpectedSize:
+							harness
+								.piEvents()
+								.filter((event) => event.type === "prompt" && event.text === PROMPT)
+								.at(-1)?.imageChars === inputBase64Chars,
+						typedOutputRefsObserved: trialWire.filter((event) => hasAttachmentRef(event.frame)).length >= 2,
+						outputBlobResolved: await image.evaluate((element) => {
+							const target = element as HTMLImageElement;
+							return target.complete && target.naturalWidth > 0;
+						}),
+						largeOutputStayedOffWebSocket: !receivedRaw.includes("iVBORw0KGgo"),
+						socketRemainedUsable: sockets.length === 1 && closedSockets.length === 0,
+					};
 					return {
 						metrics: {
 							selectionMs: selectionFinished - selectionStarted,
 							roundTripMs: roundTripFinished - roundTripStarted,
 							inputBase64Chars,
-							maxSentFrameBytes: Math.max(0, ...sentBytes),
-							maxReceivedFrameBytes: Math.max(0, ...receivedBytes),
+							maxSentFrameBytes,
+							maxReceivedFrameBytes,
 							heapDeltaBytes: heapBefore === null || heapAfter === null ? null : heapAfter - heapBefore,
 						},
-						correctness: {
-							inputReachedPiAtExpectedSize:
-								harness
-									.piEvents()
-									.filter((event) => event.type === "prompt" && event.text === PROMPT)
-									.at(-1)?.imageChars === inputBase64Chars,
-							typedOutputRefsObserved: trialWire.filter((event) => hasAttachmentRef(event.frame)).length >= 2,
-							outputBlobResolved: await image.evaluate((element) => {
-								const target = element as HTMLImageElement;
-								return target.complete && target.naturalWidth > 0;
-							}),
-							largeOutputStayedOffWebSocket: !receivedRaw.includes("iVBORw0KGgo"),
-							socketRemainedUsable: sockets.length === 1 && closedSockets.length === 0,
-						},
+						correctness,
+						evidence: createTrialEvidence(
+							{
+								correctnessFailures: Object.values(correctness).filter((value) => !value).length,
+								authenticatedAttachmentFetch: authenticatedAttachmentFetch ? 1 : 0,
+								maxSentFrameBytes,
+								maxReceivedFrameBytes,
+							},
+							{
+								console: errors.console.slice(errorStart.console),
+								page: errors.page.slice(errorStart.page),
+							},
+						),
 					};
 				});
 			}

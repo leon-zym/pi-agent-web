@@ -11,6 +11,7 @@ import {
 	type HarnessWorkspace,
 	isBoundedHarnessLifecycle,
 	MAX_HARNESS_ROOT_ENTRIES,
+	startProductionHarness,
 } from "./production-harness";
 
 const buildEnvironmentKeys = [
@@ -118,6 +119,7 @@ test("keeps restart identity and lifecycle cleanup checks deterministic", () => 
 
 	const healthy = {
 		gatewayStarts: 2,
+		ownedGatewayCount: 2,
 		activeGatewayCount: 1,
 		activeGatewayPid: 123,
 		rootExists: true,
@@ -130,4 +132,32 @@ test("keeps restart identity and lifecycle cleanup checks deterministic", () => 
 		false,
 	);
 	assert.equal(isBoundedHarnessLifecycle({ ...healthy, rootExists: false }), false);
+});
+
+test("keeps a stable origin while restarting the owned Gateway", async () => {
+	const harness = await startProductionHarness();
+	try {
+		const origin = harness.origin;
+		await harness.restart();
+		assert.equal(harness.origin, origin);
+		assert.equal(harness.lifecycle().activeGatewayCount, 1);
+	} finally {
+		await harness.stop();
+	}
+});
+
+test("serializes concurrent restart and stop operations over owned children", async () => {
+	const harness = await startProductionHarness();
+	try {
+		await Promise.all([harness.restart(), harness.restart()]);
+		const lifecycle = harness.lifecycle();
+		assert.equal(lifecycle.gatewayStarts, 3);
+		assert.equal(lifecycle.ownedGatewayCount, lifecycle.gatewayStarts);
+		assert.equal(lifecycle.activeGatewayCount, 1);
+		await Promise.all([harness.restart(), harness.stop()]);
+		assert.equal(harness.lifecycle().activeGatewayCount, 0);
+		assert.equal(harness.lifecycle().rootExists, false);
+	} finally {
+		await harness.stop();
+	}
 });
