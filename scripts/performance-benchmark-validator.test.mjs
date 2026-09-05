@@ -25,6 +25,13 @@ const scenario = {
 	requiredCapabilities: ["browser", "websocket"],
 };
 
+const recoveryScenario = {
+	...scenario,
+	id: "recovery-test",
+	domain: "recovery",
+	kind: "recovery-crash",
+};
+
 const matrix = {
 	schemaVersion: 2,
 	scope: { issue: 28, phase: 1, status: "incomplete", label: "#28 Phase 1 / incomplete" },
@@ -33,6 +40,26 @@ const matrix = {
 		stress: { scenarios: [] },
 	},
 	provenance: { rootHash: HASH_A, domainHashes: { streaming: HASH_B } },
+};
+
+const recoveryMatrix = {
+	...matrix,
+	tiers: {
+		...matrix.tiers,
+		representative: { scenarios: [recoveryScenario] },
+	},
+	provenance: { rootHash: HASH_A, domainHashes: { recovery: HASH_B } },
+};
+
+const recoveryCorrectness = {
+	complete: true,
+	recoveryBarrier: true,
+	zeroDuplicateLostEvents: true,
+	staleGenerationRejected: true,
+	staleFenceRejected: true,
+	staleEpochRejected: true,
+	finalProjectionMatches: true,
+	processRestarted: true,
 };
 
 function variantOrder(seed = "fixture-seed") {
@@ -48,39 +75,44 @@ function trialMetrics(latencyMs) {
 	};
 }
 
-function validResult(variant, baseLatency = variant === "coalesced" ? 10 : 11) {
+function validResult(
+	variant,
+	baseLatency = variant === "coalesced" ? 10 : 11,
+	definition = scenario,
+	correctness = { complete: true },
+) {
 	const measured = [baseLatency, baseLatency + 10];
 	return {
 		schemaVersion: 2,
 		suiteVersion: 2,
 		tier: "representative",
 		runId: RUN_ID,
-		scenarioId: scenario.id,
-		domain: scenario.domain,
+		scenarioId: definition.id,
+		domain: definition.domain,
 		variant,
-		kind: scenario.kind,
+		kind: definition.kind,
 		status: "passed",
 		startedAt: "2026-08-30T00:00:00.000Z",
 		finishedAt: "2026-08-30T00:00:01.000Z",
 		browserVersion: "Chromium 140",
-		parameters: structuredClone(scenario),
+		parameters: structuredClone(definition),
 		capabilities: {
 			browser: true,
 			websocket: true,
 		},
 		trials: [
-			{ index: 0, warmup: true, metrics: trialMetrics(5), correctness: { complete: true } },
+			{ index: 0, warmup: true, metrics: trialMetrics(5), correctness: structuredClone(correctness) },
 			{
 				index: 1,
 				warmup: false,
 				metrics: trialMetrics(measured[0]),
-				correctness: { complete: true },
+				correctness: structuredClone(correctness),
 			},
 			{
 				index: 2,
 				warmup: false,
 				metrics: trialMetrics(measured[1]),
-				correctness: { complete: true },
+				correctness: structuredClone(correctness),
 			},
 		],
 		summaries: Object.fromEntries(
@@ -118,24 +150,24 @@ function validResult(variant, baseLatency = variant === "coalesced" ? 10 : 11) {
 	};
 }
 
-function validResults() {
-	return FORMAL_VARIANTS.map((variant) => validResult(variant));
+function validResults(definition = scenario, correctness = { complete: true }) {
+	return FORMAL_VARIANTS.map((variant) => validResult(variant, undefined, definition, correctness));
 }
 
-function expectedScenario(variant) {
+function expectedScenario(variant, definition = scenario) {
 	return {
-		id: scenario.id,
-		domain: scenario.domain,
-		kind: scenario.kind,
+		id: definition.id,
+		domain: definition.domain,
+		kind: definition.kind,
 		variant,
-		warmups: scenario.warmups,
-		measured: scenario.samples,
-		requiredCapabilities: structuredClone(scenario.requiredCapabilities),
+		warmups: definition.warmups,
+		measured: definition.samples,
+		requiredCapabilities: structuredClone(definition.requiredCapabilities),
 	};
 }
 
-function validManifest() {
-	const expected = FORMAL_VARIANTS.map(expectedScenario);
+function validManifest(definition = scenario, matrixValue = matrix) {
+	const expected = FORMAL_VARIANTS.map((variant) => expectedScenario(variant, definition));
 	return {
 		schemaVersion: 2,
 		suiteVersion: 2,
@@ -143,7 +175,7 @@ function validManifest() {
 		runId: RUN_ID,
 		seed: "fixture-seed",
 		source: { commit: "c".repeat(40), dirty: false },
-		matrix: structuredClone(matrix.provenance),
+		matrix: structuredClone(matrixValue.provenance),
 		fixtureHashes: { deterministicPi: HASH_A },
 		lockfileHash: HASH_B,
 		buildIdentity: { cliTreeHash: HASH_A, serverTreeHash: HASH_B, uiTreeHash: HASH_C },
@@ -162,10 +194,10 @@ function validManifest() {
 		canonicalVariants: [...FORMAL_VARIANTS],
 		executionOrder: variantOrder(),
 		warmupCounts: Object.fromEntries(
-			expected.map((entry) => [`${entry.domain}/${entry.id}/${entry.variant}`, 1]),
+			expected.map((entry) => [`${entry.domain}/${entry.id}/${entry.variant}`, entry.warmups]),
 		),
 		measuredCounts: Object.fromEntries(
-			expected.map((entry) => [`${entry.domain}/${entry.id}/${entry.variant}`, 2]),
+			expected.map((entry) => [`${entry.domain}/${entry.id}/${entry.variant}`, entry.measured]),
 		),
 		capabilities: {
 			browser: true,
@@ -215,15 +247,17 @@ function rawFor(result) {
 }
 
 function validate(overrides = {}) {
-	const results = overrides.results ?? validResults();
+	const definition = overrides.definition ?? scenario;
+	const matrixValue = overrides.matrix ?? matrix;
+	const results = overrides.results ?? validResults(definition, overrides.correctness);
 	return validateBenchmarkArtifacts({
-		matrix: overrides.matrix ?? matrix,
+		matrix: matrixValue,
 		tier: "representative",
 		runId: RUN_ID,
 		artifacts:
 			overrides.artifacts ?? results.map((value) => ({ name: `${value.variant}.result.json`, value })),
 		rawArtifacts: overrides.rawArtifacts ?? results.flatMap(rawFor),
-		manifest: overrides.manifest ?? validManifest(),
+		manifest: overrides.manifest ?? validManifest(definition, matrixValue),
 		environment: overrides.environment ?? validEnvironment(),
 		playwrightExitCode: overrides.playwrightExitCode ?? 0,
 	});
@@ -243,7 +277,25 @@ test("loads the root manifest through sorted domain matrices", () => {
 		"recovery",
 		"streaming",
 	]);
-	assert.equal(loaded.tiers.representative.scenarios.length, 8);
+	assert.equal(loaded.tiers.representative.scenarios.length, 11);
+	const recovery = loaded.domains.find((domain) => domain.id === "recovery");
+	assert.ok(recovery);
+	assert.deepEqual(
+		recovery.tiers.representative.scenarios.map((entry) => entry.kind),
+		["recovery-disconnect", "recovery-gap", "recovery-crash", "recovery-rekey", "recovery-gateway-restart"],
+	);
+	assert.deepEqual(
+		recovery.tiers.representative.scenarios.map(({ warmups, samples }) => [warmups, samples]),
+		Array.from({ length: 5 }, () => [1, 3]),
+	);
+	assert.deepEqual(
+		recovery.tiers.stress.scenarios.map(({ warmups, samples }) => [warmups, samples]),
+		Array.from({ length: 5 }, () => [2, 100]),
+	);
+	assert.equal(
+		recovery.tiers.stress.scenarios.reduce((total, entry) => total + entry.samples, 0),
+		500,
+	);
 });
 
 test("defines canonical formal pairs per matrix scenario rather than producer execution order", () => {
@@ -285,6 +337,56 @@ test("rejects missing, duplicate, and partial raw trial evidence", () => {
 	assert.match(errorText(validate({ results, rawArtifacts: partial })), /missing raw trial/);
 	const duplicate = [...results.flatMap(rawFor), structuredClone(rawFor(results[0])[0])];
 	assert.match(errorText(validate({ results, rawArtifacts: duplicate })), /duplicate raw trial/);
+	const invalidPath = results.flatMap(rawFor);
+	invalidPath[0].name = "tampered-trial.json";
+	assert.match(errorText(validate({ results, rawArtifacts: invalidPath })), /raw trial path must be/);
+});
+
+test("requires every recovery correctness field and keeps diagnostic gates observational", () => {
+	const results = validResults(recoveryScenario, recoveryCorrectness);
+	assert.deepEqual(validate({ definition: recoveryScenario, matrix: recoveryMatrix, results }).errors, []);
+
+	const missingCorrectness = structuredClone(results);
+	delete missingCorrectness[0].trials[1].correctness.processRestarted;
+	assert.match(
+		errorText(
+			validate({
+				definition: recoveryScenario,
+				matrix: recoveryMatrix,
+				results: missingCorrectness,
+				rawArtifacts: missingCorrectness.flatMap(rawFor),
+			}),
+		),
+		/correctness\.processRestarted must be boolean for recovery/,
+	);
+
+	const hardDiagnostic = structuredClone(results);
+	hardDiagnostic[0].gates[0].mode = "hard";
+	assert.match(
+		errorText(
+			validate({
+				definition: recoveryScenario,
+				matrix: recoveryMatrix,
+				results: hardDiagnostic,
+				rawArtifacts: hardDiagnostic.flatMap(rawFor),
+			}),
+		),
+		/diagnostic metric latencyMs must remain observe-only/,
+	);
+
+	const missingGate = structuredClone(results);
+	missingGate[0].gates = missingGate[0].gates.filter((gate) => gate.metric !== "correctnessFailures");
+	assert.match(
+		errorText(
+			validate({
+				definition: recoveryScenario,
+				matrix: recoveryMatrix,
+				results: missingGate,
+				rawArtifacts: missingGate.flatMap(rawFor),
+			}),
+		),
+		/hard correctnessFailures=value eq 0 gate/,
+	);
 });
 
 test("fails closed on malformed evidence and missing required capabilities", () => {
