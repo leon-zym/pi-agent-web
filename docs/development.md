@@ -116,17 +116,19 @@ The representative matrix targets high-value risks:
 - concurrent Session publication and Browser fairness;
 - long streaming with structural flush boundaries;
 - large native history and incremental Browser loading;
-- replay, resync, crash recovery, and stale mutation rejection;
+- replay, resync, crash recovery, Session rekey, Gateway restart, and stale mutation rejection;
 - large typed content references near declared limits;
 - bounded projection, queue, and materialization behavior.
 
 `pnpm bench:stress` extends duration and load and runs only by explicit request or manual CI. It is
 not a substitute for deterministic correctness.
 
-This is Issue #28 Phase 1 and remains incomplete. Structural checks and declared artifact shape are
-hard gates. Host-sensitive latency, throughput, long-task, and heap measurements are observations
-until the project publishes a reference-host baseline and variance policy. A green run proves only
-the declared scenarios.
+This is Issue #28 Phase 1 and remains incomplete. Issue #28 stays open until the project publishes a
+pinned reference-host profile and records two fresh representative baseline runs. Historical
+observations from Issues #53 and #58 are non-reference. Structural checks and declared artifact
+shape are hard gates; host-sensitive latency, throughput, long-task, heap, and other
+timing/resource measurements remain diagnostic until that reference profile and variance policy
+exist. A green run proves only the declared scenarios.
 
 When changing a targeted optimization, add a reproducible scenario only if it guards a real product
 risk. Do not create a generic benchmark framework or convert unstable workstation timing into a

@@ -14,7 +14,6 @@
 		{ "id": "streaming", "path": "matrix/streaming.json" }
 	],
 	"knownCoverageGaps": [
-		"Gateway restart and its Browser recovery workload are deferred to a later scenario packet.",
 		"A deliberately slow raw WebSocket client and concurrent history/command fairness are not yet benchmarked.",
 		"Generic typed content-root references are covered by the default Browser gate but are not benchmarked as a separate performance scenario; this suite measures production attachment refs.",
 		"Browser-triggered history cancellation and post-cancel process/heap release are not yet measured; the server cancellation contract is covered separately.",

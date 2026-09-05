@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+	BENCHMARK_PRODUCER_PATHS,
 	BENCHMARK_SCHEMA_VERSION,
 	BENCHMARK_SUITE_VERSION,
 	canonicalFormalExpectedScenarioSet,
@@ -16,12 +17,6 @@ const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(scriptDirectory, "..");
 const matrixPath = path.join(repositoryRoot, "tests/e2e/benchmarks/matrix.json");
 const defaultArtifactRoot = path.join(repositoryRoot, "test-results", "performance");
-const fixturePaths = [
-	"tests/e2e/fixtures/deterministic-pi.mjs",
-	"tests/e2e/fixtures/page-observation.ts",
-	"tests/e2e/fixtures/production-harness.ts",
-	"tests/e2e/fixtures/test.ts",
-];
 const FORMAL_BENCHMARK_VARIANTS = Object.freeze(["coalesced", "sequential"]);
 const standardBuildOutputs = {
 	cli: path.join(repositoryRoot, "packages/cli/dist"),
@@ -236,7 +231,7 @@ function assertStandardBuildUnchanged(before) {
 
 function fixtureHashes() {
 	const hashes = {};
-	for (const relativePath of fixturePaths) {
+	for (const relativePath of BENCHMARK_PRODUCER_PATHS) {
 		hashes[relativePath] = hashFile(path.join(repositoryRoot, relativePath));
 	}
 	return hashes;
