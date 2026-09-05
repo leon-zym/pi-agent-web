@@ -106,6 +106,29 @@ const COMPARISONS = new Set(["lte", "gte", "eq"]);
 const GATE_MODES = new Set(["hard", "observe"]);
 const FORMAL_BENCHMARK_VARIANTS = Object.freeze(["coalesced", "sequential"]);
 const BENCHMARK_VARIANTS = new Set(FORMAL_BENCHMARK_VARIANTS);
+const RECOVERY_DOMAIN_ID = "recovery";
+const RECOVERY_FAULT_KINDS = Object.freeze([
+	"recovery-disconnect",
+	"recovery-gap",
+	"recovery-crash",
+	"recovery-rekey",
+	"recovery-gateway-restart",
+]);
+const RECOVERY_CORRECTNESS_KEYS = Object.freeze([
+	"recoveryBarrier",
+	"zeroDuplicateLostEvents",
+	"staleGenerationRejected",
+	"staleFenceRejected",
+	"staleEpochRejected",
+	"finalProjectionMatches",
+]);
+const RECOVERY_KIND_CORRECTNESS_KEYS = Object.freeze({
+	"recovery-disconnect": ["disconnectObserved"],
+	"recovery-gap": ["gapResyncObserved"],
+	"recovery-crash": ["processRestarted"],
+	"recovery-rekey": ["rekeyIdentityChanged"],
+	"recovery-gateway-restart": ["restartCleanup"],
+});
 const BUILD_VARIANT_KEYS = ["serverEntry", "serverEntryHash", "serverTreeHash", "uiDirectory", "uiTreeHash"];
 const STANDARD_BUILD_IDENTITY_KEYS = ["cliTreeHash", "serverTreeHash", "uiTreeHash"];
 
@@ -215,6 +238,47 @@ function matrixScopeIsCurrent(scope) {
 		scope.status === "incomplete" &&
 		scope.label === "#28 Phase 1 / incomplete"
 	);
+}
+
+function validateRecoveryMatrixDomain(domains, tier, errors) {
+	if (!Array.isArray(domains)) return;
+	const recovery = domains.find((domain) => isRecord(domain) && domain.id === RECOVERY_DOMAIN_ID);
+	if (!recovery) {
+		errors.push("matrix: recovery domain must declare all five recovery fault classes");
+		return;
+	}
+	const scenarios = Array.isArray(recovery.tiers?.[tier]?.scenarios) ? recovery.tiers[tier].scenarios : [];
+	if (scenarios.length !== RECOVERY_FAULT_KINDS.length) {
+		errors.push(
+			`matrix: recovery/${tier} must contain exactly ${String(RECOVERY_FAULT_KINDS.length)} distinct fault classes`,
+		);
+	}
+	const kinds = scenarios.map((scenario) => (isRecord(scenario) ? scenario.kind : undefined));
+	const distinctKinds = [...new Set(kinds)];
+	if (
+		distinctKinds.length !== RECOVERY_FAULT_KINDS.length ||
+		!RECOVERY_FAULT_KINDS.every((kind) => distinctKinds.includes(kind))
+	) {
+		errors.push(`matrix: recovery/${tier} fault classes must be exactly ${RECOVERY_FAULT_KINDS.join(", ")}`);
+	}
+	for (const [index, scenario] of scenarios.entries()) {
+		if (!isRecord(scenario)) continue;
+		const expectedWarmups = tier === "stress" ? 2 : 1;
+		const expectedSamples = tier === "stress" ? 100 : 3;
+		if (scenario.warmups !== expectedWarmups || scenario.samples !== expectedSamples) {
+			errors.push(
+				`matrix: recovery/${tier} scenario ${String(index)} must use ${String(expectedWarmups)} warmup(s) and ${String(expectedSamples)} measured sample(s)`,
+			);
+		}
+	}
+}
+
+function isRecoveryKind(kind) {
+	return RECOVERY_FAULT_KINDS.includes(kind);
+}
+
+function isRecoveryDiagnosticMetric(metric) {
+	return /(?:ms|latency|heap|long.?task|throughput|arrival|rate|paint|duration)/i.test(metric);
 }
 
 function validateScenarioDefinition(scenario, domainId, tier, errors, index) {
@@ -347,6 +411,8 @@ export function loadBenchmarkMatrix(matrixPath = defaultMatrixPath) {
 		}
 		domains.push({ ...domain, path: entry.path });
 	}
+	validateRecoveryMatrixDomain(domains, "representative", errors);
+	validateRecoveryMatrixDomain(domains, "stress", errors);
 
 	const tiers = { representative: { scenarios: [] }, stress: { scenarios: [] } };
 	const scenarioIds = { representative: new Set(), stress: new Set() };
@@ -591,6 +657,46 @@ function validateGates(result, trials, expectedSummaries, errors) {
 	return validated;
 }
 
+function validateRecoveryResult(result, definition, trials, errors) {
+	const expectedKeys = [
+		"complete",
+		...RECOVERY_CORRECTNESS_KEYS,
+		...(RECOVERY_KIND_CORRECTNESS_KEYS[definition.kind] ?? []),
+	];
+	for (const [index, trial] of trials.entries()) {
+		if (!isRecord(trial?.correctness)) continue;
+		for (const key of expectedKeys) {
+			if (typeof trial.correctness[key] !== "boolean") {
+				errors.push(`trial ${String(index)} correctness.${key} must be boolean for recovery`);
+			}
+		}
+	}
+	const correctnessGate = Array.isArray(result.gates)
+		? result.gates.find(
+				(gate) =>
+					isRecord(gate) &&
+					gate.metric === "correctnessFailures" &&
+					gate.statistic === "value" &&
+					gate.comparison === "eq" &&
+					gate.threshold === 0 &&
+					gate.mode === "hard",
+			)
+		: undefined;
+	if (!correctnessGate) {
+		errors.push("recovery result must include a hard correctnessFailures=value eq 0 gate");
+	}
+	if (Array.isArray(result.gates)) {
+		for (const [index, gate] of result.gates.entries()) {
+			if (!isRecord(gate) || typeof gate.metric !== "string") continue;
+			if (isRecoveryDiagnosticMetric(gate.metric) && gate.mode === "hard") {
+				errors.push(
+					`recovery gate ${String(index)} diagnostic metric ${gate.metric} must remain observe-only`,
+				);
+			}
+		}
+	}
+}
+
 function validateResult(result, definition, tier, runId) {
 	const errors = [];
 	if (!exactKeys(result, RESULT_KEYS)) errors.push(`result must contain exactly ${RESULT_KEYS.join(", ")}`);
@@ -629,6 +735,7 @@ function validateResult(result, definition, tier, runId) {
 	const { trials, summaries } = validateTrials(result, definition, errors);
 	validateSummaries(result, summaries, errors);
 	const gates = validateGates(result, trials, summaries, errors);
+	if (isRecoveryKind(definition.kind)) validateRecoveryResult(result, definition, trials, errors);
 	const recordedErrors = Array.isArray(result.errors) ? result.errors : [];
 	if (recordedErrors.length > 0) errors.push("result errors must be empty in a complete formal result");
 	if (gates.some((gate) => gate.mode === "hard" && gate.recomputedPassed !== true)) {
@@ -672,6 +779,10 @@ function validateRawArtifacts(rawArtifacts, results, errors) {
 		const indexedKey = `${key}/${String(value.trial.index)}`;
 		if (seen.has(indexedKey)) errors.push(`${label}: duplicate raw trial: ${indexedKey}`);
 		seen.add(indexedKey);
+		const expectedName = `${value.scenarioId}/${value.variant}-${String(value.trial.index)}.json`;
+		if (label !== expectedName) {
+			errors.push(`${label}: raw trial path must be ${expectedName}`);
+		}
 		const expectedEntry = expected.get(indexedKey);
 		if (!expectedEntry) {
 			errors.push(`${label}: unexpected raw trial: ${indexedKey}`);
@@ -930,6 +1041,7 @@ export function validateBenchmarkArtifacts({
 	const errors = [];
 	if (tier !== "representative" && tier !== "stress") errors.push("tier must be representative or stress");
 	if (!validRunId(runId)) errors.push("runId must be a safe artifact directory name");
+	validateRecoveryMatrixDomain(matrix?.domains, tier, errors);
 	const expectedScenarios = matrixScenarios(matrix, tier, errors);
 	const definitions = new Map();
 	for (const scenario of expectedScenarios) definitions.set(scenario.id, scenario);
