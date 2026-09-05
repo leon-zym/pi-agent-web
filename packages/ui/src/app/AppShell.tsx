@@ -6,6 +6,7 @@ import { Sheet, SheetContent, SheetDescription, SheetTitle } from "../components
 import { Tooltip, TooltipContent, TooltipTrigger } from "../components/ui/tooltip";
 import { ConversationColumn } from "../features/conversation/ConversationColumn";
 import { DetailsPanel } from "../features/details/DetailsPanel";
+import { SessionLiveAnnouncements } from "../features/session-status/SessionLiveAnnouncements";
 import { WorkspaceSidebar } from "../features/sidebar/WorkspaceSidebar";
 import { tt } from "../lib/i18n";
 import { newSession, openSession } from "../lib/session-controller";
@@ -336,6 +337,8 @@ export function AppShell() {
 					onNewSession={() => void newSession()}
 				/>
 			)}
+
+			<SessionLiveAnnouncements />
 		</div>
 	);
 }

@@ -314,12 +314,16 @@ export const zhCN = {
 	"ext.other": "其他…",
 	"ext.customInput": "自定义输入",
 	"ext.recommended": "推荐",
+	"ext.choices": "选项",
 
 	// Onboarding
 	"onboarding.title": "配置 Provider API Key",
 	"onboarding.description":
 		"检测到本地还没有可用的 Provider 凭据。填写你常用的 Provider 与 API Key 后即可开始使用。",
 	"onboarding.providerPlaceholder": "例如 deepseek",
+	"onboarding.providerLabel": "Provider ID",
+	"onboarding.apiKeyLabel": "API Key",
+	"onboarding.apiKeyPlaceholder": "sk-…",
 	"onboarding.securityNote": "密钥仅写入本机 ~/.pi/agent/auth.json（权限 600），不会上传到任何服务器。",
 	"onboarding.save": "保存并继续",
 	"onboarding.saving": "保存中…",
@@ -408,6 +412,12 @@ export const zhCN = {
 	"resync.degradedDescription": "自动恢复已在四次尝试后停止。",
 	"resync.stale": "同步完成前，此处显示的对话内容可能已过时。",
 	"resync.manualRetry": "重试同步",
+
+	// Session live announcements
+	"live.sessionSettled": "Session「{session}」已完成。",
+	"live.sessionWaiting": "Session「{session}」正在等待输入。",
+	"live.sessionDegraded": "Session「{session}」需要处理，自动恢复已停止。",
+	"live.sessionRevoked": "此页面已失去 Session「{session}」的控制权。",
 
 	// Chat viewport
 	"chatViewport.backToBottom": "回到最新消息",
