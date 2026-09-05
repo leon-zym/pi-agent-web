@@ -5,6 +5,7 @@ import {
 	addSummaryGate,
 	addValueGate,
 	correctnessFailureCount,
+	createTrialEvidence,
 	installBrowserBenchmarkObserver,
 	runBenchmarkScenario,
 	scenariosFor,
@@ -47,6 +48,7 @@ for (const scenario of scenariosFor("history")) {
 				const actualSourceBytes = fs.statSync(harness.session.sessionFile).size;
 				let getMessagesCount = 0;
 				await trials.run(0, async () => {
+					const errorStart = { console: errors.console.length, page: errors.page.length };
 					const heapBefore = await page.evaluate(
 						() =>
 							(performance as Performance & { memory?: { usedJSHeapSize: number } }).memory?.usedJSHeapSize ??
@@ -95,23 +97,35 @@ for (const scenario of scenariosFor("history")) {
 						.filter(
 							(event) => event.sessionId === "browser-e2e-history" && event.commandType === "get_messages",
 						).length;
+					const mountedTurnNodes = await turnWindow.locator("[data-turn-id]").count();
+					const correctness = {
+						exactSourceBoundary: actualSourceBytes === sourceBytes,
+						allTurnsPaged: (await turnWindow.getAttribute("data-turn-window-total")) === String(turns),
+						historyWindowMatchesReadPath: initialTurns === Math.min(INITIAL_TURNS, turns),
+						oldestTurnReachable: await viewport
+							.getByText(`${HISTORY_PROMPT} [turn 1]`, { exact: true })
+							.isVisible(),
+						expectedHistoryReadPath: getMessagesCount === 0,
+					};
 					return {
 						metrics: {
 							firstPageMs: firstPageFinished - firstPageStarted,
 							nextPageMs,
 							sourceBytes: actualSourceBytes,
 							heapDeltaBytes: heapBefore === null || heapAfter === null ? null : heapAfter - heapBefore,
-							mountedTurnNodes: await turnWindow.locator("[data-turn-id]").count(),
+							mountedTurnNodes,
 						},
-						correctness: {
-							exactSourceBoundary: actualSourceBytes === sourceBytes,
-							allTurnsPaged: (await turnWindow.getAttribute("data-turn-window-total")) === String(turns),
-							historyWindowMatchesReadPath: initialTurns === Math.min(INITIAL_TURNS, turns),
-							oldestTurnReachable: await viewport
-								.getByText(`${HISTORY_PROMPT} [turn 1]`, { exact: true })
-								.isVisible(),
-							expectedHistoryReadPath: getMessagesCount === 0,
-						},
+						correctness,
+						evidence: createTrialEvidence(
+							{
+								correctnessFailures: Object.values(correctness).filter((value) => !value).length,
+								mountedTurnNodes,
+							},
+							{
+								console: errors.console.slice(errorStart.console),
+								page: errors.page.slice(errorStart.page),
+							},
+						),
 					};
 				});
 				addValueGate(

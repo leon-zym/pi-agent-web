@@ -7,6 +7,7 @@ import {
 	addValueGate,
 	browserSessionFrameSnapshot,
 	correctnessFailureCount,
+	createTrialEvidence,
 	finishBrowserMeasurement,
 	installBrowserBenchmarkObserver,
 	markBrowserStreamEnd,
@@ -92,6 +93,7 @@ for (const scenario of scenariosFor("concurrency")) {
 
 			for (let index = 0; index < trialCount; index += 1) {
 				await trials.run(index, async () => {
+					const errorStart = { console: errors.console.length, page: errors.page.length };
 					await startBrowserMeasurement(page);
 					const prompts = Array.from({ length: sessionCount }, (_, sessionIndex) =>
 						[
@@ -261,6 +263,18 @@ for (const scenario of scenariosFor("concurrency")) {
 											).length,
 									),
 								);
+					const browserProjectionCheckpointDeficit = Math.max(0, 2 - minimumProjectionCheckpoints);
+					const backgroundIngestCheckpointDeficit =
+						sessionCount === 1 ? 0 : Math.max(0, 2 - minimumBackgroundCheckpoints);
+					const correctness = {
+						allSessionsStarted: starts.every((at) => at > 0),
+						allSessionsSettled: ends.every((at) => at > 0),
+						allBackgroundProjectionsRecovered: projectedSessions === sessionCount,
+						allSessionsObservedTwice: minimumProjectionCheckpoints >= 2,
+						backgroundSessionsIngestedBetweenSwitches:
+							sessionCount === 1 || minimumBackgroundCheckpoints >= 2,
+						singleMultiplexedSocket: sockets.length === 1 && closedSockets.length === 0,
+					};
 					return {
 						metrics: {
 							...browserMetrics,
@@ -271,22 +285,24 @@ for (const scenario of scenariosFor("concurrency")) {
 							browserFrameArrivalGapMs: Math.max(
 								...flatObservations.map((observation) => observation.maxFrameGapMs),
 							),
-							browserProjectionCheckpointDeficit: Math.max(0, 2 - minimumProjectionCheckpoints),
-							backgroundIngestCheckpointDeficit:
-								sessionCount === 1 ? 0 : Math.max(0, 2 - minimumBackgroundCheckpoints),
+							browserProjectionCheckpointDeficit,
+							backgroundIngestCheckpointDeficit,
 							completionSkewMs: Math.max(...ends) - Math.min(...ends),
 							durationSkewMs: Math.max(...durations) - Math.min(...durations),
 							aggregateDeltaPerSecond: overlapMs > 0 ? (deltaCount * 1_000) / overlapMs : null,
 						},
-						correctness: {
-							allSessionsStarted: starts.every((at) => at > 0),
-							allSessionsSettled: ends.every((at) => at > 0),
-							allBackgroundProjectionsRecovered: projectedSessions === sessionCount,
-							allSessionsObservedTwice: minimumProjectionCheckpoints >= 2,
-							backgroundSessionsIngestedBetweenSwitches:
-								sessionCount === 1 || minimumBackgroundCheckpoints >= 2,
-							singleMultiplexedSocket: sockets.length === 1 && closedSockets.length === 0,
-						},
+						correctness,
+						evidence: createTrialEvidence(
+							{
+								correctnessFailures: Object.values(correctness).filter((value) => !value).length,
+								browserProjectionCheckpointDeficit,
+								backgroundIngestCheckpointDeficit,
+							},
+							{
+								console: errors.console.slice(errorStart.console),
+								page: errors.page.slice(errorStart.page),
+							},
+						),
 					};
 				});
 			}

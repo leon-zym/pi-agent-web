@@ -69,6 +69,89 @@ export interface BenchmarkOutcome {
 export interface BenchmarkTrialExecution {
 	correctness: Record<string, boolean>;
 	metrics: Record<string, number | null>;
+	evidence: BenchmarkTrialEvidence;
+}
+
+export interface BenchmarkTrialEvidence {
+	browserErrors: {
+		console: string[];
+		page: string[];
+	};
+	hardMetrics: Record<string, number>;
+	recovery: BenchmarkRecoveryEvidence | null;
+}
+
+export interface BenchmarkRecoveryAuthorityEvidence {
+	workspaceHandle: string;
+	workspacePath: string;
+	sessionHandle: string;
+	nativeSessionId: string;
+	sessionFile: string | null;
+	serverEpoch: string;
+	generation: number;
+	fencingToken: string;
+}
+
+export interface BenchmarkRecoveryStaleCommandEvidence {
+	responseType: string;
+	responseSuccess: boolean;
+	responseError: string | null;
+	piCommandCountBefore: number;
+	piCommandCountAfter: number;
+}
+
+export interface BenchmarkRecoveryEvidence {
+	kind: Extract<
+		BenchmarkKind,
+		"recovery-disconnect" | "recovery-gap" | "recovery-crash" | "recovery-rekey" | "recovery-gateway-restart"
+	>;
+	authorityBefore: BenchmarkRecoveryAuthorityEvidence;
+	authorityAfter: BenchmarkRecoveryAuthorityEvidence;
+	sequence: {
+		expected: number[];
+		observed: number[];
+	};
+	projection: {
+		prompt: string;
+		reply: string;
+		promptCount: number;
+		replyCount: number;
+	};
+	stale: {
+		generation: BenchmarkRecoveryStaleCommandEvidence;
+		fence: BenchmarkRecoveryStaleCommandEvidence;
+		epoch: BenchmarkRecoveryStaleCommandEvidence;
+		parent: BenchmarkRecoveryStaleCommandEvidence;
+	};
+	fault: {
+		observed: boolean;
+		reconnectCount: number;
+		gapResyncCount: number;
+		processRestartCount: number;
+		rekeyFrameCount: number;
+		identityChanged: boolean;
+		oldParentRejected: boolean;
+		gatewayStarts: number;
+		activeGateways: number;
+		rootEntryCount: number;
+		stableOrigin: boolean;
+		ownedGatewayCount: number;
+	};
+}
+
+export function createTrialEvidence(
+	hardMetrics: Record<string, number>,
+	browserErrors: { console: string[]; page: string[] },
+	recovery: BenchmarkRecoveryEvidence | null = null,
+): BenchmarkTrialEvidence {
+	return {
+		browserErrors: {
+			console: [...browserErrors.console],
+			page: [...browserErrors.page],
+		},
+		hardMetrics: { ...hardMetrics },
+		recovery,
+	};
 }
 
 export interface BenchmarkTrialLifecycle {
@@ -344,12 +427,14 @@ export async function runBenchmarkScenario(
 	const startedAt = new Date().toISOString();
 	const outcome: BenchmarkOutcome = { trials: [], gates: [], notes: [] };
 	const errors: string[] = [];
+	const evidenceByTrial = new Map<number, BenchmarkTrialEvidence>();
 	const trials: BenchmarkTrialLifecycle = {
 		run: async (index, executeTrial) => {
 			if (index !== outcome.trials.length) {
 				throw new Error(`benchmark trial index ${String(index)} is not the next canonical trial`);
 			}
 			const execution = await executeTrial();
+			evidenceByTrial.set(index, execution.evidence);
 			outcome.trials.push({
 				index,
 				warmup: index < scenario.warmups,
@@ -414,6 +499,8 @@ export async function runBenchmarkScenario(
 	const directory = scenarioDirectory(scenario);
 	fs.mkdirSync(directory, { recursive: true });
 	for (const trial of result.trials) {
+		const evidence = evidenceByTrial.get(trial.index);
+		if (!evidence) throw new Error(`benchmark trial ${String(trial.index)} did not produce raw evidence`);
 		const rawTrial = {
 			schemaVersion: result.schemaVersion,
 			suiteVersion: result.suiteVersion,
@@ -425,6 +512,7 @@ export async function runBenchmarkScenario(
 			kind: result.kind,
 			parameters: result.parameters,
 			capabilities: result.capabilities,
+			evidence,
 			trial,
 		};
 		fs.writeFileSync(

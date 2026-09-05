@@ -4,6 +4,7 @@ import {
 	addSummaryGate,
 	addValueGate,
 	correctnessFailureCount,
+	createTrialEvidence,
 	finishBrowserMeasurement,
 	installBrowserBenchmarkObserver,
 	markBrowserStreamEnd,
@@ -36,6 +37,7 @@ for (const scenario of scenariosFor("streaming")) {
 
 			for (let index = 0; index < trialCount; index += 1) {
 				await trials.run(index, async () => {
+					const errorStart = { console: errors.console.length, page: errors.page.length };
 					await startBrowserMeasurement(page);
 					const prompt = [
 						"E2E_BENCH_STREAM",
@@ -97,25 +99,38 @@ for (const scenario of scenariosFor("streaming")) {
 						.piEvents()
 						.filter((event) => event.type === "large_frame" && event.text === prompt);
 					const metrics = await finishBrowserMeasurement(page);
+					const correctness = {
+						liveTailStayedPlain: liveRichNodes === 0,
+						structuralReleaseHeldInStreamingDom:
+							streamingDomBeforeRelease === 1 && settledDomBeforeRelease === 0,
+						structuralReleasePublishedSettledDom:
+							(await streaming.count()) === 0 && (await settled.count()) === 1,
+						settledEndSentinel: settledText?.includes("STREAM_BUDGET_END") ?? false,
+						settledUnicode: settledText?.includes("🧪") ?? false,
+						structuralFramesEmittedInOrder:
+							largeFrames.map((event) => event.eventType).join(",") === "text_end,message_end",
+						frameBudgetPreserved: largeFrames.every((event) => (event.frameBytes ?? 0) > targetBytes),
+					};
+					const turnNodes = await turn.locator("[data-turn-id]").count();
 					return {
 						metrics: {
 							...metrics,
 							deltaCount: streamEnd.deltaCount,
 							publicationRatio: metrics.publicationBatches / streamEnd.deltaCount,
 							structuralDomTransitionMs: structuralTransitionFinished - structuralTransitionStarted,
+							turnNodes,
 						},
-						correctness: {
-							liveTailStayedPlain: liveRichNodes === 0,
-							structuralReleaseHeldInStreamingDom:
-								streamingDomBeforeRelease === 1 && settledDomBeforeRelease === 0,
-							structuralReleasePublishedSettledDom:
-								(await streaming.count()) === 0 && (await settled.count()) === 1,
-							settledEndSentinel: settledText?.includes("STREAM_BUDGET_END") ?? false,
-							settledUnicode: settledText?.includes("🧪") ?? false,
-							structuralFramesEmittedInOrder:
-								largeFrames.map((event) => event.eventType).join(",") === "text_end,message_end",
-							frameBudgetPreserved: largeFrames.every((event) => (event.frameBytes ?? 0) > targetBytes),
-						},
+						correctness,
+						evidence: createTrialEvidence(
+							{
+								correctnessFailures: Object.values(correctness).filter((value) => !value).length,
+								turnNodes,
+							},
+							{
+								console: errors.console.slice(errorStart.console),
+								page: errors.page.slice(errorStart.page),
+							},
+						),
 					};
 				});
 			}

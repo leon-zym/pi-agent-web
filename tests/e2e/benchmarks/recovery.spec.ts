@@ -5,13 +5,21 @@ import {
 	observePageErrors,
 	sendControlledWebSocketFrame,
 } from "../fixtures/page-observation";
-import { isBoundedHarnessLifecycle, MAX_HARNESS_ROOT_ENTRIES } from "../fixtures/production-harness";
+import {
+	type HarnessSession,
+	isBoundedHarnessLifecycle,
+	MAX_HARNESS_ROOT_ENTRIES,
+} from "../fixtures/production-harness";
 import { expect, test } from "../fixtures/test";
 import {
 	addSummaryGate,
 	addValueGate,
 	type BenchmarkOutcome,
+	type BenchmarkRecoveryAuthorityEvidence,
+	type BenchmarkRecoveryEvidence,
+	type BenchmarkRecoveryStaleCommandEvidence,
 	correctnessFailureCount,
+	createTrialEvidence,
 	installBrowserBenchmarkObserver,
 	runBenchmarkScenario,
 	scenariosFor,
@@ -26,6 +34,9 @@ test.use({
 
 interface WireFrame extends Record<string, unknown> {
 	type?: string;
+	seq?: number;
+	workspaceId?: string;
+	barrierSeq?: number;
 	serverEpoch?: string;
 	sessionHandle?: string;
 	previousSessionHandle?: string;
@@ -37,7 +48,12 @@ interface WireFrame extends Record<string, unknown> {
 		sessionHandle?: string;
 		generation?: number;
 		serverEpoch?: string;
+		workspaceId?: string;
+		nativeSessionId?: string;
+		sessionFile?: string | null;
+		lastSeq?: number;
 	};
+	projectionEvents?: Array<{ seq?: number }>;
 	response?: {
 		id?: string;
 		success?: boolean;
@@ -58,6 +74,127 @@ function frame(payload: string | Buffer): WireFrame | undefined {
 	} catch {
 		return undefined;
 	}
+}
+
+function piCommandCount(
+	harness: { piEvents: () => Array<{ type: string; commandId?: string }> },
+	id?: string,
+): number {
+	return harness
+		.piEvents()
+		.filter((event) => event.type === "command" && (id === undefined || event.commandId === id)).length;
+}
+
+function staleEvidence(
+	response: WireFrame | undefined,
+	piCommandCountBefore: number,
+	piCommandCountAfter: number,
+	responseType = response?.type ?? "missing",
+): BenchmarkRecoveryStaleCommandEvidence {
+	return {
+		responseType,
+		responseSuccess: response?.response?.success === true,
+		responseError: response?.response?.error ?? null,
+		piCommandCountBefore,
+		piCommandCountAfter,
+	};
+}
+
+function notApplicableStaleEvidence(): BenchmarkRecoveryStaleCommandEvidence {
+	return {
+		responseType: "not_applicable",
+		responseSuccess: false,
+		responseError: null,
+		piCommandCountBefore: 0,
+		piCommandCountAfter: 0,
+	};
+}
+
+function sequenceEvidence(
+	received: WireFrame[],
+	start: number,
+	sessionHandle: string,
+): {
+	expected: number[];
+	observed: number[];
+} {
+	const observed = received
+		.slice(start)
+		.filter(
+			(candidate) =>
+				candidate.type === "event" &&
+				candidate.sessionHandle === sessionHandle &&
+				Number.isSafeInteger(candidate.seq),
+		)
+		.map((candidate) => candidate.seq as number);
+	return {
+		expected: [...new Set(observed)].sort((left, right) => left - right),
+		observed,
+	};
+}
+
+function authorityEvidence(
+	harness: { workspace: { workspaceHandle: string; path: string } },
+	lease: ControllerLease,
+	session: HarnessSession,
+): BenchmarkRecoveryAuthorityEvidence {
+	return {
+		workspaceHandle: harness.workspace.workspaceHandle,
+		workspacePath: harness.workspace.path,
+		sessionHandle: lease.sessionHandle,
+		nativeSessionId: session.nativeSessionId,
+		sessionFile: session.sessionFile,
+		serverEpoch: lease.serverEpoch,
+		generation: lease.generation,
+		fencingToken: lease.fencingToken,
+	};
+}
+
+async function sessionForHandle(
+	harness: {
+		workspace: { workspaceHandle: string };
+		requestJson: <T>(pathname: string, init?: RequestInit) => Promise<T>;
+	},
+	sessionHandle: string,
+): Promise<HarnessSession> {
+	const directory = await harness.requestJson<{ sessions: HarnessSession[] }>(
+		`/api/v1/workspaces/${encodeURIComponent(harness.workspace.workspaceHandle)}/sessions?refresh=1`,
+	);
+	const session = directory.sessions.find((candidate) => candidate.sessionHandle === sessionHandle);
+	if (!session)
+		throw new Error(`unable to resolve Session ${sessionHandle} from the authoritative directory`);
+	return session;
+}
+
+function recoveryEvidence(
+	kind: BenchmarkRecoveryEvidence["kind"],
+	harness: { workspace: { workspaceHandle: string; path: string } },
+	beforeLease: ControllerLease,
+	afterLease: ControllerLease,
+	beforeSession: HarnessSession,
+	afterSession: HarnessSession,
+	received: WireFrame[],
+	frameStart: number,
+	prompt: string,
+	reply: string,
+	projection: { promptCount: number; replyCount: number },
+	stale: {
+		generation: BenchmarkRecoveryStaleCommandEvidence;
+		fence: BenchmarkRecoveryStaleCommandEvidence;
+		epoch: BenchmarkRecoveryStaleCommandEvidence;
+		parent: BenchmarkRecoveryStaleCommandEvidence;
+	},
+	fault: BenchmarkRecoveryEvidence["fault"],
+): BenchmarkRecoveryEvidence {
+	return {
+		kind,
+		authorityBefore: authorityEvidence(harness, beforeLease, beforeSession),
+		authorityAfter: authorityEvidence(harness, afterLease, afterSession),
+		sequence: sequenceEvidence(received, frameStart, afterLease.sessionHandle),
+		projection: { prompt, reply, ...projection },
+		stale,
+		fault,
+	};
 }
 
 function conversationTurn(page: Page, prompt: string) {
@@ -125,17 +262,27 @@ async function waitForResponse(received: WireFrame[], id: string): Promise<WireF
 async function assertStaleGuards(
 	page: Page,
 	received: WireFrame[],
+	harness: { piEvents: () => Array<{ type: string; commandId?: string }> },
 	lease: ControllerLease,
 	index: number,
 	staleEpoch = `benchmark-stale-epoch-${String(index)}`,
+	parentLease?: ControllerLease,
 ): Promise<{
 	staleGenerationRejected: boolean;
 	staleFenceRejected: boolean;
 	staleEpochRejected: boolean;
+	oldParentRejected: boolean;
+	evidence: {
+		generation: BenchmarkRecoveryStaleCommandEvidence;
+		fence: BenchmarkRecoveryStaleCommandEvidence;
+		epoch: BenchmarkRecoveryStaleCommandEvidence;
+		parent: BenchmarkRecoveryStaleCommandEvidence;
+	};
 }> {
 	if (lease.generation < 1)
 		throw new Error("cannot issue a stale generation below the initial Session generation");
 	const generationId = `benchmark-stale-generation-${String(index)}`;
+	const generationCommandCountBefore = piCommandCount(harness, generationId);
 	await sendControlledWebSocketFrame(page, {
 		type: "command",
 		sessionHandle: lease.sessionHandle,
@@ -144,8 +291,10 @@ async function assertStaleGuards(
 		command: { id: generationId, type: "set_session_name", name: `stale-generation-${String(index)}` },
 	});
 	const generationResponse = await waitForResponse(received, generationId);
+	const generationCommandCountAfter = piCommandCount(harness, generationId);
 
 	const fenceId = `benchmark-stale-fence-${String(index)}`;
+	const fenceCommandCountBefore = piCommandCount(harness, fenceId);
 	await sendControlledWebSocketFrame(page, {
 		type: "command",
 		sessionHandle: lease.sessionHandle,
@@ -154,8 +303,10 @@ async function assertStaleGuards(
 		command: { id: fenceId, type: "set_session_name", name: `stale-fence-${String(index)}` },
 	});
 	const fenceResponse = await waitForResponse(received, fenceId);
+	const fenceCommandCountAfter = piCommandCount(harness, fenceId);
 
 	const epochMark = received.length;
+	const epochCommandCountBefore = piCommandCount(harness);
 	await sendControlledWebSocketFrame(page, {
 		type: "session_subscribe",
 		sessionHandle: lease.sessionHandle,
@@ -170,6 +321,29 @@ async function assertStaleGuards(
 			{ timeout: 30_000 },
 		)
 		.toBeTruthy();
+	const epochResponse = received
+		.slice(epochMark)
+		.find((candidate) => candidate.type === "resync_required" && candidate.reason === "epoch_changed");
+	const epochCommandCountAfter = piCommandCount(harness);
+
+	let parentEvidence = notApplicableStaleEvidence();
+	let oldParentRejected = true;
+	if (parentLease) {
+		const parentId = `benchmark-stale-parent-${String(index)}`;
+		const parentCommandCountBefore = piCommandCount(harness, parentId);
+		await sendControlledWebSocketFrame(page, {
+			type: "command",
+			sessionHandle: parentLease.sessionHandle,
+			expectedGeneration: parentLease.generation,
+			fencingToken: parentLease.fencingToken,
+			command: { id: parentId, type: "set_session_name", name: `stale-parent-${String(index)}` },
+		});
+		const parentResponse = await waitForResponse(received, parentId);
+		const parentCommandCountAfter = piCommandCount(harness, parentId);
+		parentEvidence = staleEvidence(parentResponse, parentCommandCountBefore, parentCommandCountAfter);
+		oldParentRejected =
+			parentResponse.response?.success === false && parentCommandCountAfter === parentCommandCountBefore;
+	}
 
 	return {
 		staleGenerationRejected:
@@ -181,6 +355,22 @@ async function assertStaleGuards(
 		staleEpochRejected: received
 			.slice(epochMark)
 			.some((candidate) => candidate.type === "resync_required" && candidate.reason === "epoch_changed"),
+		oldParentRejected,
+		evidence: {
+			generation: staleEvidence(
+				generationResponse,
+				generationCommandCountBefore,
+				generationCommandCountAfter,
+			),
+			fence: staleEvidence(fenceResponse, fenceCommandCountBefore, fenceCommandCountAfter),
+			epoch: staleEvidence(
+				epochResponse,
+				epochCommandCountBefore,
+				epochCommandCountAfter,
+				epochResponse?.type ?? "missing",
+			),
+			parent: parentEvidence,
+		},
 	};
 }
 
@@ -265,6 +455,7 @@ for (const scenario of scenariosFor("recovery-disconnect")) {
 
 			for (let index = 0; index < trialCount; index += 1) {
 				await trials.run(index, async () => {
+					const errorStart = { console: errors.console.length, page: errors.page.length };
 					const prompt = `E2E_BENCH_DISCONNECT:${scenario.id}:${String(index)}`;
 					const reply = `E2E_REPLY:${prompt}`;
 					await page.locator("textarea").fill(prompt);
@@ -272,6 +463,8 @@ for (const scenario of scenariosFor("recovery-disconnect")) {
 					await expect
 						.poll(() => harness.piEvents().some((event) => event.type === "delta" && event.text === prompt))
 						.toBe(true);
+					const beforeLease = await waitForControllerLease(page, received);
+					const beforeSession = await sessionForHandle(harness, beforeLease.sessionHandle);
 					const socketsBefore = sockets.length;
 					const closesBefore = closedSockets();
 					const framesBefore = received.length;
@@ -284,29 +477,71 @@ for (const scenario of scenariosFor("recovery-disconnect")) {
 					await expect.poll(() => sockets.length, { timeout: 30_000 }).toBeGreaterThan(socketsBefore);
 					const projection = await assertProjection(page, prompt, reply);
 					const lease = await waitForControllerLease(page, received, undefined, framesBefore);
-					const stale = await assertStaleGuards(page, received, lease, index);
+					const stale = await assertStaleGuards(page, received, harness, lease, index);
 					const finishedAt = await page.evaluate(() => performance.now());
 					const events = harness.piEvents();
 					const replayFrames = received
 						.slice(framesBefore)
 						.filter((candidate) => candidate.type === "event").length;
+					const afterSession = await sessionForHandle(harness, lease.sessionHandle);
+					const { evidence: staleEvidenceValue, oldParentRejected, ...staleChecks } = stale;
+					const correctness = {
+						recoveryBarrier: lease.sessionHandle.length > 0 && replayFrames > 0,
+						zeroDuplicateLostEvents:
+							events.filter((event) => event.type === "prompt" && event.text === prompt).length === 1 &&
+							events.filter((event) => event.type === "settled" && event.text === prompt).length === 1 &&
+							projection.promptCount === 1 &&
+							projection.replyCount === 1,
+						...staleChecks,
+						finalProjectionMatches: projection.promptCount === 1 && projection.replyCount === 1,
+						disconnectObserved: sockets.length > socketsBefore,
+					};
+					const recovery = recoveryEvidence(
+						"recovery-disconnect",
+						harness,
+						beforeLease,
+						lease,
+						beforeSession,
+						afterSession,
+						received,
+						framesBefore,
+						prompt,
+						reply,
+						projection,
+						staleEvidenceValue,
+						{
+							observed: sockets.length > socketsBefore,
+							reconnectCount: sockets.length - socketsBefore,
+							gapResyncCount: 0,
+							processRestartCount: 0,
+							rekeyFrameCount: 0,
+							identityChanged: false,
+							oldParentRejected,
+							gatewayStarts: 0,
+							activeGateways: harness.lifecycle().activeGatewayCount,
+							rootEntryCount: harness.lifecycle().rootEntryCount,
+							stableOrigin: true,
+							ownedGatewayCount: harness.lifecycle().ownedGatewayCount,
+						},
+					);
 					return {
 						metrics: {
 							recoveryMs: finishedAt - startedAt,
 							reconnectedSockets: sockets.length - socketsBefore,
 							replayFrames,
 						},
-						correctness: {
-							recoveryBarrier: lease.sessionHandle.length > 0 && replayFrames > 0,
-							zeroDuplicateLostEvents:
-								events.filter((event) => event.type === "prompt" && event.text === prompt).length === 1 &&
-								events.filter((event) => event.type === "settled" && event.text === prompt).length === 1 &&
-								projection.promptCount === 1 &&
-								projection.replyCount === 1,
-							...stale,
-							finalProjectionMatches: projection.promptCount === 1 && projection.replyCount === 1,
-							disconnectObserved: sockets.length > socketsBefore,
-						},
+						correctness,
+						evidence: createTrialEvidence(
+							{
+								correctnessFailures: Object.values(correctness).filter((value) => !value).length,
+								reconnectedSockets: sockets.length - socketsBefore,
+							},
+							{
+								console: errors.console.slice(errorStart.console),
+								page: errors.page.slice(errorStart.page),
+							},
+							recovery,
+						),
 					};
 				});
 			}
@@ -345,6 +580,7 @@ for (const scenario of scenariosFor("recovery-gap")) {
 
 			for (let index = 0; index < trialCount; index += 1) {
 				await trials.run(index, async () => {
+					const errorStart = { console: errors.console.length, page: errors.page.length };
 					const prompt = `E2E_BENCH_GAP:${scenario.id}:${String(index)}`;
 					const reply = `E2E_REPLY:${prompt}`;
 					await page.locator("textarea").fill(prompt);
@@ -352,6 +588,8 @@ for (const scenario of scenariosFor("recovery-gap")) {
 					await expect
 						.poll(() => harness.piEvents().some((event) => event.type === "delta" && event.text === prompt))
 						.toBe(true);
+					const beforeLease = await waitForControllerLease(page, received);
+					const beforeSession = await sessionForHandle(harness, beforeLease.sessionHandle);
 					const socketsBefore = sockets.length;
 					const closesBefore = closedSockets();
 					const framesBefore = received.length;
@@ -384,28 +622,70 @@ for (const scenario of scenariosFor("recovery-gap")) {
 						.slice(framesBefore)
 						.filter((candidate) => candidate.type === "resync_required" && candidate.reason === "gap");
 					const projection = await assertProjection(page, prompt, reply);
-					const lease = await waitForControllerLease(page, received, undefined, framesBefore);
-					const stale = await assertStaleGuards(page, received, lease, index);
+					const lease = beforeLease;
+					const stale = await assertStaleGuards(page, received, harness, lease, index);
 					const finishedAt = await page.evaluate(() => performance.now());
 					const events = harness.piEvents();
+					const afterSession = await sessionForHandle(harness, lease.sessionHandle);
+					const { evidence: staleEvidenceValue, oldParentRejected, ...staleChecks } = stale;
+					const correctness = {
+						recoveryBarrier: lease.sessionHandle.length > 0 && gapFrames.length === 1,
+						zeroDuplicateLostEvents:
+							events.filter((event) => event.type === "prompt" && event.text === prompt).length === 1 &&
+							events.filter((event) => event.type === "settled" && event.text === prompt).length === 1 &&
+							gapFrames.length === 1 &&
+							projection.promptCount === 1 &&
+							projection.replyCount === 1,
+						...staleChecks,
+						finalProjectionMatches: projection.promptCount === 1 && projection.replyCount === 1,
+						gapResyncObserved: gapFrames.length === 1,
+					};
+					const recovery = recoveryEvidence(
+						"recovery-gap",
+						harness,
+						beforeLease,
+						lease,
+						beforeSession,
+						afterSession,
+						received,
+						framesBefore,
+						prompt,
+						reply,
+						projection,
+						staleEvidenceValue,
+						{
+							observed: gapFrames.length === 1,
+							reconnectCount: sockets.length - socketsBefore,
+							gapResyncCount: gapFrames.length,
+							processRestartCount: 0,
+							rekeyFrameCount: 0,
+							identityChanged: false,
+							oldParentRejected,
+							gatewayStarts: 0,
+							activeGateways: harness.lifecycle().activeGatewayCount,
+							rootEntryCount: harness.lifecycle().rootEntryCount,
+							stableOrigin: true,
+							ownedGatewayCount: harness.lifecycle().ownedGatewayCount,
+						},
+					);
 					return {
 						metrics: {
 							recoveryMs: finishedAt - startedAt,
 							reconnectedSockets: sockets.length - socketsBefore,
 							gapResyncFrames: gapFrames.length,
 						},
-						correctness: {
-							recoveryBarrier: lease.sessionHandle.length > 0 && gapFrames.length === 1,
-							zeroDuplicateLostEvents:
-								events.filter((event) => event.type === "prompt" && event.text === prompt).length === 1 &&
-								events.filter((event) => event.type === "settled" && event.text === prompt).length === 1 &&
-								gapFrames.length === 1 &&
-								projection.promptCount === 1 &&
-								projection.replyCount === 1,
-							...stale,
-							finalProjectionMatches: projection.promptCount === 1 && projection.replyCount === 1,
-							gapResyncObserved: gapFrames.length === 1,
-						},
+						correctness,
+						evidence: createTrialEvidence(
+							{
+								correctnessFailures: Object.values(correctness).filter((value) => !value).length,
+								gapResyncFrames: gapFrames.length,
+							},
+							{
+								console: errors.console.slice(errorStart.console),
+								page: errors.page.slice(errorStart.page),
+							},
+							recovery,
+						),
 					};
 				});
 			}
@@ -447,6 +727,7 @@ for (const scenario of scenariosFor("recovery-crash")) {
 
 			for (let index = 0; index < trialCount; index += 1) {
 				await trials.run(index, async () => {
+					const errorStart = { console: errors.console.length, page: errors.page.length };
 					const beforePrompt = `E2E_BENCH_BEFORE_CRASH:${scenario.id}:${String(index)}`;
 					await page.locator("textarea").fill(beforePrompt);
 					await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
@@ -454,6 +735,7 @@ for (const scenario of scenariosFor("recovery-crash")) {
 						page.locator("main").getByText(`E2E_REPLY:${beforePrompt}`, { exact: true }),
 					).toHaveCount(1, { timeout: 30_000 });
 					const oldLease = await waitForControllerLease(page, received);
+					const beforeSession = await sessionForHandle(harness, oldLease.sessionHandle);
 					const startsBefore = harness.piEvents().filter((event) => event.type === "started").length;
 					const recoveryFrameMark = received.length;
 					const crashPrompt = `E2E_BENCH_CRASH:${scenario.id}:${String(index)}`;
@@ -505,7 +787,8 @@ for (const scenario of scenariosFor("recovery-crash")) {
 						oldLease.sessionHandle,
 						recoveryFrameMark,
 					);
-					const stale = await assertStaleGuards(page, received, currentLease, index);
+					const stale = await assertStaleGuards(page, received, harness, currentLease, index);
+					const afterSession = await sessionForHandle(harness, currentLease.sessionHandle);
 					const afterPrompt = `E2E_BENCH_AFTER_CRASH:${scenario.id}:${String(index)}`;
 					await page.locator("textarea").fill(afterPrompt);
 					await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
@@ -516,6 +799,7 @@ for (const scenario of scenariosFor("recovery-crash")) {
 					const crashPromptCount = await main.getByText(crashPrompt, { exact: true }).count();
 					const afterReplyCount = await main.getByText(`E2E_REPLY:${afterPrompt}`, { exact: true }).count();
 					const events = harness.piEvents();
+					const processStarts = events.filter((event) => event.type === "started").length - startsBefore;
 					const recoveryBaselineObserved = received
 						.slice(recoveryFrameMark)
 						.some(
@@ -523,28 +807,68 @@ for (const scenario of scenariosFor("recovery-crash")) {
 								candidate.type === "runtime_state" &&
 								candidate.runtime?.sessionHandle === oldLease.sessionHandle,
 						);
+					const { evidence: staleEvidenceValue, oldParentRejected, ...staleChecks } = stale;
+					const correctness = {
+						recoveryBarrier:
+							currentLease.generation > oldLease.generation &&
+							currentLease.sessionHandle === oldLease.sessionHandle &&
+							recoveryBaselineObserved,
+						zeroDuplicateLostEvents:
+							events.filter((event) => event.type === "crash_requested" && event.text === crashPrompt)
+								.length === 1 &&
+							events.filter((event) => event.type === "prompt" && event.text === afterPrompt).length === 1 &&
+							crashPromptCount === 1 &&
+							afterReplyCount === 1,
+						...staleChecks,
+						finalProjectionMatches: crashPromptCount === 1 && afterReplyCount === 1,
+						processRestarted: restarted.pid !== crashEvent.pid,
+					};
+					const recovery = recoveryEvidence(
+						"recovery-crash",
+						harness,
+						oldLease,
+						currentLease,
+						beforeSession,
+						afterSession,
+						received,
+						recoveryFrameMark,
+						afterPrompt,
+						`E2E_REPLY:${afterPrompt}`,
+						{ promptCount: crashPromptCount, replyCount: afterReplyCount },
+						staleEvidenceValue,
+						{
+							observed: processStarts === 1,
+							reconnectCount: 0,
+							gapResyncCount: 0,
+							processRestartCount: processStarts,
+							rekeyFrameCount: 0,
+							identityChanged: false,
+							oldParentRejected,
+							gatewayStarts: 0,
+							activeGateways: harness.lifecycle().activeGatewayCount,
+							rootEntryCount: harness.lifecycle().rootEntryCount,
+							stableOrigin: true,
+							ownedGatewayCount: harness.lifecycle().ownedGatewayCount,
+						},
+					);
 					return {
 						metrics: {
 							recoveryMs: Date.now() - crashEvent.at,
 							processRestartMs: restarted.at - crashEvent.at,
-							processStarts: events.filter((event) => event.type === "started").length - startsBefore,
+							processStarts,
 						},
-						correctness: {
-							recoveryBarrier:
-								currentLease.generation > oldLease.generation &&
-								currentLease.sessionHandle === oldLease.sessionHandle &&
-								recoveryBaselineObserved,
-							zeroDuplicateLostEvents:
-								events.filter((event) => event.type === "crash_requested" && event.text === crashPrompt)
-									.length === 1 &&
-								events.filter((event) => event.type === "prompt" && event.text === afterPrompt).length ===
-									1 &&
-								crashPromptCount === 1 &&
-								afterReplyCount === 1,
-							...stale,
-							finalProjectionMatches: crashPromptCount === 1 && afterReplyCount === 1,
-							processRestarted: restarted.pid !== crashEvent.pid,
-						},
+						correctness,
+						evidence: createTrialEvidence(
+							{
+								correctnessFailures: Object.values(correctness).filter((value) => !value).length,
+								processStarts,
+							},
+							{
+								console: errors.console.slice(errorStart.console),
+								page: errors.page.slice(errorStart.page),
+							},
+							recovery,
+						),
 					};
 				});
 				if (index < trialCount - 1) {
@@ -591,6 +915,7 @@ for (const scenario of scenariosFor("recovery-rekey")) {
 
 			for (let index = 0; index < trialCount; index += 1) {
 				await trials.run(index, async () => {
+					const errorStart = { console: errors.console.length, page: errors.page.length };
 					const parentPrompt = `E2E_BENCH_REKEY_PARENT:${scenario.id}:${String(index)}`;
 					await page.locator("textarea").fill(parentPrompt);
 					await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
@@ -598,6 +923,7 @@ for (const scenario of scenariosFor("recovery-rekey")) {
 						page.locator("main").getByText(`E2E_REPLY:${parentPrompt}`, { exact: true }),
 					).toHaveCount(1, { timeout: 30_000 });
 					const parentLease = await waitForControllerLease(page, received);
+					const beforeSession = await sessionForHandle(harness, parentLease.sessionHandle);
 					const rekeyStart = Date.now();
 					const rekeyFrameMark = received.length;
 					const rekeyFramesBefore = received.filter(
@@ -632,11 +958,20 @@ for (const scenario of scenariosFor("recovery-rekey")) {
 					if (!childHandle) throw new Error("fork/clone did not publish a child Session identity");
 					await expect(page.locator("textarea")).toBeEnabled({ timeout: 30_000 });
 					const childLease = await waitForControllerLease(page, received, childHandle, rekeyFrameMark);
+					const childSession = await sessionForHandle(harness, childLease.sessionHandle);
 					const childPrompt = `E2E_BENCH_REKEY_CHILD:${scenario.id}:${String(index)}`;
 					await page.locator("textarea").fill(childPrompt);
 					await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
 					const childProjection = await assertProjection(page, childPrompt, `E2E_REPLY:${childPrompt}`);
-					const stale = await assertStaleGuards(page, received, childLease, index);
+					const stale = await assertStaleGuards(
+						page,
+						received,
+						harness,
+						childLease,
+						index,
+						undefined,
+						parentLease,
+					);
 					const rekeyFrames =
 						received.filter(
 							(candidate) =>
@@ -645,29 +980,71 @@ for (const scenario of scenariosFor("recovery-rekey")) {
 						).length - rekeyFramesBefore;
 					const finishedAt = Date.now();
 					const events = harness.piEvents();
+					const { evidence: staleEvidenceValue, oldParentRejected, ...staleChecks } = stale;
+					const identityChanged =
+						parentLease.sessionHandle !== childLease.sessionHandle ||
+						beforeSession.nativeSessionId !== childSession.nativeSessionId ||
+						beforeSession.sessionFile !== childSession.sessionFile;
+					const correctness = {
+						recoveryBarrier:
+							childLease.sessionHandle === childHandle &&
+							childLease.generation > parentLease.generation &&
+							rekeyFrames === 1,
+						zeroDuplicateLostEvents:
+							events.filter((event) => event.type === "prompt" && event.text === parentPrompt).length === 1 &&
+							events.filter((event) => event.type === "prompt" && event.text === childPrompt).length === 1 &&
+							childProjection.promptCount === 1 &&
+							childProjection.replyCount === 1,
+						...staleChecks,
+						finalProjectionMatches: childProjection.promptCount === 1 && childProjection.replyCount === 1,
+						rekeyIdentityChanged: identityChanged && rekeyFrames === 1,
+					};
+					const recovery = recoveryEvidence(
+						"recovery-rekey",
+						harness,
+						parentLease,
+						childLease,
+						beforeSession,
+						childSession,
+						received,
+						rekeyFrameMark,
+						childPrompt,
+						`E2E_REPLY:${childPrompt}`,
+						childProjection,
+						staleEvidenceValue,
+						{
+							observed: rekeyFrames === 1,
+							reconnectCount: 0,
+							gapResyncCount: 0,
+							processRestartCount: 0,
+							rekeyFrameCount: rekeyFrames,
+							identityChanged,
+							oldParentRejected,
+							gatewayStarts: 0,
+							activeGateways: harness.lifecycle().activeGatewayCount,
+							rootEntryCount: harness.lifecycle().rootEntryCount,
+							stableOrigin: true,
+							ownedGatewayCount: harness.lifecycle().ownedGatewayCount,
+						},
+					);
 					return {
 						metrics: {
 							rekeyMs: finishedAt - rekeyStart,
 							rekeyFrames,
 							childGeneration: childLease.generation,
 						},
-						correctness: {
-							recoveryBarrier:
-								childLease.sessionHandle === childHandle &&
-								childLease.generation > parentLease.generation &&
-								rekeyFrames === 1,
-							zeroDuplicateLostEvents:
-								events.filter((event) => event.type === "prompt" && event.text === parentPrompt).length ===
-									1 &&
-								events.filter((event) => event.type === "prompt" && event.text === childPrompt).length ===
-									1 &&
-								childProjection.promptCount === 1 &&
-								childProjection.replyCount === 1,
-							...stale,
-							finalProjectionMatches: childProjection.promptCount === 1 && childProjection.replyCount === 1,
-							rekeyIdentityChanged:
-								parentLease.sessionHandle !== childLease.sessionHandle && rekeyFrames === 1,
-						},
+						correctness,
+						evidence: createTrialEvidence(
+							{
+								correctnessFailures: Object.values(correctness).filter((value) => !value).length,
+								rekeyFrames,
+							},
+							{
+								console: errors.console.slice(errorStart.console),
+								page: errors.page.slice(errorStart.page),
+							},
+							recovery,
+						),
 					};
 				});
 				if (index < trialCount - 1) {
@@ -710,13 +1087,14 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 		await runBenchmarkScenario(page, testInfo, harness, scenario, async (outcome, trials) => {
 			const errors = observePageErrors(page);
 			await installWebSocketDropControl(page);
-			const { received } = attachFrames(page);
+			const { sockets, received, closedSockets } = attachFrames(page);
 			await installBrowserBenchmarkObserver(page);
 			await openBenchmarkPage(page, harness.origin);
 			const trialCount = scenario.warmups + scenario.samples;
 
 			for (let index = 0; index < trialCount; index += 1) {
 				await trials.run(index, async () => {
+					const errorStart = { console: errors.console.length, page: errors.page.length };
 					const beforePrompt = `E2E_BENCH_RESTART_BEFORE:${scenario.id}:${String(index)}`;
 					await page.locator("textarea").fill(beforePrompt);
 					await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
@@ -724,19 +1102,27 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 						page.locator("main").getByText(`E2E_REPLY:${beforePrompt}`, { exact: true }),
 					).toHaveCount(1, { timeout: 30_000 });
 					const oldLease = await waitForControllerLease(page, received);
+					const beforeSession = await sessionForHandle(harness, oldLease.sessionHandle);
 					const rootBefore = harness.rootDir;
-					const sessionBefore = { ...harness.session };
+					const originBefore = harness.origin;
+					const socketsBefore = sockets.length;
+					const closesBefore = closedSockets();
 					const frameMark = received.length;
 					const startsBefore = harness.lifecycle().gatewayStarts;
+					const documentMarker = await page.evaluate(() => {
+						const marker = `restart-document-${String(Math.random())}`;
+						document.documentElement.dataset.e2eRestartDocument = marker;
+						return marker;
+					});
 					const startedAt = Date.now();
-					await harness.restart();
+					await harness.restart(page);
 					const restartFinishedAt = Date.now();
 					const lifecycle = harness.lifecycle();
-					await page.goto(harness.origin, { waitUntil: "domcontentloaded" });
+					await expect.poll(() => closedSockets()).toBeGreaterThan(closesBefore);
+					await expect.poll(() => sockets.length, { timeout: 30_000 }).toBeGreaterThan(socketsBefore);
 					await expect(page.locator("#root > div")).toBeVisible();
-					const row = page.locator("[data-session-row]").filter({ hasText: beforePrompt });
-					await expect(row).toHaveCount(1, { timeout: 30_000 });
-					await row.getByRole("button").first().click();
+					await expect(page.locator("textarea")).toBeEnabled({ timeout: 30_000 });
+					await expect(page.locator("html")).toHaveAttribute("data-e2e-restart-document", documentMarker);
 					await expect
 						.poll(
 							() => {
@@ -745,7 +1131,7 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 									frames.some(
 										(candidate) =>
 											candidate.type === "runtime_state" &&
-											candidate.runtime?.sessionHandle === sessionBefore.sessionHandle,
+											candidate.runtime?.sessionHandle === beforeSession.sessionHandle,
 									) &&
 									frames.some(
 										(candidate) =>
@@ -756,23 +1142,32 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 										(candidate) =>
 											(candidate.type === "session_snapshot" ||
 												candidate.type === "session_snapshot_begin") &&
-											candidate.sessionHandle === sessionBefore.sessionHandle,
+											candidate.sessionHandle === beforeSession.sessionHandle,
 									)
 								);
 							},
 							{ timeout: 30_000 },
 						)
 						.toBe(true);
+					await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(1);
 					await expect(
 						page.locator("main").getByText(`E2E_REPLY:${beforePrompt}`, { exact: true }),
 					).toHaveCount(1);
 					const currentLease = await waitForControllerLease(
 						page,
 						received,
-						sessionBefore.sessionHandle,
+						beforeSession.sessionHandle,
 						frameMark,
 					);
-					const stale = await assertStaleGuards(page, received, currentLease, index, oldLease.serverEpoch);
+					const stale = await assertStaleGuards(
+						page,
+						received,
+						harness,
+						currentLease,
+						index,
+						oldLease.serverEpoch,
+					);
+					const afterSession = await sessionForHandle(harness, currentLease.sessionHandle);
 					const afterPrompt = `E2E_BENCH_RESTART_AFTER:${scenario.id}:${String(index)}`;
 					await page.locator("textarea").fill(afterPrompt);
 					await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
@@ -783,32 +1178,76 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 					const beforePromptCount = await main.getByText(beforePrompt, { exact: true }).count();
 					const afterReplyCount = await main.getByText(`E2E_REPLY:${afterPrompt}`, { exact: true }).count();
 					const events = harness.piEvents();
+					const gatewayStarts = lifecycle.gatewayStarts - startsBefore;
+					const stableOrigin = harness.origin === originBefore;
+					const { evidence: staleEvidenceValue, oldParentRejected, ...staleChecks } = stale;
+					const correctness = {
+						recoveryBarrier:
+							currentLease.serverEpoch !== oldLease.serverEpoch &&
+							currentLease.sessionHandle === beforeSession.sessionHandle,
+						zeroDuplicateLostEvents:
+							events.filter((event) => event.type === "prompt" && event.text === beforePrompt).length === 1 &&
+							events.filter((event) => event.type === "prompt" && event.text === afterPrompt).length === 1 &&
+							beforePromptCount === 1 &&
+							afterReplyCount === 1,
+						...staleChecks,
+						finalProjectionMatches: beforePromptCount === 1 && afterReplyCount === 1,
+						restartCleanup:
+							harness.rootDir === rootBefore &&
+							stableOrigin &&
+							isBoundedHarnessLifecycle(lifecycle) &&
+							gatewayStarts === 1,
+					};
+					const recovery = recoveryEvidence(
+						"recovery-gateway-restart",
+						harness,
+						oldLease,
+						currentLease,
+						beforeSession,
+						afterSession,
+						received,
+						frameMark,
+						afterPrompt,
+						`E2E_REPLY:${afterPrompt}`,
+						{ promptCount: beforePromptCount, replyCount: afterReplyCount },
+						staleEvidenceValue,
+						{
+							observed: stableOrigin && gatewayStarts === 1,
+							reconnectCount: sockets.length - socketsBefore,
+							gapResyncCount: 0,
+							processRestartCount: 0,
+							rekeyFrameCount: 0,
+							identityChanged: false,
+							oldParentRejected,
+							gatewayStarts,
+							activeGateways: lifecycle.activeGatewayCount,
+							rootEntryCount: lifecycle.rootEntryCount,
+							stableOrigin,
+							ownedGatewayCount: lifecycle.ownedGatewayCount,
+						},
+					);
 					return {
 						metrics: {
 							gatewayRestartMs: restartFinishedAt - startedAt,
-							gatewayStarts: lifecycle.gatewayStarts - startsBefore,
+							gatewayStarts,
 							baselineFrames: received.length - frameMark,
 							rootEntryCount: lifecycle.rootEntryCount,
 							activeGateways: lifecycle.activeGatewayCount,
 						},
-						correctness: {
-							recoveryBarrier:
-								currentLease.serverEpoch !== oldLease.serverEpoch &&
-								currentLease.sessionHandle === sessionBefore.sessionHandle,
-							zeroDuplicateLostEvents:
-								events.filter((event) => event.type === "prompt" && event.text === beforePrompt).length ===
-									1 &&
-								events.filter((event) => event.type === "prompt" && event.text === afterPrompt).length ===
-									1 &&
-								beforePromptCount === 1 &&
-								afterReplyCount === 1,
-							...stale,
-							finalProjectionMatches: beforePromptCount === 1 && afterReplyCount === 1,
-							restartCleanup:
-								harness.rootDir === rootBefore &&
-								isBoundedHarnessLifecycle(lifecycle) &&
-								lifecycle.gatewayStarts === startsBefore + 1,
-						},
+						correctness,
+						evidence: createTrialEvidence(
+							{
+								correctnessFailures: Object.values(correctness).filter((value) => !value).length,
+								gatewayStarts,
+								activeGateways: lifecycle.activeGatewayCount,
+								rootEntryCount: lifecycle.rootEntryCount,
+							},
+							{
+								console: errors.console.slice(errorStart.console),
+								page: errors.page.slice(errorStart.page),
+							},
+							recovery,
+						),
 					};
 				});
 			}

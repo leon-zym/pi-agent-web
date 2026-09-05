@@ -35,6 +35,7 @@ const RESULT_KEYS = [
 const RAW_TRIAL_KEYS = [
 	"capabilities",
 	"domain",
+	"evidence",
 	"kind",
 	"parameters",
 	"runId",
@@ -131,6 +132,108 @@ const RECOVERY_KIND_CORRECTNESS_KEYS = Object.freeze({
 });
 const BUILD_VARIANT_KEYS = ["serverEntry", "serverEntryHash", "serverTreeHash", "uiDirectory", "uiTreeHash"];
 const STANDARD_BUILD_IDENTITY_KEYS = ["cliTreeHash", "serverTreeHash", "uiTreeHash"];
+/** Files that can alter benchmark recovery evidence are hashed by both producer and validator. */
+export const BENCHMARK_PRODUCER_PATHS = Object.freeze(
+	[
+		"tests/e2e/benchmarks/benchmark-support.ts",
+		"tests/e2e/benchmarks/recovery.spec.ts",
+		"tests/e2e/fixtures/deterministic-pi.mjs",
+		"tests/e2e/fixtures/page-observation.ts",
+		"tests/e2e/fixtures/production-harness.ts",
+		"tests/e2e/fixtures/test.ts",
+		"tests/e2e/specs/recovery-acceptance.spec.ts",
+	].sort(),
+);
+const HARD_GATE_METRICS = new Set([
+	"activeGateways",
+	"authenticatedAttachmentFetch",
+	"backgroundIngestCheckpointDeficit",
+	"browserErrors",
+	"browserProjectionCheckpointDeficit",
+	"correctnessFailures",
+	"gapResyncFrames",
+	"gatewayStarts",
+	"maxReceivedFrameBytes",
+	"maxSentFrameBytes",
+	"processStarts",
+	"reconnectedSockets",
+	"rekeyFrames",
+	"rootEntryCount",
+	"turnNodes",
+]);
+const GATE_METRIC_POLICY = Object.freeze(
+	Object.fromEntries(
+		[
+			...HARD_GATE_METRICS,
+			"aggregateDeltaPerSecond",
+			"baselineFrames",
+			"browserFrameArrivalGapMs",
+			"browserProjectionLagMs",
+			"completionSkewMs",
+			"deltaCount",
+			"durationSkewMs",
+			"firstPageMs",
+			"gatewayRestartMs",
+			"heapDeltaBytes",
+			"inputBase64Chars",
+			"inputToNextPaintMs",
+			"inputToPublicationMs",
+			"liveLongTaskMaxMs",
+			"liveLongTasksOver50Ms",
+			"nextPageMs",
+			"processRestartMs",
+			"publicationBatches",
+			"publicationRatio",
+			"producerProgressGapMs",
+			"recoveryMs",
+			"rekeyMs",
+			"replayFrames",
+			"roundTripMs",
+			"selectionMs",
+			"settlementMs",
+			"sourceBytes",
+			"streamDurationMs",
+			"structuralDomTransitionMs",
+			"totalCompletionMs",
+		].map((metric) => [metric, HARD_GATE_METRICS.has(metric) ? "hard" : "observe"]),
+	),
+);
+const EVIDENCE_KEYS = ["browserErrors", "hardMetrics", "recovery"];
+const BROWSER_ERROR_KEYS = ["console", "page"];
+const AUTHORITY_EVIDENCE_KEYS = [
+	"fencingToken",
+	"generation",
+	"nativeSessionId",
+	"serverEpoch",
+	"sessionFile",
+	"sessionHandle",
+	"workspaceHandle",
+	"workspacePath",
+];
+const STALE_COMMAND_EVIDENCE_KEYS = [
+	"piCommandCountAfter",
+	"piCommandCountBefore",
+	"responseError",
+	"responseSuccess",
+	"responseType",
+];
+const RECOVERY_STALE_KEYS = ["epoch", "fence", "generation", "parent"];
+const RECOVERY_SEQUENCE_KEYS = ["expected", "observed"];
+const RECOVERY_PROJECTION_KEYS = ["prompt", "promptCount", "reply", "replyCount"];
+const RECOVERY_FAULT_KEYS = [
+	"activeGateways",
+	"gatewayStarts",
+	"gapResyncCount",
+	"identityChanged",
+	"observed",
+	"oldParentRejected",
+	"ownedGatewayCount",
+	"processRestartCount",
+	"reconnectCount",
+	"rekeyFrameCount",
+	"rootEntryCount",
+	"stableOrigin",
+];
 
 function isRecord(value) {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -240,14 +343,25 @@ function matrixScopeIsCurrent(scope) {
 	);
 }
 
-function validateRecoveryMatrixDomain(domains, tier, errors) {
-	if (!Array.isArray(domains)) return;
-	const recovery = domains.find((domain) => isRecord(domain) && domain.id === RECOVERY_DOMAIN_ID);
-	if (!recovery) {
+function validateRecoveryMatrixDomain(matrixOrDomains, tier, errors) {
+	let scenarios;
+	if (Array.isArray(matrixOrDomains)) {
+		const recovery = matrixOrDomains.find((domain) => isRecord(domain) && domain.id === RECOVERY_DOMAIN_ID);
+		scenarios = Array.isArray(recovery?.tiers?.[tier]?.scenarios) ? recovery.tiers[tier].scenarios : [];
+	} else {
+		const isCanonicalFlatMatrix =
+			Array.isArray(matrixOrDomains?.domains) ||
+			Object.keys(matrixOrDomains?.provenance?.domainHashes ?? {}).length > 1;
+		if (!isCanonicalFlatMatrix) return;
+		const selected = isRecord(matrixOrDomains?.tiers) ? matrixOrDomains.tiers[tier] : undefined;
+		scenarios = Array.isArray(selected?.scenarios)
+			? selected.scenarios.filter((scenario) => isRecord(scenario) && scenario.domain === RECOVERY_DOMAIN_ID)
+			: [];
+	}
+	if (scenarios.length === 0) {
 		errors.push("matrix: recovery domain must declare all five recovery fault classes");
 		return;
 	}
-	const scenarios = Array.isArray(recovery.tiers?.[tier]?.scenarios) ? recovery.tiers[tier].scenarios : [];
 	if (scenarios.length !== RECOVERY_FAULT_KINDS.length) {
 		errors.push(
 			`matrix: recovery/${tier} must contain exactly ${String(RECOVERY_FAULT_KINDS.length)} distinct fault classes`,
@@ -273,12 +387,28 @@ function validateRecoveryMatrixDomain(domains, tier, errors) {
 	}
 }
 
-function isRecoveryKind(kind) {
-	return RECOVERY_FAULT_KINDS.includes(kind);
+function validateMatrixProjection(matrix, tier, errors) {
+	if (!Array.isArray(matrix?.domains)) return;
+	const projected = [];
+	for (const domain of matrix.domains) {
+		const scenarios = Array.isArray(domain?.tiers?.[tier]?.scenarios) ? domain.tiers[tier].scenarios : [];
+		for (const scenario of scenarios) {
+			projected.push({
+				...scenario,
+				domain: domain.id,
+				requiredCapabilities: Array.isArray(domain.requiredCapabilities)
+					? [...domain.requiredCapabilities]
+					: [],
+			});
+		}
+	}
+	if (!isDeepStrictEqual(matrix.tiers?.[tier]?.scenarios, projected)) {
+		errors.push(`matrix: ${tier} tier must exactly project its declared domain matrices`);
+	}
 }
 
-function isRecoveryDiagnosticMetric(metric) {
-	return /(?:ms|latency|heap|long.?task|throughput|arrival|rate|paint|duration)/i.test(metric);
+function isRecoveryKind(kind) {
+	return RECOVERY_FAULT_KINDS.includes(kind);
 }
 
 function validateScenarioDefinition(scenario, domainId, tier, errors, index) {
@@ -586,7 +716,293 @@ function validateSummaries(result, expectedSummaries, errors) {
 	}
 }
 
-function validateGates(result, trials, expectedSummaries, errors) {
+function validateStringArray(value, label, errors) {
+	if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
+		errors.push(`${label} must be a string array`);
+		return false;
+	}
+	return true;
+}
+
+function validateNonnegativeInteger(value, label, errors) {
+	if (!Number.isSafeInteger(value) || value < 0) {
+		errors.push(`${label} must be a non-negative safe integer`);
+		return false;
+	}
+	return true;
+}
+
+function validateAuthorityEvidence(value, label, errors) {
+	if (!exactKeys(value, AUTHORITY_EVIDENCE_KEYS)) {
+		errors.push(`${label} must contain exactly ${AUTHORITY_EVIDENCE_KEYS.join(", ")}`);
+		return false;
+	}
+	for (const key of [
+		"fencingToken",
+		"nativeSessionId",
+		"serverEpoch",
+		"sessionHandle",
+		"workspaceHandle",
+		"workspacePath",
+	]) {
+		if (typeof value[key] !== "string" || value[key].length === 0) {
+			errors.push(`${label}.${key} must be a non-empty string`);
+		}
+	}
+	if (
+		value.sessionFile !== null &&
+		(typeof value.sessionFile !== "string" || value.sessionFile.length === 0)
+	) {
+		errors.push(`${label}.sessionFile must be null or a non-empty string`);
+	}
+	validateNonnegativeInteger(value.generation, `${label}.generation`, errors);
+}
+
+function validateStaleCommandEvidence(value, label, errors) {
+	if (!exactKeys(value, STALE_COMMAND_EVIDENCE_KEYS)) {
+		errors.push(`${label} must contain exactly ${STALE_COMMAND_EVIDENCE_KEYS.join(", ")}`);
+		return false;
+	}
+	if (typeof value.responseType !== "string" || value.responseType.length === 0) {
+		errors.push(`${label}.responseType must be a non-empty string`);
+	}
+	if (typeof value.responseSuccess !== "boolean") errors.push(`${label}.responseSuccess must be boolean`);
+	if (value.responseError !== null && typeof value.responseError !== "string") {
+		errors.push(`${label}.responseError must be null or a string`);
+	}
+	validateNonnegativeInteger(value.piCommandCountBefore, `${label}.piCommandCountBefore`, errors);
+	validateNonnegativeInteger(value.piCommandCountAfter, `${label}.piCommandCountAfter`, errors);
+	return true;
+}
+
+function validateRecoveryTrialEvidence(value, definition, label, errors) {
+	if (!isRecord(value)) {
+		errors.push(`${label} must be a recovery evidence record`);
+		return;
+	}
+	const expectedKeys = [
+		"authorityAfter",
+		"authorityBefore",
+		"fault",
+		"kind",
+		"projection",
+		"sequence",
+		"stale",
+	];
+	if (!exactKeys(value, expectedKeys)) {
+		errors.push(`${label} must contain exactly ${expectedKeys.join(", ")}`);
+	}
+	if (value.kind !== definition.kind) errors.push(`${label}.kind must match the recovery scenario kind`);
+	validateAuthorityEvidence(value.authorityBefore, `${label}.authorityBefore`, errors);
+	validateAuthorityEvidence(value.authorityAfter, `${label}.authorityAfter`, errors);
+
+	if (!exactKeys(value.sequence, RECOVERY_SEQUENCE_KEYS)) {
+		errors.push(`${label}.sequence must contain exactly ${RECOVERY_SEQUENCE_KEYS.join(", ")}`);
+	} else {
+		for (const key of RECOVERY_SEQUENCE_KEYS) {
+			const sequence = value.sequence[key];
+			if (!Array.isArray(sequence) || sequence.some((entry) => !Number.isSafeInteger(entry) || entry <= 0)) {
+				errors.push(`${label}.sequence.${key} must be a positive safe integer array`);
+			}
+		}
+	}
+	if (!exactKeys(value.projection, RECOVERY_PROJECTION_KEYS)) {
+		errors.push(`${label}.projection must contain exactly ${RECOVERY_PROJECTION_KEYS.join(", ")}`);
+	} else {
+		for (const key of ["prompt", "reply"]) {
+			if (typeof value.projection[key] !== "string" || value.projection[key].length === 0) {
+				errors.push(`${label}.projection.${key} must be a non-empty string`);
+			}
+		}
+		validateNonnegativeInteger(value.projection.promptCount, `${label}.projection.promptCount`, errors);
+		validateNonnegativeInteger(value.projection.replyCount, `${label}.projection.replyCount`, errors);
+	}
+	if (!exactKeys(value.stale, RECOVERY_STALE_KEYS)) {
+		errors.push(`${label}.stale must contain exactly ${RECOVERY_STALE_KEYS.join(", ")}`);
+	} else {
+		for (const key of RECOVERY_STALE_KEYS) {
+			validateStaleCommandEvidence(value.stale[key], `${label}.stale.${key}`, errors);
+		}
+	}
+	if (!exactKeys(value.fault, RECOVERY_FAULT_KEYS)) {
+		errors.push(`${label}.fault must contain exactly ${RECOVERY_FAULT_KEYS.join(", ")}`);
+	} else {
+		for (const key of ["observed", "identityChanged", "oldParentRejected", "stableOrigin"]) {
+			if (typeof value.fault[key] !== "boolean") errors.push(`${label}.fault.${key} must be boolean`);
+		}
+		for (const key of [
+			"activeGateways",
+			"gatewayStarts",
+			"gapResyncCount",
+			"ownedGatewayCount",
+			"processRestartCount",
+			"reconnectCount",
+			"rekeyFrameCount",
+			"rootEntryCount",
+		]) {
+			validateNonnegativeInteger(value.fault[key], `${label}.fault.${key}`, errors);
+		}
+	}
+}
+
+function validateTrialEvidence(value, definition, label, errors) {
+	if (!exactKeys(value, EVIDENCE_KEYS)) {
+		errors.push(`${label}: evidence must contain exactly ${EVIDENCE_KEYS.join(", ")}`);
+		return;
+	}
+	if (!exactKeys(value.browserErrors, BROWSER_ERROR_KEYS)) {
+		errors.push(`${label}: evidence.browserErrors must contain exactly ${BROWSER_ERROR_KEYS.join(", ")}`);
+	} else {
+		validateStringArray(value.browserErrors.console, `${label}: evidence.browserErrors.console`, errors);
+		validateStringArray(value.browserErrors.page, `${label}: evidence.browserErrors.page`, errors);
+	}
+	if (!isRecord(value.hardMetrics) || Object.keys(value.hardMetrics).length === 0) {
+		errors.push(`${label}: evidence.hardMetrics must be a non-empty finite-number record`);
+	} else {
+		for (const [metric, metricValue] of Object.entries(value.hardMetrics)) {
+			if (!isFiniteNumber(metricValue) || metricValue < 0) {
+				errors.push(`${label}: evidence.hardMetrics.${metric} must be a non-negative finite number`);
+			}
+		}
+	}
+	if (isRecoveryKind(definition.kind)) {
+		validateRecoveryTrialEvidence(value.recovery, definition, `${label}: evidence.recovery`, errors);
+	} else if (value.recovery !== null) {
+		errors.push(`${label}: non-recovery evidence.recovery must be null`);
+	}
+}
+
+function gatePolicy(metric) {
+	return GATE_METRIC_POLICY[metric] ?? "observe";
+}
+
+function evidenceForTrial(evidenceByTrial, result, trial) {
+	return evidenceByTrial.get(
+		`${scenarioKey({ domain: result.domain, id: result.scenarioId, variant: result.variant })}/${String(trial.index)}`,
+	);
+}
+
+function hardMetricValues(metric, result, trials, evidenceByTrial, errors) {
+	const values = [];
+	for (const trial of trials) {
+		const evidence = evidenceForTrial(evidenceByTrial, result, trial);
+		const value = evidence?.hardMetrics?.[metric];
+		if (!isFiniteNumber(value) || value < 0) {
+			errors.push(
+				`hard gate metric ${metric} requires authoritative raw evidence for trial ${String(trial.index)}`,
+			);
+			continue;
+		}
+		values.push({ trial, value });
+	}
+	return values;
+}
+
+function recoveryFailureCount(evidence, definition) {
+	if (!evidence?.recovery) return 0;
+	const value = evidence.recovery;
+	if (
+		!isRecord(value.authorityBefore) ||
+		!isRecord(value.authorityAfter) ||
+		!isRecord(value.sequence) ||
+		!Array.isArray(value.sequence.expected) ||
+		!Array.isArray(value.sequence.observed) ||
+		!isRecord(value.projection) ||
+		!isRecord(value.stale) ||
+		RECOVERY_STALE_KEYS.some((key) => !isRecord(value.stale[key])) ||
+		!isRecord(value.fault)
+	) {
+		return 1;
+	}
+	let failures = 0;
+	const before = value.authorityBefore;
+	const after = value.authorityAfter;
+	const sameIdentity =
+		before.workspaceHandle === after.workspaceHandle &&
+		before.workspacePath === after.workspacePath &&
+		before.sessionHandle === after.sessionHandle &&
+		before.nativeSessionId === after.nativeSessionId &&
+		before.sessionFile === after.sessionFile;
+	const identityChanged =
+		before.sessionHandle !== after.sessionHandle ||
+		before.nativeSessionId !== after.nativeSessionId ||
+		before.sessionFile !== after.sessionFile;
+	if (before.workspaceHandle !== after.workspaceHandle || before.workspacePath !== after.workspacePath)
+		failures += 1;
+	if (definition.kind === "recovery-rekey" ? !identityChanged : !sameIdentity) failures += 1;
+	if (
+		definition.kind === "recovery-gateway-restart"
+			? before.serverEpoch === after.serverEpoch
+			: before.serverEpoch !== after.serverEpoch
+	) {
+		failures += 1;
+	}
+	if (["recovery-crash", "recovery-rekey"].includes(definition.kind)) {
+		if (after.generation <= before.generation) failures += 1;
+	} else if (after.generation !== before.generation) {
+		failures += 1;
+	}
+	if (
+		!isDeepStrictEqual(value.sequence.expected, value.sequence.observed) ||
+		new Set(value.sequence.expected).size !== value.sequence.expected.length ||
+		value.sequence.expected.length === 0
+	) {
+		failures += 1;
+	}
+	if (value.projection.promptCount !== 1 || value.projection.replyCount !== 1) failures += 1;
+	const stale = value.stale;
+	if (
+		stale.generation.responseSuccess !== false ||
+		!stale.generation.responseError?.includes("session_generation_stale") ||
+		stale.generation.piCommandCountAfter !== stale.generation.piCommandCountBefore
+	)
+		failures += 1;
+	if (
+		stale.fence.responseSuccess !== false ||
+		!stale.fence.responseError?.includes("session_read_only") ||
+		stale.fence.piCommandCountAfter !== stale.fence.piCommandCountBefore
+	)
+		failures += 1;
+	if (
+		stale.epoch.responseType !== "resync_required" ||
+		stale.epoch.responseSuccess !== false ||
+		stale.epoch.piCommandCountAfter !== stale.epoch.piCommandCountBefore
+	)
+		failures += 1;
+	if (definition.kind === "recovery-rekey") {
+		if (
+			stale.parent.responseSuccess !== false ||
+			stale.parent.piCommandCountAfter !== stale.parent.piCommandCountBefore ||
+			!value.fault.oldParentRejected
+		) {
+			failures += 1;
+		}
+	} else if (stale.parent.responseType !== "not_applicable") {
+		failures += 1;
+	}
+	const fault = value.fault;
+	if (definition.kind === "recovery-disconnect") {
+		if (!fault.observed || fault.reconnectCount < 1) failures += 1;
+	} else if (definition.kind === "recovery-gap") {
+		if (!fault.observed || fault.gapResyncCount !== 1) failures += 1;
+	} else if (definition.kind === "recovery-crash") {
+		if (!fault.observed || fault.processRestartCount !== 1) failures += 1;
+	} else if (definition.kind === "recovery-rekey") {
+		if (!fault.observed || fault.rekeyFrameCount !== 1 || !fault.identityChanged) failures += 1;
+	} else if (
+		!fault.observed ||
+		!fault.stableOrigin ||
+		fault.gatewayStarts !== 1 ||
+		fault.activeGateways !== 1 ||
+		fault.ownedGatewayCount !== fault.gatewayStarts ||
+		fault.rootEntryCount > 8
+	) {
+		failures += 1;
+	}
+	return failures;
+}
+
+function validateGates(result, definition, trials, expectedSummaries, evidenceByTrial, errors) {
 	if (!Array.isArray(result.gates) || result.gates.length === 0) {
 		errors.push("gates must be a non-empty array");
 		return [];
@@ -611,27 +1027,46 @@ function validateGates(result, trials, expectedSummaries, errors) {
 		}
 		if (!COMPARISONS.has(gate.comparison)) errors.push(`gate ${key} comparison is invalid`);
 		if (!GATE_MODES.has(gate.mode)) errors.push(`gate ${key} mode is invalid`);
+		if (gate.mode === "hard" && gatePolicy(gate.metric) !== "hard") {
+			errors.push(`hard gate ${key} diagnostic metric ${gate.metric} must remain observe-only`);
+		}
 		if (!isFiniteNumber(gate.threshold)) errors.push(`gate ${key} threshold must be finite`);
 		if (typeof gate.rationale !== "string" || gate.rationale.length === 0) {
 			errors.push(`gate ${key} rationale must be non-empty`);
 		}
 
 		let expectedActual = gate.actual;
-		if (gate.statistic === "value") {
-			if (!isFiniteNumber(gate.actual)) errors.push(`gate ${key} actual must be finite`);
-			if (gate.metric === "correctnessFailures") {
-				expectedActual = trials.reduce(
-					(total, trial) =>
-						total +
-						(isRecord(trial?.correctness)
-							? Object.values(trial.correctness).filter((value) => value !== true).length
-							: 0),
-					0,
-				);
-				if (gate.actual !== expectedActual) {
-					errors.push(`correctnessFailures actual must be ${String(expectedActual)}`);
+		if (gate.mode === "hard") {
+			const authoritativeValues =
+				gate.metric === "browserErrors"
+					? []
+					: hardMetricValues(gate.metric, result, trials, evidenceByTrial, errors);
+			if (gate.metric === "browserErrors") {
+				expectedActual = 0;
+				for (const trial of trials) {
+					const evidence = evidenceForTrial(evidenceByTrial, result, trial);
+					if (!evidence) continue;
+					expectedActual += evidence.browserErrors.console.length + evidence.browserErrors.page.length;
+				}
+			} else if (gate.statistic === "value") {
+				if (authoritativeValues.length > 0) {
+					expectedActual =
+						gate.metric === "correctnessFailures"
+							? authoritativeValues.reduce((total, entry) => total + entry.value, 0)
+							: Math.max(...authoritativeValues.map((entry) => entry.value));
+				}
+			} else {
+				const measuredValues = authoritativeValues
+					.filter((entry) => entry.trial.warmup === false)
+					.map((entry) => entry.value);
+				if (measuredValues.length === definition.samples) {
+					expectedActual = summarize(measuredValues)[gate.statistic];
+				} else {
+					errors.push(`hard gate ${key} has incomplete authoritative raw evidence`);
 				}
 			}
+		} else if (gate.statistic === "value") {
+			if (!isFiniteNumber(gate.actual)) errors.push(`gate ${key} actual must be finite`);
 		} else {
 			const measured = trials.filter((trial) => isRecord(trial) && trial.warmup === false);
 			if (measured.some((trial) => !isRecord(trial.metrics) || !isFiniteNumber(trial.metrics[gate.metric]))) {
@@ -643,6 +1078,11 @@ function validateGates(result, trials, expectedSummaries, errors) {
 			} else if (gate.actual !== expectedActual) {
 				errors.push(`gate ${key} actual must be ${String(expectedActual)}`);
 			}
+		}
+		if (gate.mode === "hard" && !isFiniteNumber(expectedActual)) {
+			errors.push(`hard gate ${key} actual must be finite from authoritative raw evidence`);
+		} else if (gate.mode === "hard" && gate.actual !== expectedActual) {
+			errors.push(`gate ${key} actual must be ${String(expectedActual)}`);
 		}
 		const expectedPassed =
 			isFiniteNumber(expectedActual) && COMPARISONS.has(gate.comparison) && isFiniteNumber(gate.threshold)
@@ -657,7 +1097,7 @@ function validateGates(result, trials, expectedSummaries, errors) {
 	return validated;
 }
 
-function validateRecoveryResult(result, definition, trials, errors) {
+function validateRecoveryResult(result, definition, trials, evidenceByTrial, errors) {
 	const expectedKeys = [
 		"complete",
 		...RECOVERY_CORRECTNESS_KEYS,
@@ -669,6 +1109,12 @@ function validateRecoveryResult(result, definition, trials, errors) {
 			if (typeof trial.correctness[key] !== "boolean") {
 				errors.push(`trial ${String(index)} correctness.${key} must be boolean for recovery`);
 			}
+		}
+		const evidence = evidenceForTrial(evidenceByTrial, result, trial);
+		if (!evidence?.recovery) {
+			errors.push(`trial ${String(index)} recovery must include authoritative raw recovery evidence`);
+		} else if (recoveryFailureCount(evidence, definition) > 0) {
+			errors.push(`trial ${String(index)} recovery evidence failed authoritative recovery invariants`);
 		}
 	}
 	const correctnessGate = Array.isArray(result.gates)
@@ -685,19 +1131,9 @@ function validateRecoveryResult(result, definition, trials, errors) {
 	if (!correctnessGate) {
 		errors.push("recovery result must include a hard correctnessFailures=value eq 0 gate");
 	}
-	if (Array.isArray(result.gates)) {
-		for (const [index, gate] of result.gates.entries()) {
-			if (!isRecord(gate) || typeof gate.metric !== "string") continue;
-			if (isRecoveryDiagnosticMetric(gate.metric) && gate.mode === "hard") {
-				errors.push(
-					`recovery gate ${String(index)} diagnostic metric ${gate.metric} must remain observe-only`,
-				);
-			}
-		}
-	}
 }
 
-function validateResult(result, definition, tier, runId) {
+function validateResult(result, definition, tier, runId, evidenceByTrial) {
 	const errors = [];
 	if (!exactKeys(result, RESULT_KEYS)) errors.push(`result must contain exactly ${RESULT_KEYS.join(", ")}`);
 	if (!isRecord(result)) return errors;
@@ -734,8 +1170,9 @@ function validateResult(result, definition, tier, runId) {
 
 	const { trials, summaries } = validateTrials(result, definition, errors);
 	validateSummaries(result, summaries, errors);
-	const gates = validateGates(result, trials, summaries, errors);
-	if (isRecoveryKind(definition.kind)) validateRecoveryResult(result, definition, trials, errors);
+	const gates = validateGates(result, definition, trials, summaries, evidenceByTrial, errors);
+	if (isRecoveryKind(definition.kind))
+		validateRecoveryResult(result, definition, trials, evidenceByTrial, errors);
 	const recordedErrors = Array.isArray(result.errors) ? result.errors : [];
 	if (recordedErrors.length > 0) errors.push("result errors must be empty in a complete formal result");
 	if (gates.some((gate) => gate.mode === "hard" && gate.recomputedPassed !== true)) {
@@ -750,9 +1187,10 @@ function scenarioKey({ domain, id, variant }) {
 }
 
 function validateRawArtifacts(rawArtifacts, results, errors) {
+	const evidenceByTrial = new Map();
 	if (!Array.isArray(rawArtifacts)) {
 		errors.push("raw artifacts must be an array");
-		return;
+		return evidenceByTrial;
 	}
 	const expected = new Map();
 	for (const result of results) {
@@ -789,6 +1227,7 @@ function validateRawArtifacts(rawArtifacts, results, errors) {
 			continue;
 		}
 		const result = expectedEntry.result;
+		validateTrialEvidence(value.evidence, { kind: result.kind }, label, errors);
 		for (const field of [
 			"schemaVersion",
 			"suiteVersion",
@@ -811,10 +1250,12 @@ function validateRawArtifacts(rawArtifacts, results, errors) {
 		if (!isDeepStrictEqual(value.trial, expectedEntry.trial)) {
 			errors.push(`${label}: raw trial must match its scenario result`);
 		}
+		if (isRecord(value.evidence)) evidenceByTrial.set(indexedKey, value.evidence);
 	}
 	for (const key of expected.keys()) {
 		if (!seen.has(key)) errors.push(`missing raw trial: ${key}`);
 	}
+	return evidenceByTrial;
 }
 
 function validateManifest(manifest, matrix, tier, runId, results, errors) {
@@ -863,6 +1304,17 @@ function validateManifest(manifest, matrix, tier, runId, results, errors) {
 	if (!isRecord(manifest.fixtureHashes) || Object.keys(manifest.fixtureHashes).length === 0) {
 		errors.push("manifest fixtureHashes must be a non-empty record");
 	} else {
+		const expectedFixtureHashes = Object.fromEntries(
+			BENCHMARK_PRODUCER_PATHS.map((relativePath) => [
+				relativePath,
+				sha256File(path.join(repositoryRoot, relativePath)),
+			]),
+		);
+		if (!isDeepStrictEqual(manifest.fixtureHashes, expectedFixtureHashes)) {
+			errors.push(
+				`manifest fixtureHashes must exactly match the shared producer set: ${BENCHMARK_PRODUCER_PATHS.join(", ")}`,
+			);
+		}
 		for (const [name, value] of Object.entries(manifest.fixtureHashes)) {
 			if (!validHash(value)) errors.push(`manifest fixtureHashes.${name} must be a SHA-256 hash`);
 		}
@@ -1041,10 +1493,11 @@ export function validateBenchmarkArtifacts({
 	const errors = [];
 	if (tier !== "representative" && tier !== "stress") errors.push("tier must be representative or stress");
 	if (!validRunId(runId)) errors.push("runId must be a safe artifact directory name");
-	validateRecoveryMatrixDomain(matrix?.domains, tier, errors);
+	validateRecoveryMatrixDomain(matrix, tier, errors);
+	validateMatrixProjection(matrix, tier, errors);
 	const expectedScenarios = matrixScenarios(matrix, tier, errors);
 	const definitions = new Map();
-	for (const scenario of expectedScenarios) definitions.set(scenario.id, scenario);
+	for (const scenario of expectedScenarios) definitions.set(`${scenario.domain}/${scenario.id}`, scenario);
 
 	if (!Array.isArray(artifacts) || artifacts.length === 0)
 		errors.push("scenario artifacts must be a non-empty array");
@@ -1072,12 +1525,14 @@ export function validateBenchmarkArtifacts({
 	}
 	for (const key of new Set(artifactKeys)) {
 		const [domain, id, variant] = key.split("/");
-		const definition = definitions.get(id);
+		const definition = definitions.get(`${domain}/${id}`);
 		if (!definition || definition.domain !== domain || !variants.has(variant)) {
 			errors.push(`unexpected scenario artifact: ${key}`);
 		}
 	}
 
+	const artifactValues = artifactList.map((artifact) => artifact.value).filter(isRecord);
+	const evidenceByTrial = validateRawArtifacts(rawArtifacts, artifactValues, errors);
 	const results = [];
 	for (const artifact of artifactList) {
 		const label = typeof artifact?.name === "string" ? artifact.name : "artifact";
@@ -1085,14 +1540,16 @@ export function validateBenchmarkArtifacts({
 			errors.push(`${label}: artifact must be a record`);
 			continue;
 		}
-		const definition = definitions.get(artifact.value.scenarioId);
+		const definition = definitions.get(`${artifact.value.domain}/${artifact.value.scenarioId}`);
 		if (!definition) continue;
-		const resultErrors = validateResult(artifact.value, definition, tier, runId);
+		const expectedResultName = `${artifact.value.scenarioId}/${artifact.value.variant}.result.json`;
+		if (label !== expectedResultName) {
+			errors.push(`${label}: result artifact path must be ${expectedResultName}`);
+		}
+		const resultErrors = validateResult(artifact.value, definition, tier, runId, evidenceByTrial);
 		for (const error of resultErrors) errors.push(`${label}: ${error}`);
 		if (resultErrors.length === 0) results.push(artifact.value);
 	}
-	const artifactValues = artifactList.map((artifact) => artifact.value).filter(isRecord);
-	validateRawArtifacts(rawArtifacts, artifactValues, errors);
 	validateManifest(manifest, matrix, tier, runId, artifactValues, errors);
 	validateEnvironment(environment, runId, artifactValues, errors);
 	if (!Number.isInteger(playwrightExitCode)) errors.push("Playwright exit code must be an integer");
