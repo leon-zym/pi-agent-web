@@ -72,7 +72,8 @@ The reference baseline is calibrated from two consecutive, fully passing formal 
 
 | Property | Run 1 | Run 2 |
 | :--- | :--- | :--- |
-| **Run ID** | `2026-09-06t092520783z-p2855-0d8e6b58` | `2026-09-06t093154444z-p3070-f9e18071` |
+| **GitHub Actions Run ID** | `34024571730` | `34024886062` |
+| **Suite Run ID** | `2026-09-06t092520783z-p2855-0d8e6b58` | `2026-09-06t093154444z-p3070-f9e18071` |
 | **Commit** | `8313132` (`8313132cf57c060cbd5f4c6ed0e318bd02b8d430`) | `e59adfc` (`e59adfc2fe8a848d07f9756e6dd8eadbba40802e`) |
 | **Timestamp** | 2026-09-06T09:24:42Z | 2026-09-06T09:31:17Z |
 | **Trials** | 22 / 22 passed | 22 / 22 passed |
