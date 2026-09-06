@@ -518,8 +518,8 @@ function matrixScopeIsCurrent(scope) {
 		exactKeys(scope, MATRIX_SCOPE_KEYS) &&
 		scope.issue === 28 &&
 		scope.phase === 1 &&
-		scope.status === "incomplete" &&
-		scope.label === "#28 Phase 1 / incomplete"
+		scope.status === "complete" &&
+		scope.label === "#28 Phase 1 / complete"
 	);
 }
 
@@ -611,7 +611,7 @@ function validateCanonicalMatrix(matrix, errors) {
 	if (matrix.schemaVersion !== BENCHMARK_SCHEMA_VERSION) {
 		errors.push(`matrix: schemaVersion must be ${String(BENCHMARK_SCHEMA_VERSION)}`);
 	}
-	if (!matrixScopeIsCurrent(matrix.scope)) errors.push("matrix: scope must declare #28 Phase 1 / incomplete");
+	if (!matrixScopeIsCurrent(matrix.scope)) errors.push("matrix: scope must declare #28 Phase 1 / complete");
 	if (
 		!Array.isArray(matrix.knownCoverageGaps) ||
 		matrix.knownCoverageGaps.some((gap) => typeof gap !== "string")
@@ -735,7 +735,7 @@ export function loadBenchmarkMatrix(matrixPath = defaultMatrixPath) {
 		errors.push(`matrix: schemaVersion must be ${String(BENCHMARK_SCHEMA_VERSION)}`);
 	}
 	if (!matrixScopeIsCurrent(root?.scope)) {
-		errors.push("matrix: scope must declare #28 Phase 1 / incomplete");
+		errors.push("matrix: scope must declare #28 Phase 1 / complete");
 	}
 	if (
 		!Array.isArray(root?.knownCoverageGaps) ||
@@ -867,7 +867,7 @@ function matrixScenarios(matrix, tier, errors) {
 		errors.push("matrix: only the canonical loadBenchmarkMatrix projection is accepted");
 		return [];
 	}
-	if (!matrixScopeIsCurrent(matrix.scope)) errors.push("matrix: scope must declare #28 Phase 1 / incomplete");
+	if (!matrixScopeIsCurrent(matrix.scope)) errors.push("matrix: scope must declare #28 Phase 1 / complete");
 	const selected = isRecord(matrix.tiers) ? matrix.tiers[tier] : undefined;
 	if (!isRecord(selected) || !Array.isArray(selected.scenarios)) {
 		errors.push(`matrix: tier ${tier} must contain a scenarios array`);

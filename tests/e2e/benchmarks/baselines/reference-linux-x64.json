@@ -1,0 +1,1223 @@
+{
+	"profileId": "linux-x64-gh-standard",
+	"os": "linux",
+	"kernel": "6.17.0-1022-azure",
+	"cpu": {
+		"models": ["INTEL(R) XEON(R) PLATINUM 8573C", "AMD EPYC 7763 64-Core Processor"],
+		"logicalCount": 4
+	},
+	"memory": {
+		"approxGiB": 16
+	},
+	"toolchain": {
+		"node": "v22.23.2",
+		"pnpm": "11.21.0",
+		"playwright": "Version 1.62.1",
+		"chromium": "151.0.7922.34"
+	},
+	"provenanceRuns": [
+		{
+			"runId": "2026-09-06t092520783z-p2855-0d8e6b58",
+			"commit": "8313132cf57c060cbd5f4c6ed0e318bd02b8d430",
+			"timestamp": "2026-09-06T09:24:42Z",
+			"trialCount": 22,
+			"validationErrors": 0
+		},
+		{
+			"runId": "2026-09-06t093154444z-p3070-f9e18071",
+			"commit": "e59adfc2fe8a848d07f9756e6dd8eadbba40802e",
+			"timestamp": "2026-09-06T09:31:17Z",
+			"trialCount": 22,
+			"validationErrors": 0
+		}
+	],
+	"formula": "threshold = Math.round((max(median_1, median_2) * 1.5 + floor) * 100) / 100; floor = isBytes ? 5MB : 50ms",
+	"scenarios": {
+		"concurrency:sessions-1:coalesced": {
+			"domain": "concurrency",
+			"scenarioId": "sessions-1",
+			"variant": "coalesced",
+			"metrics": {
+				"aggregateDeltaPerSecond": {
+					"run1Median": 87.71929824561404,
+					"run2Median": 86.36200071968334,
+					"maxMedian": 87.71929824561404,
+					"threshold": 181.58
+				},
+				"backgroundIngestCheckpointDeficit": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"browserFrameArrivalGapMs": {
+					"run1Median": 50.19999999999709,
+					"run2Median": 50.10000000000582,
+					"maxMedian": 50.19999999999709,
+					"threshold": 125.3
+				},
+				"browserProjectionCheckpointDeficit": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"browserProjectionLagMs": {
+					"run1Median": 152,
+					"run2Median": 351.5,
+					"maxMedian": 351.5,
+					"threshold": 577.25
+				},
+				"completionSkewMs": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"durationSkewMs": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"inputToNextPaintMs": {
+					"run1Median": 508,
+					"run2Median": 693.6999999999825,
+					"maxMedian": 693.6999999999825,
+					"threshold": 1090.55
+				},
+				"inputToPublicationMs": {
+					"run1Median": 492,
+					"run2Median": 678.5,
+					"maxMedian": 678.5,
+					"threshold": 1067.75
+				},
+				"liveLongTaskMaxMs": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"liveLongTasksOver50Ms": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"producerProgressGapMs": {
+					"run1Median": 251,
+					"run2Median": 250,
+					"maxMedian": 251,
+					"threshold": 426.5
+				},
+				"publicationBatches": {
+					"run1Median": 147,
+					"run2Median": 137,
+					"maxMedian": 147,
+					"threshold": 270.5
+				},
+				"settlementMs": {
+					"run1Median": 524.6999999999971,
+					"run2Median": 596.3999999999942,
+					"maxMedian": 596.3999999999942,
+					"threshold": 944.6
+				},
+				"streamDurationMs": {
+					"run1Median": 3333.800000000003,
+					"run2Median": 3676.9000000000233,
+					"maxMedian": 3676.9000000000233,
+					"threshold": 5565.35
+				},
+				"totalCompletionMs": {
+					"run1Median": 3858.5,
+					"run2Median": 4265,
+					"maxMedian": 4265,
+					"threshold": 6447.5
+				},
+				"turnNodes": {
+					"run1Median": 3,
+					"run2Median": 3,
+					"maxMedian": 3,
+					"threshold": 54.5
+				}
+			}
+		},
+		"concurrency:sessions-1:sequential": {
+			"domain": "concurrency",
+			"scenarioId": "sessions-1",
+			"variant": "sequential",
+			"metrics": {
+				"aggregateDeltaPerSecond": {
+					"run1Median": 87.87989747345294,
+					"run2Median": 87.49544294567991,
+					"maxMedian": 87.87989747345294,
+					"threshold": 181.82
+				},
+				"backgroundIngestCheckpointDeficit": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"browserFrameArrivalGapMs": {
+					"run1Median": 50.10000000000582,
+					"run2Median": 50.100000000034925,
+					"maxMedian": 50.100000000034925,
+					"threshold": 125.15
+				},
+				"browserProjectionCheckpointDeficit": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"browserProjectionLagMs": {
+					"run1Median": 185.69999999998254,
+					"run2Median": 282.29999999998836,
+					"maxMedian": 282.29999999998836,
+					"threshold": 473.45
+				},
+				"completionSkewMs": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"durationSkewMs": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"inputToNextPaintMs": {
+					"run1Median": 492,
+					"run2Median": 513.7000000000116,
+					"maxMedian": 513.7000000000116,
+					"threshold": 820.55
+				},
+				"inputToPublicationMs": {
+					"run1Median": 487.29999999998836,
+					"run2Median": 507.5999999999767,
+					"maxMedian": 507.5999999999767,
+					"threshold": 811.4
+				},
+				"liveLongTaskMaxMs": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"liveLongTasksOver50Ms": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"producerProgressGapMs": {
+					"run1Median": 250,
+					"run2Median": 250,
+					"maxMedian": 250,
+					"threshold": 425
+				},
+				"publicationBatches": {
+					"run1Median": 240,
+					"run2Median": 240,
+					"maxMedian": 240,
+					"threshold": 410
+				},
+				"settlementMs": {
+					"run1Median": 528.3999999999942,
+					"run2Median": 602,
+					"maxMedian": 602,
+					"threshold": 953
+				},
+				"streamDurationMs": {
+					"run1Median": 3360.100000000006,
+					"run2Median": 3628.4000000000233,
+					"maxMedian": 3628.4000000000233,
+					"threshold": 5492.6
+				},
+				"totalCompletionMs": {
+					"run1Median": 3888.5,
+					"run2Median": 4259.799999999988,
+					"maxMedian": 4259.799999999988,
+					"threshold": 6439.7
+				},
+				"turnNodes": {
+					"run1Median": 3,
+					"run2Median": 3,
+					"maxMedian": 3,
+					"threshold": 54.5
+				}
+			}
+		},
+		"concurrency:sessions-4:coalesced": {
+			"domain": "concurrency",
+			"scenarioId": "sessions-4",
+			"variant": "coalesced",
+			"metrics": {
+				"aggregateDeltaPerSecond": {
+					"run1Median": 345.5723542116631,
+					"run2Median": 342.9796355841372,
+					"maxMedian": 345.5723542116631,
+					"threshold": 568.36
+				},
+				"backgroundIngestCheckpointDeficit": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"browserFrameArrivalGapMs": {
+					"run1Median": 191,
+					"run2Median": 217.29999999998836,
+					"maxMedian": 217.29999999998836,
+					"threshold": 375.95
+				},
+				"browserProjectionCheckpointDeficit": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"browserProjectionLagMs": {
+					"run1Median": 1812.8999999999942,
+					"run2Median": 3064.6999999999825,
+					"maxMedian": 3064.6999999999825,
+					"threshold": 4647.05
+				},
+				"completionSkewMs": {
+					"run1Median": 26,
+					"run2Median": 27,
+					"maxMedian": 27,
+					"threshold": 90.5
+				},
+				"durationSkewMs": {
+					"run1Median": 12,
+					"run2Median": 14,
+					"maxMedian": 14,
+					"threshold": 71
+				},
+				"inputToNextPaintMs": {
+					"run1Median": 1698.1000000000058,
+					"run2Median": 2155,
+					"maxMedian": 2155,
+					"threshold": 3282.5
+				},
+				"inputToPublicationMs": {
+					"run1Median": 1682.199999999997,
+					"run2Median": 2139.3000000000175,
+					"maxMedian": 2139.3000000000175,
+					"threshold": 3258.95
+				},
+				"liveLongTaskMaxMs": {
+					"run1Median": 168,
+					"run2Median": 200,
+					"maxMedian": 200,
+					"threshold": 350
+				},
+				"liveLongTasksOver50Ms": {
+					"run1Median": 12,
+					"run2Median": 12,
+					"maxMedian": 12,
+					"threshold": 68
+				},
+				"producerProgressGapMs": {
+					"run1Median": 251,
+					"run2Median": 251,
+					"maxMedian": 251,
+					"threshold": 426.5
+				},
+				"publicationBatches": {
+					"run1Median": 115,
+					"run2Median": 92,
+					"maxMedian": 115,
+					"threshold": 222.5
+				},
+				"settlementMs": {
+					"run1Median": 1727.300000000003,
+					"run2Median": 2041.3000000000175,
+					"maxMedian": 2041.3000000000175,
+					"threshold": 3111.95
+				},
+				"streamDurationMs": {
+					"run1Median": 6007.300000000003,
+					"run2Median": 7818,
+					"maxMedian": 7818,
+					"threshold": 11777
+				},
+				"totalCompletionMs": {
+					"run1Median": 7734.600000000006,
+					"run2Median": 9859.300000000017,
+					"maxMedian": 9859.300000000017,
+					"threshold": 14838.95
+				},
+				"turnNodes": {
+					"run1Median": 3,
+					"run2Median": 3,
+					"maxMedian": 3,
+					"threshold": 54.5
+				}
+			}
+		},
+		"concurrency:sessions-4:sequential": {
+			"domain": "concurrency",
+			"scenarioId": "sessions-4",
+			"variant": "sequential",
+			"metrics": {
+				"aggregateDeltaPerSecond": {
+					"run1Median": 344.58004307250536,
+					"run2Median": 343.3476394849785,
+					"maxMedian": 344.58004307250536,
+					"threshold": 566.87
+				},
+				"backgroundIngestCheckpointDeficit": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"browserFrameArrivalGapMs": {
+					"run1Median": 168.60000000003492,
+					"run2Median": 263.6000000000349,
+					"maxMedian": 263.6000000000349,
+					"threshold": 445.4
+				},
+				"browserProjectionCheckpointDeficit": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"browserProjectionLagMs": {
+					"run1Median": 1710.7000000000116,
+					"run2Median": 3360,
+					"maxMedian": 3360,
+					"threshold": 5090
+				},
+				"completionSkewMs": {
+					"run1Median": 35,
+					"run2Median": 20,
+					"maxMedian": 35,
+					"threshold": 102.5
+				},
+				"durationSkewMs": {
+					"run1Median": 24,
+					"run2Median": 9,
+					"maxMedian": 24,
+					"threshold": 86
+				},
+				"inputToNextPaintMs": {
+					"run1Median": 1702.7999999999884,
+					"run2Median": 2225.7999999999884,
+					"maxMedian": 2225.7999999999884,
+					"threshold": 3388.7
+				},
+				"inputToPublicationMs": {
+					"run1Median": 1693.2000000000116,
+					"run2Median": 2218.7000000000116,
+					"maxMedian": 2218.7000000000116,
+					"threshold": 3378.05
+				},
+				"liveLongTaskMaxMs": {
+					"run1Median": 161,
+					"run2Median": 233,
+					"maxMedian": 233,
+					"threshold": 399.5
+				},
+				"liveLongTasksOver50Ms": {
+					"run1Median": 12,
+					"run2Median": 12,
+					"maxMedian": 12,
+					"threshold": 68
+				},
+				"producerProgressGapMs": {
+					"run1Median": 251,
+					"run2Median": 251,
+					"maxMedian": 251,
+					"threshold": 426.5
+				},
+				"publicationBatches": {
+					"run1Median": 248,
+					"run2Median": 247,
+					"maxMedian": 248,
+					"threshold": 422
+				},
+				"settlementMs": {
+					"run1Median": 1696.2999999999884,
+					"run2Median": 2224.600000000035,
+					"maxMedian": 2224.600000000035,
+					"threshold": 3386.9
+				},
+				"streamDurationMs": {
+					"run1Median": 6090.600000000035,
+					"run2Median": 8274.099999999977,
+					"maxMedian": 8274.099999999977,
+					"threshold": 12461.15
+				},
+				"totalCompletionMs": {
+					"run1Median": 7786.900000000023,
+					"run2Median": 10498.700000000012,
+					"maxMedian": 10498.700000000012,
+					"threshold": 15798.05
+				},
+				"turnNodes": {
+					"run1Median": 3,
+					"run2Median": 3,
+					"maxMedian": 3,
+					"threshold": 54.5
+				}
+			}
+		},
+		"content:content-roundtrip:coalesced": {
+			"domain": "content",
+			"scenarioId": "content-roundtrip",
+			"variant": "coalesced",
+			"metrics": {
+				"heapDeltaBytes": {
+					"run1Median": 12107635,
+					"run2Median": 1293338,
+					"maxMedian": 12107635,
+					"threshold": 23404332.5
+				},
+				"inputBase64Chars": {
+					"run1Median": 1493336,
+					"run2Median": 1493336,
+					"maxMedian": 1493336,
+					"threshold": 2240054
+				},
+				"maxReceivedFrameBytes": {
+					"run1Median": 992,
+					"run2Median": 992,
+					"maxMedian": 992,
+					"threshold": 5244368
+				},
+				"maxSentFrameBytes": {
+					"run1Median": 1493655,
+					"run2Median": 1493655,
+					"maxMedian": 1493655,
+					"threshold": 7483362.5
+				},
+				"roundTripMs": {
+					"run1Median": 489.6000000000058,
+					"run2Median": 510.30000000001746,
+					"maxMedian": 510.30000000001746,
+					"threshold": 815.45
+				},
+				"selectionMs": {
+					"run1Median": 254.10000000000582,
+					"run2Median": 357.19999999998254,
+					"maxMedian": 357.19999999998254,
+					"threshold": 585.8
+				}
+			}
+		},
+		"content:content-roundtrip:sequential": {
+			"domain": "content",
+			"scenarioId": "content-roundtrip",
+			"variant": "sequential",
+			"metrics": {
+				"heapDeltaBytes": {
+					"run1Median": -12268167,
+					"run2Median": 1256834,
+					"maxMedian": 1256834,
+					"threshold": 7128131
+				},
+				"inputBase64Chars": {
+					"run1Median": 1493336,
+					"run2Median": 1493336,
+					"maxMedian": 1493336,
+					"threshold": 2240054
+				},
+				"maxReceivedFrameBytes": {
+					"run1Median": 992,
+					"run2Median": 992,
+					"maxMedian": 992,
+					"threshold": 5244368
+				},
+				"maxSentFrameBytes": {
+					"run1Median": 1493655,
+					"run2Median": 1493655,
+					"maxMedian": 1493655,
+					"threshold": 7483362.5
+				},
+				"roundTripMs": {
+					"run1Median": 496.79999999998836,
+					"run2Median": 522.1000000000349,
+					"maxMedian": 522.1000000000349,
+					"threshold": 833.15
+				},
+				"selectionMs": {
+					"run1Median": 295.79999999998836,
+					"run2Median": 299.8999999999651,
+					"maxMedian": 299.8999999999651,
+					"threshold": 499.85
+				}
+			}
+		},
+		"history:history-65m:coalesced": {
+			"domain": "history",
+			"scenarioId": "history-65m",
+			"variant": "coalesced",
+			"metrics": {
+				"firstPageMs": {
+					"run1Median": 11656.5,
+					"run2Median": 14077.899999999994,
+					"maxMedian": 14077.899999999994,
+					"threshold": 21166.85
+				},
+				"heapDeltaBytes": {
+					"run1Median": 212161238,
+					"run2Median": 306561535,
+					"maxMedian": 306561535,
+					"threshold": 465085182.5
+				},
+				"mountedTurnNodes": {
+					"run1Median": 64,
+					"run2Median": 64,
+					"maxMedian": 64,
+					"threshold": 146
+				},
+				"nextPageMs": {
+					"run1Median": 11515.5,
+					"run2Median": 14857.800000000017,
+					"maxMedian": 14857.800000000017,
+					"threshold": 22336.7
+				},
+				"sourceBytes": {
+					"run1Median": 68157440,
+					"run2Median": 68157440,
+					"maxMedian": 68157440,
+					"threshold": 107479040
+				}
+			}
+		},
+		"history:history-65m:sequential": {
+			"domain": "history",
+			"scenarioId": "history-65m",
+			"variant": "sequential",
+			"metrics": {
+				"firstPageMs": {
+					"run1Median": 14638.200000000012,
+					"run2Median": 14364.299999999988,
+					"maxMedian": 14638.200000000012,
+					"threshold": 22007.3
+				},
+				"heapDeltaBytes": {
+					"run1Median": 614216425,
+					"run2Median": 416462090,
+					"maxMedian": 614216425,
+					"threshold": 926567517.5
+				},
+				"mountedTurnNodes": {
+					"run1Median": 64,
+					"run2Median": 64,
+					"maxMedian": 64,
+					"threshold": 146
+				},
+				"nextPageMs": {
+					"run1Median": 11576.700000000012,
+					"run2Median": 14971.799999999988,
+					"maxMedian": 14971.799999999988,
+					"threshold": 22507.7
+				},
+				"sourceBytes": {
+					"run1Median": 68157440,
+					"run2Median": 68157440,
+					"maxMedian": 68157440,
+					"threshold": 107479040
+				}
+			}
+		},
+		"recovery:recovery-gateway-restart:coalesced": {
+			"domain": "recovery",
+			"scenarioId": "recovery-gateway-restart",
+			"variant": "coalesced",
+			"metrics": {
+				"activeGateways": {
+					"run1Median": 1,
+					"run2Median": 1,
+					"maxMedian": 1,
+					"threshold": 51.5
+				},
+				"baselineFrames": {
+					"run1Median": 98,
+					"run2Median": 98,
+					"maxMedian": 98,
+					"threshold": 197
+				},
+				"gatewayRestartMs": {
+					"run1Median": 788,
+					"run2Median": 1115,
+					"maxMedian": 1115,
+					"threshold": 1722.5
+				},
+				"gatewayStarts": {
+					"run1Median": 1,
+					"run2Median": 1,
+					"maxMedian": 1,
+					"threshold": 51.5
+				},
+				"rootEntryCount": {
+					"run1Median": 6,
+					"run2Median": 6,
+					"maxMedian": 6,
+					"threshold": 59
+				}
+			}
+		},
+		"recovery:recovery-gateway-restart:sequential": {
+			"domain": "recovery",
+			"scenarioId": "recovery-gateway-restart",
+			"variant": "sequential",
+			"metrics": {
+				"activeGateways": {
+					"run1Median": 1,
+					"run2Median": 1,
+					"maxMedian": 1,
+					"threshold": 51.5
+				},
+				"baselineFrames": {
+					"run1Median": 98,
+					"run2Median": 98,
+					"maxMedian": 98,
+					"threshold": 197
+				},
+				"gatewayRestartMs": {
+					"run1Median": 791,
+					"run2Median": 1116,
+					"maxMedian": 1116,
+					"threshold": 1724
+				},
+				"gatewayStarts": {
+					"run1Median": 1,
+					"run2Median": 1,
+					"maxMedian": 1,
+					"threshold": 51.5
+				},
+				"rootEntryCount": {
+					"run1Median": 6,
+					"run2Median": 6,
+					"maxMedian": 6,
+					"threshold": 59
+				}
+			}
+		},
+		"recovery:recovery-pi-crash:coalesced": {
+			"domain": "recovery",
+			"scenarioId": "recovery-pi-crash",
+			"variant": "coalesced",
+			"metrics": {
+				"processRestartMs": {
+					"run1Median": 558,
+					"run2Median": 569,
+					"maxMedian": 569,
+					"threshold": 903.5
+				},
+				"processStarts": {
+					"run1Median": 1,
+					"run2Median": 1,
+					"maxMedian": 1,
+					"threshold": 51.5
+				},
+				"recoveryMs": {
+					"run1Median": 1392,
+					"run2Median": 1273,
+					"maxMedian": 1392,
+					"threshold": 2138
+				}
+			}
+		},
+		"recovery:recovery-pi-crash:sequential": {
+			"domain": "recovery",
+			"scenarioId": "recovery-pi-crash",
+			"variant": "sequential",
+			"metrics": {
+				"processRestartMs": {
+					"run1Median": 557,
+					"run2Median": 564,
+					"maxMedian": 564,
+					"threshold": 896
+				},
+				"processStarts": {
+					"run1Median": 1,
+					"run2Median": 1,
+					"maxMedian": 1,
+					"threshold": 51.5
+				},
+				"recoveryMs": {
+					"run1Median": 1393,
+					"run2Median": 1371,
+					"maxMedian": 1393,
+					"threshold": 2139.5
+				}
+			}
+		},
+		"recovery:recovery-replay-gap:coalesced": {
+			"domain": "recovery",
+			"scenarioId": "recovery-replay-gap",
+			"variant": "coalesced",
+			"metrics": {
+				"gapResyncFrames": {
+					"run1Median": 1,
+					"run2Median": 1,
+					"maxMedian": 1,
+					"threshold": 51.5
+				},
+				"reconnectedSockets": {
+					"run1Median": 1,
+					"run2Median": 1,
+					"maxMedian": 1,
+					"threshold": 51.5
+				},
+				"recoveryMs": {
+					"run1Median": 984.2999999999884,
+					"run2Median": 991.2000000000116,
+					"maxMedian": 991.2000000000116,
+					"threshold": 1536.8
+				}
+			}
+		},
+		"recovery:recovery-replay-gap:sequential": {
+			"domain": "recovery",
+			"scenarioId": "recovery-replay-gap",
+			"variant": "sequential",
+			"metrics": {
+				"gapResyncFrames": {
+					"run1Median": 1,
+					"run2Median": 1,
+					"maxMedian": 1,
+					"threshold": 51.5
+				},
+				"reconnectedSockets": {
+					"run1Median": 1,
+					"run2Median": 1,
+					"maxMedian": 1,
+					"threshold": 51.5
+				},
+				"recoveryMs": {
+					"run1Median": 990.4000000000233,
+					"run2Median": 986.2000000000116,
+					"maxMedian": 990.4000000000233,
+					"threshold": 1535.6
+				}
+			}
+		},
+		"recovery:recovery-session-rekey:coalesced": {
+			"domain": "recovery",
+			"scenarioId": "recovery-session-rekey",
+			"variant": "coalesced",
+			"metrics": {
+				"childGeneration": {
+					"run1Median": 2,
+					"run2Median": 2,
+					"maxMedian": 2,
+					"threshold": 53
+				},
+				"rekeyFrames": {
+					"run1Median": 1,
+					"run2Median": 1,
+					"maxMedian": 1,
+					"threshold": 51.5
+				},
+				"rekeyMs": {
+					"run1Median": 538,
+					"run2Median": 666,
+					"maxMedian": 666,
+					"threshold": 1049
+				}
+			}
+		},
+		"recovery:recovery-session-rekey:sequential": {
+			"domain": "recovery",
+			"scenarioId": "recovery-session-rekey",
+			"variant": "sequential",
+			"metrics": {
+				"childGeneration": {
+					"run1Median": 2,
+					"run2Median": 2,
+					"maxMedian": 2,
+					"threshold": 53
+				},
+				"rekeyFrames": {
+					"run1Median": 1,
+					"run2Median": 1,
+					"maxMedian": 1,
+					"threshold": 51.5
+				},
+				"rekeyMs": {
+					"run1Median": 637,
+					"run2Median": 694,
+					"maxMedian": 694,
+					"threshold": 1091
+				}
+			}
+		},
+		"recovery:recovery-websocket-disconnect:coalesced": {
+			"domain": "recovery",
+			"scenarioId": "recovery-websocket-disconnect",
+			"variant": "coalesced",
+			"metrics": {
+				"reconnectedSockets": {
+					"run1Median": 1,
+					"run2Median": 1,
+					"maxMedian": 1,
+					"threshold": 51.5
+				},
+				"recoveryMs": {
+					"run1Median": 991.8000000000175,
+					"run2Median": 993.2000000000116,
+					"maxMedian": 993.2000000000116,
+					"threshold": 1539.8
+				},
+				"replayFrames": {
+					"run1Median": 12,
+					"run2Median": 12,
+					"maxMedian": 12,
+					"threshold": 68
+				}
+			}
+		},
+		"recovery:recovery-websocket-disconnect:sequential": {
+			"domain": "recovery",
+			"scenarioId": "recovery-websocket-disconnect",
+			"variant": "sequential",
+			"metrics": {
+				"reconnectedSockets": {
+					"run1Median": 1,
+					"run2Median": 1,
+					"maxMedian": 1,
+					"threshold": 51.5
+				},
+				"recoveryMs": {
+					"run1Median": 992.7000000000116,
+					"run2Median": 905.3000000000466,
+					"maxMedian": 992.7000000000116,
+					"threshold": 1539.05
+				},
+				"replayFrames": {
+					"run1Median": 12,
+					"run2Median": 12,
+					"maxMedian": 12,
+					"threshold": 68
+				}
+			}
+		},
+		"streaming:stream-120k:coalesced": {
+			"domain": "streaming",
+			"scenarioId": "stream-120k",
+			"variant": "coalesced",
+			"metrics": {
+				"deltaCount": {
+					"run1Median": 480,
+					"run2Median": 480,
+					"maxMedian": 480,
+					"threshold": 770
+				},
+				"inputToNextPaintMs": {
+					"run1Median": 352.6000000000058,
+					"run2Median": 386.9000000000233,
+					"maxMedian": 386.9000000000233,
+					"threshold": 630.35
+				},
+				"inputToPublicationMs": {
+					"run1Median": 336.6000000000058,
+					"run2Median": 371.1000000000349,
+					"maxMedian": 371.1000000000349,
+					"threshold": 606.65
+				},
+				"liveLongTaskMaxMs": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"liveLongTasksOver50Ms": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"publicationBatches": {
+					"run1Median": 19,
+					"run2Median": 14,
+					"maxMedian": 19,
+					"threshold": 78.5
+				},
+				"publicationRatio": {
+					"run1Median": 0.03958333333333333,
+					"run2Median": 0.029166666666666667,
+					"maxMedian": 0.03958333333333333,
+					"threshold": 50.06
+				},
+				"settlementMs": {
+					"run1Median": 592.3000000000175,
+					"run2Median": 651.9000000000233,
+					"maxMedian": 651.9000000000233,
+					"threshold": 1027.85
+				},
+				"streamDurationMs": {
+					"run1Median": 1252.6000000000058,
+					"run2Median": 1490,
+					"maxMedian": 1490,
+					"threshold": 2285
+				},
+				"structuralDomTransitionMs": {
+					"run1Median": 492.30000000001746,
+					"run2Median": 509.6000000000349,
+					"maxMedian": 509.6000000000349,
+					"threshold": 814.4
+				},
+				"totalCompletionMs": {
+					"run1Median": 1814.5,
+					"run2Median": 2141.9000000000233,
+					"maxMedian": 2141.9000000000233,
+					"threshold": 3262.85
+				},
+				"turnNodes": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				}
+			}
+		},
+		"streaming:stream-120k:sequential": {
+			"domain": "streaming",
+			"scenarioId": "stream-120k",
+			"variant": "sequential",
+			"metrics": {
+				"deltaCount": {
+					"run1Median": 480,
+					"run2Median": 480,
+					"maxMedian": 480,
+					"threshold": 770
+				},
+				"inputToNextPaintMs": {
+					"run1Median": 357.20000000001164,
+					"run2Median": 361,
+					"maxMedian": 361,
+					"threshold": 591.5
+				},
+				"inputToPublicationMs": {
+					"run1Median": 346.5,
+					"run2Median": 350.80000000004657,
+					"maxMedian": 350.80000000004657,
+					"threshold": 576.2
+				},
+				"liveLongTaskMaxMs": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"liveLongTasksOver50Ms": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"publicationBatches": {
+					"run1Median": 480,
+					"run2Median": 480,
+					"maxMedian": 480,
+					"threshold": 770
+				},
+				"publicationRatio": {
+					"run1Median": 1,
+					"run2Median": 1,
+					"maxMedian": 1,
+					"threshold": 51.5
+				},
+				"settlementMs": {
+					"run1Median": 586.2000000000116,
+					"run2Median": 638.7999999999884,
+					"maxMedian": 638.7999999999884,
+					"threshold": 1008.2
+				},
+				"streamDurationMs": {
+					"run1Median": 1436,
+					"run2Median": 1771.3000000000466,
+					"maxMedian": 1771.3000000000466,
+					"threshold": 2706.95
+				},
+				"structuralDomTransitionMs": {
+					"run1Median": 473.20000000001164,
+					"run2Median": 503.70000000001164,
+					"maxMedian": 503.70000000001164,
+					"threshold": 805.55
+				},
+				"totalCompletionMs": {
+					"run1Median": 2022.2000000000116,
+					"run2Median": 2410.100000000035,
+					"maxMedian": 2410.100000000035,
+					"threshold": 3665.15
+				},
+				"turnNodes": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				}
+			}
+		},
+		"streaming:stream-1m:coalesced": {
+			"domain": "streaming",
+			"scenarioId": "stream-1m",
+			"variant": "coalesced",
+			"metrics": {
+				"deltaCount": {
+					"run1Median": 256,
+					"run2Median": 256,
+					"maxMedian": 256,
+					"threshold": 434
+				},
+				"inputToNextPaintMs": {
+					"run1Median": 348.8999999999942,
+					"run2Median": 360.6000000000349,
+					"maxMedian": 360.6000000000349,
+					"threshold": 590.9
+				},
+				"inputToPublicationMs": {
+					"run1Median": 333.29999999998836,
+					"run2Median": 345.6000000000349,
+					"maxMedian": 345.6000000000349,
+					"threshold": 568.4
+				},
+				"liveLongTaskMaxMs": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"liveLongTasksOver50Ms": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"publicationBatches": {
+					"run1Median": 52,
+					"run2Median": 47,
+					"maxMedian": 52,
+					"threshold": 128
+				},
+				"publicationRatio": {
+					"run1Median": 0.203125,
+					"run2Median": 0.18359375,
+					"maxMedian": 0.203125,
+					"threshold": 50.3
+				},
+				"settlementMs": {
+					"run1Median": 1606.5,
+					"run2Median": 2085.3000000000466,
+					"maxMedian": 2085.3000000000466,
+					"threshold": 3177.95
+				},
+				"streamDurationMs": {
+					"run1Median": 2633.600000000006,
+					"run2Median": 3102.7999999999884,
+					"maxMedian": 3102.7999999999884,
+					"threshold": 4704.2
+				},
+				"structuralDomTransitionMs": {
+					"run1Median": 1304,
+					"run2Median": 1717.3000000000466,
+					"maxMedian": 1717.3000000000466,
+					"threshold": 2625.95
+				},
+				"totalCompletionMs": {
+					"run1Median": 4179.600000000006,
+					"run2Median": 5197.299999999988,
+					"maxMedian": 5197.299999999988,
+					"threshold": 7845.95
+				},
+				"turnNodes": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				}
+			}
+		},
+		"streaming:stream-1m:sequential": {
+			"domain": "streaming",
+			"scenarioId": "stream-1m",
+			"variant": "sequential",
+			"metrics": {
+				"deltaCount": {
+					"run1Median": 256,
+					"run2Median": 256,
+					"maxMedian": 256,
+					"threshold": 434
+				},
+				"inputToNextPaintMs": {
+					"run1Median": 331.79999999998836,
+					"run2Median": 345,
+					"maxMedian": 345,
+					"threshold": 567.5
+				},
+				"inputToPublicationMs": {
+					"run1Median": 324.5,
+					"run2Median": 329.29999999998836,
+					"maxMedian": 329.29999999998836,
+					"threshold": 543.95
+				},
+				"liveLongTaskMaxMs": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"liveLongTasksOver50Ms": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				},
+				"publicationBatches": {
+					"run1Median": 257,
+					"run2Median": 259,
+					"maxMedian": 259,
+					"threshold": 438.5
+				},
+				"publicationRatio": {
+					"run1Median": 1.00390625,
+					"run2Median": 1.01171875,
+					"maxMedian": 1.01171875,
+					"threshold": 51.52
+				},
+				"settlementMs": {
+					"run1Median": 1493.7999999999884,
+					"run2Median": 2104.7000000000116,
+					"maxMedian": 2104.7000000000116,
+					"threshold": 3207.05
+				},
+				"streamDurationMs": {
+					"run1Median": 2655.7000000000116,
+					"run2Median": 3438.7000000000116,
+					"maxMedian": 3438.7000000000116,
+					"threshold": 5208.05
+				},
+				"structuralDomTransitionMs": {
+					"run1Median": 1291.5999999999767,
+					"run2Median": 1718.5,
+					"maxMedian": 1718.5,
+					"threshold": 2627.75
+				},
+				"totalCompletionMs": {
+					"run1Median": 4149.5,
+					"run2Median": 5496.200000000012,
+					"maxMedian": 5496.200000000012,
+					"threshold": 8294.3
+				},
+				"turnNodes": {
+					"run1Median": 0,
+					"run2Median": 0,
+					"maxMedian": 0,
+					"threshold": 50
+				}
+			}
+		}
+	}
+}
