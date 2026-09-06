@@ -20,6 +20,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Setup pnpm
@@ -58,7 +59,9 @@ jobs:
         run: tar -czf dist/pi-agent-web-${{ inputs.tag }}.tar.gz -C dist/staging pi-agent-web-${{ inputs.tag }}
 
       - name: Generate SHA-256 checksum
-        run: sha256sum dist/pi-agent-web-${{ inputs.tag }}.tar.gz > dist/pi-agent-web-${{ inputs.tag }}.tar.gz.sha256
+        run: |
+          cd dist
+          sha256sum "pi-agent-web-${{ inputs.tag }}.tar.gz" > "pi-agent-web-${{ inputs.tag }}.tar.gz.sha256"
 
       - name: Create draft GitHub Release
         env:

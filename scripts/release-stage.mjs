@@ -131,6 +131,9 @@ export function stageRelease({
 		const res = spawnSync("git", args, { cwd: rootDir, encoding: "utf8" });
 		return res.status === 0 ? res.stdout.trim() : "unknown";
 	};
+	const serverPkg = JSON.parse(
+		fs.readFileSync(path.join(rootDir, "packages", "server", "package.json"), "utf8"),
+	);
 	const manifest = {
 		schemaVersion: 1,
 		tag,
@@ -140,6 +143,7 @@ export function stageRelease({
 		node: process.versions.node.split(".")[0],
 		pnpm: rootPkg.packageManager?.replace("pnpm@", "") ?? "11.21.0",
 		protocol: "1.4",
+		pi: serverPkg.dependencies?.["@earendil-works/pi-coding-agent"] ?? "0.84.2",
 		packages: stagedTarballs,
 		install: "npm install --omit=dev --ignore-scripts",
 		network: "public npm registry required",

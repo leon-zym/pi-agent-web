@@ -124,3 +124,12 @@ test("stageRelease rejects workspace package version mismatch", () => {
 		fs.rmSync(tmp, { recursive: true, force: true });
 	}
 });
+
+test("server package specifies bundled pi version for release manifest", () => {
+	const serverPkg = JSON.parse(
+		fs.readFileSync(path.join(rootDir, "packages", "server", "package.json"), "utf8"),
+	);
+	const piVersion = serverPkg.dependencies?.["@earendil-works/pi-coding-agent"] ?? "0.84.2";
+	assert.equal(typeof piVersion, "string");
+	assert.match(piVersion, /^\d+\.\d+\.\d+/);
+});
