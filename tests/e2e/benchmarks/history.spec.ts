@@ -5,7 +5,7 @@ import {
 	addSummaryGate,
 	addValueGate,
 	correctnessFailureCount,
-	createTrialEvidence,
+	createTrialObservation,
 	installBrowserBenchmarkObserver,
 	runBenchmarkScenario,
 	scenariosFor,
@@ -98,13 +98,14 @@ for (const scenario of scenariosFor("history")) {
 							(event) => event.sessionId === "browser-e2e-history" && event.commandType === "get_messages",
 						).length;
 					const mountedTurnNodes = await turnWindow.locator("[data-turn-id]").count();
+					const oldestTurnCount = await viewport
+						.getByText(`${HISTORY_PROMPT} [turn 1]`, { exact: true })
+						.count();
 					const correctness = {
 						exactSourceBoundary: actualSourceBytes === sourceBytes,
 						allTurnsPaged: (await turnWindow.getAttribute("data-turn-window-total")) === String(turns),
 						historyWindowMatchesReadPath: initialTurns === Math.min(INITIAL_TURNS, turns),
-						oldestTurnReachable: await viewport
-							.getByText(`${HISTORY_PROMPT} [turn 1]`, { exact: true })
-							.isVisible(),
+						oldestTurnReachable: oldestTurnCount === 1,
 						expectedHistoryReadPath: getMessagesCount === 0,
 					};
 					return {
@@ -116,14 +117,23 @@ for (const scenario of scenariosFor("history")) {
 							mountedTurnNodes,
 						},
 						correctness,
-						evidence: createTrialEvidence(
-							{
-								correctnessFailures: Object.values(correctness).filter((value) => !value).length,
-								mountedTurnNodes,
-							},
+						observation: createTrialObservation(
+							"history",
 							{
 								console: errors.console.slice(errorStart.console),
 								page: errors.page.slice(errorStart.page),
+							},
+							{
+								dom: { mountedTurnNodes, oldestTurnCount },
+								history: {
+									actualSourceBytes,
+									expectedInitialTurns: Math.min(INITIAL_TURNS, turns),
+									expectedSourceBytes: sourceBytes,
+									expectedTurns: turns,
+									initialTurns,
+									windowTotal: Number(await turnWindow.getAttribute("data-turn-window-total")),
+								},
+								pi: { getMessagesCount },
 							},
 						),
 					};

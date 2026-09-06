@@ -4,7 +4,7 @@ import {
 	addSummaryGate,
 	addValueGate,
 	correctnessFailureCount,
-	createTrialEvidence,
+	createTrialObservation,
 	finishBrowserMeasurement,
 	installBrowserBenchmarkObserver,
 	markBrowserStreamEnd,
@@ -121,14 +121,27 @@ for (const scenario of scenariosFor("streaming")) {
 							turnNodes,
 						},
 						correctness,
-						evidence: createTrialEvidence(
-							{
-								correctnessFailures: Object.values(correctness).filter((value) => !value).length,
-								turnNodes,
-							},
+						observation: createTrialObservation(
+							"streaming",
 							{
 								console: errors.console.slice(errorStart.console),
 								page: errors.page.slice(errorStart.page),
+							},
+							{
+								dom: {
+									liveRichNodeCount: liveRichNodes,
+									settledCountAfterRelease: await settled.count(),
+									settledCountBeforeRelease: settledDomBeforeRelease,
+									settledText: settledText ?? "",
+									streamingCountAfterRelease: await streaming.count(),
+									streamingCountBeforeRelease: streamingDomBeforeRelease,
+									turnNodes,
+								},
+								frames: {
+									deltaCount: streamEnd.deltaCount,
+									largeFrameBytes: largeFrames.map((event) => event.frameBytes ?? 0),
+									largeFrameTypes: largeFrames.map((event) => event.eventType ?? ""),
+								},
 							},
 						),
 					};

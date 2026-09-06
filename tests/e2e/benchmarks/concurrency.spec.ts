@@ -7,7 +7,7 @@ import {
 	addValueGate,
 	browserSessionFrameSnapshot,
 	correctnessFailureCount,
-	createTrialEvidence,
+	createTrialObservation,
 	finishBrowserMeasurement,
 	installBrowserBenchmarkObserver,
 	markBrowserStreamEnd,
@@ -292,15 +292,22 @@ for (const scenario of scenariosFor("concurrency")) {
 							aggregateDeltaPerSecond: overlapMs > 0 ? (deltaCount * 1_000) / overlapMs : null,
 						},
 						correctness,
-						evidence: createTrialEvidence(
-							{
-								correctnessFailures: Object.values(correctness).filter((value) => !value).length,
-								browserProjectionCheckpointDeficit,
-								backgroundIngestCheckpointDeficit,
-							},
+						observation: createTrialObservation(
+							"concurrency",
 							{
 								console: errors.console.slice(errorStart.console),
 								page: errors.page.slice(errorStart.page),
+							},
+							{
+								sessions: {
+									expected: sessionCount,
+									minimumBackgroundCheckpoints,
+									minimumProjectionCheckpoints,
+									projected: projectedSessions,
+									settled: ends.filter((at) => at > 0).length,
+									started: starts.filter((at) => at > 0).length,
+								},
+								socket: { closed: closedSockets.length, opened: sockets.length },
 							},
 						),
 					};

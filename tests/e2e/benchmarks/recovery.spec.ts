@@ -6,20 +6,27 @@ import {
 	sendControlledWebSocketFrame,
 } from "../fixtures/page-observation";
 import {
+	type HarnessLifecycleSnapshot,
 	type HarnessSession,
 	isBoundedHarnessLifecycle,
 	MAX_HARNESS_ROOT_ENTRIES,
+	type PiFixtureEvent,
 } from "../fixtures/production-harness";
 import { expect, test } from "../fixtures/test";
 import {
 	addSummaryGate,
 	addValueGate,
+	type BenchmarkKind,
 	type BenchmarkOutcome,
-	type BenchmarkRecoveryAuthorityEvidence,
-	type BenchmarkRecoveryEvidence,
-	type BenchmarkRecoveryStaleCommandEvidence,
+	type BenchmarkPiMarker,
+	type BenchmarkRecoveryAuthorityFact,
+	type BenchmarkRecoveryLifecycleFact,
+	type BenchmarkRecoveryObservationFacts,
+	type BenchmarkRecoveryParentRelation,
+	type BenchmarkRecoveryProtocolFacts,
+	type BenchmarkRecoveryStaleFact,
 	correctnessFailureCount,
-	createTrialEvidence,
+	createTrialObservation,
 	installBrowserBenchmarkObserver,
 	runBenchmarkScenario,
 	scenariosFor,
@@ -35,6 +42,8 @@ test.use({
 interface WireFrame extends Record<string, unknown> {
 	type?: string;
 	seq?: number;
+	asOfSeq?: number;
+	baseSeq?: number;
 	workspaceId?: string;
 	barrierSeq?: number;
 	serverEpoch?: string;
@@ -76,50 +85,102 @@ function frame(payload: string | Buffer): WireFrame | undefined {
 	}
 }
 
-function piCommandCount(
-	harness: { piEvents: () => Array<{ type: string; commandId?: string }> },
-	id?: string,
-): number {
+function piCommandCount(harness: { piEvents: () => PiFixtureEvent[] }, id?: string): number {
 	return harness
 		.piEvents()
 		.filter((event) => event.type === "command" && (id === undefined || event.commandId === id)).length;
 }
 
-function staleEvidence(
+function staleFact(
 	response: WireFrame | undefined,
 	piCommandCountBefore: number,
 	piCommandCountAfter: number,
+	requestId: string,
 	responseType = response?.type ?? "missing",
-): BenchmarkRecoveryStaleCommandEvidence {
+): BenchmarkRecoveryStaleFact {
 	return {
-		responseType,
-		responseSuccess: response?.response?.success === true,
-		responseError: response?.response?.error ?? null,
 		piCommandCountBefore,
 		piCommandCountAfter,
+		requestId,
+		responseError: response?.response?.error ?? null,
+		responseSuccess: response?.response?.success === true,
+		responseType,
 	};
 }
 
-function notApplicableStaleEvidence(): BenchmarkRecoveryStaleCommandEvidence {
+function piMarker(event: PiFixtureEvent): BenchmarkPiMarker {
 	return {
-		responseType: "not_applicable",
-		responseSuccess: false,
-		responseError: null,
-		piCommandCountBefore: 0,
-		piCommandCountAfter: 0,
+		at: event.at,
+		commandId: event.commandId ?? null,
+		pid: event.pid,
+		sessionId: event.sessionId,
+		text: event.text ?? null,
+		type: event.type,
 	};
 }
 
-function sequenceEvidence(
+function piMarkers(events: PiFixtureEvent[]): BenchmarkPiMarker[] {
+	return events.map(piMarker);
+}
+
+function lifecycleFact(snapshot: HarnessLifecycleSnapshot, rootPath: string): BenchmarkRecoveryLifecycleFact {
+	return {
+		activeGatewayCount: snapshot.activeGatewayCount,
+		activeGatewayPid: snapshot.activeGatewayPid,
+		gatewayStarts: snapshot.gatewayStarts,
+		ownedGatewayCount: snapshot.ownedGatewayCount,
+		rootPath,
+		rootEntryCount: snapshot.rootEntryCount,
+		rootExists: snapshot.rootExists,
+	};
+}
+
+function latestRuntime(
 	received: WireFrame[],
 	start: number,
 	sessionHandle: string,
-): {
-	expected: number[];
-	observed: number[];
-} {
-	const observed = received
-		.slice(start)
+): NonNullable<WireFrame["runtime"]> | undefined {
+	for (const candidate of received.slice(start).reverse()) {
+		if (
+			candidate.runtime?.sessionHandle === sessionHandle &&
+			typeof candidate.runtime.serverEpoch === "string" &&
+			Number.isSafeInteger(candidate.runtime.generation) &&
+			Number.isSafeInteger(candidate.runtime.lastSeq)
+		) {
+			return candidate.runtime as NonNullable<WireFrame["runtime"]>;
+		}
+	}
+	return undefined;
+}
+
+function cursorBefore(
+	received: WireFrame[],
+	before: number,
+	sessionHandle: string,
+	lease: ControllerLease,
+): { generation: number; serverEpoch: string; sessionHandle: string; seq: number } {
+	const runtime = latestRuntime(received.slice(0, before), 0, sessionHandle);
+	if (!runtime) throw new Error(`authoritative runtime cursor is missing for Session ${sessionHandle}`);
+	return {
+		generation: runtime.generation ?? lease.generation,
+		serverEpoch: runtime.serverEpoch ?? lease.serverEpoch,
+		sessionHandle,
+		seq: runtime.lastSeq ?? 0,
+	};
+}
+
+function protocolFacts(
+	received: WireFrame[],
+	frameStart: number,
+	frameEnd: number,
+	sessionHandle: string,
+	mode: "replay" | "resync",
+	cursor: { generation: number; serverEpoch: string; sessionHandle: string; seq: number },
+): BenchmarkRecoveryProtocolFacts {
+	const window = received.slice(frameStart, frameEnd);
+	const runtime = latestRuntime(received.slice(0, frameEnd), frameStart, sessionHandle);
+	if (!runtime) throw new Error(`authoritative runtime watermark is missing for Session ${sessionHandle}`);
+	const eventSeqs = window
 		.filter(
 			(candidate) =>
 				candidate.type === "event" &&
@@ -127,26 +188,101 @@ function sequenceEvidence(
 				Number.isSafeInteger(candidate.seq),
 		)
 		.map((candidate) => candidate.seq as number);
+	const resync = window.find(
+		(candidate) => candidate.type === "resync_required" && candidate.sessionHandle === sessionHandle,
+	);
+	const snapshot = window.find(
+		(candidate) =>
+			(candidate.type === "session_snapshot" || candidate.type === "session_snapshot_begin") &&
+			candidate.sessionHandle === sessionHandle,
+	);
+	const barrierRuntime = resync?.runtime ?? snapshot?.runtime;
 	return {
-		expected: [...new Set(observed)].sort((left, right) => left - right),
-		observed,
+		barrier: {
+			asOfSeq: Number.isSafeInteger(snapshot?.asOfSeq) ? (snapshot?.asOfSeq as number) : null,
+			baseSeq: Number.isSafeInteger(snapshot?.baseSeq) ? (snapshot?.baseSeq as number) : null,
+			barrierSeq: Number.isSafeInteger(snapshot?.asOfSeq) ? (snapshot?.asOfSeq as number) : null,
+			reason:
+				resync?.reason === "initial" ||
+				resync?.reason === "epoch_changed" ||
+				resync?.reason === "generation_changed" ||
+				resync?.reason === "gap" ||
+				resync?.reason === "invalid_cursor"
+					? resync.reason
+					: null,
+			required: resync !== undefined,
+			runtimeLastSeq: Number.isSafeInteger(barrierRuntime?.lastSeq)
+				? (barrierRuntime?.lastSeq as number)
+				: null,
+			snapshotSeen: snapshot !== undefined,
+		},
+		cursorBefore: cursor,
+		mode,
+		observedEventSeqs: eventSeqs,
+		rekeyFrameCount: window.filter(
+			(candidate) =>
+				candidate.type === "session_rekeyed" &&
+				candidate.previousSessionHandle !== undefined &&
+				candidate.runtime?.sessionHandle === sessionHandle,
+		).length,
+		resyncFrameCount: window.filter(
+			(candidate) => candidate.type === "resync_required" && candidate.sessionHandle === sessionHandle,
+		).length,
+		snapshotFrameCount: window.filter(
+			(candidate) =>
+				(candidate.type === "session_snapshot" ||
+					candidate.type === "session_snapshot_begin" ||
+					candidate.type === "session_snapshot_end") &&
+				candidate.sessionHandle === sessionHandle,
+		).length,
+		watermarkAfter: {
+			generation: runtime.generation as number,
+			lastSeq: runtime.lastSeq as number,
+			serverEpoch: runtime.serverEpoch as string,
+			sessionHandle,
+		},
 	};
 }
 
-function authorityEvidence(
+function persistedAuthority(
 	harness: { workspace: { workspaceHandle: string; path: string } },
 	lease: ControllerLease,
 	session: HarnessSession,
-): BenchmarkRecoveryAuthorityEvidence {
+): BenchmarkRecoveryAuthorityFact {
+	if (!session.persisted || !session.sessionFile) {
+		throw new Error(`Session ${session.sessionHandle} is not a persisted native Session`);
+	}
 	return {
+		fencingToken: lease.fencingToken,
+		generation: lease.generation,
+		nativeSessionId: session.nativeSessionId,
+		persisted: session.persisted,
+		serverEpoch: lease.serverEpoch,
+		sessionFile: session.sessionFile,
+		sessionHandle: lease.sessionHandle,
 		workspaceHandle: harness.workspace.workspaceHandle,
 		workspacePath: harness.workspace.path,
-		sessionHandle: lease.sessionHandle,
-		nativeSessionId: session.nativeSessionId,
-		sessionFile: session.sessionFile,
-		serverEpoch: lease.serverEpoch,
-		generation: lease.generation,
-		fencingToken: lease.fencingToken,
+	};
+}
+
+function parentRelation(
+	parentLease: ControllerLease,
+	parentSession: HarnessSession,
+	childLease: ControllerLease,
+	childSession: HarnessSession,
+	previousSessionHandle: string,
+): BenchmarkRecoveryParentRelation {
+	if (!parentSession.sessionFile || !childSession.sessionFile) {
+		throw new Error("rekey fixture omitted a persisted parent or child session file");
+	}
+	return {
+		childNativeSessionId: childSession.nativeSessionId,
+		childSessionFile: childSession.sessionFile,
+		childSessionHandle: childLease.sessionHandle,
+		parentNativeSessionId: parentSession.nativeSessionId,
+		parentSessionFile: parentSession.sessionFile,
+		parentSessionHandle: parentLease.sessionHandle,
+		previousSessionHandle,
 	};
 }
 
@@ -166,35 +302,15 @@ async function sessionForHandle(
 	return session;
 }
 
-function recoveryEvidence(
-	kind: BenchmarkRecoveryEvidence["kind"],
-	harness: { workspace: { workspaceHandle: string; path: string } },
-	beforeLease: ControllerLease,
-	afterLease: ControllerLease,
-	beforeSession: HarnessSession,
-	afterSession: HarnessSession,
-	received: WireFrame[],
-	frameStart: number,
-	prompt: string,
-	reply: string,
-	projection: { promptCount: number; replyCount: number },
-	stale: {
-		generation: BenchmarkRecoveryStaleCommandEvidence;
-		fence: BenchmarkRecoveryStaleCommandEvidence;
-		epoch: BenchmarkRecoveryStaleCommandEvidence;
-		parent: BenchmarkRecoveryStaleCommandEvidence;
-	},
-	fault: BenchmarkRecoveryEvidence["fault"],
-): BenchmarkRecoveryEvidence {
-	return {
-		kind,
-		authorityBefore: authorityEvidence(harness, beforeLease, beforeSession),
-		authorityAfter: authorityEvidence(harness, afterLease, afterSession),
-		sequence: sequenceEvidence(received, frameStart, afterLease.sessionHandle),
-		projection: { prompt, reply, ...projection },
-		stale,
-		fault,
-	};
+function recoveryObservation(
+	kind: Extract<
+		BenchmarkKind,
+		"recovery-disconnect" | "recovery-gap" | "recovery-crash" | "recovery-rekey" | "recovery-gateway-restart"
+	>,
+	browserErrors: { console: string[]; page: string[] },
+	facts: BenchmarkRecoveryObservationFacts,
+): ReturnType<typeof createTrialObservation> {
+	return createTrialObservation(kind, browserErrors, facts);
 }
 
 function conversationTurn(page: Page, prompt: string) {
@@ -262,7 +378,7 @@ async function waitForResponse(received: WireFrame[], id: string): Promise<WireF
 async function assertStaleGuards(
 	page: Page,
 	received: WireFrame[],
-	harness: { piEvents: () => Array<{ type: string; commandId?: string }> },
+	harness: { piEvents: () => PiFixtureEvent[] },
 	lease: ControllerLease,
 	index: number,
 	staleEpoch = `benchmark-stale-epoch-${String(index)}`,
@@ -272,11 +388,11 @@ async function assertStaleGuards(
 	staleFenceRejected: boolean;
 	staleEpochRejected: boolean;
 	oldParentRejected: boolean;
-	evidence: {
-		generation: BenchmarkRecoveryStaleCommandEvidence;
-		fence: BenchmarkRecoveryStaleCommandEvidence;
-		epoch: BenchmarkRecoveryStaleCommandEvidence;
-		parent: BenchmarkRecoveryStaleCommandEvidence;
+	stale: {
+		generation: BenchmarkRecoveryStaleFact;
+		fence: BenchmarkRecoveryStaleFact;
+		epoch: BenchmarkRecoveryStaleFact;
+		parent: BenchmarkRecoveryStaleFact | null;
 	};
 }> {
 	if (lease.generation < 1)
@@ -326,7 +442,7 @@ async function assertStaleGuards(
 		.find((candidate) => candidate.type === "resync_required" && candidate.reason === "epoch_changed");
 	const epochCommandCountAfter = piCommandCount(harness);
 
-	let parentEvidence = notApplicableStaleEvidence();
+	let parentFact: BenchmarkRecoveryStaleFact | null = null;
 	let oldParentRejected = true;
 	if (parentLease) {
 		const parentId = `benchmark-stale-parent-${String(index)}`;
@@ -340,7 +456,7 @@ async function assertStaleGuards(
 		});
 		const parentResponse = await waitForResponse(received, parentId);
 		const parentCommandCountAfter = piCommandCount(harness, parentId);
-		parentEvidence = staleEvidence(parentResponse, parentCommandCountBefore, parentCommandCountAfter);
+		parentFact = staleFact(parentResponse, parentCommandCountBefore, parentCommandCountAfter, parentId);
 		oldParentRejected =
 			parentResponse.response?.success === false && parentCommandCountAfter === parentCommandCountBefore;
 	}
@@ -356,20 +472,22 @@ async function assertStaleGuards(
 			.slice(epochMark)
 			.some((candidate) => candidate.type === "resync_required" && candidate.reason === "epoch_changed"),
 		oldParentRejected,
-		evidence: {
-			generation: staleEvidence(
+		stale: {
+			generation: staleFact(
 				generationResponse,
 				generationCommandCountBefore,
 				generationCommandCountAfter,
+				generationId,
 			),
-			fence: staleEvidence(fenceResponse, fenceCommandCountBefore, fenceCommandCountAfter),
-			epoch: staleEvidence(
+			fence: staleFact(fenceResponse, fenceCommandCountBefore, fenceCommandCountAfter, fenceId),
+			epoch: staleFact(
 				epochResponse,
 				epochCommandCountBefore,
 				epochCommandCountAfter,
+				staleEpoch,
 				epochResponse?.type ?? "missing",
 			),
-			parent: parentEvidence,
+			parent: parentFact,
 		},
 	};
 }
@@ -465,9 +583,12 @@ for (const scenario of scenariosFor("recovery-disconnect")) {
 						.toBe(true);
 					const beforeLease = await waitForControllerLease(page, received);
 					const beforeSession = await sessionForHandle(harness, beforeLease.sessionHandle);
+					const lifecycleBefore = lifecycleFact(harness.lifecycle(), harness.rootDir);
+					const markersBefore = piMarkers(harness.piEvents());
 					const socketsBefore = sockets.length;
 					const closesBefore = closedSockets();
 					const framesBefore = received.length;
+					const sourceCursor = cursorBefore(received, framesBefore, beforeLease.sessionHandle, beforeLease);
 					const startedAt = await page.evaluate(() => performance.now());
 					await dropControlledWebSockets(page);
 					await expect.poll(() => closedSockets()).toBeGreaterThan(closesBefore);
@@ -477,14 +598,25 @@ for (const scenario of scenariosFor("recovery-disconnect")) {
 					await expect.poll(() => sockets.length, { timeout: 30_000 }).toBeGreaterThan(socketsBefore);
 					const projection = await assertProjection(page, prompt, reply);
 					const lease = await waitForControllerLease(page, received, undefined, framesBefore);
-					const stale = await assertStaleGuards(page, received, harness, lease, index);
 					const finishedAt = await page.evaluate(() => performance.now());
 					const events = harness.piEvents();
 					const replayFrames = received
 						.slice(framesBefore)
 						.filter((candidate) => candidate.type === "event").length;
+					const recoveryWindowEnd = received.length;
+					const protocol = protocolFacts(
+						received,
+						framesBefore,
+						recoveryWindowEnd,
+						lease.sessionHandle,
+						"replay",
+						sourceCursor,
+					);
+					const stale = await assertStaleGuards(page, received, harness, lease, index);
 					const afterSession = await sessionForHandle(harness, lease.sessionHandle);
-					const { evidence: staleEvidenceValue, oldParentRejected, ...staleChecks } = stale;
+					const lifecycleAfter = lifecycleFact(harness.lifecycle(), harness.rootDir);
+					const markersAfter = piMarkers(harness.piEvents());
+					const { stale: staleFacts, oldParentRejected, ...staleChecks } = stale;
 					const correctness = {
 						recoveryBarrier: lease.sessionHandle.length > 0 && replayFrames > 0,
 						zeroDuplicateLostEvents:
@@ -496,34 +628,6 @@ for (const scenario of scenariosFor("recovery-disconnect")) {
 						finalProjectionMatches: projection.promptCount === 1 && projection.replyCount === 1,
 						disconnectObserved: sockets.length > socketsBefore,
 					};
-					const recovery = recoveryEvidence(
-						"recovery-disconnect",
-						harness,
-						beforeLease,
-						lease,
-						beforeSession,
-						afterSession,
-						received,
-						framesBefore,
-						prompt,
-						reply,
-						projection,
-						staleEvidenceValue,
-						{
-							observed: sockets.length > socketsBefore,
-							reconnectCount: sockets.length - socketsBefore,
-							gapResyncCount: 0,
-							processRestartCount: 0,
-							rekeyFrameCount: 0,
-							identityChanged: false,
-							oldParentRejected,
-							gatewayStarts: 0,
-							activeGateways: harness.lifecycle().activeGatewayCount,
-							rootEntryCount: harness.lifecycle().rootEntryCount,
-							stableOrigin: true,
-							ownedGatewayCount: harness.lifecycle().ownedGatewayCount,
-						},
-					);
 					return {
 						metrics: {
 							recoveryMs: finishedAt - startedAt,
@@ -531,16 +635,34 @@ for (const scenario of scenariosFor("recovery-disconnect")) {
 							replayFrames,
 						},
 						correctness,
-						evidence: createTrialEvidence(
-							{
-								correctnessFailures: Object.values(correctness).filter((value) => !value).length,
-								reconnectedSockets: sockets.length - socketsBefore,
-							},
+						observation: recoveryObservation(
+							"recovery-disconnect",
 							{
 								console: errors.console.slice(errorStart.console),
 								page: errors.page.slice(errorStart.page),
 							},
-							recovery,
+							{
+								identity: {
+									before: persistedAuthority(harness, beforeLease, beforeSession),
+									after: persistedAuthority(harness, lease, afterSession),
+									parentRelation: null,
+								},
+								lifecycle: {
+									before: lifecycleBefore,
+									after: lifecycleAfter,
+									originBefore: harness.origin,
+									originAfter: harness.origin,
+								},
+								pi: {
+									markersBefore,
+									markersAfter,
+									targetSessionId: afterSession.nativeSessionId,
+								},
+								protocol,
+								projection: { prompt, reply, ...projection },
+								socket: { closed: closedSockets() - closesBefore, opened: sockets.length - socketsBefore },
+								stale: staleFacts,
+							},
 						),
 					};
 				});
@@ -590,9 +712,12 @@ for (const scenario of scenariosFor("recovery-gap")) {
 						.toBe(true);
 					const beforeLease = await waitForControllerLease(page, received);
 					const beforeSession = await sessionForHandle(harness, beforeLease.sessionHandle);
+					const lifecycleBefore = lifecycleFact(harness.lifecycle(), harness.rootDir);
+					const markersBefore = piMarkers(harness.piEvents());
 					const socketsBefore = sockets.length;
 					const closesBefore = closedSockets();
 					const framesBefore = received.length;
+					const sourceCursor = cursorBefore(received, framesBefore, beforeLease.sessionHandle, beforeLease);
 					const startedAt = await page.evaluate(() => performance.now());
 					await dropControlledWebSockets(page);
 					harness.triggerReplayGap(prompt);
@@ -623,11 +748,22 @@ for (const scenario of scenariosFor("recovery-gap")) {
 						.filter((candidate) => candidate.type === "resync_required" && candidate.reason === "gap");
 					const projection = await assertProjection(page, prompt, reply);
 					const lease = beforeLease;
-					const stale = await assertStaleGuards(page, received, harness, lease, index);
 					const finishedAt = await page.evaluate(() => performance.now());
 					const events = harness.piEvents();
+					const recoveryWindowEnd = received.length;
+					const protocol = protocolFacts(
+						received,
+						framesBefore,
+						recoveryWindowEnd,
+						lease.sessionHandle,
+						"resync",
+						sourceCursor,
+					);
+					const stale = await assertStaleGuards(page, received, harness, lease, index);
 					const afterSession = await sessionForHandle(harness, lease.sessionHandle);
-					const { evidence: staleEvidenceValue, oldParentRejected, ...staleChecks } = stale;
+					const lifecycleAfter = lifecycleFact(harness.lifecycle(), harness.rootDir);
+					const markersAfter = piMarkers(harness.piEvents());
+					const { stale: staleFacts, oldParentRejected, ...staleChecks } = stale;
 					const correctness = {
 						recoveryBarrier: lease.sessionHandle.length > 0 && gapFrames.length === 1,
 						zeroDuplicateLostEvents:
@@ -640,34 +776,6 @@ for (const scenario of scenariosFor("recovery-gap")) {
 						finalProjectionMatches: projection.promptCount === 1 && projection.replyCount === 1,
 						gapResyncObserved: gapFrames.length === 1,
 					};
-					const recovery = recoveryEvidence(
-						"recovery-gap",
-						harness,
-						beforeLease,
-						lease,
-						beforeSession,
-						afterSession,
-						received,
-						framesBefore,
-						prompt,
-						reply,
-						projection,
-						staleEvidenceValue,
-						{
-							observed: gapFrames.length === 1,
-							reconnectCount: sockets.length - socketsBefore,
-							gapResyncCount: gapFrames.length,
-							processRestartCount: 0,
-							rekeyFrameCount: 0,
-							identityChanged: false,
-							oldParentRejected,
-							gatewayStarts: 0,
-							activeGateways: harness.lifecycle().activeGatewayCount,
-							rootEntryCount: harness.lifecycle().rootEntryCount,
-							stableOrigin: true,
-							ownedGatewayCount: harness.lifecycle().ownedGatewayCount,
-						},
-					);
 					return {
 						metrics: {
 							recoveryMs: finishedAt - startedAt,
@@ -675,16 +783,34 @@ for (const scenario of scenariosFor("recovery-gap")) {
 							gapResyncFrames: gapFrames.length,
 						},
 						correctness,
-						evidence: createTrialEvidence(
-							{
-								correctnessFailures: Object.values(correctness).filter((value) => !value).length,
-								gapResyncFrames: gapFrames.length,
-							},
+						observation: recoveryObservation(
+							"recovery-gap",
 							{
 								console: errors.console.slice(errorStart.console),
 								page: errors.page.slice(errorStart.page),
 							},
-							recovery,
+							{
+								identity: {
+									before: persistedAuthority(harness, beforeLease, beforeSession),
+									after: persistedAuthority(harness, lease, afterSession),
+									parentRelation: null,
+								},
+								lifecycle: {
+									before: lifecycleBefore,
+									after: lifecycleAfter,
+									originBefore: harness.origin,
+									originAfter: harness.origin,
+								},
+								pi: {
+									markersBefore,
+									markersAfter,
+									targetSessionId: afterSession.nativeSessionId,
+								},
+								protocol,
+								projection: { prompt, reply, ...projection },
+								socket: { closed: closedSockets() - closesBefore, opened: sockets.length - socketsBefore },
+								stale: staleFacts,
+							},
 						),
 					};
 				});
@@ -736,8 +862,11 @@ for (const scenario of scenariosFor("recovery-crash")) {
 					).toHaveCount(1, { timeout: 30_000 });
 					const oldLease = await waitForControllerLease(page, received);
 					const beforeSession = await sessionForHandle(harness, oldLease.sessionHandle);
+					const lifecycleBefore = lifecycleFact(harness.lifecycle(), harness.rootDir);
+					const markersBefore = piMarkers(harness.piEvents());
 					const startsBefore = harness.piEvents().filter((event) => event.type === "started").length;
 					const recoveryFrameMark = received.length;
+					const sourceCursor = cursorBefore(received, recoveryFrameMark, oldLease.sessionHandle, oldLease);
 					const crashPrompt = `E2E_BENCH_CRASH:${scenario.id}:${String(index)}`;
 					await page.locator("textarea").fill(crashPrompt);
 					await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
@@ -787,7 +916,6 @@ for (const scenario of scenariosFor("recovery-crash")) {
 						oldLease.sessionHandle,
 						recoveryFrameMark,
 					);
-					const stale = await assertStaleGuards(page, received, harness, currentLease, index);
 					const afterSession = await sessionForHandle(harness, currentLease.sessionHandle);
 					const afterPrompt = `E2E_BENCH_AFTER_CRASH:${scenario.id}:${String(index)}`;
 					await page.locator("textarea").fill(afterPrompt);
@@ -807,7 +935,19 @@ for (const scenario of scenariosFor("recovery-crash")) {
 								candidate.type === "runtime_state" &&
 								candidate.runtime?.sessionHandle === oldLease.sessionHandle,
 						);
-					const { evidence: staleEvidenceValue, oldParentRejected, ...staleChecks } = stale;
+					const recoveryWindowEnd = received.length;
+					const protocol = protocolFacts(
+						received,
+						recoveryFrameMark,
+						recoveryWindowEnd,
+						currentLease.sessionHandle,
+						"resync",
+						sourceCursor,
+					);
+					const stale = await assertStaleGuards(page, received, harness, currentLease, index);
+					const lifecycleAfter = lifecycleFact(harness.lifecycle(), harness.rootDir);
+					const markersAfter = piMarkers(harness.piEvents());
+					const { stale: staleFacts, oldParentRejected, ...staleChecks } = stale;
 					const correctness = {
 						recoveryBarrier:
 							currentLease.generation > oldLease.generation &&
@@ -823,34 +963,6 @@ for (const scenario of scenariosFor("recovery-crash")) {
 						finalProjectionMatches: crashPromptCount === 1 && afterReplyCount === 1,
 						processRestarted: restarted.pid !== crashEvent.pid,
 					};
-					const recovery = recoveryEvidence(
-						"recovery-crash",
-						harness,
-						oldLease,
-						currentLease,
-						beforeSession,
-						afterSession,
-						received,
-						recoveryFrameMark,
-						afterPrompt,
-						`E2E_REPLY:${afterPrompt}`,
-						{ promptCount: crashPromptCount, replyCount: afterReplyCount },
-						staleEvidenceValue,
-						{
-							observed: processStarts === 1,
-							reconnectCount: 0,
-							gapResyncCount: 0,
-							processRestartCount: processStarts,
-							rekeyFrameCount: 0,
-							identityChanged: false,
-							oldParentRejected,
-							gatewayStarts: 0,
-							activeGateways: harness.lifecycle().activeGatewayCount,
-							rootEntryCount: harness.lifecycle().rootEntryCount,
-							stableOrigin: true,
-							ownedGatewayCount: harness.lifecycle().ownedGatewayCount,
-						},
-					);
 					return {
 						metrics: {
 							recoveryMs: Date.now() - crashEvent.at,
@@ -858,16 +970,39 @@ for (const scenario of scenariosFor("recovery-crash")) {
 							processStarts,
 						},
 						correctness,
-						evidence: createTrialEvidence(
-							{
-								correctnessFailures: Object.values(correctness).filter((value) => !value).length,
-								processStarts,
-							},
+						observation: recoveryObservation(
+							"recovery-crash",
 							{
 								console: errors.console.slice(errorStart.console),
 								page: errors.page.slice(errorStart.page),
 							},
-							recovery,
+							{
+								identity: {
+									before: persistedAuthority(harness, oldLease, beforeSession),
+									after: persistedAuthority(harness, currentLease, afterSession),
+									parentRelation: null,
+								},
+								lifecycle: {
+									before: lifecycleBefore,
+									after: lifecycleAfter,
+									originBefore: harness.origin,
+									originAfter: harness.origin,
+								},
+								pi: {
+									markersBefore,
+									markersAfter,
+									targetSessionId: afterSession.nativeSessionId,
+								},
+								protocol,
+								projection: {
+									prompt: afterPrompt,
+									reply: `E2E_REPLY:${afterPrompt}`,
+									promptCount: crashPromptCount,
+									replyCount: afterReplyCount,
+								},
+								socket: { closed: 0, opened: 0 },
+								stale: staleFacts,
+							},
 						),
 					};
 				});
@@ -924,6 +1059,8 @@ for (const scenario of scenariosFor("recovery-rekey")) {
 					).toHaveCount(1, { timeout: 30_000 });
 					const parentLease = await waitForControllerLease(page, received);
 					const beforeSession = await sessionForHandle(harness, parentLease.sessionHandle);
+					const lifecycleBefore = lifecycleFact(harness.lifecycle(), harness.rootDir);
+					const markersBefore = piMarkers(harness.piEvents());
 					const rekeyStart = Date.now();
 					const rekeyFrameMark = received.length;
 					const rekeyFramesBefore = received.filter(
@@ -959,10 +1096,20 @@ for (const scenario of scenariosFor("recovery-rekey")) {
 					await expect(page.locator("textarea")).toBeEnabled({ timeout: 30_000 });
 					const childLease = await waitForControllerLease(page, received, childHandle, rekeyFrameMark);
 					const childSession = await sessionForHandle(harness, childLease.sessionHandle);
+					const sourceCursor = cursorBefore(received, rekeyFrameMark, parentLease.sessionHandle, parentLease);
 					const childPrompt = `E2E_BENCH_REKEY_CHILD:${scenario.id}:${String(index)}`;
 					await page.locator("textarea").fill(childPrompt);
 					await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
 					const childProjection = await assertProjection(page, childPrompt, `E2E_REPLY:${childPrompt}`);
+					const recoveryWindowEnd = received.length;
+					const protocol = protocolFacts(
+						received,
+						rekeyFrameMark,
+						recoveryWindowEnd,
+						childLease.sessionHandle,
+						"resync",
+						sourceCursor,
+					);
 					const stale = await assertStaleGuards(
 						page,
 						received,
@@ -980,10 +1127,12 @@ for (const scenario of scenariosFor("recovery-rekey")) {
 						).length - rekeyFramesBefore;
 					const finishedAt = Date.now();
 					const events = harness.piEvents();
-					const { evidence: staleEvidenceValue, oldParentRejected, ...staleChecks } = stale;
+					const lifecycleAfter = lifecycleFact(harness.lifecycle(), harness.rootDir);
+					const markersAfter = piMarkers(harness.piEvents());
+					const { stale: staleFacts, oldParentRejected, ...staleChecks } = stale;
 					const identityChanged =
-						parentLease.sessionHandle !== childLease.sessionHandle ||
-						beforeSession.nativeSessionId !== childSession.nativeSessionId ||
+						parentLease.sessionHandle !== childLease.sessionHandle &&
+						beforeSession.nativeSessionId !== childSession.nativeSessionId &&
 						beforeSession.sessionFile !== childSession.sessionFile;
 					const correctness = {
 						recoveryBarrier:
@@ -998,35 +1147,8 @@ for (const scenario of scenariosFor("recovery-rekey")) {
 						...staleChecks,
 						finalProjectionMatches: childProjection.promptCount === 1 && childProjection.replyCount === 1,
 						rekeyIdentityChanged: identityChanged && rekeyFrames === 1,
+						staleParentRejected: oldParentRejected,
 					};
-					const recovery = recoveryEvidence(
-						"recovery-rekey",
-						harness,
-						parentLease,
-						childLease,
-						beforeSession,
-						childSession,
-						received,
-						rekeyFrameMark,
-						childPrompt,
-						`E2E_REPLY:${childPrompt}`,
-						childProjection,
-						staleEvidenceValue,
-						{
-							observed: rekeyFrames === 1,
-							reconnectCount: 0,
-							gapResyncCount: 0,
-							processRestartCount: 0,
-							rekeyFrameCount: rekeyFrames,
-							identityChanged,
-							oldParentRejected,
-							gatewayStarts: 0,
-							activeGateways: harness.lifecycle().activeGatewayCount,
-							rootEntryCount: harness.lifecycle().rootEntryCount,
-							stableOrigin: true,
-							ownedGatewayCount: harness.lifecycle().ownedGatewayCount,
-						},
-					);
 					return {
 						metrics: {
 							rekeyMs: finishedAt - rekeyStart,
@@ -1034,16 +1156,44 @@ for (const scenario of scenariosFor("recovery-rekey")) {
 							childGeneration: childLease.generation,
 						},
 						correctness,
-						evidence: createTrialEvidence(
-							{
-								correctnessFailures: Object.values(correctness).filter((value) => !value).length,
-								rekeyFrames,
-							},
+						observation: recoveryObservation(
+							"recovery-rekey",
 							{
 								console: errors.console.slice(errorStart.console),
 								page: errors.page.slice(errorStart.page),
 							},
-							recovery,
+							{
+								identity: {
+									before: persistedAuthority(harness, parentLease, beforeSession),
+									after: persistedAuthority(harness, childLease, childSession),
+									parentRelation: parentRelation(
+										parentLease,
+										beforeSession,
+										childLease,
+										childSession,
+										rekey?.previousSessionHandle ?? parentLease.sessionHandle,
+									),
+								},
+								lifecycle: {
+									before: lifecycleBefore,
+									after: lifecycleAfter,
+									originBefore: harness.origin,
+									originAfter: harness.origin,
+								},
+								pi: {
+									markersBefore,
+									markersAfter,
+									targetSessionId: childSession.nativeSessionId,
+								},
+								protocol,
+								projection: {
+									prompt: childPrompt,
+									reply: `E2E_REPLY:${childPrompt}`,
+									...childProjection,
+								},
+								socket: { closed: 0, opened: 0 },
+								stale: staleFacts,
+							},
 						),
 					};
 				});
@@ -1103,11 +1253,14 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 					).toHaveCount(1, { timeout: 30_000 });
 					const oldLease = await waitForControllerLease(page, received);
 					const beforeSession = await sessionForHandle(harness, oldLease.sessionHandle);
+					const lifecycleBefore = lifecycleFact(harness.lifecycle(), harness.rootDir);
+					const markersBefore = piMarkers(harness.piEvents());
 					const rootBefore = harness.rootDir;
 					const originBefore = harness.origin;
 					const socketsBefore = sockets.length;
 					const closesBefore = closedSockets();
 					const frameMark = received.length;
+					const sourceCursor = cursorBefore(received, frameMark, oldLease.sessionHandle, oldLease);
 					const startsBefore = harness.lifecycle().gatewayStarts;
 					const documentMarker = await page.evaluate(() => {
 						const marker = `restart-document-${String(Math.random())}`;
@@ -1117,7 +1270,7 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 					const startedAt = Date.now();
 					await harness.restart(page);
 					const restartFinishedAt = Date.now();
-					const lifecycle = harness.lifecycle();
+					const lifecycleSnapshot = harness.lifecycle();
 					await expect.poll(() => closedSockets()).toBeGreaterThan(closesBefore);
 					await expect.poll(() => sockets.length, { timeout: 30_000 }).toBeGreaterThan(socketsBefore);
 					await expect(page.locator("#root > div")).toBeVisible();
@@ -1159,14 +1312,6 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 						beforeSession.sessionHandle,
 						frameMark,
 					);
-					const stale = await assertStaleGuards(
-						page,
-						received,
-						harness,
-						currentLease,
-						index,
-						oldLease.serverEpoch,
-					);
 					const afterSession = await sessionForHandle(harness, currentLease.sessionHandle);
 					const afterPrompt = `E2E_BENCH_RESTART_AFTER:${scenario.id}:${String(index)}`;
 					await page.locator("textarea").fill(afterPrompt);
@@ -1178,9 +1323,28 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 					const beforePromptCount = await main.getByText(beforePrompt, { exact: true }).count();
 					const afterReplyCount = await main.getByText(`E2E_REPLY:${afterPrompt}`, { exact: true }).count();
 					const events = harness.piEvents();
-					const gatewayStarts = lifecycle.gatewayStarts - startsBefore;
+					const gatewayStarts = lifecycleSnapshot.gatewayStarts - startsBefore;
 					const stableOrigin = harness.origin === originBefore;
-					const { evidence: staleEvidenceValue, oldParentRejected, ...staleChecks } = stale;
+					const recoveryWindowEnd = received.length;
+					const protocol = protocolFacts(
+						received,
+						frameMark,
+						recoveryWindowEnd,
+						currentLease.sessionHandle,
+						"resync",
+						sourceCursor,
+					);
+					const stale = await assertStaleGuards(
+						page,
+						received,
+						harness,
+						currentLease,
+						index,
+						oldLease.serverEpoch,
+					);
+					const lifecycleAfter = lifecycleFact(harness.lifecycle(), harness.rootDir);
+					const markersAfter = piMarkers(harness.piEvents());
+					const { stale: staleFacts, oldParentRejected, ...staleChecks } = stale;
 					const correctness = {
 						recoveryBarrier:
 							currentLease.serverEpoch !== oldLease.serverEpoch &&
@@ -1195,58 +1359,54 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 						restartCleanup:
 							harness.rootDir === rootBefore &&
 							stableOrigin &&
-							isBoundedHarnessLifecycle(lifecycle) &&
+							isBoundedHarnessLifecycle(lifecycleSnapshot) &&
 							gatewayStarts === 1,
 					};
-					const recovery = recoveryEvidence(
-						"recovery-gateway-restart",
-						harness,
-						oldLease,
-						currentLease,
-						beforeSession,
-						afterSession,
-						received,
-						frameMark,
-						afterPrompt,
-						`E2E_REPLY:${afterPrompt}`,
-						{ promptCount: beforePromptCount, replyCount: afterReplyCount },
-						staleEvidenceValue,
-						{
-							observed: stableOrigin && gatewayStarts === 1,
-							reconnectCount: sockets.length - socketsBefore,
-							gapResyncCount: 0,
-							processRestartCount: 0,
-							rekeyFrameCount: 0,
-							identityChanged: false,
-							oldParentRejected,
-							gatewayStarts,
-							activeGateways: lifecycle.activeGatewayCount,
-							rootEntryCount: lifecycle.rootEntryCount,
-							stableOrigin,
-							ownedGatewayCount: lifecycle.ownedGatewayCount,
-						},
-					);
 					return {
 						metrics: {
 							gatewayRestartMs: restartFinishedAt - startedAt,
 							gatewayStarts,
 							baselineFrames: received.length - frameMark,
-							rootEntryCount: lifecycle.rootEntryCount,
-							activeGateways: lifecycle.activeGatewayCount,
+							rootEntryCount: lifecycleSnapshot.rootEntryCount,
+							activeGateways: lifecycleSnapshot.activeGatewayCount,
 						},
 						correctness,
-						evidence: createTrialEvidence(
-							{
-								correctnessFailures: Object.values(correctness).filter((value) => !value).length,
-								gatewayStarts,
-								activeGateways: lifecycle.activeGatewayCount,
-								rootEntryCount: lifecycle.rootEntryCount,
-							},
+						observation: recoveryObservation(
+							"recovery-gateway-restart",
 							{
 								console: errors.console.slice(errorStart.console),
 								page: errors.page.slice(errorStart.page),
 							},
-							recovery,
+							{
+								identity: {
+									before: persistedAuthority(harness, oldLease, beforeSession),
+									after: persistedAuthority(harness, currentLease, afterSession),
+									parentRelation: null,
+								},
+								lifecycle: {
+									before: lifecycleBefore,
+									after: lifecycleAfter,
+									originBefore,
+									originAfter: harness.origin,
+								},
+								pi: {
+									markersBefore,
+									markersAfter,
+									targetSessionId: afterSession.nativeSessionId,
+								},
+								protocol,
+								projection: {
+									prompt: afterPrompt,
+									reply: `E2E_REPLY:${afterPrompt}`,
+									promptCount: beforePromptCount,
+									replyCount: afterReplyCount,
+								},
+								socket: {
+									closed: closedSockets() - closesBefore,
+									opened: sockets.length - socketsBefore,
+								},
+								stale: staleFacts,
+							},
 						),
 					};
 				});
