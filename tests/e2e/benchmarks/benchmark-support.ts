@@ -69,89 +69,240 @@ export interface BenchmarkOutcome {
 export interface BenchmarkTrialExecution {
 	correctness: Record<string, boolean>;
 	metrics: Record<string, number | null>;
-	evidence: BenchmarkTrialEvidence;
+	observation: BenchmarkTrialObservation;
 }
 
-export interface BenchmarkTrialEvidence {
-	browserErrors: {
-		console: string[];
-		page: string[];
+export interface BenchmarkBrowserErrors {
+	console: string[];
+	page: string[];
+}
+
+export type BenchmarkTrialObservation = {
+	[K in BenchmarkKind]: {
+		browserErrors: BenchmarkBrowserErrors;
+		facts: BenchmarkObservationFactsByKind[K];
+		kind: K;
 	};
-	hardMetrics: Record<string, number>;
-	recovery: BenchmarkRecoveryEvidence | null;
+}[BenchmarkKind];
+
+export interface BenchmarkStreamingObservationFacts {
+	dom: {
+		liveRichNodeCount: number;
+		settledCountAfterRelease: number;
+		settledCountBeforeRelease: number;
+		settledText: string;
+		streamingCountAfterRelease: number;
+		streamingCountBeforeRelease: number;
+		turnNodes: number;
+	};
+	frames: {
+		deltaCount: number;
+		largeFrameBytes: number[];
+		largeFrameTypes: string[];
+	};
 }
 
-export interface BenchmarkRecoveryAuthorityEvidence {
+export interface BenchmarkConcurrencyObservationFacts {
+	sessions: {
+		expected: number;
+		minimumBackgroundCheckpoints: number;
+		minimumProjectionCheckpoints: number;
+		projected: number;
+		settled: number;
+		started: number;
+	};
+	socket: {
+		closed: number;
+		opened: number;
+	};
+}
+
+export interface BenchmarkHistoryObservationFacts {
+	dom: {
+		mountedTurnNodes: number;
+		oldestTurnCount: number;
+	};
+	history: {
+		actualSourceBytes: number;
+		expectedInitialTurns: number;
+		expectedSourceBytes: number;
+		expectedTurns: number;
+		initialTurns: number;
+		windowTotal: number;
+	};
+	pi: {
+		getMessagesCount: number;
+	};
+}
+
+export interface BenchmarkContentObservationFacts {
+	attachments: {
+		attachmentRefCount: number;
+		expectedInputBase64Chars: number;
+		fetchStatus: number;
+		imageComplete: boolean;
+		inlineImageSignatureCount: number;
+		naturalWidth: number;
+		observedInputBase64Chars: number;
+	};
+	frames: {
+		maxReceivedFrameBytes: number;
+		maxSentFrameBytes: number;
+	};
+	socket: {
+		closed: number;
+		opened: number;
+	};
+}
+
+export interface BenchmarkRecoveryAuthorityFact {
+	fencingToken: string;
+	generation: number;
+	nativeSessionId: string;
+	persisted: boolean;
+	serverEpoch: string;
+	sessionFile: string;
+	sessionHandle: string;
 	workspaceHandle: string;
 	workspacePath: string;
-	sessionHandle: string;
-	nativeSessionId: string;
-	sessionFile: string | null;
-	serverEpoch: string;
+}
+
+export interface BenchmarkRecoveryCursorFact {
 	generation: number;
-	fencingToken: string;
+	serverEpoch: string;
+	sessionHandle: string;
+	seq: number;
 }
 
-export interface BenchmarkRecoveryStaleCommandEvidence {
-	responseType: string;
-	responseSuccess: boolean;
-	responseError: string | null;
-	piCommandCountBefore: number;
+export interface BenchmarkRecoveryWatermarkFact {
+	generation: number;
+	lastSeq: number;
+	serverEpoch: string;
+	sessionHandle: string;
+}
+
+export interface BenchmarkRecoveryBarrierFact {
+	asOfSeq: number | null;
+	baseSeq: number | null;
+	barrierSeq: number | null;
+	reason: "initial" | "epoch_changed" | "generation_changed" | "gap" | "invalid_cursor" | null;
+	required: boolean;
+	runtimeLastSeq: number | null;
+	snapshotSeen: boolean;
+}
+
+export interface BenchmarkRecoveryProtocolFacts {
+	barrier: BenchmarkRecoveryBarrierFact;
+	cursorBefore: BenchmarkRecoveryCursorFact;
+	mode: "replay" | "resync";
+	observedEventSeqs: number[];
+	rekeyFrameCount: number;
+	resyncFrameCount: number;
+	snapshotFrameCount: number;
+	watermarkAfter: BenchmarkRecoveryWatermarkFact;
+}
+
+export interface BenchmarkRecoveryParentRelation {
+	childNativeSessionId: string;
+	childSessionFile: string;
+	childSessionHandle: string;
+	parentNativeSessionId: string;
+	parentSessionFile: string;
+	parentSessionHandle: string;
+	previousSessionHandle: string;
+}
+
+export interface BenchmarkRecoveryStaleFact {
 	piCommandCountAfter: number;
+	piCommandCountBefore: number;
+	requestId: string;
+	responseError: string | null;
+	responseSuccess: boolean;
+	responseType: string;
 }
 
-export interface BenchmarkRecoveryEvidence {
-	kind: Extract<
-		BenchmarkKind,
-		"recovery-disconnect" | "recovery-gap" | "recovery-crash" | "recovery-rekey" | "recovery-gateway-restart"
-	>;
-	authorityBefore: BenchmarkRecoveryAuthorityEvidence;
-	authorityAfter: BenchmarkRecoveryAuthorityEvidence;
-	sequence: {
-		expected: number[];
-		observed: number[];
+export interface BenchmarkPiMarker {
+	at: number;
+	commandId: string | null;
+	pid: number;
+	sessionId: string;
+	text: string | null;
+	type: string;
+}
+
+export interface BenchmarkRecoveryLifecycleFact {
+	activeGatewayCount: number;
+	activeGatewayPid: number | null;
+	gatewayStarts: number;
+	ownedGatewayCount: number;
+	rootPath: string;
+	rootEntryCount: number;
+	rootExists: boolean;
+}
+
+export interface BenchmarkRecoveryObservationFacts {
+	identity: {
+		after: BenchmarkRecoveryAuthorityFact;
+		before: BenchmarkRecoveryAuthorityFact;
+		parentRelation: BenchmarkRecoveryParentRelation | null;
 	};
+	lifecycle: {
+		after: BenchmarkRecoveryLifecycleFact;
+		before: BenchmarkRecoveryLifecycleFact;
+		originAfter: string;
+		originBefore: string;
+	};
+	pi: {
+		markersAfter: BenchmarkPiMarker[];
+		markersBefore: BenchmarkPiMarker[];
+		targetSessionId: string;
+	};
+	protocol: BenchmarkRecoveryProtocolFacts;
 	projection: {
 		prompt: string;
 		reply: string;
 		promptCount: number;
 		replyCount: number;
 	};
-	stale: {
-		generation: BenchmarkRecoveryStaleCommandEvidence;
-		fence: BenchmarkRecoveryStaleCommandEvidence;
-		epoch: BenchmarkRecoveryStaleCommandEvidence;
-		parent: BenchmarkRecoveryStaleCommandEvidence;
+	socket: {
+		closed: number;
+		opened: number;
 	};
-	fault: {
-		observed: boolean;
-		reconnectCount: number;
-		gapResyncCount: number;
-		processRestartCount: number;
-		rekeyFrameCount: number;
-		identityChanged: boolean;
-		oldParentRejected: boolean;
-		gatewayStarts: number;
-		activeGateways: number;
-		rootEntryCount: number;
-		stableOrigin: boolean;
-		ownedGatewayCount: number;
+	stale: {
+		epoch: BenchmarkRecoveryStaleFact;
+		fence: BenchmarkRecoveryStaleFact;
+		generation: BenchmarkRecoveryStaleFact;
+		parent: BenchmarkRecoveryStaleFact | null;
 	};
 }
 
-export function createTrialEvidence(
-	hardMetrics: Record<string, number>,
-	browserErrors: { console: string[]; page: string[] },
-	recovery: BenchmarkRecoveryEvidence | null = null,
-): BenchmarkTrialEvidence {
+export type BenchmarkObservationFactsByKind = {
+	concurrency: BenchmarkConcurrencyObservationFacts;
+	"content-roundtrip": BenchmarkContentObservationFacts;
+	history: BenchmarkHistoryObservationFacts;
+	"recovery-crash": BenchmarkRecoveryObservationFacts;
+	"recovery-disconnect": BenchmarkRecoveryObservationFacts;
+	"recovery-gap": BenchmarkRecoveryObservationFacts;
+	"recovery-gateway-restart": BenchmarkRecoveryObservationFacts;
+	"recovery-rekey": BenchmarkRecoveryObservationFacts;
+	streaming: BenchmarkStreamingObservationFacts;
+};
+
+export type BenchmarkObservationFacts = BenchmarkObservationFactsByKind[BenchmarkKind];
+
+export function createTrialObservation<K extends BenchmarkKind>(
+	kind: K,
+	browserErrors: BenchmarkBrowserErrors,
+	facts: BenchmarkObservationFactsByKind[K],
+): Extract<BenchmarkTrialObservation, { kind: K }> {
 	return {
 		browserErrors: {
 			console: [...browserErrors.console],
 			page: [...browserErrors.page],
 		},
-		hardMetrics: { ...hardMetrics },
-		recovery,
-	};
+		facts,
+		kind,
+	} as Extract<BenchmarkTrialObservation, { kind: K }>;
 }
 
 export interface BenchmarkTrialLifecycle {
@@ -427,14 +578,14 @@ export async function runBenchmarkScenario(
 	const startedAt = new Date().toISOString();
 	const outcome: BenchmarkOutcome = { trials: [], gates: [], notes: [] };
 	const errors: string[] = [];
-	const evidenceByTrial = new Map<number, BenchmarkTrialEvidence>();
+	const observationByTrial = new Map<number, BenchmarkTrialObservation>();
 	const trials: BenchmarkTrialLifecycle = {
 		run: async (index, executeTrial) => {
 			if (index !== outcome.trials.length) {
 				throw new Error(`benchmark trial index ${String(index)} is not the next canonical trial`);
 			}
 			const execution = await executeTrial();
-			evidenceByTrial.set(index, execution.evidence);
+			observationByTrial.set(index, execution.observation);
 			outcome.trials.push({
 				index,
 				warmup: index < scenario.warmups,
@@ -499,8 +650,9 @@ export async function runBenchmarkScenario(
 	const directory = scenarioDirectory(scenario);
 	fs.mkdirSync(directory, { recursive: true });
 	for (const trial of result.trials) {
-		const evidence = evidenceByTrial.get(trial.index);
-		if (!evidence) throw new Error(`benchmark trial ${String(trial.index)} did not produce raw evidence`);
+		const observation = observationByTrial.get(trial.index);
+		if (!observation)
+			throw new Error(`benchmark trial ${String(trial.index)} did not produce a raw observation`);
 		const rawTrial = {
 			schemaVersion: result.schemaVersion,
 			suiteVersion: result.suiteVersion,
@@ -512,8 +664,8 @@ export async function runBenchmarkScenario(
 			kind: result.kind,
 			parameters: result.parameters,
 			capabilities: result.capabilities,
-			evidence,
-			trial,
+			observation,
+			trial: { index: trial.index, warmup: trial.warmup },
 		};
 		fs.writeFileSync(
 			path.join(directory, `${variant}-${String(trial.index)}.json`),
