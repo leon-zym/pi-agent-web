@@ -287,6 +287,7 @@ const RECOVERY_LIFECYCLE_PAIR_KEYS = ["after", "before", "originAfter", "originB
 const RECOVERY_PI_KEYS = ["markersAfter", "markersBefore", "targetSessionId"];
 const RECOVERY_STALE_FACT_KEYS = ["epoch", "fence", "generation", "parent"];
 const RECOVERY_FACT_KEYS = ["identity", "lifecycle", "pi", "protocol", "projection", "socket", "stale"];
+const REKEY_PARENT_REJECTION_ERRORS = new Set(["session_not_subscribed", "session_read_only"]);
 const STREAMING_FACT_KEYS = ["dom", "frames"];
 const STREAMING_DOM_KEYS = [
 	"liveRichNodeCount",
@@ -1638,7 +1639,7 @@ function recoveryStaleIsCorrect(facts, definition) {
 	)
 		return false;
 	if (definition.kind === "recovery-rekey") {
-		return noSideEffect(stale.parent) && stale.parent.responseError?.includes("session_read_only");
+		return noSideEffect(stale.parent) && REKEY_PARENT_REJECTION_ERRORS.has(stale.parent.responseError);
 	}
 	return stale.parent === null;
 }
@@ -1850,8 +1851,10 @@ function deriveHardMetric(metric, result, definition, trials, observationByTrial
 		if (metric === "turnNodes") return isRecord(facts.dom) ? facts.dom.turnNodes : null;
 		if (metric === "browserProjectionCheckpointDeficit")
 			return isRecord(facts.sessions) ? Math.max(0, 2 - facts.sessions.minimumProjectionCheckpoints) : null;
-		if (metric === "backgroundIngestCheckpointDeficit")
-			return isRecord(facts.sessions) ? Math.max(0, 2 - facts.sessions.minimumBackgroundCheckpoints) : null;
+		if (metric === "backgroundIngestCheckpointDeficit") {
+			if (!isRecord(facts.sessions)) return null;
+			return facts.sessions.expected === 1 ? 0 : Math.max(0, 2 - facts.sessions.minimumBackgroundCheckpoints);
+		}
 		if (metric === "mountedTurnNodes") return isRecord(facts.dom) ? facts.dom.mountedTurnNodes : null;
 		if (metric === "authenticatedAttachmentFetch")
 			return isRecord(facts.attachments) ? facts.attachments.fetchStatus : null;

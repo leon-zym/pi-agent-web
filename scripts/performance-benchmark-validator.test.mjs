@@ -716,6 +716,50 @@ test("allows only one exact Gateway restart refusal in its own raw trial", () =>
 	assert.match(errorText(validate({ rawArtifacts: nonRestart })), /browserErrors/);
 });
 
+test("accepts an explicit rekey pre-admission rejection only without side effects", () => {
+	const accepted = validResults().flatMap(rawFor);
+	const rekeyTrials = accepted.filter((artifact) => artifact.value.kind === "recovery-rekey");
+	assert.ok(rekeyTrials.length > 0);
+	for (const artifact of rekeyTrials) {
+		artifact.value.observation.facts.stale.parent.responseError = "session_not_subscribed";
+	}
+	assert.deepEqual(validate({ rawArtifacts: accepted }).errors, []);
+
+	for (const [label, mutate] of [
+		["arbitrary rejection", (parent) => (parent.responseError = "session_unknown")],
+		["accepted response", (parent) => (parent.responseSuccess = true)],
+		["Pi side effect", (parent) => (parent.piCommandCountAfter += 1)],
+	]) {
+		const rawArtifacts = validResults().flatMap(rawFor);
+		const rekeyTrial = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-rekey");
+		assert.ok(rekeyTrial);
+		rekeyTrial.value.observation.facts.stale.parent.responseError = "session_not_subscribed";
+		mutate(rekeyTrial.value.observation.facts.stale.parent);
+		assert.match(errorText(validate({ rawArtifacts })), /correctness|stale/, `${label} must fail validation`);
+	}
+});
+
+test("does not require background checkpoints for one Session but keeps the multi-Session deficit gate", () => {
+	const oneSession = validResults().flatMap(rawFor);
+	for (const artifact of oneSession) {
+		if (artifact.value.kind === "concurrency" && artifact.value.observation.facts.sessions.expected === 1) {
+			artifact.value.observation.facts.sessions.minimumBackgroundCheckpoints = 0;
+		}
+	}
+	assert.deepEqual(validate({ rawArtifacts: oneSession }).errors, []);
+
+	const multiSession = validResults().flatMap(rawFor);
+	for (const artifact of multiSession) {
+		if (artifact.value.kind === "concurrency" && artifact.value.observation.facts.sessions.expected > 1) {
+			artifact.value.observation.facts.sessions.minimumBackgroundCheckpoints = 0;
+		}
+	}
+	assert.match(
+		errorText(validate({ rawArtifacts: multiSession })),
+		/gate backgroundIngestCheckpointDeficit\.max actual must be 2/,
+	);
+});
+
 test("keeps timing metrics observe-only and enforces required structural hard gates", () => {
 	const results = validResults();
 	results[0].gates[0].mode = "hard";
