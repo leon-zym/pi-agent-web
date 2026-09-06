@@ -43,7 +43,7 @@ Pi JSONL 是持久化数据的唯一事实来源。Pi Agent Web 不会将工作�
 </tr>
 </table>
 
-演示内容使用确定性测试夹具，不包含提供商凭据、私有路径或用户会话历史。
+演示内容使用确定性测试夹具，不包含提供商凭据、私有路径或用户会话历史。关于演示视频的无障碍文本流程说明，请参阅[演示交互文本记录](docs/demo-transcript.md)。
 
 ## 架构概览
 
@@ -62,6 +62,27 @@ Pi JSONL 是持久化数据的唯一事实来源。Pi Agent Web 不会将工作�
 系统会拒绝操作并进入显式恢复流程，而不是静默修补游标。
 
 ## 快速开始
+
+### 发行版安装
+
+直接使用官方发布的独立归档包运行 Pi Agent Web，无需克隆源代码仓库：
+
+1. 从 [GitHub Releases](https://github.com/leon-zym/pi-agent-web/releases) 下载发布归档包（`pi-agent-web-v<version>.tar.gz`）及校验和文件。
+2. 解压归档包：
+   ```bash
+   tar -xzf pi-agent-web-v*.tar.gz
+   cd pi-agent-web-v*
+   ```
+3. 安装生产依赖（忽略开发依赖和生命周期脚本）：
+   ```bash
+   npm install --omit=dev --ignore-scripts
+   ```
+4. 启动工作台：
+   ```bash
+   npx pi-web
+   ```
+
+### 开发环境配置
 
 环境要求：Node.js 22 或更高版本、pnpm 11.21.0，以及兼容的 Pi Coding Agent 运行时。
 
@@ -100,9 +121,25 @@ pnpm bench:stress           # 显式执行的长时间压力矩阵
 PI_WEB_RUN_E2E=1 pnpm test:e2e:real  # 显式执行、会使用凭据的真实 Pi 验收
 ```
 
-性能矩阵属于 Issue #28 第一阶段，目前尚未完成。在固定的参考主机画像和两次新的代表性基线运行结果
-都记录之前，Issue #28 保持开放。Issue #53 和 #58 的历史观测不作为参考基线；延迟、吞吐量、长任务、
-堆内存及其他受宿主机影响的时序/资源指标仍只作诊断。测试边界参见[开发文档](docs/development.md)。
+测试边界参见[开发文档](docs/development.md)。
+
+### 性能基准
+
+第一阶段代表性性能基线已在标准参考环境（`linux-x64-gh-standard`）完成校准。该套件严格校验 16 项确定性正确性硬门禁（0 重复事件、0 丢失事件、过期租约拒绝、时序屏障、0 浏览器错误），并在 22 组代表性场景与变体中追踪受宿主机影响的诊断性时序指标。
+
+- 正式报告与基线数据：[性能基准报告](docs/benchmark-report.md)
+- 本地复现代表性性能基准套件：
+  ```bash
+  pnpm bench:representative
+  ```
+- 对比本地基准结果与校准基线：
+  ```bash
+  node scripts/compare-benchmark-baseline.mjs <benchmark-dir>
+  ```
+- 运行显式长时间压力测试矩阵：
+  ```bash
+  pnpm bench:stress
+  ```
 
 ## 分发状态
 
@@ -128,6 +165,8 @@ docs/              当前契约和架构决策
 - [UI 与 UX](docs/ui-ux.md)：用户可见行为和可访问性
 - [视觉设计](docs/design.md)：视觉语言和验收标准
 - [开发](docs/development.md)：测试层次、CI、打包和发布检查
+- [性能基准报告](docs/benchmark-report.md)：第一阶段基线画像与校准数据
+- [演示交互记录](docs/demo-transcript.md)：演示视频无障碍文本流程说明
 - [安全策略](SECURITY.md)：私密漏洞报告、支持版本和威胁边界
 - [架构决策](docs/decisions/README.md)：决策理由、替代关系和被否决的方案
 - [GitHub Issues](https://github.com/leon-zym/pi-agent-web/issues)：待办事项和交付状态

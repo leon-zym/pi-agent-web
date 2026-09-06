@@ -47,7 +47,8 @@ Selecting a Session changes only the visible Browser view. It does not use Pi's 
 </table>
 
 The demo uses deterministic fixtures and contains no provider credentials, private paths, or user
-Session history.
+Session history. For an accessible text walkthrough of the demo interaction and state recovery flow,
+see the [demo interaction transcript](docs/demo-transcript.md).
 
 ## Architecture at a glance
 
@@ -67,6 +68,27 @@ not require a controller lease. Unknown identity or ordering fails closed and tr
 recovery rather than silent cursor repair.
 
 ## Quick start
+
+### Release installation
+
+To run Pi Agent Web from an official release archive without cloning the source repository:
+
+1. Download the release archive (`pi-agent-web-v<version>.tar.gz`) and checksum from [GitHub Releases](https://github.com/leon-zym/pi-agent-web/releases).
+2. Unpack the archive:
+   ```bash
+   tar -xzf pi-agent-web-v*.tar.gz
+   cd pi-agent-web-v*
+   ```
+3. Install production dependencies (omitting development packages and ignoring lifecycle scripts):
+   ```bash
+   npm install --omit=dev --ignore-scripts
+   ```
+4. Launch the workbench:
+   ```bash
+   npx pi-web
+   ```
+
+### Development setup
 
 Requirements: Node.js 22 or later, pnpm 11.21.0, and a compatible Pi Coding Agent runtime.
 
@@ -108,11 +130,25 @@ pnpm bench:stress           # explicit long-running stress matrix
 PI_WEB_RUN_E2E=1 pnpm test:e2e:real  # explicit credential-bearing real-Pi acceptance
 ```
 
-The performance matrix is Issue #28 Phase 1 and remains incomplete. Issue #28 stays open until a
-pinned reference-host profile and two fresh representative baseline runs are recorded. Historical
-observations from Issues #53 and #58 are non-reference; host-sensitive latency, throughput,
-long-task, heap, and other timing/resource metrics remain diagnostic. See
-[Development](docs/development.md) for test boundaries.
+See [Development](docs/development.md) for test boundaries.
+
+### Performance benchmarks
+
+The Phase 1 representative performance baseline is calibrated on the reference environment (`linux-x64-gh-standard`). It verifies 16 deterministic correctness hard gates (0 duplicate events, 0 lost events, stale lease rejection, sequence barriers, 0 browser errors) and tracks host-sensitive diagnostic timing metrics across 22 representative scenario and variant combinations.
+
+- Formal report and baseline data: [Performance Benchmark Report](docs/benchmark-report.md)
+- Reproduce the representative benchmark suite locally:
+  ```bash
+  pnpm bench:representative
+  ```
+- Compare local results against the calibrated reference baseline:
+  ```bash
+  node scripts/compare-benchmark-baseline.mjs <benchmark-dir>
+  ```
+- Run the explicit long-running stress matrix:
+  ```bash
+  pnpm bench:stress
+  ```
 
 ## Distribution status
 
@@ -138,6 +174,8 @@ docs/              Current contracts and architecture decisions
 - [UI and UX](docs/ui-ux.md): user-visible behavior and accessibility
 - [Design](docs/design.md): visual language and acceptance criteria
 - [Development](docs/development.md): test layers, CI, packaging, and release checks
+- [Performance benchmark report](docs/benchmark-report.md): Phase 1 baseline profile and calibration
+- [Demo transcript](docs/demo-transcript.md): accessible interaction walkthrough of the product demo
 - [Security policy](SECURITY.md): private reporting, supported versions, and threat boundary
 - [Architecture decisions](docs/decisions/README.md): rationale, supersession, and rejected alternatives
 - [GitHub Issues](https://github.com/leon-zym/pi-agent-web/issues): backlog and delivery status
