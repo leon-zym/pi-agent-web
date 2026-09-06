@@ -1,5 +1,11 @@
 import type { Page, WebSocket } from "@playwright/test";
 import {
+	GATEWAY_PROTOCOL_VERSION,
+	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
+	GATEWAY_SESSION_HISTORY_CAPABILITY,
+	SESSION_PAYLOAD_BUDGET,
+} from "../../../packages/protocol/dist/index.js";
+import {
 	dropControlledWebSockets,
 	installWebSocketDropControl,
 	observePageErrors,
@@ -75,6 +81,21 @@ interface ControllerLease {
 	sessionHandle: string;
 	generation: number;
 	fencingToken: string;
+}
+
+const DIAGNOSTIC_SOCKET_QUERY = "e2e=stale-epoch-probe";
+const DIAGNOSTIC_CLIENT_HELLO = {
+	type: "client_hello",
+	protocol: GATEWAY_PROTOCOL_VERSION,
+	clientBuild: "0.1.0",
+	capabilities: [...GATEWAY_SERVER_REQUIRED_CAPABILITIES, GATEWAY_SESSION_HISTORY_CAPABILITY],
+	limits: { maxServerFrameBytes: SESSION_PAYLOAD_BUDGET.maxServerFrameBytes },
+} as const;
+
+interface DiagnosticSocketObservation {
+	frames: WireFrame[];
+	closed: boolean;
+	closeCode: number | null;
 }
 
 function frame(payload: string | Buffer): WireFrame | undefined {
@@ -392,6 +413,118 @@ async function waitForResponse(received: WireFrame[], id: string): Promise<WireF
 	return response;
 }
 
+async function staleEpochProbe(
+	page: Page,
+	lease: ControllerLease,
+	staleEpoch: string,
+): Promise<DiagnosticSocketObservation> {
+	const observation = await page.evaluate(
+		({ hello, query, sessionHandle, generation, staleEpoch }) =>
+			new Promise<{
+				frames: Array<Record<string, unknown>>;
+				closed: boolean;
+				closeCode: number | null;
+			}>((resolve, reject) => {
+				const frames: Array<Record<string, unknown>> = [];
+				let settled = false;
+				let subscribeSent = false;
+				let closeCode: number | null = null;
+				let timeout = 0;
+				const socketUrl = `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/api/v1/ws?${query}`;
+				const socket = new WebSocket(socketUrl);
+
+				const fail = (error: Error): void => {
+					if (settled) return;
+					settled = true;
+					window.clearTimeout(timeout);
+					try {
+						socket.close(1011, "stale epoch probe failed");
+					} catch {
+						// The diagnostic socket may already be closed.
+					}
+					reject(error);
+				};
+
+				const closeAfterProbe = (): void => {
+					if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+						socket.close(1000, "stale epoch probe complete");
+					}
+				};
+
+				timeout = window.setTimeout(
+					() => fail(new Error("stale epoch diagnostic WebSocket timed out")),
+					30_000,
+				);
+				socket.addEventListener("open", () => {
+					try {
+						socket.send(JSON.stringify(hello));
+					} catch (error) {
+						fail(error instanceof Error ? error : new Error(String(error)));
+					}
+				});
+				socket.addEventListener("message", (event) => {
+					if (typeof event.data !== "string") return;
+					let value: unknown;
+					try {
+						value = JSON.parse(event.data);
+					} catch {
+						return;
+					}
+					if (typeof value !== "object" || value === null || Array.isArray(value)) return;
+					const frame = value as Record<string, unknown>;
+					frames.push(frame);
+					if (frame.type === "server_hello" && !subscribeSent) {
+						subscribeSent = true;
+						socket.send(
+							JSON.stringify({
+								type: "session_subscribe",
+								sessionHandle,
+								cursor: { serverEpoch: staleEpoch, generation, seq: 0 },
+							}),
+						);
+					}
+					if (
+						frame.type === "resync_required" &&
+						frame.sessionHandle === sessionHandle &&
+						frame.reason === "epoch_changed"
+					) {
+						closeAfterProbe();
+					}
+				});
+				socket.addEventListener("close", (event) => {
+					if (settled) return;
+					settled = true;
+					window.clearTimeout(timeout);
+					closeCode = event.code;
+					resolve({ frames, closed: true, closeCode });
+				});
+				socket.addEventListener("error", () => fail(new Error("stale epoch diagnostic WebSocket failed")));
+			}),
+		{
+			hello: DIAGNOSTIC_CLIENT_HELLO,
+			query: DIAGNOSTIC_SOCKET_QUERY,
+			sessionHandle: lease.sessionHandle,
+			generation: lease.generation,
+			staleEpoch,
+		},
+	);
+	const frames = observation.frames as WireFrame[];
+	if (!frames.some((candidate) => candidate.type === "server_hello")) {
+		throw new Error("stale epoch diagnostic WebSocket did not complete the canonical hello");
+	}
+	if (
+		!frames.some(
+			(candidate) =>
+				candidate.type === "resync_required" &&
+				candidate.sessionHandle === lease.sessionHandle &&
+				candidate.reason === "epoch_changed",
+		)
+	) {
+		throw new Error("stale epoch diagnostic WebSocket did not reject the stale epoch");
+	}
+	return { frames, closed: observation.closed, closeCode: observation.closeCode };
+}
+
 async function assertStaleGuards(
 	page: Page,
 	received: WireFrame[],
@@ -404,6 +537,8 @@ async function assertStaleGuards(
 	staleGenerationRejected: boolean;
 	staleFenceRejected: boolean;
 	staleEpochRejected: boolean;
+	staleEpochDiagnosticClosed: boolean;
+	liveControllerEnabledAfterEpochProbe: boolean;
 	oldParentRejected: boolean;
 	stale: {
 		generation: BenchmarkRecoveryStaleFact;
@@ -438,26 +573,14 @@ async function assertStaleGuards(
 	const fenceResponse = await waitForResponse(received, fenceId);
 	const fenceCommandCountAfter = piCommandCount(harness, fenceId);
 
-	const epochMark = received.length;
 	const epochCommandCountBefore = piCommandCount(harness);
-	await sendControlledWebSocketFrame(page, {
-		type: "session_subscribe",
-		sessionHandle: lease.sessionHandle,
-		cursor: { serverEpoch: staleEpoch, generation: lease.generation, seq: 0 },
-	});
-	await expect
-		.poll(
-			() =>
-				received
-					.slice(epochMark)
-					.find((candidate) => candidate.type === "resync_required" && candidate.reason === "epoch_changed"),
-			{ timeout: 30_000 },
-		)
-		.toBeTruthy();
-	const epochResponse = received
-		.slice(epochMark)
-		.find((candidate) => candidate.type === "resync_required" && candidate.reason === "epoch_changed");
+	const diagnostic = await staleEpochProbe(page, lease, staleEpoch);
+	const epochResponse = diagnostic.frames.find(
+		(candidate) => candidate.type === "resync_required" && candidate.reason === "epoch_changed",
+	);
 	const epochCommandCountAfter = piCommandCount(harness);
+	await expect(page.locator("textarea")).toBeEnabled({ timeout: 30_000 });
+	const liveControllerEnabledAfterEpochProbe = await page.locator("textarea").isEnabled();
 
 	let parentFact: BenchmarkRecoveryStaleFact | null = null;
 	let oldParentRejected = true;
@@ -485,9 +608,11 @@ async function assertStaleGuards(
 		staleFenceRejected:
 			fenceResponse.response?.success === false &&
 			(fenceResponse.response.error?.includes("session_read_only") ?? false),
-		staleEpochRejected: received
-			.slice(epochMark)
-			.some((candidate) => candidate.type === "resync_required" && candidate.reason === "epoch_changed"),
+		staleEpochRejected: diagnostic.frames.some(
+			(candidate) => candidate.type === "resync_required" && candidate.reason === "epoch_changed",
+		),
+		staleEpochDiagnosticClosed: diagnostic.closed && diagnostic.closeCode === 1000,
+		liveControllerEnabledAfterEpochProbe,
 		oldParentRejected,
 		stale: {
 			generation: staleFact(
@@ -532,6 +657,7 @@ function attachFrames(page: Page): {
 	const received: WireFrame[] = [];
 	let closed = 0;
 	page.on("websocket", (socket: WebSocket) => {
+		if (new URL(socket.url()).searchParams.get("e2e") === "stale-epoch-probe") return;
 		sockets.push(socket);
 		socket.on("close", () => {
 			closed += 1;
@@ -575,6 +701,18 @@ function addCommonRecoveryGates(
 		"Browser errors invalidate recovery correctness.",
 	);
 	addSummaryGate(outcome, timingMetric, "p95", "gte", 0, "observe", timingRationale);
+}
+
+function filterExpectedGatewayRestartErrors(errors: { console: string[]; page: string[] }): {
+	console: string[];
+	page: string[];
+} {
+	const expectedReconnectFailure =
+		/^WebSocket connection to 'ws:\/\/127\.0\.0\.1:\d+\/api\/v1\/ws' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED$/;
+	return {
+		console: errors.console.filter((message) => !expectedReconnectFailure.test(message)),
+		page: errors.page,
+	};
 }
 
 for (const scenario of scenariosFor("recovery-disconnect")) {
@@ -1091,9 +1229,12 @@ for (const scenario of scenariosFor("recovery-rekey")) {
 						.getByRole("button", { name: /^(Fork|分叉)$/ })
 						.last()
 						.click();
-					await expect(page.getByText(/Forked a new session|已从该消息分叉出新会话/)).toBeVisible({
-						timeout: 30_000,
-					});
+					await expect(
+						page
+							.getByRole("region", { name: /^(Notifications|通知)/ })
+							.getByText(/Forked a new session|已从该消息分叉出新会话/)
+							.last(),
+					).toBeVisible({ timeout: 30_000 });
 					await expect
 						.poll(
 							() =>
@@ -1114,7 +1255,20 @@ for (const scenario of scenariosFor("recovery-rekey")) {
 					if (!childHandle) throw new Error("fork/clone did not publish a child Session identity");
 					await expect(page.locator("textarea")).toBeEnabled({ timeout: 30_000 });
 					const childLease = await waitForControllerLease(page, received, childHandle, rekeyFrameMark);
-					const childSession = await sessionForHandle(harness, childLease.sessionHandle);
+					const pendingChildSession = await sessionForHandle(harness, childLease.sessionHandle);
+					if (
+						pendingChildSession.sessionHandle !== childHandle ||
+						pendingChildSession.workspaceHandle !== harness.workspace.workspaceHandle ||
+						pendingChildSession.persisted ||
+						!pendingChildSession.nativeSessionId ||
+						!pendingChildSession.sessionFile ||
+						pendingChildSession.nativeSessionId === beforeSession.nativeSessionId ||
+						pendingChildSession.sessionFile === beforeSession.sessionFile
+					) {
+						throw new Error(
+							"fork/clone did not expose the expected pending child identity before its first prompt",
+						);
+					}
 					const sourceCursor = cursorBefore(received, rekeyFrameMark, parentLease.sessionHandle, parentLease);
 					const childPrompt = `E2E_BENCH_REKEY_CHILD:${scenario.id}:${String(index)}`;
 					// Capture the child prompt boundary after rekey and before issuing its prompt.
@@ -1122,6 +1276,15 @@ for (const scenario of scenariosFor("recovery-rekey")) {
 					await page.locator("textarea").fill(childPrompt);
 					await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
 					const childProjection = await assertProjection(page, childPrompt, `E2E_REPLY:${childPrompt}`);
+					await expect
+						.poll(async () => (await sessionForHandle(harness, childLease.sessionHandle)).persisted, {
+							timeout: 30_000,
+						})
+						.toBe(true);
+					const childSession = await sessionForHandle(harness, childLease.sessionHandle);
+					if (!childSession.persisted || !childSession.sessionFile) {
+						throw new Error("fork/clone child did not become a persisted Session after its first prompt");
+					}
 					const recoveryWindowEnd = received.length;
 					const protocol = protocolFacts(
 						received,
@@ -1269,9 +1432,7 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 					const beforePrompt = `E2E_BENCH_RESTART_BEFORE:${scenario.id}:${String(index)}`;
 					await page.locator("textarea").fill(beforePrompt);
 					await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
-					await expect(
-						page.locator("main").getByText(`E2E_REPLY:${beforePrompt}`, { exact: true }),
-					).toHaveCount(1, { timeout: 30_000 });
+					await assertProjection(page, beforePrompt, `E2E_REPLY:${beforePrompt}`);
 					const oldLease = await waitForControllerLease(page, received);
 					const beforeSession = await sessionForHandle(harness, oldLease.sessionHandle);
 					const lifecycleBefore = lifecycleFact(harness.lifecycle(), harness.rootDir);
@@ -1325,9 +1486,7 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 						)
 						.toBe(true);
 					await expect(page.locator('[data-session-row][data-current="true"]')).toHaveCount(1);
-					await expect(
-						page.locator("main").getByText(`E2E_REPLY:${beforePrompt}`, { exact: true }),
-					).toHaveCount(1);
+					const beforeProjection = await assertProjection(page, beforePrompt, `E2E_REPLY:${beforePrompt}`);
 					const currentLease = await waitForControllerLease(
 						page,
 						received,
@@ -1338,12 +1497,7 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 					const afterPrompt = `E2E_BENCH_RESTART_AFTER:${scenario.id}:${String(index)}`;
 					await page.locator("textarea").fill(afterPrompt);
 					await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
-					await expect(
-						page.locator("main").getByText(`E2E_REPLY:${afterPrompt}`, { exact: true }),
-					).toHaveCount(1, { timeout: 30_000 });
-					const main = page.locator("main");
-					const beforePromptCount = await main.getByText(beforePrompt, { exact: true }).count();
-					const afterReplyCount = await main.getByText(`E2E_REPLY:${afterPrompt}`, { exact: true }).count();
+					const afterProjection = await assertProjection(page, afterPrompt, `E2E_REPLY:${afterPrompt}`);
 					const events = harness.piEvents();
 					const gatewayStarts = lifecycleSnapshot.gatewayStarts - startsBefore;
 					const stableOrigin = harness.origin === originBefore;
@@ -1374,10 +1528,12 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 						zeroDuplicateLostEvents:
 							events.filter((event) => event.type === "prompt" && event.text === beforePrompt).length === 1 &&
 							events.filter((event) => event.type === "prompt" && event.text === afterPrompt).length === 1 &&
-							beforePromptCount === 1 &&
-							afterReplyCount === 1,
+							beforeProjection.promptCount === 1 &&
+							beforeProjection.replyCount === 1 &&
+							afterProjection.promptCount === 1 &&
+							afterProjection.replyCount === 1,
 						...staleChecks,
-						finalProjectionMatches: beforePromptCount === 1 && afterReplyCount === 1,
+						finalProjectionMatches: afterProjection.promptCount === 1 && afterProjection.replyCount === 1,
 						restartCleanup:
 							harness.rootDir === rootBefore &&
 							stableOrigin &&
@@ -1420,8 +1576,8 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 								projection: {
 									prompt: afterPrompt,
 									reply: `E2E_REPLY:${afterPrompt}`,
-									promptCount: beforePromptCount,
-									replyCount: afterReplyCount,
+									promptCount: afterProjection.promptCount,
+									replyCount: afterProjection.replyCount,
 								},
 								socket: {
 									closed: closedSockets() - closesBefore,
@@ -1435,7 +1591,7 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 			}
 			addCommonRecoveryGates(
 				outcome,
-				errors,
+				filterExpectedGatewayRestartErrors(errors),
 				"gatewayRestartMs",
 				"Gateway restart and fresh-baseline latency are diagnostic until a portable reference profile exists.",
 			);
@@ -1468,6 +1624,9 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 			);
 			outcome.notes.push(
 				"The harness restarts only the Gateway child, reuses its existing agent/session/web-data roots, refreshes the authoritative REST directory, and the Browser waits for a new runtime plus snapshot baseline before control assertions.",
+			);
+			outcome.notes.push(
+				"The raw observation retains the expected loopback WebSocket connection-refused console message emitted while the Gateway child is intentionally offline; the browser-error gate excludes only that exact restart handshake failure.",
 			);
 		});
 	});
