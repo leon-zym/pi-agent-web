@@ -576,19 +576,20 @@ for (const scenario of scenariosFor("recovery-disconnect")) {
 					const errorStart = { console: errors.console.length, page: errors.page.length };
 					const prompt = `E2E_BENCH_DISCONNECT:${scenario.id}:${String(index)}`;
 					const reply = `E2E_REPLY:${prompt}`;
-					await page.locator("textarea").fill(prompt);
-					await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
-					await expect
-						.poll(() => harness.piEvents().some((event) => event.type === "delta" && event.text === prompt))
-						.toBe(true);
 					const beforeLease = await waitForControllerLease(page, received);
 					const beforeSession = await sessionForHandle(harness, beforeLease.sessionHandle);
 					const lifecycleBefore = lifecycleFact(harness.lifecycle(), harness.rootDir);
+					// Capture the marker boundary before issuing the prompt that will cross the disconnect.
 					const markersBefore = piMarkers(harness.piEvents());
 					const socketsBefore = sockets.length;
 					const closesBefore = closedSockets();
 					const framesBefore = received.length;
 					const sourceCursor = cursorBefore(received, framesBefore, beforeLease.sessionHandle, beforeLease);
+					await page.locator("textarea").fill(prompt);
+					await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
+					await expect
+						.poll(() => harness.piEvents().some((event) => event.type === "delta" && event.text === prompt))
+						.toBe(true);
 					const startedAt = await page.evaluate(() => performance.now());
 					await dropControlledWebSockets(page);
 					await expect.poll(() => closedSockets()).toBeGreaterThan(closesBefore);
@@ -705,19 +706,20 @@ for (const scenario of scenariosFor("recovery-gap")) {
 					const errorStart = { console: errors.console.length, page: errors.page.length };
 					const prompt = `E2E_BENCH_GAP:${scenario.id}:${String(index)}`;
 					const reply = `E2E_REPLY:${prompt}`;
-					await page.locator("textarea").fill(prompt);
-					await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
-					await expect
-						.poll(() => harness.piEvents().some((event) => event.type === "delta" && event.text === prompt))
-						.toBe(true);
 					const beforeLease = await waitForControllerLease(page, received);
 					const beforeSession = await sessionForHandle(harness, beforeLease.sessionHandle);
 					const lifecycleBefore = lifecycleFact(harness.lifecycle(), harness.rootDir);
+					// Capture the marker boundary before issuing the prompt that will cross the replay gap.
 					const markersBefore = piMarkers(harness.piEvents());
 					const socketsBefore = sockets.length;
 					const closesBefore = closedSockets();
 					const framesBefore = received.length;
 					const sourceCursor = cursorBefore(received, framesBefore, beforeLease.sessionHandle, beforeLease);
+					await page.locator("textarea").fill(prompt);
+					await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
+					await expect
+						.poll(() => harness.piEvents().some((event) => event.type === "delta" && event.text === prompt))
+						.toBe(true);
 					const startedAt = await page.evaluate(() => performance.now());
 					await dropControlledWebSockets(page);
 					harness.triggerReplayGap(prompt);
@@ -863,6 +865,7 @@ for (const scenario of scenariosFor("recovery-crash")) {
 					const oldLease = await waitForControllerLease(page, received);
 					const beforeSession = await sessionForHandle(harness, oldLease.sessionHandle);
 					const lifecycleBefore = lifecycleFact(harness.lifecycle(), harness.rootDir);
+					// The crash-triggering prompt is issued immediately after this marker boundary.
 					const markersBefore = piMarkers(harness.piEvents());
 					const startsBefore = harness.piEvents().filter((event) => event.type === "started").length;
 					const recoveryFrameMark = received.length;
@@ -1060,7 +1063,6 @@ for (const scenario of scenariosFor("recovery-rekey")) {
 					const parentLease = await waitForControllerLease(page, received);
 					const beforeSession = await sessionForHandle(harness, parentLease.sessionHandle);
 					const lifecycleBefore = lifecycleFact(harness.lifecycle(), harness.rootDir);
-					const markersBefore = piMarkers(harness.piEvents());
 					const rekeyStart = Date.now();
 					const rekeyFrameMark = received.length;
 					const rekeyFramesBefore = received.filter(
@@ -1098,6 +1100,8 @@ for (const scenario of scenariosFor("recovery-rekey")) {
 					const childSession = await sessionForHandle(harness, childLease.sessionHandle);
 					const sourceCursor = cursorBefore(received, rekeyFrameMark, parentLease.sessionHandle, parentLease);
 					const childPrompt = `E2E_BENCH_REKEY_CHILD:${scenario.id}:${String(index)}`;
+					// Capture the child prompt boundary after rekey and before issuing its prompt.
+					const markersBefore = piMarkers(harness.piEvents());
 					await page.locator("textarea").fill(childPrompt);
 					await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
 					const childProjection = await assertProjection(page, childPrompt, `E2E_REPLY:${childPrompt}`);
@@ -1254,6 +1258,7 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 					const oldLease = await waitForControllerLease(page, received);
 					const beforeSession = await sessionForHandle(harness, oldLease.sessionHandle);
 					const lifecycleBefore = lifecycleFact(harness.lifecycle(), harness.rootDir);
+					// The post-restart prompt is measured against this pre-fault marker boundary.
 					const markersBefore = piMarkers(harness.piEvents());
 					const rootBefore = harness.rootDir;
 					const originBefore = harness.origin;

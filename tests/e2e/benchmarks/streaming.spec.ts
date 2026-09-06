@@ -98,6 +98,14 @@ for (const scenario of scenariosFor("streaming")) {
 					const largeFrames = harness
 						.piEvents()
 						.filter((event) => event.type === "large_frame" && event.text === prompt);
+					const largeFrameTypes = largeFrames.map((event) => event.eventType ?? "");
+					const largeFrameBytes = largeFrames.map((event) => event.frameBytes ?? 0);
+					const exactStructuralFramePair =
+						largeFrameTypes.length === 2 &&
+						largeFrameTypes[0] === "text_end" &&
+						largeFrameTypes[1] === "message_end" &&
+						largeFrameBytes.length === 2 &&
+						largeFrameBytes.every((bytes) => bytes > targetBytes);
 					const metrics = await finishBrowserMeasurement(page);
 					const correctness = {
 						liveTailStayedPlain: liveRichNodes === 0,
@@ -107,9 +115,8 @@ for (const scenario of scenariosFor("streaming")) {
 							(await streaming.count()) === 0 && (await settled.count()) === 1,
 						settledEndSentinel: settledText?.includes("STREAM_BUDGET_END") ?? false,
 						settledUnicode: settledText?.includes("🧪") ?? false,
-						structuralFramesEmittedInOrder:
-							largeFrames.map((event) => event.eventType).join(",") === "text_end,message_end",
-						frameBudgetPreserved: largeFrames.every((event) => (event.frameBytes ?? 0) > targetBytes),
+						structuralFramesEmittedInOrder: exactStructuralFramePair,
+						frameBudgetPreserved: exactStructuralFramePair,
 					};
 					const turnNodes = await turn.locator("[data-turn-id]").count();
 					return {
@@ -139,8 +146,8 @@ for (const scenario of scenariosFor("streaming")) {
 								},
 								frames: {
 									deltaCount: streamEnd.deltaCount,
-									largeFrameBytes: largeFrames.map((event) => event.frameBytes ?? 0),
-									largeFrameTypes: largeFrames.map((event) => event.eventType ?? ""),
+									largeFrameBytes,
+									largeFrameTypes,
 								},
 							},
 						),

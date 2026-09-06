@@ -102,7 +102,14 @@ for (const scenario of scenariosFor("content-roundtrip")) {
 		await runBenchmarkScenario(page, testInfo, harness, scenario, async (outcome, trials) => {
 			if (scenario.inputBytes === undefined) throw new Error("content scenario is missing inputBytes");
 			const input = validPng(scenario.inputBytes);
-			const inputBase64Chars = input.toString("base64").length;
+			if (input.byteLength !== scenario.inputBytes) {
+				throw new Error("content fixture byte length does not match the canonical matrix definition");
+			}
+			// Node's unwrapped RFC 4648 Base64 uses four characters for every three bytes, rounded up.
+			const inputBase64Chars = 4 * Math.ceil(scenario.inputBytes / 3);
+			if (input.toString("base64").length !== inputBase64Chars) {
+				throw new Error("content fixture Base64 length does not match its byte-count derivation");
+			}
 			const errors = observePageErrors(page);
 			const sockets: WebSocket[] = [];
 			const closedSockets: WebSocket[] = [];

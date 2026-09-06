@@ -326,6 +326,10 @@ const RECOVERY_RESYNC_REASONS = new Set([
 	"invalid_cursor",
 ]);
 const RECOVERY_LIFECYCLE_MAX_ROOT_ENTRIES = 8;
+// The history fixture emits two native messages per turn and the current reader admits 96
+// messages into its initial page, so 48 turns is the only initial-window expectation derivable
+// without trusting a producer-supplied raw value.
+const HISTORY_INITIAL_TURN_WINDOW = 48;
 const OBSERVATION_FACT_KEYS_BY_KIND = {
 	streaming: STREAMING_FACT_KEYS,
 	concurrency: CONCURRENCY_FACT_KEYS,
@@ -429,6 +433,13 @@ function seededVariantOrder(seed) {
 		const rightHash = sha256(`${seed}\0${right}`);
 		return leftHash.localeCompare(rightHash) || left.localeCompare(right);
 	});
+}
+
+function expectedInputBase64Chars(inputBytes) {
+	if (!Number.isSafeInteger(inputBytes) || inputBytes < 0) return null;
+	// The fixture uses unwrapped RFC 4648 Base64: four characters for every three input bytes,
+	// rounded up to the next quartet.
+	return 4 * Math.ceil(inputBytes / 3);
 }
 
 function canonicalExpectedScenarioSet(matrix, tier, errors) {
@@ -1347,6 +1358,18 @@ function newRecoveryMarkers(facts) {
 	return after.slice(before);
 }
 
+function recoveryCursorIdentityMatches(cursor, watermark) {
+	return (
+		cursor.serverEpoch === watermark.serverEpoch &&
+		cursor.generation === watermark.generation &&
+		cursor.sessionHandle === watermark.sessionHandle
+	);
+}
+
+function recoveryWatermarkAdvances(cursor, watermark) {
+	return watermark.lastSeq > cursor.seq || !recoveryCursorIdentityMatches(cursor, watermark);
+}
+
 function recoverySequenceIsContinuous(facts) {
 	const protocol = facts?.protocol;
 	if (!isRecord(protocol) || !isRecord(protocol.cursorBefore) || !isRecord(protocol.watermarkAfter))
@@ -1372,8 +1395,9 @@ function recoverySequenceIsContinuous(facts) {
 			protocol.snapshotFrameCount !== 0
 		)
 			return false;
+		if (!recoveryCursorIdentityMatches(cursor, watermark) || watermark.lastSeq <= cursor.seq) return false;
 		const count = watermark.lastSeq - cursor.seq;
-		if (count < 0) return false;
+		if (count <= 0) return false;
 		const expected = Array.from({ length: count }, (_, index) => cursor.seq + index + 1);
 		return isDeepStrictEqual(observed, expected);
 	}
@@ -1397,6 +1421,7 @@ function recoverySequenceIsContinuous(facts) {
 		barrier.baseSeq > barrier.asOfSeq
 	)
 		return false;
+	if (!recoveryWatermarkAdvances(cursor, watermark)) return false;
 	const postBarrier = observed.filter((seq) => seq > barrier.asOfSeq);
 	const count = watermark.lastSeq - barrier.asOfSeq;
 	if (count < 0) return false;
@@ -1483,22 +1508,32 @@ function recoveryLifecycleIsCorrect(facts, definition) {
 	const before = facts?.lifecycle?.before;
 	const after = facts?.lifecycle?.after;
 	if (!before || !after) return false;
-	const bounded =
+	const boundedAfter =
 		after.activeGatewayCount === 1 &&
 		after.rootExists === true &&
 		after.rootEntryCount <= RECOVERY_LIFECYCLE_MAX_ROOT_ENTRIES &&
 		typeof after.rootPath === "string" &&
 		after.rootPath.length > 0;
 	if (
-		!bounded ||
+		!boundedAfter ||
 		facts.lifecycle.originBefore !== facts.lifecycle.originAfter ||
 		before.rootPath !== after.rootPath
 	)
 		return false;
 	if (definition.kind === "recovery-gateway-restart") {
+		const validGatewayState = (state) =>
+			state.activeGatewayCount === 1 &&
+			state.rootExists === true &&
+			state.rootEntryCount <= RECOVERY_LIFECYCLE_MAX_ROOT_ENTRIES &&
+			typeof state.rootPath === "string" &&
+			state.rootPath.length > 0 &&
+			state.activeGatewayPid !== null &&
+			state.activeGatewayPid > 0;
+		if (!validGatewayState(before) || !validGatewayState(after)) return false;
 		return (
 			after.gatewayStarts - before.gatewayStarts === 1 &&
-			after.ownedGatewayCount - before.ownedGatewayCount === 1
+			after.ownedGatewayCount - before.ownedGatewayCount === 1 &&
+			after.activeGatewayPid !== before.activeGatewayPid
 		);
 	}
 	return after.gatewayStarts === before.gatewayStarts && after.ownedGatewayCount === before.ownedGatewayCount;
@@ -1527,8 +1562,18 @@ function recoveryStaleIsCorrect(facts, definition) {
 function recoveryPiIsCorrect(facts, definition) {
 	const target = facts?.pi?.targetSessionId;
 	const projection = facts?.projection;
+	const beforeMarkers = Array.isArray(facts?.pi?.markersBefore) ? facts.pi.markersBefore : [];
 	const freshMarkers = newRecoveryMarkers(facts);
 	if (typeof target !== "string" || !projection || freshMarkers.length === 0) return false;
+	if (
+		beforeMarkers.some(
+			(marker) =>
+				marker.sessionId === target &&
+				(marker.type === "prompt" || marker.type === "settled") &&
+				marker.text === projection.prompt,
+		)
+	)
+		return false;
 	const promptMarkers = freshMarkers.filter(
 		(marker) => marker.type === "prompt" && marker.sessionId === target && marker.text === projection.prompt,
 	);
@@ -1567,7 +1612,17 @@ function deriveCorrectness(observation, definition) {
 	if (definition.kind === "streaming") {
 		const dom = facts?.dom;
 		const frames = facts?.frames;
-		const targetBytes = definition.targetBytes ?? 0;
+		const targetBytes = definition.targetBytes;
+		const exactStructuralFramePair =
+			isFiniteNumber(targetBytes) &&
+			targetBytes >= 0 &&
+			Array.isArray(frames?.largeFrameTypes) &&
+			frames.largeFrameTypes.length === 2 &&
+			frames.largeFrameTypes[0] === "text_end" &&
+			frames.largeFrameTypes[1] === "message_end" &&
+			Array.isArray(frames?.largeFrameBytes) &&
+			frames.largeFrameBytes.length === 2 &&
+			frames.largeFrameBytes.every((bytes) => isFiniteNumber(bytes) && bytes > targetBytes);
 		correctness = {
 			liveTailStayedPlain: dom?.liveRichNodeCount === 0,
 			structuralReleaseHeldInStreamingDom:
@@ -1577,10 +1632,8 @@ function deriveCorrectness(observation, definition) {
 			settledEndSentinel:
 				typeof dom?.settledText === "string" && dom.settledText.includes("STREAM_BUDGET_END"),
 			settledUnicode: typeof dom?.settledText === "string" && dom.settledText.includes("🧪"),
-			structuralFramesEmittedInOrder: frames?.largeFrameTypes?.join(",") === "text_end,message_end",
-			frameBudgetPreserved:
-				Array.isArray(frames?.largeFrameBytes) &&
-				frames.largeFrameBytes.every((bytes) => bytes > targetBytes),
+			structuralFramesEmittedInOrder: exactStructuralFramePair,
+			frameBudgetPreserved: exactStructuralFramePair,
 		};
 	} else if (definition.kind === "concurrency") {
 		const sessions = facts?.sessions;
@@ -1598,19 +1651,24 @@ function deriveCorrectness(observation, definition) {
 	} else if (definition.kind === "history") {
 		const dom = facts?.dom;
 		const history = facts?.history;
+		const expectedInitialTurns = Number.isSafeInteger(definition.turns)
+			? Math.min(HISTORY_INITIAL_TURN_WINDOW, definition.turns)
+			: null;
 		correctness = {
-			exactSourceBoundary: history?.actualSourceBytes === history?.expectedSourceBytes,
-			allTurnsPaged: history?.windowTotal === history?.expectedTurns,
-			historyWindowMatchesReadPath: history?.initialTurns === history?.expectedInitialTurns,
+			exactSourceBoundary: history?.actualSourceBytes === definition.sourceBytes,
+			allTurnsPaged: history?.windowTotal === definition.turns,
+			historyWindowMatchesReadPath:
+				expectedInitialTurns !== null && history?.initialTurns === expectedInitialTurns,
 			oldestTurnReachable: dom?.oldestTurnCount === 1,
 			expectedHistoryReadPath: facts?.pi?.getMessagesCount === 0,
 		};
 	} else if (definition.kind === "content-roundtrip") {
 		const attachments = facts?.attachments;
 		const socket = facts?.socket;
+		const expectedInputChars = expectedInputBase64Chars(definition.inputBytes);
 		correctness = {
 			inputReachedPiAtExpectedSize:
-				attachments?.observedInputBase64Chars === attachments?.expectedInputBase64Chars,
+				expectedInputChars !== null && attachments?.observedInputBase64Chars === expectedInputChars,
 			typedOutputRefsObserved: (attachments?.attachmentRefCount ?? -1) >= 2,
 			outputBlobResolved: attachments?.imageComplete === true && (attachments?.naturalWidth ?? 0) > 0,
 			largeOutputStayedOffWebSocket: attachments?.inlineImageSignatureCount === 0,

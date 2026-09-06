@@ -16,6 +16,22 @@ const HASH_B = "b".repeat(64);
 const HASH_C = "c".repeat(64);
 const RUN_ID = "20260831t000000z-fixture";
 const FORMAL_VARIANTS = ["coalesced", "sequential"];
+// Independently maintained oracle: this must not be generated from the validator export under test.
+const EXPECTED_BENCHMARK_PRODUCER_PATHS = Object.freeze([
+	"scripts/run-performance-benchmarks.mjs",
+	"tests/e2e/benchmarks/benchmark-support.ts",
+	"tests/e2e/benchmarks/concurrency.spec.ts",
+	"tests/e2e/benchmarks/content-roundtrip.spec.ts",
+	"tests/e2e/benchmarks/history.spec.ts",
+	"tests/e2e/benchmarks/playwright.config.ts",
+	"tests/e2e/benchmarks/recovery.spec.ts",
+	"tests/e2e/benchmarks/streaming.spec.ts",
+	"tests/e2e/fixtures/deterministic-pi.mjs",
+	"tests/e2e/fixtures/page-observation.ts",
+	"tests/e2e/fixtures/production-harness.ts",
+	"tests/e2e/fixtures/test.ts",
+	"tests/e2e/specs/recovery-acceptance.spec.ts",
+]);
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const matrix = loadBenchmarkMatrix();
 const representativeScenarios = matrix.tiers.representative.scenarios;
@@ -32,7 +48,7 @@ function variantOrder(seed = "fixture-seed") {
 
 function fixtureHashes() {
 	return Object.fromEntries(
-		BENCHMARK_PRODUCER_PATHS.map((relativePath) => [
+		EXPECTED_BENCHMARK_PRODUCER_PATHS.map((relativePath) => [
 			relativePath,
 			createHash("sha256")
 				.update(fs.readFileSync(path.join(repositoryRoot, relativePath)))
@@ -43,6 +59,11 @@ function fixtureHashes() {
 
 function browserErrors() {
 	return { console: [], page: [] };
+}
+
+function base64CharsForBytes(byteLength) {
+	// The content fixture uses unwrapped RFC 4648 Base64: four characters per three bytes, rounded up.
+	return 4 * Math.ceil(byteLength / 3);
 }
 
 function authority(sessionHandle, nativeSessionId, sessionFile, serverEpoch, generation) {
@@ -194,7 +215,9 @@ function recoveryObservation(kind) {
 function observationFor(definition) {
 	if (definition.kind.startsWith("recovery-")) return recoveryObservation(definition.kind);
 	if (definition.kind === "streaming") {
-		const targetBytes = definition.targetBytes ?? 1024;
+		if (!Number.isSafeInteger(definition.targetBytes))
+			throw new Error("streaming fixture is missing targetBytes");
+		const targetBytes = definition.targetBytes;
 		return {
 			kind: "streaming",
 			browserErrors: browserErrors(),
@@ -235,8 +258,10 @@ function observationFor(definition) {
 		};
 	}
 	if (definition.kind === "history") {
-		const expectedTurns = definition.turns ?? 48;
-		const expectedSourceBytes = definition.sourceBytes ?? 1024;
+		if (!Number.isSafeInteger(definition.turns) || !Number.isSafeInteger(definition.sourceBytes))
+			throw new Error("history fixture is missing sourceBytes or turns");
+		const expectedTurns = definition.turns;
+		const expectedSourceBytes = definition.sourceBytes;
 		return {
 			kind: "history",
 			browserErrors: browserErrors(),
@@ -254,23 +279,29 @@ function observationFor(definition) {
 			},
 		};
 	}
-	return {
-		kind: "content-roundtrip",
-		browserErrors: browserErrors(),
-		facts: {
-			attachments: {
-				attachmentRefCount: 2,
-				expectedInputBase64Chars: 1024,
-				fetchStatus: 1,
-				imageComplete: true,
-				inlineImageSignatureCount: 0,
-				naturalWidth: 1,
-				observedInputBase64Chars: 1024,
+	if (definition.kind === "content-roundtrip") {
+		if (!Number.isSafeInteger(definition.inputBytes))
+			throw new Error("content fixture is missing inputBytes");
+		const inputBase64Chars = base64CharsForBytes(definition.inputBytes);
+		return {
+			kind: "content-roundtrip",
+			browserErrors: browserErrors(),
+			facts: {
+				attachments: {
+					attachmentRefCount: 2,
+					expectedInputBase64Chars: inputBase64Chars,
+					fetchStatus: 1,
+					imageComplete: true,
+					inlineImageSignatureCount: 0,
+					naturalWidth: 1,
+					observedInputBase64Chars: inputBase64Chars,
+				},
+				frames: { maxReceivedFrameBytes: 1024, maxSentFrameBytes: 2048 },
+				socket: { closed: 0, opened: 1 },
 			},
-			frames: { maxReceivedFrameBytes: 1024, maxSentFrameBytes: 2048 },
-			socket: { closed: 0, opened: 1 },
-		},
-	};
+		};
+	}
+	throw new Error(`fixture matrix contains an unsupported benchmark kind: ${definition.kind}`);
 }
 
 function correctnessFor(definition) {
@@ -569,6 +600,10 @@ test("defines canonical formal pairs from the loaded matrix projection", () => {
 	);
 });
 
+test("keeps the validator producer-path export aligned with an independent oracle", () => {
+	assert.deepEqual(BENCHMARK_PRODUCER_PATHS, EXPECTED_BENCHMARK_PRODUCER_PATHS);
+});
+
 test("accepts one complete formal schema-v2 artifact set", () => {
 	assert.deepEqual(validate().errors, []);
 });
@@ -717,7 +752,7 @@ test("rejects provenance hash drift and a nonzero Playwright run reported green"
 });
 
 test("requires the exact shared fixture producer hash set", () => {
-	for (const requiredPath of BENCHMARK_PRODUCER_PATHS) {
+	for (const requiredPath of EXPECTED_BENCHMARK_PRODUCER_PATHS) {
 		const manifest = validManifest();
 		delete manifest.fixtureHashes[requiredPath];
 		assert.match(errorText(validate({ manifest })), /fixtureHashes.*exactly/);
@@ -813,6 +848,106 @@ test("rejects stale-authority side effects even when the response is rejected", 
 	assert.ok(recoveryRaw);
 	recoveryRaw.value.observation.facts.stale.generation.piCommandCountAfter = 1;
 	assert.match(errorText(validate({ rawArtifacts })), /correctness|stale|independently derived/);
+});
+
+test("binds history and content correctness to canonical workload definitions", () => {
+	const rawArtifacts = validResults().flatMap(rawFor);
+	const historyRaw = rawArtifacts.find((artifact) => artifact.value.kind === "history");
+	assert.ok(historyRaw);
+	const history = historyRaw.value.observation.facts.history;
+	history.actualSourceBytes += 1;
+	history.expectedSourceBytes = history.actualSourceBytes;
+	history.windowTotal += 1;
+	history.expectedTurns = history.windowTotal;
+	const contentRaw = rawArtifacts.find((artifact) => artifact.value.kind === "content-roundtrip");
+	assert.ok(contentRaw);
+	contentRaw.value.observation.facts.attachments.observedInputBase64Chars = 0;
+	contentRaw.value.observation.facts.attachments.expectedInputBase64Chars = 0;
+	assert.match(errorText(validate({ rawArtifacts })), /correctness|independently derived/);
+});
+
+test("ignores redundant raw workload expectations when observations match the matrix", () => {
+	const rawArtifacts = validResults().flatMap(rawFor);
+	for (const artifact of rawArtifacts) {
+		if (artifact.value.kind === "history") {
+			artifact.value.observation.facts.history.expectedInitialTurns = 0;
+			artifact.value.observation.facts.history.expectedSourceBytes = 0;
+			artifact.value.observation.facts.history.expectedTurns = 0;
+		}
+		if (artifact.value.kind === "content-roundtrip") {
+			artifact.value.observation.facts.attachments.expectedInputBase64Chars = 0;
+		}
+	}
+	assert.deepEqual(validate({ rawArtifacts }).errors, []);
+});
+
+test("requires an exact non-empty ordered streaming frame pair", () => {
+	assert.ok(scenario.targetBytes !== undefined);
+	for (const largeFrameBytes of [
+		[],
+		[scenario.targetBytes + 1],
+		[scenario.targetBytes + 1, scenario.targetBytes + 2, scenario.targetBytes + 3],
+	]) {
+		const rawArtifacts = validResults().flatMap(rawFor);
+		const streamingRaw = rawArtifacts.find((artifact) => artifact.value.kind === "streaming");
+		assert.ok(streamingRaw);
+		streamingRaw.value.observation.facts.frames.largeFrameBytes = largeFrameBytes;
+		assert.match(errorText(validate({ rawArtifacts })), /correctness|independently derived/);
+	}
+});
+
+test("requires recovery progress beyond the authoritative pre-fault cursor", () => {
+	for (const kind of ["recovery-disconnect", "recovery-gap"]) {
+		const rawArtifacts = validResults().flatMap(rawFor);
+		const recoveryRaw = rawArtifacts.find((artifact) => artifact.value.kind === kind);
+		assert.ok(recoveryRaw);
+		const protocol = recoveryRaw.value.observation.facts.protocol;
+		protocol.cursorBefore.seq = 1;
+		protocol.watermarkAfter.lastSeq = 1;
+		protocol.observedEventSeqs = [];
+		if (protocol.mode === "resync") {
+			protocol.barrier.asOfSeq = 1;
+			protocol.barrier.barrierSeq = 1;
+			protocol.barrier.runtimeLastSeq = 1;
+		}
+		const errors = errorText(validate({ rawArtifacts }));
+		assert.ok(errors.length > 0, `${kind}: expected non-advancing recovery progress to fail`);
+		assert.match(errors, /correctness|sequence|watermark|independently derived/);
+	}
+});
+
+test("does not reclassify a pre-fault marker as the recovered target prompt", () => {
+	const rawArtifacts = validResults().flatMap(rawFor);
+	const recoveryRaw = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-disconnect");
+	assert.ok(recoveryRaw);
+	const facts = recoveryRaw.value.observation.facts;
+	const preFaultPrompt = structuredClone(facts.pi.markersAfter[0]);
+	const recoveredPrompt = { ...preFaultPrompt, at: preFaultPrompt.at + 2 };
+	const recoveredSettled = { ...facts.pi.markersAfter[1], at: preFaultPrompt.at + 3 };
+	facts.pi.markersBefore = [preFaultPrompt];
+	facts.pi.markersAfter = [preFaultPrompt, recoveredPrompt, recoveredSettled];
+	assert.match(errorText(validate({ rawArtifacts })), /correctness|independently derived/);
+});
+
+test("requires a real before/after Gateway restart lifecycle and PID transition", () => {
+	for (const mutate of [
+		(lifecycle) => {
+			lifecycle.before.activeGatewayCount = 0;
+			lifecycle.before.activeGatewayPid = null;
+		},
+		(lifecycle) => {
+			lifecycle.after.activeGatewayPid = lifecycle.before.activeGatewayPid;
+		},
+		(lifecycle) => {
+			lifecycle.after.activeGatewayPid = null;
+		},
+	]) {
+		const rawArtifacts = validResults().flatMap(rawFor);
+		const restartRaw = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-gateway-restart");
+		assert.ok(restartRaw);
+		mutate(restartRaw.value.observation.facts.lifecycle);
+		assert.match(errorText(validate({ rawArtifacts })), /correctness|gateway|independently derived/);
+	}
 });
 
 test("rejects traversal, duplicate, missing, and extra raw labels", () => {
