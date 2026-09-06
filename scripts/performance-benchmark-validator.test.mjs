@@ -630,12 +630,26 @@ test("requires canonical result and raw artifact paths", () => {
 	assert.match(errorText(validate({ results, rawArtifacts })), /raw artifact path|raw trial path must be/);
 });
 
-test("rejects a matrix that overclaims Issue #28 completion", () => {
-	const completedMatrix = structuredClone(matrix);
-	completedMatrix.scope.status = "complete";
+test("enforces exact Issue #28 Phase 1 complete matrix scope", () => {
+	const incompleteMatrix = structuredClone(matrix);
+	incompleteMatrix.scope.status = "incomplete";
 	assert.match(
-		errorText(validate({ matrix: completedMatrix, manifest: validManifest() })),
-		/#28 Phase 1 \/ incomplete/,
+		errorText(validate({ matrix: incompleteMatrix, manifest: validManifest() })),
+		/#28 Phase 1 \/ complete/,
+	);
+
+	const overclaimedPhaseMatrix = structuredClone(matrix);
+	overclaimedPhaseMatrix.scope.phase = 2;
+	assert.match(
+		errorText(validate({ matrix: overclaimedPhaseMatrix, manifest: validManifest() })),
+		/#28 Phase 1 \/ complete/,
+	);
+
+	const invalidLabelMatrix = structuredClone(matrix);
+	invalidLabelMatrix.scope.label = "#28 Phase 1 / incomplete";
+	assert.match(
+		errorText(validate({ matrix: invalidLabelMatrix, manifest: validManifest() })),
+		/#28 Phase 1 \/ complete/,
 	);
 });
 
