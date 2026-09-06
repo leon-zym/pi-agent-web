@@ -181,6 +181,11 @@ export interface BenchmarkRecoveryWatermarkFact {
 	sessionHandle: string;
 }
 
+export interface BenchmarkRecoveryBoundaryFact {
+	resyncFrameIndex: number | null;
+	snapshotFrameIndex: number | null;
+}
+
 export interface BenchmarkRecoveryBarrierFact {
 	asOfSeq: number | null;
 	baseSeq: number | null;
@@ -193,11 +198,14 @@ export interface BenchmarkRecoveryBarrierFact {
 
 export interface BenchmarkRecoveryProtocolFacts {
 	barrier: BenchmarkRecoveryBarrierFact;
+	boundary: BenchmarkRecoveryBoundaryFact;
 	cursorBefore: BenchmarkRecoveryCursorFact;
 	mode: "replay" | "resync";
-	observedEventSeqs: number[];
+	postBarrierEventSeqs: number[];
+	preBarrierEventSeqs: number[];
 	rekeyFrameCount: number;
 	resyncFrameCount: number;
+	replayEventSeqs: number[];
 	snapshotFrameCount: number;
 	watermarkAfter: BenchmarkRecoveryWatermarkFact;
 }

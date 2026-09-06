@@ -180,14 +180,23 @@ function protocolFacts(
 	const window = received.slice(frameStart, frameEnd);
 	const runtime = latestRuntime(received.slice(0, frameEnd), frameStart, sessionHandle);
 	if (!runtime) throw new Error(`authoritative runtime watermark is missing for Session ${sessionHandle}`);
-	const eventSeqs = window
-		.filter(
-			(candidate) =>
-				candidate.type === "event" &&
-				candidate.sessionHandle === sessionHandle &&
-				Number.isSafeInteger(candidate.seq),
-		)
-		.map((candidate) => candidate.seq as number);
+	const eventSeqs = (frames: WireFrame[]) =>
+		frames
+			.filter(
+				(candidate) =>
+					candidate.type === "event" &&
+					candidate.sessionHandle === sessionHandle &&
+					Number.isSafeInteger(candidate.seq),
+			)
+			.map((candidate) => candidate.seq as number);
+	const resyncFrameIndex = window.findIndex(
+		(candidate) => candidate.type === "resync_required" && candidate.sessionHandle === sessionHandle,
+	);
+	const snapshotFrameIndex = window.findIndex(
+		(candidate) =>
+			(candidate.type === "session_snapshot" || candidate.type === "session_snapshot_begin") &&
+			candidate.sessionHandle === sessionHandle,
+	);
 	const resync = window.find(
 		(candidate) => candidate.type === "resync_required" && candidate.sessionHandle === sessionHandle,
 	);
@@ -218,7 +227,15 @@ function protocolFacts(
 		},
 		cursorBefore: cursor,
 		mode,
-		observedEventSeqs: eventSeqs,
+		boundary: {
+			resyncFrameIndex: resyncFrameIndex >= 0 ? resyncFrameIndex : null,
+			snapshotFrameIndex: snapshotFrameIndex >= 0 ? snapshotFrameIndex : null,
+		},
+		postBarrierEventSeqs:
+			mode === "resync" && snapshotFrameIndex >= 0 ? eventSeqs(window.slice(snapshotFrameIndex + 1)) : [],
+		preBarrierEventSeqs:
+			mode === "resync" && snapshotFrameIndex >= 0 ? eventSeqs(window.slice(0, snapshotFrameIndex)) : [],
+		replayEventSeqs: mode === "replay" ? eventSeqs(window) : [],
 		rekeyFrameCount: window.filter(
 			(candidate) =>
 				candidate.type === "session_rekeyed" &&

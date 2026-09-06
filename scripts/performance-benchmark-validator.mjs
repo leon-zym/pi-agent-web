@@ -227,7 +227,16 @@ const STALE_COMMAND_KEYS = [
 	"responseType",
 ];
 const RECOVERY_STALE_KEYS = ["epoch", "fence", "generation", "parent"];
-const RECOVERY_SEQUENCE_KEYS = ["barrier", "cursorBefore", "mode", "observedEventSeqs", "watermarkAfter"];
+const RECOVERY_SEQUENCE_KEYS = [
+	"barrier",
+	"boundary",
+	"cursorBefore",
+	"mode",
+	"postBarrierEventSeqs",
+	"preBarrierEventSeqs",
+	"replayEventSeqs",
+	"watermarkAfter",
+];
 const RECOVERY_BARRIER_KEYS = [
 	"asOfSeq",
 	"baseSeq",
@@ -239,6 +248,7 @@ const RECOVERY_BARRIER_KEYS = [
 ];
 const RECOVERY_CURSOR_KEYS = ["generation", "serverEpoch", "sessionHandle", "seq"];
 const RECOVERY_WATERMARK_KEYS = ["generation", "lastSeq", "serverEpoch", "sessionHandle"];
+const RECOVERY_BOUNDARY_KEYS = ["resyncFrameIndex", "snapshotFrameIndex"];
 const RECOVERY_PROJECTION_KEYS = ["prompt", "promptCount", "reply", "replyCount"];
 const RECOVERY_PARENT_KEYS = [
 	"childNativeSessionId",
@@ -261,11 +271,14 @@ const RECOVERY_LIFECYCLE_KEYS = [
 ];
 const RECOVERY_PROTOCOL_KEYS = [
 	"barrier",
+	"boundary",
 	"cursorBefore",
 	"mode",
-	"observedEventSeqs",
+	"postBarrierEventSeqs",
+	"preBarrierEventSeqs",
 	"rekeyFrameCount",
 	"resyncFrameCount",
+	"replayEventSeqs",
 	"snapshotFrameCount",
 	"watermarkAfter",
 ];
@@ -1108,11 +1121,18 @@ function validateProtocolFact(value, label, errors) {
 		validateNonnegativeInteger(value.watermarkAfter.generation, `${label}.watermarkAfter.generation`, errors);
 		validateNonnegativeInteger(value.watermarkAfter.lastSeq, `${label}.watermarkAfter.lastSeq`, errors);
 	}
-	if (
-		!Array.isArray(value.observedEventSeqs) ||
-		value.observedEventSeqs.some((seq) => !Number.isSafeInteger(seq) || seq <= 0)
-	) {
-		errors.push(`${label}.observedEventSeqs must be a positive safe integer array`);
+	if (!exactKeys(value.boundary, RECOVERY_BOUNDARY_KEYS)) {
+		errors.push(`${label}.boundary must contain exactly ${RECOVERY_BOUNDARY_KEYS.join(", ")}`);
+	} else {
+		for (const key of RECOVERY_BOUNDARY_KEYS) {
+			if (value.boundary[key] !== null)
+				validateNonnegativeInteger(value.boundary[key], `${label}.boundary.${key}`, errors);
+		}
+	}
+	for (const key of ["postBarrierEventSeqs", "preBarrierEventSeqs", "replayEventSeqs"]) {
+		if (!Array.isArray(value[key]) || value[key].some((seq) => !Number.isSafeInteger(seq) || seq <= 0)) {
+			errors.push(`${label}.${key} must be a positive safe integer array`);
+		}
 	}
 	validateNonnegativeInteger(value.rekeyFrameCount, `${label}.rekeyFrameCount`, errors);
 	validateNonnegativeInteger(value.resyncFrameCount, `${label}.resyncFrameCount`, errors);
@@ -1374,14 +1394,17 @@ function recoverySequenceIsContinuous(facts) {
 	const protocol = facts?.protocol;
 	if (!isRecord(protocol) || !isRecord(protocol.cursorBefore) || !isRecord(protocol.watermarkAfter))
 		return false;
-	if (!isRecord(protocol.barrier)) return false;
+	if (!isRecord(protocol.barrier) || !isRecord(protocol.boundary)) return false;
 	const cursor = protocol.cursorBefore;
 	const watermark = protocol.watermarkAfter;
-	const observed = Array.isArray(protocol.observedEventSeqs) ? protocol.observedEventSeqs : [];
-	const uniqueAndOrdered =
-		new Set(observed).size === observed.length &&
-		observed.every((seq, index) => index === 0 || seq > observed[index - 1]);
-	if (!uniqueAndOrdered) return false;
+	const replayEventSeqs = Array.isArray(protocol.replayEventSeqs) ? protocol.replayEventSeqs : [];
+	const preBarrierEventSeqs = Array.isArray(protocol.preBarrierEventSeqs) ? protocol.preBarrierEventSeqs : [];
+	const postBarrierEventSeqs = Array.isArray(protocol.postBarrierEventSeqs)
+		? protocol.postBarrierEventSeqs
+		: [];
+	const orderedAndUnique = (seqs) =>
+		new Set(seqs).size === seqs.length && seqs.every((seq, index) => index === 0 || seq > seqs[index - 1]);
+	if (![replayEventSeqs, preBarrierEventSeqs, postBarrierEventSeqs].every(orderedAndUnique)) return false;
 	if (protocol.mode === "replay") {
 		if (
 			protocol.barrier.required ||
@@ -1392,14 +1415,18 @@ function recoverySequenceIsContinuous(facts) {
 			protocol.barrier.barrierSeq !== null ||
 			protocol.barrier.runtimeLastSeq !== null ||
 			protocol.resyncFrameCount !== 0 ||
-			protocol.snapshotFrameCount !== 0
+			protocol.snapshotFrameCount !== 0 ||
+			protocol.boundary.resyncFrameIndex !== null ||
+			protocol.boundary.snapshotFrameIndex !== null ||
+			preBarrierEventSeqs.length !== 0 ||
+			postBarrierEventSeqs.length !== 0
 		)
 			return false;
 		if (!recoveryCursorIdentityMatches(cursor, watermark) || watermark.lastSeq <= cursor.seq) return false;
 		const count = watermark.lastSeq - cursor.seq;
 		if (count <= 0) return false;
 		const expected = Array.from({ length: count }, (_, index) => cursor.seq + index + 1);
-		return isDeepStrictEqual(observed, expected);
+		return isDeepStrictEqual(replayEventSeqs, expected);
 	}
 	if (
 		protocol.mode !== "resync" ||
@@ -1418,15 +1445,28 @@ function recoverySequenceIsContinuous(facts) {
 		barrier.runtimeLastSeq === null ||
 		barrier.asOfSeq !== barrier.barrierSeq ||
 		barrier.asOfSeq !== barrier.runtimeLastSeq ||
-		barrier.baseSeq > barrier.asOfSeq
+		barrier.baseSeq > barrier.asOfSeq ||
+		!Number.isSafeInteger(protocol.boundary.resyncFrameIndex) ||
+		!Number.isSafeInteger(protocol.boundary.snapshotFrameIndex) ||
+		protocol.boundary.resyncFrameIndex < 0 ||
+		protocol.boundary.snapshotFrameIndex < 0 ||
+		protocol.boundary.resyncFrameIndex >= protocol.boundary.snapshotFrameIndex
 	)
 		return false;
 	if (!recoveryWatermarkAdvances(cursor, watermark)) return false;
-	const postBarrier = observed.filter((seq) => seq > barrier.asOfSeq);
+	if (replayEventSeqs.length !== 0) return false;
+	const sameIdentity = recoveryCursorIdentityMatches(cursor, watermark);
+	if (sameIdentity) {
+		if (barrier.asOfSeq < cursor.seq) return false;
+		if (preBarrierEventSeqs.some((seq) => seq <= cursor.seq || seq > barrier.asOfSeq)) return false;
+	}
 	const count = watermark.lastSeq - barrier.asOfSeq;
 	if (count < 0) return false;
 	const expected = Array.from({ length: count }, (_, index) => barrier.asOfSeq + index + 1);
-	return isDeepStrictEqual(postBarrier, expected) && observed.every((seq) => seq > barrier.asOfSeq);
+	return (
+		isDeepStrictEqual(postBarrierEventSeqs, expected) &&
+		postBarrierEventSeqs.every((seq) => seq > barrier.asOfSeq)
+	);
 }
 
 function recoveryProtocolIsCorrect(facts, definition) {

@@ -186,9 +186,15 @@ function recoveryObservation(kind) {
 				},
 				cursorBefore: source,
 				mode: resync ? "resync" : "replay",
-				observedEventSeqs: resync ? [2] : [1],
+				boundary: {
+					resyncFrameIndex: resync ? 0 : null,
+					snapshotFrameIndex: resync ? 1 : null,
+				},
+				postBarrierEventSeqs: resync ? [2] : [],
+				preBarrierEventSeqs: resync ? [1] : [],
 				rekeyFrameCount: rekey ? 1 : 0,
 				resyncFrameCount: resync ? 1 : 0,
+				replayEventSeqs: resync ? [] : [1],
 				snapshotFrameCount: resync ? 1 : 0,
 				watermarkAfter: {
 					generation: watermarkGeneration,
@@ -779,12 +785,12 @@ test("rejects duplicate, missing, and extra scenario results before map overwrit
 	assert.match(errors, /unexpected scenario artifact/);
 });
 
-test("requires an authoritative watermark and strict observed sequence continuity", () => {
+test("requires an authoritative watermark and strict partitioned sequence continuity", () => {
 	const rawArtifacts = validResults().flatMap(rawFor);
 	const recoveryRaw = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-crash");
 	assert.ok(recoveryRaw);
 	recoveryRaw.value.observation.facts.protocol.watermarkAfter.lastSeq = 2;
-	recoveryRaw.value.observation.facts.protocol.observedEventSeqs = [1];
+	recoveryRaw.value.observation.facts.protocol.postBarrierEventSeqs = [1];
 	assert.match(errorText(validate({ rawArtifacts })), /sequence|watermark|independently derived/);
 });
 
@@ -904,7 +910,9 @@ test("requires recovery progress beyond the authoritative pre-fault cursor", () 
 		const protocol = recoveryRaw.value.observation.facts.protocol;
 		protocol.cursorBefore.seq = 1;
 		protocol.watermarkAfter.lastSeq = 1;
-		protocol.observedEventSeqs = [];
+		protocol.replayEventSeqs = [];
+		protocol.preBarrierEventSeqs = [];
+		protocol.postBarrierEventSeqs = [];
 		if (protocol.mode === "resync") {
 			protocol.barrier.asOfSeq = 1;
 			protocol.barrier.barrierSeq = 1;
@@ -913,6 +921,60 @@ test("requires recovery progress beyond the authoritative pre-fault cursor", () 
 		const errors = errorText(validate({ rawArtifacts }));
 		assert.ok(errors.length > 0, `${kind}: expected non-advancing recovery progress to fail`);
 		assert.match(errors, /correctness|sequence|watermark|independently derived/);
+	}
+});
+
+test("records ordered recovery sequence partitions around the snapshot boundary", () => {
+	const rawArtifacts = validResults().flatMap(rawFor);
+	const replayRaw = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-disconnect");
+	const resyncRaw = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-gap");
+	assert.ok(replayRaw);
+	assert.ok(resyncRaw);
+	assert.deepEqual(replayRaw.value.observation.facts.protocol.boundary, {
+		resyncFrameIndex: null,
+		snapshotFrameIndex: null,
+	});
+	assert.deepEqual(replayRaw.value.observation.facts.protocol.replayEventSeqs, [1]);
+	assert.deepEqual(resyncRaw.value.observation.facts.protocol.boundary, {
+		resyncFrameIndex: 0,
+		snapshotFrameIndex: 1,
+	});
+	assert.deepEqual(resyncRaw.value.observation.facts.protocol.preBarrierEventSeqs, [1]);
+	assert.deepEqual(resyncRaw.value.observation.facts.protocol.postBarrierEventSeqs, [2]);
+});
+
+test("rejects a same-identity resync barrier that predates the consumed cursor", () => {
+	const rawArtifacts = validResults().flatMap(rawFor);
+	const recoveryRaw = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-gap");
+	assert.ok(recoveryRaw);
+	const protocol = recoveryRaw.value.observation.facts.protocol;
+	protocol.cursorBefore.seq = 2;
+	protocol.barrier.asOfSeq = 1;
+	protocol.barrier.barrierSeq = 1;
+	protocol.barrier.runtimeLastSeq = 1;
+	protocol.watermarkAfter.lastSeq = 3;
+	protocol.preBarrierEventSeqs = [1, 2];
+	protocol.postBarrierEventSeqs = [2, 3];
+	assert.match(errorText(validate({ rawArtifacts })), /correctness|sequence|independently derived/);
+});
+
+test("accepts a nonempty pre-barrier prefix when the snapshot advances the watermark", () => {
+	const rawArtifacts = validResults().flatMap(rawFor);
+	const recoveryRaw = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-gap");
+	assert.ok(recoveryRaw);
+	const protocol = recoveryRaw.value.observation.facts.protocol;
+	protocol.postBarrierEventSeqs = [];
+	protocol.watermarkAfter.lastSeq = protocol.barrier.asOfSeq;
+	assert.deepEqual(validate({ rawArtifacts }).errors, []);
+});
+
+test("rejects post-barrier gaps and duplicates", () => {
+	for (const postBarrierEventSeqs of [[3], [2, 2]]) {
+		const rawArtifacts = validResults().flatMap(rawFor);
+		const recoveryRaw = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-gap");
+		assert.ok(recoveryRaw);
+		recoveryRaw.value.observation.facts.protocol.postBarrierEventSeqs = postBarrierEventSeqs;
+		assert.match(errorText(validate({ rawArtifacts })), /correctness|sequence|independently derived/);
 	}
 });
 
