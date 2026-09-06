@@ -52,13 +52,17 @@ test("sidebar geometry stays fixed and relative time exposes an exact timestamp"
 	expect(collapsedTheme.color).toBe(expandedTheme.color);
 
 	await page.getByRole("button", { name: /^(Expand sidebar|展开侧栏)$/ }).click();
-	await page
+	const historicalRow = page
 		.locator("[data-session-row]")
-		.filter({ hasText: "E2E sidebar geometry history" })
-		.getByRole("button")
-		.first()
-		.click();
+		.filter({ hasText: "E2E sidebar geometry history" });
+	await historicalRow.getByRole("button").first().click();
+	await expect(historicalRow).toHaveAttribute("data-current", "true");
+	await expect(page.getByTestId("session-control-status")).toHaveAttribute(
+		"data-session-control-mode",
+		"controller",
+	);
 	const relativeTime = page.locator("header time");
+	await expect(relativeTime).toBeVisible();
 	const expectedExactTime = await relativeTime.evaluate((element) => {
 		const date = new Date((element as HTMLTimeElement).dateTime);
 		const pad = (value: number) => value.toString().padStart(2, "0");
