@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and stage release archive
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.21.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Release gate - verify
+        run: pnpm verify
+
+      - name: Release gate - server smoke
+        run: pnpm test:smoke
+
+      - name: Install Playwright browsers
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Release gate - packaged browser E2E
+        run: pnpm test:browser
+
+      - name: Release gate - pack smoke
+        run: pnpm test:pack
+
+      - name: Stage release bundle
+        run: node scripts/release-stage.mjs --tag=${{ inputs.tag }}
+
+      - name: Archive staged bundle
+        run: tar -czf dist/pi-agent-web-${{ inputs.tag }}.tar.gz -C dist/staging pi-agent-web-${{ inputs.tag }}
+
+      - name: Generate SHA-256 checksum
+        run: |
+          cd dist
+          sha256sum "pi-agent-web-${{ inputs.tag }}.tar.gz" > "pi-agent-web-${{ inputs.tag }}.tar.gz.sha256"
+
+      - name: Create draft GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ inputs.tag }}" \
+            --draft \
+            --title "pi-agent-web ${{ inputs.tag }}" \
+            --notes "Draft release for pi-agent-web ${{ inputs.tag }}." \
+            dist/pi-agent-web-${{ inputs.tag }}.tar.gz \
+            dist/pi-agent-web-${{ inputs.tag }}.tar.gz.sha256

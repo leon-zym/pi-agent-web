@@ -189,6 +189,31 @@ artifact, and documentation links. Report the exact real-Pi outcome. Do not clos
 until its accepted behavior is on the shipped branch and deferred work is explicitly recorded.
 Confirm the ruleset, exact required checks, and current maintainer-count exception.
 
+## Release staging and workflow
+
+Official release archives are staged on the release runner via `pnpm release:stage`:
+
+```bash
+pnpm release:stage --tag=v<version>
+```
+
+For local testing or dry runs, pass `--allow-local`:
+
+```bash
+pnpm release:stage --tag=v<version> --allow-local
+```
+
+The staging script validates that root and workspace package versions match the target tag,
+confirms that the working tree is clean, packs all four workspace packages, inspects tarball
+contents for compiled artifacts and lack of workspace protocol leaks, and stages the release
+directory in `dist/staging/pi-agent-web-v<version>/` with bundle manifest, private root package,
+INSTALL guide, and license.
+
+The GitHub Actions release workflow (`.github/workflows/release.yml`) triggers via `workflow_dispatch`
+with a required `tag` input. It runs the full serial release gates (`pnpm verify`, `pnpm test:smoke`,
+`pnpm test:browser`, `pnpm test:pack`), stages the release directory, creates the outer tar.gz archive
+and SHA-256 sidecar checksum, and drafts a GitHub Release for maintainer review.
+
 ## Code and commit conventions
 
 - Use tabs and Biome. Do not add ESLint or Prettier.
