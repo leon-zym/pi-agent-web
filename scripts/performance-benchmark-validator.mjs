@@ -1340,6 +1340,48 @@ function validateSocketFact(value, label, errors) {
 	validateNonnegativeInteger(value.opened, `${label}.opened`, errors);
 }
 
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+
+function expectedGatewayRestartRefusal(observation) {
+	const lifecycle = observation?.facts?.lifecycle;
+	const origin = lifecycle?.originBefore;
+	if (typeof origin !== "string" || !isRecord(lifecycle) || lifecycle.originAfter !== origin) return null;
+	let parsed;
+	try {
+		parsed = new URL(origin);
+	} catch {
+		return null;
+	}
+	if (
+		!new Set(["http:", "https:"]).has(parsed.protocol) ||
+		parsed.origin !== origin ||
+		!LOOPBACK_HOSTS.has(parsed.hostname)
+	)
+		return null;
+	const websocketProtocol = parsed.protocol === "https:" ? "wss:" : "ws:";
+	return `WebSocket connection to '${websocketProtocol}//${parsed.host}/api/v1/ws' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED`;
+}
+
+function allowlistedGatewayRestartBrowserErrors(observation, kind) {
+	if (kind !== "recovery-gateway-restart") return false;
+	const browserErrors = observation?.browserErrors;
+	if (!Array.isArray(browserErrors?.console) || !Array.isArray(browserErrors?.page)) return false;
+	const expected = expectedGatewayRestartRefusal(observation);
+	return (
+		expected !== null &&
+		browserErrors.page.length === 0 &&
+		browserErrors.console.length <= 1 &&
+		browserErrors.console.every((message) => message === expected)
+	);
+}
+
+function derivedBrowserErrorCount(observation, definition) {
+	const browserErrors = observation?.browserErrors;
+	if (!Array.isArray(browserErrors?.console) || !Array.isArray(browserErrors?.page)) return null;
+	if (allowlistedGatewayRestartBrowserErrors(observation, definition.kind)) return 0;
+	return browserErrors.console.length + browserErrors.page.length;
+}
+
 function validateObservation(value, definition, label, errors) {
 	if (!exactKeys(value, OBSERVATION_KEYS)) {
 		errors.push(`${label}: observation must contain exactly ${OBSERVATION_KEYS.join(", ")}`);
@@ -1351,6 +1393,8 @@ function validateObservation(value, definition, label, errors) {
 	} else {
 		validateStringArray(value.browserErrors.console, `${label}: observation.browserErrors.console`, errors);
 		validateStringArray(value.browserErrors.page, `${label}: observation.browserErrors.page`, errors);
+		if (derivedBrowserErrorCount(value, definition) !== 0)
+			errors.push(`${label}: observation.browserErrors contains an unallowlisted browser error`);
 	}
 	validateObservationFacts(value.facts, definition.kind, label, errors);
 }
@@ -1791,8 +1835,7 @@ function deriveHardMetric(metric, result, definition, trials, observationByTrial
 		)
 	)
 		return observations.reduce(
-			(total, observation) =>
-				total + observation.browserErrors.console.length + observation.browserErrors.page.length,
+			(total, observation) => total + derivedBrowserErrorCount(observation, definition),
 			0,
 		);
 	if (metric === "correctnessFailures")

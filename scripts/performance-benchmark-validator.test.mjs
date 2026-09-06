@@ -61,6 +61,9 @@ function browserErrors() {
 	return { console: [], page: [] };
 }
 
+const EXPECTED_GATEWAY_RESTART_REFUSAL =
+	"WebSocket connection to 'ws://127.0.0.1:3000/api/v1/ws' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED";
+
 function base64CharsForBytes(byteLength) {
 	// The content fixture uses unwrapped RFC 4648 Base64: four characters per three bytes, rounded up.
 	return 4 * Math.ceil(byteLength / 3);
@@ -652,6 +655,65 @@ test("derives browser-error hard gates from atomic observations", () => {
 	const rawArtifacts = results.flatMap(rawFor);
 	rawArtifacts[0].value.observation.browserErrors.console.push("observed console error");
 	assert.match(errorText(validate({ results, rawArtifacts })), /gate browserErrors\.value actual must be 1/);
+});
+
+test("allows only one exact Gateway restart refusal in its own raw trial", () => {
+	const accepted = validResults().flatMap(rawFor);
+	const acceptedTrial = accepted.find((artifact) => artifact.value.kind === "recovery-gateway-restart");
+	assert.ok(acceptedTrial);
+	acceptedTrial.value.observation.browserErrors.console.push(EXPECTED_GATEWAY_RESTART_REFUSAL);
+	assert.deepEqual(validate({ rawArtifacts: accepted }).errors, []);
+
+	for (const [label, mutate] of [
+		[
+			"wrong host",
+			(observation) =>
+				observation.browserErrors.console.push(
+					EXPECTED_GATEWAY_RESTART_REFUSAL.replace("127.0.0.1", "localhost"),
+				),
+		],
+		[
+			"wrong path",
+			(observation) =>
+				observation.browserErrors.console.push(
+					EXPECTED_GATEWAY_RESTART_REFUSAL.replace("/api/v1/ws", "/api/v1/other"),
+				),
+		],
+		[
+			"wrong message",
+			(observation) =>
+				observation.browserErrors.console.push(
+					EXPECTED_GATEWAY_RESTART_REFUSAL.replace("net::ERR_CONNECTION_REFUSED", "net::ERR_FAILED"),
+				),
+		],
+		[
+			"duplicate refusal",
+			(observation) =>
+				observation.browserErrors.console.push(
+					EXPECTED_GATEWAY_RESTART_REFUSAL,
+					EXPECTED_GATEWAY_RESTART_REFUSAL,
+				),
+		],
+		[
+			"page error",
+			(observation) => {
+				observation.browserErrors.console.push(EXPECTED_GATEWAY_RESTART_REFUSAL);
+				observation.browserErrors.page.push("unexpected page error");
+			},
+		],
+	]) {
+		const rawArtifacts = validResults().flatMap(rawFor);
+		const restartTrial = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-gateway-restart");
+		assert.ok(restartTrial);
+		mutate(restartTrial.value.observation);
+		assert.match(errorText(validate({ rawArtifacts })), /browserErrors/, `${label} must fail validation`);
+	}
+
+	const nonRestart = validResults().flatMap(rawFor);
+	const disconnectTrial = nonRestart.find((artifact) => artifact.value.kind === "recovery-disconnect");
+	assert.ok(disconnectTrial);
+	disconnectTrial.value.observation.browserErrors.console.push(EXPECTED_GATEWAY_RESTART_REFUSAL);
+	assert.match(errorText(validate({ rawArtifacts: nonRestart })), /browserErrors/);
 });
 
 test("keeps timing metrics observe-only and enforces required structural hard gates", () => {

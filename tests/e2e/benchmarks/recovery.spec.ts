@@ -438,7 +438,7 @@ async function staleEpochProbe(
 					settled = true;
 					window.clearTimeout(timeout);
 					try {
-						socket.close(1011, "stale epoch probe failed");
+						socket.close(1000, "stale epoch probe failed");
 					} catch {
 						// The diagnostic socket may already be closed.
 					}
@@ -537,8 +537,6 @@ async function assertStaleGuards(
 	staleGenerationRejected: boolean;
 	staleFenceRejected: boolean;
 	staleEpochRejected: boolean;
-	staleEpochDiagnosticClosed: boolean;
-	liveControllerEnabledAfterEpochProbe: boolean;
 	oldParentRejected: boolean;
 	stale: {
 		generation: BenchmarkRecoveryStaleFact;
@@ -579,8 +577,9 @@ async function assertStaleGuards(
 		(candidate) => candidate.type === "resync_required" && candidate.reason === "epoch_changed",
 	);
 	const epochCommandCountAfter = piCommandCount(harness);
+	expect(diagnostic.closed).toBe(true);
+	expect(diagnostic.closeCode).toBe(1000);
 	await expect(page.locator("textarea")).toBeEnabled({ timeout: 30_000 });
-	const liveControllerEnabledAfterEpochProbe = await page.locator("textarea").isEnabled();
 
 	let parentFact: BenchmarkRecoveryStaleFact | null = null;
 	let oldParentRejected = true;
@@ -611,8 +610,6 @@ async function assertStaleGuards(
 		staleEpochRejected: diagnostic.frames.some(
 			(candidate) => candidate.type === "resync_required" && candidate.reason === "epoch_changed",
 		),
-		staleEpochDiagnosticClosed: diagnostic.closed && diagnostic.closeCode === 1000,
-		liveControllerEnabledAfterEpochProbe,
 		oldParentRejected,
 		stale: {
 			generation: staleFact(
@@ -703,14 +700,50 @@ function addCommonRecoveryGates(
 	addSummaryGate(outcome, timingMetric, "p95", "gte", 0, "observe", timingRationale);
 }
 
-function filterExpectedGatewayRestartErrors(errors: { console: string[]; page: string[] }): {
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+
+function expectedGatewayRestartRefusal(origin: string): string | undefined {
+	let parsed: URL;
+	try {
+		parsed = new URL(origin);
+	} catch {
+		return undefined;
+	}
+	if (
+		!LOOPBACK_HOSTS.has(parsed.hostname) ||
+		(parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+		parsed.origin !== origin
+	)
+		return undefined;
+	const websocketProtocol = parsed.protocol === "https:" ? "wss:" : "ws:";
+	return `WebSocket connection to '${websocketProtocol}//${parsed.host}/api/v1/ws' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED`;
+}
+
+function filterExpectedGatewayRestartErrors(
+	errors: { console: string[]; page: string[] },
+	origin: string,
+	expectedRefusalsByTrial: Array<number | null>,
+): {
 	console: string[];
 	page: string[];
 } {
-	const expectedReconnectFailure =
-		/^WebSocket connection to 'ws:\/\/127\.0\.0\.1:\d+\/api\/v1\/ws' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED$/;
+	const expectedReconnectFailure = expectedGatewayRestartRefusal(origin);
+	const expectedRefusalCount = expectedReconnectFailure
+		? errors.console.filter((message) => message === expectedReconnectFailure).length
+		: 0;
+	const expectedRefusalsInTrials = expectedRefusalsByTrial.every(
+		(count) => Number.isSafeInteger(count) && (count as number) >= 0 && (count as number) <= 1,
+	)
+		? expectedRefusalsByTrial.reduce<number>((total, count) => total + (count ?? 0), 0)
+		: null;
+	const canExcludeExpectedRefusals =
+		expectedReconnectFailure !== undefined &&
+		expectedRefusalsInTrials !== null &&
+		expectedRefusalsInTrials === expectedRefusalCount;
 	return {
-		console: errors.console.filter((message) => !expectedReconnectFailure.test(message)),
+		console: canExcludeExpectedRefusals
+			? errors.console.filter((message) => message !== expectedReconnectFailure)
+			: errors.console,
 		page: errors.page,
 	};
 }
@@ -1425,6 +1458,9 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 			await installBrowserBenchmarkObserver(page);
 			await openBenchmarkPage(page, harness.origin);
 			const trialCount = scenario.warmups + scenario.samples;
+			const gatewayOrigin = harness.origin;
+			const expectedGatewayRefusal = expectedGatewayRestartRefusal(gatewayOrigin);
+			const expectedRefusalsByTrial: Array<number | null> = Array.from({ length: trialCount }, () => null);
 
 			for (let index = 0; index < trialCount; index += 1) {
 				await trials.run(index, async () => {
@@ -1520,6 +1556,14 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 					);
 					const lifecycleAfter = lifecycleFact(harness.lifecycle(), harness.rootDir);
 					const markersAfter = piMarkers(harness.piEvents());
+					const trialBrowserErrors = {
+						console: errors.console.slice(errorStart.console),
+						page: errors.page.slice(errorStart.page),
+					};
+					expectedRefusalsByTrial[index] =
+						expectedGatewayRefusal === undefined
+							? null
+							: trialBrowserErrors.console.filter((message) => message === expectedGatewayRefusal).length;
 					const { stale: staleFacts, oldParentRejected, ...staleChecks } = stale;
 					const correctness = {
 						recoveryBarrier:
@@ -1549,49 +1593,42 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 							activeGateways: lifecycleSnapshot.activeGatewayCount,
 						},
 						correctness,
-						observation: recoveryObservation(
-							"recovery-gateway-restart",
-							{
-								console: errors.console.slice(errorStart.console),
-								page: errors.page.slice(errorStart.page),
+						observation: recoveryObservation("recovery-gateway-restart", trialBrowserErrors, {
+							identity: {
+								before: persistedAuthority(harness, oldLease, beforeSession),
+								after: persistedAuthority(harness, currentLease, afterSession),
+								parentRelation: null,
 							},
-							{
-								identity: {
-									before: persistedAuthority(harness, oldLease, beforeSession),
-									after: persistedAuthority(harness, currentLease, afterSession),
-									parentRelation: null,
-								},
-								lifecycle: {
-									before: lifecycleBefore,
-									after: lifecycleAfter,
-									originBefore,
-									originAfter: harness.origin,
-								},
-								pi: {
-									markersBefore,
-									markersAfter,
-									targetSessionId: afterSession.nativeSessionId,
-								},
-								protocol,
-								projection: {
-									prompt: afterPrompt,
-									reply: `E2E_REPLY:${afterPrompt}`,
-									promptCount: afterProjection.promptCount,
-									replyCount: afterProjection.replyCount,
-								},
-								socket: {
-									closed: closedSockets() - closesBefore,
-									opened: sockets.length - socketsBefore,
-								},
-								stale: staleFacts,
+							lifecycle: {
+								before: lifecycleBefore,
+								after: lifecycleAfter,
+								originBefore,
+								originAfter: harness.origin,
 							},
-						),
+							pi: {
+								markersBefore,
+								markersAfter,
+								targetSessionId: afterSession.nativeSessionId,
+							},
+							protocol,
+							projection: {
+								prompt: afterPrompt,
+								reply: `E2E_REPLY:${afterPrompt}`,
+								promptCount: afterProjection.promptCount,
+								replyCount: afterProjection.replyCount,
+							},
+							socket: {
+								closed: closedSockets() - closesBefore,
+								opened: sockets.length - socketsBefore,
+							},
+							stale: staleFacts,
+						}),
 					};
 				});
 			}
 			addCommonRecoveryGates(
 				outcome,
-				filterExpectedGatewayRestartErrors(errors),
+				filterExpectedGatewayRestartErrors(errors, gatewayOrigin, expectedRefusalsByTrial),
 				"gatewayRestartMs",
 				"Gateway restart and fresh-baseline latency are diagnostic until a portable reference profile exists.",
 			);
