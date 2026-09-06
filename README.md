@@ -108,9 +108,11 @@ pnpm bench:stress           # explicit long-running stress matrix
 PI_WEB_RUN_E2E=1 pnpm test:e2e:real  # explicit credential-bearing real-Pi acceptance
 ```
 
-The performance matrix is Issue #28 Phase 1 and remains incomplete. Structural correctness is
-gated; host-sensitive latency, throughput, long-task, and heap results remain observational until a
-reference-host baseline exists. See [Development](docs/development.md) for test boundaries.
+The performance matrix is Issue #28 Phase 1 and remains incomplete. Issue #28 stays open until a
+pinned reference-host profile and two fresh representative baseline runs are recorded. Historical
+observations from Issues #53 and #58 are non-reference; host-sensitive latency, throughput,
+long-task, heap, and other timing/resource metrics remain diagnostic. See
+[Development](docs/development.md) for test boundaries.
 
 ## Distribution status
 

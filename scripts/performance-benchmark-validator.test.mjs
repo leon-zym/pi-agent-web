@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import {
+	BENCHMARK_PRODUCER_PATHS,
 	canonicalFormalExpectedScenarioSet,
 	loadBenchmarkMatrix,
 	validateBenchmarkArtifacts,
@@ -12,28 +16,28 @@ const HASH_B = "b".repeat(64);
 const HASH_C = "c".repeat(64);
 const RUN_ID = "20260831t000000z-fixture";
 const FORMAL_VARIANTS = ["coalesced", "sequential"];
-
-const scenario = {
-	id: "stream-test",
-	domain: "streaming",
-	kind: "streaming",
-	targetBytes: 10240,
-	chunkBytes: 128,
-	chunkDelayMs: 1,
-	warmups: 1,
-	samples: 2,
-	requiredCapabilities: ["browser", "websocket"],
-};
-
-const matrix = {
-	schemaVersion: 2,
-	scope: { issue: 28, phase: 1, status: "incomplete", label: "#28 Phase 1 / incomplete" },
-	tiers: {
-		representative: { scenarios: [scenario] },
-		stress: { scenarios: [] },
-	},
-	provenance: { rootHash: HASH_A, domainHashes: { streaming: HASH_B } },
-};
+// Independently maintained oracle: this must not be generated from the validator export under test.
+const EXPECTED_BENCHMARK_PRODUCER_PATHS = Object.freeze([
+	"scripts/run-performance-benchmarks.mjs",
+	"tests/e2e/benchmarks/benchmark-support.ts",
+	"tests/e2e/benchmarks/concurrency.spec.ts",
+	"tests/e2e/benchmarks/content-roundtrip.spec.ts",
+	"tests/e2e/benchmarks/history.spec.ts",
+	"tests/e2e/benchmarks/playwright.config.ts",
+	"tests/e2e/benchmarks/recovery.spec.ts",
+	"tests/e2e/benchmarks/streaming.spec.ts",
+	"tests/e2e/fixtures/deterministic-pi.mjs",
+	"tests/e2e/fixtures/page-observation.ts",
+	"tests/e2e/fixtures/production-harness.ts",
+	"tests/e2e/fixtures/test.ts",
+	"tests/e2e/specs/recovery-acceptance.spec.ts",
+]);
+const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const matrix = loadBenchmarkMatrix();
+const representativeScenarios = matrix.tiers.representative.scenarios;
+const scenario = representativeScenarios.find((entry) => entry.kind === "streaming");
+const recoveryScenario = representativeScenarios.find((entry) => entry.kind === "recovery-crash");
+if (!scenario || !recoveryScenario) throw new Error("fixture matrix is missing streaming or crash scenarios");
 
 function variantOrder(seed = "fixture-seed") {
 	return [...FORMAL_VARIANTS].sort((left, right) => {
@@ -42,100 +46,444 @@ function variantOrder(seed = "fixture-seed") {
 	});
 }
 
-function trialMetrics(latencyMs) {
+function fixtureHashes() {
+	return Object.fromEntries(
+		EXPECTED_BENCHMARK_PRODUCER_PATHS.map((relativePath) => [
+			relativePath,
+			createHash("sha256")
+				.update(fs.readFileSync(path.join(repositoryRoot, relativePath)))
+				.digest("hex"),
+		]),
+	);
+}
+
+function browserErrors() {
+	return { console: [], page: [] };
+}
+
+const EXPECTED_GATEWAY_RESTART_REFUSAL =
+	"WebSocket connection to 'ws://127.0.0.1:3000/api/v1/ws' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED";
+
+function base64CharsForBytes(byteLength) {
+	// The content fixture uses unwrapped RFC 4648 Base64: four characters per three bytes, rounded up.
+	return 4 * Math.ceil(byteLength / 3);
+}
+
+function authority(sessionHandle, nativeSessionId, sessionFile, serverEpoch, generation) {
 	return {
-		latencyMs,
+		fencingToken: `fence-${sessionHandle}`,
+		generation,
+		nativeSessionId,
+		persisted: true,
+		serverEpoch,
+		sessionFile,
+		sessionHandle,
+		workspaceHandle: "workspace",
+		workspacePath: "/workspace",
 	};
 }
 
-function validResult(variant, baseLatency = variant === "coalesced" ? 10 : 11) {
-	const measured = [baseLatency, baseLatency + 10];
+function staleFact(type, error = null) {
+	return {
+		piCommandCountAfter: 0,
+		piCommandCountBefore: 0,
+		requestId: `request-${type}`,
+		responseError: error,
+		responseSuccess: false,
+		responseType: type === "epoch" ? "resync_required" : "response",
+	};
+}
+
+function marker(at, type, sessionId, text = null, pid = 100) {
+	return { at, commandId: null, pid, sessionId, text, type };
+}
+
+function recoveryObservation(kind) {
+	const before = authority("session-parent", "native-parent", "/workspace/parent.jsonl", "epoch-a", 1);
+	const rekey = kind === "recovery-rekey";
+	const gatewayRestart = kind === "recovery-gateway-restart";
+	const crash = kind === "recovery-crash";
+	const after = rekey
+		? authority("session-child", "native-child", "/workspace/child.jsonl", "epoch-a", 2)
+		: authority(
+				before.sessionHandle,
+				before.nativeSessionId,
+				before.sessionFile,
+				gatewayRestart ? "epoch-b" : before.serverEpoch,
+				crash ? 2 : before.generation,
+			);
+	const source = { generation: 1, serverEpoch: "epoch-a", sessionHandle: "session-parent", seq: 0 };
+	const resync = kind === "recovery-gap" || gatewayRestart || rekey || crash;
+	const barrierSeq = resync ? 1 : null;
+	const watermarkGeneration = rekey || crash ? 2 : 1;
+	const watermarkEpoch = gatewayRestart ? "epoch-b" : "epoch-a";
+	const watermarkSession = rekey ? "session-child" : "session-parent";
+	const watermarkSeq = resync ? 2 : 1;
+	const targetSessionId = after.nativeSessionId;
+	const markers = crash
+		? [
+				marker(1, "crash_requested", targetSessionId, "prompt", 100),
+				marker(2, "started", targetSessionId, null, 101),
+				marker(3, "prompt", targetSessionId, "prompt", 101),
+				marker(4, "settled", targetSessionId, "prompt", 101),
+			]
+		: [marker(1, "prompt", targetSessionId, "prompt"), marker(2, "settled", targetSessionId, "prompt")];
+	return {
+		kind,
+		browserErrors: browserErrors(),
+		facts: {
+			identity: {
+				before,
+				after,
+				parentRelation: rekey
+					? {
+							childNativeSessionId: after.nativeSessionId,
+							childSessionFile: after.sessionFile,
+							childSessionHandle: after.sessionHandle,
+							parentNativeSessionId: before.nativeSessionId,
+							parentSessionFile: before.sessionFile,
+							parentSessionHandle: before.sessionHandle,
+							previousSessionHandle: before.sessionHandle,
+						}
+					: null,
+			},
+			lifecycle: {
+				before: {
+					activeGatewayCount: 1,
+					activeGatewayPid: 10,
+					gatewayStarts: 4,
+					ownedGatewayCount: 4,
+					rootPath: "/tmp/benchmark-root",
+					rootEntryCount: 2,
+					rootExists: true,
+				},
+				after: {
+					activeGatewayCount: 1,
+					activeGatewayPid: 11,
+					gatewayStarts: gatewayRestart ? 5 : 4,
+					ownedGatewayCount: gatewayRestart ? 5 : 4,
+					rootPath: "/tmp/benchmark-root",
+					rootEntryCount: 2,
+					rootExists: true,
+				},
+				originAfter: "http://127.0.0.1:3000",
+				originBefore: "http://127.0.0.1:3000",
+			},
+			pi: { markersAfter: markers, markersBefore: [], targetSessionId },
+			protocol: {
+				barrier: {
+					asOfSeq: barrierSeq,
+					baseSeq: resync ? 0 : null,
+					barrierSeq,
+					reason:
+						kind === "recovery-gap"
+							? "gap"
+							: gatewayRestart
+								? "epoch_changed"
+								: rekey || crash
+									? "initial"
+									: null,
+					required: resync,
+					runtimeLastSeq: barrierSeq,
+					snapshotSeen: resync,
+				},
+				cursorBefore: source,
+				mode: resync ? "resync" : "replay",
+				boundary: {
+					resyncFrameIndex: resync ? 0 : null,
+					snapshotFrameIndex: resync ? 1 : null,
+				},
+				postBarrierEventSeqs: resync ? [2] : [],
+				preBarrierEventSeqs: resync ? [1] : [],
+				rekeyFrameCount: rekey ? 1 : 0,
+				resyncFrameCount: resync ? 1 : 0,
+				replayEventSeqs: resync ? [] : [1],
+				snapshotFrameCount: resync ? 1 : 0,
+				watermarkAfter: {
+					generation: watermarkGeneration,
+					lastSeq: watermarkSeq,
+					serverEpoch: watermarkEpoch,
+					sessionHandle: watermarkSession,
+				},
+			},
+			projection: { prompt: "prompt", promptCount: 1, reply: "reply", replyCount: 1 },
+			socket: {
+				closed: kind === "recovery-disconnect" || kind === "recovery-gap" || gatewayRestart ? 1 : 0,
+				opened: kind === "recovery-disconnect" || kind === "recovery-gap" || gatewayRestart ? 1 : 0,
+			},
+			stale: {
+				epoch: staleFact("epoch"),
+				fence: staleFact("fence", "session_read_only"),
+				generation: staleFact("generation", "session_generation_stale"),
+				parent: rekey ? staleFact("parent", "session_read_only") : null,
+			},
+		},
+	};
+}
+
+function observationFor(definition) {
+	if (definition.kind.startsWith("recovery-")) return recoveryObservation(definition.kind);
+	if (definition.kind === "streaming") {
+		if (!Number.isSafeInteger(definition.targetBytes))
+			throw new Error("streaming fixture is missing targetBytes");
+		const targetBytes = definition.targetBytes;
+		return {
+			kind: "streaming",
+			browserErrors: browserErrors(),
+			facts: {
+				dom: {
+					liveRichNodeCount: 0,
+					settledCountAfterRelease: 1,
+					settledCountBeforeRelease: 0,
+					settledText: "STREAM_BUDGET_END 🧪",
+					streamingCountAfterRelease: 0,
+					streamingCountBeforeRelease: 1,
+					turnNodes: 4,
+				},
+				frames: {
+					deltaCount: 2,
+					largeFrameBytes: [targetBytes + 1, targetBytes + 2],
+					largeFrameTypes: ["text_end", "message_end"],
+				},
+			},
+		};
+	}
+	if (definition.kind === "concurrency") {
+		const expected = definition.sessions ?? 1;
+		return {
+			kind: "concurrency",
+			browserErrors: browserErrors(),
+			facts: {
+				sessions: {
+					expected,
+					minimumBackgroundCheckpoints: 2,
+					minimumProjectionCheckpoints: 2,
+					projected: expected,
+					settled: expected,
+					started: expected,
+				},
+				socket: { closed: 0, opened: 1 },
+			},
+		};
+	}
+	if (definition.kind === "history") {
+		if (!Number.isSafeInteger(definition.turns) || !Number.isSafeInteger(definition.sourceBytes))
+			throw new Error("history fixture is missing sourceBytes or turns");
+		const expectedTurns = definition.turns;
+		const expectedSourceBytes = definition.sourceBytes;
+		return {
+			kind: "history",
+			browserErrors: browserErrors(),
+			facts: {
+				dom: { mountedTurnNodes: 4, oldestTurnCount: 1 },
+				history: {
+					actualSourceBytes: expectedSourceBytes,
+					expectedInitialTurns: Math.min(48, expectedTurns),
+					expectedSourceBytes,
+					expectedTurns,
+					initialTurns: Math.min(48, expectedTurns),
+					windowTotal: expectedTurns,
+				},
+				pi: { getMessagesCount: 0 },
+			},
+		};
+	}
+	if (definition.kind === "content-roundtrip") {
+		if (!Number.isSafeInteger(definition.inputBytes))
+			throw new Error("content fixture is missing inputBytes");
+		const inputBase64Chars = base64CharsForBytes(definition.inputBytes);
+		return {
+			kind: "content-roundtrip",
+			browserErrors: browserErrors(),
+			facts: {
+				attachments: {
+					attachmentRefCount: 2,
+					expectedInputBase64Chars: inputBase64Chars,
+					fetchStatus: 1,
+					imageComplete: true,
+					inlineImageSignatureCount: 0,
+					naturalWidth: 1,
+					observedInputBase64Chars: inputBase64Chars,
+				},
+				frames: { maxReceivedFrameBytes: 1024, maxSentFrameBytes: 2048 },
+				socket: { closed: 0, opened: 1 },
+			},
+		};
+	}
+	throw new Error(`fixture matrix contains an unsupported benchmark kind: ${definition.kind}`);
+}
+
+function correctnessFor(definition) {
+	const keys =
+		definition.kind === "streaming"
+			? [
+					"liveTailStayedPlain",
+					"structuralReleaseHeldInStreamingDom",
+					"structuralReleasePublishedSettledDom",
+					"settledEndSentinel",
+					"settledUnicode",
+					"structuralFramesEmittedInOrder",
+					"frameBudgetPreserved",
+				]
+			: definition.kind === "concurrency"
+				? [
+						"allSessionsStarted",
+						"allSessionsSettled",
+						"allBackgroundProjectionsRecovered",
+						"allSessionsObservedTwice",
+						"backgroundSessionsIngestedBetweenSwitches",
+						"singleMultiplexedSocket",
+					]
+				: definition.kind === "history"
+					? [
+							"exactSourceBoundary",
+							"allTurnsPaged",
+							"historyWindowMatchesReadPath",
+							"oldestTurnReachable",
+							"expectedHistoryReadPath",
+						]
+					: definition.kind === "content-roundtrip"
+						? [
+								"inputReachedPiAtExpectedSize",
+								"typedOutputRefsObserved",
+								"outputBlobResolved",
+								"largeOutputStayedOffWebSocket",
+								"socketRemainedUsable",
+							]
+						: [
+								"recoveryBarrier",
+								"zeroDuplicateLostEvents",
+								"staleGenerationRejected",
+								"staleFenceRejected",
+								"staleEpochRejected",
+								"finalProjectionMatches",
+								definition.kind === "recovery-disconnect"
+									? "disconnectObserved"
+									: definition.kind === "recovery-gap"
+										? "gapResyncObserved"
+										: definition.kind === "recovery-crash"
+											? "processRestarted"
+											: definition.kind === "recovery-rekey"
+												? "rekeyIdentityChanged"
+												: "restartCleanup",
+							];
+	if (definition.kind === "recovery-rekey") keys.push("staleParentRejected");
+	return Object.fromEntries([...keys.map((key) => [key, true]), ["complete", true]]);
+}
+
+function hardGate(metric, statistic, comparison, threshold, actual) {
+	return {
+		metric,
+		statistic,
+		comparison,
+		threshold,
+		actual,
+		mode: "hard",
+		passed: true,
+		rationale: "fixture",
+	};
+}
+
+function validGates(definition, variant) {
+	const measuredP95 =
+		variant === "coalesced" ? (definition.warmups === 0 ? 10 : 20) : definition.warmups === 0 ? 11 : 21;
+	const gates = [
+		{
+			metric: "latencyMs",
+			statistic: "p95",
+			comparison: "lte",
+			threshold: 25,
+			actual: measuredP95,
+			mode: "observe",
+			passed: true,
+			rationale: "fixture",
+		},
+		hardGate("correctnessFailures", "value", "eq", 0, 0),
+		hardGate("browserErrors", "value", "eq", 0, 0),
+	];
+	if (definition.kind === "streaming") gates.push(hardGate("turnNodes", "max", "lte", 64, 4));
+	if (definition.kind === "concurrency") {
+		gates.push(hardGate("browserProjectionCheckpointDeficit", "max", "lte", 0, 0));
+		gates.push(hardGate("backgroundIngestCheckpointDeficit", "max", "lte", 0, 0));
+	}
+	if (definition.kind === "history") gates.push(hardGate("mountedTurnNodes", "max", "lte", 64, 4));
+	if (definition.kind === "content-roundtrip") {
+		gates.push(hardGate("authenticatedAttachmentFetch", "value", "eq", 1, 1));
+		gates.push(hardGate("maxSentFrameBytes", "max", "lte", 8 * 1024 * 1024, 2048));
+		gates.push(hardGate("maxReceivedFrameBytes", "max", "lte", 256 * 1024, 1024));
+	}
+	if (definition.kind === "recovery-disconnect")
+		gates.push(hardGate("reconnectedSockets", "max", "lte", 2, 1));
+	if (definition.kind === "recovery-gap") gates.push(hardGate("gapResyncFrames", "max", "eq", 1, 1));
+	if (definition.kind === "recovery-crash") gates.push(hardGate("processStarts", "max", "eq", 1, 1));
+	if (definition.kind === "recovery-rekey") gates.push(hardGate("rekeyFrames", "max", "eq", 1, 1));
+	if (definition.kind === "recovery-gateway-restart") {
+		gates.push(hardGate("gatewayStarts", "max", "eq", 1, 1));
+		gates.push(hardGate("activeGateways", "max", "eq", 1, 1));
+		gates.push(hardGate("rootEntryCount", "max", "lte", 8, 2));
+	}
+	return gates;
+}
+
+function validResult(variant, definition) {
+	const measured = Array.from({ length: definition.samples }, (_, index) => {
+		if (variant === "coalesced") return index === 0 ? 10 : 20;
+		return index === 0 ? 11 : 21;
+	});
+	const correctness = correctnessFor(definition);
 	return {
 		schemaVersion: 2,
 		suiteVersion: 2,
 		tier: "representative",
 		runId: RUN_ID,
-		scenarioId: scenario.id,
-		domain: scenario.domain,
+		scenarioId: definition.id,
+		domain: definition.domain,
 		variant,
-		kind: scenario.kind,
+		kind: definition.kind,
 		status: "passed",
 		startedAt: "2026-08-30T00:00:00.000Z",
 		finishedAt: "2026-08-30T00:00:01.000Z",
 		browserVersion: "Chromium 140",
-		parameters: structuredClone(scenario),
-		capabilities: {
-			browser: true,
-			websocket: true,
-		},
+		parameters: structuredClone(definition),
+		capabilities: { browser: true, websocket: true, cdp: true, longtask: true, "precise-memory": true },
 		trials: [
-			{ index: 0, warmup: true, metrics: trialMetrics(5), correctness: { complete: true } },
-			{
-				index: 1,
+			...(definition.warmups > 0
+				? [{ index: 0, warmup: true, metrics: { latencyMs: 5 }, correctness: structuredClone(correctness) }]
+				: []),
+			...measured.map((value, index) => ({
+				index: index + definition.warmups,
 				warmup: false,
-				metrics: trialMetrics(measured[0]),
-				correctness: { complete: true },
-			},
-			{
-				index: 2,
-				warmup: false,
-				metrics: trialMetrics(measured[1]),
-				correctness: { complete: true },
-			},
+				metrics: { latencyMs: value },
+				correctness: structuredClone(correctness),
+			})),
 		],
-		summaries: Object.fromEntries(
-			Object.entries(trialMetrics(measured[0])).map(([metric, value]) => [
-				metric,
-				metric === "latencyMs"
-					? { count: 2, min: measured[0], median: baseLatency + 5, p95: measured[1], max: measured[1] }
-					: { count: 2, min: value, median: value, p95: value, max: value },
-			]),
-		),
-		gates: [
-			{
-				metric: "latencyMs",
-				statistic: "p95",
-				comparison: "lte",
-				threshold: 25,
-				actual: measured[1],
-				mode: "observe",
-				passed: true,
-				rationale: "fixture",
+		summaries: {
+			latencyMs: {
+				count: measured.length,
+				min: measured[0],
+				median:
+					measured.length % 2 === 0
+						? (measured[measured.length / 2 - 1] + measured[measured.length / 2]) / 2
+						: measured[Math.floor(measured.length / 2)],
+				p95: measured.at(-1),
+				max: measured.at(-1),
 			},
-			{
-				metric: "correctnessFailures",
-				statistic: "value",
-				comparison: "eq",
-				threshold: 0,
-				actual: 0,
-				mode: "hard",
-				passed: true,
-				rationale: "fixture",
-			},
-		],
+		},
+		gates: validGates(definition, variant),
 		notes: [],
 		errors: [],
 	};
 }
 
 function validResults() {
-	return FORMAL_VARIANTS.map((variant) => validResult(variant));
+	return representativeScenarios.flatMap((definition) =>
+		FORMAL_VARIANTS.map((variant) => validResult(variant, definition)),
+	);
 }
 
-function expectedScenario(variant) {
-	return {
-		id: scenario.id,
-		domain: scenario.domain,
-		kind: scenario.kind,
-		variant,
-		warmups: scenario.warmups,
-		measured: scenario.samples,
-		requiredCapabilities: structuredClone(scenario.requiredCapabilities),
-	};
-}
-
-function validManifest() {
-	const expected = FORMAL_VARIANTS.map(expectedScenario);
+function validManifest(matrixValue = matrix) {
+	const expected = canonicalFormalExpectedScenarioSet(matrixValue, "representative");
+	const keys = expected.map((entry) => `${entry.domain}/${entry.id}/${entry.variant}`);
 	return {
 		schemaVersion: 2,
 		suiteVersion: 2,
@@ -143,8 +491,8 @@ function validManifest() {
 		runId: RUN_ID,
 		seed: "fixture-seed",
 		source: { commit: "c".repeat(40), dirty: false },
-		matrix: structuredClone(matrix.provenance),
-		fixtureHashes: { deterministicPi: HASH_A },
+		matrix: structuredClone(matrixValue.provenance),
+		fixtureHashes: fixtureHashes(),
 		lockfileHash: HASH_B,
 		buildIdentity: { cliTreeHash: HASH_A, serverTreeHash: HASH_B, uiTreeHash: HASH_C },
 		buildVariants: Object.fromEntries(
@@ -161,16 +509,9 @@ function validManifest() {
 		),
 		canonicalVariants: [...FORMAL_VARIANTS],
 		executionOrder: variantOrder(),
-		warmupCounts: Object.fromEntries(
-			expected.map((entry) => [`${entry.domain}/${entry.id}/${entry.variant}`, 1]),
-		),
-		measuredCounts: Object.fromEntries(
-			expected.map((entry) => [`${entry.domain}/${entry.id}/${entry.variant}`, 2]),
-		),
-		capabilities: {
-			browser: true,
-			websocket: true,
-		},
+		warmupCounts: Object.fromEntries(keys.map((key, index) => [key, expected[index].warmups])),
+		measuredCounts: Object.fromEntries(keys.map((key, index) => [key, expected[index].measured])),
+		capabilities: { browser: true, websocket: true, cdp: true, longtask: true, "precise-memory": true },
 		expectedScenarioSet: expected,
 	};
 }
@@ -209,21 +550,24 @@ function rawFor(result) {
 			kind: result.kind,
 			parameters: structuredClone(result.parameters),
 			capabilities: structuredClone(result.capabilities),
-			trial: structuredClone(trial),
+			observation: structuredClone(observationFor(result.parameters)),
+			trial: { index: trial.index, warmup: trial.warmup },
 		},
 	}));
 }
 
 function validate(overrides = {}) {
 	const results = overrides.results ?? validResults();
+	const matrixValue = overrides.matrix ?? matrix;
 	return validateBenchmarkArtifacts({
-		matrix: overrides.matrix ?? matrix,
+		matrix: matrixValue,
 		tier: "representative",
 		runId: RUN_ID,
 		artifacts:
-			overrides.artifacts ?? results.map((value) => ({ name: `${value.variant}.result.json`, value })),
+			overrides.artifacts ??
+			results.map((value) => ({ name: `${value.scenarioId}/${value.variant}.result.json`, value })),
 		rawArtifacts: overrides.rawArtifacts ?? results.flatMap(rawFor),
-		manifest: overrides.manifest ?? validManifest(),
+		manifest: overrides.manifest ?? validManifest(matrixValue),
 		environment: overrides.environment ?? validEnvironment(),
 		playwrightExitCode: overrides.playwrightExitCode ?? 0,
 	});
@@ -233,143 +577,281 @@ function errorText(outcome) {
 	return outcome.errors.join("\n");
 }
 
-test("loads the root manifest through sorted domain matrices", () => {
-	const loaded = loadBenchmarkMatrix();
-	assert.equal(loaded.schemaVersion, 2);
-	assert.deepEqual(Object.keys(loaded.provenance.domainHashes), [
+function resultsForKind(kind) {
+	return validResults().filter((result) => result.kind === kind);
+}
+
+test("loads the complete root and domain matrices with exactly five recovery classes per tier", () => {
+	assert.deepEqual(Object.keys(matrix.provenance.domainHashes), [
 		"concurrency",
 		"content",
 		"history",
 		"recovery",
 		"streaming",
 	]);
-	assert.equal(loaded.tiers.representative.scenarios.length, 8);
+	assert.equal(matrix.tiers.representative.scenarios.length, 11);
+	const recovery = matrix.domains.find((domain) => domain.id === "recovery");
+	assert.ok(recovery);
+	assert.deepEqual(
+		recovery.tiers.representative.scenarios.map((entry) => entry.kind),
+		["recovery-disconnect", "recovery-gap", "recovery-crash", "recovery-rekey", "recovery-gateway-restart"],
+	);
 });
 
-test("defines canonical formal pairs per matrix scenario rather than producer execution order", () => {
-	const secondScenario = { ...scenario, id: "stream-second" };
-	const expected = canonicalFormalExpectedScenarioSet(
-		{
-			...matrix,
-			tiers: {
-				...matrix.tiers,
-				representative: { scenarios: [scenario, secondScenario] },
-			},
-		},
-		"representative",
-	);
+test("defines canonical formal pairs from the loaded matrix projection", () => {
+	const expected = canonicalFormalExpectedScenarioSet(matrix, "representative");
+	assert.equal(expected.length, matrix.tiers.representative.scenarios.length * 2);
+	const firstScenario = representativeScenarios[0];
+	assert.ok(firstScenario);
 	assert.deepEqual(
-		expected.map((entry) => `${entry.id}/${entry.variant}`),
-		[
-			"stream-test/coalesced",
-			"stream-test/sequential",
-			"stream-second/coalesced",
-			"stream-second/sequential",
-		],
+		expected.slice(0, 2).map((entry) => `${entry.id}/${entry.variant}`),
+		[`${firstScenario.id}/coalesced`, `${firstScenario.id}/sequential`],
 	);
+});
+
+test("keeps the validator producer-path export aligned with an independent oracle", () => {
+	assert.deepEqual(BENCHMARK_PRODUCER_PATHS, EXPECTED_BENCHMARK_PRODUCER_PATHS);
 });
 
 test("accepts one complete formal schema-v2 artifact set", () => {
 	assert.deepEqual(validate().errors, []);
 });
 
+test("requires canonical result and raw artifact paths", () => {
+	const results = validResults();
+	const artifacts = results.map((value) => ({
+		name: `${value.scenarioId}/${value.variant}.result.json`,
+		value,
+	}));
+	artifacts[0].name = "renamed.result.json";
+	assert.match(errorText(validate({ results, artifacts })), /result artifact path must be/);
+	const rawArtifacts = results.flatMap(rawFor);
+	rawArtifacts[0].name = "../escape.json";
+	assert.match(errorText(validate({ results, rawArtifacts })), /raw artifact path|raw trial path must be/);
+});
+
 test("rejects a matrix that overclaims Issue #28 completion", () => {
 	const completedMatrix = structuredClone(matrix);
 	completedMatrix.scope.status = "complete";
-	assert.match(errorText(validate({ matrix: completedMatrix })), /#28 Phase 1 \/ incomplete/);
+	assert.match(
+		errorText(validate({ matrix: completedMatrix, manifest: validManifest() })),
+		/#28 Phase 1 \/ incomplete/,
+	);
 });
 
-test("rejects missing, duplicate, and partial raw trial evidence", () => {
+test("rejects missing, duplicate, and partial raw trial observations", () => {
 	const results = validResults();
 	const partial = results.flatMap(rawFor).slice(0, -1);
 	assert.match(errorText(validate({ results, rawArtifacts: partial })), /missing raw trial/);
 	const duplicate = [...results.flatMap(rawFor), structuredClone(rawFor(results[0])[0])];
 	assert.match(errorText(validate({ results, rawArtifacts: duplicate })), /duplicate raw trial/);
+	const malformed = results.flatMap(rawFor);
+	delete malformed[0].value.observation;
+	assert.match(errorText(validate({ results, rawArtifacts: malformed })), /observation/);
 });
 
-test("fails closed on malformed evidence and missing required capabilities", () => {
-	const nonfinite = validResults();
-	nonfinite[0].trials[1].metrics.latencyMs = Number.NaN;
-	nonfinite[0].summaries.latencyMs = {
-		count: 2,
-		min: Number.NaN,
-		median: Number.NaN,
-		p95: Number.NaN,
-		max: Number.NaN,
-	};
+test("derives browser-error hard gates from atomic observations", () => {
+	const results = validResults();
+	const rawArtifacts = results.flatMap(rawFor);
+	rawArtifacts[0].value.observation.browserErrors.console.push("observed console error");
+	assert.match(errorText(validate({ results, rawArtifacts })), /gate browserErrors\.value actual must be 1/);
+});
+
+test("allows only one exact Gateway restart refusal in its own raw trial", () => {
+	const accepted = validResults().flatMap(rawFor);
+	const acceptedTrial = accepted.find((artifact) => artifact.value.kind === "recovery-gateway-restart");
+	assert.ok(acceptedTrial);
+	acceptedTrial.value.observation.browserErrors.console.push(EXPECTED_GATEWAY_RESTART_REFUSAL);
+	assert.deepEqual(validate({ rawArtifacts: accepted }).errors, []);
+
+	for (const [label, mutate] of [
+		[
+			"wrong host",
+			(observation) =>
+				observation.browserErrors.console.push(
+					EXPECTED_GATEWAY_RESTART_REFUSAL.replace("127.0.0.1", "localhost"),
+				),
+		],
+		[
+			"wrong path",
+			(observation) =>
+				observation.browserErrors.console.push(
+					EXPECTED_GATEWAY_RESTART_REFUSAL.replace("/api/v1/ws", "/api/v1/other"),
+				),
+		],
+		[
+			"wrong message",
+			(observation) =>
+				observation.browserErrors.console.push(
+					EXPECTED_GATEWAY_RESTART_REFUSAL.replace("net::ERR_CONNECTION_REFUSED", "net::ERR_FAILED"),
+				),
+		],
+		[
+			"duplicate refusal",
+			(observation) =>
+				observation.browserErrors.console.push(
+					EXPECTED_GATEWAY_RESTART_REFUSAL,
+					EXPECTED_GATEWAY_RESTART_REFUSAL,
+				),
+		],
+		[
+			"page error",
+			(observation) => {
+				observation.browserErrors.console.push(EXPECTED_GATEWAY_RESTART_REFUSAL);
+				observation.browserErrors.page.push("unexpected page error");
+			},
+		],
+	]) {
+		const rawArtifacts = validResults().flatMap(rawFor);
+		const restartTrial = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-gateway-restart");
+		assert.ok(restartTrial);
+		mutate(restartTrial.value.observation);
+		assert.match(errorText(validate({ rawArtifacts })), /browserErrors/, `${label} must fail validation`);
+	}
+
+	const nonRestart = validResults().flatMap(rawFor);
+	const disconnectTrial = nonRestart.find((artifact) => artifact.value.kind === "recovery-disconnect");
+	assert.ok(disconnectTrial);
+	disconnectTrial.value.observation.browserErrors.console.push(EXPECTED_GATEWAY_RESTART_REFUSAL);
+	assert.match(errorText(validate({ rawArtifacts: nonRestart })), /browserErrors/);
+});
+
+test("accepts an explicit rekey pre-admission rejection only without side effects", () => {
+	const accepted = validResults().flatMap(rawFor);
+	const rekeyTrials = accepted.filter((artifact) => artifact.value.kind === "recovery-rekey");
+	assert.ok(rekeyTrials.length > 0);
+	for (const artifact of rekeyTrials) {
+		artifact.value.observation.facts.stale.parent.responseError = "session_not_subscribed";
+	}
+	assert.deepEqual(validate({ rawArtifacts: accepted }).errors, []);
+
+	for (const [label, mutate] of [
+		["arbitrary rejection", (parent) => (parent.responseError = "session_unknown")],
+		["accepted response", (parent) => (parent.responseSuccess = true)],
+		["Pi side effect", (parent) => (parent.piCommandCountAfter += 1)],
+	]) {
+		const rawArtifacts = validResults().flatMap(rawFor);
+		const rekeyTrial = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-rekey");
+		assert.ok(rekeyTrial);
+		rekeyTrial.value.observation.facts.stale.parent.responseError = "session_not_subscribed";
+		mutate(rekeyTrial.value.observation.facts.stale.parent);
+		assert.match(errorText(validate({ rawArtifacts })), /correctness|stale/, `${label} must fail validation`);
+	}
+});
+
+test("does not require background checkpoints for one Session but keeps the multi-Session deficit gate", () => {
+	const oneSession = validResults().flatMap(rawFor);
+	for (const artifact of oneSession) {
+		if (artifact.value.kind === "concurrency" && artifact.value.observation.facts.sessions.expected === 1) {
+			artifact.value.observation.facts.sessions.minimumBackgroundCheckpoints = 0;
+		}
+	}
+	assert.deepEqual(validate({ rawArtifacts: oneSession }).errors, []);
+
+	const multiSession = validResults().flatMap(rawFor);
+	for (const artifact of multiSession) {
+		if (artifact.value.kind === "concurrency" && artifact.value.observation.facts.sessions.expected > 1) {
+			artifact.value.observation.facts.sessions.minimumBackgroundCheckpoints = 0;
+		}
+	}
 	assert.match(
-		errorText(validate({ results: nonfinite, rawArtifacts: nonfinite.flatMap(rawFor) })),
-		/metrics\.latencyMs must be finite/,
-	);
-	const missing = validResults();
-	missing[0].trials[1].metrics = {};
-	assert.match(
-		errorText(validate({ results: missing, rawArtifacts: missing.flatMap(rawFor) })),
-		/metrics must be a non-empty record/,
-	);
-	const staleGate = validResults();
-	staleGate[0].gates[0].metric = "heapDeltaBytes";
-	assert.match(
-		errorText(validate({ results: staleGate, rawArtifacts: staleGate.flatMap(rawFor) })),
-		/gated metric heapDeltaBytes must be finite in every measured trial/,
-	);
-	const unavailable = validResults();
-	unavailable[0].capabilities.websocket = false;
-	assert.match(
-		errorText(validate({ results: unavailable, rawArtifacts: unavailable.flatMap(rawFor) })),
-		/missing required capability: websocket/,
+		errorText(validate({ rawArtifacts: multiSession })),
+		/gate backgroundIngestCheckpointDeficit\.max actual must be 2/,
 	);
 });
 
-test("rejects incomplete correctness and failed result status even with a zero outer exit", () => {
-	const incomplete = validResults();
-	incomplete[0].trials[1].correctness.complete = false;
-	incomplete[0].gates[1].actual = 1;
-	incomplete[0].gates[1].passed = false;
-	incomplete[0].status = "failed";
+test("keeps timing metrics observe-only and enforces required structural hard gates", () => {
+	const results = validResults();
+	results[0].gates[0].mode = "hard";
+	assert.match(errorText(validate({ results })), /hard gate.*latencyMs.*observe-only/);
+	const history = resultsForKind("history")[0];
+	assert.ok(history);
+	assert.ok(history.gates.some((gate) => gate.metric === "mountedTurnNodes" && gate.mode === "hard"));
+});
+
+test("rejects a flat or partial matrix instead of accepting a fallback projection", () => {
+	const flattened = structuredClone(matrix);
+	delete flattened.domains;
+	const outcome = validate({
+		matrix: flattened,
+		artifacts: [],
+		rawArtifacts: [],
+		manifest: {},
+		environment: {},
+	});
+	assert.match(errorText(outcome), /canonical loadBenchmarkMatrix projection/);
+});
+
+test("rejects a synthetic matrix projection even when its local shape is valid", () => {
+	const forged = structuredClone(matrix);
+	const streamingDomain = forged.domains.find((domain) => domain.id === "streaming");
+	assert.ok(streamingDomain);
+	streamingDomain.requiredCapabilities = [...streamingDomain.requiredCapabilities, "forged"];
 	assert.match(
-		errorText(validate({ results: incomplete, rawArtifacts: incomplete.flatMap(rawFor) })),
-		/correctness\.complete must be true/,
+		errorText(validate({ matrix: forged, artifacts: [], rawArtifacts: [], manifest: {} })),
+		/canonical/,
 	);
+});
+
+test("requires every recovery correctness field and the hard correctness gate", () => {
+	const results = validResults();
+	const crash = results.find((result) => result.kind === "recovery-crash" && result.variant === "coalesced");
+	assert.ok(crash);
+	delete crash.trials[1].correctness.processRestarted;
 	assert.match(
-		errorText(validate({ results: incomplete, rawArtifacts: incomplete.flatMap(rawFor) })),
-		/status must be passed in a complete formal result/,
+		errorText(validate({ results })),
+		/correctness\.processRestarted must be boolean for recovery/,
 	);
-	const failed = validResults();
-	failed[0].status = "failed";
-	assert.match(
-		errorText(validate({ results: failed, rawArtifacts: failed.flatMap(rawFor) })),
-		/status must be passed in a complete formal result/,
+	const noGate = validResults();
+	const noCrashGate = noGate.find(
+		(result) => result.kind === "recovery-crash" && result.variant === "coalesced",
 	);
+	assert.ok(noCrashGate);
+	noCrashGate.gates = noCrashGate.gates.filter((gate) => gate.metric !== "correctnessFailures");
+	assert.match(errorText(validate({ results: noGate })), /missing required hard gate correctnessFailures/);
+});
+
+test("fails closed on malformed observations and missing required capabilities", () => {
+	const malformed = validResults();
+	delete malformed[0].capabilities.websocket;
+	assert.match(errorText(validate({ results: malformed })), /missing required capability: websocket/);
+	const rawArtifacts = validResults().flatMap(rawFor);
+	const streamingRaw = rawArtifacts.find((artifact) => artifact.value.kind === "streaming");
+	assert.ok(streamingRaw);
+	delete streamingRaw.value.observation.facts.dom;
+	assert.match(errorText(validate({ rawArtifacts })), /facts.*dom/);
+});
+
+test("rejects incomplete correctness and failed result status with a zero outer exit", () => {
+	const results = validResults();
+	results[0].trials[1].correctness.complete = false;
+	results[0].status = "failed";
+	assert.match(errorText(validate({ results })), /correctness\.complete must be true/);
+	assert.match(errorText(validate({ results })), /status must be passed in a complete formal result/);
 });
 
 test("rejects singleton producer declarations and a tampered execution order", () => {
 	const manifest = validManifest();
-	manifest.expectedScenarioSet = manifest.expectedScenarioSet.filter(
-		(entry) => entry.variant === "coalesced",
-	);
-	manifest.buildVariants = { coalesced: manifest.buildVariants.coalesced };
 	manifest.canonicalVariants = ["coalesced"];
 	manifest.executionOrder = ["coalesced"];
 	assert.match(errorText(validate({ manifest })), /canonicalVariants must be exactly/);
-	assert.match(errorText(validate({ manifest })), /complete canonical matrix × formal variant set/);
 	const orderManifest = validManifest();
 	orderManifest.executionOrder.reverse();
 	assert.match(errorText(validate({ manifest: orderManifest })), /deterministic seeded formal variant order/);
 });
 
-test("recomputes summaries, gates, tier, and canonical manifest counts", () => {
+test("recomputes summaries, gates, and canonical manifest counts", () => {
 	const results = validResults();
-	results[0].summaries.latencyMs.p95 = 1;
-	results[0].gates[0].actual = 1;
-	results[0].gates[0].passed = false;
+	const first = results[0];
+	first.summaries.latencyMs.p95 = 1;
+	first.gates[0].actual = 1;
+	first.gates[0].passed = false;
 	const manifest = validManifest();
-	manifest.measuredCounts["streaming/stream-test/coalesced"] = 1;
+	manifest.measuredCounts[`${first.domain}/${first.scenarioId}/${first.variant}`] = 1;
 	const errors = errorText(validate({ results, manifest }));
 	assert.match(errors, /summary latencyMs\.p95 must be 20/);
 	assert.match(errors, /gate latencyMs\.p95 actual must be 20/);
-	assert.match(errors, /gate latencyMs\.p95 passed must be true/);
-	assert.match(errors, /measuredCounts\.streaming\/stream-test\/coalesced must match expected scenario/);
+	assert.match(errors, /measuredCounts.*must match expected scenario/);
 });
 
 test("rejects provenance hash drift and a nonzero Playwright run reported green", () => {
@@ -381,22 +863,273 @@ test("rejects provenance hash drift and a nonzero Playwright run reported green"
 	assert.match(errors, /Playwright nonzero cannot report green/);
 });
 
-test("rejects duplicate, missing, and extra scenario results before result-map overwrite", () => {
+test("requires the exact shared fixture producer hash set", () => {
+	for (const requiredPath of EXPECTED_BENCHMARK_PRODUCER_PATHS) {
+		const manifest = validManifest();
+		delete manifest.fixtureHashes[requiredPath];
+		assert.match(errorText(validate({ manifest })), /fixtureHashes.*exactly/);
+	}
+});
+
+test("rejects duplicate, missing, and extra scenario results before map overwrite", () => {
 	const results = validResults();
 	const duplicate = structuredClone(results[0]);
+	const artifacts = results.map((value) => ({
+		name: `${value.scenarioId}/${value.variant}.result.json`,
+		value,
+	}));
+	artifacts.push({
+		name: `${duplicate.scenarioId}/${duplicate.variant}.duplicate.result.json`,
+		value: duplicate,
+	});
 	const extra = structuredClone(results[0]);
 	extra.scenarioId = "extra";
 	extra.parameters.id = "extra";
-	const errors = errorText(
-		validate({
-			artifacts: [
-				{ name: "first.result.json", value: results[0] },
-				{ name: "second.result.json", value: duplicate },
-				{ name: "sequential.result.json", value: results[1] },
-				{ name: "extra.result.json", value: extra },
-			],
-		}),
+	artifacts.push({ name: "extra/coalesced.result.json", value: extra });
+	const errors = errorText(validate({ artifacts }));
+	assert.match(errors, /duplicate scenario artifact/);
+	assert.match(errors, /unexpected scenario artifact/);
+});
+
+test("requires an authoritative watermark and strict partitioned sequence continuity", () => {
+	const rawArtifacts = validResults().flatMap(rawFor);
+	const recoveryRaw = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-crash");
+	assert.ok(recoveryRaw);
+	recoveryRaw.value.observation.facts.protocol.watermarkAfter.lastSeq = 2;
+	recoveryRaw.value.observation.facts.protocol.postBarrierEventSeqs = [1];
+	assert.match(errorText(validate({ rawArtifacts })), /sequence|watermark|independently derived/);
+});
+
+test("derives restart ownership from cumulative before/after lifecycle snapshots", () => {
+	const rawArtifacts = validResults().flatMap(rawFor);
+	const restartRaw = rawArtifacts.filter((artifact) => artifact.value.kind === "recovery-gateway-restart");
+	assert.ok(restartRaw.length > 0);
+	for (const artifact of restartRaw) {
+		const lifecycle = artifact.value.observation.facts.lifecycle;
+		lifecycle.before.gatewayStarts = 5;
+		lifecycle.before.ownedGatewayCount = 5;
+		lifecycle.after.gatewayStarts = 6;
+		lifecycle.after.ownedGatewayCount = 6;
+	}
+	assert.deepEqual(validate({ rawArtifacts }).errors, []);
+	restartRaw[0].value.observation.facts.lifecycle.after.ownedGatewayCount = 7;
+	assert.match(errorText(validate({ rawArtifacts })), /correctness|gateway|independently derived/);
+});
+
+test("does not accept forged non-recovery hard claims detached from observations", () => {
+	const results = validResults();
+	const streaming = results.find((result) => result.kind === "streaming" && result.variant === "coalesced");
+	assert.ok(streaming);
+	streaming.gates.find((gate) => gate.metric === "turnNodes").actual = 999;
+	streaming.gates.find((gate) => gate.metric === "turnNodes").passed = false;
+	assert.match(errorText(validate({ results })), /turnNodes.*actual must be 4/);
+});
+
+test("permits mountedTurnNodes as an independently recomputable hard gate", () => {
+	const history = resultsForKind("history").find((result) => result.variant === "coalesced");
+	assert.ok(history);
+	const gate = history.gates.find((entry) => entry.metric === "mountedTurnNodes");
+	assert.ok(gate);
+	assert.equal(gate.mode, "hard");
+	assert.equal(gate.actual, 4);
+	assert.deepEqual(validate().errors, []);
+});
+
+test("does not aggregate a missing hard value observation away", () => {
+	const rawArtifacts = validResults().flatMap(rawFor);
+	const contentRaw = rawArtifacts.filter((artifact) => artifact.value.kind === "content-roundtrip");
+	assert.ok(contentRaw.length > 0);
+	for (const artifact of contentRaw) artifact.value.observation.facts.attachments.fetchStatus = 0;
+	assert.match(
+		errorText(validate({ rawArtifacts })),
+		/authenticatedAttachmentFetch.*actual must be 0|correctness/,
 	);
-	assert.match(errors, /duplicate scenario artifact: streaming\/stream-test\/coalesced/);
-	assert.match(errors, /unexpected scenario artifact: streaming\/extra\/coalesced/);
+});
+
+test("rejects null or partial persisted recovery identity", () => {
+	const rawArtifacts = validResults().flatMap(rawFor);
+	const recoveryRaw = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-crash");
+	assert.ok(recoveryRaw);
+	recoveryRaw.value.observation.facts.identity.before.sessionFile = null;
+	assert.match(errorText(validate({ rawArtifacts })), /sessionFile|persisted|identity/);
+});
+
+test("rejects stale-authority side effects even when the response is rejected", () => {
+	const rawArtifacts = validResults().flatMap(rawFor);
+	const recoveryRaw = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-crash");
+	assert.ok(recoveryRaw);
+	recoveryRaw.value.observation.facts.stale.generation.piCommandCountAfter = 1;
+	assert.match(errorText(validate({ rawArtifacts })), /correctness|stale|independently derived/);
+});
+
+test("binds history and content correctness to canonical workload definitions", () => {
+	const rawArtifacts = validResults().flatMap(rawFor);
+	const historyRaw = rawArtifacts.find((artifact) => artifact.value.kind === "history");
+	assert.ok(historyRaw);
+	const history = historyRaw.value.observation.facts.history;
+	history.actualSourceBytes += 1;
+	history.expectedSourceBytes = history.actualSourceBytes;
+	history.windowTotal += 1;
+	history.expectedTurns = history.windowTotal;
+	const contentRaw = rawArtifacts.find((artifact) => artifact.value.kind === "content-roundtrip");
+	assert.ok(contentRaw);
+	contentRaw.value.observation.facts.attachments.observedInputBase64Chars = 0;
+	contentRaw.value.observation.facts.attachments.expectedInputBase64Chars = 0;
+	assert.match(errorText(validate({ rawArtifacts })), /correctness|independently derived/);
+});
+
+test("ignores redundant raw workload expectations when observations match the matrix", () => {
+	const rawArtifacts = validResults().flatMap(rawFor);
+	for (const artifact of rawArtifacts) {
+		if (artifact.value.kind === "history") {
+			artifact.value.observation.facts.history.expectedInitialTurns = 0;
+			artifact.value.observation.facts.history.expectedSourceBytes = 0;
+			artifact.value.observation.facts.history.expectedTurns = 0;
+		}
+		if (artifact.value.kind === "content-roundtrip") {
+			artifact.value.observation.facts.attachments.expectedInputBase64Chars = 0;
+		}
+	}
+	assert.deepEqual(validate({ rawArtifacts }).errors, []);
+});
+
+test("requires an exact non-empty ordered streaming frame pair", () => {
+	assert.ok(scenario.targetBytes !== undefined);
+	for (const largeFrameBytes of [
+		[],
+		[scenario.targetBytes + 1],
+		[scenario.targetBytes + 1, scenario.targetBytes + 2, scenario.targetBytes + 3],
+	]) {
+		const rawArtifacts = validResults().flatMap(rawFor);
+		const streamingRaw = rawArtifacts.find((artifact) => artifact.value.kind === "streaming");
+		assert.ok(streamingRaw);
+		streamingRaw.value.observation.facts.frames.largeFrameBytes = largeFrameBytes;
+		assert.match(errorText(validate({ rawArtifacts })), /correctness|independently derived/);
+	}
+});
+
+test("requires recovery progress beyond the authoritative pre-fault cursor", () => {
+	for (const kind of ["recovery-disconnect", "recovery-gap"]) {
+		const rawArtifacts = validResults().flatMap(rawFor);
+		const recoveryRaw = rawArtifacts.find((artifact) => artifact.value.kind === kind);
+		assert.ok(recoveryRaw);
+		const protocol = recoveryRaw.value.observation.facts.protocol;
+		protocol.cursorBefore.seq = 1;
+		protocol.watermarkAfter.lastSeq = 1;
+		protocol.replayEventSeqs = [];
+		protocol.preBarrierEventSeqs = [];
+		protocol.postBarrierEventSeqs = [];
+		if (protocol.mode === "resync") {
+			protocol.barrier.asOfSeq = 1;
+			protocol.barrier.barrierSeq = 1;
+			protocol.barrier.runtimeLastSeq = 1;
+		}
+		const errors = errorText(validate({ rawArtifacts }));
+		assert.ok(errors.length > 0, `${kind}: expected non-advancing recovery progress to fail`);
+		assert.match(errors, /correctness|sequence|watermark|independently derived/);
+	}
+});
+
+test("records ordered recovery sequence partitions around the snapshot boundary", () => {
+	const rawArtifacts = validResults().flatMap(rawFor);
+	const replayRaw = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-disconnect");
+	const resyncRaw = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-gap");
+	assert.ok(replayRaw);
+	assert.ok(resyncRaw);
+	assert.deepEqual(replayRaw.value.observation.facts.protocol.boundary, {
+		resyncFrameIndex: null,
+		snapshotFrameIndex: null,
+	});
+	assert.deepEqual(replayRaw.value.observation.facts.protocol.replayEventSeqs, [1]);
+	assert.deepEqual(resyncRaw.value.observation.facts.protocol.boundary, {
+		resyncFrameIndex: 0,
+		snapshotFrameIndex: 1,
+	});
+	assert.deepEqual(resyncRaw.value.observation.facts.protocol.preBarrierEventSeqs, [1]);
+	assert.deepEqual(resyncRaw.value.observation.facts.protocol.postBarrierEventSeqs, [2]);
+});
+
+test("rejects a same-identity resync barrier that predates the consumed cursor", () => {
+	const rawArtifacts = validResults().flatMap(rawFor);
+	const recoveryRaw = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-gap");
+	assert.ok(recoveryRaw);
+	const protocol = recoveryRaw.value.observation.facts.protocol;
+	protocol.cursorBefore.seq = 2;
+	protocol.barrier.asOfSeq = 1;
+	protocol.barrier.barrierSeq = 1;
+	protocol.barrier.runtimeLastSeq = 1;
+	protocol.watermarkAfter.lastSeq = 3;
+	protocol.preBarrierEventSeqs = [1, 2];
+	protocol.postBarrierEventSeqs = [2, 3];
+	assert.match(errorText(validate({ rawArtifacts })), /correctness|sequence|independently derived/);
+});
+
+test("accepts a nonempty pre-barrier prefix when the snapshot advances the watermark", () => {
+	const rawArtifacts = validResults().flatMap(rawFor);
+	const recoveryRaw = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-gap");
+	assert.ok(recoveryRaw);
+	const protocol = recoveryRaw.value.observation.facts.protocol;
+	protocol.postBarrierEventSeqs = [];
+	protocol.watermarkAfter.lastSeq = protocol.barrier.asOfSeq;
+	assert.deepEqual(validate({ rawArtifacts }).errors, []);
+});
+
+test("rejects post-barrier gaps and duplicates", () => {
+	for (const postBarrierEventSeqs of [[3], [2, 2]]) {
+		const rawArtifacts = validResults().flatMap(rawFor);
+		const recoveryRaw = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-gap");
+		assert.ok(recoveryRaw);
+		recoveryRaw.value.observation.facts.protocol.postBarrierEventSeqs = postBarrierEventSeqs;
+		assert.match(errorText(validate({ rawArtifacts })), /correctness|sequence|independently derived/);
+	}
+});
+
+test("does not reclassify a pre-fault marker as the recovered target prompt", () => {
+	const rawArtifacts = validResults().flatMap(rawFor);
+	const recoveryRaw = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-disconnect");
+	assert.ok(recoveryRaw);
+	const facts = recoveryRaw.value.observation.facts;
+	const preFaultPrompt = structuredClone(facts.pi.markersAfter[0]);
+	const recoveredPrompt = { ...preFaultPrompt, at: preFaultPrompt.at + 2 };
+	const recoveredSettled = { ...facts.pi.markersAfter[1], at: preFaultPrompt.at + 3 };
+	facts.pi.markersBefore = [preFaultPrompt];
+	facts.pi.markersAfter = [preFaultPrompt, recoveredPrompt, recoveredSettled];
+	assert.match(errorText(validate({ rawArtifacts })), /correctness|independently derived/);
+});
+
+test("requires a real before/after Gateway restart lifecycle and PID transition", () => {
+	for (const mutate of [
+		(lifecycle) => {
+			lifecycle.before.activeGatewayCount = 0;
+			lifecycle.before.activeGatewayPid = null;
+		},
+		(lifecycle) => {
+			lifecycle.after.activeGatewayPid = lifecycle.before.activeGatewayPid;
+		},
+		(lifecycle) => {
+			lifecycle.after.activeGatewayPid = null;
+		},
+	]) {
+		const rawArtifacts = validResults().flatMap(rawFor);
+		const restartRaw = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-gateway-restart");
+		assert.ok(restartRaw);
+		mutate(restartRaw.value.observation.facts.lifecycle);
+		assert.match(errorText(validate({ rawArtifacts })), /correctness|gateway|independently derived/);
+	}
+});
+
+test("rejects traversal, duplicate, missing, and extra raw labels", () => {
+	const results = validResults();
+	const rawArtifacts = results.flatMap(rawFor);
+	rawArtifacts[0].name = "stream-test/../../escape.json";
+	const duplicate = structuredClone(rawArtifacts[1]);
+	duplicate.name = rawArtifacts[1].name;
+	rawArtifacts.push(duplicate);
+	rawArtifacts.pop();
+	rawArtifacts.pop();
+	rawArtifacts.push({ name: "extra/coalesced-0.json", value: structuredClone(rawArtifacts[0].value) });
+	assert.match(
+		errorText(validate({ results, rawArtifacts })),
+		/raw artifact path|raw trial path|missing raw trial|unexpected raw trial/,
+	);
 });

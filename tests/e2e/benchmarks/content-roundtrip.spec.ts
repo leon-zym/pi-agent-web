@@ -6,6 +6,7 @@ import {
 	addSummaryGate,
 	addValueGate,
 	correctnessFailureCount,
+	createTrialObservation,
 	installBrowserBenchmarkObserver,
 	runBenchmarkScenario,
 	scenariosFor,
@@ -101,7 +102,14 @@ for (const scenario of scenariosFor("content-roundtrip")) {
 		await runBenchmarkScenario(page, testInfo, harness, scenario, async (outcome, trials) => {
 			if (scenario.inputBytes === undefined) throw new Error("content scenario is missing inputBytes");
 			const input = validPng(scenario.inputBytes);
-			const inputBase64Chars = input.toString("base64").length;
+			if (input.byteLength !== scenario.inputBytes) {
+				throw new Error("content fixture byte length does not match the canonical matrix definition");
+			}
+			// Node's unwrapped RFC 4648 Base64 uses four characters for every three bytes, rounded up.
+			const inputBase64Chars = 4 * Math.ceil(scenario.inputBytes / 3);
+			if (input.toString("base64").length !== inputBase64Chars) {
+				throw new Error("content fixture Base64 length does not match its byte-count derivation");
+			}
 			const errors = observePageErrors(page);
 			const sockets: WebSocket[] = [];
 			const closedSockets: WebSocket[] = [];
@@ -127,6 +135,8 @@ for (const scenario of scenariosFor("content-roundtrip")) {
 
 			for (let index = 0; index < trialCount; index += 1) {
 				await trials.run(index, async () => {
+					const errorStart = { console: errors.console.length, page: errors.page.length };
+					let authenticatedAttachmentFetchForTrial = 0;
 					const heapBefore = await page.evaluate(
 						() =>
 							(performance as Performance & { memory?: { usedJSHeapSize: number } }).memory?.usedJSHeapSize ??
@@ -175,10 +185,12 @@ for (const scenario of scenariosFor("content-roundtrip")) {
 						.toBe(true);
 					if (attachmentResponse) {
 						const response = await attachmentResponse;
-						authenticatedAttachmentFetch =
+						const authenticated =
 							response.status() === 200 &&
 							response.request().method() === "GET" &&
 							(await response.request().allHeaders()).cookie?.includes("pi_web_session=") === true;
+						authenticatedAttachmentFetchForTrial = authenticated ? 1 : 0;
+						authenticatedAttachmentFetch ||= authenticated;
 					}
 					const roundTripFinished = await page.evaluate(() => performance.now());
 					const heapAfter = await page.evaluate(
@@ -197,29 +209,59 @@ for (const scenario of scenariosFor("content-roundtrip")) {
 						.filter((event) => event.direction === "received")
 						.map((event) => event.raw)
 						.join("\n");
+					const imageState = await image.evaluate((element) => {
+						const target = element as HTMLImageElement;
+						return { complete: target.complete, naturalWidth: target.naturalWidth };
+					});
+					const attachmentRefCount = trialWire.filter((event) => hasAttachmentRef(event.frame)).length;
+					const inlineImageSignatureCount = receivedRaw.match(/iVBORw0KGgo/g)?.length ?? 0;
+					const maxSentFrameBytes = Math.max(0, ...sentBytes);
+					const maxReceivedFrameBytes = Math.max(0, ...receivedBytes);
+					const correctness = {
+						inputReachedPiAtExpectedSize:
+							harness
+								.piEvents()
+								.filter((event) => event.type === "prompt" && event.text === PROMPT)
+								.at(-1)?.imageChars === inputBase64Chars,
+						typedOutputRefsObserved: attachmentRefCount >= 2,
+						outputBlobResolved: imageState.complete && imageState.naturalWidth > 0,
+						largeOutputStayedOffWebSocket: inlineImageSignatureCount === 0,
+						socketRemainedUsable: sockets.length === 1 && closedSockets.length === 0,
+					};
 					return {
 						metrics: {
 							selectionMs: selectionFinished - selectionStarted,
 							roundTripMs: roundTripFinished - roundTripStarted,
 							inputBase64Chars,
-							maxSentFrameBytes: Math.max(0, ...sentBytes),
-							maxReceivedFrameBytes: Math.max(0, ...receivedBytes),
+							maxSentFrameBytes,
+							maxReceivedFrameBytes,
 							heapDeltaBytes: heapBefore === null || heapAfter === null ? null : heapAfter - heapBefore,
 						},
-						correctness: {
-							inputReachedPiAtExpectedSize:
-								harness
-									.piEvents()
-									.filter((event) => event.type === "prompt" && event.text === PROMPT)
-									.at(-1)?.imageChars === inputBase64Chars,
-							typedOutputRefsObserved: trialWire.filter((event) => hasAttachmentRef(event.frame)).length >= 2,
-							outputBlobResolved: await image.evaluate((element) => {
-								const target = element as HTMLImageElement;
-								return target.complete && target.naturalWidth > 0;
-							}),
-							largeOutputStayedOffWebSocket: !receivedRaw.includes("iVBORw0KGgo"),
-							socketRemainedUsable: sockets.length === 1 && closedSockets.length === 0,
-						},
+						correctness,
+						observation: createTrialObservation(
+							"content-roundtrip",
+							{
+								console: errors.console.slice(errorStart.console),
+								page: errors.page.slice(errorStart.page),
+							},
+							{
+								attachments: {
+									attachmentRefCount,
+									expectedInputBase64Chars: inputBase64Chars,
+									fetchStatus: authenticatedAttachmentFetchForTrial,
+									imageComplete: imageState.complete,
+									inlineImageSignatureCount,
+									naturalWidth: imageState.naturalWidth,
+									observedInputBase64Chars:
+										harness
+											.piEvents()
+											.filter((event) => event.type === "prompt" && event.text === PROMPT)
+											.at(-1)?.imageChars ?? 0,
+								},
+								frames: { maxReceivedFrameBytes, maxSentFrameBytes },
+								socket: { closed: closedSockets.length, opened: sockets.length },
+							},
+						),
 					};
 				});
 			}

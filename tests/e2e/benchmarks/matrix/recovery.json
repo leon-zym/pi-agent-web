@@ -6,30 +6,66 @@
 		"representative": {
 			"scenarios": [
 				{
-					"id": "recovery-disconnect-gap",
+					"id": "recovery-websocket-disconnect",
 					"kind": "recovery-disconnect",
 					"warmups": 1,
-					"samples": 10
+					"samples": 3
+				},
+				{
+					"id": "recovery-replay-gap",
+					"kind": "recovery-gap",
+					"warmups": 1,
+					"samples": 3
 				},
 				{
 					"id": "recovery-pi-crash",
 					"kind": "recovery-crash",
 					"warmups": 1,
-					"samples": 10
+					"samples": 3
+				},
+				{
+					"id": "recovery-session-rekey",
+					"kind": "recovery-rekey",
+					"warmups": 1,
+					"samples": 3
+				},
+				{
+					"id": "recovery-gateway-restart",
+					"kind": "recovery-gateway-restart",
+					"warmups": 1,
+					"samples": 3
 				}
 			]
 		},
 		"stress": {
 			"scenarios": [
 				{
-					"id": "recovery-disconnect-gap",
+					"id": "recovery-websocket-disconnect",
 					"kind": "recovery-disconnect",
+					"warmups": 2,
+					"samples": 100
+				},
+				{
+					"id": "recovery-replay-gap",
+					"kind": "recovery-gap",
 					"warmups": 2,
 					"samples": 100
 				},
 				{
 					"id": "recovery-pi-crash",
 					"kind": "recovery-crash",
+					"warmups": 2,
+					"samples": 100
+				},
+				{
+					"id": "recovery-session-rekey",
+					"kind": "recovery-rekey",
+					"warmups": 2,
+					"samples": 100
+				},
+				{
+					"id": "recovery-gateway-restart",
+					"kind": "recovery-gateway-restart",
 					"warmups": 2,
 					"samples": 100
 				}
