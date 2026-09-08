@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { statSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { type FileHandle, open } from "node:fs/promises";
 import type { SessionEntry, SessionHeader } from "@earendil-works/pi-coding-agent";
 import {
@@ -28,7 +28,11 @@ export type SessionHistoryErrorCode =
 export class SessionHistoryError extends Error {
 	readonly code: SessionHistoryErrorCode;
 
-	constructor(code: SessionHistoryErrorCode, message: string) {
+	constructor(
+		code: SessionHistoryErrorCode,
+		message: string,
+		readonly identityLost = false,
+	) {
 		super(message);
 		this.name = "SessionHistoryError";
 		this.code = code;
@@ -81,6 +85,7 @@ export class NativeSessionHistoryPlan {
 
 	private readonly records: readonly SessionHistoryRecord[];
 	private readonly fingerprint: SessionHistoryFingerprint;
+	private readonly canonicalSourceFile: string;
 
 	constructor(args: {
 		sessionFile: string;
@@ -90,6 +95,7 @@ export class NativeSessionHistoryPlan {
 		totalMessages: number;
 	}) {
 		this.sessionFile = args.sessionFile;
+		this.canonicalSourceFile = realpathSync(args.sessionFile);
 		this.fingerprint = args.fingerprint;
 		this.records = args.records;
 		this.initialStart = args.initialStart;
@@ -166,6 +172,33 @@ export class NativeSessionHistoryPlan {
 		}
 	}
 
+	/** Revalidate identity without treating a legitimate append as replacement. */
+	assertSourceIdentity(): void {
+		try {
+			const stats = statSync(this.sessionFile, { bigint: true });
+			if (
+				realpathSync(this.sessionFile) !== this.canonicalSourceFile ||
+				!stats.isFile() ||
+				stats.dev !== this.fingerprint.dev ||
+				stats.ino !== this.fingerprint.ino
+			) {
+				throw new SessionHistoryError(
+					"session_history_changed",
+					"native Session file identity changed",
+					true,
+				);
+			}
+		} catch (error) {
+			if (
+				(error as NodeJS.ErrnoException).code === "ENOENT" ||
+				(error as NodeJS.ErrnoException).code === "ENOTDIR"
+			) {
+				throw new SessionHistoryError("session_history_changed", "native Session file disappeared", true);
+			}
+			throw error;
+		}
+	}
+
 	/** Compare only the durable file identity; content growth may still be valid. */
 	hasSameSourceFile(other: NativeSessionHistoryPlan): boolean {
 		return this.fingerprint.dev === other.fingerprint.dev && this.fingerprint.ino === other.fingerprint.ino;
@@ -212,6 +245,7 @@ export class NativeSessionHistoryPlan {
 			throw new SessionHistoryError("session_history_invalid_cursor", "history range is invalid");
 		}
 		throwIfAborted(signal);
+		this.assertSourceIdentity();
 		const handle = await open(this.sessionFile, "r");
 		try {
 			assertFingerprint(await fingerprintFor(handle), this.fingerprint);
@@ -578,6 +612,7 @@ function assertFingerprint(actual: SessionHistoryFingerprint, expected: SessionH
 		throw new SessionHistoryError(
 			"session_history_changed",
 			"native Session history changed during a bounded read",
+			actual.dev !== expected.dev || actual.ino !== expected.ino,
 		);
 	}
 }

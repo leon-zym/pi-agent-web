@@ -1502,7 +1502,10 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		const channel = store.getState().sessions[sessionHandle];
 		const recovery = resyncCoordinator.getState(sessionHandle);
 		if (
-			channel?.runtime?.error === "session_snapshot_overflow" &&
+			channel?.runtime?.state === "crashed" &&
+			channel.runtime.recoverable &&
+			(channel.runtime.error === "session_snapshot_overflow" ||
+				channel.runtime.error === "session_history_changed") &&
 			channel.generation !== null &&
 			recovery?.phase === "degraded"
 		) {
@@ -3566,7 +3569,10 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			if (
 				pendingRestart &&
 				identitiesMatch(pendingRestart, current.runtime) &&
-				current.runtime?.error === "session_snapshot_overflow"
+				current.runtime?.state === "crashed" &&
+				current.runtime.recoverable &&
+				(current.runtime.error === "session_snapshot_overflow" ||
+					current.runtime.error === "session_history_changed")
 			) {
 				transitionControl({ type: "claim_settled", sessionHandle: message.sessionHandle });
 				transitionRecovery({ type: "clear_pending_overflow_restart", sessionHandle: message.sessionHandle });

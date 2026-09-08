@@ -122,6 +122,7 @@ function messageTextFragments(value: unknown): string[] {
 function createHarness(options: {
 	targets: ExistingSessionTarget[];
 	onBroadcast?: (message: SessionSupervisorMessage) => void;
+	log?: (level: "info" | "warn" | "error", message: string) => void;
 	onHotRuntimeInventory?: (inventory: HotRuntimeInventoryDto) => void;
 	maxHotProcesses?: number;
 	maxHotRuntimes?: number;
@@ -160,6 +161,7 @@ function createHarness(options: {
 			compatibilityStatus: "current",
 			capabilities: adapter.capabilities,
 		},
+		log: options.log,
 		env: options.env,
 		envForWorkspace: options.envForWorkspace,
 		resolveSession: async (sessionHandle) => targets.get(sessionHandle),
@@ -1977,6 +1979,149 @@ describe("SessionSupervisor", () => {
 		expect(fs.readFileSync(getMessagesMarker, "utf8").trim().split("\n")).toHaveLength(1);
 	});
 
+	it.each(["replace", "header", "path"] as const)(
+		"rejects mutations after detected native identity loss: %s",
+		async (mutation) => {
+			const root = temporaryRoot();
+			const cwd = path.join(root, "workspace");
+			fs.mkdirSync(cwd);
+			const target = createNativeSession(root, cwd, `identity-${mutation}`);
+			appendLargeNativeHistory(target, 3, 128);
+			const { supervisor, messages } = createHarness({ targets: [target], maxAutoRestarts: 2 });
+			const lease = await supervisor.claim(target.sessionHandle, "controller");
+			const generation = supervisor.getRuntime(target.sessionHandle)!.generation;
+			const context = {
+				connectionId: "controller",
+				expectedGeneration: generation,
+				fencingToken: lease.fencingToken,
+			};
+			const original = fs.readFileSync(target.sessionFile, "utf8");
+			if (mutation === "replace") {
+				fs.writeFileSync(`${target.sessionFile}.replacement`, original);
+				fs.renameSync(`${target.sessionFile}.replacement`, target.sessionFile);
+			} else if (mutation === "header") {
+				fs.writeFileSync(
+					target.sessionFile,
+					original.replace(`"id":"${target.nativeSessionId}"`, '"id":"wrong-session"'),
+				);
+			} else {
+				fs.renameSync(target.sessionFile, `${target.sessionFile}.moved`);
+				fs.symlinkSync(`${target.sessionFile}.moved`, target.sessionFile);
+			}
+			// A public work command causes the settled idle refresh to observe the change.
+			await supervisor.sendCommand(target.sessionHandle, { type: "prompt", message: "hi" }, context);
+			await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.state === "crashed");
+			expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({
+				generation,
+				error: "session_history_changed",
+			});
+			expect(
+				messages.some(
+					(message) =>
+						message.type === "runtime_state" && message.runtime.error === "session_history_changed",
+				),
+			).toBe(true);
+			for (const command of [
+				{ type: "prompt", message: "must reject" },
+				{ type: "set_session_name", name: "must reject" },
+			] as const) {
+				await expect(supervisor.sendCommand(target.sessionHandle, command, context)).rejects.toThrow(
+					"session_history_changed",
+				);
+			}
+			await expect(supervisor.activate(target.sessionHandle)).rejects.toThrow("session_history_changed");
+			await expect(
+				supervisor.restart(target.sessionHandle, { ...context, fencingToken: "wrong" }),
+			).rejects.toThrow("session_read_only");
+			let recoveryGeneration = generation;
+			let recoveryContext = context;
+			if (mutation === "header") {
+				await expect(supervisor.restart(target.sessionHandle, context)).rejects.toThrow();
+				recoveryGeneration = supervisor.getRuntime(target.sessionHandle)!.generation;
+				expect(recoveryGeneration).toBe(generation + 1);
+				expect(supervisor.getRuntime(target.sessionHandle)?.error).toBe("session_history_changed");
+				await expect(
+					supervisor.sendCommand(
+						target.sessionHandle,
+						{ type: "prompt", message: "invalid header" },
+						context,
+					),
+				).rejects.toThrow();
+				const recoveryLease = await supervisor.claim(target.sessionHandle, "controller");
+				recoveryContext = {
+					...context,
+					expectedGeneration: recoveryGeneration,
+					fencingToken: recoveryLease.fencingToken,
+				};
+			}
+			if (mutation === "path") fs.unlinkSync(target.sessionFile);
+			fs.writeFileSync(target.sessionFile, original);
+			await expect(supervisor.activate(target.sessionHandle)).rejects.toThrow("session_history_changed");
+			const recovered = await supervisor.restart(target.sessionHandle, recoveryContext);
+			expect(recovered.generation).toBe(recoveryGeneration + 1);
+			await expect(
+				supervisor.sendCommand(target.sessionHandle, { type: "prompt", message: "stale" }, context),
+			).rejects.toThrow();
+			// Observers remain free to read after trustworthy explicit recovery.
+			const read = await supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "get_state" },
+				{ connectionId: "observer", expectedGeneration: recovered.generation, fencingToken: "unused" },
+			);
+			expect(read.response.success).toBe(true);
+			const newLease = await supervisor.claim(target.sessionHandle, "controller");
+			const accepted = await supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "prompt", message: "recovered" },
+				{ ...context, expectedGeneration: recovered.generation, fencingToken: newLease.fencingToken },
+			);
+			expect(accepted.response.success).toBe(true);
+		},
+	);
+
+	it("keeps mutation authority after a recoverable native scan error", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "recoverable-scan");
+		appendLargeNativeHistory(target, 3, 128);
+		const warnings: string[] = [];
+		const { supervisor } = createHarness({
+			targets: [target],
+			log: (_level, message) => warnings.push(message),
+		});
+		const lease = await supervisor.claim(target.sessionHandle, "controller");
+		const generation = supervisor.getRuntime(target.sessionHandle)!.generation;
+		const context = {
+			connectionId: "controller",
+			expectedGeneration: generation,
+			fencingToken: lease.fencingToken,
+		};
+		const original = fs.readFileSync(target.sessionFile, "utf8");
+		// Invalid entry content does not change the verified Header or file identity.
+		fs.appendFileSync(target.sessionFile, `${JSON.stringify({ type: "message", id: "invalid" })}\n`);
+		await supervisor.sendCommand(target.sessionHandle, { type: "prompt", message: "hi" }, context);
+		await waitFor(() => warnings.some((message) => message.includes("session_history_invalid_entry")));
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({ generation, state: "idle" });
+		const accepted = await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "set_session_name", name: "still authorized" },
+			context,
+		);
+		expect(accepted.response.success).toBe(true);
+		fs.writeFileSync(target.sessionFile, original);
+		appendNativeHistoryEntry(target, 3, 128);
+		const appended = await supervisor.sendCommand(
+			target.sessionHandle,
+			{ type: "prompt", message: "valid append" },
+			context,
+		);
+		expect(appended.response.success).toBe(true);
+		await waitFor(() => supervisor.getRuntime(target.sessionHandle)?.phase === "ready");
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({ generation, state: "idle" });
+		expect(supervisor.getRuntime(target.sessionHandle)?.error).toBeUndefined();
+	});
+
 	it("fails native history pages closed after deletion or inode replacement", async () => {
 		for (const mutation of ["delete", "replace"] as const) {
 			const root = temporaryRoot();
@@ -1992,8 +2137,6 @@ describe("SessionSupervisor", () => {
 				throw new Error("native history did not expose a page cursor");
 			}
 			const runtime = exactRuntimeObject(supervisor, target.sessionHandle);
-			const originalPlan = Reflect.get(runtime, "nativeHistoryPlan");
-			const originalSnapshotId = Reflect.get(runtime, "nativeHistorySnapshotId");
 			if (mutation === "delete") {
 				fs.unlinkSync(target.sessionFile);
 			} else {
@@ -2012,8 +2155,8 @@ describe("SessionSupervisor", () => {
 				return true;
 			});
 			await compaction;
-			expect(Reflect.get(runtime, "nativeHistoryPlan")).toBe(originalPlan);
-			expect(Reflect.get(runtime, "nativeHistorySnapshotId")).toBe(originalSnapshotId);
+			expect(Reflect.get(runtime, "nativeHistoryPlan")).toBeNull();
+			expect(Reflect.get(runtime, "nativeHistorySnapshotId")).toBeNull();
 
 			await expect(
 				result.chunkedSnapshot.readPage(result.chunkedSnapshot.history.nextCursor, 8),
