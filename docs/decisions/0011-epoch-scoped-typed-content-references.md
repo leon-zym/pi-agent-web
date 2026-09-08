@@ -3,13 +3,11 @@
 - Status: Accepted and activated; compatibility wording amended by ADRs 0013 and 0015
 - Date: 2026-08-28
 
-The protocol 1.3 activation was part of the release change recorded by this document. The accepted
-design below is unchanged; the activation state records the production contract after the atomic
-Main, Supervisor, Bridge, route, Browser, and documentation switch.
-
-The detailed decision below is historical rationale. ADR 0013 and `docs/protocol.md` define the
-current single-version Gateway contract; references to a 1.2 compatibility surface describe the
-pre-activation state and the explicit mismatch fixtures only.
+This record describes the protocol 1.3 activation and its content-ownership rationale.
+[ADR 0013](0013-canonical-gateway-and-explicit-boundaries.md) and
+[ADR 0015](0015-atomic-gateway-1-4-fenced-session-takeover.md) amend the compatibility wording;
+[Protocol](../protocol.md) defines the current Gateway contract. References to versions 1.2 and 1.3
+below describe that historical transition, not supported production modes.
 
 ## Context
 
@@ -175,34 +173,17 @@ atomicity protocol to every hold, download, materialization, and recovery path.
     and reruns the slot guard. A 404, 410, decode failure, or guard failure reports one failure for
     the exact Session and generation and requests a cursorless authoritative resync. Stale identity
     or uncommitted-baseline failures do not affect the current channel.
-14. At this decision's activation, protocol version 1.3 was the Gateway contract. Both directions require
-    `payload.epoch_attachment_refs` and `payload.epoch_content_refs`, and `server_hello` carries the
-    complete `payloadBudget` and `contentRefBudget`. A missing capability, incomplete budget,
-    incompatible frame ceiling, or non-1.3 peer terminates the connection before Session subscription.
-    The Gateway does not provide a per-connection inline fallback. Protocol 1.2 remains documented
-    as the previous compatibility surface and is tested explicitly, but is not a production Session
-    mode after this activation.
+14. At activation, both peers required protocol 1.3, both payload capabilities, and complete
+    canonical budgets before Session subscription. Missing or incompatible negotiation failed
+    closed; version 1.2 was not a fallback production mode.
 
-## Activation status
+## Activation rationale
 
-The activation is atomic. Main creates one payload activation containing the current `serverEpoch`,
-the canonical `payloadBudget`, the canonical `contentRefBudget`, and the shared `EpochContentStore`.
-That activation is passed to REST routes, Supervisor externalization and ownership, the WebSocket
-Bridge, and Browser hello/materialization. The production Browser selects protocol minor 3 and both
-payload capabilities from this activation; no component selects the content mode by inspecting a
-payload shape.
-
-The switch includes the following already activated behavior:
-
-- the shared store has raster and `utf8` namespaces, one lifecycle lock, one reservation/cache
-  ledger, and one shutdown fence;
-- the server-private adapter externalizes only reviewed roots, publishes a reference only after the
-  bytes are readable, and carries the transfer through exact Runtime generation ownership;
-- live, replay, snapshot, and history response families use the 1.3 product DTOs and their own
-  complete guards;
-- the Browser retains references in projection, materializes tool and message roots on demand, and
-  materializes ordered Extension roots before semantic state and sequence commit;
-- the integration, packaged Browser, and release gates below are the evidence for this activation.
+Activation had to be atomic across REST, Runtime ownership, WebSocket publication, and Browser
+materialization: a peer must not receive references before every downstream boundary can validate,
+retain, and recover them. One activation supplied the epoch, both canonical budgets, and the shared
+store to those boundaries. Content mode came from negotiated authority, never payload-shape
+inspection.
 
 ## Consequences
 

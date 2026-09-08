@@ -4,9 +4,11 @@ ADRs record decisions that change identity, process ownership, protocol ordering
 operations, or major UI performance strategy. Current contracts remain in the parent documentation;
 an ADR explains why the contract exists and which alternatives were rejected.
 
-Read superseded ADR text as historical context only. `docs/architecture.md`, `docs/protocol.md`,
-`docs/ui-ux.md`, and `docs/design.md` define current behavior; the newest accepted ADR wins when
-earlier records describe a different implementation.
+Current behavior is defined by [Architecture](../architecture.md), [Protocol](../protocol.md),
+[UI and UX](../ui-ux.md), and [Design](../design.md). ADRs explain those contracts; they do not
+provide a competing current specification. Within the decision history, follow explicit amendment
+and supersession links. Superseded text remains historical context, including its old versions,
+rollout steps, and verification inventories.
 
 | ADR | Decision |
 |---|---|
