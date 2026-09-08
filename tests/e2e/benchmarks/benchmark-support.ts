@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import type { Page, TestInfo } from "@playwright/test";
 import type { RecoveryEvidence } from "../../../packages/ui/src/lib/benchmark-recovery-recorder";
 import type { ProductionHarness } from "../fixtures/production-harness";
+import type { RestartAuthenticationObservation } from "./restart-authentication-observation";
 
 export type BenchmarkTier = "representative" | "stress";
 export type BenchmarkVariant = "coalesced" | "sequential";
@@ -256,6 +257,7 @@ export interface BenchmarkRecoveryLifecycleFact {
 }
 
 export interface BenchmarkRecoveryObservationFacts {
+	restartAuthentication?: RestartAuthenticationObservation | null;
 	identity: {
 		after: BenchmarkRecoveryAuthorityFact;
 		before: BenchmarkRecoveryAuthorityFact;

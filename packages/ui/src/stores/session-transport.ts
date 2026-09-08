@@ -48,6 +48,7 @@ import {
 } from "@pi-agent-web/protocol";
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
+import { api } from "../lib/api";
 import { getSessionBrowserEffects } from "../lib/session-browser-effects";
 import {
 	createSessionContentAdapter,
@@ -378,6 +379,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 
 	let socket: SessionWebSocket | null = null;
 	let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	let cancelReconnectAuthentication: (() => void) | null = null;
 	let helloTimer: ReturnType<typeof setTimeout> | null = null;
 	let historyRequestCounter = 0;
 	let nextSnapshotWaiterToken = 1;
@@ -985,6 +987,43 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	}
 
 	function openSocket(socketEpoch: number): void {
+		if (!options.reauthenticate || socketEpoch === 1) {
+			openAuthenticatedSocket(socketEpoch);
+			return;
+		}
+		if (disposed || !connectionMachine.getState().reconnectEnabled || cancelReconnectAuthentication) return;
+		const controller = new AbortController();
+		const cancel = () => {
+			if (cancelReconnectAuthentication === cancel) cancelReconnectAuthentication = null;
+			clearTimeout(timer);
+			controller.abort();
+		};
+		const current = () =>
+			cancelReconnectAuthentication === cancel &&
+			!disposed &&
+			connectionMachine.getState().reconnectEnabled &&
+			connectionMachine.getState().socketEpoch === socketEpoch;
+		const fail = () => {
+			if (!current()) return;
+			cancel();
+			transitionConnection({ type: "socket_failed", socketEpoch });
+			handleDisconnected();
+		};
+		const timer = setTimeout(fail, helloTimeoutMs);
+		cancelReconnectAuthentication = cancel;
+		Promise.resolve()
+			.then(() => {
+				if (!current()) return;
+				return options.reauthenticate?.(controller.signal);
+			})
+			.then(() => {
+				if (!current()) return;
+				cancel();
+				openAuthenticatedSocket(socketEpoch);
+			}, fail);
+	}
+
+	function openAuthenticatedSocket(socketEpoch: number): void {
 		if (
 			disposed ||
 			!connectionMachine.getState().reconnectEnabled ||
@@ -1148,6 +1187,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	}
 
 	function closeSocket(socketEpoch: number): void {
+		if (connectionMachine.getState().socketEpoch === socketEpoch) cancelReconnectAuthentication?.();
 		const current = socketForEpoch(socketEpoch);
 		if (!current) return;
 		socket = null;
@@ -1163,6 +1203,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	}
 
 	function disconnect(): void {
+		cancelReconnectAuthentication?.();
 		const socketEpoch = socket ? connectionMachine.getState().socketEpoch : null;
 		transitionConnection({ type: "disconnect", socketEpoch });
 		handleDisconnected();
@@ -4207,7 +4248,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 }
 
 /** Default store/controller. Importing this module never opens a socket. */
-export const sessionTransport = createSessionTransport();
+export const sessionTransport = createSessionTransport({ reauthenticate: (signal) => api.bootstrap(signal) });
 export const sessionTransportStore = sessionTransport.store;
 
 export function useSessionTransportStore<T>(selector: (state: SessionTransportState) => T): T {

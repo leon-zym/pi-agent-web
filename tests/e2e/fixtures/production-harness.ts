@@ -4,7 +4,6 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Page } from "@playwright/test";
 
 const fixturesDir = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(fixturesDir, "../../..");
@@ -85,7 +84,7 @@ export interface ProductionHarness {
 	startPrompt: (text: string) => void;
 	triggerReplayGap: (text: string) => void;
 	requestJson: <T>(pathname: string, init?: RequestInit) => Promise<T>;
-	restart: (page?: Page) => Promise<void>;
+	restart: () => Promise<void>;
 	lifecycle: () => HarnessLifecycleSnapshot;
 	stop: () => Promise<void>;
 }
@@ -421,13 +420,6 @@ async function bootstrapGateway(origin: string, output: () => string): Promise<s
 	throw new Error(`pi-web did not become ready (${lastFailure}):\n${output()}`);
 }
 
-async function refreshBrowserAuthentication(page: Page): Promise<void> {
-	await page.evaluate(async () => {
-		const response = await fetch("/api/v1/bootstrap", { credentials: "include" });
-		if (!response.ok) throw new Error(`Browser bootstrap failed with ${String(response.status)}`);
-	});
-}
-
 export async function startProductionHarness(options: StartHarnessOptions = {}): Promise<ProductionHarness> {
 	const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-browser-e2e-"));
 	const agentDir = path.join(rootDir, "agent");
@@ -620,7 +612,7 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 			if (!fs.existsSync(markerPath)) throw new Error("deterministic fake Pi was not started");
 		}
 
-		const restart = (page?: Page): Promise<void> =>
+		const restart = (): Promise<void> =>
 			withLifecycleLock(async () => {
 				const previousChild = child;
 				if (!previousChild || !isActiveChild(previousChild)) {
@@ -638,7 +630,6 @@ export async function startProductionHarness(options: StartHarnessOptions = {}):
 						`/api/v1/workspaces/${encodeURIComponent(workspace.workspaceHandle)}/sessions?refresh=1`,
 					);
 					assertPreservedHarnessIdentity(workspace, session, workspaces, directory.sessions);
-					if (page) await refreshBrowserAuthentication(page);
 				} catch (error) {
 					const replacement = child;
 					child = undefined;

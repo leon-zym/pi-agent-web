@@ -63,7 +63,13 @@ function sessionPath(workspaceHandle: string, sessionHandle: string, suffix = ""
 }
 
 export const api = {
-	bootstrap: () => request<{ ok: true }>("/api/v1/bootstrap"),
+	bootstrap: (signal?: AbortSignal) =>
+		request<{ ok: true }>("/api/v1/bootstrap", {
+			signal,
+			mode: "same-origin",
+			redirect: "error",
+			cache: "no-store",
+		}),
 	listWorkspaces: () => request<NativeWorkspaceDto[]>("/api/v1/workspaces"),
 	pickWorkspaceDirectory: () =>
 		request<{ path: string | null }>("/api/v1/workspaces/pick-directory", { method: "POST" }),

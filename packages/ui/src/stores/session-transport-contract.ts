@@ -186,6 +186,8 @@ export interface SessionWebSocket {
 }
 
 export interface SessionTransportOptions {
+	/** Production cookie bootstrap before reconnect; bounded by the hello timeout and socket attempt. */
+	reauthenticate?: (signal: AbortSignal) => Promise<unknown>;
 	createSocket?: (url: string) => SessionWebSocket;
 	url?: () => string;
 	now?: () => number;

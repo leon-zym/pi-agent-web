@@ -37,7 +37,6 @@ import {
 	runBenchmarkScenario,
 	scenariosFor,
 } from "./benchmark-support";
-
 import {
 	armRecoveryGate,
 	finishRecoveryEvidence,
@@ -45,6 +44,10 @@ import {
 	releaseRecoveryGate,
 	waitForRecoveryHold,
 } from "./recovery-evidence";
+import {
+	expectedRestartAuthenticationError,
+	observeRestartAuthentication,
+} from "./restart-authentication-observation";
 
 test.use({
 	harnessOptions: {
@@ -1479,6 +1482,8 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 		test.slow();
 		await runBenchmarkScenario(page, testInfo, harness, scenario, async (outcome, trials) => {
 			const errors = observePageErrors(page);
+			const authentication = observeRestartAuthentication(page);
+			const excludedAuthenticationErrors = new Set<number>();
 			await installWebSocketDropControl(page);
 			const { sockets, received, closedSockets } = attachFrames(page);
 			await installBrowserBenchmarkObserver(page);
@@ -1490,6 +1495,7 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 
 			for (let index = 0; index < trialCount; index += 1) {
 				await trials.run(index, async () => {
+					authentication.begin();
 					const errorStart = { console: errors.console.length, page: errors.page.length };
 					const beforePrompt = `E2E_BENCH_RESTART_BEFORE:${scenario.id}:${String(index)}`;
 					await page.locator("textarea").fill(beforePrompt);
@@ -1513,7 +1519,9 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 						return marker;
 					});
 					const startedAt = Date.now();
-					await harness.restart(page);
+					authentication.arm();
+					await harness.restart();
+					authentication.seal();
 					const restartFinishedAt = Date.now();
 					const lifecycleSnapshot = harness.lifecycle();
 					await expect.poll(() => closedSockets()).toBeGreaterThan(closesBefore);
@@ -1586,6 +1594,13 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 						console: errors.console.slice(errorStart.console),
 						page: errors.page.slice(errorStart.page),
 					};
+					const restartAuthentication = authentication.read();
+					const excluded = expectedRestartAuthenticationError(
+						restartAuthentication,
+						originBefore,
+						trialBrowserErrors.console,
+					);
+					if (excluded !== null) excludedAuthenticationErrors.add(errorStart.console + excluded);
 					expectedRefusalsByTrial[index] =
 						expectedGatewayRefusal === undefined
 							? null
@@ -1620,6 +1635,7 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 						},
 						correctness,
 						observation: recoveryObservation("recovery-gateway-restart", trialBrowserErrors, {
+							restartAuthentication,
 							identity: {
 								before: persistedAuthority(harness, oldLease, beforeSession),
 								after: persistedAuthority(harness, currentLease, afterSession),
@@ -1652,9 +1668,17 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 					};
 				});
 			}
+			authentication.dispose();
 			addCommonRecoveryGates(
 				outcome,
-				filterExpectedGatewayRestartErrors(errors, gatewayOrigin, expectedRefusalsByTrial),
+				filterExpectedGatewayRestartErrors(
+					{
+						console: errors.console.filter((_, index) => !excludedAuthenticationErrors.has(index)),
+						page: errors.page,
+					},
+					gatewayOrigin,
+					expectedRefusalsByTrial,
+				),
 				"gatewayRestartMs",
 				"Gateway restart and fresh-baseline latency are diagnostic until a portable reference profile exists.",
 			);
@@ -1689,7 +1713,7 @@ for (const scenario of scenariosFor("recovery-gateway-restart")) {
 				"The harness restarts only the Gateway child, reuses its existing agent/session/web-data roots, refreshes the authoritative REST directory, and the Browser waits for a new runtime plus snapshot baseline before control assertions.",
 			);
 			outcome.notes.push(
-				"The raw observation retains the expected loopback WebSocket connection-refused console message emitted while the Gateway child is intentionally offline; the browser-error gate excludes only that exact restart handshake failure.",
+				"Raw errors are retained. The browser-error gate excludes the exact loopback WebSocket refusal or one bootstrap refusal uniquely attributed by same-page request and console URL evidence inside the restart-call window; ambiguity and page errors remain failures.",
 			);
 		});
 	});
