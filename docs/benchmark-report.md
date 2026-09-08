@@ -1,13 +1,19 @@
-# Performance Benchmark Report: Phase 1 Representative Baseline
+# Performance Benchmark Report: Historical Phase 1 Observations
 
 ## Overview
 
-This document is the formal performance benchmark report for Issue #28 Phase 1 calibration.
-It establishes the reference performance baseline profile (`linux-x64-gh-standard`) on
-GitHub standard Linux runners, records two fresh provenance benchmark runs, documents the
-calibration methodology separating deterministic correctness hard gates from host-sensitive
-timing metrics, and presents the calibrated thresholds across all 22 representative scenario
-and variant combinations.
+The September 6, 2026 tables below preserve historical observations from the two recorded commits.
+Their metric semantics, pooled CPU profiles, and calibration formula are incompatible with the
+corrected benchmark suite. They do not establish a current reference baseline or performance
+guarantee. The original values and reported statuses remain unchanged for provenance.
+
+See [current streaming observer semantics](#current-streaming-observer-semantics) and the
+[reproduction guide](#reproduction-guide) for current measurement definitions and comparison
+requirements. Fresh calibration and remaining coverage are tracked in
+[Issue #28](https://github.com/leon-zym/pi-agent-web/issues/28).
+
+The reference environment, methodology, and numerical sections that follow describe that historical
+calibration, including its original claims and limitations.
 
 ## Reference Environment (`linux-x64-gh-standard`)
 
