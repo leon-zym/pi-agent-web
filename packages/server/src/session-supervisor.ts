@@ -3,11 +3,15 @@ import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type {
+	ExtensionUiRequestDto,
 	ExtensionUiResponseDto,
 	HotRuntimeInventoryDto,
 	HotRuntimeInventoryEntryDto,
+	ProductSessionEventDto,
 	SessionCommandDto,
+	SessionCommandResponseDto,
 	SessionRuntimeIdentityDto,
+	SessionSnapshotDto,
 } from "@pi-agent-web/protocol";
 import {
 	RpcError,
@@ -24,11 +28,6 @@ import {
 	type SessionRuntimeCore,
 	type SessionRuntimeCoreOptions,
 	type SessionRuntimePiPayloadServices,
-	type SessionRuntimeProductEvent,
-	type SessionRuntimeProductExtensionRequest,
-	type SessionRuntimeProductMode,
-	type SessionRuntimeProductResponse,
-	type SessionRuntimeProductSnapshot,
 } from "./session-runtime.js";
 import {
 	type ExistingSessionTarget,
@@ -71,34 +70,29 @@ export interface HotRuntimeSubscriptionToken {
 	readonly kind: "hot_runtime_subscription";
 }
 
-export type HotRuntimeSubscriptionResult<M extends SessionRuntimeProductMode = "content_ref"> = ReplayResult<
-	SessionRuntimeProductEvent<M>,
-	SessionRuntimeProductSnapshot<M>,
-	SessionRuntimeProductExtensionRequest<M>,
-	SessionRuntimeProductSnapshot<M>["settledMessages"][number]
+export type HotRuntimeSubscriptionResult = ReplayResult<
+	ProductSessionEventDto,
+	SessionSnapshotDto,
+	ExtensionUiRequestDto,
+	SessionSnapshotDto["settledMessages"][number]
 > & {
 	observationToken: HotRuntimeSubscriptionToken;
 };
 
-interface HotRuntimeSubscriptionObservation<M extends SessionRuntimeProductMode = "content_ref"> {
-	runtime: SessionRuntimeCore<M>;
+interface HotRuntimeSubscriptionObservation {
+	runtime: SessionRuntimeCore;
 	expected: SessionRuntimeIdentityDto;
 	observation: SessionHotRuntimeObservation;
 }
 
 /** Shared constructor seam for the canonical Browser protocol. */
-export interface SessionSupervisorBaseOptions<M extends SessionRuntimeProductMode = "content_ref"> {
+export interface SessionSupervisorBaseOptions {
 	serverEpoch?: string;
 	resolved: ProbedPiRuntime;
 	env?: Record<string, string>;
 	envForWorkspace?: (cwd: string) => Record<string, string>;
 	resolveSession: (sessionHandle: string) => Promise<ExistingSessionTarget | undefined>;
-	broadcast: (
-		message: SessionSupervisorMessage<
-			SessionRuntimeProductEvent<M>,
-			SessionRuntimeProductExtensionRequest<M>
-		>,
-	) => void;
+	broadcast: (message: SessionSupervisorMessage<ProductSessionEventDto, ExtensionUiRequestDto>) => void;
 	onHotRuntimeInventory?: (inventory: HotRuntimeInventoryDto) => void;
 	log?: (level: "info" | "warn" | "error", message: string) => void;
 	readyTimeoutMs?: number;
@@ -126,14 +120,11 @@ export interface SessionSupervisorBaseOptions<M extends SessionRuntimeProductMod
 	restartBaseDelayMs?: number;
 }
 
-export interface SessionSupervisorOptions extends SessionSupervisorBaseOptions<"content_ref"> {
-	piPayloadServices: SessionRuntimePiPayloadServices<"content_ref">;
+export interface SessionSupervisorOptions extends SessionSupervisorBaseOptions {
+	piPayloadServices: SessionRuntimePiPayloadServices;
 }
 
-type SupervisorRuntimeOptions<M extends SessionRuntimeProductMode> = Omit<
-	SessionRuntimeCoreOptions<M>,
-	"productAdapter" | "payloadCustody"
->;
+type SupervisorRuntimeOptions = Omit<SessionRuntimeCoreOptions, "productAdapter" | "payloadCustody">;
 
 interface LeaseOwner {
 	connectionId: string;
@@ -169,15 +160,15 @@ interface Alias {
  * most one hot runtime. Historical Sessions remain dormant. Control leases,
  * crash budgets, replay, and capacity are isolated per Session handle.
  */
-export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "content_ref"> {
+export class SessionSupervisorCore {
 	private readonly hotRuntimeSubscriptionObservations = new WeakMap<
 		HotRuntimeSubscriptionToken,
-		HotRuntimeSubscriptionObservation<M>
+		HotRuntimeSubscriptionObservation
 	>();
 	readonly serverEpoch: string;
 	private readonly opts: Required<
 		Pick<
-			SessionSupervisorBaseOptions<M>,
+			SessionSupervisorBaseOptions,
 			| "readyTimeoutMs"
 			| "replayLimit"
 			| "maxHotProcesses"
@@ -190,10 +181,10 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 			| "restartBaseDelayMs"
 		>
 	> &
-		SessionSupervisorBaseOptions<M>;
-	private readonly runtimeFactory: (options: SupervisorRuntimeOptions<M>) => SessionRuntimeCore<M>;
-	private runtimes = new Map<string, SessionRuntimeCore<M>>();
-	private activationPromises = new Map<string, Promise<SessionRuntimeCore<M>>>();
+		SessionSupervisorBaseOptions;
+	private readonly runtimeFactory: (options: SupervisorRuntimeOptions) => SessionRuntimeCore;
+	private runtimes = new Map<string, SessionRuntimeCore>();
+	private activationPromises = new Map<string, Promise<SessionRuntimeCore>>();
 	private leases = new Map<string, LeaseState>();
 	private aliases = new Map<string, Alias>();
 	private crashTimes = new Map<string, number[]>();
@@ -213,8 +204,8 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 	private closePromise: Promise<void> | null = null;
 
 	constructor(
-		opts: SessionSupervisorBaseOptions<M>,
-		runtimeFactory: (options: SupervisorRuntimeOptions<M>) => SessionRuntimeCore<M>,
+		opts: SessionSupervisorBaseOptions,
+		runtimeFactory: (options: SupervisorRuntimeOptions) => SessionRuntimeCore,
 	) {
 		this.runtimeFactory = runtimeFactory;
 		this.serverEpoch = opts.serverEpoch ?? randomUUID();
@@ -355,10 +346,10 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 		cursor?: ReplayCursor,
 	): Promise<
 		ReplayResult<
-			SessionRuntimeProductEvent<M>,
-			SessionRuntimeProductSnapshot<M>,
-			SessionRuntimeProductExtensionRequest<M>,
-			SessionRuntimeProductSnapshot<M>["settledMessages"][number]
+			ProductSessionEventDto,
+			SessionSnapshotDto,
+			ExtensionUiRequestDto,
+			SessionSnapshotDto["settledMessages"][number]
 		>
 	> {
 		const runtime = await this.ensureRuntime(sessionHandle);
@@ -368,7 +359,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 	async subscribeHotExact(
 		expected: SessionRuntimeIdentityDto,
 		cursor?: ReplayCursor,
-	): Promise<HotRuntimeSubscriptionResult<M>> {
+	): Promise<HotRuntimeSubscriptionResult> {
 		return this.withPoolLock(async () => {
 			this.assertOpen();
 			const runtime = this.runtimes.get(expected.sessionHandle);
@@ -578,7 +569,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 		sessionHandle: string,
 		command: SessionCommandDto,
 		context: SessionCommandContext,
-	): Promise<SessionCommandResult<SessionRuntimeProductResponse<M>>> {
+	): Promise<SessionCommandResult<SessionCommandResponseDto>> {
 		if (HOST_MANAGED_COMMANDS.has(command.type)) {
 			throw new RpcError(command.type, "host_managed_session_lifecycle");
 		}
@@ -788,7 +779,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 	): Promise<void> {
 		this.assertOpen();
 		const handle = this.resolveAlias(sessionHandle);
-		let runtime: SessionRuntimeCore<M> | undefined;
+		let runtime: SessionRuntimeCore | undefined;
 		let sessionFile: string | null = null;
 		await this.withPoolLock(async () => {
 			this.assertOpen();
@@ -851,7 +842,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 	): Promise<T> {
 		this.assertOpen();
 		const handle = this.resolveAlias(sessionHandle);
-		let runtime: SessionRuntimeCore<M> | undefined;
+		let runtime: SessionRuntimeCore | undefined;
 		await this.withPoolLock(async () => {
 			this.assertOpen();
 			if (this.deletionReservations.has(handle)) throw new RpcError("delete", "session_deleting");
@@ -981,7 +972,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 		this.safeBroadcast({ type: "session_directory_changed", workspaceId });
 	}
 
-	private async ensureRuntime(sessionHandle: string): Promise<SessionRuntimeCore<M>> {
+	private async ensureRuntime(sessionHandle: string): Promise<SessionRuntimeCore> {
 		this.assertOpen();
 		const handle = this.resolveAlias(sessionHandle);
 		if (this.deletionReservations.has(handle)) throw new RpcError("activate", "session_deleting");
@@ -1046,7 +1037,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 
 	private async acquireRuntime(
 		sessionHandle: string,
-	): Promise<{ runtime: SessionRuntimeCore<M>; release: () => void }> {
+	): Promise<{ runtime: SessionRuntimeCore; release: () => void }> {
 		const runtime = await this.ensureRuntime(sessionHandle);
 		let release: (() => void) | undefined;
 		await this.withPoolLock(async () => {
@@ -1079,7 +1070,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 		}
 	}
 
-	private async startRuntimeWithCapacity(runtime: SessionRuntimeCore<M>): Promise<void> {
+	private async startRuntimeWithCapacity(runtime: SessionRuntimeCore): Promise<void> {
 		let release: (() => void) | undefined;
 		await this.withPoolLock(async () => {
 			this.assertOpen();
@@ -1112,7 +1103,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 	private createRuntime(
 		target: ExistingSessionTarget | NewSessionTarget,
 		initialGeneration?: number,
-	): SessionRuntimeCore<M> {
+	): SessionRuntimeCore {
 		return this.runtimeFactory({
 			serverEpoch: this.serverEpoch,
 			target,
@@ -1141,11 +1132,8 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 	}
 
 	private async commitIdentityTransition(
-		runtime: SessionRuntimeCore<M>,
-		transition: SessionIdentityTransitionCommit<
-			SessionRuntimeProductEvent<M>,
-			SessionRuntimeProductExtensionRequest<M>
-		>,
+		runtime: SessionRuntimeCore,
+		transition: SessionIdentityTransitionCommit<ProductSessionEventDto, ExtensionUiRequestDto>,
 	): Promise<void> {
 		let leaseTransition: SessionLeaseTransition | undefined;
 		try {
@@ -1172,10 +1160,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 				transition.apply();
 				leaseTransition = await this.rekeyRuntime(previousSessionHandle, runtime, false);
 				const committedRuntime = runtime.snapshot();
-				let stagedMessages: SessionSupervisorMessage<
-					SessionRuntimeProductEvent<M>,
-					SessionRuntimeProductExtensionRequest<M>
-				>[];
+				let stagedMessages: SessionSupervisorMessage<ProductSessionEventDto, ExtensionUiRequestDto>[];
 				try {
 					stagedMessages = transition.commitStaged();
 				} catch (error) {
@@ -1284,7 +1269,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 		return state;
 	}
 
-	private reconcileLeaseGeneration(runtime: SessionRuntimeCore<M>): void {
+	private reconcileLeaseGeneration(runtime: SessionRuntimeCore): void {
 		this.leaseStateFor(runtime.sessionHandle, runtime.generation);
 	}
 
@@ -1377,7 +1362,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 
 	private async rekeyRuntime(
 		previousHandle: string,
-		runtime: SessionRuntimeCore<M>,
+		runtime: SessionRuntimeCore,
 		keepAlias: boolean,
 	): Promise<SessionLeaseTransition> {
 		const nextHandle = runtime.sessionHandle;
@@ -1432,13 +1417,13 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 		return handle;
 	}
 
-	private assertGeneration(runtime: SessionRuntimeCore<M>, command: string, expected: number): void {
+	private assertGeneration(runtime: SessionRuntimeCore, command: string, expected: number): void {
 		if (expected !== runtime.generation) {
 			throw new RpcError(command, "session_generation_stale");
 		}
 	}
 
-	private assertLease(runtime: SessionRuntimeCore<M>, command: string, context: SessionCommandContext): void {
+	private assertLease(runtime: SessionRuntimeCore, command: string, context: SessionCommandContext): void {
 		const lease = this.leaseOwnerFor(runtime.sessionHandle, runtime.generation);
 		if (
 			!lease ||
@@ -1449,7 +1434,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 		}
 	}
 
-	private handleCrash(runtime: SessionRuntimeCore<M>): void {
+	private handleCrash(runtime: SessionRuntimeCore): void {
 		if (this.closed) return;
 		if (runtime.protocolIncompatible) {
 			this.log("warn", `Not restarting protocol-incompatible Session ${runtime.sessionHandle}`);
@@ -1592,7 +1577,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 		});
 	}
 
-	private isEvictable(runtime: SessionRuntimeCore<M>): boolean {
+	private isEvictable(runtime: SessionRuntimeCore): boolean {
 		return runtime.canEvict && !this.hasLease(runtime.sessionHandle, runtime.generation);
 	}
 
@@ -1628,7 +1613,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 
 	private commitHotRuntimeInventoryIfChanged(): void {
 		const entries: HotRuntimeInventoryEntryDto[] = [];
-		const seen = new Set<SessionRuntimeCore<M>>();
+		const seen = new Set<SessionRuntimeCore>();
 		for (const [trackedHandle, runtime] of this.runtimes) {
 			if (seen.has(runtime)) continue;
 			seen.add(runtime);
@@ -1703,10 +1688,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 	}
 
 	private safeBroadcast(
-		message: SessionSupervisorMessage<
-			SessionRuntimeProductEvent<M>,
-			SessionRuntimeProductExtensionRequest<M>
-		>,
+		message: SessionSupervisorMessage<ProductSessionEventDto, ExtensionUiRequestDto>,
 	): void {
 		try {
 			this.opts.broadcast(message);
@@ -1721,7 +1703,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 }
 
 /** Canonical Browser protocol Supervisor API. */
-export class SessionSupervisor extends SessionSupervisorCore<"content_ref"> {
+export class SessionSupervisor extends SessionSupervisorCore {
 	constructor(opts: SessionSupervisorOptions) {
 		const { piPayloadServices, ...coreOptions } = opts;
 		super(coreOptions, (runtimeOptions) => new SessionRuntime({ ...runtimeOptions, piPayloadServices }));
