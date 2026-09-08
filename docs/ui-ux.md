@@ -48,6 +48,14 @@ Command completion waits for both the response and its projection barrier. Disco
 change, stale fence, or sequence uncertainty preserves the user's draft when safe and presents an
 actionable recovery state.
 
+After Gateway restart, the existing page refreshes authentication and recovers Session authority
+without requiring a reload. The selected Session and draft remain available; mutations wait for
+authoritative recovery. Terminal protocol incompatibility remains terminal.
+
+Subscription pressure and rejection are distinct states. Protected background work may remain
+subscribed above the soft target; retry is offered only for a retryable rejection once transport is
+usable.
+
 ## Conversation
 
 Assistant output uses a quiet reading column rather than chat bubbles. User messages remain visually
@@ -73,8 +81,11 @@ state, model, thinking level, slash commands, and input history do not leak betw
 
 Required behavior:
 
-- `Enter` submits when the current input mode permits; `Shift+Enter` inserts a newline.
-- Expanded editing provides a deliberate multiline mode and restores focus on exit.
+- In compact mode, `Enter` submits an idle prompt or steers a running Session; `Cmd/Ctrl+Enter`
+  queues a follow-up while running. `Shift+Enter` inserts a newline.
+- In expanded mode, `Enter` inserts a newline and `Cmd/Ctrl+Enter` submits. While running, the
+  explicit Steer/Follow-up selection determines delivery. Composition input does not submit.
+- Expanded editing restores focus on exit.
 - Input-history navigation runs only when it does not steal normal caret movement.
 - Slash and skill commands remain atomic while composing and deleting.
 - Workspace file mentions use the selected Workspace and remain keyboard accessible.
@@ -101,7 +112,8 @@ meter remains reachable at narrow widths and does not conceal the primary send o
 ## Large history and referenced content
 
 Persisted history loads in bounded pages. Loading older messages preserves the visible anchor and
-does not block live publication for the same or another Session.
+does not block live publication for the same or another Session. An in-flight older-page load can
+complete for its captured Session while another Session is visible, preserving the other draft.
 
 Large tool, message, and Extension values may remain typed references until a visible consumer needs
 them. Materialization shows a restrained loading state, is cancellable, and updates the captured
@@ -159,6 +171,5 @@ User-visible copy goes through `packages/ui/src/lib/i18n`. `zh-CN` is the defaul
 ## Acceptance baseline
 
 Changes to navigation, conversation, composer, control, recovery, Extension UI, or responsive layout
-require a deterministic Browser regression. Visual review covers both themes, both locales, keyboard
-focus, reduced motion, fine and coarse pointers, and representative phone, tablet, desktop, and wide
-desktop widths. See [Development](development.md) for the executable gate.
+require a deterministic Browser regression. Use [Design's acceptance matrix](design.md#visual-acceptance-matrix)
+for visual review and [Development](development.md#deterministic-browser-e2e) for the executable gate.
