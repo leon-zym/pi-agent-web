@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import {
 	GATEWAY_SERVER_REQUIRED_CAPABILITIES,
 	GATEWAY_SESSION_HISTORY_CAPABILITY,
@@ -24,6 +25,7 @@ import {
 	type SessionWebSocket,
 } from "../src/stores/session-transport";
 
+const UI_SOURCE_ROOT = fileURLToPath(new URL("../", import.meta.url));
 const SERVER_EPOCH = "pipeline-epoch";
 const SESSION_HANDLE = "pipeline-session";
 const USAGE = {
@@ -494,6 +496,17 @@ it("materializes and projects a page while another Session remains selected", as
 									errors: result.value.errors.slice(0, 2).map((error: unknown) => ({
 										name: (error instanceof Error ? error.name : typeof error).slice(0, 200),
 										message: (error instanceof Error ? error.message : String(error)).slice(0, 200),
+										locations: (error instanceof Error ? (error.stack ?? "") : "")
+											.split("\n")
+											.flatMap((frame) => {
+												const start = frame.indexOf(UI_SOURCE_ROOT);
+												if (start < 0) return [];
+												const location = frame
+													.slice(start + UI_SOURCE_ROOT.length)
+													.match(/^(?:src|test)\/[\w./-]+:\d+:\d+/)?.[0];
+												return location ? [`packages/ui/${location}`.slice(0, 200)] : [];
+											})
+											.slice(0, 2),
 									})),
 								},
 							];
