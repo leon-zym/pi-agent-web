@@ -10,7 +10,7 @@ import {
 } from "./restart-authentication-validator.mjs";
 
 export const BENCHMARK_SCHEMA_VERSION = 2;
-export const BENCHMARK_SUITE_VERSION = 4;
+export const BENCHMARK_SUITE_VERSION = 5;
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(scriptDirectory, "..");
@@ -118,7 +118,6 @@ const RECOVERY_FAULT_KINDS = Object.freeze([
 	"recovery-gap",
 	"recovery-crash",
 	"recovery-rekey",
-	"recovery-gateway-restart",
 ]);
 const RECOVERY_CORRECTNESS_KEYS = Object.freeze([
 	"recoveryBarrier",
@@ -1442,17 +1441,21 @@ function gatePolicy(metric) {
 export function benchmarkMetricPolicy(metric) {
 	if (!Object.hasOwn(GATE_METRIC_POLICY, metric)) return null;
 	const mode = gatePolicy(metric);
-	const unit = metric.endsWith("Ms")
-		? "ms"
-		: metric.endsWith("Bytes")
-			? "bytes"
-			: metric === "inputBase64Chars"
-				? "chars"
-				: metric === "streamingDomMutationPerDeltaRatio"
-					? "ratio"
-					: metric === "aggregateDeltaPerSecond"
-						? "events/s"
-						: "count";
+	// This metric counts tasks; its suffix describes the duration threshold.
+	const unit =
+		metric === "liveLongTasksOver50Ms"
+			? "count"
+			: metric.endsWith("Ms")
+				? "ms"
+				: metric.endsWith("Bytes")
+					? "bytes"
+					: metric === "inputBase64Chars"
+						? "chars"
+						: metric === "streamingDomMutationPerDeltaRatio"
+							? "ratio"
+							: metric === "aggregateDeltaPerSecond"
+								? "events/s"
+								: "count";
 	return {
 		mode,
 		unit,
@@ -2135,7 +2138,8 @@ function validateRecoveryResult(result, definition, trials, observationByTrial, 
 	}
 }
 
-function validateResult(result, definition, tier, runId, observationByTrial) {
+/** Per-scenario oracle; formal admission still requires validateBenchmarkArtifacts. */
+export function validateResult(result, definition, tier, runId, observationByTrial) {
 	const errors = [];
 	if (!exactKeys(result, RESULT_KEYS)) errors.push(`result must contain exactly ${RESULT_KEYS.join(", ")}`);
 	if (!isRecord(result)) return errors;
@@ -2198,7 +2202,8 @@ function scenarioKey({ domain, id, variant }) {
 	return `${domain}/${id}/${variant}`;
 }
 
-function validateRawArtifacts(rawArtifacts, results, errors) {
+/** Raw oracle shared by formal validation and deferred-scenario regression tests. */
+export function validateRawArtifacts(rawArtifacts, results, errors) {
 	const observationByTrial = new Map();
 	if (!Array.isArray(rawArtifacts)) {
 		errors.push("raw artifacts must be an array");

@@ -13,6 +13,8 @@ import {
 	canonicalFormalExpectedScenarioSet,
 	loadBenchmarkMatrix,
 	validateBenchmarkArtifacts,
+	validateRawArtifacts,
+	validateResult,
 } from "./performance-benchmark-validator.mjs";
 import { disconnectEvidenceIsValid } from "./recovery-evidence-validator.mjs";
 
@@ -488,7 +490,7 @@ function validResult(variant, definition) {
 	const correctness = correctnessFor(definition);
 	return {
 		schemaVersion: 2,
-		suiteVersion: 4,
+		suiteVersion: 5,
 		tier: "representative",
 		runId: RUN_ID,
 		scenarioId: definition.id,
@@ -541,7 +543,7 @@ function validManifest(matrixValue = matrix) {
 	const keys = expected.map((entry) => `${entry.domain}/${entry.id}/${entry.variant}`);
 	return {
 		schemaVersion: 2,
-		suiteVersion: 4,
+		suiteVersion: 5,
 		tier: "representative",
 		runId: RUN_ID,
 		seed: "fixture-seed",
@@ -574,7 +576,7 @@ function validManifest(matrixValue = matrix) {
 function validEnvironment() {
 	return {
 		schemaVersion: 2,
-		suiteVersion: 4,
+		suiteVersion: 5,
 		runId: RUN_ID,
 		os: "linux",
 		kernel: "6.0",
@@ -628,6 +630,27 @@ function validate(overrides = {}) {
 	});
 }
 
+// #105 is excluded from formal bundles, but its strict raw/result oracle remains tested.
+const deferredRestartDefinition = {
+	domain: "recovery",
+	id: "recovery-gateway-restart",
+	kind: "recovery-gateway-restart",
+	warmups: 1,
+	samples: 3,
+	requiredCapabilities: ["browser", "websocket"],
+};
+function deferredRestartResults() {
+	return FORMAL_VARIANTS.map((variant) => validResult(variant, deferredRestartDefinition));
+}
+function validateDeferredRestart({ rawArtifacts }) {
+	const results = deferredRestartResults();
+	const errors = [];
+	const observations = validateRawArtifacts(rawArtifacts, results, errors);
+	for (const result of results)
+		errors.push(...validateResult(result, deferredRestartDefinition, "representative", RUN_ID, observations));
+	return { errors };
+}
+
 function errorText(outcome) {
 	return outcome.errors.join("\n");
 }
@@ -636,7 +659,7 @@ function resultsForKind(kind) {
 	return validResults().filter((result) => result.kind === kind);
 }
 
-test("loads the complete root and domain matrices with exactly five recovery classes per tier", () => {
+test("loads the complete root and domain matrices with exactly four recovery classes per tier", () => {
 	assert.deepEqual(Object.keys(matrix.provenance.domainHashes), [
 		"concurrency",
 		"content",
@@ -644,12 +667,38 @@ test("loads the complete root and domain matrices with exactly five recovery cla
 		"recovery",
 		"streaming",
 	]);
-	assert.equal(matrix.tiers.representative.scenarios.length, 11);
+	assert.equal(matrix.tiers.representative.scenarios.length, 10);
 	const recovery = matrix.domains.find((domain) => domain.id === "recovery");
 	assert.ok(recovery);
 	assert.deepEqual(
 		recovery.tiers.representative.scenarios.map((entry) => entry.kind),
-		["recovery-disconnect", "recovery-gap", "recovery-crash", "recovery-rekey", "recovery-gateway-restart"],
+		["recovery-disconnect", "recovery-gap", "recovery-crash", "recovery-rekey"],
+	);
+});
+
+test("requires all four faults and both variants, with 800 measured stress trials", () => {
+	const stress = canonicalFormalExpectedScenarioSet(matrix, "stress").filter(
+		(entry) => entry.domain === "recovery",
+	);
+	assert.equal(stress.length, 8);
+	assert.ok(stress.every((entry) => entry.measured === 100 && entry.warmups === 2));
+	assert.equal(
+		stress.reduce((sum, entry) => sum + entry.measured, 0),
+		800,
+	);
+	for (const omitted of validResults().filter((result) => result.domain === "recovery")) {
+		const results = validResults().filter(
+			(result) => result.scenarioId !== omitted.scenarioId || result.variant !== omitted.variant,
+		);
+		assert.match(errorText(validate({ results })), /missing scenario artifact/);
+	}
+});
+
+test("rejects deferred restart artifacts instead of silently filtering them", () => {
+	const results = [...validResults(), ...deferredRestartResults()];
+	assert.match(
+		errorText(validate({ results })),
+		/unexpected scenario artifact: recovery\/recovery-gateway-restart/,
 	);
 });
 
@@ -727,11 +776,11 @@ test("derives browser-error hard gates from atomic observations", () => {
 });
 
 test("allows only one exact Gateway restart refusal in its own raw trial", () => {
-	const accepted = validResults().flatMap(rawFor);
+	const accepted = deferredRestartResults().flatMap(rawFor);
 	const acceptedTrial = accepted.find((artifact) => artifact.value.kind === "recovery-gateway-restart");
 	assert.ok(acceptedTrial);
 	acceptedTrial.value.observation.browserErrors.console.push(EXPECTED_GATEWAY_RESTART_REFUSAL);
-	assert.deepEqual(validate({ rawArtifacts: accepted }).errors, []);
+	assert.deepEqual(validateDeferredRestart({ rawArtifacts: accepted }).errors, []);
 
 	for (const [label, mutate] of [
 		[
@@ -771,11 +820,15 @@ test("allows only one exact Gateway restart refusal in its own raw trial", () =>
 			},
 		],
 	]) {
-		const rawArtifacts = validResults().flatMap(rawFor);
+		const rawArtifacts = deferredRestartResults().flatMap(rawFor);
 		const restartTrial = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-gateway-restart");
 		assert.ok(restartTrial);
 		mutate(restartTrial.value.observation);
-		assert.match(errorText(validate({ rawArtifacts })), /browserErrors/, `${label} must fail validation`);
+		assert.match(
+			errorText(validateDeferredRestart({ rawArtifacts })),
+			/browserErrors/,
+			`${label} must fail validation`,
+		);
 	}
 
 	const nonRestart = validResults().flatMap(rawFor);
@@ -970,7 +1023,7 @@ test("requires an authoritative watermark and strict partitioned sequence contin
 });
 
 test("derives restart ownership from cumulative before/after lifecycle snapshots", () => {
-	const rawArtifacts = validResults().flatMap(rawFor);
+	const rawArtifacts = deferredRestartResults().flatMap(rawFor);
 	const restartRaw = rawArtifacts.filter((artifact) => artifact.value.kind === "recovery-gateway-restart");
 	assert.ok(restartRaw.length > 0);
 	for (const artifact of restartRaw) {
@@ -980,9 +1033,12 @@ test("derives restart ownership from cumulative before/after lifecycle snapshots
 		lifecycle.after.gatewayStarts = 6;
 		lifecycle.after.ownedGatewayCount = 6;
 	}
-	assert.deepEqual(validate({ rawArtifacts }).errors, []);
+	assert.deepEqual(validateDeferredRestart({ rawArtifacts }).errors, []);
 	restartRaw[0].value.observation.facts.lifecycle.after.ownedGatewayCount = 7;
-	assert.match(errorText(validate({ rawArtifacts })), /correctness|gateway|independently derived/);
+	assert.match(
+		errorText(validateDeferredRestart({ rawArtifacts })),
+		/correctness|gateway|independently derived/,
+	);
 });
 
 test("does not accept forged non-recovery hard claims detached from observations", () => {
@@ -1179,11 +1235,14 @@ test("requires a real before/after Gateway restart lifecycle and PID transition"
 			lifecycle.after.activeGatewayPid = null;
 		},
 	]) {
-		const rawArtifacts = validResults().flatMap(rawFor);
+		const rawArtifacts = deferredRestartResults().flatMap(rawFor);
 		const restartRaw = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-gateway-restart");
 		assert.ok(restartRaw);
 		mutate(restartRaw.value.observation.facts.lifecycle);
-		assert.match(errorText(validate({ rawArtifacts })), /correctness|gateway|independently derived/);
+		assert.match(
+			errorText(validateDeferredRestart({ rawArtifacts })),
+			/correctness|gateway|independently derived/,
+		);
 	}
 });
 
@@ -1220,8 +1279,8 @@ for (const field of ["turnNodes", "streamingDomMutationBatches", "deltaCount"]) 
 
 test("rejects suite-v2 streaming evidence after observer semantics changed", () => {
 	const results = validResults();
-	results[0].suiteVersion = 2;
-	assert.match(errorText(validate({ results })), /suiteVersion must be 4/);
+	results[0].suiteVersion = 4;
+	assert.match(errorText(validate({ results })), /suiteVersion must be 5/);
 });
 
 for (const warmup of [true, false]) {
@@ -1568,7 +1627,7 @@ function authenticationFixture(observation) {
 }
 
 test("independently attributes one restart bootstrap refusal while preserving raw errors", () => {
-	const rawArtifacts = validResults().flatMap(rawFor);
+	const rawArtifacts = deferredRestartResults().flatMap(rawFor);
 	const observation = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-gateway-restart")
 		.value.observation;
 	const evidence = authenticationFixture(observation);
@@ -1580,7 +1639,7 @@ test("independently attributes one restart bootstrap refusal while preserving ra
 		),
 		0,
 	);
-	assert.deepEqual(validate({ rawArtifacts }).errors, []);
+	assert.deepEqual(validateDeferredRestart({ rawArtifacts }).errors, []);
 	assert.equal(observation.browserErrors.console.length, 1);
 });
 
@@ -1734,7 +1793,7 @@ test("restart authentication attribution fails closed for adversarial evidence",
 		],
 	];
 	for (const [label, mutate] of cases) {
-		const rawArtifacts = validResults().flatMap(rawFor);
+		const rawArtifacts = deferredRestartResults().flatMap(rawFor);
 		const observation = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-gateway-restart")
 			.value.observation;
 		const evidence = authenticationFixture(observation);
@@ -1748,14 +1807,17 @@ test("restart authentication attribution fails closed for adversarial evidence",
 			null,
 			label,
 		);
-		assert.match(errorText(validate({ rawArtifacts })), /browserErrors/, label);
+		assert.match(errorText(validateDeferredRestart({ rawArtifacts })), /browserErrors/, label);
 	}
-	const rawArtifacts = validResults().flatMap(rawFor);
+	const rawArtifacts = deferredRestartResults().flatMap(rawFor);
 	const observation = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-gateway-restart")
 		.value.observation;
 	authenticationFixture(observation);
 	observation.browserErrors.page.push("page error");
-	assert.match(errorText(validate({ rawArtifacts })), /gate browserErrors\.value actual must be 1/);
+	assert.match(
+		errorText(validateDeferredRestart({ rawArtifacts })),
+		/gate browserErrors\.value actual must be 1/,
+	);
 });
 
 test("validates restart attribution fields independently of the error gate", () => {
@@ -1782,14 +1844,17 @@ test("validates restart attribution fields independently of the error gate", () 
 			e.console.push({ index: 1, at: 4, type: "error", text: "", url: "", samePage: true });
 		},
 	]) {
-		const rawArtifacts = validResults().flatMap(rawFor);
+		const rawArtifacts = deferredRestartResults().flatMap(rawFor);
 		const observation = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-gateway-restart")
 			.value.observation;
 		const evidence = authenticationFixture(observation);
 		observation.browserErrors.console = [];
 		evidence.console = [];
 		mutate(evidence);
-		assert.match(errorText(validate({ rawArtifacts })), /restartAuthentication has invalid public-API facts/);
+		assert.match(
+			errorText(validateDeferredRestart({ rawArtifacts })),
+			/restartAuthentication has invalid public-API facts/,
+		);
 	}
 });
 
