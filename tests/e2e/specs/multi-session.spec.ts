@@ -137,6 +137,59 @@ test("two Sessions in one Workspace stream independently while the user switches
 	expect(errors.page).toEqual([]);
 });
 
+for (const decodeFails of [false, true]) {
+	test(`removing an attachment during delayed image decode stays removed when decode ${decodeFails ? "fails" : "succeeds"}`, async ({
+		page,
+		harness,
+	}) => {
+		await openWorkbench(page, harness);
+		const png = Buffer.from(
+			"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+			"base64",
+		);
+		const input = page.locator("#piweb-image-input");
+		const previews = page.getByTestId("composer-card").locator("img");
+		await input.setInputFiles({ name: "removed.png", mimeType: "image/png", buffer: png });
+		await expect(previews).toHaveCount(1);
+		await expect(input).toBeEnabled();
+		await page.locator("textarea").fill("preserved draft");
+
+		// Delay the real browser decoder, keeping the production preparation and remove paths intact.
+		await page.evaluate((fail) => {
+			const decode = window.createImageBitmap.bind(window);
+			window.createImageBitmap = new Proxy(decode, {
+				async apply(target, thisArg, args) {
+					window.createImageBitmap = decode;
+					document.documentElement.setAttribute("data-test-decode-pending", "true");
+					await new Promise<void>((resolve) => {
+						document.addEventListener("test:release-image-decode", () => resolve(), { once: true });
+					});
+					document.documentElement.removeAttribute("data-test-decode-pending");
+					if (fail) throw new Error("delayed test decode failure");
+					return Reflect.apply(target, thisArg, args);
+				},
+			});
+		}, decodeFails);
+		await input.setInputFiles({ name: "added.png", mimeType: "image/png", buffer: png });
+		await expect(page.locator("html")).toHaveAttribute("data-test-decode-pending", "true");
+		await expect(input).toBeDisabled();
+		const remove = page.getByRole("button", { name: /^(Remove attachment|移除附件)$/ });
+		await expect(remove).toBeEnabled();
+		await remove.click();
+		await expect(previews).toHaveCount(0);
+		await page.evaluate(() => document.dispatchEvent(new Event("test:release-image-decode")));
+		await expect(input).toBeEnabled();
+		await expect(previews).toHaveCount(decodeFails ? 0 : 1);
+		await expect(page.locator("textarea")).toHaveValue("preserved draft");
+		if (!decodeFails) {
+			await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
+			await expect
+				.poll(() => eventFor(harness, (event) => event.type === "prompt" && event.text === "preserved draft"))
+				.toMatchObject({ imageCount: 1, imageChars: png.toString("base64").length });
+		}
+	});
+}
+
 test("an image-only prompt is delivered and the same WebSocket remains usable", async ({ page, harness }) => {
 	const errors = observePageErrors(page);
 	const sockets: WebSocket[] = [];

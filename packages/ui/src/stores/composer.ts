@@ -1,9 +1,11 @@
 import {
+	SESSION_IMAGE_TOTAL_MAX_BASE64_CHARS,
 	WORKSPACE_FILE_REFERENCE_MAX_COUNT,
 	WORKSPACE_FILE_REFERENCE_TEXT_TOTAL_MAX_BYTES,
 	type WorkspaceFileReferenceDto,
 } from "@pi-agent-web/protocol";
 import { create } from "zustand";
+import { COMPOSER_IMAGE_MAX_COUNT, ImageAttachmentError, imagePayloadChars } from "../lib/image-attachments";
 import type { ImageContent } from "../types/pi-types";
 
 export type DeliveryMode = "auto" | "steer" | "follow_up";
@@ -124,6 +126,7 @@ interface ComposerState extends ComposerSnapshot {
 	finishAttachmentWorkForSession: (
 		sessionHandle: string,
 		attachmentWorkId: number,
+		/** Newly prepared additions, never a captured draft snapshot. */
 		preparedImages?: ImageContent[],
 	) => void;
 	setTrigger: (trigger: SlashTrigger | null) => void;
@@ -324,12 +327,21 @@ export const useComposerStore = create<ComposerState>()((set, get) => {
 						snapshot.attachmentWorkIds.includes(attachmentWorkId),
 					)?.[0];
 			if (!targetHandle) return;
+			const currentImages = state.bySession[targetHandle]!.images;
+			const images = preparedImages ? [...currentImages, ...preparedImages] : currentImages;
+			let error: ImageAttachmentError | undefined;
+			if (preparedImages && images.length > COMPOSER_IMAGE_MAX_COUNT) {
+				error = new ImageAttachmentError("too_many", "attachment_limit_reached");
+			} else if (preparedImages && imagePayloadChars(images) > SESSION_IMAGE_TOTAL_MAX_BASE64_CHARS) {
+				error = new ImageAttachmentError("total_too_large", "attachment_total_too_large");
+			}
 			updateSession(targetHandle, (snapshot) => ({
 				...snapshot,
-				...(preparedImages ? { images: preparedImages } : {}),
+				images: error ? currentImages : images,
 				attachmentWorkCount: Math.max(0, snapshot.attachmentWorkCount - 1),
 				attachmentWorkIds: snapshot.attachmentWorkIds.filter((id) => id !== attachmentWorkId),
 			}));
+			if (error) throw error;
 		},
 
 		setTrigger: (trigger) => {
