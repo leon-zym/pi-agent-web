@@ -94,6 +94,7 @@ export interface BenchmarkStreamingObservationFacts {
 		streamingCountAfterRelease: number;
 		streamingCountBeforeRelease: number;
 		turnNodes: number;
+		streamingDomMutationBatches: number;
 	};
 	frames: {
 		deltaCount: number;
@@ -319,7 +320,7 @@ export interface BenchmarkTrialLifecycle {
 
 export interface BenchmarkScenarioResult {
 	schemaVersion: 2;
-	suiteVersion: 2;
+	suiteVersion: 3;
 	tier: BenchmarkTier;
 	runId: string;
 	scenarioId: string;
@@ -340,14 +341,14 @@ export interface BenchmarkScenarioResult {
 }
 
 export interface BrowserBenchmarkSnapshot {
-	inputToPublicationMs: number | null;
-	inputToNextPaintMs: number | null;
+	automationStartToFirstStreamingDomMs: number | null;
+	automationStartToFirstStreamingRafMs: number | null;
 	streamDurationMs: number | null;
 	settlementMs: number | null;
 	totalCompletionMs: number | null;
 	liveLongTaskMaxMs: number;
 	liveLongTasksOver50Ms: number;
-	publicationBatches: number;
+	streamingDomMutationBatches: number;
 	turnNodes: number;
 }
 
@@ -636,7 +637,7 @@ export async function runBenchmarkScenario(
 	}
 	const result: BenchmarkScenarioResult = {
 		schemaVersion: 2,
-		suiteVersion: 2,
+		suiteVersion: 3,
 		tier,
 		runId,
 		scenarioId: scenario.id,
@@ -695,11 +696,12 @@ export async function installBrowserBenchmarkObserver(page: Page): Promise<void>
 		const state = {
 			active: false,
 			startedAt: 0,
-			firstPublicationAt: null as number | null,
-			firstPaintAt: null as number | null,
+			firstStreamingDomAt: null as number | null,
+			firstStreamingRafAt: null as number | null,
+			firstStreamingRafId: null as number | null,
 			streamEndedAt: null as number | null,
 			settledAt: null as number | null,
-			publicationBatches: 0,
+			streamingDomMutationBatches: 0,
 			longTasks: [] as Array<{ startTime: number; duration: number }>,
 		};
 		type SessionFrameState = {
@@ -764,15 +766,22 @@ export async function installBrowserBenchmarkObserver(page: Page): Promise<void>
 			value: BenchmarkWebSocket,
 			writable: true,
 		});
-		const mutationObserver = new MutationObserver(() => {
+		const mutationObserver = new MutationObserver((records) => {
 			if (!state.active) return;
 			const live = document.querySelector<HTMLElement>('[data-markdown-streaming="true"]');
 			if (!live?.textContent) return;
-			state.publicationBatches += 1;
-			if (state.firstPublicationAt !== null) return;
-			state.firstPublicationAt = performance.now();
-			requestAnimationFrame(() => {
-				if (state.firstPaintAt === null) state.firstPaintAt = performance.now();
+			const changedLiveDom = records.some(
+				(record) =>
+					live.contains(record.target) ||
+					[...record.addedNodes].some((node) => node === live || node.contains(live)),
+			);
+			if (!changedLiveDom) return;
+			state.streamingDomMutationBatches += 1;
+			if (state.firstStreamingDomAt !== null) return;
+			state.firstStreamingDomAt = performance.now();
+			state.firstStreamingRafId = requestAnimationFrame(() => {
+				state.firstStreamingRafId = null;
+				if (state.firstStreamingRafAt === null) state.firstStreamingRafAt = performance.now();
 			});
 		});
 		mutationObserver.observe(document, { childList: true, characterData: true, subtree: true });
@@ -804,13 +813,16 @@ export async function installBrowserBenchmarkObserver(page: Page): Promise<void>
 				return observed ? { ...observed } : null;
 			},
 			start() {
+				mutationObserver.takeRecords();
+				if (state.firstStreamingRafId !== null) cancelAnimationFrame(state.firstStreamingRafId);
+				state.firstStreamingRafId = null;
 				state.active = true;
 				state.startedAt = performance.now();
-				state.firstPublicationAt = null;
-				state.firstPaintAt = null;
+				state.firstStreamingDomAt = null;
+				state.firstStreamingRafAt = null;
 				state.streamEndedAt = null;
 				state.settledAt = null;
-				state.publicationBatches = 0;
+				state.streamingDomMutationBatches = 0;
 				state.longTasks.length = 0;
 			},
 			markStreamEnd() {
@@ -826,9 +838,10 @@ export async function installBrowserBenchmarkObserver(page: Page): Promise<void>
 					(entry) => entry.startTime >= state.startedAt && entry.startTime < streamEnd,
 				);
 				return {
-					inputToPublicationMs:
-						state.firstPublicationAt === null ? null : state.firstPublicationAt - state.startedAt,
-					inputToNextPaintMs: state.firstPaintAt === null ? null : state.firstPaintAt - state.startedAt,
+					automationStartToFirstStreamingDomMs:
+						state.firstStreamingDomAt === null ? null : state.firstStreamingDomAt - state.startedAt,
+					automationStartToFirstStreamingRafMs:
+						state.firstStreamingRafAt === null ? null : state.firstStreamingRafAt - state.startedAt,
 					streamDurationMs: state.streamEndedAt === null ? null : state.streamEndedAt - state.startedAt,
 					settlementMs:
 						state.streamEndedAt === null || state.settledAt === null
@@ -837,7 +850,7 @@ export async function installBrowserBenchmarkObserver(page: Page): Promise<void>
 					totalCompletionMs: state.settledAt === null ? null : state.settledAt - state.startedAt,
 					liveLongTaskMaxMs: Math.max(0, ...liveLongTasks.map((entry) => entry.duration)),
 					liveLongTasksOver50Ms: liveLongTasks.filter((entry) => entry.duration > 50).length,
-					publicationBatches: state.publicationBatches,
+					streamingDomMutationBatches: state.streamingDomMutationBatches,
 					turnNodes: document.querySelectorAll("[data-turn-id]").length,
 				};
 			},

@@ -107,7 +107,11 @@ for (const scenario of scenariosFor("streaming")) {
 						largeFrameBytes.length === 2 &&
 						largeFrameBytes.every((bytes) => bytes > targetBytes);
 					const metrics = await finishBrowserMeasurement(page);
+					const turnNodes = metrics.turnNodes;
+					await expect(turn).toHaveCount(1);
 					const correctness = {
+						nonemptyStreamingObservation:
+							turnNodes > 0 && metrics.streamingDomMutationBatches > 0 && streamEnd.deltaCount > 0,
 						liveTailStayedPlain: liveRichNodes === 0,
 						structuralReleaseHeldInStreamingDom:
 							streamingDomBeforeRelease === 1 && settledDomBeforeRelease === 0,
@@ -118,12 +122,11 @@ for (const scenario of scenariosFor("streaming")) {
 						structuralFramesEmittedInOrder: exactStructuralFramePair,
 						frameBudgetPreserved: exactStructuralFramePair,
 					};
-					const turnNodes = await turn.locator("[data-turn-id]").count();
 					return {
 						metrics: {
 							...metrics,
 							deltaCount: streamEnd.deltaCount,
-							publicationRatio: metrics.publicationBatches / streamEnd.deltaCount,
+							streamingDomMutationPerDeltaRatio: metrics.streamingDomMutationBatches / streamEnd.deltaCount,
 							structuralDomTransitionMs: structuralTransitionFinished - structuralTransitionStarted,
 							turnNodes,
 						},
@@ -143,6 +146,7 @@ for (const scenario of scenariosFor("streaming")) {
 									streamingCountAfterRelease: await streaming.count(),
 									streamingCountBeforeRelease: streamingDomBeforeRelease,
 									turnNodes,
+									streamingDomMutationBatches: metrics.streamingDomMutationBatches,
 								},
 								frames: {
 									deltaCount: streamEnd.deltaCount,
@@ -166,23 +170,23 @@ for (const scenario of scenariosFor("streaming")) {
 			);
 			addSummaryGate(
 				outcome,
-				"publicationRatio",
+				"streamingDomMutationPerDeltaRatio",
 				"p95",
 				"lte",
 				0.5,
 				"observe",
-				"Publication coalescing is measured, but rAF cadence is hardware-sensitive without calibration.",
+				"Streaming DOM MutationObserver callbacks per fixture delta; not store publications or React commits.",
 			);
 			addSummaryGate(
 				outcome,
-				"inputToNextPaintMs",
+				"automationStartToFirstStreamingRafMs",
 				"p95",
 				"lte",
 				targetBytes >= 1024 * 1024 ? 2_000 : 1_000,
 				"observe",
 				targetBytes >= 1024 * 1024
 					? "The repeated 1 MiB baseline is currently slow; 2 s is a regression ceiling, not the product target."
-					: "Three-sample p95 with a generous budget detects a lost/coarsely delayed first paint.",
+					: "Automation start to first rAF callback after streaming DOM mutation; includes fill/click overhead, not user-input latency or pixel paint.",
 			);
 			addSummaryGate(
 				outcome,
@@ -251,7 +255,7 @@ for (const scenario of scenariosFor("streaming")) {
 			);
 			if (targetBytes >= 1024 * 1024) {
 				outcome.notes.push(
-					"Repeated 1 MiB turns currently show approximately 1.3 s first-paint p95 and 0.5 s long tasks on the development host. Treat the wider gates as a checked regression ceiling, not acceptance of the UX.",
+					"Historical timing budgets predate the corrected observer semantics and are diagnostic only; fresh calibration remains pending.",
 				);
 			}
 		});
