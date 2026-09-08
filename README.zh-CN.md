@@ -43,7 +43,7 @@ Pi JSONL 是持久化数据的唯一事实来源。Pi Agent Web 不会将工作�
 </tr>
 </table>
 
-演示内容使用确定性测试夹具，不包含提供商凭据、私有路径或用户会话历史。关于演示视频的无障碍文本流程说明，请参阅[演示交互文本记录](docs/demo-transcript.md)。
+演示内容使用确定性测试夹具，不包含提供商凭据、私有路径或用户会话历史。[演示分镜草案](docs/demo-transcript.md)描述拟录制的流程，不是已完成视频的文本记录。
 
 ## 架构概览
 
@@ -171,8 +171,8 @@ docs/              当前契约和架构决策
 - [UI 与 UX](docs/ui-ux.md)：用户可见行为和可访问性
 - [视觉设计](docs/design.md)：视觉语言和验收标准
 - [开发](docs/development.md)：测试层次、CI、打包和发布检查
-- [性能基准报告](docs/benchmark-report.md)：第一阶段基线画像与校准数据
-- [演示交互记录](docs/demo-transcript.md)：演示视频无障碍文本流程说明
+- [性能基准报告](docs/benchmark-report.md)：历史观测与当前测量定义
+- [演示分镜草案](docs/demo-transcript.md)：拟录制的交互流程
 - [安全策略](SECURITY.md)：私密漏洞报告、支持版本和威胁边界
 - [架构决策](docs/decisions/README.md)：决策理由、替代关系和被否决的方案
 - [GitHub Issues](https://github.com/leon-zym/pi-agent-web/issues)：待办事项和交付状态
