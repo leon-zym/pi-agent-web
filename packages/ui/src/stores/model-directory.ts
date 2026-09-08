@@ -33,6 +33,7 @@ interface ModelDirectoryState extends ModelSnapshot {
 
 const refreshGeneration = new Map<string, number>();
 const modelSelectionGeneration = new Map<string, number>();
+const thinkingStateGeneration = new Map<string, number>();
 let operationCounter = 0;
 
 function nextGeneration(target: Map<string, number>, sessionHandle: string): number {
@@ -102,6 +103,7 @@ export const useModelDirectoryStore = create<ModelDirectoryState>()((set, get) =
 				delete bySession[sessionHandle];
 				refreshGeneration.delete(sessionHandle);
 				modelSelectionGeneration.delete(sessionHandle);
+				thinkingStateGeneration.delete(sessionHandle);
 				return {
 					bySession,
 					...(state.activeSessionHandle === sessionHandle
@@ -115,22 +117,29 @@ export const useModelDirectoryStore = create<ModelDirectoryState>()((set, get) =
 			if (sessionHandle) get().applyStateForSession(sessionHandle, state);
 		},
 
-		applyStateForSession: (sessionHandle, state) =>
+		applyStateForSession: (sessionHandle, state) => {
+			nextGeneration(modelSelectionGeneration, sessionHandle);
+			nextGeneration(thinkingStateGeneration, sessionHandle);
 			updateSession(sessionHandle, (snapshot) => ({
 				...snapshot,
 				currentModel: state.model
 					? { provider: state.model.provider, modelId: state.model.id }
 					: snapshot.currentModel,
 				currentThinkingLevel: state.thinkingLevel,
-			})),
+			}));
+		},
 
 		applyThinkingLevel: (sessionHandle, level) => get().applyThinkingLevelForSession(sessionHandle, level),
 
-		applyThinkingLevelForSession: (sessionHandle, level) =>
-			updateSession(sessionHandle, (snapshot) => ({ ...snapshot, currentThinkingLevel: level })),
+		applyThinkingLevelForSession: (sessionHandle, level) => {
+			nextGeneration(thinkingStateGeneration, sessionHandle);
+			updateSession(sessionHandle, (snapshot) => ({ ...snapshot, currentThinkingLevel: level }));
+		},
 
 		refresh: async (sessionHandle) => {
 			const generation = nextGeneration(refreshGeneration, sessionHandle);
+			const modelGeneration = modelSelectionGeneration.get(sessionHandle);
+			const thinkingGeneration = thinkingStateGeneration.get(sessionHandle);
 			updateSession(sessionHandle, (snapshot) => ({ ...snapshot, loading: true, error: undefined }));
 			try {
 				const transport = sessionTransport.store.getState();
@@ -149,12 +158,22 @@ export const useModelDirectoryStore = create<ModelDirectoryState>()((set, get) =
 					group.push(model);
 					byProvider[model.provider] = group;
 				}
-				updateSession(sessionHandle, () => ({
+				updateSession(sessionHandle, (snapshot) => ({
+					...snapshot,
 					models,
 					byProvider,
-					currentModel: state.model ? { provider: state.model.provider, modelId: state.model.id } : null,
-					thinkingLevels: levels,
-					currentThinkingLevel: state.thinkingLevel,
+					// Directory freshness does not authorize replacing newer Session choices or events.
+					...(modelSelectionGeneration.get(sessionHandle) === modelGeneration
+						? {
+								currentModel: state.model
+									? { provider: state.model.provider, modelId: state.model.id }
+									: null,
+								thinkingLevels: levels,
+								...(thinkingStateGeneration.get(sessionHandle) === thinkingGeneration
+									? { currentThinkingLevel: state.thinkingLevel }
+									: {}),
+							}
+						: {}),
 					loadedAt: Date.now(),
 					loading: false,
 					error: undefined,
@@ -176,13 +195,34 @@ export const useModelDirectoryStore = create<ModelDirectoryState>()((set, get) =
 				.sendCommand(sessionHandle, { type: "set_model", provider, modelId });
 			const model = expectCommandData(response, "set_model");
 			if (!isLatest(modelSelectionGeneration, sessionHandle, generation)) return;
+			// Also fence refreshes that started while set_model was still pending.
+			const completedGeneration = nextGeneration(modelSelectionGeneration, sessionHandle);
+			const thinkingGeneration = thinkingStateGeneration.get(sessionHandle);
 			updateSession(sessionHandle, (snapshot) => ({
 				...snapshot,
 				currentModel: { provider: model.provider, modelId: model.id },
+				thinkingLevels: [],
+			}));
+			const transport = sessionTransport.store.getState();
+			const [stateResponse, levelsResponse] = await Promise.all([
+				transport.sendCommand(sessionHandle, { type: "get_state" }),
+				transport.sendCommand(sessionHandle, { type: "get_available_thinking_levels" }),
+			]);
+			if (!isLatest(modelSelectionGeneration, sessionHandle, completedGeneration)) return;
+			const state = expectCommandData(stateResponse, "get_state");
+			const { levels } = expectCommandData(levelsResponse, "get_available_thinking_levels");
+			updateSession(sessionHandle, (snapshot) => ({
+				...snapshot,
+				currentModel: state.model ? { provider: state.model.provider, modelId: state.model.id } : null,
+				thinkingLevels: levels,
+				...(thinkingStateGeneration.get(sessionHandle) === thinkingGeneration
+					? { currentThinkingLevel: state.thinkingLevel }
+					: {}),
 			}));
 		},
 
 		selectThinkingLevel: async (sessionHandle, level) => {
+			nextGeneration(thinkingStateGeneration, sessionHandle);
 			await sessionTransport.store
 				.getState()
 				.sendCommand(sessionHandle, { type: "set_thinking_level", level });

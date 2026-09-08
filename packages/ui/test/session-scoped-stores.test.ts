@@ -176,6 +176,10 @@ describe("Session-scoped UI stores", () => {
 			sendCommand: async (sessionHandle: string, command: SessionCommandDto) => {
 				calls.push({ sessionHandle, command });
 				if (sessionHandle === "session-a" && command.type === "set_model") await aGate;
+				if (command.type === "get_state")
+					return response(command.type, { model: model(sessionHandle), thinkingLevel: "off" });
+				if (command.type === "get_available_thinking_levels")
+					return response(command.type, { levels: ["off"] });
 				return response(command.type, model(sessionHandle));
 			},
 		});
@@ -199,6 +203,8 @@ describe("Session-scoped UI stores", () => {
 		await directory.selectThinkingLevel("session-b", "low");
 		expect(calls.map(({ sessionHandle, command }) => [sessionHandle, command.type])).toEqual([
 			["session-a", "set_model"],
+			["session-a", "get_state"],
+			["session-a", "get_available_thinking_levels"],
 			["session-b", "set_thinking_level"],
 		]);
 
