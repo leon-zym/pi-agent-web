@@ -239,6 +239,7 @@ function observationFor(definition) {
 					streamingCountAfterRelease: 0,
 					streamingCountBeforeRelease: 1,
 					turnNodes: 4,
+					streamingDomMutationBatches: 2,
 				},
 				frames: {
 					deltaCount: 2,
@@ -317,6 +318,7 @@ function correctnessFor(definition) {
 	const keys =
 		definition.kind === "streaming"
 			? [
+					"nonemptyStreamingObservation",
 					"liveTailStayedPlain",
 					"structuralReleaseHeldInStreamingDom",
 					"structuralReleasePublishedSettledDom",
@@ -433,7 +435,7 @@ function validResult(variant, definition) {
 	const correctness = correctnessFor(definition);
 	return {
 		schemaVersion: 2,
-		suiteVersion: 2,
+		suiteVersion: 3,
 		tier: "representative",
 		runId: RUN_ID,
 		scenarioId: definition.id,
@@ -486,7 +488,7 @@ function validManifest(matrixValue = matrix) {
 	const keys = expected.map((entry) => `${entry.domain}/${entry.id}/${entry.variant}`);
 	return {
 		schemaVersion: 2,
-		suiteVersion: 2,
+		suiteVersion: 3,
 		tier: "representative",
 		runId: RUN_ID,
 		seed: "fixture-seed",
@@ -519,7 +521,7 @@ function validManifest(matrixValue = matrix) {
 function validEnvironment() {
 	return {
 		schemaVersion: 2,
-		suiteVersion: 2,
+		suiteVersion: 3,
 		runId: RUN_ID,
 		os: "linux",
 		kernel: "6.0",
@@ -1147,3 +1149,54 @@ test("rejects traversal, duplicate, missing, and extra raw labels", () => {
 		/raw artifact path|raw trial path|missing raw trial|unexpected raw trial/,
 	);
 });
+
+for (const field of ["turnNodes", "streamingDomMutationBatches", "deltaCount"]) {
+	test(`rejects empty streaming ${field} even when producer claims success`, () => {
+		const results = validResults();
+		const rawArtifacts = results.flatMap(rawFor);
+		const raw = rawArtifacts.find((entry) => entry.value.kind === "streaming");
+		const facts = raw.value.observation.facts;
+		if (field === "deltaCount") facts.frames.deltaCount = 0;
+		else facts.dom[field] = 0;
+		assert.match(
+			errorText(validate({ results, rawArtifacts })),
+			/correctness must equal independently derived/,
+		);
+	});
+}
+
+test("rejects suite-v2 streaming evidence after observer semantics changed", () => {
+	const results = validResults();
+	results[0].suiteVersion = 2;
+	assert.match(errorText(validate({ results })), /suiteVersion must be 3/);
+});
+
+for (const warmup of [true, false]) {
+	test(`rejects streaming turn overmount in ${warmup ? "warmup" : "measured"} trials`, () => {
+		const results = validResults();
+		const streaming = results.find((result) => result.kind === "streaming");
+		for (const entry of streaming.trials) entry.metrics.turnNodes = 4;
+		streaming.summaries.turnNodes = { count: 3, min: 4, max: 4, median: 4, p95: 4 };
+		assert.deepEqual(validate({ results }).errors, []);
+		const trial = streaming.trials.find((entry) => entry.warmup === warmup);
+		trial.metrics.turnNodes = 65;
+		if (!warmup) {
+			streaming.summaries.turnNodes.max = 65;
+			streaming.summaries.turnNodes.p95 = 65;
+		}
+		const rawArtifacts = results.flatMap(rawFor);
+		const raw = rawArtifacts.find(
+			(entry) =>
+				entry.value.scenarioId === streaming.scenarioId &&
+				entry.value.variant === streaming.variant &&
+				entry.value.trial.index === trial.index,
+		);
+		raw.value.observation.facts.dom.turnNodes = 65;
+		// Keep raw facts and trial metrics consistent; the per-trial correctness
+		// claim must reject overmount even when the summary excludes warmups.
+		assert.match(
+			errorText(validate({ results, rawArtifacts })),
+			/correctness must equal independently derived/,
+		);
+	});
+}

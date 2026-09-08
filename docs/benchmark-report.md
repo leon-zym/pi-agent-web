@@ -421,6 +421,33 @@ gateway restart, supervisor process crash, sequence gap resynchronization, sessi
 | `recoveryMs` | 992.7 | 905.3 | 992.7 | 1,539.05 | OK |
 | `replayFrames` | 12 | 12 | 12 | 68 | OK |
 
+## Current streaming observer semantics
+
+Suite version 3 keeps artifact schema version 2 but changes the streaming measurement contract.
+The historical tables above and checked-in calibration file retain their original names and values;
+they are not suite-v3 calibration. Comparisons reject unsupported suite versions and changed
+producer hashes. Fresh local/reference calibration remains pending under #28.
+
+| Current metric | Exact observation boundary |
+| --- | --- |
+| `automationStartToFirstStreamingDomMs` | Browser `performance.now()` at measurement start, before Playwright fill/click, to the first MutationObserver callback affecting non-empty streaming DOM |
+| `automationStartToFirstStreamingRafMs` | The same automation start to the first rAF callback scheduled after that DOM observation; this runs before rendering and does not measure pixel paint |
+| `streamingDomMutationBatches` | MutationObserver callback batches affecting the live streaming element; excludes unrelated DOM updates, and is neither store publications nor React commits |
+| `streamingDomMutationPerDeltaRatio` | Those DOM callback batches divided by the fixture's emitted delta count; not a publication/coalescing ratio |
+| `turnNodes` | All mounted `[data-turn-id]` roots in the document, including the current turn root itself |
+
+The two automation-start timings include fill/click dispatch, fixture pacing, transport and rendering
+work. They are not user-input latency. `streamDurationMs` ends when automation observes stream end;
+`settlementMs`, `structuralDomTransitionMs`, and `totalCompletionMs` include assertion/polling and
+callback scheduling overhead at their recorded endpoints. No metric here certifies actual paint,
+React commit count, or store publication latency.
+
+Streaming observations must contain positive mounted-turn, streaming-DOM-batch and fixture-delta
+counts, including warmups. The independent validator derives that correctness claim from raw facts.
+The 64-turn upper bound applies to every trial, including warmups, as a hard correctness condition;
+zero is no longer accepted as bounded evidence.
+Timing budgets remain diagnostic and have not been recalibrated by this change.
+
 ## Reproduction Guide
 
 To run the representative benchmark suite locally:
