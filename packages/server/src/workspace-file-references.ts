@@ -626,6 +626,11 @@ async function ignoredPaths(root: string, paths: string[], signal?: AbortSignal)
 			}
 			output = Buffer.concat([output, chunk]);
 		});
+		child.stdin.on("error", () => {
+			// Stream errors are independent of the child's error/exit events.
+			child.kill("SIGTERM");
+			finish({ ignored: new Set(), policy: "unknown" });
+		});
 		child.on("error", () => finish({ ignored: new Set(), policy: "unknown" }));
 		child.on("close", (code) => {
 			if (settled) return;
