@@ -1474,6 +1474,8 @@ for (const scenario of scenariosFor("recovery-rekey")) {
 	});
 }
 
+// Deferred to #105: absent from both formal matrices. Keep the implementation and
+// strict error oracle for that follow-up; no skipped trials or replacement samples.
 for (const scenario of scenariosFor("recovery-gateway-restart")) {
 	test(`${scenario.id} recovers a Gateway restart with preserved roots`, async ({
 		page,

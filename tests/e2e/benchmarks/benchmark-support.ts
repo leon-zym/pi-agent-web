@@ -328,7 +328,7 @@ export interface BenchmarkTrialLifecycle {
 
 export interface BenchmarkScenarioResult {
 	schemaVersion: 2;
-	suiteVersion: 4;
+	suiteVersion: 5;
 	tier: BenchmarkTier;
 	runId: string;
 	scenarioId: string;
@@ -645,7 +645,7 @@ export async function runBenchmarkScenario(
 	}
 	const result: BenchmarkScenarioResult = {
 		schemaVersion: 2,
-		suiteVersion: 4,
+		suiteVersion: 5,
 		tier,
 		runId,
 		scenarioId: scenario.id,

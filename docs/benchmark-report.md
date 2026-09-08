@@ -15,6 +15,28 @@ requirements. Fresh calibration and remaining coverage are tracked in
 The reference environment, methodology, and numerical sections that follow describe that historical
 calibration, including its original claims and limitations.
 
+## Current recovery scope (suite version 5)
+
+Gateway restart performance is explicitly deferred to [Issue #105](https://github.com/leon-zym/pi-agent-web/issues/105).
+It is absent from both formal matrices; the retained implementation has no active matrix entry.
+The runner selects the remaining declared scenarios, and the validator still fails missing required
+scenarios, variants, trials or unexpected artifacts. This is a workload revision, not skipped tests,
+error suppression or replacement sampling. The strict restart error oracle remains unit-tested.
+
+The four required fault classes are WebSocket disconnect, replay gap, Pi crash and Session rekey.
+Stress retains 100 measured trials per fault per variant: 800 measured trials across both variants,
+plus warmups. Gateway restart's additional 100 per variant belongs to #105. Other history, load and
+fairness work remains in #28. The default Browser suite continues running the #103 real Gateway
+restart directory-recovery regression, including automatic recovery without another prompt or click,
+error/loading clearance and preserved selection/draft. This suite does not currently measure or
+budget the directory-read/shutdown overlap.
+
+Version 5 and changed matrix provenance reject old bundles as current evidence. Historical artifacts,
+including the invalid local reference-2, remain unchanged; a new frozen source requires a new complete
+cohort. The previously inspected holdout cannot validate a newly selected budget policy. Strict timing
+budgets remain unimplemented. `liveLongTasksOver50Ms` is a count (zero additive floor), not a duration;
+its suffix describes the 50 ms threshold. Other metric dimensions and diagnostic modes are unchanged.
+
 ## Reference Environment (`linux-x64-gh-standard`)
 
 All Phase 1 baseline benchmarks were executed within the pinned reference environment:
