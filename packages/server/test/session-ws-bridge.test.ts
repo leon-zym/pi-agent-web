@@ -2657,35 +2657,70 @@ describe("SessionWsBridge", () => {
 			return result;
 		};
 
-		const observerSubscription = subscribe(observer, target.sessionHandle);
-		await baselineCaptured;
-		await command(
-			owner,
-			target.sessionHandle,
-			ownerSubscription.runtime.generation,
-			{ id: "events-during-catch-up", type: "prompt", message: "events" },
-			ownerLease.fencingToken,
-		);
-		const current = await eventually(() => {
-			const runtime = harness.supervisor.getRuntime(target.sessionHandle);
-			return runtime?.state === "idle" && runtime.lastSeq >= 4 ? runtime : undefined;
-		});
-		releaseCatchUp?.();
-		const caughtUp = await observerSubscription;
-		const scopedFrames = caughtUp.frames.filter((frame) => {
-			if (frame.type === "runtime_state") {
-				return frame.runtime.sessionHandle === target.sessionHandle;
+		// The observer connected second. Hold a real outbound frame after its lease baseline.
+		const observerSocket = [...harness.bridge.wss.clients][1]!;
+		const originalSend = observerSocket.send;
+		const send = originalSend.bind(observerSocket);
+		let releaseEvent: (() => void) | undefined;
+		observerSocket.send = ((payload: string, callback: (error?: Error) => void) => {
+			const frame = JSON.parse(String(payload));
+			if (frame.type === "event" && frame.seq === 3) {
+				releaseEvent = () => {
+					releaseEvent = undefined;
+					send(payload, callback);
+				};
+				return;
 			}
-			return "sessionHandle" in frame && frame.sessionHandle === target.sessionHandle;
-		});
-		const baselineIndex = scopedFrames.findIndex((frame) => frame.type === "runtime_state");
-		const resyncIndex = scopedFrames.findIndex((frame) => frame.type === "resync_required");
-		const snapshotIndex = scopedFrames.findIndex((frame) => frame.type === "session_snapshot");
-		const leaseIndex = scopedFrames.findIndex((frame) => frame.type === "lease_status");
-		const eventSequences = scopedFrames.flatMap((frame) => (frame.type === "event" ? [frame.seq] : []));
+			send(payload, callback);
+		}) as typeof observerSocket.send;
+		const observerMark = observer.mark();
+		try {
+			const observerSubscription = subscribe(observer, target.sessionHandle);
+			await baselineCaptured;
+			await command(
+				owner,
+				target.sessionHandle,
+				ownerSubscription.runtime.generation,
+				{ id: "events-during-catch-up", type: "prompt", message: "events" },
+				ownerLease.fencingToken,
+			);
+			const current = await eventually(() => {
+				const runtime = harness.supervisor.getRuntime(target.sessionHandle);
+				return runtime?.state === "idle" && runtime.lastSeq >= 4 ? runtime : undefined;
+			});
+			releaseCatchUp?.();
+			const caughtUp = await observerSubscription;
+			await eventually(() => releaseEvent);
+			// A lease proves subscription admission, not delivery of the buffered event suffix.
+			expect(caughtUp.frames.some((frame) => frame.type === "event" && frame.seq === 3)).toBe(false);
+			releaseEvent?.();
+			await observer.waitForFrame(
+				(frame): frame is Extract<SessionWsServerMessage, { type: "event" }> =>
+					frame.type === "event" &&
+					frame.sessionHandle === target.sessionHandle &&
+					frame.generation === current.generation &&
+					frame.seq === current.lastSeq,
+				observerMark,
+			);
+			const scopedFrames = observer.frames.slice(observerMark).filter((frame) => {
+				if (frame.type === "runtime_state") {
+					return frame.runtime.sessionHandle === target.sessionHandle;
+				}
+				return "sessionHandle" in frame && frame.sessionHandle === target.sessionHandle;
+			});
+			const baselineIndex = scopedFrames.findIndex((frame) => frame.type === "runtime_state");
+			const resyncIndex = scopedFrames.findIndex((frame) => frame.type === "resync_required");
+			const snapshotIndex = scopedFrames.findIndex((frame) => frame.type === "session_snapshot");
+			const leaseIndex = scopedFrames.findIndex((frame) => frame.type === "lease_status");
+			const eventSequences = scopedFrames.flatMap((frame) => (frame.type === "event" ? [frame.seq] : []));
 
-		expect([baselineIndex, resyncIndex, snapshotIndex, leaseIndex]).toEqual([0, 1, 2, 3]);
-		expect(eventSequences).toEqual(Array.from({ length: current.lastSeq }, (_value, index) => index + 1));
+			expect([baselineIndex, resyncIndex, snapshotIndex, leaseIndex]).toEqual([0, 1, 2, 3]);
+			expect(eventSequences).toEqual(Array.from({ length: current.lastSeq }, (_value, index) => index + 1));
+		} finally {
+			releaseCatchUp?.();
+			releaseEvent?.();
+			observerSocket.send = originalSend;
+		}
 	});
 
 	it("publishes an extension request exactly once across the replay snapshot barrier", async () => {
