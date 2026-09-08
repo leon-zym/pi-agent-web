@@ -1170,3 +1170,33 @@ test("rejects suite-v2 streaming evidence after observer semantics changed", () 
 	results[0].suiteVersion = 2;
 	assert.match(errorText(validate({ results })), /suiteVersion must be 3/);
 });
+
+for (const warmup of [true, false]) {
+	test(`rejects streaming turn overmount in ${warmup ? "warmup" : "measured"} trials`, () => {
+		const results = validResults();
+		const streaming = results.find((result) => result.kind === "streaming");
+		for (const entry of streaming.trials) entry.metrics.turnNodes = 4;
+		streaming.summaries.turnNodes = { count: 3, min: 4, max: 4, median: 4, p95: 4 };
+		assert.deepEqual(validate({ results }).errors, []);
+		const trial = streaming.trials.find((entry) => entry.warmup === warmup);
+		trial.metrics.turnNodes = 65;
+		if (!warmup) {
+			streaming.summaries.turnNodes.max = 65;
+			streaming.summaries.turnNodes.p95 = 65;
+		}
+		const rawArtifacts = results.flatMap(rawFor);
+		const raw = rawArtifacts.find(
+			(entry) =>
+				entry.value.scenarioId === streaming.scenarioId &&
+				entry.value.variant === streaming.variant &&
+				entry.value.trial.index === trial.index,
+		);
+		raw.value.observation.facts.dom.turnNodes = 65;
+		// Keep raw facts and trial metrics consistent; the per-trial correctness
+		// claim must reject overmount even when the summary excludes warmups.
+		assert.match(
+			errorText(validate({ results, rawArtifacts })),
+			/correctness must equal independently derived/,
+		);
+	});
+}

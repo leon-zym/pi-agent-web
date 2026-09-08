@@ -1740,7 +1740,10 @@ function deriveCorrectness(observation, definition) {
 			frames.largeFrameBytes.every((bytes) => isFiniteNumber(bytes) && bytes > targetBytes);
 		correctness = {
 			nonemptyStreamingObservation:
-				dom?.turnNodes > 0 && dom?.streamingDomMutationBatches > 0 && frames?.deltaCount > 0,
+				dom?.turnNodes > 0 &&
+				dom.turnNodes <= 64 &&
+				dom?.streamingDomMutationBatches > 0 &&
+				frames?.deltaCount > 0,
 			liveTailStayedPlain: dom?.liveRichNodeCount === 0,
 			structuralReleaseHeldInStreamingDom:
 				dom?.streamingCountBeforeRelease === 1 && dom?.settledCountBeforeRelease === 0,

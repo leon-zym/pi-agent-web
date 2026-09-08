@@ -444,7 +444,8 @@ React commit count, or store publication latency.
 
 Streaming observations must contain positive mounted-turn, streaming-DOM-batch and fixture-delta
 counts, including warmups. The independent validator derives that correctness claim from raw facts.
-The retained 64-turn upper bound is still a hard gate; zero is no longer accepted as bounded evidence.
+The 64-turn upper bound applies to every trial, including warmups, as a hard correctness condition;
+zero is no longer accepted as bounded evidence.
 Timing budgets remain diagnostic and have not been recalibrated by this change.
 
 ## Reproduction Guide

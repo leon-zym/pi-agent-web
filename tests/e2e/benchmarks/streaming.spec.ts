@@ -111,7 +111,10 @@ for (const scenario of scenariosFor("streaming")) {
 					await expect(turn).toHaveCount(1);
 					const correctness = {
 						nonemptyStreamingObservation:
-							turnNodes > 0 && metrics.streamingDomMutationBatches > 0 && streamEnd.deltaCount > 0,
+							turnNodes > 0 &&
+							turnNodes <= 64 &&
+							metrics.streamingDomMutationBatches > 0 &&
+							streamEnd.deltaCount > 0,
 						liveTailStayedPlain: liveRichNodes === 0,
 						structuralReleaseHeldInStreamingDom:
 							streamingDomBeforeRelease === 1 && settledDomBeforeRelease === 0,
