@@ -191,7 +191,8 @@ export class NativeSessionHistoryPlan {
 		} catch (error) {
 			if (
 				(error as NodeJS.ErrnoException).code === "ENOENT" ||
-				(error as NodeJS.ErrnoException).code === "ENOTDIR"
+				(error as NodeJS.ErrnoException).code === "ENOTDIR" ||
+				(error as NodeJS.ErrnoException).code === "ELOOP"
 			) {
 				throw new SessionHistoryError("session_history_changed", "native Session file disappeared", true);
 			}

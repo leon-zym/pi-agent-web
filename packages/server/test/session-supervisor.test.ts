@@ -2122,6 +2122,45 @@ describe("SessionSupervisor", () => {
 		expect(supervisor.getRuntime(target.sessionHandle)?.error).toBeUndefined();
 	});
 
+	it("revokes old authority after a public history read detects a symlink loop", async () => {
+		const root = temporaryRoot();
+		const cwd = path.join(root, "workspace");
+		fs.mkdirSync(cwd);
+		const target = createNativeSession(root, cwd, "loop-admission");
+		appendLargeNativeHistory(target, 110, 128);
+		const { supervisor } = createHarness({ targets: [target], maxAutoRestarts: 0 });
+		const lease = await supervisor.claim(target.sessionHandle, "controller");
+		const generation = supervisor.getRuntime(target.sessionHandle)!.generation;
+		const context = {
+			connectionId: "controller",
+			expectedGeneration: generation,
+			fencingToken: lease.fencingToken,
+		};
+		const subscription = await supervisor.subscribe(target.sessionHandle);
+		if (subscription.type !== "resync_required" || !subscription.chunkedSnapshot?.history.nextCursor)
+			throw new Error("missing native page");
+		const original = fs.readFileSync(target.sessionFile);
+		fs.unlinkSync(target.sessionFile);
+		fs.symlinkSync(target.sessionFile, target.sessionFile);
+		await expect(
+			subscription.chunkedSnapshot.readPage(subscription.chunkedSnapshot.history.nextCursor, 8),
+		).rejects.toThrow();
+		fs.unlinkSync(target.sessionFile);
+		fs.writeFileSync(target.sessionFile, original);
+		await expect(
+			supervisor.sendCommand(
+				target.sessionHandle,
+				{ type: "set_session_name", name: "must reject" },
+				context,
+			),
+		).rejects.toThrow("session_history_changed");
+		expect(supervisor.getRuntime(target.sessionHandle)).toMatchObject({
+			state: "crashed",
+			generation,
+			error: "session_history_changed",
+		});
+	});
+
 	it("fails native history pages closed after deletion or inode replacement", async () => {
 		for (const mutation of ["delete", "replace"] as const) {
 			const root = temporaryRoot();
