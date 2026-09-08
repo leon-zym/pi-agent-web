@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
+import { readFrozenReferences } from "./benchmark-frozen-references.mjs";
 import { BUDGET_POLICY, loadReferenceArchive, referenceSet } from "./benchmark-reference-evidence.mjs";
 import {
 	BENCHMARK_SCHEMA_VERSION,
@@ -155,10 +156,24 @@ function compatibility(bundle) {
 				"measuredCounts",
 			].map((key) => [key, m[key]]),
 		),
+		schemaVersion: b.schemaVersion,
 		suiteVersion: b.suiteVersion,
 		tier: b.tier,
 		parameters: b.results.map((result) => [keyFor(result), result.parameters]).sort(),
 	};
+}
+
+function compatibilityDifferences(target, baseline) {
+	const differences = [];
+	const left = compatibility(target);
+	const right = compatibility(baseline);
+	for (const group of Object.keys(left)) {
+		if (!isDeepStrictEqual(left[group], right[group])) differences.push(`${group} differs`);
+	}
+	for (const group of [left.environment, left.workload, right.environment, right.workload]) {
+		if (missingMetadata(group)) differences.push("missing compatibility metadata");
+	}
+	return differences;
 }
 
 /** Compare complete run bundles. This supplements, and never replaces, formal raw validation. */
@@ -182,14 +197,7 @@ export function compareBenchmarkBaseline(target, baseline) {
 		);
 		return comparison;
 	}
-	const left = compatibility(target);
-	const right = compatibility(baseline);
-	for (const group of Object.keys(left)) {
-		if (!isDeepStrictEqual(left[group], right[group])) comparison.incompatibilities.push(`${group} differs`);
-	}
-	for (const group of [left.environment, left.workload, right.environment, right.workload]) {
-		if (missingMetadata(group)) comparison.incompatibilities.push("missing compatibility metadata");
-	}
+	comparison.incompatibilities = compatibilityDifferences(target, baseline);
 	for (const result of target.benchmark.results) {
 		const previous = baseline.benchmark.results.find((entry) => keyFor(entry) === keyFor(result));
 		if (previous && !sameKeys(result.summaries, previous.summaries))
@@ -378,6 +386,8 @@ export function evaluateStrictBudgets(target, references) {
 
 export function runStrictEvaluation(targetDirectory, description, environment, localArchive) {
 	const target = readCompleteBundle(targetDirectory);
+	const errors = evidenceErrors(target);
+	if (errors.length) throw new Error(errors.join("; "));
 	const set = referenceSet(description, environment);
 	if (set.status === "pending")
 		return {
@@ -389,12 +399,18 @@ export function runStrictEvaluation(targetDirectory, description, environment, l
 		};
 	const archive = loadReferenceArchive(set, environment, localArchive);
 	try {
-		const references = [set.reference1, set.reference2].map((id) => {
-			const bundle = readCompleteBundle(path.join(archive.directory, id));
-			if (bundle.benchmark.runId !== id || bundle.manifest.source.commit !== set.source)
-				throw new Error("fixed reference identity/source mismatch");
-			return bundle;
-		});
+		const references = readFrozenReferences(set, archive.directory);
+		const incompatibilities = references.flatMap((reference, index) =>
+			compatibilityDifferences(target, reference).map((reason) => `reference-${index + 1}: ${reason}`),
+		);
+		if (incompatibilities.length)
+			return {
+				status: "INCOMPATIBLE",
+				runId: target.benchmark.runId,
+				errors: [],
+				incompatibilities,
+				comparisons: [],
+			};
 		return evaluateStrictBudgets(target, references);
 	} finally {
 		archive.dispose();

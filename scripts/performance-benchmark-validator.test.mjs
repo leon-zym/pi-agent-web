@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 import { createRecoveryRecorder } from "../packages/ui/src/lib/benchmark-recovery-recorder.ts";
 import { expectedRestartAuthenticationError } from "../tests/e2e/benchmarks/restart-authentication-observation.ts";
+import { readFrozenReferences, TRUSTED_REFERENCE_SOURCE } from "./benchmark-frozen-references.mjs";
 import {
 	evaluateStrictBudgets,
 	generateStrictMarkdown,
@@ -1876,7 +1877,7 @@ test("unknown memory quota remains valid diagnostic evidence, not a numeric quot
 	}
 });
 
-function strictBundleFiles(root, id, value = 100) {
+function strictBundleFiles(root, id, value = 100, source = "c".repeat(40)) {
 	const results = validResults();
 	for (const result of results) {
 		for (const trial of result.trials) {
@@ -1905,7 +1906,9 @@ function strictBundleFiles(root, id, value = 100) {
 	const validated = validate({ results });
 	assert.deepEqual(validated.errors, []);
 	const rename = (value) => JSON.parse(JSON.stringify(value).replaceAll(RUN_ID, id));
-	const manifest = JSON.stringify(rename(validManifest()));
+	const manifestValue = rename(validManifest());
+	manifestValue.source.commit = source;
+	const manifest = JSON.stringify(manifestValue);
 	const environment = JSON.stringify(rename(validEnvironment()));
 	const benchmark = {
 		schemaVersion: 2,
@@ -1935,6 +1938,20 @@ function strictBundleFiles(root, id, value = 100) {
 		fs.writeFileSync(filename, JSON.stringify(rename(artifact.value)));
 	}
 	return directory;
+}
+
+function zipStrictReferences(root) {
+	execFileSync("python3", [
+		"-c",
+		`import pathlib,sys,zipfile
+root=pathlib.Path(sys.argv[1])
+with zipfile.ZipFile(root/'cohort.zip','w',zipfile.ZIP_DEFLATED) as z:
+ for name in ['reference-1','reference-2']:
+  for p in (root/name).rglob('*'):
+   if p.is_file(): z.write(p,p.relative_to(root))
+`,
+		root,
+	]);
 }
 
 test("strict budget validates real raw files, both references and equality without gating diagnostics", (t) => {
@@ -1974,8 +1991,8 @@ test("strict bootstrap still requires raw; active archives never fall back to bo
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "strict-evidence-test-"));
 	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
 	const target = strictBundleFiles(root, "target");
-	strictBundleFiles(root, "reference-1");
-	strictBundleFiles(root, "reference-2");
+	strictBundleFiles(root, "reference-1", 100, TRUSTED_REFERENCE_SOURCE);
+	strictBundleFiles(root, "reference-2", 100, TRUSTED_REFERENCE_SOURCE);
 	const pending = {
 		policy: "completion-median-v1",
 		actions: { status: "pending" },
@@ -1986,21 +2003,11 @@ test("strict bootstrap still requires raw; active archives never fall back to bo
 		/性能预算未评估：参考尚未建立/,
 	);
 	const archive = path.join(root, "cohort.zip");
-	execFileSync("python3", [
-		"-c",
-		`import pathlib,sys,zipfile
-root=pathlib.Path(sys.argv[1])
-with zipfile.ZipFile(root/'cohort.zip','w',zipfile.ZIP_DEFLATED) as z:
- for name in ['reference-1','reference-2']:
-  for p in (root/name).rglob('*'):
-   if p.is_file(): z.write(p,p.relative_to(root))
-`,
-		root,
-	]);
+	zipStrictReferences(root);
 	const active = structuredClone(pending);
 	active.local = {
 		status: "active",
-		source: "c".repeat(40),
+		source: TRUSTED_REFERENCE_SOURCE,
 		artifactId: null,
 		sha256: createHash("sha256").update(fs.readFileSync(archive)).digest("hex"),
 		reference1: "reference-1",
@@ -2036,4 +2043,198 @@ with zipfile.ZipFile(root/'cohort.zip','w',zipfile.ZIP_DEFLATED) as z:
 		.find((name) => name.endsWith("-0.json"));
 	fs.unlinkSync(path.join(target, "raw", raw));
 	assert.throws(() => runStrictEvaluation(target, pending, "local"), /raw/);
+});
+
+test("strict iteration validates frozen raw and envelopes before classifying changed producers", (t) => {
+	const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "strict-iteration-")));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const target = strictBundleFiles(root, "target");
+	const set = { source: TRUSTED_REFERENCE_SOURCE, reference1: "reference-1", reference2: "reference-2" };
+	for (const id of [set.reference1, set.reference2]) strictBundleFiles(root, id, 100, set.source);
+	assert.equal(readFrozenReferences(set, root).length, 2);
+	assert.throws(() => readFrozenReferences({ ...set, source: "a".repeat(40) }, root), /unsupported/);
+	assert.throws(() => readFrozenReferences({ ...set, reference2: set.reference1 }, root), /IDs/);
+	const checkout = path.join(root, "checkout");
+	fs.mkdirSync(checkout);
+	execFileSync("git", ["init", "-q", checkout]);
+	assert.throws(() => readFrozenReferences(set, root, checkout), /git fetch --depth=1 origin 00fe129/);
+	execFileSync("git", ["-C", checkout, "fetch", "--depth=1", `file://${repositoryRoot}`, set.source], {
+		stdio: "pipe",
+	});
+	assert.equal(fs.existsSync(path.join(checkout, ".git/shallow")), true);
+	assert.equal(readFrozenReferences(set, root, checkout).length, 2);
+	execFileSync("tar", ["-xf", "-", "-C", checkout], {
+		input: execFileSync("git", ["archive", set.source], { cwd: repositoryRoot, maxBuffer: 32 * 1024 * 1024 }),
+	});
+	for (const name of ["compare-benchmark-baseline.mjs", "benchmark-frozen-references.mjs"])
+		fs.copyFileSync(path.join(repositoryRoot, "scripts", name), path.join(checkout, "scripts", name));
+	const description = path.join(root, "references.json");
+	const archive = path.join(root, "cohort.zip");
+	const pack = () => {
+		zipStrictReferences(root);
+		fs.writeFileSync(
+			description,
+			JSON.stringify({
+				policy: "completion-median-v1",
+				actions: { status: "pending" },
+				local: {
+					...set,
+					status: "active",
+					artifactId: null,
+					sha256: createHash("sha256").update(fs.readFileSync(archive)).digest("hex"),
+				},
+			}),
+		);
+	};
+	const run = () =>
+		spawnSync(
+			process.execPath,
+			[
+				path.join(checkout, "scripts/compare-benchmark-baseline.mjs"),
+				target,
+				"--strict",
+				"--references",
+				description,
+				"--environment",
+				"local",
+				"--archive",
+				archive,
+			],
+			{ encoding: "utf8" },
+		);
+	const rewrite = (directory, change) => {
+		for (const name of fs
+			.readdirSync(directory, { recursive: true })
+			.filter((name) => name.endsWith(".json"))) {
+			const file = path.join(directory, name);
+			fs.writeFileSync(file, JSON.stringify(change(JSON.parse(fs.readFileSync(file)), name)));
+		}
+		const file = path.join(directory, "benchmark.json");
+		const value = JSON.parse(fs.readFileSync(file));
+		for (const name of ["manifest", "environment"])
+			value[`${name}Hash`] = createHash("sha256")
+				.update(fs.readFileSync(path.join(directory, `${name}.json`)))
+				.digest("hex");
+		fs.writeFileSync(file, JSON.stringify(value));
+	};
+	pack();
+	const compatible = run();
+	assert.equal(compatible.status, 0, compatible.stderr);
+	assert.match(compatible.stdout, /Performance budget: OK/);
+	const producer = "tests/e2e/benchmarks/history.spec.ts";
+	fs.appendFileSync(path.join(checkout, producer), "\n// Changed current producer.\n");
+	rewrite(target, (value, name) => {
+		if (name === "manifest.json")
+			value.fixtureHashes[producer] = createHash("sha256")
+				.update(fs.readFileSync(path.join(checkout, producer)))
+				.digest("hex");
+		return value;
+	});
+	const currentComparator = path.join(checkout, "scripts/compare-benchmark-baseline.mjs");
+	fs.writeFileSync(
+		currentComparator,
+		execFileSync("git", ["show", `${set.source}:scripts/compare-benchmark-baseline.mjs`], {
+			cwd: repositoryRoot,
+		}),
+	);
+	const oldBehavior = run();
+	assert.equal(oldBehavior.status, 1);
+	assert.match(oldBehavior.stderr, /fixtureHashes must exactly match/);
+	fs.copyFileSync(path.join(repositoryRoot, "scripts/compare-benchmark-baseline.mjs"), currentComparator);
+	const changed = run();
+	assert.equal(changed.status, 0, changed.stderr);
+	assert.match(changed.stdout, /incompatible references/);
+	assert.doesNotMatch(changed.stdout, /Performance budget: OK/);
+	// A changed matrix and supported current suite still validate their own target contract.
+	const matrixFile = path.join(checkout, "tests/e2e/benchmarks/matrix.json");
+	fs.appendFileSync(matrixFile, "\n");
+	rewrite(target, (value, name) => {
+		if (name === "manifest.json")
+			value.matrix.rootHash = createHash("sha256").update(fs.readFileSync(matrixFile)).digest("hex");
+		return value;
+	});
+	const changedMatrix = run();
+	assert.equal(changedMatrix.status, 0, changedMatrix.stderr);
+	assert.match(changedMatrix.stdout, /workload differs/);
+	const validator = path.join(checkout, "scripts/performance-benchmark-validator.mjs");
+	fs.writeFileSync(
+		validator,
+		fs.readFileSync(validator, "utf8").replace("BENCHMARK_SUITE_VERSION = 5", "BENCHMARK_SUITE_VERSION = 6"),
+	);
+	rewrite(target, (value, name) => {
+		value = JSON.parse(JSON.stringify(value).replaceAll('"suiteVersion":5', '"suiteVersion":6'));
+		if (name === "manifest.json")
+			value.matrix.rootHash = createHash("sha256").update(fs.readFileSync(matrixFile)).digest("hex");
+		return value;
+	});
+	const nextSuite = run();
+	assert.equal(nextSuite.status, 0, nextSuite.stderr);
+	assert.match(nextSuite.stdout, /suiteVersion differs/);
+	for (const id of [set.reference1, set.reference2]) {
+		const directory = path.join(root, id);
+		rewrite(directory, (value, name) =>
+			name === "benchmark.json" ? { ...value, suiteVersion: 999 } : value,
+		);
+		pack();
+		assert.match(run().stderr, /invalid reference envelope/);
+		strictBundleFiles(root, id, 100, set.source);
+		const raw = fs
+			.readdirSync(path.join(directory, "raw"), { recursive: true })
+			.find((name) => name.endsWith("-0.json"));
+		fs.rmSync(path.join(directory, "raw", raw));
+		pack();
+		assert.equal(run().status, 1);
+		strictBundleFiles(root, id, 100, set.source);
+	}
+	pack();
+	rewrite(target, (value, name) => (name === "benchmark.json" ? { ...value, suiteVersion: 999 } : value));
+	const invalidDescription = JSON.parse(fs.readFileSync(description));
+	invalidDescription.local.source = "a".repeat(40);
+	fs.writeFileSync(description, JSON.stringify(invalidDescription));
+	const invalidTarget = run();
+	assert.equal(invalidTarget.status, 1);
+	assert.match(invalidTarget.stderr, /unsupported run schema\/suite/);
+	rewrite(path.join(root, set.reference1), (value, name) => {
+		if (name === "manifest.json") value.source.commit = "b".repeat(40);
+		return value;
+	});
+	assert.throws(() => readFrozenReferences(set, root), /identity\/source mismatch/);
+});
+
+test("frozen subprocess has no credentials and cleans up failed or malformed output", () => {
+	const source = fs
+		.readFileSync(path.join(repositoryRoot, "scripts/benchmark-frozen-references.mjs"), "utf8")
+		.replace(/^import .*;\n/gm, "")
+		.replaceAll("export ", "")
+		.replaceAll("import.meta.url", JSON.stringify(import.meta.url));
+	for (const failure of ["throw", "", "[]", "{}", "null"]) {
+		let directory;
+		const context = vm.createContext({
+			fs,
+			os,
+			path,
+			fileURLToPath,
+			pathToFileURL: (value) => ({ href: value }),
+			process,
+			execFileSync(command, _args, options) {
+				assert.equal(JSON.stringify(options.env), JSON.stringify({ PATH: process.env.PATH }));
+				assert.ok(options.timeout <= 60_000 && options.maxBuffer <= 32 * 1024 * 1024);
+				if (command === process.execPath) {
+					directory = options.cwd;
+					if (failure === "throw") throw new Error("subprocess timeout");
+					return Buffer.from(failure);
+				}
+				return Buffer.from(TRUSTED_REFERENCE_SOURCE);
+			},
+		});
+		vm.runInContext(source, context);
+		assert.throws(() =>
+			vm.runInContext(
+				`readFrozenReferences({source: TRUSTED_REFERENCE_SOURCE, reference1:'ref1', reference2:'ref2'}, '.')`,
+				context,
+			),
+		);
+		assert.equal(typeof directory, "string");
+		assert.equal(fs.existsSync(directory), false);
+	}
 });

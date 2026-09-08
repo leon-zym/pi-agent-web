@@ -20,6 +20,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Fetch trusted benchmark source for offline validator tests
+        run: git fetch --depth=1 origin 00fe129125fcf273f8c27332ec4b115b59779ce8
       - uses: pnpm/action-setup@v4
         with:
           version: 11.21.0
@@ -94,6 +96,17 @@ jobs:
             # First introduction only; future PRs use their base's registered references.
             cp "$description" "$RUNNER_TEMP/benchmark-references.json"
           fi
+          source=$(node --input-type=module -e '
+            import fs from "node:fs";
+            import { referenceSet } from "./scripts/benchmark-reference-evidence.mjs";
+            import { TRUSTED_REFERENCE_SOURCE } from "./scripts/benchmark-frozen-references.mjs";
+            const set = referenceSet(JSON.parse(fs.readFileSync(process.argv[1])), "actions");
+            if (set.status === "active") {
+              if (set.source !== TRUSTED_REFERENCE_SOURCE) throw new Error("unsupported trusted reference source");
+              process.stdout.write(TRUSTED_REFERENCE_SOURCE);
+            }
+          ' "$RUNNER_TEMP/benchmark-references.json")
+          if [[ -n "$source" ]]; then git fetch --depth=1 origin "$source"; fi
           report=test-results/performance/representative/budget.md
           set +e
           node scripts/compare-benchmark-baseline.mjs "test-results/performance/representative/ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --strict --references "$RUNNER_TEMP/benchmark-references.json" --environment actions > "$report" 2>&1
