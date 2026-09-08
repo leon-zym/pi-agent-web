@@ -187,6 +187,16 @@ for (const [turns, bytes] of [
 				.map((line) => JSON.parse(line));
 			assert.equal(entries.length, (turns * 12) / 5 + 1);
 			const messages = entries.slice(1);
+			assert.equal(
+				sha256(
+					JSON.stringify(messages, (key, value) =>
+						key === "text" && typeof value === "string" ? value.replace(/x+$/, "") : value,
+					),
+				),
+				turns === 1000
+					? "de9ea6b7ee802c3080ce872d3362e6152abb02d049906e5850867ad342370e7c"
+					: "0572fe11c4ffef971c3f834fc43115cdca812a984c756431edc02581d18d9f7e",
+			);
 			assert.equal(messages.filter((e) => e.message.role === "user").length, turns);
 			assert.equal(messages.filter((e) => e.message.role === "toolResult").length, turns / 5);
 			assert.equal(new Set(messages.map((e) => e.id)).size, messages.length);

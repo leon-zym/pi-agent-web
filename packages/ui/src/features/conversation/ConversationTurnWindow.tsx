@@ -321,7 +321,7 @@ export const ConversationTurnWindow = memo(
 			pendingPrependRef.current = null;
 			const currentStart = startRef.current;
 			const currentRange = fullHistory
-				? { hasOlder: false }
+				? { hasNewer: false }
 				: getTurnWindowRange(turnsRef.current.length, currentStart);
 			if (!currentRange.hasNewer) return;
 			const maxStart = getInitialTurnWindowStart(turnsRef.current.length);

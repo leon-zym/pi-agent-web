@@ -325,6 +325,12 @@ function mixedObservation(d, cycle = 0) {
 			failure: null,
 			cycle,
 			sourceBytes: d.sourceBytes,
+			fixtureDigest:
+				d.turns === 1000
+					? "de9ea6b7ee802c3080ce872d3362e6152abb02d049906e5850867ad342370e7c"
+					: "0572fe11c4ffef971c3f834fc43115cdca812a984c756431edc02581d18d9f7e",
+			liveTurns: d.turns + 1,
+			liveMounted: d.historyMount === "full" ? d.turns + 1 : 64,
 			initialTurns: 40,
 			finalTurns: d.turns,
 			mounted: d.historyMount === "full" ? d.turns : 64,
@@ -369,6 +375,7 @@ function mixedMetrics(d) {
 		settlementMs: 2,
 		cycleMs: 200,
 		retainedHeapBytes: 100000,
+		heapDeltaBytes: 0,
 		mountedTurnNodes: d.historyMount === "full" ? d.turns : 64,
 		navigationMs: 3,
 		anchorErrorPx: 1,
@@ -2527,4 +2534,57 @@ test("mixed prepend accepts actual partial-page turn grouping in both mount mode
 		const map = new Map([[`${result.domain}/${result.scenarioId}/${result.variant}/0`, observation]]);
 		assert.deepEqual(validateResult(result, definition, "representative", RUN_ID, map), []);
 	}
+});
+
+for (const [name, mutate] of Object.entries({
+	"recipe digest": (f) => {
+		f.fixtureDigest = HASH_A;
+	},
+	"missing live turn": (f) => {
+		f.liveTurns--;
+	},
+	"excess live mount": (f) => {
+		f.liveMounted = 65;
+	},
+	"malformed action": (f) => {
+		f.actions[0] = null;
+	},
+	"malformed GC": (f) => {
+		f.gc[0] = null;
+	},
+}))
+	test(`mixed history rejects ${name}`, () => {
+		const d = representativeScenarios.find((d) => d.kind === "history-mixed");
+		const result = validResult("coalesced", d),
+			observation = mixedObservation(d);
+		const map = new Map([[`${result.domain}/${result.scenarioId}/${result.variant}/0`, observation]]);
+		assert.deepEqual(validateResult(result, d, "representative", RUN_ID, map), []);
+		mutate(observation.facts);
+		assert.ok(validateResult(result, d, "representative", RUN_ID, map).length > 0);
+	});
+
+test("mixed history recomputes signed retained heap differences", () => {
+	const d = representativeScenarios.find((d) => d.kind === "history-mixed");
+	const result = validResult("coalesced", d),
+		observation = mixedObservation(d);
+	observation.facts.gc[0].heap = 200000;
+	result.trials[0].metrics.heapDeltaBytes = -100000;
+	result.summaries.heapDeltaBytes = { count: 1, min: -100000, max: -100000, median: -100000, p95: -100000 };
+	const map = new Map([[`${result.domain}/${result.scenarioId}/${result.variant}/0`, observation]]);
+	assert.deepEqual(validateResult(result, d, "representative", RUN_ID, map), []);
+	result.trials[0].metrics.heapDeltaBytes = 0;
+	assert.ok(validateResult(result, d, "representative", RUN_ID, map).length > 0);
+});
+
+test("mixed stress declares exactly 32 cycles across sizes, mount modes and publication variants", () => {
+	const mixed = canonicalFormalExpectedScenarioSet(matrix, "stress").filter(
+		(d) => d.kind === "history-mixed" || d.id.startsWith("history-mixed-"),
+	);
+	assert.equal(mixed.length, 8);
+	assert.ok(mixed.every((d) => d.warmups === 1 && d.measured === 3));
+	assert.equal(
+		mixed.reduce((sum, d) => sum + d.warmups + d.measured, 0),
+		32,
+	);
+	assert.equal(new Set(mixed.map((d) => `${d.id}/${d.variant}`)).size, 8);
 });

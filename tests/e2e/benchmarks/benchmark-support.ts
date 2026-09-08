@@ -141,6 +141,9 @@ export interface BenchmarkHistoryObservationFacts {
 }
 
 export interface MixedHistoryFacts {
+	fixtureDigest: string;
+	liveTurns: number;
+	liveMounted: number;
 	failure: string | null;
 	cycle: number;
 	sourceBytes: number;

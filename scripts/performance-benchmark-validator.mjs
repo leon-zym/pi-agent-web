@@ -372,6 +372,9 @@ const OBSERVATION_FACT_KEYS_BY_KIND = {
 	concurrency: CONCURRENCY_FACT_KEYS,
 	history: HISTORY_FACT_KEYS,
 	"history-mixed": [
+		"fixtureDigest",
+		"liveTurns",
+		"liveMounted",
 		"failure",
 		"cycle",
 		"sourceBytes",
@@ -1812,6 +1815,14 @@ function mixedHistoryValid(f, d) {
 		d.sourceBytes !== (d.turns === 1000 ? 4 : 16) * 1024 ** 2 ||
 		!["bounded", "full"].includes(d.historyMount) ||
 		f.sourceBytes !== d.sourceBytes ||
+		f.fixtureDigest !==
+			(d.turns === 1000
+				? "de9ea6b7ee802c3080ce872d3362e6152abb02d049906e5850867ad342370e7c"
+				: "0572fe11c4ffef971c3f834fc43115cdca812a984c756431edc02581d18d9f7e") ||
+		f.liveTurns !== d.turns + 1 ||
+		!Number.isSafeInteger(f.liveMounted) ||
+		f.liveMounted < 1 ||
+		(d.historyMount === "full" ? f.liveMounted !== f.liveTurns : f.liveMounted > 64) ||
 		f.initialTurns !== 40 ||
 		f.finalTurns !== d.turns ||
 		f.getMessagesCount !== 0 ||
@@ -1971,7 +1982,14 @@ function mixedHistoryValid(f, d) {
 }
 
 function mixedHistoryMetrics(f) {
-	if (!isRecord(f?.times) || !Array.isArray(f.actions) || !Array.isArray(f.gc) || !isRecord(f.anchor))
+	if (
+		!isRecord(f?.times) ||
+		!Array.isArray(f.actions) ||
+		!Array.isArray(f.gc) ||
+		!isRecord(f.anchor) ||
+		f.actions.some((a) => !isRecord(a)) ||
+		f.gc.some((g) => !isRecord(g))
+	)
 		return null;
 	const elapsed = (name) => {
 		const action = f.actions.find((a) => a?.name === name);
@@ -1983,6 +2001,9 @@ function mixedHistoryMetrics(f) {
 		settlementMs: f.times.settlement,
 		cycleMs: f.times.cycle,
 		retainedHeapBytes: f.gc.find((g) => g?.name === "warm")?.heap ?? 0,
+		heapDeltaBytes:
+			(f.gc.find((g) => g?.name === "warm")?.heap ?? 0) -
+			(f.gc.find((g) => g?.name === "baseline")?.heap ?? 0),
 		mountedTurnNodes: f.mounted,
 		navigationMs: elapsed("oldest") + elapsed("middle") + elapsed("latest"),
 		anchorErrorPx: Math.abs(f.anchor.after - f.anchor.before),

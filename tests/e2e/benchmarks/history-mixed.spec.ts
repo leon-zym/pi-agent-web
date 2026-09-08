@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { expect, type Page, test, type WebSocketRoute } from "@playwright/test";
+import type { SessionWsClientMessage } from "../../../packages/protocol/src/index";
 import { observePageErrors } from "../fixtures/page-observation";
 import { type ProductionHarness, startProductionHarness } from "../fixtures/production-harness";
 import {
 	addValueGate,
+	benchmarkVariant,
 	correctnessFailureCount,
 	createTrialObservation,
 	type MixedHistoryFacts,
@@ -18,11 +20,17 @@ const digest = (value: string) => createHash("sha256").update(value).digest("hex
 const cursorHash = (value: unknown) => (typeof value === "string" ? digest(value) : null);
 const stamp = () => performance.now();
 
-for (const scenario of scenariosFor("history-mixed")) {
+const scenarios = scenariosFor("history-mixed").sort(
+	(a, b) =>
+		a.turns! - b.turns! ||
+		a.historyMount!.localeCompare(b.historyMount!) * (benchmarkVariant() === "coalesced" ? 1 : -1),
+);
+for (const scenario of scenarios) {
 	test(scenario.id, async ({ browser }, testInfo) => {
 		test.setTimeout(20 * 60_000);
 		let page!: Page;
 		let harness: ProductionHarness | undefined;
+		let browserErrorCount = 0;
 		try {
 			await runBenchmarkScenario(
 				() => page,
@@ -40,6 +48,9 @@ for (const scenario of scenariosFor("history-mixed")) {
 						const errors = observePageErrors(page);
 						const facts: MixedHistoryFacts = {
 							failure: null,
+							fixtureDigest: "",
+							liveTurns: 0,
+							liveMounted: 0,
 							cycle,
 							sourceBytes: 0,
 							initialTurns: 0,
@@ -81,13 +92,27 @@ for (const scenario of scenariosFor("history-mixed")) {
 										mixedHistory: true,
 									},
 								});
-								facts.sourceBytes = fs.statSync(harness.session.sessionFile!).size;
+								const source = fs.readFileSync(harness.session.sessionFile!, "utf8");
+								facts.sourceBytes = Buffer.byteLength(source);
+								// Exclude the private header cwd and only the recipe's terminal byte padding.
+								facts.fixtureDigest = digest(
+									JSON.stringify(
+										source
+											.trim()
+											.split("\n")
+											.slice(1)
+											.map((line) => JSON.parse(line)),
+										(key, value) =>
+											key === "text" && typeof value === "string" ? value.replace(/x+$/, "") : value,
+									),
+								);
 								await page.addInitScript((full) => {
 									Reflect.set(globalThis, "__piwebBenchmarkFullHistory", full);
 									localStorage.setItem("pi-web-theme", "light");
 								}, scenario.historyMount === "full");
 								let recording = true;
 								let route: WebSocketRoute | undefined;
+								let serverRoute: WebSocketRoute | undefined;
 								let opened = 0;
 								const pageRequests: Array<{
 									id: string;
@@ -101,15 +126,16 @@ for (const scenario of scenariosFor("history-mixed")) {
 									route = socket;
 									opened++;
 									const server = socket.connectToServer();
+									serverRoute = server;
 									socket.onMessage((message) => {
-										const frame = JSON.parse(message.toString());
+										const frame = JSON.parse(message.toString()) as SessionWsClientMessage;
 										if (
 											frame.type === "session_history_page" &&
 											frame.sessionHandle === harness?.session.sessionHandle
 										) {
-											const request = { id: digest(frame.requestId), endId: "", messages: 0, userTurns: 0 };
+											const request = { id: digest(frame.id), endId: "", messages: 0, userTurns: 0 };
 											pageRequests.push(request);
-											inflight.set(frame.requestId, request);
+											inflight.set(frame.id, request);
 										}
 										server.send(message);
 									});
@@ -377,7 +403,9 @@ for (const scenario of scenariosFor("history-mixed")) {
 								await row.click();
 								await action("reconnect", async () => {
 									const previous = opened;
-									route!.close({ code: 1012, reason: "synthetic reconnect" });
+									// Close the actual upstream socket as well as the intercepted Browser side.
+									await serverRoute!.close({ code: 4100, reason: "synthetic reconnect" });
+									await route!.close({ code: 4100, reason: "synthetic reconnect" });
 									await expect.poll(() => opened).toBeGreaterThan(previous);
 									await expect(page.locator("textarea")).toBeEnabled();
 									await allPages();
@@ -391,6 +419,9 @@ for (const scenario of scenariosFor("history-mixed")) {
 									await expect(page.getByText("E2E_SCOPED_WIDGET_LINE_1")).toBeVisible();
 									await dialog.getByRole("button", { name: /^(Cancel|取消)$/ }).click();
 									await expect(dialog).toHaveCount(0);
+									await expect(window).toContainText("E2E_EXTENSION_UI_SCOPED_CANCELLED");
+									facts.liveTurns = await total();
+									facts.liveMounted = await window.locator("[data-turn-id]").count();
 									return "widget+dialog";
 								});
 								facts.getMessagesCount = harness
@@ -406,6 +437,7 @@ for (const scenario of scenariosFor("history-mixed")) {
 								harness = undefined;
 							}
 							facts.times.cycle = stamp() - started;
+							browserErrorCount += errors.console.length + errors.page.length;
 							const byName = (name: string) => {
 								const a = facts.actions.find((a) => a.name === name);
 								return a ? a.finished - a.started : 0;
@@ -417,6 +449,9 @@ for (const scenario of scenariosFor("history-mixed")) {
 									settlementMs: facts.times.settlement,
 									cycleMs: facts.times.cycle,
 									retainedHeapBytes: facts.gc.find((g) => g.name === "warm")?.heap ?? 0,
+									heapDeltaBytes:
+										(facts.gc.find((g) => g.name === "warm")?.heap ?? 0) -
+										(facts.gc.find((g) => g.name === "baseline")?.heap ?? 0),
 									mountedTurnNodes: facts.mounted,
 									navigationMs: byName("oldest") + byName("middle") + byName("latest"),
 									anchorErrorPx: Math.abs(facts.anchor.after - facts.anchor.before),
@@ -445,13 +480,14 @@ for (const scenario of scenariosFor("history-mixed")) {
 					addValueGate(
 						outcome,
 						"browserErrors",
-						0,
+						browserErrorCount,
 						"eq",
 						0,
 						"hard",
 						"Raw Browser errors are independently validated.",
 					);
 					outcome.notes.push(
+						"Fixed mode order within each size: coalesced bounded/full; sequential full/bounded. All cycles retain the same action sequence.",
 						"Cold = fresh Browser context and Gateway caches, not OS disk cache eviction. Warm = same retained Session store. GC checkpoints include retained Session cache; they are not unload/leak measurements.",
 						"Find covers a revealed/mounted target only. Browser find cannot search off-window history. Extension UI is a live state added after native history measurements.",
 					);

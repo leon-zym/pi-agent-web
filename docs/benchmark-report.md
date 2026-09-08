@@ -26,7 +26,8 @@ not multiplied by every Turn. No real history or provider output is used.
 Representative adds one 1,000-Turn bounded-mount cycle per publication variant. Stress declares
 two sizes × two publication variants × bounded/full mounting × (one warmup + three measured
 cycles): 32 independent cycles, 24 measured. This is a declared workload, not a claim that the
-full stress matrix has passed. Each cycle owns one fresh Browser context and Gateway; the
+full stress matrix has passed. Mode order is fixed within each size: coalesced bounded/full,
+sequential full/bounded. Each cycle owns one fresh Browser context and Gateway; the
 Browser executable and OS disk cache may be reused. Full mounting is a compile-time benchmark
 control using the same TurnView. The ordinary production executable scan must exclude the control.
 
@@ -34,6 +35,7 @@ Cold opening ends after the authoritative initial history is visible, loading ha
 animation frames have completed. Warm opening returns to the same retained Session store after
 visiting a small second Session. GC is outside open/navigation timing: baseline, all-pages,
 warm-reopen and small-Session-return checkpoints record absolute retained heap and DOM counts.
+`heapDeltaBytes` is warm retained heap minus baseline, including negative values.
 The final checkpoint intentionally retains cached history; it is not an unload or leak test.
 
 Raw evidence records actual wire-page cursors and the deterministic timestamp/role/stop-reason
@@ -44,7 +46,8 @@ and all declared actions. Oldest/middle/latest navigation, remote prepend anchor
 pixels), focus, resize, theme, text selection, clipboard copy, mounted-target find, draft-preserving
 Session switching, reconnect and live Extension UI have separate outcomes and timings. Browser
 find does not search unmounted history. Extension UI is live accompanying state added after the
-native measurements; it is not fabricated persisted history.
+native measurements; its added Turn and mounted count are recorded separately. It is not fabricated
+persisted history. A fixed semantic digest excludes the private header and byte padding.
 
 A cycle exceeding 120 seconds, 1 GiB measured JS heap or 500,000 DOM nodes stops as incomplete
 INVALID evidence. Those are execution safety caps, not accepted performance budgets. Missing GC,

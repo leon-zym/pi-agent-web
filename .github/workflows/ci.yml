@@ -33,6 +33,8 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm verify
+      - name: Check exact mixed history fixtures
+        run: pnpm --filter @pi-agent-web/server exec tsx --test --test-name-pattern="mixed history" ../../tests/e2e/fixtures/production-harness.test.ts
       - run: pnpm test:smoke
       - run: pnpm test:pack
 
