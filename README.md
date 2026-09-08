@@ -47,8 +47,8 @@ Selecting a Session changes only the visible Browser view. It does not use Pi's 
 </table>
 
 The demo uses deterministic fixtures and contains no provider credentials, private paths, or user
-Session history. For an accessible text walkthrough of the demo interaction and state recovery flow,
-see the [demo interaction transcript](docs/demo-transcript.md).
+Session history. The [proposed demo storyboard](docs/demo-transcript.md) outlines a future recording;
+it is not a transcript of a completed video.
 
 ## Architecture at a glance
 
@@ -183,8 +183,8 @@ docs/              Current contracts and architecture decisions
 - [UI and UX](docs/ui-ux.md): user-visible behavior and accessibility
 - [Design](docs/design.md): visual language and acceptance criteria
 - [Development](docs/development.md): test layers, CI, packaging, and release checks
-- [Performance benchmark report](docs/benchmark-report.md): Phase 1 baseline profile and calibration
-- [Demo transcript](docs/demo-transcript.md): accessible interaction walkthrough of the product demo
+- [Performance benchmark report](docs/benchmark-report.md): historical observations and current measurement definitions
+- [Demo storyboard](docs/demo-transcript.md): proposed interaction sequence for a future recording
 - [Security policy](SECURITY.md): private reporting, supported versions, and threat boundary
 - [Architecture decisions](docs/decisions/README.md): rationale, supersession, and rejected alternatives
 - [GitHub Issues](https://github.com/leon-zym/pi-agent-web/issues): backlog and delivery status
