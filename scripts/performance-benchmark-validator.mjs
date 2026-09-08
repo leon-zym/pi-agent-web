@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
 export const BENCHMARK_SCHEMA_VERSION = 2;
-export const BENCHMARK_SUITE_VERSION = 2;
+export const BENCHMARK_SUITE_VERSION = 3;
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(scriptDirectory, "..");
@@ -184,14 +184,14 @@ const GATE_METRIC_POLICY = Object.freeze(
 			"gatewayRestartMs",
 			"heapDeltaBytes",
 			"inputBase64Chars",
-			"inputToNextPaintMs",
-			"inputToPublicationMs",
+			"automationStartToFirstStreamingRafMs",
+			"automationStartToFirstStreamingDomMs",
 			"liveLongTaskMaxMs",
 			"liveLongTasksOver50Ms",
 			"nextPageMs",
 			"processRestartMs",
-			"publicationBatches",
-			"publicationRatio",
+			"streamingDomMutationBatches",
+			"streamingDomMutationPerDeltaRatio",
 			"producerProgressGapMs",
 			"recoveryMs",
 			"rekeyMs",
@@ -298,6 +298,7 @@ const STREAMING_DOM_KEYS = [
 	"streamingCountAfterRelease",
 	"streamingCountBeforeRelease",
 	"turnNodes",
+	"streamingDomMutationBatches",
 ];
 const STREAMING_FRAME_KEYS = ["deltaCount", "largeFrameBytes", "largeFrameTypes"];
 const CONCURRENCY_FACT_KEYS = ["sessions", "socket"];
@@ -1257,6 +1258,7 @@ function validateObservationFacts(value, kind, label, errors) {
 				"streamingCountAfterRelease",
 				"streamingCountBeforeRelease",
 				"turnNodes",
+				"streamingDomMutationBatches",
 			])
 				validateNonnegativeInteger(value.dom[key], `${label}.facts.dom.${key}`, errors);
 			if (typeof value.dom.settledText !== "string")
@@ -1415,7 +1417,7 @@ export function benchmarkMetricPolicy(metric) {
 			? "bytes"
 			: metric === "inputBase64Chars"
 				? "chars"
-				: metric === "publicationRatio"
+				: metric === "streamingDomMutationPerDeltaRatio"
 					? "ratio"
 					: metric === "aggregateDeltaPerSecond"
 						? "events/s"
@@ -1737,6 +1739,11 @@ function deriveCorrectness(observation, definition) {
 			frames.largeFrameBytes.length === 2 &&
 			frames.largeFrameBytes.every((bytes) => isFiniteNumber(bytes) && bytes > targetBytes);
 		correctness = {
+			nonemptyStreamingObservation:
+				dom?.turnNodes > 0 &&
+				dom.turnNodes <= 64 &&
+				dom?.streamingDomMutationBatches > 0 &&
+				frames?.deltaCount > 0,
 			liveTailStayedPlain: dom?.liveRichNodeCount === 0,
 			structuralReleaseHeldInStreamingDom:
 				dom?.streamingCountBeforeRelease === 1 && dom?.settledCountBeforeRelease === 0,

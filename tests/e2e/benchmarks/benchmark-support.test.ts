@@ -31,7 +31,7 @@ async function observerPageUrl(): Promise<string> {
 }
 
 describe("benchmark Browser observer", () => {
-	it("keeps native requestAnimationFrame intact while observing a native paint", async () => {
+	it("keeps native requestAnimationFrame intact while observing a post-mutation rAF callback", async () => {
 		const browser = await chromium.launch({
 			headless: true,
 			args: ["--enable-precise-memory-info"],
@@ -42,7 +42,7 @@ describe("benchmark Browser observer", () => {
 		await page.goto(await observerPageUrl());
 
 		const observed = await page.evaluate(async () => {
-			type Snapshot = { inputToNextPaintMs: number | null };
+			type Snapshot = { automationStartToFirstStreamingRafMs: number | null };
 			type BenchmarkWindow = Window & {
 				__piwebBenchmark: {
 					markSettled: () => void;
@@ -56,7 +56,7 @@ describe("benchmark Browser observer", () => {
 			benchmark.start();
 			const streaming = document.createElement("div");
 			streaming.dataset.markdownStreaming = "true";
-			streaming.textContent = "native paint observation";
+			streaming.textContent = "streaming DOM observation";
 			document.body.append(streaming);
 			await new Promise<void>((resolve) =>
 				window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve())),
@@ -64,13 +64,77 @@ describe("benchmark Browser observer", () => {
 			benchmark.markStreamEnd();
 			benchmark.markSettled();
 			return {
-				inputToNextPaintMs: benchmark.snapshot().inputToNextPaintMs,
+				automationStartToFirstStreamingRafMs: benchmark.snapshot().automationStartToFirstStreamingRafMs,
 				nativeRequestAnimationFramePreserved: nativeRequestAnimationFrame === window.requestAnimationFrame,
 			};
 		});
 
 		assert.equal(observed.nativeRequestAnimationFramePreserved, true);
-		assert.notEqual(observed.inputToNextPaintMs, null);
-		assert.ok((observed.inputToNextPaintMs ?? -1) >= 0);
+		assert.notEqual(observed.automationStartToFirstStreamingRafMs, null);
+		assert.ok((observed.automationStartToFirstStreamingRafMs ?? -1) >= 0);
+	});
+});
+
+describe("streaming DOM observer boundaries", () => {
+	it("counts turn roots, requires nonempty streaming text and excludes unrelated mutations", async () => {
+		const browser = await chromium.launch({ headless: true });
+		browsers.push(browser);
+		const page = await browser.newPage();
+		await installBrowserBenchmarkObserver(page);
+		await page.goto(await observerPageUrl());
+		const observed = await page.evaluate(async () => {
+			type Snapshot = {
+				automationStartToFirstStreamingDomMs: number | null;
+				automationStartToFirstStreamingRafMs: number | null;
+				streamingDomMutationBatches: number;
+				turnNodes: number;
+			};
+			const benchmark = (
+				window as unknown as { __piwebBenchmark: { start: () => void; snapshot: () => Snapshot } }
+			).__piwebBenchmark;
+			benchmark.start();
+			const empty = benchmark.snapshot();
+			const turns = [document.createElement("section"), document.createElement("section")] as const;
+			for (const [index, turn] of turns.entries()) turn.dataset.turnId = String(index);
+			const streaming = document.createElement("div");
+			streaming.dataset.markdownStreaming = "true";
+			turns[1].append(streaming);
+			document.body.append(...turns);
+			await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+			const blank = benchmark.snapshot();
+			streaming.textContent = "first delta";
+			await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+			await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+			const first = benchmark.snapshot();
+			const unrelated = document.createElement("aside");
+			unrelated.textContent = "unrelated UI update";
+			document.body.append(unrelated);
+			await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+			const afterUnrelated = benchmark.snapshot();
+			streaming.firstChild!.textContent = "second delta";
+			await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+			return {
+				empty,
+				blank,
+				first,
+				afterUnrelated,
+				second: benchmark.snapshot(),
+				descendantCount: turns[1].querySelectorAll("[data-turn-id]").length,
+			};
+		});
+		assert.equal(observed.empty.turnNodes, 0);
+		assert.equal(observed.empty.automationStartToFirstStreamingDomMs, null);
+		assert.equal(observed.blank.streamingDomMutationBatches, 0);
+		assert.equal(observed.blank.automationStartToFirstStreamingRafMs, null);
+		assert.equal(observed.descendantCount, 0);
+		assert.equal(observed.first.turnNodes, 2);
+		assert.equal(observed.first.streamingDomMutationBatches, 1);
+		assert.ok((observed.first.automationStartToFirstStreamingDomMs ?? -1) >= 0);
+		assert.ok(
+			(observed.first.automationStartToFirstStreamingRafMs ?? -1) >=
+				observed.first.automationStartToFirstStreamingDomMs!,
+		);
+		assert.equal(observed.afterUnrelated.streamingDomMutationBatches, 1);
+		assert.equal(observed.second.streamingDomMutationBatches, 2);
 	});
 });
