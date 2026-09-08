@@ -1,5 +1,19 @@
 {
 	"policy": "completion-median-v1",
-	"actions": { "status": "pending" },
-	"local": { "status": "pending" }
+	"actions": {
+		"status": "active",
+		"source": "00fe129125fcf273f8c27332ec4b115b59779ce8",
+		"artifactId": 10067582509,
+		"sha256": "62e2ff61ca25cbfbbbed46293d1c89e0fae0251b02129aa982cf5d320efeed25",
+		"reference1": "calibration-34253318826-1-reference-1",
+		"reference2": "calibration-34253318826-1-reference-2"
+	},
+	"local": {
+		"status": "active",
+		"source": "00fe129125fcf273f8c27332ec4b115b59779ce8",
+		"artifactId": null,
+		"sha256": "5a56ab8b8e57a3e1f2eebfc7ae9b186d3fb5df92a51434bf918b60f4bc6862a4",
+		"reference1": "local-20260908t160511z-suite5-reference-1",
+		"reference2": "local-20260908t160511z-suite5-reference-2"
+	}
 }
