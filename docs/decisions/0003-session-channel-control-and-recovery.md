@@ -1,7 +1,14 @@
 # ADR 0003: Multiplex isolated Session channels
 
-- Status: Accepted
+- Status: Accepted; recovery and control wording amended by later decisions
 - Date: 2026-08-21
+
+This record describes the original generation-scoped channel design.
+[ADR 0008](0008-authoritative-epoch-aware-live-session-resync.md) supersedes its recovery cursor and
+separate Extension baseline; [ADR 0015](0015-atomic-gateway-1-4-fenced-session-takeover.md) adds explicit
+fenced takeover while the previous controller remains connected. Read [Protocol](../protocol.md)
+for current epoch, snapshot, lease, and takeover semantics. The original decisions below explain
+why channels and response barriers are Session-scoped.
 
 ## Context
 
