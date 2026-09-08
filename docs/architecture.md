@@ -109,6 +109,11 @@ On reconnect, the Gateway publishes an authoritative hot-Runtime inventory. The 
 known channels by exact identity. A proven bounded gap can use replay. Missing or uncertain identity,
 epoch, generation, or sequence requires an explicit snapshot resync.
 
+Browser subscription retention uses a soft admission target. Only subscribed, persisted, non-hot
+ready/dormant Sessions without pending Extension requests are eviction candidates. Protected work
+may exceed that target; Gateway admission limits still apply. This policy is not a total Browser
+heap guarantee.
+
 ## History and projections
 
 Verified non-empty persisted JSONL uses native paged history. Empty, unmaterialized, and unverified
@@ -117,6 +122,12 @@ merged only under exact file and generation evidence.
 
 History pages, live events, and snapshots use one product projection model. A snapshot initializes a
 channel or replaces it during explicit recovery; it is not a competing event source.
+
+Each Session has at most one owned older-history page operation. It retains its captured identity,
+snapshot, materialization, and cancellation ownership through ordered delivery and settlement.
+Changing the visible Session does not transfer that work. Cancellation, replacement, rekey, or
+terminal retirement prevents late completion from recreating a channel or settling into a newer
+operation. Snapshot recovery remains a separate lifecycle.
 
 Projection growth is bounded. If a live projection cannot fit, the Runtime enters
 `session_snapshot_overflow`, stops normal publication, and retains only budgeted recoverable state.
@@ -179,9 +190,8 @@ dialog-close boundaries flush synchronously. Background subscribed Sessions cont
 
 ## Resource and security boundary
 
-The Gateway accepts only loopback listeners. Except for bootstrap-cookie issuance, REST and
-WebSocket access require that cookie and same-origin checks. Host, Origin when present, and Fetch
-Metadata are validated before privileged work.
+[Protocol](protocol.md#local-access-control) owns bootstrap, reconnect authentication, and privileged
+request checks. [Security](../SECURITY.md#security-boundary) defines the supported threat boundary.
 
 Paths, JSONL headers, model output, extension payloads, filenames, and Browser frames are untrusted.
 Every buffering boundary owns item and byte ceilings, admission before expensive work, cancellation,

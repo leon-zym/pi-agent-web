@@ -56,6 +56,12 @@ The Gateway accepts only loopback hosts. `/api/v1/bootstrap` validates the reque
 an HttpOnly session cookie. Every other API and WebSocket request requires that cookie plus Host and
 same-origin validation. Fetch Metadata covers same-origin Browser GETs that omit Origin.
 
+Gateway restart rotates authentication. Before opening a reconnect WebSocket, the Browser refreshes
+bootstrap authentication with one cancellable, time-bounded same-origin request and the existing
+reconnect backoff. Disposal cancels pending authentication; protocol incompatibility remains terminal.
+New-epoch Session authority must be established before mutations resume; an old cookie or fence is
+not reused as authority.
+
 Development uses Vite's same-origin proxy. Production serves the UI and API from one listener. These
 checks do not make the product safe for public, LAN, remote, or multi-user exposure.
 

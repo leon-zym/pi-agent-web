@@ -135,13 +135,9 @@ release promise.
 
 ## Visual verification
 
-Use the matrix in [Visual design](design.md). At minimum, inspect changed surfaces in both themes,
-both product locales, keyboard and coarse-pointer modes, reduced motion, and relevant narrow and
-wide widths.
-
-Exercise empty, streaming, settled, failed, blocked, recovering, long-content, overlay, and
-software-keyboard states where relevant. Check focus restoration, clipping, overlap, scroll
-anchoring, background Session continuity, and critical action reachability.
+Use the [Design acceptance matrix](design.md#visual-acceptance-matrix) for themes, locales, input
+modes, viewport sizes, and interaction states. Inspect the affected surfaces; screenshots support
+that review but do not replace it.
 
 ## CI
 
