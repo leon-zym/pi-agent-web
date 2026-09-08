@@ -264,3 +264,33 @@ test("non-Linux preserves the explicit CPU sentinel without probing Linux paths"
 		},
 	);
 });
+
+test("preserves a whitespace-only cgroup name instead of reading the unlimited root", () => {
+	const result = quotaFrom(
+		quotaFixture(
+			{
+				"/sys/fs/cgroup/ /cpu.max": "10000 100000\n",
+				"/sys/fs/cgroup/ /memory.max": "1024\n",
+			},
+			"/ ",
+		),
+	);
+	assert.equal(result.cpu, "10000/100000");
+	assert.equal(result.memoryBytes, 1024);
+});
+
+test("preserves trailing whitespace instead of reading an unlimited sibling", () => {
+	const result = quotaFrom(
+		quotaFixture(
+			{
+				"/sys/fs/cgroup/job/cpu.max": "max 100000\n",
+				"/sys/fs/cgroup/job/memory.max": "max\n",
+				"/sys/fs/cgroup/job /cpu.max": "20000 100000\n",
+				"/sys/fs/cgroup/job /memory.max": "2048\n",
+			},
+			"/job ",
+		),
+	);
+	assert.equal(result.cpu, "20000/100000");
+	assert.equal(result.memoryBytes, 2048);
+});

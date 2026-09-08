@@ -13,7 +13,8 @@ export function benchmarkQuota({
 	if (platform !== "linux") return { cpu: "unavailable", memoryBytes: totalMemory, evidence };
 	function read(name, role) {
 		try {
-			const value = readFile(name).trim();
+			// Proc records end in a newline; spaces are legal cgroup name bytes.
+			const value = readFile(name).replace(/\n$/, "");
 			if (value.length > 1024 * 1024) throw Object.assign(new Error(), { code: "CAP" });
 			return { value };
 		} catch (error) {
