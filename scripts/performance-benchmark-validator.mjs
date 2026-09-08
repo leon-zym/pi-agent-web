@@ -1442,17 +1442,21 @@ function gatePolicy(metric) {
 export function benchmarkMetricPolicy(metric) {
 	if (!Object.hasOwn(GATE_METRIC_POLICY, metric)) return null;
 	const mode = gatePolicy(metric);
-	const unit = metric.endsWith("Ms")
-		? "ms"
-		: metric.endsWith("Bytes")
-			? "bytes"
-			: metric === "inputBase64Chars"
-				? "chars"
-				: metric === "streamingDomMutationPerDeltaRatio"
-					? "ratio"
-					: metric === "aggregateDeltaPerSecond"
-						? "events/s"
-						: "count";
+	// This metric counts tasks; its suffix describes the duration threshold.
+	const unit =
+		metric === "liveLongTasksOver50Ms"
+			? "count"
+			: metric.endsWith("Ms")
+				? "ms"
+				: metric.endsWith("Bytes")
+					? "bytes"
+					: metric === "inputBase64Chars"
+						? "chars"
+						: metric === "streamingDomMutationPerDeltaRatio"
+							? "ratio"
+							: metric === "aggregateDeltaPerSecond"
+								? "events/s"
+								: "count";
 	return {
 		mode,
 		unit,

@@ -7,6 +7,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { compareBenchmarkBaseline, generateComparisonMarkdown } from "./compare-benchmark-baseline.mjs";
 import {
+	benchmarkMetricPolicy,
 	canonicalFormalExpectedScenarioSet,
 	loadBenchmarkMatrix,
 } from "./performance-benchmark-validator.mjs";
@@ -155,6 +156,26 @@ test("throughput increases are OK; decreases regress", () => {
 	assert.equal(compareBenchmarkBaseline(target, fixture()).status, "OK");
 	metric(target, "aggregateDeltaPerSecond", 60);
 	assert.equal(compareBenchmarkBaseline(target, fixture()).status, "REGRESSION");
+});
+
+test("long tasks over 50 ms are counts without a timing floor", () => {
+	assert.deepEqual(benchmarkMetricPolicy("liveLongTasksOver50Ms"), {
+		mode: "observe",
+		unit: "count",
+		direction: "lower",
+		floor: 0,
+	});
+	const reference = fixture();
+	const target = fixture();
+	metric(reference, "liveLongTasksOver50Ms", 0);
+	metric(target, "liveLongTasksOver50Ms", 1);
+	const result = compareBenchmarkBaseline(target, reference);
+	assert.equal(result.status, "REGRESSION");
+	const count = result.metrics.find((entry) => entry.name === "liveLongTasksOver50Ms");
+	assert.equal(count.unit, "count");
+	assert.equal(count.threshold, 0);
+	assert.equal(benchmarkMetricPolicy("liveLongTaskMaxMs").unit, "ms");
+	assert.equal(benchmarkMetricPolicy("liveLongTaskMaxMs").floor, 50);
 });
 
 test("ratio has no +50 floor; timing keeps its millisecond floor", () => {
