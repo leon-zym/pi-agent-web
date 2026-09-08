@@ -400,6 +400,8 @@ export function runStrictEvaluation(targetDirectory, description, environment, l
 	const archive = loadReferenceArchive(set, environment, localArchive);
 	try {
 		const references = readFrozenReferences(set, archive.directory);
+		if (new Set([target, ...references].map((bundle) => bundle.benchmark.runId)).size !== 3)
+			throw new Error("target and fixed reference run IDs must be distinct");
 		const incompatibilities = references.flatMap((reference, index) =>
 			compatibilityDifferences(target, reference).map((reason) => `reference-${index + 1}: ${reason}`),
 		);

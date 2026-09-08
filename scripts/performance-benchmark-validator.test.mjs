@@ -2145,6 +2145,12 @@ test("strict iteration validates frozen raw and envelopes before classifying cha
 	assert.equal(changed.status, 0, changed.stderr);
 	assert.match(changed.stdout, /incompatible references/);
 	assert.doesNotMatch(changed.stdout, /Performance budget: OK/);
+	rewrite(target, (value) => JSON.parse(JSON.stringify(value).replaceAll('"target"', '"reference-1"')));
+	const duplicateTarget = run();
+	assert.equal(duplicateTarget.status, 1);
+	assert.match(duplicateTarget.stderr, /run IDs must be distinct/);
+	rewrite(target, (value) => JSON.parse(JSON.stringify(value).replaceAll('"reference-1"', '"target"')));
+
 	// A changed matrix and supported current suite still validate their own target contract.
 	const matrixFile = path.join(checkout, "tests/e2e/benchmarks/matrix.json");
 	fs.appendFileSync(matrixFile, "\n");
