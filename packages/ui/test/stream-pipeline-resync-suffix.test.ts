@@ -17,6 +17,7 @@ import {
 	sessionHistoryMessagesBytes,
 } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { SessionBrowserEffects } from "../src/lib/session-browser-effects";
 import {
 	createSessionTransport,
 	SESSION_FRAME_DEFERRED,
@@ -136,9 +137,9 @@ function snapshot(
 }
 
 const controllers: SessionTransportController[] = [];
-const deliverySpyCleanups: Array<() => void> = [];
+const browserEffects: SessionBrowserEffects[] = [];
 
-async function setup(captureDelivery = false) {
+async function setup() {
 	vi.resetModules();
 	const sockets: FakeSocket[] = [];
 	const controller = createSessionTransport({
@@ -151,8 +152,6 @@ async function setup(captureDelivery = false) {
 		protocolVersion: { major: 1, minor: 4 },
 	});
 	controllers.push(controller);
-	const deliverySpy = captureDelivery ? vi.spyOn(controller.frameBus, "emit") : null;
-	if (deliverySpy) deliverySpyCleanups.push(() => deliverySpy.mockRestore());
 	vi.doMock("../src/stores/session-transport", async () => ({
 		...(await vi.importActual<typeof import("../src/stores/session-transport")>(
 			"../src/stores/session-transport",
@@ -165,6 +164,10 @@ async function setup(captureDelivery = false) {
 		import("../src/stores/extension-ui"),
 		import("../src/stores/projection"),
 	]);
+	// resetModules creates a new effects singleton alongside the new pipeline graph.
+	// The controller was imported before reset and cannot dispose this separate owner.
+	const effects = (await import("../src/lib/session-browser-effects")).getSessionBrowserEffects();
+	browserEffects.push(effects);
 	initPipeline();
 	const socket = sockets[0];
 	if (!socket) throw new Error("pipeline did not connect");
@@ -178,12 +181,16 @@ async function setup(captureDelivery = false) {
 		runtime: runtime(2),
 		reason: "gap",
 	});
-	return { controller, socket, useExtensionUiStore, useProjectionStore, deliverySpy };
+	return { controller, socket, useExtensionUiStore, useProjectionStore, effects };
+}
+
+function disposeHarness() {
+	for (const effects of browserEffects.splice(0)) effects.dispose();
+	for (const controller of controllers.splice(0)) controller.dispose();
 }
 
 afterEach(() => {
-	for (const cleanup of deliverySpyCleanups.splice(0)) cleanup();
-	for (const controller of controllers.splice(0)) controller.dispose();
+	disposeHarness();
 	vi.doUnmock("../src/stores/session-transport");
 	vi.useRealTimers();
 });
@@ -312,201 +319,144 @@ describe("stream pipeline snapshot suffix delivery", () => {
 });
 
 it("materializes and projects a page while another Session remains selected", async () => {
-	const { controller, socket, useProjectionStore, deliverySpy } = await setup(true);
-	if (!deliverySpy) throw new Error("missing delivery diagnostic");
-	const startedAt = performance.now();
-	const trace: unknown[] = [];
-	let baselineReady = false;
-	const record = (stage: string) => {
-		if (baselineReady || (stage !== "baseline-wait-failed" && trace.length >= 31)) return;
-		const state = controller.store.getState();
-		const channel = state.sessions[SESSION_HANDLE];
-		trace.push({
-			stage,
-			elapsedMs: Math.round(performance.now() - startedAt),
-			connection: state.connectionState,
-			subscribed: channel?.subscribed,
-			generation: channel?.generation,
-			baseline: channel?.baselineAuthoritative,
-			lastSeq: channel?.lastSeq,
-			projectedSeq: channel?.projectedSeq,
-			resync: channel?.resync,
-			recovery: channel?.recovery && {
-				phase: channel.recovery.phase,
-				attempt: channel.recovery.attempt,
-				lastError: channel.recovery.lastError?.slice(0, 200),
-			},
-			history: channel?.history && {
-				snapshotId: channel.history.snapshotId,
-				asOfSeq: channel.history.asOfSeq,
-				loading: channel.history.loading,
-				loadedMessages: channel.history.loadedMessages,
-				error: channel.history.error?.slice(0, 200),
-			},
-			projectionTurns: useProjectionStore.getState().projections[SESSION_HANDLE]?.turns.length ?? 0,
-		});
+	const { controller, socket, useProjectionStore } = await setup();
+	const { useSessionDirectoryStore } = await import("../src/stores/session-directory");
+	const { useComposerStore } = await import("../src/stores/composer");
+	const latest = [{ role: "user" as const, content: "latest", timestamp: 1 }];
+	const older = [{ role: "user" as const, content: "older", timestamp: 0 }];
+	const identity = {
+		serverEpoch: SERVER_EPOCH,
+		workspaceId: "workspace-a",
+		sessionHandle: SESSION_HANDLE,
+		generation: 1,
+		snapshotId: "pipeline-snapshot",
 	};
-	record("setup-returned");
-	const stopStateTrace = controller.store.subscribe(() => record("channel-change"));
-	const stopFrameTrace = controller.frameBus.subscribeAll(({ sessionHandle, message, representation }) => {
-		if (sessionHandle === SESSION_HANDLE) record(`bus:${message.type}:${representation}`);
+	const history = {
+		totalMessages: 2,
+		loadedMessages: 1,
+		totalBytes: 200,
+		loadedBytes: sessionHistoryMessagesBytes(latest),
+		nextCursor: "older-cursor",
+	};
+	const { settledMessages: _messages, ...header } = snapshot();
+	socket.receive({ ...header, type: "session_snapshot_begin", baseSeq: 2, projectionEvents: [], history });
+	socket.receive({
+		...identity,
+		type: "session_snapshot_chunk",
+		chunkIndex: 0,
+		messages: latest,
+		itemCount: 1,
+		byteCount: history.loadedBytes,
+		checksum: sessionHistoryChecksum(latest),
 	});
-	const receive = socket.receive.bind(socket);
-	const receiveTrace = vi.spyOn(socket, "receive").mockImplementation((message) => {
-		record(`before:${(message as { type: string }).type}`);
-		receive(message);
-		record(`after:${(message as { type: string }).type}`);
+	socket.receive({
+		...identity,
+		type: "session_snapshot_end",
+		chunkCount: 1,
+		itemCount: 1,
+		byteCount: history.loadedBytes,
+		checksum: sessionHistoryChecksum([sessionHistoryChecksum(latest)]),
+		nextCursor: history.nextCursor,
 	});
-
-	try {
-		const { useSessionDirectoryStore } = await import("../src/stores/session-directory");
-		const { useComposerStore } = await import("../src/stores/composer");
-		const latest = [{ role: "user" as const, content: "latest", timestamp: 1 }];
-		const older = [{ role: "user" as const, content: "older", timestamp: 0 }];
-		const identity = {
-			serverEpoch: SERVER_EPOCH,
-			workspaceId: "workspace-a",
-			sessionHandle: SESSION_HANDLE,
-			generation: 1,
-			snapshotId: "pipeline-snapshot",
-		};
-		const history = {
-			totalMessages: 2,
-			loadedMessages: 1,
-			totalBytes: 200,
-			loadedBytes: sessionHistoryMessagesBytes(latest),
-			nextCursor: "older-cursor",
-		};
-		const { settledMessages: _messages, ...header } = snapshot();
-		socket.receive({ ...header, type: "session_snapshot_begin", baseSeq: 2, projectionEvents: [], history });
-		socket.receive({
-			...identity,
-			type: "session_snapshot_chunk",
-			chunkIndex: 0,
-			messages: latest,
-			itemCount: 1,
-			byteCount: history.loadedBytes,
-			checksum: sessionHistoryChecksum(latest),
-		});
-		socket.receive({
-			...identity,
-			type: "session_snapshot_end",
-			chunkCount: 1,
-			itemCount: 1,
-			byteCount: history.loadedBytes,
-			checksum: sessionHistoryChecksum([sessionHistoryChecksum(latest)]),
-			nextCursor: history.nextCursor,
-		});
-		await vi.waitFor(() =>
-			expect(controller.store.getState().sessions[SESSION_HANDLE]?.baselineAuthoritative).toBe(true),
-		);
-		baselineReady = true;
-		expect(controller.store.getState().loadOlderSessionHistory(SESSION_HANDLE)).toBe(true);
-		const request = socket.sent.find((message) => message.type === "session_history_page");
-		if (request?.type !== "session_history_page") throw new Error("missing page request");
-		const pageIdentity = { ...identity, requestId: request.id };
-		const byteCount = sessionHistoryMessagesBytes(older);
-		const checksum = sessionHistoryChecksum(older);
-		socket.receive({
-			...pageIdentity,
-			type: "session_history_page_begin",
-			asOfSeq: 2,
-			cursor: history.nextCursor,
-			history: { ...history, loadedBytes: byteCount, nextCursor: null },
-		});
-		socket.receive({
-			...pageIdentity,
-			type: "session_history_page_chunk",
-			chunkIndex: 0,
-			messages: older,
-			itemCount: 1,
-			byteCount,
-			checksum,
-		});
-		const otherHandle = "other-session";
-		useSessionDirectoryStore.setState({
-			currentWorkspaceHandle: "workspace-a",
-			currentSession: {
-				sessionHandle: otherHandle,
-				workspaceHandle: "workspace-a",
-				nativeSessionId: "other-native",
-				sessionFile: "/tmp/other.jsonl",
-				persisted: true,
-				createdAt: null,
-				modifiedAt: null,
-				messageCount: 0,
-				firstMessage: "",
-				runtime: null,
-			},
-			selectedSessionByWorkspace: { "workspace-a": otherHandle },
-		});
-		useComposerStore.getState().beginSession(otherHandle);
-		useComposerStore.getState().setDraft("Keep while history loads");
-		expect(
-			useProjectionStore
-				.getState()
-				.projections[SESSION_HANDLE]?.turns.map((turn) => turn.userMessages[0]?.text),
-		).toEqual(["latest"]);
-		// Release only the end while selection stays elsewhere. This crosses the production
-		// content materializer, ordered bus and pipeline before inspecting the hidden projection.
-		socket.receive({
-			...pageIdentity,
-			type: "session_history_page_end",
-			chunkCount: 1,
-			itemCount: 1,
-			byteCount,
-			checksum: sessionHistoryChecksum([checksum]),
+	await vi.waitFor(() =>
+		expect(controller.store.getState().sessions[SESSION_HANDLE]?.baselineAuthoritative).toBe(true),
+	);
+	expect(controller.store.getState().loadOlderSessionHistory(SESSION_HANDLE)).toBe(true);
+	const request = socket.sent.find((message) => message.type === "session_history_page");
+	if (request?.type !== "session_history_page") throw new Error("missing page request");
+	const pageIdentity = { ...identity, requestId: request.id };
+	const byteCount = sessionHistoryMessagesBytes(older);
+	const checksum = sessionHistoryChecksum(older);
+	socket.receive({
+		...pageIdentity,
+		type: "session_history_page_begin",
+		asOfSeq: 2,
+		cursor: history.nextCursor,
+		history: { ...history, loadedBytes: byteCount, nextCursor: null },
+	});
+	socket.receive({
+		...pageIdentity,
+		type: "session_history_page_chunk",
+		chunkIndex: 0,
+		messages: older,
+		itemCount: 1,
+		byteCount,
+		checksum,
+	});
+	const otherHandle = "other-session";
+	useSessionDirectoryStore.setState({
+		currentWorkspaceHandle: "workspace-a",
+		currentSession: {
+			sessionHandle: otherHandle,
+			workspaceHandle: "workspace-a",
+			nativeSessionId: "other-native",
+			sessionFile: "/tmp/other.jsonl",
+			persisted: true,
+			createdAt: null,
+			modifiedAt: null,
+			messageCount: 0,
+			firstMessage: "",
+			runtime: null,
+		},
+		selectedSessionByWorkspace: { "workspace-a": otherHandle },
+	});
+	useComposerStore.getState().beginSession(otherHandle);
+	useComposerStore.getState().setDraft("Keep while history loads");
+	expect(
+		useProjectionStore
+			.getState()
+			.projections[SESSION_HANDLE]?.turns.map((turn) => turn.userMessages[0]?.text),
+	).toEqual(["latest"]);
+	// Release only the end while selection stays elsewhere. This crosses the production
+	// content materializer, ordered bus and pipeline before inspecting the hidden projection.
+	socket.receive({
+		...pageIdentity,
+		type: "session_history_page_end",
+		chunkCount: 1,
+		itemCount: 1,
+		byteCount,
+		checksum: sessionHistoryChecksum([checksum]),
+		nextCursor: null,
+	});
+	await vi.waitFor(() =>
+		expect(controller.store.getState().sessions[SESSION_HANDLE]?.history).toMatchObject({
+			loading: false,
+			loadedMessages: 2,
 			nextCursor: null,
-		});
-		await vi.waitFor(() =>
-			expect(controller.store.getState().sessions[SESSION_HANDLE]?.history).toMatchObject({
-				loading: false,
-				loadedMessages: 2,
-				nextCursor: null,
-			}),
-		);
-		expect(
-			useProjectionStore
-				.getState()
-				.projections[SESSION_HANDLE]?.turns.map((turn) => turn.userMessages[0]?.text),
-		).toEqual(["older", "latest"]);
-		expect(useSessionDirectoryStore.getState().currentSession?.sessionHandle).toBe(otherHandle);
-		expect(useSessionDirectoryStore.getState().selectedSessionByWorkspace["workspace-a"]).toBe(otherHandle);
-		expect(useComposerStore.getState().draft).toBe("Keep while history loads");
-		expect(socket.sent.filter((message) => message.type === "session_history_page")).toHaveLength(1);
-	} catch (error) {
-		if (!baselineReady) {
-			record("baseline-wait-failed");
-			console.error("PAGE_BASELINE_DIAGNOSTIC", JSON.stringify(trace));
-			console.error(
-				"PAGE_BASELINE_DELIVERY",
-				JSON.stringify(
-					deliverySpy.mock.calls
-						.flatMap<unknown>((args, index) => {
-							const type = (args[1] as { type: string }).type;
-							if (type !== "runtime_state" && type !== "session_snapshot") return [];
-							const result = deliverySpy.mock.results[index];
-							if (result?.type !== "return") return [{ type, returned: false }];
-							return [
-								{
-									type,
-									deferred: result.value.deferred,
-									errors: result.value.errors.slice(0, 2).map((error: unknown) => ({
-										name: (error instanceof Error ? error.name : typeof error).slice(0, 200),
-										message: (error instanceof Error ? error.message : String(error)).slice(0, 200),
-									})),
-								},
-							];
-						})
-						.slice(0, 4),
-				),
-			);
-		}
-		throw error;
-	} finally {
-		stopStateTrace();
-		stopFrameTrace();
-		receiveTrace.mockRestore();
-		deliverySpy.mockRestore();
-	}
+		}),
+	);
+	expect(
+		useProjectionStore
+			.getState()
+			.projections[SESSION_HANDLE]?.turns.map((turn) => turn.userMessages[0]?.text),
+	).toEqual(["older", "latest"]);
+	expect(useSessionDirectoryStore.getState().currentSession?.sessionHandle).toBe(otherHandle);
+	expect(useSessionDirectoryStore.getState().selectedSessionByWorkspace["workspace-a"]).toBe(otherHandle);
+	expect(useComposerStore.getState().draft).toBe("Keep while history loads");
+	expect(socket.sent.filter((message) => message.type === "session_history_page")).toHaveLength(1);
+});
+
+it("retires deferred directory refresh before a new module graph is loaded", async () => {
+	vi.useFakeTimers();
+	const first = await setup();
+	first.socket.receive(snapshot());
+	await vi.advanceTimersByTimeAsync(0);
+	first.socket.receive(frame(3, { type: "agent_settled" }));
+	await vi.advanceTimersByTimeAsync(0);
+	expect(first.effects.pendingTimerCount()).toBe(1);
+
+	disposeHarness();
+	expect(first.effects.pendingTimerCount()).toBe(0);
+	// The old 100ms refresh must not dynamically import directory while resetModules
+	// is loading the next pipeline and its stores.
+	const next = setup();
+	await vi.advanceTimersByTimeAsync(100);
+	const second = await next;
+	second.socket.receive(snapshot());
+	await vi.advanceTimersByTimeAsync(0);
+	expect(second.controller.store.getState().sessions[SESSION_HANDLE]).toMatchObject({
+		baselineAuthoritative: true,
+		projectedSeq: 2,
+		resync: null,
+	});
 });
