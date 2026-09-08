@@ -22,11 +22,16 @@ test("loads an oversized history page across navigation without losing another d
 }) => {
 	test.slow();
 	const errors = observePageErrors(page);
+	let pageRequests = 0;
 	let releasePage: (() => void) | undefined;
 	// Only hold the end marker of this one page; native history is served by the Gateway,
 	// so the deterministic Pi prompt gate cannot control this boundary.
 	await page.routeWebSocket("**/api/v1/ws", (socket) => {
 		const server = socket.connectToServer();
+		socket.onMessage((message) => {
+			if (JSON.parse(message.toString()).type === "session_history_page") pageRequests += 1;
+			server.send(message);
+		});
 		server.onMessage((message) => {
 			const frame = JSON.parse(message.toString()) as { type?: string };
 			if (frame.type === "session_history_page_end" && !releasePage) {
@@ -69,6 +74,8 @@ test("loads an oversized history page across navigation without losing another d
 	await expect.poll(() => Boolean(releasePage)).toBe(true);
 	await otherRow.getByRole("button").first().click();
 	await expect(page.locator("textarea")).toHaveValue("Keep while history loads");
+	expect(pageRequests).toBe(1);
+	// Background completion itself is asserted in the real transport/pipeline regression.
 	releasePage?.();
 	await page
 		.locator("[data-session-row]")
@@ -85,6 +92,7 @@ test("loads an oversized history page across navigation without losing another d
 
 	await otherRow.getByRole("button").first().click();
 	await expect(page.locator("textarea")).toHaveValue("Keep while history loads");
+	expect(pageRequests).toBe(1);
 	expect(errors.console).toEqual([]);
 	expect(errors.page).toEqual([]);
 });
