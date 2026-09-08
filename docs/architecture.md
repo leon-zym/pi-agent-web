@@ -109,6 +109,10 @@ On reconnect, the Gateway publishes an authoritative hot-Runtime inventory. The 
 known channels by exact identity. A proven bounded gap can use replay. Missing or uncertain identity,
 epoch, generation, or sequence requires an explicit snapshot resync.
 
+After authenticated reconnect and its initial inventory, the Browser refreshes the REST Workspace
+and current Session directories once without user activity. Older directory requests cannot overwrite
+the new recovery result or a newer navigation choice. Transient failures retain cached directory data.
+
 Browser subscription retention uses a soft admission target. Only subscribed, persisted, non-hot
 ready/dormant Sessions without pending Extension requests are eviction candidates. Protected work
 may exceed that target; Gateway admission limits still apply. This policy is not a total Browser

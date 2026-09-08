@@ -7,7 +7,10 @@ import { ExtensionDialogs, OnboardingWizard, SettingsDialog } from "../features/
 import { api } from "../lib/api";
 import { displayError } from "../lib/format";
 import { tt } from "../lib/i18n";
-import { loadDirectoryAfterStableHotInventory } from "../lib/initial-inventory-bootstrap";
+import {
+	loadDirectoryAfterStableHotInventory,
+	watchDirectoryReconnect,
+} from "../lib/initial-inventory-bootstrap";
 import { ensureInitialSession } from "../lib/session-controller";
 import { initPipeline } from "../lib/stream-pipeline";
 import { useTheme } from "../lib/use-theme";
@@ -53,6 +56,7 @@ export function App() {
 
 	useEffect(() => {
 		let cancelled = false;
+		let stopDirectoryRecovery: (() => void) | undefined;
 		void api
 			.bootstrap()
 			.then(async () => {
@@ -65,6 +69,15 @@ export function App() {
 					isCancelled: () => cancelled,
 				});
 				if (!ready) return;
+				stopDirectoryRecovery = watchDirectoryReconnect({
+					readTransportState: () => sessionTransport.store.getState(),
+					subscribeTransportState: (listener) => sessionTransport.store.subscribe(listener),
+					invalidateDirectoryRequests: () =>
+						useSessionDirectoryStore.getState().invalidateDirectoryRequests(),
+					loadWorkspaces: (options) => useSessionDirectoryStore.getState().loadWorkspaces(options),
+					reloadCurrentSessions: (options) =>
+						useSessionDirectoryStore.getState().reloadSessions(undefined, { ...options, force: true }),
+				});
 				const directory = useSessionDirectoryStore.getState();
 				const workspace = directory.workspaces.find(
 					(candidate) => candidate.workspaceHandle === directory.currentWorkspaceHandle,
@@ -82,6 +95,7 @@ export function App() {
 		window.addEventListener("piweb:open-settings", openSettings);
 		return () => {
 			cancelled = true;
+			stopDirectoryRecovery?.();
 			window.removeEventListener("piweb:open-settings", openSettings);
 		};
 	}, []);

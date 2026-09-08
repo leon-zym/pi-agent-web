@@ -30,3 +30,42 @@ export async function loadDirectoryAfterStableHotInventory({
 		}
 	}
 }
+
+interface DirectoryReconnectDependencies {
+	readTransportState: InitialInventoryBootstrapDependencies["readTransportState"];
+	subscribeTransportState: (listener: () => void) => () => void;
+	invalidateDirectoryRequests: () => void;
+	loadWorkspaces: (options: { isCurrent: () => boolean }) => Promise<void>;
+	reloadCurrentSessions: (options: { isCurrent: () => boolean }) => Promise<unknown>;
+}
+
+/** Installed after initial bootstrap; each subsequent authenticated connection owns one refresh. */
+export function watchDirectoryReconnect(dependencies: DirectoryReconnectDependencies): () => void {
+	let connected = true;
+	let generation = 0;
+	let disposed = false;
+	const observe = () => {
+		const state = dependencies.readTransportState();
+		if (state.connectionState !== "online" || !state.hotRuntimeInventory) {
+			if (connected) generation += 1;
+			connected = false;
+			return;
+		}
+		if (connected) return;
+		connected = true;
+		const request = generation;
+		const isCurrent = () => !disposed && generation === request;
+		dependencies.invalidateDirectoryRequests();
+		void (async () => {
+			await dependencies.loadWorkspaces({ isCurrent });
+			if (isCurrent()) await dependencies.reloadCurrentSessions({ isCurrent });
+		})();
+	};
+	const unsubscribe = dependencies.subscribeTransportState(observe);
+	observe();
+	return () => {
+		disposed = true;
+		unsubscribe();
+		dependencies.invalidateDirectoryRequests();
+	};
+}
