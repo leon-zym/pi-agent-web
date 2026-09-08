@@ -6143,3 +6143,100 @@ it("terminal forget cancels a pending recovery snapshot and its late completion"
 	expect(recovery.getState().skipNextResubscribe.size).toBe(0);
 	expect(socket.sent).toHaveLength(sent);
 });
+
+it("does not revive a forgotten channel when page delivery synchronously retires it", async () => {
+	const h = harness();
+	const socket = connectWithHistory(h);
+	const handle = "page-forget-during-delivery";
+	h.controller.store.getState().subscribeSession(handle);
+	const value = runtime(handle);
+	socket.serverMessage({ type: "runtime_state", runtime: value });
+	socket.serverMessage({
+		type: "resync_required",
+		serverEpoch: value.serverEpoch,
+		sessionHandle: handle,
+		runtime: value,
+		reason: "initial",
+	});
+	for (const frame of historySnapshotFrames(handle)) socket.serverMessage(frame);
+	await flushPromises();
+	let delivered = 0;
+	h.controller.frameBus.subscribe(handle, ({ message }) => {
+		if (message.type !== "session_history_page_loaded") return;
+		delivered += 1;
+		h.controller.store.getState().forgetSession(handle);
+	});
+	expect(h.controller.store.getState().loadOlderSessionHistory(handle)).toBe(true);
+	const request = socket.sent.find((message) => message.type === "session_history_page");
+	if (request?.type !== "session_history_page") throw new Error("missing page request");
+	for (const frame of historyPageFrames(handle, request.id)) socket.serverMessage(frame);
+	await flushPromises();
+	expect(delivered).toBe(1);
+	expect(h.controller.store.getState().sessions[handle]).toBeUndefined();
+});
+
+it.each(["forget", "unsubscribe", "generation", "rekey", "disconnect", "incompatible", "dispose"] as const)(
+	"cancels a materializing page through the real %s lifecycle entry",
+	async (transition) => {
+		const h = harness();
+		const socket = connectWithHistory(h);
+		const handle = "page-lifecycle";
+		h.controller.store.getState().subscribeSession(handle);
+		const value = runtime(handle);
+		socket.serverMessage({ type: "runtime_state", runtime: value });
+		socket.serverMessage({
+			type: "resync_required",
+			serverEpoch: value.serverEpoch,
+			sessionHandle: handle,
+			runtime: value,
+			reason: "initial",
+		});
+		for (const frame of historySnapshotFrames(handle)) socket.serverMessage(frame);
+		await flushPromises();
+		const delivered: unknown[] = [];
+		h.controller.frameBus.subscribeAll(({ message }) => {
+			if (message.type === "session_history_page_loaded") delivered.push(message);
+		});
+		expect(h.controller.store.getState().loadOlderSessionHistory(handle)).toBe(true);
+		const request = socket.sent.find((message) => message.type === "session_history_page");
+		if (request?.type !== "session_history_page") throw new Error("missing page request");
+		for (const frame of historyPageFrames(handle, request.id)) socket.serverMessage(frame);
+		// Materialization has crossed its first await but has not committed.
+		switch (transition) {
+			case "forget":
+				h.controller.store.getState().forgetSession(handle);
+				break;
+			case "unsubscribe":
+				h.controller.store.getState().unsubscribeSession(handle);
+				break;
+			case "generation":
+				socket.serverMessage({ type: "runtime_state", runtime: runtime(handle, 2) });
+				break;
+			case "rekey":
+				h.controller.ingestServerMessage({
+					type: "session_rekeyed",
+					serverEpoch: value.serverEpoch,
+					previousSessionHandle: handle,
+					runtime: runtime("page-child", 2),
+				});
+				break;
+			case "disconnect":
+				h.controller.store.getState().disconnect();
+				break;
+			case "incompatible":
+				socket.serverMessage({
+					type: "protocol_error",
+					code: "protocol_major_unsupported",
+					supported: { major: 1, minMinor: 0, maxMinor: 0 },
+				});
+				break;
+			case "dispose":
+				h.controller.dispose();
+				break;
+		}
+		await flushPromises();
+		expect(delivered).toEqual([]);
+		expect(h.controller.store.getState().cancelSessionHistory(handle)).toBe(false);
+		if (transition === "forget") expect(h.controller.store.getState().sessions[handle]).toBeUndefined();
+	},
+);

@@ -16,15 +16,34 @@ test.use({
 	},
 });
 
-test("loads an oversized native history in bounded chunks and pages older turns", async ({
+test("loads an oversized history page across navigation without losing another draft", async ({
 	page,
 	harness,
 }) => {
 	test.slow();
 	const errors = observePageErrors(page);
+	let releasePage: (() => void) | undefined;
+	// Only hold the end marker of this one page; native history is served by the Gateway,
+	// so the deterministic Pi prompt gate cannot control this boundary.
+	await page.routeWebSocket("**/api/v1/ws", (socket) => {
+		const server = socket.connectToServer();
+		server.onMessage((message) => {
+			const frame = JSON.parse(message.toString()) as { type?: string };
+			if (frame.type === "session_history_page_end" && !releasePage) {
+				releasePage = () => socket.send(message);
+				return;
+			}
+			socket.send(message);
+		});
+	});
 	await page.goto(harness.origin, { waitUntil: "domcontentloaded" });
 	await expect(page.locator("#root > div")).toBeVisible();
 	await expect(page.locator("textarea")).toBeEnabled();
+	await page.locator("textarea").fill("E2E_B_FAST");
+	await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
+	await expect(page.locator("main")).toContainText("E2E_REPLY:E2E_B_FAST");
+	await page.locator("textarea").fill("Keep while history loads");
+	const otherRow = page.locator("[data-session-row]").filter({ hasText: "E2E_B_FAST" });
 	await page
 		.locator("[data-session-row]")
 		.filter({ hasText: HISTORY_PROMPT })
@@ -47,6 +66,16 @@ test("loads an oversized native history in bounded chunks and pages older turns"
 	expect(getMessages).toEqual([]);
 
 	await turnWindow.locator('[data-load-older-turns="true"]').click();
+	await expect.poll(() => Boolean(releasePage)).toBe(true);
+	await otherRow.getByRole("button").first().click();
+	await expect(page.locator("textarea")).toHaveValue("Keep while history loads");
+	releasePage?.();
+	await page
+		.locator("[data-session-row]")
+		.filter({ hasText: HISTORY_PROMPT })
+		.getByRole("button")
+		.first()
+		.click();
 	await expect(turnWindow).toHaveAttribute("data-turn-window-total", String(HISTORY_TURNS), {
 		timeout: 30_000,
 	});
@@ -54,6 +83,8 @@ test("loads an oversized native history in bounded chunks and pages older turns"
 	await page.locator("[data-toc-tick]").first().click({ force: true });
 	await expect(viewport.getByText(`${HISTORY_PROMPT} [turn 1]`, { exact: true })).toBeVisible();
 
+	await otherRow.getByRole("button").first().click();
+	await expect(page.locator("textarea")).toHaveValue("Keep while history loads");
 	expect(errors.console).toEqual([]);
 	expect(errors.page).toEqual([]);
 });

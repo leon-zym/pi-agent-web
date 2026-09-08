@@ -34,8 +34,6 @@ import {
 	type SessionCommandResponseDto,
 	type SessionContentRefGuardContext,
 	type SessionEntryDto,
-	type SessionHistoryPageBeginDto,
-	type SessionHistoryPageEndDto,
 	type SessionMessageDto,
 	type SessionReplayCursorDto,
 	type SessionResponseFrameDto,
@@ -61,6 +59,7 @@ import {
 	type SessionTextPayloadProjection,
 } from "../lib/session-content-adapter";
 import { createSessionContentResolver } from "../lib/session-content-resolver";
+import { createSessionHistoryPages } from "../lib/session-history-pages";
 import { SessionHistoryStreamAssembler } from "../lib/session-history-stream";
 import type { SessionResyncAttemptContext, SessionResyncCompletion } from "../lib/session-resync";
 import {
@@ -88,12 +87,10 @@ import {
 	type CompletedHistorySnapshot,
 	createSessionRecoveryMachine,
 	type HistoryOperation,
-	type HistoryPageChunk,
 	type HistorySnapshotBegin,
 	type HistorySnapshotChunk,
 	type LazyIdentityScope,
 	type LazyOperation,
-	type PageHistoryAssembly,
 	type ProjectionTail,
 	type RecoverySnapshotFrame,
 	type SnapshotHistoryAssembly,
@@ -106,11 +103,7 @@ import {
 	retentionCandidate,
 	subscriptionAdmissionCode,
 } from "./retention-machine";
-import {
-	OrderedSessionFrameBus,
-	type SessionHistoryPageLoadedFrame,
-	SessionTransportGlobalBus,
-} from "./session-frame-bus";
+import { OrderedSessionFrameBus, SessionTransportGlobalBus } from "./session-frame-bus";
 import {
 	emptySessionHistoryState,
 	type HotRuntimeInventoryToken,
@@ -174,7 +167,6 @@ const DEFAULT_HELLO_TIMEOUT_MS = 5_000;
 const MAX_RESYNC_BUFFERED_FRAMES = 1_024;
 const MAX_RESYNC_BUFFERED_BYTES = 1024 * 1024;
 export const MAX_ACTIVE_SUBSCRIPTIONS = 6;
-const SESSION_HISTORY_PAGE_LIMIT = 128;
 const CLIENT_BUILD = "0.1.0";
 const CLIENT_CAPABILITIES = [...GATEWAY_SERVER_REQUIRED_CAPABILITIES, GATEWAY_SESSION_HISTORY_CAPABILITY];
 const CONTENT_ADAPTER_METHODS = [
@@ -381,7 +373,6 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	let cancelReconnectAuthentication: (() => void) | null = null;
 	let helloTimer: ReturnType<typeof setTimeout> | null = null;
-	let historyRequestCounter = 0;
 	let nextSnapshotWaiterToken = 1;
 	let disposed = false;
 	let negotiatedMaxClientFrameBytes = SESSION_WS_CLIENT_MAX_BYTES;
@@ -402,7 +393,6 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		commandMaterializations,
 		snapshotWaiters,
 		snapshotHistoryAssemblies,
-		pageHistoryAssemblies,
 		projectionTails,
 		lazyIdentityScopes,
 		initialInventoryWaiters,
@@ -467,6 +457,54 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		manualRetryResync,
 		retrySessionSubscription,
 	}));
+
+	const historyPages = createSessionHistoryPages({
+		now,
+		context: (sessionHandle) => {
+			const state = store.getState();
+			const channel = state.sessions[sessionHandle];
+			if (
+				!channel?.runtime ||
+				channel.generation === null ||
+				channel.history.snapshotId === null ||
+				channel.history.asOfSeq === null
+			)
+				return null;
+			return {
+				identity: channel.runtime,
+				snapshotId: channel.history.snapshotId,
+				asOfSeq: channel.history.asOfSeq,
+				nextCursor: channel.history.nextCursor,
+				ready:
+					historyNegotiated && channel.subscribed && channel.baselineAuthoritative && channel.resync === null,
+				loading: channel.history.loading,
+				online: state.connectionState === "online",
+			};
+		},
+		send: sendWire,
+		materialize: async (messages, signal) => {
+			const adapter = activeContentAdapter;
+			const guardContext = attachmentGuardContext;
+			if (!adapter) throw new Error(" history page materialization is unavailable");
+			const result: PiSessionMessageDto[] = [];
+			for (const message of messages) {
+				if (signal.aborted) throw new DOMException("Session history page was aborted", "AbortError");
+				result.push(await materializeMessage(message, adapter, signal, guardContext));
+			}
+			return result;
+		},
+		deliver: (frame) => {
+			const delivery = frameBus.emit(frame.sessionHandle, frame, now());
+			if (delivery.errors.length === 0 && !delivery.deferred) return null;
+			return delivery.errors[0] instanceof Error
+				? delivery.errors[0]
+				: new Error("History page projection failed");
+		},
+		updateHistory: (sessionHandle, update) => {
+			if (!store.getState().sessions[sessionHandle]) return;
+			setChannel(sessionHandle, (channel) => ({ ...channel, history: update(channel.history) }));
+		},
+	});
 
 	function transitionConnection(event: SessionConnectionMachineEvent): void {
 		const transition = connectionMachine.transition(event);
@@ -874,11 +912,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			snapshotWaiters.delete(key);
 			waiter.reject(new SessionTransportError("stale_resync"));
 		}
-		for (const [requestId, assembly] of pageHistoryAssemblies) {
-			if (!identitiesMatch(assembly.identity, identity)) continue;
-			pageHistoryAssemblies.delete(requestId);
-			assembly.controller.abort();
-		}
+		historyPages.cancelIdentity(identity);
 	}
 
 	function clearSessionResyncData(sessionHandle: string): void {
@@ -906,11 +940,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			snapshotHistoryAssemblies.delete(key);
 			abortSnapshotHistoryAssembly(assembly);
 		}
-		for (const [candidateId, assembly] of pageHistoryAssemblies) {
-			if (assembly.identity.sessionHandle !== sessionHandle) continue;
-			pageHistoryAssemblies.delete(candidateId);
-			assembly.controller.abort();
-		}
+		historyPages.cancelSession(sessionHandle);
 	}
 
 	function clearDeliveredNotifyKeys(sessionHandle: string): void {
@@ -1233,6 +1263,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		abortAllProjections();
 		abortAllLazyOperations();
 		abortAllHistoryOperations();
+		historyPages.cancelAll();
 		disposeInstalledContent();
 		for (const channel of Object.values(store.getState().sessions)) {
 			invalidateBrowserEffectIdentity(channel.runtime, channel.sessionHandle);
@@ -1351,93 +1382,11 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	}
 
 	function loadOlderSessionHistory(sessionHandle: string): boolean {
-		if (!historyNegotiated) return false;
-		const channel = store.getState().sessions[sessionHandle];
-		if (
-			!channel?.subscribed ||
-			!channel.baselineAuthoritative ||
-			channel.resync !== null ||
-			channel.generation === null ||
-			!channel.runtime ||
-			channel.history.snapshotId === null ||
-			channel.history.asOfSeq === null ||
-			channel.history.nextCursor === null ||
-			channel.history.loading ||
-			[...pageHistoryAssemblies.values()].some(
-				(assembly) => assembly.identity.sessionHandle === sessionHandle,
-			)
-		) {
-			return false;
-		}
-		const requestId = `history-page-${String(++historyRequestCounter)}-${now().toString(36)}`;
-		const operation: PageHistoryAssembly = {
-			identity: channel.runtime,
-			requestId,
-			representation: "projected",
-			controller: new AbortController(),
-			assembler: new SessionHistoryStreamAssembler<
-				unknown,
-				SessionHistoryPageBeginDto,
-				HistoryPageChunk,
-				SessionHistoryPageEndDto
-			>("page"),
-			finishing: false,
-		};
-		pageHistoryAssemblies.set(requestId, operation);
-		setChannel(sessionHandle, (current) => ({
-			...current,
-			history: { ...current.history, loading: true, error: null },
-		}));
-		const delivered = sendWire({
-			type: "session_history_page",
-			id: requestId,
-			sessionHandle,
-			expectedGeneration: channel.generation,
-			snapshotId: channel.history.snapshotId,
-			asOfSeq: channel.history.asOfSeq,
-			cursor: channel.history.nextCursor,
-			limit: SESSION_HISTORY_PAGE_LIMIT,
-		});
-		if (delivered !== "sent") {
-			pageHistoryAssemblies.delete(requestId);
-			operation.controller.abort();
-			setChannel(sessionHandle, (current) => ({
-				...current,
-				history: { ...current.history, loading: false, error: delivered },
-			}));
-			return false;
-		}
-		return true;
+		return historyPages.start(sessionHandle);
 	}
 
 	function cancelSessionHistory(sessionHandle: string): boolean {
-		const operation = [...pageHistoryAssemblies.values()].find(
-			(candidate) => candidate.identity.sessionHandle === sessionHandle,
-		);
-		if (!operation) return false;
-		pageHistoryAssemblies.delete(operation.requestId);
-		operation.controller.abort();
-		const channel = store.getState().sessions[sessionHandle];
-		if (
-			channel?.runtime &&
-			channel.generation !== null &&
-			channel.history.snapshotId !== null &&
-			channel.history.asOfSeq !== null &&
-			store.getState().connectionState === "online"
-		) {
-			sendWire({
-				type: "session_history_cancel",
-				id: operation.requestId,
-				sessionHandle,
-				expectedGeneration: channel.generation,
-				snapshotId: channel.history.snapshotId,
-			});
-		}
-		setChannel(sessionHandle, (current) => ({
-			...current,
-			history: { ...current.history, loading: false, error: null },
-		}));
-		return true;
+		return historyPages.cancelSession(sessionHandle, true);
 	}
 
 	function unsubscribeSession(sessionHandle: string): void {
@@ -1933,13 +1882,13 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				handleSessionSnapshotEnd(message, "wire");
 				return;
 			case "session_history_page_begin":
-				handleSessionHistoryPageBegin(message, "wire");
+				historyPages.accept(message, "wire");
 				return;
 			case "session_history_page_chunk":
-				handleSessionHistoryPageChunk(message, "wire");
+				historyPages.accept(message, "wire");
 				return;
 			case "session_history_page_end":
-				handleSessionHistoryPageEnd(message, "wire");
+				historyPages.accept(message, "wire");
 				return;
 			case "extension_ui_snapshot":
 				handleExtensionSnapshot(message);
@@ -2402,13 +2351,13 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				handleSessionSnapshotEnd(message, "projected");
 				return true;
 			case "session_history_page_begin":
-				handleSessionHistoryPageBegin(message, "projected");
+				historyPages.accept(message, "projected");
 				return true;
 			case "session_history_page_chunk":
-				handleSessionHistoryPageChunk(message, "projected");
+				historyPages.accept(message, "projected");
 				return true;
 			case "session_history_page_end":
-				handleSessionHistoryPageEnd(message, "projected");
+				historyPages.accept(message, "projected");
 				return true;
 			case "extension_ui_snapshot":
 				return enqueueProjection(identity, rawWireBytes, null, async (signal) => {
@@ -2624,164 +2573,6 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 				discardProjectionTail(assembly.identity.sessionHandle, tail);
 			}
 		}
-	}
-
-	function handleSessionHistoryPageBegin(
-		message: SessionHistoryPageBeginDto,
-		representation: "wire" | "projected",
-	): void {
-		const operation = pageHistoryAssemblies.get(message.requestId);
-		const channel = store.getState().sessions[message.sessionHandle];
-		if (!operation || operation.representation !== representation) return;
-		if (
-			!channel?.subscribed ||
-			!channel.baselineAuthoritative ||
-			!identitiesMatch(channel.runtime, operation.identity) ||
-			!identitiesMatch(operation.identity, message) ||
-			channel.history.snapshotId !== message.snapshotId ||
-			channel.history.asOfSeq !== message.asOfSeq
-		) {
-			failHistoryPage(operation, new Error("History page crossed an identity fence"));
-			return;
-		}
-		try {
-			operation.assembler.begin(message);
-		} catch (error) {
-			failHistoryPage(operation, error instanceof Error ? error : new Error(String(error)));
-		}
-	}
-
-	function handleSessionHistoryPageChunk(
-		message: HistoryPageChunk,
-		representation: "wire" | "projected",
-	): void {
-		const operation = pageHistoryAssemblies.get(message.requestId);
-		if (!operation || operation.representation !== representation || operation.finishing) return;
-		try {
-			operation.assembler.chunk(message);
-		} catch (error) {
-			failHistoryPage(operation, error instanceof Error ? error : new Error(String(error)));
-		}
-	}
-
-	function handleSessionHistoryPageEnd(
-		message: SessionHistoryPageEndDto,
-		representation: "wire" | "projected",
-	): void {
-		const operation = pageHistoryAssemblies.get(message.requestId);
-		if (!operation || operation.representation !== representation || operation.finishing) return;
-		let completed: ReturnType<typeof operation.assembler.end>;
-		try {
-			completed = operation.assembler.end(message);
-		} catch (error) {
-			failHistoryPage(operation, error instanceof Error ? error : new Error(String(error)));
-			return;
-		}
-		operation.finishing = true;
-		if (representation === "wire") {
-			pageHistoryAssemblies.delete(operation.requestId);
-			completeHistoryPage(
-				operation,
-				completed.messages as PiSessionMessageDto[],
-				completed.begin,
-				completed.end,
-			);
-			return;
-		}
-		void finishHistoryPage(operation, completed);
-	}
-
-	function completeHistoryPage(
-		operation: PageHistoryAssembly,
-		messages: PiSessionMessageDto[],
-		begin: SessionHistoryPageBeginDto,
-		end: SessionHistoryPageEndDto,
-	): void {
-		const channel = store.getState().sessions[operation.identity.sessionHandle];
-		if (
-			!channel?.subscribed ||
-			!channel.baselineAuthoritative ||
-			!identitiesMatch(channel.runtime, operation.identity) ||
-			channel.history.snapshotId !== begin.snapshotId ||
-			channel.history.asOfSeq !== begin.asOfSeq
-		) {
-			return;
-		}
-		const frame: SessionHistoryPageLoadedFrame = {
-			...operation.identity,
-			type: "session_history_page_loaded",
-			requestId: operation.requestId,
-			snapshotId: begin.snapshotId,
-			asOfSeq: begin.asOfSeq,
-			messages,
-		};
-		const delivery = frameBus.emit(operation.identity.sessionHandle, frame, now());
-		if (delivery.errors.length > 0 || delivery.deferred) {
-			failHistoryPage(
-				operation,
-				delivery.errors[0] instanceof Error
-					? delivery.errors[0]
-					: new Error("History page projection failed"),
-			);
-			return;
-		}
-		setChannel(operation.identity.sessionHandle, (current) => ({
-			...current,
-			history: {
-				...current.history,
-				totalMessages: begin.history.totalMessages,
-				totalBytes: begin.history.totalBytes,
-				loadedMessages: current.history.loadedMessages + end.itemCount,
-				loadedBytes: current.history.loadedBytes + end.byteCount,
-				nextCursor: end.nextCursor,
-				loading: false,
-				error: null,
-			},
-		}));
-	}
-
-	async function finishHistoryPage(
-		operation: PageHistoryAssembly,
-		completed: ReturnType<typeof operation.assembler.end>,
-	): Promise<void> {
-		try {
-			const adapter = activeContentAdapter;
-			if (!adapter) throw new Error(" history page materialization is unavailable");
-			const messages: PiSessionMessageDto[] = [];
-			for (const message of completed.messages as SessionMessageDto[]) {
-				messages.push(
-					await materializeMessage(message, adapter, operation.controller.signal, attachmentGuardContext),
-				);
-			}
-			if (!isCurrentPageAssembly(operation)) return;
-			pageHistoryAssemblies.delete(operation.requestId);
-			completeHistoryPage(operation, messages, completed.begin, completed.end);
-		} catch (error) {
-			if (operation.controller.signal.aborted) return;
-			failHistoryPage(operation, error instanceof Error ? error : new Error(String(error)));
-		}
-	}
-
-	function isCurrentPageAssembly(operation: PageHistoryAssembly): boolean {
-		const channel = store.getState().sessions[operation.identity.sessionHandle];
-		return Boolean(
-			pageHistoryAssemblies.get(operation.requestId) === operation &&
-				channel?.subscribed &&
-				channel.baselineAuthoritative &&
-				identitiesMatch(channel.runtime, operation.identity),
-		);
-	}
-
-	function failHistoryPage(operation: PageHistoryAssembly, error: Error): void {
-		if (operation.controller.signal.aborted) return;
-		if (pageHistoryAssemblies.get(operation.requestId) === operation) {
-			pageHistoryAssemblies.delete(operation.requestId);
-		}
-		operation.controller.abort();
-		setChannel(operation.identity.sessionHandle, (channel) => ({
-			...channel,
-			history: { ...channel.history, loading: false, error: error.message },
-		}));
 	}
 
 	function frameIdentity(message: SessionTransportFrameMessage): SessionRuntimeIdentityDto | null {
@@ -3098,17 +2889,14 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			return;
 		}
 		if (message.operation === "history_page") {
-			const operation = [...pageHistoryAssemblies.values()].find(
-				(candidate) => candidate.identity.sessionHandle === message.sessionHandle,
-			);
 			const error = new Error(message.code ?? message.error);
+			const failedPage = historyPages.failSession(message.sessionHandle, error);
 			const requiresFreshBaseline =
-				operation !== undefined &&
+				failedPage &&
 				(message.code === "session_history_snapshot_stale" ||
 					message.code === "session_history_changed" ||
 					message.code === "session_history_invalid_cursor");
-			if (operation) failHistoryPage(operation, error);
-			else {
+			if (!failedPage) {
 				setChannel(message.sessionHandle, (channel) => ({
 					...channel,
 					history: { ...channel.history, loading: false, error: message.code ?? message.error },
@@ -4233,7 +4021,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		transitionRecovery({ type: "reset" });
 		snapshotWaiters.clear();
 		snapshotHistoryAssemblies.clear();
-		pageHistoryAssemblies.clear();
+		historyPages.dispose();
 		resyncCoordinator.dispose();
 		for (const sessionHandle of Object.keys(extensionMachine.getState().sessions)) {
 			transitionExtension({ type: "reset", sessionHandle });
