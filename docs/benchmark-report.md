@@ -452,7 +452,11 @@ does not replace that validator or certify raw observations independently.
 Compatibility requires matching OS/kernel/architecture, exact CPU model and logical count,
 resource quota and memory, image, Node/pnpm/Playwright/Chromium, suite/tier, fixture and matrix
 hashes, lockfile, seed, warmup/sample counts, and scenario parameters. Commit and production build
-hashes may differ because those are the subject of the comparison. A shared `ubuntu-latest` label
+hashes may differ because those are the subject of the comparison. All trials must have canonical counts, indices, warmup flags, finite metrics, and successful
+recorded correctness; summary statistics use measured trials only. Darwin
+`quota.cpu="unavailable"` is interpreted as inapplicable because the producer only reads Linux
+cgroup CPU quotas; missing Darwin values and unknown Linux quotas remain incompatible.
+A shared `ubuntu-latest` label
 or reference-profile name does not make different CPUs compatible. For local runs, set `PI_WEB_BENCHMARK_IMAGE` to a stable label for the OS installation
 (for example, `local-host-v1`) on both invocations; an unspecified image remains incompatible.
 Downloaded Actions artifacts can be compared with the same command when their metadata matches.

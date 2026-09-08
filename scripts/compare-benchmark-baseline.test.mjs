@@ -21,9 +21,9 @@ function fixture(tier = "representative") {
 		errors: [],
 		parameters: { fixture: "same" },
 		gates: [{ mode: "hard", passed: true }],
-		trials: Array.from({ length: entry.measured }, (_, index) => ({
+		trials: Array.from({ length: entry.warmups + entry.measured }, (_, index) => ({
 			index,
-			warmup: false,
+			warmup: index < entry.warmups,
 			correctness: { complete: true },
 			metrics: { aggregateDeltaPerSecond: 100, publicationRatio: 0.1, recoveryMs: 100, browserErrors: 0 },
 		})),
@@ -78,7 +78,13 @@ function fixture(tier = "representative") {
 function metric(bundle, name, value) {
 	const result = bundle.benchmark.results[0];
 	for (const trial of result.trials) trial.metrics[name] = value;
-	result.summaries[name] = { count: result.trials.length, min: value, max: value, median: value, p95: value };
+	result.summaries[name] = {
+		count: result.trials.filter((trial) => !trial.warmup).length,
+		min: value,
+		max: value,
+		median: value,
+		p95: value,
+	};
 }
 
 test("complete comparable evidence is OK and includes units and direction", () => {
@@ -256,4 +262,66 @@ test("CLI compares complete artifact directories and enforces provenance hashes"
 test("different complete tiers are incompatible without dereferencing missing scenarios", () => {
 	assert.equal(compareBenchmarkBaseline(fixture("stress"), fixture()).status, "INCOMPATIBLE");
 	assert.equal(compareBenchmarkBaseline(fixture(), { scenarios: {} }).status, "INVALID");
+});
+
+function darwinFixture() {
+	const bundle = fixture();
+	Object.assign(bundle.environment, {
+		os: "darwin",
+		kernel: "25.0.0",
+		architecture: "arm64",
+		cpu: { model: "Apple M4", logicalCount: 10 },
+		quota: { cpu: "unavailable", memoryBytes: 17179869184 },
+		memory: { totalBytes: 17179869184 },
+		image: "local-host-v1",
+	});
+	return bundle;
+}
+
+test("Darwin producer quota is inapplicable, while unknown Linux quota still rejects", () => {
+	assert.equal(compareBenchmarkBaseline(darwinFixture(), darwinFixture()).status, "OK");
+	const linux = fixture();
+	linux.environment.quota.cpu = "unavailable";
+	assert.equal(compareBenchmarkBaseline(linux, linux).status, "INCOMPATIBLE");
+	const missing = darwinFixture();
+	delete missing.environment.quota.cpu;
+	assert.equal(compareBenchmarkBaseline(missing, missing).status, "INCOMPATIBLE");
+	const changed = darwinFixture();
+	changed.environment.cpu.model = "Apple M3";
+	assert.equal(compareBenchmarkBaseline(changed, darwinFixture()).status, "INCOMPATIBLE");
+});
+
+for (const [name, mutate] of Object.entries({
+	missingWarmup: (trials) => {
+		trials.shift();
+	},
+	failedWarmup: (trials) => {
+		trials[0].correctness.complete = false;
+	},
+	failedWarmupClaim: (trials) => {
+		trials[0].correctness.noLostEvents = false;
+	},
+	extraWarmup: (trials) => {
+		trials.push({ ...trials[0] });
+	},
+	duplicateIndex: (trials) => {
+		trials[1].index = 0;
+	},
+	wrongWarmupFlag: (trials) => {
+		trials[0].warmup = false;
+	},
+	malformedTrial: (trials) => {
+		trials[0] = null;
+	},
+}))
+	test(`${name} invalidates the complete trial envelope`, () => {
+		const bundle = fixture();
+		mutate(bundle.benchmark.results[0].trials);
+		assert.equal(compareBenchmarkBaseline(bundle, fixture()).status, "INVALID");
+	});
+
+test("warmup measurements do not enter measured summaries", () => {
+	const bundle = fixture();
+	bundle.benchmark.results[0].trials[0].metrics.recoveryMs = 99999;
+	assert.equal(compareBenchmarkBaseline(bundle, fixture()).status, "OK");
 });

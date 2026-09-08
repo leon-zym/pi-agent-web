@@ -45,23 +45,36 @@ function evidenceErrors(bundle) {
 			errors.push(`${key}: empty summaries`);
 			continue;
 		}
-		const measured = Array.isArray(result.trials)
-			? result.trials.filter((trial) => record(trial) && trial.warmup === false)
-			: [];
 		const definition = expected.find((entry) => keyFor(entry) === key);
-		if (!measured?.length || measured.length !== definition?.measured) {
-			errors.push(`${key}: missing measured trials`);
+		const trials = Array.isArray(result.trials) ? result.trials : [];
+		if (!definition || trials.length !== definition.warmups + definition.measured) {
+			errors.push(`${key}: incomplete trial count`);
 			continue;
 		}
-		for (const trial of measured) {
-			if (!record(trial.metrics) || !sameKeys(trial.metrics, result.summaries))
-				errors.push(`${key}: missing trial metrics`);
+		for (const [index, trial] of trials.entries()) {
+			if (!record(trial)) {
+				errors.push(`${key}: malformed trial ${index}`);
+				continue;
+			}
+			if (trial.index !== index || trial.warmup !== index < definition.warmups)
+				errors.push(`${key}: invalid trial index/warmup ${index}`);
+			if (
+				!record(trial.metrics) ||
+				!sameKeys(trial.metrics, result.summaries) ||
+				Object.values(trial.metrics).some((value) => !Number.isFinite(value))
+			)
+				errors.push(`${key}: missing or invalid trial metrics`);
 			if (
 				!record(trial.correctness) ||
 				trial.correctness.complete !== true ||
 				Object.values(trial.correctness).some((value) => value !== true)
 			)
 				errors.push(`${key}: failed correctness`);
+		}
+		const measured = trials.filter((trial) => record(trial) && trial.warmup === false);
+		if (measured.length !== definition.measured) {
+			errors.push(`${key}: missing measured trials`);
+			continue;
 		}
 		for (const [name, summary] of Object.entries(result.summaries)) {
 			const values = measured.map((trial) => trial.metrics?.[name]).sort((a, b) => a - b);
@@ -99,6 +112,15 @@ function missingMetadata(value) {
 	return value === undefined || value === null || value === "" || value === "unavailable";
 }
 
+function compatibilityQuota(environment) {
+	// The current producer reads CPU quotas from Linux cgroups only. Darwin's
+	// explicit sentinel means inapplicable here; absent fields and Linux unknowns
+	// still fail metadata validation. Do not modify the recorded evidence.
+	if (environment.os === "darwin" && environment.quota?.cpu === "unavailable")
+		return { cpu: "not-applicable:darwin-cgroups", memoryBytes: environment.quota.memoryBytes };
+	return { cpu: environment.quota?.cpu, memoryBytes: environment.quota?.memoryBytes };
+}
+
 function compatibility(bundle) {
 	const { environment: e, manifest: m, benchmark: b } = bundle;
 	return {
@@ -115,7 +137,7 @@ function compatibility(bundle) {
 				"pnpm",
 				"playwright",
 				"chromium",
-			].map((key) => [key, e[key]]),
+			].map((key) => [key, key === "quota" ? compatibilityQuota(e) : e[key]]),
 		),
 		workload: Object.fromEntries(
 			[
