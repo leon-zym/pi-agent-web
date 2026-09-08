@@ -177,6 +177,7 @@ const GATE_METRIC_POLICY = Object.freeze(
 			"browserFrameArrivalGapMs",
 			"browserProjectionLagMs",
 			"completionSkewMs",
+			"childGeneration",
 			"deltaCount",
 			"durationSkewMs",
 			"firstPageMs",
@@ -1402,6 +1403,33 @@ function validateObservation(value, definition, label, errors) {
 
 function gatePolicy(metric) {
 	return GATE_METRIC_POLICY[metric] ?? "observe";
+}
+
+/** Diagnostic units and direction extend the same metric inventory used by hard gates. */
+export function benchmarkMetricPolicy(metric) {
+	if (!Object.hasOwn(GATE_METRIC_POLICY, metric)) return null;
+	const mode = gatePolicy(metric);
+	const unit = metric.endsWith("Ms")
+		? "ms"
+		: metric.endsWith("Bytes")
+			? "bytes"
+			: metric === "inputBase64Chars"
+				? "chars"
+				: metric === "publicationRatio"
+					? "ratio"
+					: metric === "aggregateDeltaPerSecond"
+						? "events/s"
+						: "count";
+	return {
+		mode,
+		unit,
+		direction: ["childGeneration", "deltaCount", "inputBase64Chars", "sourceBytes"].includes(metric)
+			? "none"
+			: metric === "aggregateDeltaPerSecond"
+				? "higher"
+				: "lower",
+		floor: unit === "ms" ? 50 : unit === "bytes" ? 5 * 1024 * 1024 : 0,
+	};
 }
 
 function observationForTrial(observationByTrial, result, trial) {
