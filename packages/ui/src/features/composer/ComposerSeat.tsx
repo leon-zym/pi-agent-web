@@ -308,10 +308,10 @@ export function ComposerSeat() {
 		const attachmentWorkId = composer.beginAttachmentWorkForSession(targetSessionHandle);
 		const existing = composer.bySession[targetSessionHandle]?.images ?? [];
 		try {
-			const prepared = await prepareImageAttachments(Array.from(files), existing);
+			const additions = await prepareImageAttachments(Array.from(files), existing);
 			useComposerStore
 				.getState()
-				.finishAttachmentWorkForSession(targetSessionHandle, attachmentWorkId, prepared);
+				.finishAttachmentWorkForSession(targetSessionHandle, attachmentWorkId, additions);
 		} catch (error) {
 			const code = error instanceof ImageAttachmentError ? error.code : "decode_failed";
 			toast.error(tt(`composer.imageError.${code}` as never));
