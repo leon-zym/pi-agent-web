@@ -1,0 +1,5 @@
+{
+	"policy": "completion-median-v1",
+	"actions": { "status": "pending" },
+	"local": { "status": "pending" }
+}

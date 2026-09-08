@@ -60,6 +60,9 @@ jobs:
           retention-days: 7
 
   performance:
+    permissions:
+      contents: read
+      actions: read
     name: Representative performance
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -75,6 +78,29 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm bench:representative
+        env:
+          PI_WEB_BENCHMARK_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Evaluate completion median budgets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REFERENCE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          description=tests/e2e/benchmarks/references.json
+          git fetch --depth=1 origin "$REFERENCE_SHA"
+          if [[ -n "$(git ls-tree "$REFERENCE_SHA" -- "$description")" ]]; then
+            git show "$REFERENCE_SHA:$description" > "$RUNNER_TEMP/benchmark-references.json"
+          else
+            # First introduction only; future PRs use their base's registered references.
+            cp "$description" "$RUNNER_TEMP/benchmark-references.json"
+          fi
+          report=test-results/performance/representative/budget.md
+          set +e
+          node scripts/compare-benchmark-baseline.mjs "test-results/performance/representative/ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --strict --references "$RUNNER_TEMP/benchmark-references.json" --environment actions > "$report" 2>&1
+          status=$?
+          set -e
+          cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
       - name: Upload representative benchmark evidence
         if: always()
         uses: actions/upload-artifact@v4
