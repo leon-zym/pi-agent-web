@@ -1,13 +1,9 @@
 import type {
 	HotRuntimeInventoryEntryDto,
-	InlineSessionHistoryPageChunkDto,
 	InlineSessionReplayFrameDto,
 	InlineSessionSnapshotBeginDto,
 	InlineSessionSnapshotChunkDto,
 	InlineSessionSnapshotDto,
-	SessionHistoryPageBeginDto,
-	SessionHistoryPageChunkDto,
-	SessionHistoryPageEndDto,
 	SessionRuntimeIdentityDto,
 	SessionSnapshotBeginDto,
 	SessionSnapshotChunkDto,
@@ -35,7 +31,6 @@ export type RecoverySnapshotFrame =
 
 export type HistorySnapshotBegin = InlineSessionSnapshotBeginDto | SessionSnapshotBeginDto;
 export type HistorySnapshotChunk = InlineSessionSnapshotChunkDto | SessionSnapshotChunkDto;
-export type HistoryPageChunk = InlineSessionHistoryPageChunkDto | SessionHistoryPageChunkDto;
 export type CompletedHistorySnapshot = ReturnType<
 	SessionHistoryStreamAssembler<
 		unknown,
@@ -74,20 +69,6 @@ export interface SnapshotHistoryAssembly {
 	completion?: Promise<CompletedHistorySnapshot>;
 	resolveCompletion?: (completed: CompletedHistorySnapshot) => void;
 	rejectCompletion?: (error: Error) => void;
-}
-
-export interface PageHistoryAssembly {
-	identity: SessionRuntimeIdentityDto;
-	requestId: string;
-	representation: "wire" | "projected";
-	controller: AbortController;
-	assembler: SessionHistoryStreamAssembler<
-		unknown,
-		SessionHistoryPageBeginDto,
-		HistoryPageChunk,
-		SessionHistoryPageEndDto
-	>;
-	finishing: boolean;
 }
 
 export interface ProjectionTail {
@@ -139,7 +120,6 @@ export interface SessionRecoveryEffects {
 	commandMaterializations: Map<string, HistoryOperation>;
 	snapshotWaiters: Map<string, SnapshotWaiter>;
 	snapshotHistoryAssemblies: Map<string, SnapshotHistoryAssembly>;
-	pageHistoryAssemblies: Map<string, PageHistoryAssembly>;
 	projectionTails: Map<string, ProjectionTail>;
 	lazyIdentityScopes: Map<string, LazyIdentityScope>;
 	initialInventoryWaiters: Set<InitialInventoryWaiter>;
@@ -150,7 +130,6 @@ export function createSessionRecoveryEffects(): SessionRecoveryEffects {
 		commandMaterializations: new Map(),
 		snapshotWaiters: new Map(),
 		snapshotHistoryAssemblies: new Map(),
-		pageHistoryAssemblies: new Map(),
 		projectionTails: new Map(),
 		lazyIdentityScopes: new Map(),
 		initialInventoryWaiters: new Set(),
