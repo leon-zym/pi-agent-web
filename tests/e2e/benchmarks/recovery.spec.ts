@@ -789,6 +789,7 @@ for (const scenario of scenariosFor("recovery-disconnect")) {
 						beforeLease.sessionHandle,
 						beforeLease.serverEpoch,
 						beforeLease.generation,
+						beforeSession.workspaceHandle,
 					);
 					await page.locator("textarea").fill(prompt);
 					await page.getByRole("button", { name: /^(Send|发送)$/ }).click();

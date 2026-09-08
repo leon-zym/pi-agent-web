@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import { stripTypeScriptTypes } from "node:module";
 import path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import vm from "node:vm";
 import { createRecoveryRecorder } from "../packages/ui/src/lib/benchmark-recovery-recorder.ts";
 import {
 	BENCHMARK_PRODUCER_PATHS,
@@ -1350,53 +1352,90 @@ test("recorder fails closed on reset, overflow, late callbacks, and missing star
 	assert.equal(recorder.read().invalid, false);
 });
 
-test("callback gate receives before forwarding, drops the old callback, and holds authoritative overwrite", async () => {
-	const { installRecoveryGate } = await import("../tests/e2e/benchmarks/recovery-evidence.ts");
+test("actual observer, callback gate and validator preserve the complete wire identity", async () => {
+	const { armRecoveryGate, installRecoveryGate } = await import(
+		"../tests/e2e/benchmarks/recovery-evidence.ts"
+	);
+	const source = fs.readFileSync(
+		new URL("../packages/ui/src/lib/benchmark-browser.tsx", import.meta.url),
+		"utf8",
+	);
+	const observer = stripTypeScriptTypes(
+		source
+			.slice(source.indexOf("export function installRecoveryEvidence"), source.indexOf("/**\n * This root"))
+			.replace("export function", "function"),
+	);
 	const originalWindow = globalThis.window;
-	const records = [];
-	const delivered = [];
-	class Socket {
-		static OPEN = 1;
-		readyState = 1;
-		listeners = new Map();
-		send() {}
-		addEventListener(type, callback) {
-			this.listeners.set(type, callback);
+	async function run(change = {}, tail = false) {
+		let bus;
+		let changed;
+		const channel = {
+			runtime: { serverEpoch: "epoch", generation: 1, workspaceId: "workspace" },
+			lastSeq: 0,
+			projectedSeq: 0,
+			baselineAuthoritative: true,
+			resync: null,
+		};
+		class Socket {
+			static OPEN = 1;
+			readyState = 1;
+			listeners = new Map();
+			send() {}
+			addEventListener(type, callback) {
+				this.listeners.set(type, callback);
+			}
+			close() {
+				this.readyState = 3;
+			}
+			receive(message) {
+				this.listeners.get("message")?.({ data: JSON.stringify(message) });
+			}
 		}
-		close() {
-			this.readyState = 3;
-			this.listeners.get("close")?.();
-		}
-		receive(message) {
-			this.listeners.get("message")?.({ data: JSON.stringify(message) });
-		}
-	}
-	let invalid = false;
-	globalThis.window = {
-		WebSocket: Socket,
-		__piwebBenchmarkRecovery: {
-			start() {},
-			end() {},
-			record(...args) {
-				records.push(args);
+		const win = { WebSocket: Socket };
+		vm.runInNewContext(`${observer}\ninstallRecoveryEvidence();`, {
+			window: win,
+			createRecoveryRecorder,
+			sessionTransport: {
+				store: {
+					getState: () => ({ sessions: { session: channel } }),
+					subscribe: (callback) => {
+						changed = callback;
+					},
+				},
+				frameBus: {
+					subscribeAll: (callback) => {
+						bus = callback;
+					},
+				},
 			},
-			read: () => ({ rows: [{ seq: 0 }] }),
-			fail: () => {
-				invalid = true;
-			},
-		},
-	};
-	try {
+		});
+		globalThis.window = win;
 		await installRecoveryGate({ addInitScript: (install) => install() });
-		const win = globalThis.window;
+		const delivered = [];
+		const callback = (event) => {
+			const message = JSON.parse(event.data);
+			delivered.push(message.seq);
+			bus({ message });
+			channel.lastSeq = message.seq;
+			channel.projectedSeq = message.seq;
+			changed();
+		};
 		const old = new win.WebSocket();
-		old.onmessage = (event) => delivered.push(JSON.parse(event.data).seq);
-		win.__piwebRecoveryGate.arm(0, "session", "epoch", 1);
+		old.onmessage = callback;
+		await armRecoveryGate(
+			{ evaluate: (evaluate, args) => evaluate(args) },
+			0,
+			"session",
+			"epoch",
+			1,
+			"workspace",
+		);
 		const frame = (seq, event) => ({
 			type: "event",
 			sessionHandle: "session",
 			serverEpoch: "epoch",
 			generation: 1,
+			workspaceId: "workspace",
 			seq,
 			event,
 		});
@@ -1404,11 +1443,14 @@ test("callback gate receives before forwarding, drops the old callback, and hold
 			type: "message_update",
 			assistantMessageEvent: { type: "text_delta", delta: "unique-token" },
 		});
-		old.receive(delta);
+		const end = frame(2, { type: "message_end", message: { role: "assistant" } });
+		old.receive({ ...delta, ...(tail ? {} : change) });
+		if (tail) old.receive({ ...end, ...change });
 		assert.deepEqual(delivered, []);
 		assert.equal(old.readyState, 3);
+		old.listeners.get("close")();
 		const next = new win.WebSocket();
-		next.onmessage = old.onmessage;
+		next.onmessage = callback;
 		next.send(
 			JSON.stringify({
 				type: "session_subscribe",
@@ -1417,25 +1459,29 @@ test("callback gate receives before forwarding, drops the old callback, and hold
 			}),
 		);
 		next.receive(delta);
-		next.receive(frame(2, { type: "message_end", message: { role: "assistant" } }));
+		next.receive(end);
 		next.receive(frame(3, { type: "agent_settled" }));
 		assert.deepEqual(delivered, [1]);
-		assert.deepEqual(
-			records.filter((row) => row[1] === "wire").map((row) => row.slice(2)),
-			[
-				[1, 1],
-				[2, 1],
-				[2, 2],
-				[2, 3],
-			],
-		);
 		win.__piwebRecoveryGate.release();
 		assert.deepEqual(delivered, [1, 2, 3]);
-		win.__piwebRecoveryGate.finish();
-		assert.equal(invalid, false);
+		const evidence = structuredClone(win.__piwebRecoveryGate.finish());
+		evidence.beforeOverwrite = { prompt: "prompt", reply: "unique-token", promptCount: 1, replyCount: 1 };
+		const valid = disconnectEvidenceIsValid(evidence, 0, 3, evidence.beforeOverwrite);
 		old.receive(delta);
-		assert.equal(invalid, true);
+		assert.equal(win.__piwebBenchmarkRecovery.read().invalid, true);
 		assert.deepEqual(delivered, [1, 2, 3]);
+		return { evidence, valid };
+	}
+	try {
+		assert.equal((await run()).valid, true);
+		assert.equal((await run({}, true)).valid, true);
+		for (const change of [{ workspaceId: "OTHER" }, { serverEpoch: "OTHER" }, { generation: 2 }]) {
+			for (const tail of [false, true]) {
+				const result = await run(change, tail);
+				assert.equal(result.evidence.invalid, true, JSON.stringify({ change, tail }));
+				assert.equal(result.valid, false);
+			}
+		}
 	} finally {
 		globalThis.window = originalWindow;
 	}

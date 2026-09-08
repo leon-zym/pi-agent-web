@@ -15,7 +15,7 @@ type EvidenceWindow = Window &
 	typeof globalThis & {
 		__piwebBenchmarkRecovery: RecoveryApi;
 		__piwebRecoveryGate: {
-			arm(trial: number, handle: string, epoch: string, generation: number): void;
+			arm(trial: number, handle: string, epoch: string, generation: number, workspaceId: string): void;
 			release(): void;
 			finish(): RecoveryEvidence;
 		};
@@ -27,7 +27,13 @@ export async function installRecoveryGate(page: Page): Promise<void> {
 		const win = window as EvidenceWindow;
 		const NativeSocket = window.WebSocket;
 		let nextSocket = 0;
-		let active: { trial: number; handle: string; epoch: string; generation: number } | null = null;
+		let active: {
+			trial: number;
+			handle: string;
+			epoch: string;
+			generation: number;
+			workspaceId: string;
+		} | null = null;
 		let gateSocket = 0;
 		let heldSocket = 0;
 		let released = false;
@@ -81,7 +87,11 @@ export async function installRecoveryGate(page: Page): Promise<void> {
 						const targeted = active && message.sessionHandle === active.handle;
 						const sequenced = targeted && Number.isSafeInteger(message.seq);
 						if (sequenced) {
-							if (message.serverEpoch !== active?.epoch || message.generation !== active?.generation)
+							if (
+								message.serverEpoch !== active?.epoch ||
+								message.generation !== active?.generation ||
+								message.workspaceId !== active?.workspaceId
+							)
 								api().fail();
 							record("wire", id, message.seq);
 						}
@@ -124,12 +134,12 @@ export async function installRecoveryGate(page: Page): Promise<void> {
 			}),
 		});
 		win.__piwebRecoveryGate = {
-			arm(trial, handle, epoch, generation) {
+			arm(trial, handle, epoch, generation, workspaceId) {
 				if (active || pending.length) {
 					api().fail();
 					return;
 				}
-				active = { trial, handle, epoch, generation };
+				active = { trial, handle, epoch, generation, workspaceId };
 				gateSocket = 0;
 				heldSocket = 0;
 				released = false;
@@ -163,12 +173,14 @@ export async function armRecoveryGate(
 	handle: string,
 	epoch: string,
 	generation: number,
+	workspaceId: string,
 ) {
 	await page.evaluate((args) => (window as EvidenceWindow).__piwebRecoveryGate.arm(...args), [
 		trial,
 		handle,
 		epoch,
 		generation,
+		workspaceId,
 	] as const);
 }
 export async function waitForRecoveryHold(page: Page): Promise<void> {
