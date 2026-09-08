@@ -32,6 +32,7 @@ const deferNewSessionFile =
 	!requestedFile &&
 	(process.env.PI_WEB_E2E_DEFER_NEW_SESSION_FILE === "1" ||
 		countRecordedStarts(markerPath) >= deferNewSessionFileAfterStarts);
+const modelCapabilities = process.env.PI_WEB_E2E_MODEL_CAPABILITIES === "1";
 const recoveryFeatures = process.env.PI_WEB_E2E_RECOVERY_FEATURES === "1";
 const longContextCost = process.env.PI_WEB_E2E_LONG_CONTEXT_COST === "1";
 // This branch is inert unless the default Browser content-reference fixture asks for it.
@@ -52,16 +53,24 @@ fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
 if (!deferNewSessionFile) ensureSessionFile();
 
 const messages = fs.existsSync(sessionFile) ? loadMessages(sessionFile) : [];
-const models = recoveryFeatures
-	? Array.from({ length: 24 }, (_, index) => ({
-			id: `deterministic-${String(index + 1).padStart(2, "0")}`,
-			name: `Deterministic Model ${String(index + 1).padStart(2, "0")}`,
-			provider: index < 12 ? "e2e-primary" : "e2e-secondary",
-			reasoning: true,
-			contextWindow: 128_000,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		}))
-	: [];
+const capabilityModels = [
+	{ id: "plain", name: "Plain Model", reasoning: false },
+	{ id: "reason", name: "Reason Model", reasoning: true },
+	{ id: "extended", name: "Extended Model", reasoning: true },
+].map((model) => ({ ...model, provider: "e2e", contextWindow: 128_000 }));
+const capabilityLevels = { plain: ["off"], reason: ["low", "high"], extended: ["high", "max"] };
+const models = modelCapabilities
+	? capabilityModels
+	: recoveryFeatures
+		? Array.from({ length: 24 }, (_, index) => ({
+				id: `deterministic-${String(index + 1).padStart(2, "0")}`,
+				name: `Deterministic Model ${String(index + 1).padStart(2, "0")}`,
+				provider: index < 12 ? "e2e-primary" : "e2e-secondary",
+				reasoning: true,
+				contextWindow: 128_000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			}))
+		: [];
 let currentModel = models[0];
 let thinkingLevel = recoveryFeatures ? "medium" : "off";
 record("started", { pid: process.pid, sessionId, sessionFile, cwd: process.cwd() });
@@ -2067,13 +2076,27 @@ function handleLine(line) {
 			respond(command, { models });
 			return;
 		case "get_available_thinking_levels":
-			respond(command, { levels: recoveryFeatures ? ["off", "low", "medium", "high"] : ["off"] });
+			respond(command, {
+				levels: modelCapabilities
+					? capabilityLevels[currentModel.id]
+					: recoveryFeatures
+						? ["off", "low", "medium", "high"]
+						: ["off"],
+			});
 			return;
 		case "set_model": {
 			const selected = models.find(
 				(model) => model.provider === command.provider && model.id === command.modelId,
 			);
 			if (selected) currentModel = selected;
+			if (modelCapabilities) {
+				const levels = capabilityLevels[currentModel.id];
+				const effective = levels.includes(thinkingLevel) ? thinkingLevel : levels.at(-1);
+				if (thinkingLevel !== effective) {
+					thinkingLevel = effective;
+					send({ type: "thinking_level_changed", level: thinkingLevel });
+				}
+			}
 			respond(command, currentModel);
 			return;
 		}
