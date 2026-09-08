@@ -136,8 +136,9 @@ function snapshot(
 }
 
 const controllers: SessionTransportController[] = [];
+const deliverySpyCleanups: Array<() => void> = [];
 
-async function setup() {
+async function setup(captureDelivery = false) {
 	vi.resetModules();
 	const sockets: FakeSocket[] = [];
 	const controller = createSessionTransport({
@@ -150,6 +151,8 @@ async function setup() {
 		protocolVersion: { major: 1, minor: 4 },
 	});
 	controllers.push(controller);
+	const deliverySpy = captureDelivery ? vi.spyOn(controller.frameBus, "emit") : null;
+	if (deliverySpy) deliverySpyCleanups.push(() => deliverySpy.mockRestore());
 	vi.doMock("../src/stores/session-transport", async () => ({
 		...(await vi.importActual<typeof import("../src/stores/session-transport")>(
 			"../src/stores/session-transport",
@@ -175,10 +178,11 @@ async function setup() {
 		runtime: runtime(2),
 		reason: "gap",
 	});
-	return { controller, socket, useExtensionUiStore, useProjectionStore };
+	return { controller, socket, useExtensionUiStore, useProjectionStore, deliverySpy };
 }
 
 afterEach(() => {
+	for (const cleanup of deliverySpyCleanups.splice(0)) cleanup();
 	for (const controller of controllers.splice(0)) controller.dispose();
 	vi.doUnmock("../src/stores/session-transport");
 	vi.useRealTimers();
@@ -308,7 +312,8 @@ describe("stream pipeline snapshot suffix delivery", () => {
 });
 
 it("materializes and projects a page while another Session remains selected", async () => {
-	const { controller, socket, useProjectionStore } = await setup();
+	const { controller, socket, useProjectionStore, deliverySpy } = await setup(true);
+	if (!deliverySpy) throw new Error("missing delivery diagnostic");
 	const startedAt = performance.now();
 	const trace: unknown[] = [];
 	let baselineReady = false;
@@ -473,11 +478,35 @@ it("materializes and projects a page while another Session remains selected", as
 		if (!baselineReady) {
 			record("baseline-wait-failed");
 			console.error("PAGE_BASELINE_DIAGNOSTIC", JSON.stringify(trace));
+			console.error(
+				"PAGE_BASELINE_DELIVERY",
+				JSON.stringify(
+					deliverySpy.mock.calls
+						.flatMap<unknown>((args, index) => {
+							const type = (args[1] as { type: string }).type;
+							if (type !== "runtime_state" && type !== "session_snapshot") return [];
+							const result = deliverySpy.mock.results[index];
+							if (result?.type !== "return") return [{ type, returned: false }];
+							return [
+								{
+									type,
+									deferred: result.value.deferred,
+									errors: result.value.errors.slice(0, 2).map((error: unknown) => ({
+										name: (error instanceof Error ? error.name : typeof error).slice(0, 200),
+										message: (error instanceof Error ? error.message : String(error)).slice(0, 200),
+									})),
+								},
+							];
+						})
+						.slice(0, 4),
+				),
+			);
 		}
 		throw error;
 	} finally {
 		stopStateTrace();
 		stopFrameTrace();
 		receiveTrace.mockRestore();
+		deliverySpy.mockRestore();
 	}
 });
