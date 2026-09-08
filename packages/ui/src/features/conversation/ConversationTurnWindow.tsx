@@ -24,6 +24,10 @@ import {
 	revealTurnWindowStart,
 } from "./turn-window";
 
+// This pre-mount control is eliminated from ordinary production bundles.
+const fullHistory =
+	import.meta.env.VITE_PI_WEB_BENCHMARK_BUILD === "1" &&
+	Reflect.get(globalThis, "__piwebBenchmarkFullHistory") === true;
 const TURN_LOAD_THRESHOLD = 96;
 const TURN_SCROLL_THRESHOLD = 24;
 const SAVED_WINDOW_START_LIMIT = 32;
@@ -132,7 +136,13 @@ export const ConversationTurnWindow = memo(
 			};
 		}, []);
 
-		const range = useMemo(() => getTurnWindowRange(turns.length, start), [turns.length, start]);
+		const range = useMemo(
+			() =>
+				fullHistory
+					? { start: 0, end: turns.length, hasOlder: false, hasNewer: false }
+					: getTurnWindowRange(turns.length, start),
+			[turns.length, start],
+		);
 
 		useEffect(() => {
 			const previousCount = previousTurnCountRef.current;
@@ -186,7 +196,7 @@ export const ConversationTurnWindow = memo(
 		const loadOlder = useCallback(() => {
 			const currentStart = startRef.current;
 			const currentRange = getTurnWindowRange(turnsRef.current.length, currentStart);
-			if (!currentRange.hasOlder) {
+			if (fullHistory || !currentRange.hasOlder) {
 				if (remoteHistoryHasOlder && !remoteHistoryLoading) onLoadRemoteOlder?.();
 				return;
 			}

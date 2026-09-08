@@ -10,7 +10,7 @@ import {
 } from "./restart-authentication-validator.mjs";
 
 export const BENCHMARK_SCHEMA_VERSION = 2;
-export const BENCHMARK_SUITE_VERSION = 5;
+export const BENCHMARK_SUITE_VERSION = 6;
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(scriptDirectory, "..");
@@ -140,6 +140,7 @@ const STANDARD_BUILD_IDENTITY_KEYS = ["cliTreeHash", "serverTreeHash", "uiTreeHa
 export const BENCHMARK_PRODUCER_PATHS = Object.freeze(
 	[
 		"packages/ui/src/lib/benchmark-browser.tsx",
+		"packages/ui/src/features/conversation/ConversationTurnWindow.tsx",
 		"packages/ui/src/lib/benchmark-recovery-recorder.ts",
 		"tests/e2e/benchmarks/recovery-evidence.ts",
 		"scripts/run-performance-benchmarks.mjs",
@@ -148,6 +149,7 @@ export const BENCHMARK_PRODUCER_PATHS = Object.freeze(
 		"tests/e2e/benchmarks/concurrency.spec.ts",
 		"tests/e2e/benchmarks/content-roundtrip.spec.ts",
 		"tests/e2e/benchmarks/history.spec.ts",
+		"tests/e2e/benchmarks/history-mixed.spec.ts",
 		"tests/e2e/benchmarks/playwright.config.ts",
 		"tests/e2e/benchmarks/recovery.spec.ts",
 		"tests/e2e/benchmarks/restart-authentication-observation.ts",
@@ -192,6 +194,15 @@ const GATE_METRIC_POLICY = Object.freeze(
 			"firstPageMs",
 			"gatewayRestartMs",
 			"heapDeltaBytes",
+			"coldOpenMs",
+			"warmOpenMs",
+			"cycleMs",
+			"retainedHeapBytes",
+			"navigationMs",
+			"anchorErrorPx",
+			"sessionSwitchMs",
+			"interactionMs",
+
 			"inputBase64Chars",
 			"automationStartToFirstStreamingRafMs",
 			"automationStartToFirstStreamingDomMs",
@@ -360,6 +371,21 @@ const OBSERVATION_FACT_KEYS_BY_KIND = {
 	streaming: STREAMING_FACT_KEYS,
 	concurrency: CONCURRENCY_FACT_KEYS,
 	history: HISTORY_FACT_KEYS,
+	"history-mixed": [
+		"failure",
+		"cycle",
+		"sourceBytes",
+		"initialTurns",
+		"finalTurns",
+		"mounted",
+		"getMessagesCount",
+		"pages",
+		"gc",
+		"actions",
+		"anchor",
+		"prepend",
+		"times",
+	],
 	"content-roundtrip": CONTENT_FACT_KEYS,
 	"recovery-disconnect": RECOVERY_FACT_KEYS,
 	"recovery-gap": RECOVERY_FACT_KEYS,
@@ -368,6 +394,10 @@ const OBSERVATION_FACT_KEYS_BY_KIND = {
 	"recovery-gateway-restart": RECOVERY_FACT_KEYS,
 };
 const REQUIRED_HARD_GATES_BY_KIND = Object.freeze({
+	"history-mixed": [
+		["correctnessFailures", "value", "eq", 0],
+		["browserErrors", "value", "eq", 0],
+	],
 	streaming: [
 		["correctnessFailures", "value", "eq", 0],
 		["browserErrors", "value", "eq", 0],
@@ -1355,6 +1385,7 @@ function validateObservationFacts(value, kind, label, errors) {
 		validateSocketFact(value.socket, `${label}.facts.socket`, errors);
 		return;
 	}
+	if (kind === "history-mixed") return;
 	validateRecoveryFacts(value, `${label}.facts`, errors, kind);
 }
 
@@ -1442,8 +1473,9 @@ export function benchmarkMetricPolicy(metric) {
 	if (!Object.hasOwn(GATE_METRIC_POLICY, metric)) return null;
 	const mode = gatePolicy(metric);
 	// This metric counts tasks; its suffix describes the duration threshold.
-	const unit =
-		metric === "liveLongTasksOver50Ms"
+	const unit = metric.endsWith("Px")
+		? "px"
+		: metric === "liveLongTasksOver50Ms"
 			? "count"
 			: metric.endsWith("Ms")
 				? "ms"
@@ -1772,10 +1804,201 @@ function recoveryPiIsCorrect(facts, definition) {
 	);
 }
 
+/** The native recipe has no public entry IDs; timestamp/role/stopReason uniquely identify its messages. */
+function mixedHistoryValid(f, d) {
+	if (!exactKeys(f, OBSERVATION_FACT_KEYS_BY_KIND["history-mixed"]) || f.failure !== null) return false;
+	if (
+		![1000, 5000].includes(d.turns) ||
+		d.sourceBytes !== (d.turns === 1000 ? 4 : 16) * 1024 ** 2 ||
+		!["bounded", "full"].includes(d.historyMount) ||
+		f.sourceBytes !== d.sourceBytes ||
+		f.initialTurns !== 40 ||
+		f.finalTurns !== d.turns ||
+		f.getMessagesCount !== 0 ||
+		!Number.isSafeInteger(f.cycle) ||
+		f.cycle < 0 ||
+		!Number.isSafeInteger(f.mounted) ||
+		f.mounted < 1 ||
+		(d.historyMount === "full" ? f.mounted !== d.turns : f.mounted > 64)
+	)
+		return false;
+	if (
+		!exactKeys(f.times, ["cold", "warm", "settlement", "cycle"]) ||
+		!Object.values(f.times).every((v) => isFiniteNumber(v) && v > 0) ||
+		f.times.cycle > 120_000 ||
+		f.times.settlement > f.times.cold ||
+		f.times.cold + f.times.warm > f.times.cycle
+	)
+		return false;
+	if (!Array.isArray(f.pages) || f.pages.length < 3) return false;
+	let previous = null;
+	for (const [index, page] of f.pages.entries()) {
+		if (
+			!exactKeys(page, ["cursor", "next", "ids"]) ||
+			page.cursor !== previous ||
+			(page.next !== null && !validHash(page.next)) ||
+			!Array.isArray(page.ids) ||
+			page.ids.length < 1 ||
+			page.ids.length > (index === 0 ? 96 : 256) ||
+			(index === 0 && page.ids.length !== 96) ||
+			(index < f.pages.length - 1 && page.next === null)
+		)
+			return false;
+		previous = page.next;
+	}
+	if (previous !== null) return false;
+	const expected = [];
+	for (let index = 0; index < d.turns; index++) {
+		const timestamp = Date.UTC(2026, 0, 1) + index * 2000;
+		expected.push(`${timestamp}:user:`);
+		if (index % 5 === 2)
+			expected.push(`${timestamp + 1000}:assistant:toolUse`, `${timestamp + 1000}:toolResult:`);
+		expected.push(`${timestamp + 1000}:assistant:stop`);
+	}
+	if (
+		!isDeepStrictEqual(
+			f.pages.toReversed().flatMap((p) => p.ids),
+			expected,
+		)
+	)
+		return false;
+	const duration = (v) =>
+		isFiniteNumber(v.started) && isFiniteNumber(v.finished) && v.started >= 0 && v.finished >= v.started;
+	if (
+		!Array.isArray(f.gc) ||
+		!isDeepStrictEqual(
+			f.gc.map((g) => g?.name),
+			["baseline", "loaded", "warm", "returned"],
+		) ||
+		!f.gc.every(
+			(g, i) =>
+				exactKeys(g, ["name", "started", "finished", "heap", "dom"]) &&
+				duration(g) &&
+				isFiniteNumber(g.heap) &&
+				g.heap > 0 &&
+				g.heap <= 1024 ** 3 &&
+				Number.isSafeInteger(g.dom) &&
+				g.dom > 0 &&
+				g.dom <= 500_000 &&
+				(i === 0 || g.started >= f.gc[i - 1].finished),
+		)
+	)
+		return false;
+	const prepend = f.prepend;
+	if (
+		!exactKeys(prepend, [
+			"requestsBefore",
+			"requestsAfter",
+			"inflightBefore",
+			"inflightAfter",
+			"requestId",
+			"endRequestId",
+			"beforeTurns",
+			"afterTurns",
+			"pageMessages",
+			"pageUserTurns",
+			"anchorVisible",
+			"windowBefore",
+			"windowAfter",
+		]) ||
+		prepend.requestsBefore !== f.pages.length - 1 ||
+		prepend.requestsAfter !== prepend.requestsBefore + 1 ||
+		prepend.inflightBefore !== 0 ||
+		prepend.inflightAfter !== 0 ||
+		!validHash(prepend.requestId) ||
+		prepend.requestId !== prepend.endRequestId ||
+		prepend.anchorVisible !== true ||
+		prepend.beforeTurns !== f.initialTurns ||
+		prepend.pageMessages !== f.pages[1].ids.length ||
+		prepend.pageUserTurns !== f.pages[1].ids.filter((id) => id.endsWith(":user:")).length ||
+		prepend.afterTurns !== prepend.beforeTurns + prepend.pageUserTurns
+	)
+		return false;
+	for (const [range, total] of [
+		[prepend.windowBefore, prepend.beforeTurns],
+		[prepend.windowAfter, prepend.afterTurns],
+	]) {
+		if (
+			!Array.isArray(range) ||
+			range.length !== 2 ||
+			!range.every(Number.isSafeInteger) ||
+			range[0] < 0 ||
+			range[1] <= range[0] ||
+			range[1] > total ||
+			(d.historyMount === "full" ? range[0] !== 0 || range[1] !== total : range[1] - range[0] > 64)
+		)
+			return false;
+	}
+	const anchor = f.anchor;
+	if (
+		!exactKeys(anchor, ["beforeId", "afterId", "before", "after"]) ||
+		typeof anchor.beforeId !== "string" ||
+		!anchor.beforeId ||
+		anchor.beforeId !== anchor.afterId ||
+		!isFiniteNumber(anchor.before) ||
+		!isFiniteNumber(anchor.after) ||
+		Math.abs(anchor.after - anchor.before) > 2
+	)
+		return false;
+	const prompt = (n) => `E2E_MIXED_HISTORY [turn ${n}]`;
+	const actions = [
+		["oldest", prompt(1)],
+		["middle", prompt(d.turns / 2 + 1)],
+		["latest", prompt(d.turns)],
+		["prepend", anchor.afterId],
+		["focus", "older"],
+		["resize", "1024"],
+		["theme", "dark"],
+		["selection", prompt(1)],
+		["find", prompt(1)],
+		["copy", prompt(1)],
+		["switch", "mixed draft"],
+		["reconnect", String(d.turns)],
+		["extension", "widget+dialog"],
+	];
+	return (
+		Array.isArray(f.actions) &&
+		f.actions.length === actions.length &&
+		f.actions.every(
+			(a, i) =>
+				exactKeys(a, ["name", "started", "finished", "actual"]) &&
+				duration(a) &&
+				a.name === actions[i][0] &&
+				a.actual === actions[i][1] &&
+				(i === 0 || a.started >= f.actions[i - 1].finished),
+		)
+	);
+}
+
+function mixedHistoryMetrics(f) {
+	if (!isRecord(f?.times) || !Array.isArray(f.actions) || !Array.isArray(f.gc) || !isRecord(f.anchor))
+		return null;
+	const elapsed = (name) => {
+		const action = f.actions.find((a) => a?.name === name);
+		return action ? action.finished - action.started : 0;
+	};
+	return {
+		coldOpenMs: f.times.cold,
+		warmOpenMs: f.times.warm,
+		settlementMs: f.times.settlement,
+		cycleMs: f.times.cycle,
+		retainedHeapBytes: f.gc.find((g) => g?.name === "warm")?.heap ?? 0,
+		mountedTurnNodes: f.mounted,
+		navigationMs: elapsed("oldest") + elapsed("middle") + elapsed("latest"),
+		anchorErrorPx: Math.abs(f.anchor.after - f.anchor.before),
+		sessionSwitchMs: elapsed("switch"),
+		interactionMs: f.actions.reduce((sum, a) => sum + a.finished - a.started, 0),
+	};
+}
+
 function deriveCorrectness(observation, definition) {
 	const facts = observation?.facts;
 	if (!isRecord(facts)) return { complete: false };
 	let correctness;
+	if (definition.kind === "history-mixed") {
+		const complete = mixedHistoryValid(facts, definition);
+		return { mixedHistoryComplete: complete, complete };
+	}
 	if (definition.kind === "streaming") {
 		const dom = facts?.dom;
 		const frames = facts?.frames;
@@ -2183,6 +2406,12 @@ export function validateResult(result, definition, tier, runId, observationByTri
 			continue;
 		}
 		const derived = deriveCorrectness(observation, definition);
+		if (
+			definition.kind === "history-mixed" &&
+			(observation.facts?.cycle !== trial.index ||
+				!isDeepStrictEqual(trial.metrics, mixedHistoryMetrics(observation.facts)))
+		)
+			errors.push(`trial ${String(index)} mixed history metrics/cycle must match raw facts`);
 		if (!isDeepStrictEqual(trial.correctness, derived))
 			errors.push(`trial ${String(index)} correctness must equal independently derived observation claims`);
 	}

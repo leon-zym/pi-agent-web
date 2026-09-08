@@ -21,7 +21,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Fetch trusted benchmark source for offline validator tests
-        run: git fetch --depth=1 origin 00fe129125fcf273f8c27332ec4b115b59779ce8
+        run: |
+          git fetch --depth=1 origin 00fe129125fcf273f8c27332ec4b115b59779ce8
+          git fetch --depth=1 origin 9d2174acb8ed5fcd9eda8ad53b5099b540ba0eda
       - uses: pnpm/action-setup@v4
         with:
           version: 11.21.0

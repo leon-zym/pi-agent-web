@@ -100,6 +100,7 @@ export interface StartHarnessOptions {
 		turnCount?: number;
 		/** Pad ASCII assistant content so the native JSONL has this exact byte length. */
 		targetSourceBytes?: number;
+		mixedHistory?: boolean;
 	};
 }
 
@@ -228,7 +229,7 @@ export function assertPreservedHarnessIdentity(
 	}
 }
 
-function seedHistoricalSession(
+export function seedHistoricalSession(
 	sessionDir: string,
 	workspacePath: string,
 	seed: NonNullable<StartHarnessOptions["seedHistoricalSession"]>,
@@ -237,6 +238,14 @@ function seedHistoricalSession(
 	const timestamp = "2026-01-01T00:00:00.000Z";
 	const sessionFile = path.join(sessionDir, `2026-01-01T00-00-00-000Z_${nativeSessionId}.jsonl`);
 	const turnCount = Math.max(1, Math.floor(seed.turnCount ?? 1));
+	if (
+		seed.mixedHistory &&
+		!(
+			(turnCount === 1000 && seed.targetSourceBytes === 4 * 1024 * 1024) ||
+			(turnCount === 5000 && seed.targetSourceBytes === 16 * 1024 * 1024)
+		)
+	)
+		throw new Error("mixed history requires 1000/4MiB or 5000/16MiB");
 	const entries: Array<Record<string, unknown>> = [
 		{
 			type: "session",
@@ -254,7 +263,18 @@ function seedHistoricalSession(
 		const userTimestamp = Date.parse(timestamp) + index * 2_000;
 		const assistantTimestamp = userTimestamp + 1_000;
 		const userText = turnCount === 1 ? seed.userText : `${seed.userText} [turn ${String(index + 1)}]`;
-		const assistantText = turnCount === 1 ? seed.assistantText : `${seed.assistantText} ${String(index + 1)}`;
+		let assistantText = turnCount === 1 ? seed.assistantText : `${seed.assistantText} ${String(index + 1)}`;
+		if (seed.mixedHistory) {
+			if (index % 5 === 1) assistantText += "\n\n```ts\nconst synthetic = 42;\n```";
+			if (index % 5 === 4)
+				assistantText += "\n\n- first\n- second\n\n| key | value |\n| --- | --- |\n| test | 42 |";
+			const block = [0, turnCount / 4, turnCount / 2, (3 * turnCount) / 4].indexOf(index);
+			if (block >= 0) {
+				const bytes = [10 * 1024, 64 * 1024, 120 * 1024, 1024 * 1024][block]!;
+				const prefix = `\n\n# Mixed Markdown ${bytes}\n\n`;
+				assistantText += prefix + "m".repeat(bytes - Buffer.byteLength(prefix));
+			}
+		}
 		const assistantMessage = {
 			role: "assistant",
 			content: [{ type: "text" as const, text: assistantText }],
@@ -293,6 +313,53 @@ function seedHistoricalSession(
 				message: assistantMessage,
 			},
 		);
+		if (seed.mixedHistory && index % 5 === 2) {
+			const final = entries.pop()!;
+			const callId = `${assistantId}-call`;
+			const resultId = `${assistantId}-result`;
+			entries.push(
+				{
+					type: "message",
+					id: callId,
+					parentId: userId,
+					timestamp,
+					message: {
+						...assistantMessage,
+						content: [
+							{
+								type: "toolCall",
+								id: callId,
+								name: "edit",
+								arguments: { path: "synthetic.ts", oldText: "1", newText: "2" },
+							},
+						],
+						stopReason: "toolUse",
+					},
+				},
+				{
+					type: "message",
+					id: resultId,
+					parentId: callId,
+					timestamp,
+					message: {
+						role: "toolResult",
+						toolCallId: callId,
+						toolName: "edit",
+						content: [{ type: "text", text: "Synthetic edit completed" }],
+						details: { diff: "-const n = 1;\n+const n = 2;" },
+						isError: false,
+						timestamp: assistantTimestamp,
+					},
+				},
+				{ ...final, parentId: resultId },
+			);
+		}
+		if (seed.mixedHistory && index % 5 === 3) {
+			Reflect.set(assistantMessage, "content", [
+				...assistantMessage.content,
+				{ type: "thinking", thinking: "Synthetic collapsed reasoning." },
+			]);
+		}
 		parentId = assistantId;
 	}
 	const serialize = () => `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`;

@@ -53,7 +53,7 @@ function fixture(tier = "representative") {
 	return {
 		benchmark: {
 			schemaVersion: 2,
-			suiteVersion: 5,
+			suiteVersion: 6,
 			runId: "fixture",
 			tier,
 			results,

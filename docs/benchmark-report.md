@@ -15,7 +15,49 @@ requirements. Fresh calibration and remaining coverage are tracked in
 The reference environment, methodology, and numerical sections that follow describe that historical
 calibration, including its original claims and limitations.
 
-## Current recovery scope (suite version 5)
+## Mixed history contract (suite version 6)
+
+The additional history scenarios preserve `history-65m` and the stress byte-boundary cases.
+They independently constrain native JSONL to 1,000 Turns / 4 MiB and 5,000 Turns / 16 MiB.
+A five-Turn recipe mixes prose, fenced code, tool-call/result chains, collapsed thinking and
+list/table Markdown. Four individual Markdown blocks are 10/64/120 KiB and 1 MiB; these are
+not multiplied by every Turn. No real history or provider output is used.
+
+Representative adds one 1,000-Turn bounded-mount cycle per publication variant. Stress declares
+two sizes × two publication variants × bounded/full mounting × (one warmup + three measured
+cycles): 32 independent cycles, 24 measured. This is a declared workload, not a claim that the
+full stress matrix has passed. Each cycle owns one fresh Browser context and Gateway; the
+Browser executable and OS disk cache may be reused. Full mounting is a compile-time benchmark
+control using the same TurnView. The ordinary production executable scan must exclude the control.
+
+Cold opening ends after the authoritative initial history is visible, loading has ended and two
+animation frames have completed. Warm opening returns to the same retained Session store after
+visiting a small second Session. GC is outside open/navigation timing: baseline, all-pages,
+warm-reopen and small-Session-return checkpoints record absolute retained heap and DOM counts.
+The final checkpoint intentionally retains cached history; it is not an unload or leak test.
+
+Raw evidence records actual wire-page cursors and the deterministic timestamp/role/stop-reason
+message identities, rather than counting local window expansion as remote pagination. Validation
+requires every native message exactly once in order, the exact initial/final Turn counts, no
+`get_messages` fallback, bounded mounting ≤64 or full mounting equal to the native Turn count,
+and all declared actions. Oldest/middle/latest navigation, remote prepend anchor error (≤2 CSS
+pixels), focus, resize, theme, text selection, clipboard copy, mounted-target find, draft-preserving
+Session switching, reconnect and live Extension UI have separate outcomes and timings. Browser
+find does not search unmounted history. Extension UI is live accompanying state added after the
+native measurements; it is not fabricated persisted history.
+
+A cycle exceeding 120 seconds, 1 GiB measured JS heap or 500,000 DOM nodes stops as incomplete
+INVALID evidence. Those are execution safety caps, not accepted performance budgets. Missing GC,
+missing actions, duplicate/gapped pages, Browser errors or inconsistent raw-to-summary metrics
+cannot become zero-valued success. A B-only development run remains partial; it cannot replace
+formal stress completeness or the 800 measured recovery trials.
+
+Suite 6 and changed producer/matrix provenance make the accepted suite-5 references incompatible.
+They remain immutable and fully validated with their trusted frozen source before reporting budget
+not evaluated. The six completion medians and `completion-median-v1` policy are unchanged. Final
+B/C calibration is separate from this implementation and is still tracked in #28.
+
+## Recovery scope (introduced in suite version 5)
 
 Gateway restart performance is explicitly deferred to [Issue #105](https://github.com/leon-zym/pi-agent-web/issues/105).
 It is absent from both formal matrices; the retained implementation has no active matrix entry.
