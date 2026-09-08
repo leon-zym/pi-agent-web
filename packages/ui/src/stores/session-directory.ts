@@ -50,11 +50,15 @@ export interface SessionDirectoryState {
 	loadingSessions: boolean;
 	searchQuery: string;
 	error?: string;
-	loadWorkspaces: () => Promise<void>;
+	invalidateDirectoryRequests: () => void;
+	loadWorkspaces: (options?: { isCurrent?: () => boolean }) => Promise<void>;
 	addWorkspace: (path: string) => Promise<NativeWorkspaceDto>;
 	removeWorkspace: (workspaceHandle: string) => Promise<void>;
 	selectWorkspace: (workspaceHandle: string) => Promise<void>;
-	reloadSessions: (workspaceHandle?: string, options?: { force?: boolean }) => Promise<NativeSessionDto[]>;
+	reloadSessions: (
+		workspaceHandle?: string,
+		options?: { force?: boolean; isCurrent?: () => boolean },
+	) => Promise<NativeSessionDto[]>;
 	selectSession: (session: NativeSessionDto | null) => void;
 	resumeTransientSession: (workspaceHandle: string) => boolean;
 	hotTransientResumeStatus: (workspaceHandle: string) => HotTransientResumeStatus;
@@ -84,6 +88,7 @@ interface SessionRequest {
 const sessionRequestByWorkspace = new Map<string, SessionRequest>();
 const transientAbandons = new Set<string>();
 let sessionRequestCounter = 0;
+let workspaceRequestCounter = 0;
 let navigationTokenCounter = 0;
 let cancelPendingVisibleSessionClaim: (() => void) | null = null;
 let visibleSessionTransitionToken = 0;
@@ -564,10 +569,31 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 	loadingSessions: false,
 	searchQuery: "",
 
-	loadWorkspaces: async () => {
+	invalidateDirectoryRequests: () => {
+		workspaceRequestCounter += 1;
+		sessionRequestByWorkspace.clear();
+		set({ loadingWorkspaces: false, loadingSessions: false });
+	},
+
+	loadWorkspaces: async (options = {}) => {
+		const request = ++workspaceRequestCounter;
+		const navigationTokenAtStart = get().navigationToken;
+		const isCurrent = () => {
+			if (request !== workspaceRequestCounter) return false;
+			if (options.isCurrent?.() === false) {
+				set({ loadingWorkspaces: false });
+				return false;
+			}
+			return true;
+		};
 		set({ loadingWorkspaces: true, error: undefined });
 		try {
 			const workspaces = await api.listWorkspaces();
+			if (!isCurrent()) return;
+			if (get().navigationToken !== navigationTokenAtStart) {
+				set({ loadingWorkspaces: false });
+				return;
+			}
 			const current = get().currentWorkspaceHandle;
 			set({ workspaces, loadingWorkspaces: false });
 			if (current && workspaces.some((workspace) => workspace.workspaceHandle === current)) return;
@@ -590,9 +616,15 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 			});
 			releaseDormantView(previousSessionHandle, null);
 			activateSessionView(null);
-			if (preferred) await get().reloadSessions(preferred.workspaceHandle);
+			if (preferred) await get().reloadSessions(preferred.workspaceHandle, options);
 		} catch (error) {
-			set({ loadingWorkspaces: false, error: error instanceof Error ? error.message : String(error) });
+			if (!isCurrent()) return;
+			set({
+				loadingWorkspaces: false,
+				...(get().navigationToken === navigationTokenAtStart
+					? { error: error instanceof Error ? error.message : String(error) }
+					: {}),
+			});
 		}
 	},
 
@@ -734,6 +766,7 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 		const workspaceHandle = requestedWorkspaceHandle ?? get().currentWorkspaceHandle;
 		if (!workspaceHandle) return Promise.resolve([]);
 		const request = nextSessionRequest();
+		const navigationTokenAtStart = get().navigationToken;
 		if (get().currentWorkspaceHandle === workspaceHandle) set({ loadingSessions: true });
 		const completion = (async () => {
 			try {
@@ -741,6 +774,15 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 					workspaceHandle,
 					options.force ? { force: true } : undefined,
 				);
+				if (options.isCurrent?.() === false) {
+					if (
+						isLatestSessionRequest(workspaceHandle, request) &&
+						get().currentWorkspaceHandle === workspaceHandle
+					) {
+						set({ loadingSessions: false });
+					}
+					return get().sessionsByWorkspace[workspaceHandle] ?? [];
+				}
 				if (!isLatestSessionRequest(workspaceHandle, request)) {
 					return (
 						sessionRequestByWorkspace.get(workspaceHandle)?.completion ??
@@ -782,6 +824,15 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 				});
 				return sorted;
 			} catch (error) {
+				if (options.isCurrent?.() === false) {
+					if (
+						isLatestSessionRequest(workspaceHandle, request) &&
+						get().currentWorkspaceHandle === workspaceHandle
+					) {
+						set({ loadingSessions: false });
+					}
+					return get().sessionsByWorkspace[workspaceHandle] ?? [];
+				}
 				if (!isLatestSessionRequest(workspaceHandle, request)) {
 					return (
 						sessionRequestByWorkspace.get(workspaceHandle)?.completion ??
@@ -792,7 +843,9 @@ export const useSessionDirectoryStore = create<SessionDirectoryState>()((set, ge
 				if (get().currentWorkspaceHandle === workspaceHandle) {
 					set({
 						loadingSessions: false,
-						error: error instanceof Error ? error.message : String(error),
+						...(get().navigationToken === navigationTokenAtStart
+							? { error: error instanceof Error ? error.message : String(error) }
+							: {}),
 					});
 				}
 				return get().sessionsByWorkspace[workspaceHandle] ?? [];
