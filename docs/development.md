@@ -123,12 +123,11 @@ The representative matrix targets high-value risks:
 `pnpm bench:stress` extends duration and load and runs only by explicit request or manual CI. It is
 not a substitute for deterministic correctness.
 
-This is Issue #28 Phase 1 and remains incomplete. Issue #28 stays open until the project publishes a
-pinned reference-host profile and records two fresh representative baseline runs. Historical
-observations from Issues #53 and #58 are non-reference. Structural checks and declared artifact
-shape are hard gates; host-sensitive latency, throughput, long-task, heap, and other
-timing/resource measurements remain diagnostic until that reference profile and variance policy
-exist. A green run proves only the declared scenarios.
+Structural checks and declared artifact shape are hard gates. Host-sensitive timing and resource
+measurements remain diagnostic unless backed by a compatible reference profile and variance policy.
+A green run proves only its declared scenarios. The [benchmark report](benchmark-report.md)
+defines measurement and comparison semantics; [Issue #28](https://github.com/leon-zym/pi-agent-web/issues/28)
+owns calibration, coverage gaps, and delivery acceptance.
 
 When changing a targeted optimization, add a reproducible scenario only if it guards a real product
 risk. Do not create a generic benchmark framework or convert unstable workstation timing into a

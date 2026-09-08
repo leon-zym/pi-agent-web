@@ -44,43 +44,30 @@ selection, scrolling, accessibility, and bundle cost.
   keeps a lightweight TOC tick, and prepend/reveal preserve a stable scroll anchor. This is a
   bounded turn window, not a second history database or a fixed-height virtualization spacer.
 
-## Measurements
+## Measurement rationale and historical evidence
 
-On the same local benchmark fixture:
+Early reducer, scheduler, SSR, and renderer comparisons informed this decision. The observations
+preserved in the [original recovered record](https://github.com/leon-zym/pi-agent-web/blob/5987e40dc4e9da45c45a7468fcc533323ce38f17/docs/decisions/0005-conversation-rendering.md)
+are historical reports, not current benchmarks; that record does not establish raw-run provenance
+for each number. Node SSR parsing/highlighting cost is a Browser long-task risk signal, not a
+Chromium mount, layout, or paint measurement. Lazy loading and streaming fallbacks do not by
+themselves prove that settled rendering is fast.
 
-- 10,000 sequential reducer updates took about 1.35 ms; scheduler plus batch took about 0.71 ms.
-- Eight Sessions × 2,000 compatible updates took about 1.88 ms in the scheduler path.
-- Moving settled Markdown behind a lazy boundary keeps the initial route independent from the
-  syntax-highlighting/Markdown chunk; the current production sizes and working budgets are listed
-  below.
-- A 64 KiB GFM/code fixture costs roughly 130 to 180 ms in the current Node SSR
-  parse/highlight/render proxy. This flags a browser long-task risk; it is not itself a Chromium
-  mount/layout/paint measurement and is not claimed as solved by lazy loading or the streaming
-  circuit breakers.
-- Production Chromium fixtures cover 10 KiB, 64 KiB, 120 KiB, and 1 MiB streamed responses. They
-  emit live long-task, cold/warm settlement, mounted-turn, and post-GC heap-delta metrics alongside
-  deterministic content, structure, and safety assertions. Host-sensitive numerical metrics are
-  diagnostic observations rather than hard budgets or a latest-pass claim until a calibrated
-  reference-host baseline and variance policy exist. Settlement timing starts at the final
-  stream-delta boundary and ends only after the settled DOM is present; the measurement reads
-  numeric DOM/heap values in the page and does not pull the full text across the Playwright
-  boundary.
-- The exact current-main production build is 243,266 bytes gzip for the entry JavaScript; the
-  unmodified 24-S2a candidate is 246,386 bytes gzip. The former 240 KiB entry cap (245,760 bytes)
-  consumes about 99.0% of that cap and leaves only 2,494 bytes, so the cap was nearly exhausted and
-  no longer provided a meaningful working margin. The entry cap is rebaselined to 256 KiB (262,144
-  bytes), leaving 15,758 bytes, or about 6.4%, of headroom above the candidate. The settled-Markdown
-  and UI CSS budgets remain unchanged at ≤110 KiB and ≤12 KiB gzip; root `pnpm build` runs
-  `scripts/check-ui-bundle-budget.mjs` and fails when one is exceeded.
-- The current build has one eager entry chunk, and the hard cap applies to that chunk. If the build
-  configuration later introduces additional eager/static JavaScript chunks, the checker must
-  aggregate the full initial synchronous graph before that change can pass. Manual/static chunk
-  splitting or an immediate dynamic App import used only to move bytes out of the checked entry may
-  not be credited as a reduction. Truly lazy, non-initial surfaces remain excluded.
-- Markstream parsed/mounted the same shape substantially faster in an isolated `<pre>` setup, but
-  its lazy JavaScript and CSS were about twice the current Markdown chunk footprint. Equivalent
-  syntax highlighting was absent, stable-prefix reuse required explicit options and was disabled by
-  final mode, and link/HTML/virtualization behavior differed.
+[PR #61](https://github.com/leon-zym/pi-agent-web/pull/61) records the historical entry-size comparison
+and the separate [bundle-budget change](https://github.com/leon-zym/pi-agent-web/commit/82a772282bb2a2c61235228bacec84ad689c048a).
+The old cap left little headroom for that candidate, motivating the rebaseline. Those byte counts
+identify that experiment, not current main. Enforced limits remain in the
+[bundle checker](../../scripts/check-ui-bundle-budget.mjs).
+
+The budget must account for the full initial synchronous JavaScript graph if additional eager/static
+chunks are introduced. Manual splitting or an immediate dynamic App import used only to move bytes
+out of the checked entry is not a reduction. Truly lazy, non-initial surfaces remain excluded.
+
+The isolated Markstream comparison lacked equivalent highlighting and differed in stable-prefix,
+link, HTML, and virtualization behavior. A faster isolated render therefore did not justify replacing
+the renderer. Current observation boundaries, reproducibility, and diagnostic limitations belong in
+the [benchmark report](../benchmark-report.md#current-streaming-observer-semantics); calibration and
+coverage delivery belong to [Issue #28](https://github.com/leon-zym/pi-agent-web/issues/28).
 
 ## Consequences
 

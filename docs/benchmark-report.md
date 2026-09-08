@@ -475,9 +475,10 @@ experiment. Snapshot and rekey scenarios retain their separate existing barrier 
 this experiment is instrumented recovery timing, including automation, callback gates and content
 assertions; it is not uninstrumented reconnect latency.
 
-Historical artifacts remain unchanged and incompatible. In particular, the earlier CI duplicate
-receive sequence lacks the connection/application boundaries required for retrospective attribution;
-this experiment does not establish that historical failure's cause or clear its failed result.
+Historical artifacts remain unchanged and incompatible. The unresolved historical failure and its
+investigation are recorded in [Issue #28](https://github.com/leon-zym/pi-agent-web/issues/28#issuecomment-5579565003)
+and [PR #90](https://github.com/leon-zym/pi-agent-web/pull/90); this experiment does not retrospectively
+clear that failed result.
 
 ## Reproduction Guide
 
