@@ -56,6 +56,12 @@ export function benchmarkQuota({
 	const controllers = read(path.posix.join(mount, "cgroup.controllers"), "root-controllers");
 	if (controllers.error) return unknown();
 	const available = controllers.value.split(/\s+/);
+	evidence.push({
+		version: 2,
+		mountRoot: "/",
+		membershipDepth: group === "/" ? 0 : group.split("/").length - 1,
+		controllers: available,
+	});
 	const values = {};
 	for (const [controller, file] of [
 		["cpu", "cpu.max"],
