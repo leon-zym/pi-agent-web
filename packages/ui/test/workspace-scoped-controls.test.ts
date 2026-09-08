@@ -14,6 +14,7 @@ import {
 	openSession,
 	renameSession,
 } from "../src/lib/session-controller";
+import { useComposerStore } from "../src/stores/composer";
 import { selectSessionControlStatus } from "../src/stores/session-control";
 import { selectCurrentWorkspaceSessions, useSessionDirectoryStore } from "../src/stores/session-directory";
 import {
@@ -23,6 +24,7 @@ import {
 } from "../src/stores/session-transport";
 
 const originalTransport = sessionTransport.store.getState();
+const originalComposer = useComposerStore.getState();
 const originalDirectory = useSessionDirectoryStore.getState();
 
 function workspace(workspaceHandle: string, available = true): NativeWorkspaceDto {
@@ -157,6 +159,7 @@ function isolateTransportActions() {
 
 afterEach(() => {
 	vi.restoreAllMocks();
+	useComposerStore.setState(originalComposer, true);
 	sessionTransport.store.setState(originalTransport, true);
 	useSessionDirectoryStore.setState(originalDirectory, true);
 });
@@ -1199,6 +1202,64 @@ describe("Session-scoped controls", () => {
 			fencingToken: "fence-crashed",
 		});
 		expect(releaseSession).toHaveBeenCalledWith("session-crashed");
-		expect(unsubscribeSession).toHaveBeenCalledWith("session-crashed");
+		expect(sessionTransport.store.getState().sessions["session-crashed"]).toBeUndefined();
 	});
+});
+
+it("forgets transport channels after each distinct successful deletion", async () => {
+	const request = vi.spyOn(api, "deleteSession").mockResolvedValue({ ok: true, recoverable: true });
+	vi.spyOn(api, "listWorkspaces").mockResolvedValue([workspace("workspace-a")]);
+	const other = transportChannel("kept", "held", true);
+	sessionTransport.store.setState({ sessions: { kept: other } });
+	useComposerStore.getState().beginSession("kept");
+	useComposerStore.getState().setDraftForSession("kept", "keep my draft");
+	for (let index = 0; index < 20; index += 1) {
+		const handle = `deleted-${index}`;
+		const deleted = session(handle, "workspace-a");
+		const channel = transportChannel(handle, "held", true);
+		channel.lease = { isController: true, fencingToken: `fence-${index}` };
+		sessionTransport.store.setState({
+			sessions: { [handle]: channel, ...sessionTransport.store.getState().sessions },
+		});
+		useSessionDirectoryStore.setState({
+			workspaces: [workspace("workspace-a")],
+			currentWorkspaceHandle: "workspace-a",
+			currentSession: deleted,
+			sessionsByWorkspace: { "workspace-a": [deleted] },
+		});
+		expect(sessionTransport.store.getState().sessions[handle]).toBeDefined();
+		await deleteSession(deleted);
+		expect(useSessionDirectoryStore.getState().sessionsByWorkspace["workspace-a"]).toHaveLength(0);
+		expect(Object.keys(sessionTransport.store.getState().sessions)).toEqual(["kept"]);
+		expect(sessionTransport.store.getState().sessions.kept).toBe(other);
+		expect(useComposerStore.getState().bySession.kept?.draft).toBe("keep my draft");
+	}
+	expect(request).toHaveBeenCalledTimes(20);
+});
+
+it("keeps channel and draft while deletion is pending or fails", async () => {
+	let reject!: (error: Error) => void;
+	vi.spyOn(api, "deleteSession").mockReturnValue(
+		new Promise((_resolve, fail) => {
+			reject = fail;
+		}),
+	);
+	const kept = session("delete-failed", "workspace-a");
+	const channel = transportChannel(kept.sessionHandle, "held", true);
+	channel.lease = { isController: true, fencingToken: "fence" };
+	sessionTransport.store.setState({ sessions: { [kept.sessionHandle]: channel } });
+	useSessionDirectoryStore.setState({
+		currentWorkspaceHandle: "workspace-a",
+		currentSession: kept,
+		sessionsByWorkspace: { "workspace-a": [kept] },
+	});
+	useComposerStore.getState().beginSession(kept.sessionHandle);
+	useComposerStore.getState().setDraftForSession(kept.sessionHandle, "unsent");
+	const pending = deleteSession(kept);
+	expect(sessionTransport.store.getState().sessions[kept.sessionHandle]).toBe(channel);
+	reject(new Error("delete rejected"));
+	await pending;
+	expect(sessionTransport.store.getState().sessions[kept.sessionHandle]).toBe(channel);
+	expect(useSessionDirectoryStore.getState().currentSession).toBe(kept);
+	expect(useComposerStore.getState().bySession[kept.sessionHandle]?.draft).toBe("unsent");
 });

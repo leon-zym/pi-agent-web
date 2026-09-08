@@ -467,7 +467,7 @@ async function abandonTransientChannel(
 			generation: management.generation,
 			fencingToken: management.fencingToken,
 		});
-		sessionTransport.store.getState().unsubscribeSession(sessionHandle);
+		sessionTransport.store.getState().forgetSession(sessionHandle);
 		useSessionDirectoryStore.getState().removeSession(management.workspaceHandle, sessionHandle);
 		return true;
 	} catch {

@@ -231,6 +231,8 @@ export interface SessionTransportState {
 	disconnect: () => void;
 	subscribeSession: (sessionHandle: string) => void;
 	unsubscribeSession: (sessionHandle: string) => void;
+	/** Retire local ownership only after confirmed deletion or completed transient abandonment. */
+	forgetSession: (sessionHandle: string) => void;
 	loadOlderSessionHistory: (sessionHandle: string) => boolean;
 	cancelSessionHistory: (sessionHandle: string) => boolean;
 	/** Drop a dormant local baseline so the next subscribe requests an initial snapshot. */

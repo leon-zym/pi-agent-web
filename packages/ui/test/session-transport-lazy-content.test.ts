@@ -360,7 +360,7 @@ describe("Session transport lazy projected content facade", () => {
 		expect(h.controller.store.getState().sessions["session-a"]?.recovery).toBeNull();
 	});
 
-	it.each(["disconnect", "rekey", "generation", "epoch", "dispose"] as const)(
+	it.each(["forget", "disconnect", "rekey", "generation", "epoch", "dispose"] as const)(
 		"aborts a lazy operation on %s and ignores its late settlement without resync",
 		async (transition) => {
 			if (transition === "epoch") vi.useFakeTimers();
@@ -384,7 +384,9 @@ describe("Session transport lazy projected content facade", () => {
 			const pending = h.controller.resolveText(value, externalText());
 			await vi.waitFor(() => expect(signal).toBeDefined());
 
-			if (transition === "disconnect") {
+			if (transition === "forget") {
+				h.controller.store.getState().forgetSession(value.sessionHandle);
+			} else if (transition === "disconnect") {
 				socket.serverClose();
 			} else if (transition === "rekey") {
 				h.controller.ingestServerMessage({

@@ -402,7 +402,7 @@ export async function deleteSession(session: NativeSessionDto): Promise<void> {
 			nextBrowserEffectKey("session-deleted"),
 		);
 		transport.releaseSession(session.sessionHandle);
-		transport.unsubscribeSession(session.sessionHandle);
+		transport.forgetSession(session.sessionHandle);
 		const directory = useSessionDirectoryStore.getState();
 		directory.removeSession(session.workspaceHandle, session.sessionHandle);
 		void directory.loadWorkspaces();

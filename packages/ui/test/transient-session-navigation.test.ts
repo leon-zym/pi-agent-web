@@ -364,7 +364,7 @@ describe("transient Session navigation", () => {
 		expect(releaseSession).not.toHaveBeenCalledWith(transient.sessionHandle);
 		finishAbandon?.();
 		await vi.waitFor(() => {
-			expect(unsubscribeSession).toHaveBeenCalledWith(transient.sessionHandle);
+			expect(sessionTransport.store.getState().sessions[transient.sessionHandle]).toBeUndefined();
 			expect(
 				useSessionDirectoryStore
 					.getState()
@@ -646,7 +646,7 @@ describe("transient Session navigation", () => {
 			generation: 4,
 			fencingToken: "fence-transient",
 		});
-		expect(unsubscribeSession).toHaveBeenCalledWith(transient.sessionHandle);
+		expect(sessionTransport.store.getState().sessions[transient.sessionHandle]).toBeUndefined();
 		expect(useSessionDirectoryStore.getState().retainedTransientByWorkspace["workspace-a"]).toBeUndefined();
 		expect(useSessionDirectoryStore.getState().currentWorkspaceHandle).toBeNull();
 	});
@@ -880,7 +880,7 @@ describe("transient Session navigation", () => {
 				generation: 4,
 				fencingToken: "fence-transient",
 			});
-			expect(unsubscribeSession).toHaveBeenCalledWith(transient.sessionHandle);
+			expect(sessionTransport.store.getState().sessions[transient.sessionHandle]).toBeUndefined();
 		});
 	});
 
@@ -923,7 +923,40 @@ describe("transient Session navigation", () => {
 				fencingToken: "fence-transient",
 			});
 			expect(useSessionDirectoryStore.getState().currentSession?.sessionHandle).toBe(target.sessionHandle);
-			expect(unsubscribeSession).toHaveBeenCalledWith(created.sessionHandle);
+			expect(sessionTransport.store.getState().sessions[created.sessionHandle]).toBeUndefined();
 		});
 	});
+});
+
+it("terminally forgets distinct completed transient abandons while preserving another draft", async () => {
+	const abandon = vi.spyOn(api, "abandonTransientSession").mockResolvedValue({ ok: true, abandoned: true });
+	const target = session("kept-history", true);
+	useSessionDirectoryStore.setState({ currentWorkspaceHandle: "workspace-a", currentSession: target });
+	useComposerStore.getState().beginSession(target.sessionHandle);
+	useComposerStore.getState().setDraftForSession(target.sessionHandle, "keep draft");
+	for (let index = 0; index < 20; index += 1) {
+		const handle = `abandoned-${index}`;
+		sessionTransport.store.setState({ sessions: { [handle]: controlledTransient(handle) } });
+		useSessionDirectoryStore.setState({ locallyCreatedTransientSessions: { [handle]: true } });
+		expect(sessionTransport.store.getState().sessions[handle]).toBeDefined();
+		reconcileHiddenSessionLifecycle(handle);
+		await vi.waitFor(() => expect(sessionTransport.store.getState().sessions[handle]).toBeUndefined());
+		expect(useSessionDirectoryStore.getState().currentSession).toBe(target);
+		expect(useComposerStore.getState().bySession[target.sessionHandle]?.draft).toBe("keep draft");
+	}
+	expect(abandon).toHaveBeenCalledTimes(20);
+});
+
+it("keeps a transient channel when abandonment fails", async () => {
+	vi.spyOn(api, "abandonTransientSession").mockRejectedValue(new Error("abandon rejected"));
+	const handle = "abandon-failed";
+	sessionTransport.store.setState({ sessions: { [handle]: controlledTransient(handle) } });
+	useSessionDirectoryStore.setState({
+		currentSession: session("kept-history", true),
+		locallyCreatedTransientSessions: { [handle]: true },
+	});
+	reconcileHiddenSessionLifecycle(handle);
+	await Promise.resolve();
+	await Promise.resolve();
+	expect(sessionTransport.store.getState().sessions[handle]).toBeDefined();
 });

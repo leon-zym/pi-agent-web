@@ -161,3 +161,46 @@ test("375px viewport has no page-level horizontal overflow", async ({ page, harn
 	expect(errors.console).toEqual([]);
 	expect(errors.page).toEqual([]);
 });
+
+test("confirmed deletion preserves another Session draft and cancellation preserves the target", async ({
+	page,
+	harness,
+}) => {
+	const errors = observePageErrors(page);
+	await page.goto(harness.origin, { waitUntil: "domcontentloaded" });
+	await expect(page.locator("textarea")).toBeEnabled();
+	await page.locator("textarea").fill("E2E_B_FAST");
+	await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
+	await expect(page.locator("main")).toContainText("E2E_REPLY:E2E_B_FAST");
+	await page.locator("textarea").fill("Keep this other Session draft");
+	const keptRow = page.locator("[data-session-row]").filter({ hasText: "E2E_B_FAST" });
+	await expect(keptRow).toHaveCount(1);
+	await page
+		.getByRole("navigation", { name: /^(Sidebar|侧栏)$/ })
+		.getByRole("button", { name: /^(New session|新建会话)$/ })
+		.first()
+		.click();
+	await expect(page.locator("textarea")).toHaveValue("");
+	await page.locator("textarea").fill("E2E_AFTER_IMAGE");
+	await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
+	await expect(page.locator("main")).toContainText("E2E_REPLY:E2E_AFTER_IMAGE");
+	await page.locator("textarea").fill("Keep until confirmed");
+	const deletedRow = page.locator("[data-session-row]").filter({ hasText: "E2E_AFTER_IMAGE" });
+	await expect(deletedRow).toHaveCount(1);
+	const moreActions = page.getByRole("button", { name: /^(More session actions|更多会话操作)$/ });
+	await moreActions.click();
+	await page.getByRole("menuitem", { name: /^(Delete session|删除会话)$/ }).click();
+	const dialog = page.getByRole("alertdialog", { name: /^(Delete session|删除会话)$/ });
+	await dialog.getByRole("button", { name: /^(Cancel|取消)$/ }).click();
+	await expect(page.locator("textarea")).toHaveValue("Keep until confirmed");
+	await expect(deletedRow).toHaveCount(1);
+	await moreActions.click();
+	await page.getByRole("menuitem", { name: /^(Delete session|删除会话)$/ }).click();
+	await dialog.getByRole("button", { name: /^(Delete|删除)$/ }).click();
+	await expect(deletedRow).toHaveCount(0);
+	await keptRow.getByRole("button").first().click();
+	await expect(page.locator("textarea")).toHaveValue("Keep this other Session draft");
+	await expect(page.locator("main")).toContainText("E2E_REPLY:E2E_B_FAST");
+	expect(errors.console).toEqual([]);
+	expect(errors.page).toEqual([]);
+});
