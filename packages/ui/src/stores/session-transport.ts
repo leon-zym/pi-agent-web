@@ -1463,11 +1463,30 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		return true;
 	}
 
+	function hasPendingInactiveRecovery(channel: SessionChannelState | undefined): boolean {
+		const runtime = channel?.runtime;
+		return Boolean(
+			store.getState().connectionState === "online" &&
+				channel?.subscribed &&
+				runtime &&
+				channel.generation === runtime.generation &&
+				channel.resync?.generation === runtime.generation &&
+				runtime.state === "crashed" &&
+				runtime.recoverable &&
+				(runtime.error === "session_snapshot_overflow" || runtime.error === "session_history_changed") &&
+				identitiesMatch(
+					recoveryMachine.getState().pendingOverflowRestarts.get(runtime.sessionHandle),
+					runtime,
+				),
+		);
+	}
+
 	function claimSessionIfReady(sessionHandle: string): boolean {
 		const channel = store.getState().sessions[sessionHandle];
 		const transition = transitionControl({
 			type: "claim_if_ready",
 			sessionHandle,
+			inactiveRecovery: hasPendingInactiveRecovery(channel),
 			online: store.getState().connectionState === "online",
 			baselineAuthoritative: channel?.baselineAuthoritative === true,
 			currentIdentity: channel?.runtime ?? null,
@@ -1502,42 +1521,25 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		const channel = store.getState().sessions[sessionHandle];
 		const recovery = resyncCoordinator.getState(sessionHandle);
 		if (
-			channel?.runtime?.error === "session_snapshot_overflow" &&
+			channel?.runtime?.state === "crashed" &&
+			channel.runtime.recoverable &&
+			(channel.runtime.error === "session_snapshot_overflow" ||
+				channel.runtime.error === "session_history_changed") &&
 			channel.generation !== null &&
 			recovery?.phase === "degraded"
 		) {
 			transitionControl({ type: "claim_intent", sessionHandle });
-			if (
-				channel.baselineAuthoritative &&
-				hasFreshLeaseBaseline(channel) &&
-				channel.resync === null &&
-				channel.lease.fencingToken
-			) {
-				return (
-					sendWire({
-						type: "session_restart",
-						sessionHandle,
-						expectedGeneration: channel.generation,
-						fencingToken: channel.lease.fencingToken,
-					}) === "sent"
-				);
-			}
+
 			transitionRecovery({
 				type: "set_pending_overflow_restart",
 				sessionHandle,
 				identity: channel.runtime,
 			});
-			if (!channel.baselineAuthoritative || !hasFreshLeaseBaseline(channel) || channel.resync !== null) {
-				if (resyncCoordinator.manualRetry(sessionHandle)) return true;
-				transitionRecovery({ type: "clear_pending_overflow_restart", sessionHandle });
-				transitionControl({ type: "clear_intent", sessionHandle });
-				return false;
-			}
-			if (!claimSessionIfReady(sessionHandle)) {
-				transitionRecovery({ type: "clear_pending_overflow_restart", sessionHandle });
-				return false;
-			}
-			return true;
+			// Re-subscribe for current runtime/lease evidence; a discarded projection cannot authorize work.
+			if (resyncCoordinator.manualRetry(sessionHandle)) return true;
+			transitionRecovery({ type: "clear_pending_overflow_restart", sessionHandle });
+			transitionControl({ type: "clear_intent", sessionHandle });
+			return false;
 		}
 		return resyncCoordinator.manualRetry(sessionHandle);
 	}
@@ -3548,6 +3550,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		const transition = transitionControl({
 			type: "lease_status",
 			sessionHandle: message.sessionHandle,
+			inactiveRecovery: hasPendingInactiveRecovery(current),
 			message,
 			currentIdentity: current.runtime,
 			baselineAuthoritative: current.baselineAuthoritative,
@@ -3566,7 +3569,10 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			if (
 				pendingRestart &&
 				identitiesMatch(pendingRestart, current.runtime) &&
-				current.runtime?.error === "session_snapshot_overflow"
+				current.runtime?.state === "crashed" &&
+				current.runtime.recoverable &&
+				(current.runtime.error === "session_snapshot_overflow" ||
+					current.runtime.error === "session_history_changed")
 			) {
 				transitionControl({ type: "claim_settled", sessionHandle: message.sessionHandle });
 				transitionRecovery({ type: "clear_pending_overflow_restart", sessionHandle: message.sessionHandle });

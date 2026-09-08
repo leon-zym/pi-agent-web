@@ -219,6 +219,46 @@ describe("Session connection machine", () => {
 });
 
 describe("Session control machine", () => {
+	it("requires a requested matching lease baseline for snapshot-free inactive recovery", () => {
+		const machine = createSessionControlMachine();
+		const handle = identity.sessionHandle;
+		machine.transition({ type: "subscribe", sessionHandle: handle });
+		machine.transition({ type: "claim_intent", sessionHandle: handle });
+		const event = {
+			type: "lease_status" as const,
+			sessionHandle: handle,
+			message: leaseStatus(identity, 0),
+			currentIdentity: identity,
+			baselineAuthoritative: false,
+			inactiveRecovery: true,
+		};
+		expect(machine.transition(event).leaseAccepted).toBe(false);
+		machine.transition({
+			type: "subscription_started",
+			sessionHandle: handle,
+			expectedIdentity: identityKey({ ...identity, generation: identity.generation + 1 }),
+		});
+		expect(machine.transition(event).leaseAccepted).toBe(false);
+		machine.transition({
+			type: "subscription_started",
+			sessionHandle: handle,
+			expectedIdentity: identityKey(identity),
+		});
+		expect(machine.transition(event).leaseAccepted).toBe(true);
+		const claim = {
+			type: "claim_if_ready" as const,
+			sessionHandle: handle,
+			online: true,
+			baselineAuthoritative: false,
+			currentIdentity: identity,
+		};
+		expect(machine.transition(claim).accepted).toBe(false);
+		expect(machine.transition({ ...claim, inactiveRecovery: true, online: false }).accepted).toBe(false);
+		expect(machine.transition({ ...claim, inactiveRecovery: true }).accepted).toBe(true);
+		machine.transition({ type: "connection_reset" });
+		expect(machine.transition({ ...claim, inactiveRecovery: true }).accepted).toBe(false);
+	});
+
 	it("defers lease state until baseline, gates claims, and preserves takeover CAS fencing", () => {
 		const machine = createSessionControlMachine();
 		const handle = identity.sessionHandle;

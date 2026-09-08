@@ -431,7 +431,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 	private establishLiveOverflowRecovery(connection: ConnectionState<M>, runtime: SessionRuntimeDto): void {
 		const current = this.supervisor.getRuntime(runtime.sessionHandle);
 		if (
-			runtime.error !== "session_snapshot_overflow" ||
+			!isExplicitlyRestartableRuntime(runtime) ||
 			current?.generation !== runtime.generation ||
 			current.error !== runtime.error ||
 			current.state !== runtime.state ||
@@ -992,12 +992,14 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 	): boolean {
 		if (
 			catchUp.exactTransactional ||
-			sessionErrorCode(this.errorText(error)) !== "session_snapshot_overflow"
+			!["session_snapshot_overflow", "session_history_changed"].includes(
+				sessionErrorCode(this.errorText(error)),
+			)
 		) {
 			return false;
 		}
 		const runtime = this.supervisor.getRuntime(catchUp.currentHandle);
-		if (runtime?.error !== "session_snapshot_overflow") return false;
+		if (!runtime || !isExplicitlyRestartableRuntime(runtime)) return false;
 		if (!this.adoptCatchUpHandle(connection, catchUp, runtime.sessionHandle, catchUp.rekeyVersion)) {
 			return false;
 		}
@@ -1826,7 +1828,7 @@ class SessionWsBridgeCore<M extends SessionRuntimeProductMode> {
 				this.connections.has(connection) &&
 				this.isSubscribed(connection, sessionHandle) &&
 				current?.generation === message.expectedGeneration &&
-				current.error === "session_snapshot_overflow"
+				isExplicitlyRestartableRuntime(current)
 			) {
 				connection.restartableOverflows.set(current.sessionHandle, current.generation);
 			}
@@ -2349,6 +2351,15 @@ function assertBridgeActivation(value: BridgeActivation, serverEpoch: string): v
 
 function positiveLimit(value: number | undefined, fallback: number): number {
 	return Number.isFinite(value) ? Math.min(fallback, Math.max(1, Math.floor(value as number))) : fallback;
+}
+
+// Both failures discard the projection and require a fresh, explicitly fenced generation.
+function isExplicitlyRestartableRuntime(runtime: SessionRuntimeDto): boolean {
+	return (
+		runtime.state === "crashed" &&
+		runtime.recoverable &&
+		(runtime.error === "session_snapshot_overflow" || runtime.error === "session_history_changed")
+	);
 }
 
 function sessionErrorCode(errorText: string): string {
