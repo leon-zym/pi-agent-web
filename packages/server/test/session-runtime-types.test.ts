@@ -125,9 +125,7 @@ describe("Session Runtime canonical payload carriers", () => {
 			SessionReplayFrame<ProductSessionEventDto, ExtensionUiRequestDto>,
 			{ type: "extension_ui_request" }
 		>["request"];
-		type CanonicalExtensionResponse = Parameters<
-			SessionRuntimeCore<"content_ref">["sendExtensionUiResponse"]
-		>[0];
+		type CanonicalExtensionResponse = Parameters<SessionRuntimeCore["sendExtensionUiResponse"]>[0];
 		expectTypeOf<CanonicalExtension>().toEqualTypeOf<ExtensionUiRequestDto>();
 		expectTypeOf<CanonicalExtensionResponse>().toEqualTypeOf<ExtensionUiResponseDto>();
 		expect(supervisor).toBe(frame);
