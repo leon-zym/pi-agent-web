@@ -1,7 +1,8 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	WorkspaceFileReferenceError,
@@ -28,6 +29,38 @@ afterEach(() => {
 });
 
 describe("WorkspaceFileReferenceService", () => {
+	it.each(["closed", "reading"])("preserves ignore-policy safety when Git stdin is %s", async (mode) => {
+		const root = workspace();
+		write(root, ".gitignore", "ignored.txt\n");
+		write(root, "safe.txt", "captured bytes\n");
+		const { stdout, stderr } = await promisify(execFile)(
+			process.execPath,
+			[
+				"--import",
+				import.meta.resolve("tsx"),
+				path.join(import.meta.dirname, "fixtures", "git-ignore-stdin.mjs"),
+				root,
+				mode,
+			],
+			{ timeout: 5_000 },
+		);
+		expect(stderr).toBe("");
+		const result = JSON.parse(stdout);
+		expect(result.content).toEqual({ type: "text", text: "captured bytes\n" });
+		if (mode === "closed") {
+			expect(result.policy).toBe("unknown");
+			expect(result.file.risks).toContain("policy_unknown");
+			expect(result.file.availability).toBe("confirmation_required");
+			expect(result.file.preview).toBeUndefined();
+			expect(result.captureError).toBe("workspace_file_confirmation_required");
+		} else {
+			expect(result.policy).toBe("none");
+			expect(result.file.risks).toEqual([]);
+			expect(result.file.preview).toBe("captured bytes\n");
+			expect(result.captureError).toBeNull();
+		}
+	});
+
 	it("classifies text, hidden, generated, credential, binary, image, ignored, and large files", async () => {
 		const root = workspace();
 		execFileSync("git", ["init", "-q"], { cwd: root });
