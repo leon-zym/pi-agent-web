@@ -1,293 +1,284 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
+import {
+	benchmarkMetricPolicy,
+	canonicalFormalExpectedScenarioSet,
+	loadBenchmarkMatrix,
+} from "./performance-benchmark-validator.mjs";
 
-const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
-const repositoryRoot = path.resolve(scriptDirectory, "..");
-const defaultBaselinePath = path.join(
-	repositoryRoot,
-	"tests/e2e/benchmarks/baselines/reference-linux-x64.json",
-);
+const keyFor = (value) => `${value.domain}:${value.scenarioId ?? value.id}:${value.variant}`;
+const record = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+const sameKeys = (left, right) => isDeepStrictEqual(Object.keys(left).sort(), Object.keys(right).sort());
+const hash = (text) => createHash("sha256").update(text).digest("hex");
 
-function formatNumber(value) {
-	if (value === null || value === undefined || !Number.isFinite(value)) return "—";
-	if (Number.isInteger(value)) return value.toLocaleString("en-US");
-	return Number(value.toFixed(2)).toLocaleString("en-US");
-}
-
-function formatDelta(diff) {
-	if (diff === null || diff === undefined || !Number.isFinite(diff)) return "—";
-	const prefix = diff > 0 ? "+" : "";
-	const formatted = Number.isInteger(diff)
-		? diff.toLocaleString("en-US")
-		: Number(diff.toFixed(2)).toLocaleString("en-US");
-	return `${prefix}${formatted}`;
-}
-
-function formatPercent(pct) {
-	if (pct === null || pct === undefined || !Number.isFinite(pct)) return "—";
-	const prefix = pct > 0 ? "+" : "";
-	return `${prefix}${pct.toFixed(1)}%`;
-}
-
-export function compareBenchmarkBaseline(benchmark, baselineData) {
-	const results = Array.isArray(benchmark?.results) ? benchmark.results : [];
-	const baselineScenarios = baselineData?.scenarios ?? {};
-
-	const scenarioComparisons = [];
-	const warnings = [];
-	let totalMetricsEvaluated = 0;
-
-	for (const result of results) {
-		const scenarioKey = `${result.domain}:${result.scenarioId}:${result.variant}`;
-		const baselineScenario = baselineScenarios[scenarioKey];
-
-		const metricComparisons = [];
-		const summaries = result.summaries ?? {};
-
-		const metricKeys = new Set([
-			...Object.keys(summaries),
-			...(baselineScenario?.metrics ? Object.keys(baselineScenario.metrics) : []),
-		]);
-
-		const sortedMetricKeys = [...metricKeys].sort();
-
-		for (const metricName of sortedMetricKeys) {
-			totalMetricsEvaluated++;
-			const observedSummary = summaries[metricName];
-			const baselineMetric = baselineScenario?.metrics?.[metricName];
-
-			const actual = observedSummary?.median ?? null;
-			const baselineMedian = baselineMetric?.maxMedian ?? null;
-			const threshold = baselineMetric?.threshold ?? null;
-
-			let diff = null;
-			let pctDiff = null;
-			let isWarning = false;
-			let status = "OK";
-
-			if (actual !== null && baselineMedian !== null) {
-				diff = actual - baselineMedian;
-				if (baselineMedian !== 0) {
-					pctDiff = (diff / baselineMedian) * 100;
-				} else {
-					pctDiff = diff === 0 ? 0 : null;
-				}
-			}
-
-			if (actual !== null && threshold !== null) {
-				if (actual > threshold) {
-					isWarning = true;
-					status = "WARNING";
-					warnings.push({
-						scenarioKey,
-						domain: result.domain,
-						scenarioId: result.scenarioId,
-						variant: result.variant,
-						metricName,
-						actual,
-						baselineMedian,
-						threshold,
-						diff,
-						pctDiff,
-						exceededBy: actual - threshold,
-					});
-				}
-			} else if (baselineMetric === undefined) {
-				status = "UNTRACKED";
-			} else if (actual === null) {
-				status = "MISSING";
-			}
-
-			metricComparisons.push({
-				metricName,
-				actual,
-				baselineMedian,
-				threshold,
-				diff,
-				pctDiff,
-				isWarning,
-				status,
-			});
-		}
-
-		scenarioComparisons.push({
-			scenarioKey,
-			domain: result.domain,
-			scenarioId: result.scenarioId,
-			variant: result.variant,
-			metrics: metricComparisons,
-			hasBaseline: Boolean(baselineScenario),
-		});
+function evidenceErrors(bundle) {
+	const errors = [];
+	const { benchmark: run, manifest, environment } = bundle ?? {};
+	if (!record(run) || !record(manifest) || !record(environment))
+		return ["missing run, manifest or environment"];
+	if (run.schemaVersion !== 2 || run.suiteVersion !== 2) errors.push("unsupported run schema/suite");
+	if (!Array.isArray(run.validationErrors) || run.validationErrors.length || run.playwrightExitCode !== 0)
+		errors.push("formal run validation did not succeed");
+	if (!run.runId || manifest.runId !== run.runId || environment.runId !== run.runId)
+		errors.push("run identity mismatch");
+	if (!Array.isArray(run.results) || !run.results.length) return [...errors, "empty results"];
+	let expected;
+	try {
+		expected = canonicalFormalExpectedScenarioSet(loadBenchmarkMatrix(), run.tier);
+	} catch {
+		return [...errors, "unknown matrix tier"];
 	}
+	if (!isDeepStrictEqual(manifest.expectedScenarioSet, expected))
+		errors.push("incomplete canonical scenario set");
+	if (run.results.some((result) => !record(result))) return [...errors, "malformed scenario"];
+	const actualKeys = run.results.map(keyFor).sort();
+	if (!isDeepStrictEqual(actualKeys, expected.map(keyFor).sort()))
+		errors.push("missing, duplicate or unexpected scenario");
+	for (const result of run.results) {
+		const key = keyFor(result);
+		if (result.status !== "passed" || !Array.isArray(result.errors) || result.errors.length)
+			errors.push(`${key}: unsuccessful scenario`);
+		if (!record(result.summaries) || !Object.keys(result.summaries).length) {
+			errors.push(`${key}: empty summaries`);
+			continue;
+		}
+		const definition = expected.find((entry) => keyFor(entry) === key);
+		const trials = Array.isArray(result.trials) ? result.trials : [];
+		if (!definition || trials.length !== definition.warmups + definition.measured) {
+			errors.push(`${key}: incomplete trial count`);
+			continue;
+		}
+		for (const [index, trial] of trials.entries()) {
+			if (!record(trial)) {
+				errors.push(`${key}: malformed trial ${index}`);
+				continue;
+			}
+			if (trial.index !== index || trial.warmup !== index < definition.warmups)
+				errors.push(`${key}: invalid trial index/warmup ${index}`);
+			if (
+				!record(trial.metrics) ||
+				!sameKeys(trial.metrics, result.summaries) ||
+				Object.values(trial.metrics).some((value) => !Number.isFinite(value))
+			)
+				errors.push(`${key}: missing or invalid trial metrics`);
+			if (
+				!record(trial.correctness) ||
+				trial.correctness.complete !== true ||
+				Object.values(trial.correctness).some((value) => value !== true)
+			)
+				errors.push(`${key}: failed correctness`);
+		}
+		const measured = trials.filter((trial) => record(trial) && trial.warmup === false);
+		if (measured.length !== definition.measured) {
+			errors.push(`${key}: missing measured trials`);
+			continue;
+		}
+		for (const [name, summary] of Object.entries(result.summaries)) {
+			const values = measured.map((trial) => trial.metrics?.[name]).sort((a, b) => a - b);
+			if (
+				!record(summary) ||
+				!benchmarkMetricPolicy(name) ||
+				values.some((value) => !Number.isFinite(value))
+			) {
+				errors.push(`${key}: invalid metric ${name}`);
+				continue;
+			}
+			const median = values[Math.floor(values.length / 2)];
+			const expectedSummary = {
+				count: values.length,
+				min: values[0],
+				max: values.at(-1),
+				median: values.length % 2 ? median : (values[values.length / 2 - 1] + median) / 2,
+				p95: values[Math.ceil(values.length * 0.95) - 1],
+			};
+			if (!isDeepStrictEqual(summary, expectedSummary)) errors.push(`${key}: invalid summary ${name}`);
+		}
+		if (
+			!Array.isArray(result.gates) ||
+			!result.gates.length ||
+			result.gates.some((gate) => !record(gate) || (gate.mode === "hard" && gate.passed !== true))
+		)
+			errors.push(`${key}: missing or failed hard gates`);
+	}
+	return errors;
+}
 
+function missingMetadata(value) {
+	if (record(value)) return !Object.keys(value).length || Object.values(value).some(missingMetadata);
+	if (Array.isArray(value)) return !value.length || value.some(missingMetadata);
+	return value === undefined || value === null || value === "" || value === "unavailable";
+}
+
+function compatibilityQuota(environment) {
+	// The current producer reads CPU quotas from Linux cgroups only. Darwin's
+	// explicit sentinel means inapplicable here; absent fields and Linux unknowns
+	// still fail metadata validation. Do not modify the recorded evidence.
+	if (environment.os === "darwin" && environment.quota?.cpu === "unavailable")
+		return { cpu: "not-applicable:darwin-cgroups", memoryBytes: environment.quota.memoryBytes };
+	return { cpu: environment.quota?.cpu, memoryBytes: environment.quota?.memoryBytes };
+}
+
+function compatibility(bundle) {
+	const { environment: e, manifest: m, benchmark: b } = bundle;
 	return {
-		runId: benchmark?.runId ?? "unknown",
-		tier: benchmark?.tier ?? "unknown",
-		profileId: baselineData?.profileId ?? "unknown",
-		baselineRuns: baselineData?.provenanceRuns ?? [],
-		formula: baselineData?.formula ?? "",
-		scenarios: scenarioComparisons,
-		warnings,
-		totalScenarios: scenarioComparisons.length,
-		totalMetrics: totalMetricsEvaluated,
+		environment: Object.fromEntries(
+			[
+				"os",
+				"kernel",
+				"architecture",
+				"cpu",
+				"quota",
+				"memory",
+				"image",
+				"node",
+				"pnpm",
+				"playwright",
+				"chromium",
+			].map((key) => [key, key === "quota" ? compatibilityQuota(e) : e[key]]),
+		),
+		workload: Object.fromEntries(
+			[
+				"matrix",
+				"fixtureHashes",
+				"lockfileHash",
+				"seed",
+				"expectedScenarioSet",
+				"warmupCounts",
+				"measuredCounts",
+			].map((key) => [key, m[key]]),
+		),
+		suiteVersion: b.suiteVersion,
+		tier: b.tier,
+		parameters: b.results.map((result) => [keyFor(result), result.parameters]).sort(),
 	};
 }
 
+/** Compare complete run bundles. This supplements, and never replaces, formal raw validation. */
+export function compareBenchmarkBaseline(target, baseline) {
+	const errors = evidenceErrors(target);
+	const legacy = record(baseline?.scenarios) && !baseline.benchmark;
+	if (legacy && !Object.keys(baseline.scenarios).length) errors.push("empty historical baseline");
+	if (!legacy) errors.push(...evidenceErrors(baseline).map((error) => `baseline: ${error}`));
+	const comparison = {
+		status: "INVALID",
+		errors,
+		incompatibilities: [],
+		metrics: [],
+		runId: target?.benchmark?.runId ?? "unknown",
+	};
+	if (errors.length) return comparison;
+	if (legacy) {
+		comparison.status = "INCOMPATIBLE";
+		comparison.incompatibilities.push(
+			"historical calibration lacks exact workload/environment provenance and uses the old metric policy",
+		);
+		return comparison;
+	}
+	const left = compatibility(target);
+	const right = compatibility(baseline);
+	for (const group of Object.keys(left)) {
+		if (!isDeepStrictEqual(left[group], right[group])) comparison.incompatibilities.push(`${group} differs`);
+	}
+	for (const group of [left.environment, left.workload, right.environment, right.workload]) {
+		if (missingMetadata(group)) comparison.incompatibilities.push("missing compatibility metadata");
+	}
+	for (const result of target.benchmark.results) {
+		const previous = baseline.benchmark.results.find((entry) => keyFor(entry) === keyFor(result));
+		if (previous && !sameKeys(result.summaries, previous.summaries))
+			comparison.errors.push(`${keyFor(result)}: missing comparison metric`);
+	}
+	if (comparison.errors.length) return comparison;
+	if (comparison.incompatibilities.length) {
+		comparison.status = "INCOMPATIBLE";
+		return comparison;
+	}
+	for (const result of target.benchmark.results) {
+		const previous = baseline.benchmark.results.find((entry) => keyFor(entry) === keyFor(result));
+		for (const [name, summary] of Object.entries(result.summaries)) {
+			const policy = benchmarkMetricPolicy(name);
+			if (policy.mode === "hard" || policy.direction === "none") continue;
+			const reference = previous.summaries[name].median;
+			const threshold =
+				policy.direction === "higher"
+					? reference / 1.5
+					: reference + Math.abs(reference) * 0.5 + policy.floor;
+			const regression =
+				policy.direction === "higher" ? summary.median < threshold : summary.median > threshold;
+			comparison.metrics.push({
+				scenario: keyFor(result),
+				name,
+				...policy,
+				actual: summary.median,
+				reference,
+				threshold,
+				status: regression ? "REGRESSION" : "OK",
+			});
+		}
+	}
+	comparison.status = comparison.metrics.some((metric) => metric.status === "REGRESSION")
+		? "REGRESSION"
+		: comparison.metrics.length
+			? "OK"
+			: "INVALID";
+	if (!comparison.metrics.length) comparison.errors.push("no diagnostic metrics evaluated");
+	return comparison;
+}
+
 export function generateComparisonMarkdown(comparison) {
-	const lines = [
-		"# Performance Benchmark Baseline Comparison",
+	return [
+		"# Performance Benchmark Comparison",
 		"",
-		`- Target Run: \`${comparison.runId}\``,
-		`- Tier: \`${comparison.tier}\``,
-		`- Baseline Profile: \`${comparison.profileId}\``,
-		`- Total Scenarios Evaluated: ${String(comparison.totalScenarios)}`,
-		`- Total Metrics Evaluated: ${String(comparison.totalMetrics)}`,
-		`- Status: ${comparison.warnings.length === 0 ? "PASSED (No threshold regressions)" : `WARNING (${String(comparison.warnings.length)} metric(s) exceeded threshold)`}`,
+		`- Target Run: ${comparison.runId}`,
+		`- Status: ${comparison.status}`,
 		"",
-	];
-
-	if (comparison.warnings.length > 0) {
-		lines.push(
-			"## ⚠️ Threshold Warnings",
-			"",
-			"| Scenario | Metric | Actual Median | Baseline Median | Threshold | Exceeded By |",
-			"| :--- | :--- | ---: | ---: | ---: | ---: |",
-		);
-		for (const w of comparison.warnings) {
-			lines.push(
-				`| \`${w.scenarioKey}\` | \`${w.metricName}\` | ${formatNumber(w.actual)} | ${formatNumber(w.baselineMedian)} | ${formatNumber(w.threshold)} | +${formatNumber(w.exceededBy)} |`,
-			);
-		}
-		lines.push("");
-	} else {
-		lines.push("> ✅ All observed scenario medians are within calibrated baseline thresholds.", "");
-	}
-
-	lines.push("## Scenario Details", "");
-
-	for (const scenario of comparison.scenarios) {
-		lines.push(`### \`${scenario.scenarioKey}\``, "");
-		if (!scenario.hasBaseline) {
-			lines.push("> *No baseline profile entry calibrated for this scenario.*", "");
-			continue;
-		}
-
-		lines.push(
-			"| Metric | Actual Median | Baseline Median | Delta | Delta % | Threshold | Status |",
-			"| :--- | ---: | ---: | ---: | ---: | ---: | :---: |",
-		);
-		for (const m of scenario.metrics) {
-			const statusBadge = m.isWarning ? "⚠️ WARNING" : m.status;
-			lines.push(
-				`| \`${m.metricName}\` | ${formatNumber(m.actual)} | ${formatNumber(m.baselineMedian)} | ${formatDelta(m.diff)} | ${formatPercent(m.pctDiff)} | ${formatNumber(m.threshold)} | ${statusBadge} |`,
-			);
-		}
-		lines.push("");
-	}
-
-	return lines.join("\n");
+		"Timing/resource regressions are diagnostic. Correctness remains a formal hard gate. OK is not a raw-artifact validation certificate.",
+		"",
+		...comparison.errors.map((error) => `- INVALID: ${error}`),
+		...comparison.incompatibilities.map((reason) => `- INCOMPATIBLE: ${reason}`),
+		"",
+		"| Scenario | Metric | Unit | Direction | Actual median | Reference median | Threshold | Status |",
+		"| --- | --- | --- | --- | ---: | ---: | ---: | --- |",
+		...comparison.metrics.map(
+			(m) =>
+				`| ${m.scenario} | ${m.name} | ${m.unit} | ${m.direction} | ${m.actual} | ${m.reference} | ${m.threshold} | ${m.status} |`,
+		),
+		"",
+	].join("\n");
 }
 
-function parseArgs(args) {
-	let target = null;
-	let baseline = null;
-
-	for (let i = 0; i < args.length; i++) {
-		const arg = args[i];
-		if (arg === "--help" || arg === "-h") {
-			return { help: true, target: null, baseline: null };
-		}
-		if (arg === "--baseline") {
-			i++;
-			if (i < args.length) {
-				baseline = args[i];
-			}
-		} else if (arg.startsWith("--baseline=")) {
-			baseline = arg.slice("--baseline=".length);
-		} else if (!arg.startsWith("-")) {
-			if (!target) {
-				target = arg;
-			}
-		}
-	}
-
-	return { help: false, target, baseline };
+function readBundle(target) {
+	const resolved = path.resolve(target);
+	const filename = fs.statSync(resolved).isDirectory() ? path.join(resolved, "benchmark.json") : resolved;
+	const benchmark = JSON.parse(fs.readFileSync(filename, "utf8"));
+	if (record(benchmark.scenarios)) return benchmark;
+	const directory = path.dirname(filename);
+	const manifestText = fs.readFileSync(path.join(directory, "manifest.json"), "utf8");
+	const environmentText = fs.readFileSync(path.join(directory, "environment.json"), "utf8");
+	if (hash(manifestText) !== benchmark.manifestHash || hash(environmentText) !== benchmark.environmentHash)
+		throw new Error("manifest/environment hashes do not match the run");
+	return { benchmark, manifest: JSON.parse(manifestText), environment: JSON.parse(environmentText) };
 }
 
-export function main() {
-	const args = process.argv.slice(2);
-	const parsed = parseArgs(args);
-
-	if (parsed.help || !parsed.target) {
+export function main(args = process.argv.slice(2)) {
+	if (args.includes("--help") || args.includes("-h")) {
 		process.stdout.write(
-			"Usage: node scripts/compare-benchmark-baseline.mjs <path-to-benchmark-dir-or-benchmark.json> [--baseline <path-to-baseline.json>]\n",
+			"Usage: node scripts/compare-benchmark-baseline.mjs <run-dir-or-json> --baseline <run-dir-or-json>\n",
 		);
 		return 0;
 	}
-
-	const resolvedTarget = path.resolve(process.cwd(), parsed.target);
-	let benchmarkFile = resolvedTarget;
-	let isDir = false;
-
 	try {
-		const stat = fs.statSync(resolvedTarget);
-		if (stat.isDirectory()) {
-			isDir = true;
-			benchmarkFile = path.join(resolvedTarget, "benchmark.json");
-		}
+		if (args.length !== 3 || args[1] !== "--baseline")
+			throw new Error("provide a target run and --baseline run directory or JSON");
+		const comparison = compareBenchmarkBaseline(readBundle(args[0]), readBundle(args[2]));
+		process.stdout.write(generateComparisonMarkdown(comparison));
+		return comparison.status === "INVALID" ? 1 : comparison.status === "INCOMPATIBLE" ? 2 : 0;
 	} catch (error) {
-		process.stderr.write(`Target path does not exist: ${resolvedTarget} (${error.message})\n`);
-		return 0;
+		process.stderr.write(`INVALID: ${error.message}\n`);
+		return 1;
 	}
-
-	if (!fs.existsSync(benchmarkFile)) {
-		process.stderr.write(`Benchmark JSON file not found at: ${benchmarkFile}\n`);
-		return 0;
-	}
-
-	const resolvedBaseline = parsed.baseline
-		? path.resolve(process.cwd(), parsed.baseline)
-		: defaultBaselinePath;
-
-	if (!fs.existsSync(resolvedBaseline)) {
-		process.stderr.write(`Baseline JSON file not found at: ${resolvedBaseline}\n`);
-		return 0;
-	}
-
-	let benchmark;
-	try {
-		benchmark = JSON.parse(fs.readFileSync(benchmarkFile, "utf8"));
-	} catch (error) {
-		process.stderr.write(`Failed to parse benchmark JSON at ${benchmarkFile}: ${error.message}\n`);
-		return 0;
-	}
-
-	let baselineData;
-	try {
-		baselineData = JSON.parse(fs.readFileSync(resolvedBaseline, "utf8"));
-	} catch (error) {
-		process.stderr.write(`Failed to parse baseline JSON at ${resolvedBaseline}: ${error.message}\n`);
-		return 0;
-	}
-
-	const comparison = compareBenchmarkBaseline(benchmark, baselineData);
-	const markdown = generateComparisonMarkdown(comparison);
-
-	process.stdout.write(`${markdown}\n`);
-
-	if (isDir) {
-		const comparisonFilePath = path.join(resolvedTarget, "benchmark-comparison.md");
-		try {
-			fs.writeFileSync(comparisonFilePath, `${markdown}\n`, "utf8");
-		} catch (error) {
-			process.stderr.write(`Failed to write comparison file to ${comparisonFilePath}: ${error.message}\n`);
-		}
-	}
-
-	return 0;
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
-	process.exitCode = main();
-}
+if (process.argv[1] === fileURLToPath(import.meta.url)) process.exitCode = main();

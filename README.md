@@ -134,17 +134,26 @@ See [Development](docs/development.md) for test boundaries.
 
 ### Performance benchmarks
 
-The Phase 1 representative performance baseline is calibrated on the reference environment (`linux-x64-gh-standard`). It verifies 16 deterministic correctness hard gates (0 duplicate events, 0 lost events, stale lease rejection, sequence barriers, 0 browser errors) and tracks host-sensitive diagnostic timing metrics across 22 representative scenario and variant combinations.
+The representative suite runs the same deterministic scenarios locally and on Actions. Correctness
+is a hard gate; timing and resource comparisons are diagnostic. The checked-in September 6
+calibration is historical evidence, incompatible with the corrected comparison policy. Fresh
+reference calibration remains part of #28.
 
-- Formal report and baseline data: [Performance Benchmark Report](docs/benchmark-report.md)
-- Reproduce the representative benchmark suite locally:
+- Method, historical evidence, and compatibility requirements: [Performance Benchmark Report](docs/benchmark-report.md)
+- Collect two complete runs on the same local host (use a stable label for its OS installation):
   ```bash
-  pnpm bench:representative
+  PI_WEB_BENCHMARK_IMAGE=local-host-v1 pnpm bench:representative
+  # Repeat after the change, keeping the environment and benchmark fixtures unchanged.
+  PI_WEB_BENCHMARK_IMAGE=local-host-v1 pnpm bench:representative
   ```
-- Compare local results against the calibrated reference baseline:
+- Compare their artifact directories, retaining sibling manifest and environment files:
   ```bash
-  node scripts/compare-benchmark-baseline.mjs <benchmark-dir>
+  node scripts/compare-benchmark-baseline.mjs <target-run-dir> --baseline <reference-run-dir>
   ```
+  Results are under `test-results/performance/`. Actions artifacts use the same command after
+  download. Reference comparisons require matching CPU, OS, toolchain, workload, and resource
+  metadata; an Actions label alone is insufficient. Incompatible runs return `INCOMPATIBLE`
+  without applying budgets. Keep failed artifacts; do not select only the fastest reference run.
 - Run the explicit long-running stress matrix:
   ```bash
   pnpm bench:stress
