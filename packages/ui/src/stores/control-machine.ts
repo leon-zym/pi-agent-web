@@ -62,6 +62,7 @@ export type SessionControlMachineEvent =
 	| {
 			type: "claim_if_ready";
 			sessionHandle: string;
+			inactiveRecovery?: boolean;
 			online: boolean;
 			baselineAuthoritative: boolean;
 			currentIdentity: SessionRuntimeIdentityDto | null;
@@ -81,6 +82,7 @@ export type SessionControlMachineEvent =
 	| {
 			type: "lease_status";
 			sessionHandle: string;
+			inactiveRecovery?: boolean;
 			message: LeaseStatusMessage;
 			currentIdentity: SessionRuntimeIdentityDto | null;
 			baselineAuthoritative: boolean;
@@ -274,7 +276,10 @@ function reduceLeaseStatus(
 			expectedFromSubscription !== undefined &&
 			(expectedFromSubscription === null || expectedFromSubscription === identityKey(currentIdentity)));
 
-	if (!event.baselineAuthoritative) {
+	// Inactive recovery proves control through a requested lease baseline, never a projection.
+	const recoveryControl =
+		event.inactiveRecovery === true && (controlledBaseline || hasFreshBaseline(session, currentIdentity));
+	if (!event.baselineAuthoritative && !recoveryControl) {
 		const pending = session.pendingLeaseStatus;
 		if (!pending || event.message.leaseRevision > pending.message.leaseRevision) {
 			const updated = updateSession(state, event.sessionHandle, (current) => ({
@@ -500,7 +505,7 @@ export function reduceSessionControlMachine(
 				!session?.subscribed ||
 				!event.online ||
 				!session.controllerIntent ||
-				!event.baselineAuthoritative ||
+				(!event.baselineAuthoritative && event.inactiveRecovery !== true) ||
 				!event.currentIdentity ||
 				!hasFreshBaseline(session, event.currentIdentity) ||
 				session.lease.isController ||

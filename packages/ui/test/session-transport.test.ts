@@ -3375,93 +3375,186 @@ describe("session transport replay and recovery", () => {
 		expect(socket.sent).toContainEqual({ type: "session_subscribe", sessionHandle: "session-a" });
 	});
 
-	it("uses explicit fenced restart for a degraded snapshot-overflow runtime", async () => {
-		const clock = new ResyncClock();
-		const h = harness({ resyncClock: clock, resyncRandom: () => 0.5 });
-		const socket = connect(h);
-		subscribeAndPrime(h, "session-a", 3, 8);
-		const overflowed = {
-			...runtime("session-a", 3, 9),
-			state: "crashed" as const,
-			error: "session_snapshot_overflow",
-		};
-		socket.serverMessage({ type: "runtime_state", runtime: overflowed });
-		socket.serverMessage({
-			type: "resync_required",
-			serverEpoch: overflowed.serverEpoch,
-			sessionHandle: overflowed.sessionHandle,
-			runtime: overflowed,
-			reason: "gap",
-		});
-		socket.serverMessage({
-			type: "lease_status",
-			serverEpoch: overflowed.serverEpoch,
-			sessionHandle: overflowed.sessionHandle,
-			generation: overflowed.generation,
-			leaseRevision: 0,
-			controlState: "free",
-			transition: "baseline",
-			isController: false,
-		});
-		const failAttempt = () =>
+	it.each(["session_snapshot_overflow", "session_history_changed"])(
+		"uses explicit fenced restart for a degraded runtime: %s",
+		async (error) => {
+			const clock = new ResyncClock();
+			const h = harness({ resyncClock: clock, resyncRandom: () => 0.5 });
+			const socket = connect(h);
+			subscribeAndPrime(h, "session-a", 3, 8);
+			let overflowed = {
+				...runtime("session-a", 3, 9),
+				state: "crashed" as const,
+				error,
+			};
+			socket.serverMessage({ type: "runtime_state", runtime: overflowed });
+			socket.serverMessage({
+				type: "resync_required",
+				serverEpoch: overflowed.serverEpoch,
+				sessionHandle: overflowed.sessionHandle,
+				runtime: overflowed,
+				reason: "gap",
+			});
+			socket.serverMessage({
+				type: "lease_status",
+				serverEpoch: overflowed.serverEpoch,
+				sessionHandle: overflowed.sessionHandle,
+				generation: overflowed.generation,
+				leaseRevision: 0,
+				controlState: "free",
+				transition: "baseline",
+				isController: false,
+			});
+			const failAttempt = () =>
+				socket.serverMessage({
+					type: "session_error",
+					serverEpoch: overflowed.serverEpoch,
+					sessionHandle: overflowed.sessionHandle,
+					operation: "subscribe",
+					error,
+					code: error,
+					retryable: true,
+				});
+			for (const delay of [500, 1_000, 2_000]) {
+				failAttempt();
+				await flushPromises();
+				clock.advanceBy(delay);
+				await flushPromises();
+			}
+			failAttempt();
+			await flushPromises();
+			expect(h.controller.store.getState().sessions["session-a"]?.recovery?.phase).toBe("degraded");
+
+			expect(h.controller.store.getState().manualRetryResync("session-a")).toBe(true);
+			expect(socket.sent.at(-1)).toEqual({ type: "session_subscribe", sessionHandle: "session-a" });
+			socket.serverMessage({ type: "runtime_state", runtime: overflowed });
+			socket.serverMessage({
+				type: "resync_required",
+				serverEpoch: overflowed.serverEpoch,
+				sessionHandle: overflowed.sessionHandle,
+				runtime: overflowed,
+				reason: "gap",
+			});
+			socket.serverMessage({
+				type: "lease_status",
+				serverEpoch: overflowed.serverEpoch,
+				sessionHandle: overflowed.sessionHandle,
+				generation: overflowed.generation,
+				leaseRevision: 0,
+				controlState: "free",
+				transition: "baseline",
+				isController: false,
+			});
+			failAttempt();
+			expect(socket.sent.at(-1)).toEqual({ type: "session_claim", sessionHandle: "session-a" });
+			socket.serverMessage({
+				type: "lease_status",
+				serverEpoch: overflowed.serverEpoch,
+				sessionHandle: overflowed.sessionHandle,
+				generation: overflowed.generation,
+				leaseRevision: 1,
+				controlState: "held",
+				transition: "claim",
+				isController: true,
+				fencingToken: "overflow-fence",
+			});
+			expect(socket.sent.at(-1)).toEqual({
+				type: "session_restart",
+				sessionHandle: "session-a",
+				expectedGeneration: 3,
+				fencingToken: "overflow-fence",
+			});
+			expect(h.controller.store.getState().sessions["session-a"]?.baselineAuthoritative).toBe(false);
+			// Failed revalidation publishes a new crashed generation, but never a snapshot.
+			overflowed = { ...overflowed, generation: 4, lastSeq: 0 };
+			const failedSubscription = () => {
+				socket.serverMessage({ type: "runtime_state", runtime: overflowed });
+				socket.serverMessage({
+					type: "resync_required",
+					serverEpoch: overflowed.serverEpoch,
+					sessionHandle: overflowed.sessionHandle,
+					runtime: overflowed,
+					reason: "gap",
+				});
+				socket.serverMessage({
+					type: "lease_status",
+					serverEpoch: overflowed.serverEpoch,
+					sessionHandle: overflowed.sessionHandle,
+					generation: 4,
+					leaseRevision: 0,
+					controlState: "free",
+					transition: "baseline",
+					isController: false,
+				});
+				failAttempt();
+			};
+			failedSubscription();
 			socket.serverMessage({
 				type: "session_error",
 				serverEpoch: overflowed.serverEpoch,
 				sessionHandle: overflowed.sessionHandle,
-				operation: "subscribe",
-				error: "session_snapshot_overflow",
-				code: "session_snapshot_overflow",
+				operation: "restart",
+				error,
+				code: error,
 				retryable: true,
 			});
-		for (const delay of [500, 1_000, 2_000]) {
-			failAttempt();
+			for (const delay of [500, 1_000, 2_000]) {
+				await flushPromises();
+				clock.advanceBy(delay);
+				failedSubscription();
+			}
 			await flushPromises();
-			clock.advanceBy(delay);
-			await flushPromises();
-		}
-		failAttempt();
-		await flushPromises();
-		expect(h.controller.store.getState().sessions["session-a"]?.recovery?.phase).toBe("degraded");
-
-		expect(h.controller.store.getState().manualRetryResync("session-a")).toBe(true);
-		expect(socket.sent.at(-1)).toEqual({ type: "session_subscribe", sessionHandle: "session-a" });
-		completeWithSnapshot(
-			h,
-			overflowed.sessionHandle,
-			overflowed.generation,
-			overflowed.lastSeq,
-			[],
-			overflowed,
-		);
-		socket.serverMessage({
-			type: "lease_status",
-			serverEpoch: overflowed.serverEpoch,
-			sessionHandle: overflowed.sessionHandle,
-			generation: overflowed.generation,
-			leaseRevision: 0,
-			controlState: "free",
-			transition: "baseline",
-			isController: false,
-		});
-		expect(socket.sent.at(-1)).toEqual({ type: "session_claim", sessionHandle: "session-a" });
-		socket.serverMessage({
-			type: "lease_status",
-			serverEpoch: overflowed.serverEpoch,
-			sessionHandle: overflowed.sessionHandle,
-			generation: overflowed.generation,
-			leaseRevision: 1,
-			controlState: "held",
-			transition: "claim",
-			isController: true,
-			fencingToken: "overflow-fence",
-		});
-		expect(socket.sent.at(-1)).toEqual({
-			type: "session_restart",
-			sessionHandle: "session-a",
-			expectedGeneration: 3,
-			fencingToken: "overflow-fence",
-		});
-	});
+			expect(socket.sent.filter((message) => message.type === "session_restart")).toHaveLength(1);
+			expect(h.controller.store.getState().sessions["session-a"]?.recovery?.phase).toBe("degraded");
+			// Repair alone is not authorization; the next click obtains a new lease baseline.
+			expect(h.controller.store.getState().manualRetryResync("session-a")).toBe(true);
+			const beforeBaseline = socket.sent.length;
+			socket.serverMessage({
+				type: "lease_status",
+				serverEpoch: overflowed.serverEpoch,
+				sessionHandle: overflowed.sessionHandle,
+				generation: 3,
+				leaseRevision: 99,
+				controlState: "held",
+				transition: "claim",
+				isController: true,
+				fencingToken: "old-fence",
+			});
+			expect(socket.sent).toHaveLength(beforeBaseline);
+			failedSubscription();
+			expect(socket.sent.at(-1)).toEqual({ type: "session_claim", sessionHandle: "session-a" });
+			socket.serverMessage({
+				type: "lease_status",
+				serverEpoch: overflowed.serverEpoch,
+				sessionHandle: overflowed.sessionHandle,
+				generation: 4,
+				leaseRevision: 1,
+				controlState: "held",
+				transition: "claim",
+				isController: true,
+				fencingToken: "recovery-fence",
+			});
+			expect(socket.sent.at(-1)).toEqual({
+				type: "session_restart",
+				sessionHandle: "session-a",
+				expectedGeneration: 4,
+				fencingToken: "recovery-fence",
+			});
+			expect(h.controller.store.getState().sessions["session-a"]?.baselineAuthoritative).toBe(false);
+			// A snapshot is legitimate only after successful startup of the repaired target.
+			const recovered = runtime("session-a", 5, 0);
+			socket.serverMessage({ type: "runtime_state", runtime: recovered });
+			socket.serverMessage({
+				type: "resync_required",
+				serverEpoch: recovered.serverEpoch,
+				sessionHandle: recovered.sessionHandle,
+				runtime: recovered,
+				reason: "generation_changed",
+			});
+			completeWithSnapshot(h, "session-a", 5, 0, [], recovered);
+			expect(h.controller.store.getState().sessions["session-a"]?.baselineAuthoritative).toBe(true);
+		},
+	);
 
 	it("fences a failed snapshot waiter before creating its immediate replacement", async () => {
 		const h = harness();
