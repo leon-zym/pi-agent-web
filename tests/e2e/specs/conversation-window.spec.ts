@@ -38,7 +38,16 @@ test("long history keeps mounted turns bounded and reveals older turns on demand
 	await expect(turnWindow).toHaveAttribute("data-turn-window-total", "48");
 	let loadedTurns = 48;
 	while (loadedTurns < HISTORY_TURNS) {
-		await turnWindow.locator('[data-load-older-turns="true"]').click();
+		// A remote prepend now retains the reader's window; reveal its local older slice
+		// before asking for the next remote page.
+		await page
+			.locator("[data-toc-tick]")
+			.first()
+			.evaluate((button) => (button as HTMLButtonElement).click());
+		await expect(turnWindow).toHaveAttribute("data-turn-window-start", "0");
+		await turnWindow
+			.locator('[data-load-older-turns="true"]')
+			.evaluate((button) => (button as HTMLButtonElement).click());
 		await expect
 			.poll(async () => Number(await turnWindow.getAttribute("data-turn-window-total")), {
 				timeout: 30_000,
