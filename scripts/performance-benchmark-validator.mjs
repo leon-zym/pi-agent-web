@@ -3,9 +3,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
+import { disconnectEvidenceIsValid } from "./recovery-evidence-validator.mjs";
 
 export const BENCHMARK_SCHEMA_VERSION = 2;
-export const BENCHMARK_SUITE_VERSION = 3;
+export const BENCHMARK_SUITE_VERSION = 4;
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(scriptDirectory, "..");
@@ -135,6 +136,9 @@ const STANDARD_BUILD_IDENTITY_KEYS = ["cliTreeHash", "serverTreeHash", "uiTreeHa
 /** Files that can alter benchmark recovery observations are hashed by both producer and validator. */
 export const BENCHMARK_PRODUCER_PATHS = Object.freeze(
 	[
+		"packages/ui/src/lib/benchmark-browser.tsx",
+		"packages/ui/src/lib/benchmark-recovery-recorder.ts",
+		"tests/e2e/benchmarks/recovery-evidence.ts",
 		"scripts/run-performance-benchmarks.mjs",
 		"tests/e2e/benchmarks/benchmark-support.ts",
 		"tests/e2e/benchmarks/concurrency.spec.ts",
@@ -271,6 +275,7 @@ const RECOVERY_LIFECYCLE_KEYS = [
 	"rootExists",
 ];
 const RECOVERY_PROTOCOL_KEYS = [
+	"disconnectEvidence",
 	"barrier",
 	"boundary",
 	"cursorBefore",
@@ -1479,7 +1484,14 @@ function recoverySequenceIsContinuous(facts) {
 		: [];
 	const orderedAndUnique = (seqs) =>
 		new Set(seqs).size === seqs.length && seqs.every((seq, index) => index === 0 || seq > seqs[index - 1]);
-	if (![replayEventSeqs, preBarrierEventSeqs, postBarrierEventSeqs].every(orderedAndUnique)) return false;
+	if (
+		!(
+			protocol.disconnectEvidence
+				? [preBarrierEventSeqs, postBarrierEventSeqs]
+				: [replayEventSeqs, preBarrierEventSeqs, postBarrierEventSeqs]
+		).every(orderedAndUnique)
+	)
+		return false;
 	if (protocol.mode === "replay") {
 		if (
 			protocol.barrier.required ||
@@ -1498,13 +1510,24 @@ function recoverySequenceIsContinuous(facts) {
 		)
 			return false;
 		if (!recoveryCursorIdentityMatches(cursor, watermark) || watermark.lastSeq <= cursor.seq) return false;
-		const count = watermark.lastSeq - cursor.seq;
-		if (count <= 0) return false;
-		const expected = Array.from({ length: count }, (_, index) => cursor.seq + index + 1);
-		return isDeepStrictEqual(replayEventSeqs, expected);
+
+		return (
+			protocol.disconnectEvidence !== null &&
+			disconnectEvidenceIsValid(
+				protocol.disconnectEvidence,
+				cursor.seq,
+				watermark.lastSeq,
+				facts.projection,
+			) &&
+			isDeepStrictEqual(
+				replayEventSeqs,
+				protocol.disconnectEvidence.rows.filter((row) => row.kind === "wire").map((row) => row.seq),
+			)
+		);
 	}
 	if (
 		protocol.mode !== "resync" ||
+		protocol.disconnectEvidence !== null ||
 		!protocol.barrier.required ||
 		!protocol.barrier.snapshotSeen ||
 		!RECOVERY_RESYNC_REASONS.has(protocol.barrier.reason) ||
@@ -2193,6 +2216,11 @@ function validateRawArtifacts(rawArtifacts, results, errors) {
 		}
 		const result = expectedEntry.result;
 		validateObservation(value.observation, { kind: result.kind }, label, errors);
+		if (
+			result.kind === "recovery-disconnect" &&
+			value.observation?.facts?.protocol?.disconnectEvidence?.trial !== value.trial.index
+		)
+			errors.push(`${label}: disconnect evidence must belong to this trial`);
 		for (const field of [
 			"schemaVersion",
 			"suiteVersion",

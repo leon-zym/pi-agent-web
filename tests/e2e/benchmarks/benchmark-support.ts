@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Page, TestInfo } from "@playwright/test";
+import type { RecoveryEvidence } from "../../../packages/ui/src/lib/benchmark-recovery-recorder";
 import type { ProductionHarness } from "../fixtures/production-harness";
 
 export type BenchmarkTier = "representative" | "stress";
@@ -198,6 +199,11 @@ export interface BenchmarkRecoveryBarrierFact {
 }
 
 export interface BenchmarkRecoveryProtocolFacts {
+	disconnectEvidence:
+		| (RecoveryEvidence & {
+				beforeOverwrite: { prompt: string; reply: string; promptCount: number; replyCount: number };
+		  })
+		| null;
 	barrier: BenchmarkRecoveryBarrierFact;
 	boundary: BenchmarkRecoveryBoundaryFact;
 	cursorBefore: BenchmarkRecoveryCursorFact;
@@ -320,7 +326,7 @@ export interface BenchmarkTrialLifecycle {
 
 export interface BenchmarkScenarioResult {
 	schemaVersion: 2;
-	suiteVersion: 3;
+	suiteVersion: 4;
 	tier: BenchmarkTier;
 	runId: string;
 	scenarioId: string;
@@ -637,7 +643,7 @@ export async function runBenchmarkScenario(
 	}
 	const result: BenchmarkScenarioResult = {
 		schemaVersion: 2,
-		suiteVersion: 3,
+		suiteVersion: 4,
 		tier,
 		runId,
 		scenarioId: scenario.id,
