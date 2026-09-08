@@ -83,8 +83,25 @@ for (const scenario of scenariosFor("history")) {
 						await expect(turnWindow.locator('[aria-busy="true"]')).toHaveCount(0, { timeout: 90_000 });
 						nextPageMs = (await page.evaluate(() => performance.now())) - nextPageStarted;
 					}
-					await page.locator("[data-toc-tick]").first().click({ force: true });
-					await expect(viewport.getByText(`${HISTORY_PROMPT} [turn 1]`, { exact: true })).toBeVisible({
+					// Navigation is outside the page timing. The TOC is hidden at this viewport;
+					// reveal bounded local slices through the available older-history control.
+					for (let step = 0; step < turns; step += 1) {
+						const previousStart = Number(await turnWindow.getAttribute("data-turn-window-start"));
+						if (previousStart === 0) break;
+						await viewport.evaluate((element) => {
+							element.scrollTop = 140;
+							element.dispatchEvent(new Event("scroll"));
+						});
+						await expect(loadOlder).toBeVisible();
+						await loadOlder.evaluate((button) => (button as HTMLButtonElement).click());
+						await expect
+							.poll(async () => Number(await turnWindow.getAttribute("data-turn-window-start")))
+							.toBeLessThan(previousStart);
+					}
+					await expect(turnWindow).toHaveAttribute("data-turn-window-start", "0");
+					const oldestTurn = viewport.getByText(`${HISTORY_PROMPT} [turn 1]`, { exact: true });
+					await oldestTurn.scrollIntoViewIfNeeded();
+					await expect(oldestTurn).toBeVisible({
 						timeout: 90_000,
 					});
 					const heapAfter = await page.evaluate(
