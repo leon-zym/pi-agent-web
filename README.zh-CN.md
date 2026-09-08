@@ -125,17 +125,23 @@ PI_WEB_RUN_E2E=1 pnpm test:e2e:real  # 显式执行、会使用凭据的真实 P
 
 ### 性能基准
 
-第一阶段代表性性能基线已在标准参考环境（`linux-x64-gh-standard`）完成校准。该套件严格校验 16 项确定性正确性硬门禁（0 重复事件、0 丢失事件、过期租约拒绝、时序屏障、0 浏览器错误），并在 22 组代表性场景与变体中追踪受宿主机影响的诊断性时序指标。
+代表性套件在本机和 Actions 使用同一套确定性场景。正确性是硬门禁，时序与资源比较是诊断信息。
+仓库中的 9 月 6 日校准数据保留为历史证据，与修正后的比较策略不相容；新的参考校准仍属于 #28 待办。
 
-- 正式报告与基线数据：[性能基准报告](docs/benchmark-report.md)
-- 本地复现代表性性能基准套件：
+- 方法、历史证据与相容性要求：[性能基准报告](docs/benchmark-report.md)
+- 在同一台本机采集两次完整运行，为其操作系统安装指定稳定标签：
   ```bash
-  pnpm bench:representative
+  PI_WEB_BENCHMARK_IMAGE=local-host-v1 pnpm bench:representative
+  # 修改后再次运行，保持环境和基准夹具不变。
+  PI_WEB_BENCHMARK_IMAGE=local-host-v1 pnpm bench:representative
   ```
-- 对比本地基准结果与校准基线：
+- 比较两次产物目录，保留相邻的 manifest 和 environment 文件：
   ```bash
-  node scripts/compare-benchmark-baseline.mjs <benchmark-dir>
+  node scripts/compare-benchmark-baseline.mjs <target-run-dir> --baseline <reference-run-dir>
   ```
+  产物位于 `test-results/performance/`。下载 Actions 产物后使用同一命令。参考比较要求 CPU、
+  操作系统、工具链、工作负载与资源元数据一致，仅有相同 Actions 标签并不足够。
+  不相容运行返回 `INCOMPATIBLE`，不套用预算。保留失败产物，不只挑最快的运行作为参考。
 - 运行显式长时间压力测试矩阵：
   ```bash
   pnpm bench:stress

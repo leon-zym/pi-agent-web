@@ -1,0 +1,259 @@
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { test } from "node:test";
+import { compareBenchmarkBaseline, generateComparisonMarkdown } from "./compare-benchmark-baseline.mjs";
+import {
+	canonicalFormalExpectedScenarioSet,
+	loadBenchmarkMatrix,
+} from "./performance-benchmark-validator.mjs";
+
+function fixture(tier = "representative") {
+	const expected = canonicalFormalExpectedScenarioSet(loadBenchmarkMatrix(), tier);
+	const results = expected.map((entry) => ({
+		domain: entry.domain,
+		scenarioId: entry.id,
+		variant: entry.variant,
+		status: "passed",
+		errors: [],
+		parameters: { fixture: "same" },
+		gates: [{ mode: "hard", passed: true }],
+		trials: Array.from({ length: entry.measured }, (_, index) => ({
+			index,
+			warmup: false,
+			correctness: { complete: true },
+			metrics: { aggregateDeltaPerSecond: 100, publicationRatio: 0.1, recoveryMs: 100, browserErrors: 0 },
+		})),
+		summaries: Object.fromEntries(
+			Object.entries({
+				aggregateDeltaPerSecond: 100,
+				publicationRatio: 0.1,
+				recoveryMs: 100,
+				browserErrors: 0,
+			}).map(([key, value]) => [
+				key,
+				{ count: entry.measured, min: value, max: value, median: value, p95: value },
+			]),
+		),
+	}));
+	return {
+		benchmark: {
+			schemaVersion: 2,
+			suiteVersion: 2,
+			runId: "fixture",
+			tier,
+			results,
+			validationErrors: [],
+			playwrightExitCode: 0,
+		},
+		manifest: {
+			runId: "fixture",
+			expectedScenarioSet: expected,
+			matrix: { rootHash: "a" },
+			fixtureHashes: { fixture: "b" },
+			lockfileHash: "c",
+			seed: "fixed",
+			warmupCounts: { fixture: 1 },
+			measuredCounts: { fixture: 3 },
+		},
+		environment: {
+			runId: "fixture",
+			os: "linux",
+			kernel: "kernel",
+			architecture: "x64",
+			cpu: { model: "cpu A", logicalCount: 4 },
+			quota: { cpu: "4", memoryBytes: 1024 },
+			memory: { totalBytes: 1024 },
+			image: "image-1",
+			node: "v22",
+			pnpm: "11.21.0",
+			playwright: "1.62.1",
+			chromium: "151",
+		},
+	};
+}
+function metric(bundle, name, value) {
+	const result = bundle.benchmark.results[0];
+	for (const trial of result.trials) trial.metrics[name] = value;
+	result.summaries[name] = { count: result.trials.length, min: value, max: value, median: value, p95: value };
+}
+
+test("complete comparable evidence is OK and includes units and direction", () => {
+	const result = compareBenchmarkBaseline(fixture(), fixture());
+	assert.equal(result.status, "OK");
+	assert.ok(result.metrics.length > 0);
+	assert.match(generateComparisonMarkdown(result), /Status: OK/);
+	assert.equal(result.metrics.find((m) => m.name === "aggregateDeltaPerSecond").direction, "higher");
+	assert.equal(
+		result.metrics.some((m) => m.name === "browserErrors"),
+		false,
+	);
+});
+
+for (const [name, mutate] of Object.entries({
+	empty: (b) => {
+		b.benchmark.results = [];
+	},
+	missingScenario: (b) => {
+		b.benchmark.results.pop();
+	},
+	duplicateScenario: (b) => {
+		b.benchmark.results.push(b.benchmark.results[0]);
+	},
+	missingMetric: (b) => {
+		delete b.benchmark.results[0].summaries.publicationRatio;
+	},
+	missingBothTrialAndSummary: (b) => {
+		const r = b.benchmark.results[0];
+		delete r.summaries.publicationRatio;
+		for (const t of r.trials) delete t.metrics.publicationRatio;
+	},
+	emptyMetrics: (b) => {
+		b.benchmark.results[0].summaries = {};
+	},
+	nan: (b) => metric(b, "publicationRatio", Number.NaN),
+	infinity: (b) => metric(b, "publicationRatio", Number.POSITIVE_INFINITY),
+	failedValidation: (b) => {
+		b.benchmark.validationErrors = ["failed"];
+	},
+	failedCorrectness: (b) => {
+		b.benchmark.results[0].trials[0].correctness.complete = false;
+	},
+	failedGate: (b) => {
+		b.benchmark.results[0].gates[0].passed = false;
+	},
+	zeroSamples: (b) => {
+		b.benchmark.results[0].trials = [];
+	},
+}))
+	test(`${name} evidence is INVALID, never green`, () => {
+		const target = fixture();
+		mutate(target);
+		const result = compareBenchmarkBaseline(target, fixture());
+		assert.equal(result.status, "INVALID");
+		assert.ok(result.errors.length);
+		assert.match(generateComparisonMarkdown(result), /Status: INVALID/);
+	});
+
+test("throughput increases are OK; decreases regress", () => {
+	const target = fixture();
+	metric(target, "aggregateDeltaPerSecond", 200);
+	assert.equal(compareBenchmarkBaseline(target, fixture()).status, "OK");
+	metric(target, "aggregateDeltaPerSecond", 60);
+	assert.equal(compareBenchmarkBaseline(target, fixture()).status, "REGRESSION");
+});
+
+test("ratio has no +50 floor; timing keeps its millisecond floor", () => {
+	const target = fixture();
+	metric(target, "publicationRatio", 0.2);
+	const result = compareBenchmarkBaseline(target, fixture());
+	assert.equal(result.status, "REGRESSION");
+	assert.ok(Math.abs(result.metrics.find((m) => m.name === "publicationRatio").threshold - 0.15) < 1e-10);
+	metric(target, "publicationRatio", 0.1);
+	metric(target, "recoveryMs", 200);
+	assert.equal(compareBenchmarkBaseline(target, fixture()).status, "OK");
+	metric(target, "recoveryMs", 201);
+	assert.equal(compareBenchmarkBaseline(target, fixture()).status, "REGRESSION");
+});
+
+for (const [name, mutate] of Object.entries({
+	platform: (b) => {
+		b.environment.os = "darwin";
+	},
+	cpu: (b) => {
+		b.environment.cpu.model = "cpu B";
+	},
+	image: (b) => {
+		b.environment.image = "image-2";
+	},
+	toolchain: (b) => {
+		b.environment.chromium = "152";
+	},
+	fixture: (b) => {
+		b.manifest.fixtureHashes.fixture = "changed";
+	},
+	parameters: (b) => {
+		b.benchmark.results[0].parameters.fixture = "changed";
+	},
+	missingMetadata: (b) => {
+		delete b.environment.cpu;
+	},
+}))
+	test(`${name} mismatch is INCOMPATIBLE without applying budgets`, () => {
+		const target = fixture();
+		mutate(target);
+		const result = compareBenchmarkBaseline(target, fixture());
+		assert.equal(result.status, "INCOMPATIBLE");
+		assert.equal(result.metrics.length, 0);
+	});
+
+test("historical calibration remains incompatible, not silently recalibrated", () => {
+	assert.equal(compareBenchmarkBaseline(fixture(), { scenarios: { old: {} } }).status, "INCOMPATIBLE");
+	assert.equal(compareBenchmarkBaseline({}, { scenarios: {} }).status, "INVALID");
+});
+
+test("CLI invalid input fails while help succeeds", () => {
+	const cli = "scripts/compare-benchmark-baseline.mjs";
+	assert.equal(spawnSync(process.execPath, [cli, "--help"]).status, 0);
+	const invalid = spawnSync(
+		process.execPath,
+		[cli, "/missing/benchmark.json", "--baseline", "/missing/baseline.json"],
+		{ encoding: "utf8" },
+	);
+	assert.equal(invalid.status, 1);
+	assert.match(invalid.stderr, /INVALID/);
+});
+
+test("CLI compares complete artifact directories and enforces provenance hashes", () => {
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-comparison-test-"));
+	const write = (name, bundle) => {
+		const target = path.join(directory, name);
+		fs.mkdirSync(target, { recursive: true });
+		for (const field of ["manifest", "environment"]) {
+			const text = `${JSON.stringify(bundle[field])}\n`;
+			fs.writeFileSync(path.join(target, `${field}.json`), text);
+			bundle.benchmark[`${field}Hash`] = createHash("sha256").update(text).digest("hex");
+		}
+		fs.writeFileSync(path.join(target, "benchmark.json"), JSON.stringify(bundle.benchmark));
+		return target;
+	};
+	try {
+		const baseline = write("baseline", fixture());
+		const bundle = fixture();
+		bundle.benchmark.runId = bundle.manifest.runId = bundle.environment.runId = "second-run";
+		const target = write("target", bundle);
+		const compare = () =>
+			spawnSync(
+				process.execPath,
+				["scripts/compare-benchmark-baseline.mjs", target, "--baseline", baseline],
+				{ encoding: "utf8" },
+			);
+		let result = compare();
+		assert.equal(result.status, 0);
+		assert.match(result.stdout, /Status: OK/);
+		metric(bundle, "aggregateDeltaPerSecond", 1);
+		write("target", bundle);
+		result = compare();
+		assert.equal(result.status, 0);
+		assert.match(result.stdout, /Status: REGRESSION/);
+		bundle.environment.cpu.model = "different CPU";
+		write("target", bundle);
+		result = compare();
+		assert.equal(result.status, 2);
+		assert.match(result.stdout, /Status: INCOMPATIBLE/);
+		fs.appendFileSync(path.join(target, "environment.json"), " ");
+		result = compare();
+		assert.equal(result.status, 1);
+		assert.match(result.stderr, /hashes do not match/);
+	} finally {
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test("different complete tiers are incompatible without dereferencing missing scenarios", () => {
+	assert.equal(compareBenchmarkBaseline(fixture("stress"), fixture()).status, "INCOMPATIBLE");
+	assert.equal(compareBenchmarkBaseline(fixture(), { scenarios: {} }).status, "INVALID");
+});

@@ -429,16 +429,47 @@ To run the representative benchmark suite locally:
 pnpm bench:representative
 ```
 
-This executes all 22 representative scenarios across the 5 domains and outputs results and artifacts to `dist/benchmarks/<timestamp>/`.
+This executes the same deterministic matrix locally and on Actions, writing artifacts under
+`test-results/performance/<run-id>/`. Preserve every run, including failed raw artifacts; do not
+select the best run as a reference.
 
-To compare local benchmark results against the calibrated reference baseline:
+Compare two complete runs with their sibling `manifest.json` and `environment.json` files:
 
 ```bash
-node scripts/compare-benchmark-baseline.mjs dist/benchmarks/<timestamp>
+node scripts/compare-benchmark-baseline.mjs test-results/performance/<target> --baseline test-results/performance/<reference>
 ```
 
-The comparison script evaluates all observed medians against the calibrated thresholds in `tests/e2e/benchmarks/baselines/reference-linux-x64.json`
-and generates a structured comparison markdown report (`benchmark-comparison.md`).
+The comparator prints Markdown to stdout (redirect it to save a report). It checks non-empty,
+complete scenario and metric evidence, measured summaries, recorded correctness outcomes, and
+manifest/environment hashes. It supplements the runner's independent raw-artifact validator; it
+does not replace that validator or certify raw observations independently.
+
+- `INVALID` (exit 1): missing, malformed, incomplete or failed evidence; no green comparison.
+- `INCOMPATIBLE` (exit 2): valid evidence cannot share a budget. No thresholds are applied.
+- `REGRESSION` (exit 0): compatible diagnostic metrics exceed the comparison policy.
+- `OK` (exit 0): compatible diagnostic metrics stay within that policy.
+
+Compatibility requires matching OS/kernel/architecture, exact CPU model and logical count,
+resource quota and memory, image, Node/pnpm/Playwright/Chromium, suite/tier, fixture and matrix
+hashes, lockfile, seed, warmup/sample counts, and scenario parameters. Commit and production build
+hashes may differ because those are the subject of the comparison. A shared `ubuntu-latest` label
+or reference-profile name does not make different CPUs compatible. For local runs, set `PI_WEB_BENCHMARK_IMAGE` to a stable label for the OS installation
+(for example, `local-host-v1`) on both invocations; an unspecified image remains incompatible.
+Downloaded Actions artifacts can be compared with the same command when their metadata matches.
+Local same-host diagnostics and Actions reference runs use one suite; neither may borrow another platform's budgets.
+
+The minimal diagnostic policy uses the reference median: higher-is-better throughput has a lower
+bound of median / 1.5; lower-is-better metrics have an upper bound of median + abs(median) * 0.5
+plus a unit-specific floor (50 ms, 5 MiB, or zero for ratios/counts). This is an explicit diagnostic
+policy, not newly calibrated variance evidence. Existing hard correctness metrics remain governed
+by the formal validator and are excluded from relative timing budgets. Generation identities and
+fixed workload counters (`childGeneration`, `deltaCount`, `inputBase64Chars`, `sourceBytes`)
+have no performance direction and are also excluded.
+
+All numerical tables above and `baselines/reference-linux-x64.json` retain their historical
+2026-09-06 semantics, including the old common floor and pooled CPU models. That file is
+`INCOMPATIBLE` with the new comparator; it has not been silently recalibrated. Fresh repeated
+reference runs and measurement corrections are still required by #28 before new calibration claims.
 
 For explicit long-running stress benchmarking:
 
