@@ -882,7 +882,9 @@ describe("native REST routes", () => {
 			},
 		);
 		expect(unconfirmed.status).toBe(409);
-		expect(await json(unconfirmed)).toMatchObject({ error: "workspace_file_confirmation_required" });
+		expect(await json(unconfirmed)).toMatchObject({
+			error: { code: "workspace_file_confirmation_required" },
+		});
 		const captured = await app.request(`/workspaces/${preference.workspaceHandle}/file-references/capture`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
