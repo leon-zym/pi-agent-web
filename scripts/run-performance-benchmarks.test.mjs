@@ -294,3 +294,97 @@ test("preserves trailing whitespace instead of reading an unlimited sibling", ()
 	assert.equal(result.cpu, "20000/100000");
 	assert.equal(result.memoryBytes, 2048);
 });
+
+// Execute the actual manual-workflow shell with cheap stand-ins. This protects
+// the expensive three-run path's ordering and failure propagation without sampling.
+for (const failure of ["none", "quota", "runner-reference-2", "compare-reference-2"]) {
+	test(`calibration workflow preserves ordering and stops on ${failure}`, () => {
+		const workflow = fs.readFileSync(
+			path.join(repositoryRoot, ".github/workflows/performance-stress.yml"),
+			"utf8",
+		);
+		const step = workflow
+			.split("      - name: Collect representative calibration\n")[1]
+			?.split("      - name: Upload benchmark evidence\n")[0];
+		assert.ok(step);
+		const script = step
+			.split("        run: |\n")[1]
+			.split("\n")
+			.map((line) => line.slice(10))
+			.join("\n");
+		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "piweb-calibration-shell-"));
+		try {
+			const bin = path.join(temporaryDirectory, "bin");
+			fs.mkdirSync(bin);
+			fs.writeFileSync(
+				path.join(bin, "pnpm"),
+				`#!/bin/sh
+printf 'run %s\\n' "$PI_WEB_BENCHMARK_RUN_ID" >> "$TASK_COMMAND_LOG"
+mkdir -p "test-results/performance/representative/$PI_WEB_BENCHMARK_RUN_ID"
+printf 'preserve\\n' > "test-results/performance/representative/$PI_WEB_BENCHMARK_RUN_ID/raw-marker"
+case "$TASK_FAILURE:$PI_WEB_BENCHMARK_RUN_ID" in runner-reference-2:*-reference-2) exit 7;; esac
+`,
+				{ mode: 0o755 },
+			);
+			fs.writeFileSync(
+				path.join(bin, "node"),
+				`#!/bin/sh
+if [ "$1" = --input-type=module ]; then
+  printf 'quota\\n' >> "$TASK_COMMAND_LOG"
+  [ "$TASK_FAILURE" != quota ] || exit 2
+else
+  printf 'compare %s %s\\n' "$2" "$4" >> "$TASK_COMMAND_LOG"
+  printf 'diagnostic report\\n'
+  case "$TASK_FAILURE:$2" in compare-reference-2:*-reference-2) exit 2;; esac
+fi
+`,
+				{ mode: 0o755 },
+			);
+			const log = path.join(temporaryDirectory, "commands");
+			const result = spawnSync("bash", ["-e", "-o", "pipefail", "-c", script], {
+				cwd: temporaryDirectory,
+				encoding: "utf8",
+				timeout: 5000,
+				env: {
+					...process.env,
+					PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+					TASK_COMMAND_LOG: log,
+					TASK_FAILURE: failure,
+					GITHUB_RUN_ID: "123",
+					GITHUB_RUN_ATTEMPT: "1",
+				},
+			});
+			assert.equal(
+				result.status,
+				failure === "none" ? 0 : failure === "runner-reference-2" ? 7 : 2,
+				result.stderr,
+			);
+			const commands = fs.readFileSync(log, "utf8").trim().split("\n");
+			const phases =
+				failure === "quota"
+					? []
+					: failure === "none"
+						? ["reference-1", "reference-2", "holdout"]
+						: ["reference-1", "reference-2"];
+			assert.deepEqual(
+				commands.filter((line) => line.startsWith("run ")),
+				phases.map((phase) => `run calibration-123-1-${phase}`),
+			);
+			if (failure === "none") {
+				assert.equal(commands.filter((line) => line.startsWith("compare ")).length, 4);
+				assert.match(commands.at(-1), /holdout .*reference-2$/);
+			}
+			for (const phase of phases)
+				assert.ok(
+					fs.existsSync(
+						path.join(
+							temporaryDirectory,
+							`test-results/performance/representative/calibration-123-1-${phase}/raw-marker`,
+						),
+					),
+				);
+		} finally {
+			fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+		}
+	});
+}
