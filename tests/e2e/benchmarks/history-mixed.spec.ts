@@ -363,14 +363,22 @@ for (const scenario of scenarios) {
 									}),
 								);
 								await action("find", async () =>
-									page.evaluate((text) => {
-										globalThis.getSelection()?.removeAllRanges();
+									window.getByText(firstPrompt, { exact: true }).evaluate((node, text) => {
+										const selection = globalThis.getSelection()!;
+										const start = document.createRange();
+										start.selectNodeContents(node);
+										start.collapse(true);
+										selection.removeAllRanges();
+										selection.addRange(start);
 										const found = (
 											globalThis as typeof globalThis & { find: (text: string) => boolean }
 										).find(text);
-										return found ? globalThis.getSelection()!.toString() : "missing";
+										return found && node.contains(selection.anchorNode) && node.contains(selection.focusNode)
+											? selection.toString()
+											: "missing";
 									}, firstPrompt),
 								);
+								await page.evaluate(() => navigator.clipboard.writeText("mixed-history-before-copy"));
 								await action("copy", async () => {
 									await window
 										.locator("[data-turn-id]")
