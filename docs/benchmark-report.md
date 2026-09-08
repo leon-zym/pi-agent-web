@@ -518,6 +518,11 @@ cgroup CPU quotas; missing Darwin values and unknown Linux quotas remain incompa
 A shared `ubuntu-latest` label
 or reference-profile name does not make different CPUs compatible. For local runs, set `PI_WEB_BENCHMARK_IMAGE` to a stable label for the OS installation
 (for example, `local-host-v1`) on both invocations; an unspecified image remains incompatible.
+Linux quota collection resolves the process's fully visible cgroup v2 hierarchy and checks ancestor
+CPU and memory limits. Unsupported v1/hybrid or hidden hierarchies, missing constraints and read
+errors remain `unavailable`; they do not imply unlimited resources. Sanitized probe reasons and
+values are retained in `logs/quota.json`. Unknown memory quota, like unknown CPU quota, prevents
+comparison. No private cgroup paths are recorded.
 Downloaded Actions artifacts can be compared with the same command when their metadata matches.
 Local same-host diagnostics and Actions reference runs use one suite; neither may borrow another platform's budgets.
 

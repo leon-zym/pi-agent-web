@@ -25,6 +25,7 @@ const FORMAL_VARIANTS = ["coalesced", "sequential"];
 const EXPECTED_BENCHMARK_PRODUCER_PATHS = Object.freeze([
 	"packages/ui/src/lib/benchmark-browser.tsx",
 	"packages/ui/src/lib/benchmark-recovery-recorder.ts",
+	"scripts/benchmark-quota.mjs",
 	"scripts/run-performance-benchmarks.mjs",
 	"tests/e2e/benchmarks/benchmark-support.ts",
 	"tests/e2e/benchmarks/concurrency.spec.ts",
@@ -1789,5 +1790,15 @@ test("validates restart attribution fields independently of the error gate", () 
 		evidence.console = [];
 		mutate(evidence);
 		assert.match(errorText(validate({ rawArtifacts })), /restartAuthentication has invalid public-API facts/);
+	}
+});
+
+test("unknown memory quota remains valid diagnostic evidence, not a numeric quota", () => {
+	const environment = validEnvironment();
+	environment.quota.memoryBytes = "unavailable";
+	assert.deepEqual(validate({ environment }).errors, []);
+	for (const value of [0, -1, "unknown", null]) {
+		environment.quota.memoryBytes = value;
+		assert.match(errorText(validate({ environment })), /quota.memoryBytes/);
 	}
 });
