@@ -68,6 +68,15 @@ function rememberWindowStart(sessionHandle: string, start: number): void {
 	}
 }
 
+function findVisibleTurn(container: HTMLDivElement | null): HTMLElement | undefined {
+	if (!container) return undefined;
+	const viewport = container.getBoundingClientRect();
+	return Array.from(container.querySelectorAll<HTMLElement>("[data-turn-id]")).find((candidate) => {
+		const rect = candidate.getBoundingClientRect();
+		return rect.bottom > viewport.top && rect.top < viewport.bottom;
+	});
+}
+
 function scrollToTurnElement(container: HTMLDivElement | null, turnId: string): void {
 	if (!container) return;
 	const element = Array.from(container.querySelectorAll<HTMLElement>("[data-turn-id]")).find(
@@ -247,14 +256,7 @@ export const ConversationTurnWindow = memo(
 			const currentRange = getTurnWindowRange(turnsRef.current.length, currentStart);
 			if (remotePrependRef.current || (!currentRange.hasOlder && remoteHistoryLoading)) return;
 			const container = scrollContainerRef.current;
-			const viewport = container?.getBoundingClientRect();
-			const anchor =
-				container && viewport
-					? Array.from(container.querySelectorAll<HTMLElement>("[data-turn-id]")).find((candidate) => {
-							const rect = candidate.getBoundingClientRect();
-							return rect.bottom > viewport.top && rect.top < viewport.bottom;
-						})
-					: undefined;
+			const anchor = findVisibleTurn(container);
 			if (!currentRange.hasOlder) {
 				if (!remoteHistoryHasOlder || !onLoadRemoteOlder) return;
 				const firstTurnId = turnsRef.current[0]?.id;
@@ -339,6 +341,14 @@ export const ConversationTurnWindow = memo(
 			if (!container) return;
 			const onScroll = () => {
 				if (!mountedRef.current) return;
+				const pending = remotePrependRef.current;
+				if (pending) {
+					const anchor = findVisibleTurn(container);
+					if (anchor?.dataset.turnId) {
+						pending.anchorId = anchor.dataset.turnId;
+						pending.anchorTop = anchor.getBoundingClientRect().top;
+					}
+				}
 				const currentRange = getTurnWindowRange(turnsRef.current.length, startRef.current);
 				if (container.scrollTop <= TURN_LOAD_THRESHOLD) {
 					loadOlder();
