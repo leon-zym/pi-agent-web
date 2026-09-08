@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { benchmarkQuota } from "./benchmark-quota.mjs";
 import {
 	BENCHMARK_PRODUCER_PATHS,
 	BENCHMARK_SCHEMA_VERSION,
@@ -245,31 +246,9 @@ function seededVariantOrder(seed) {
 	});
 }
 
-function cgroupValue(relativePath) {
-	if (process.platform !== "linux") return undefined;
-	try {
-		return fs.readFileSync(path.join("/sys/fs/cgroup", relativePath), "utf8").trim();
-	} catch {
-		return undefined;
-	}
-}
-
-function cpuQuota() {
-	const value = cgroupValue("cpu.max");
-	if (!value) return "unavailable";
-	const [quota, period] = value.split(/\s+/, 2);
-	if (!quota || quota === "max") return "unlimited";
-	return period ? `${quota}/${period}` : quota;
-}
-
-function memoryQuota() {
-	const value = cgroupValue("memory.max");
-	if (!value || value === "max") return os.totalmem();
-	const parsed = Number(value);
-	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : os.totalmem();
-}
-
-function environmentForRun(runId, chromium = "unavailable") {
+function environmentForRun(runId, chromium, logsDirectory) {
+	const { evidence, ...quota } = benchmarkQuota({ platform: process.platform, totalMemory: os.totalmem() });
+	writeJson(path.join(logsDirectory, "quota.json"), evidence);
 	const cpus = os.cpus();
 	return {
 		schemaVersion: BENCHMARK_SCHEMA_VERSION,
@@ -282,7 +261,7 @@ function environmentForRun(runId, chromium = "unavailable") {
 			model: cpus[0]?.model ?? "unavailable",
 			logicalCount: Math.max(1, os.availableParallelism()),
 		},
-		quota: { cpu: cpuQuota(), memoryBytes: memoryQuota() },
+		quota,
 		memory: { totalBytes: os.totalmem() },
 		image:
 			process.env.PI_WEB_BENCHMARK_IMAGE ??
@@ -674,7 +653,10 @@ async function main() {
 			expectedScenarioSet: expected,
 		};
 		writeJson(path.join(ownedRunDirectory, "manifest.json"), manifest);
-		writeJson(path.join(ownedRunDirectory, "environment.json"), environmentForRun(runId));
+		writeJson(
+			path.join(ownedRunDirectory, "environment.json"),
+			environmentForRun(runId, "unavailable", logsDirectory),
+		);
 
 		if (fs.existsSync(benchmarkServerLegacyOutput)) {
 			throw new RunFailure(
@@ -812,7 +794,7 @@ async function main() {
 		const chromium = browserVersions.length === 1 ? browserVersions[0] : "unavailable";
 		manifest.capabilities = capabilitiesFor(expected, artifacts);
 		writeJson(path.join(ownedRunDirectory, "manifest.json"), manifest);
-		const environment = environmentForRun(runId, chromium);
+		const environment = environmentForRun(runId, chromium, logsDirectory);
 		writeJson(path.join(ownedRunDirectory, "environment.json"), environment);
 		const playwrightStatuses = statuses
 			.filter((status) => status.phase.startsWith("playwright-"))

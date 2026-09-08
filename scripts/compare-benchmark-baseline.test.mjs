@@ -333,3 +333,9 @@ test("warmup measurements do not enter measured summaries", () => {
 	bundle.benchmark.results[0].trials[0].metrics.recoveryMs = 99999;
 	assert.equal(compareBenchmarkBaseline(bundle, fixture()).status, "OK");
 });
+
+test("unknown Linux memory quota cannot be compared even with known CPU quota", () => {
+	const bundle = fixture();
+	bundle.environment.quota = { cpu: "unlimited", memoryBytes: "unavailable" };
+	assert.equal(compareBenchmarkBaseline(bundle, structuredClone(bundle)).status, "INCOMPATIBLE");
+});

@@ -144,6 +144,7 @@ export const BENCHMARK_PRODUCER_PATHS = Object.freeze(
 		"packages/ui/src/lib/benchmark-recovery-recorder.ts",
 		"tests/e2e/benchmarks/recovery-evidence.ts",
 		"scripts/run-performance-benchmarks.mjs",
+		"scripts/benchmark-quota.mjs",
 		"tests/e2e/benchmarks/benchmark-support.ts",
 		"tests/e2e/benchmarks/concurrency.spec.ts",
 		"tests/e2e/benchmarks/content-roundtrip.spec.ts",
@@ -2486,8 +2487,11 @@ function validateEnvironment(environment, runId, results, errors) {
 	else {
 		if (typeof environment.quota.cpu !== "string" || environment.quota.cpu.length === 0)
 			errors.push("environment quota.cpu must be non-empty");
-		if (!Number.isSafeInteger(environment.quota.memoryBytes) || environment.quota.memoryBytes <= 0) {
-			errors.push("environment quota.memoryBytes must be positive");
+		if (
+			environment.quota.memoryBytes !== "unavailable" &&
+			(!Number.isSafeInteger(environment.quota.memoryBytes) || environment.quota.memoryBytes <= 0)
+		) {
+			errors.push("environment quota.memoryBytes must be positive or unavailable");
 		}
 	}
 	if (

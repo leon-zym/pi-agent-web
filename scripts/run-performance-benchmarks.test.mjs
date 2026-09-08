@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { benchmarkQuota } from "./benchmark-quota.mjs";
 
 const scriptsDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(scriptsDirectory, "..");
@@ -130,4 +131,136 @@ test("rejects an active same-WorkTree runner lock rather than racing", () => {
 		fs.rmSync(runnerLockPath, { force: true });
 		fs.rmSync(temporaryDirectory, { recursive: true, force: true });
 	}
+});
+
+// Sanitized producer-shaped layout from the one-shot Actions probe34218564159:
+// full v2 mount, two non-root levels, root interfaces absent, both levels max.
+function quotaFixture(overrides = {}, group = "/slice/job") {
+	return {
+		"/proc/self/cgroup": `0::${group}\n`,
+		"/proc/self/mountinfo": "1 0 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+		"/sys/fs/cgroup/cgroup.controllers": "cpuset cpu io memory pids\n",
+		"/sys/fs/cgroup/slice/cpu.max": "max 100000\n",
+		"/sys/fs/cgroup/slice/job/cpu.max": "max 100000\n",
+		"/sys/fs/cgroup/slice/memory.max": "max\n",
+		"/sys/fs/cgroup/slice/job/memory.max": "max\n",
+		...overrides,
+	};
+}
+
+function quotaFrom(files) {
+	return benchmarkQuota({
+		platform: "linux",
+		totalMemory: 4096,
+		readFile(name) {
+			if (files[name] instanceof Error) throw files[name];
+			if (typeof files[name] === "string") return files[name];
+			throw Object.assign(new Error("fixture missing"), { code: "ENOENT" });
+		},
+	});
+}
+
+test("collects the observed Actions hierarchy instead of assuming a root quota file", () => {
+	const result = quotaFrom(quotaFixture());
+	assert.equal(result.cpu, "unlimited");
+	assert.equal(result.memoryBytes, 4096);
+	assert.deepEqual(
+		result.evidence.filter((e) => e.controller === "cpu").map((e) => e.value),
+		["max 100000", "max 100000"],
+	);
+});
+
+test("finite ancestor limits constrain unlimited children for CPU and memory", () => {
+	const result = quotaFrom(
+		quotaFixture({
+			"/sys/fs/cgroup/slice/cpu.max": "200000 100000",
+			"/sys/fs/cgroup/slice/memory.max": "2048",
+		}),
+	);
+	assert.equal(result.cpu, "200000/100000");
+	assert.equal(result.memoryBytes, 2048);
+	assert.equal(
+		quotaFrom(
+			quotaFixture({
+				"/sys/fs/cgroup/slice/cpu.max": "200000 100000",
+				"/sys/fs/cgroup/slice/job/cpu.max": "10000 10000",
+			}),
+		).cpu,
+		"10000/10000",
+	);
+});
+
+test("missing, denied and malformed constraints stay unknown", () => {
+	for (const value of [
+		undefined,
+		"",
+		"max garbage",
+		"max",
+		"0 100000",
+		"100 0",
+		"-1 100000",
+		"1e3 100000",
+		"9007199254740992 1",
+		Object.assign(new Error(), { code: "EACCES" }),
+	]) {
+		const result = quotaFrom(quotaFixture({ "/sys/fs/cgroup/slice/cpu.max": value }));
+		assert.equal(result.cpu, "unavailable", String(value));
+	}
+	const denied = quotaFrom(
+		quotaFixture({ "/sys/fs/cgroup/slice/cpu.max": Object.assign(new Error(), { code: "EACCES" }) }),
+	);
+	assert.ok(denied.evidence.some((e) => e.error === "EACCES"));
+	const memory = quotaFrom(quotaFixture({ "/sys/fs/cgroup/slice/memory.max": undefined }));
+	assert.equal(memory.memoryBytes, "unavailable");
+});
+
+test("real root requires both an available controller and absent root interface", () => {
+	assert.equal(quotaFrom(quotaFixture({}, "/")).cpu, "unlimited");
+	for (const overrides of [
+		{ "/sys/fs/cgroup/cpu.max": "max 100000" },
+		{ "/sys/fs/cgroup/cpu.max": Object.assign(new Error(), { code: "EACCES" }) },
+		{ "/sys/fs/cgroup/cgroup.controllers": "memory" },
+		{ "/sys/fs/cgroup/cgroup.controllers": undefined },
+	])
+		assert.equal(quotaFrom(quotaFixture(overrides)).cpu, "unavailable");
+});
+
+test("unsupported v1, absent proc evidence, hidden roots and ambiguous mounts fail closed", () => {
+	for (const overrides of [
+		{
+			"/proc/self/cgroup": "2:cpu,cpuacct:/job",
+			"/proc/self/mountinfo": "1 0 0:1 / /sys/fs/cgroup/cpu rw - cgroup cgroup rw,cpu,cpuacct",
+		},
+		{ "/proc/self/cgroup": "" },
+		{ "/proc/self/cgroup": undefined },
+		{ "/proc/self/mountinfo": "" },
+		{ "/proc/self/mountinfo": "1 0 0:1 /parent /sys/fs/cgroup rw - cgroup2 cgroup rw" },
+		{
+			"/proc/self/mountinfo":
+				"1 0 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n2 0 0:1 / /other rw - cgroup2 cgroup rw",
+		},
+		{ "/proc/self/cgroup": "0::/slice/../job" },
+		{ "/proc/self/cgroup": `0::/${"deep/".repeat(20)}job` },
+	]) {
+		const result = quotaFrom(quotaFixture(overrides));
+		assert.equal(result.cpu, "unavailable");
+		assert.equal(result.memoryBytes, "unavailable");
+	}
+});
+
+test("non-Linux preserves the explicit CPU sentinel without probing Linux paths", () => {
+	assert.deepEqual(
+		benchmarkQuota({
+			platform: "darwin",
+			totalMemory: 4096,
+			readFile() {
+				throw new Error("must not read");
+			},
+		}),
+		{
+			cpu: "unavailable",
+			memoryBytes: 4096,
+			evidence: [],
+		},
+	);
 });
