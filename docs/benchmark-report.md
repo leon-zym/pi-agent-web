@@ -423,9 +423,10 @@ gateway restart, supervisor process crash, sequence gap resynchronization, sessi
 
 ## Current streaming observer semantics
 
-Suite version 3 keeps artifact schema version 2 but changes the streaming measurement contract.
+Suite version 4 retains the streaming measurement contract introduced in suite version 3
+and keeps artifact schema version 2.
 The historical tables above and checked-in calibration file retain their original names and values;
-they are not suite-v3 calibration. Comparisons reject unsupported suite versions and changed
+they are not current-suite calibration. Comparisons reject unsupported suite versions and changed
 producer hashes. Fresh local/reference calibration remains pending under #28.
 
 | Current metric | Exact observation boundary |
@@ -447,6 +448,30 @@ counts, including warmups. The independent validator derives that correctness cl
 The 64-turn upper bound applies to every trial, including warmups, as a hard correctness condition;
 zero is no longer accepted as bounded evidence.
 Timing budgets remain diagnostic and have not been recalibrated by this change.
+
+## Disconnect evidence boundary
+
+Suite version 4 replaces the flattened disconnect replay oracle with per-connection sequence
+segments and the actual reconnect subscription cursor. The controlled experiment receives the
+first text delta on the old socket but closes it before forwarding that callback. The new socket
+replays from the retained cursor. Both publication variants use the same instrumentation.
+
+A benchmark-build-only observer records ordered bus delivery and transport `lastSeq`/`projectedSeq`
+high watermarks while this trial is armed. Bus delivery alone is not successful admission, and
+projection confirmation is not a per-event reducer execution receipt. The validator combines these
+facts to check observable admission uniqueness and confirmation coverage. Before forwarding the
+assistant `message_end`, the test checks the exact streaming reply so authoritative final text cannot
+hide repeated appends. This does not exclude arbitrary hidden duplicate reducer execution.
+
+The bounded recorder retains at most 512 scalar rows without overwriting. Missing start/end,
+active reset, overflow, identity changes, resync, and late callbacks invalidate this pure-disconnect
+experiment. Snapshot and rekey scenarios retain their separate existing barrier checks. Timing in
+this experiment is instrumented recovery timing, including automation, callback gates and content
+assertions; it is not uninstrumented reconnect latency.
+
+Historical artifacts remain unchanged and incompatible. In particular, the earlier CI duplicate
+receive sequence lacks the connection/application boundaries required for retrospective attribution;
+this experiment does not establish that historical failure's cause or clear its failed result.
 
 ## Reproduction Guide
 

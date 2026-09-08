@@ -1,15 +1,19 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import { stripTypeScriptTypes } from "node:module";
 import path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import vm from "node:vm";
+import { createRecoveryRecorder } from "../packages/ui/src/lib/benchmark-recovery-recorder.ts";
 import {
 	BENCHMARK_PRODUCER_PATHS,
 	canonicalFormalExpectedScenarioSet,
 	loadBenchmarkMatrix,
 	validateBenchmarkArtifacts,
 } from "./performance-benchmark-validator.mjs";
+import { disconnectEvidenceIsValid } from "./recovery-evidence-validator.mjs";
 
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
@@ -18,12 +22,15 @@ const RUN_ID = "20260831t000000z-fixture";
 const FORMAL_VARIANTS = ["coalesced", "sequential"];
 // Independently maintained oracle: this must not be generated from the validator export under test.
 const EXPECTED_BENCHMARK_PRODUCER_PATHS = Object.freeze([
+	"packages/ui/src/lib/benchmark-browser.tsx",
+	"packages/ui/src/lib/benchmark-recovery-recorder.ts",
 	"scripts/run-performance-benchmarks.mjs",
 	"tests/e2e/benchmarks/benchmark-support.ts",
 	"tests/e2e/benchmarks/concurrency.spec.ts",
 	"tests/e2e/benchmarks/content-roundtrip.spec.ts",
 	"tests/e2e/benchmarks/history.spec.ts",
 	"tests/e2e/benchmarks/playwright.config.ts",
+	"tests/e2e/benchmarks/recovery-evidence.ts",
 	"tests/e2e/benchmarks/recovery.spec.ts",
 	"tests/e2e/benchmarks/streaming.spec.ts",
 	"tests/e2e/fixtures/deterministic-pi.mjs",
@@ -98,6 +105,43 @@ function marker(at, type, sessionId, text = null, pid = 100) {
 	return { at, commandId: null, pid, sessionId, text, type };
 }
 
+function disconnectEvidence() {
+	let high = 0;
+	const row = (kind, socket, seq, projected = high) => {
+		high = projected;
+		return { kind, socket, seq, projected, baseline: true, resync: false };
+	};
+	return {
+		trial: 0,
+		invalid: false,
+		ended: true,
+		beforeOverwrite: { prompt: "prompt", reply: "reply", promptCount: 1, replyCount: 1 },
+		rows: [
+			row("start", 0, 0),
+			row("attach", 1, 0),
+			row("wire", 1, 1),
+			row("gate", 1, 1),
+			row("close", 1, 0),
+			row("subscribe", 2, 0),
+			row("wire", 2, 1),
+			row("forward", 2, 1),
+			row("bus", 0, 1),
+			row("state", 0, 1, 1),
+			row("wire", 2, 2),
+			row("hold", 2, 2, 1),
+			row("release", 2, 0, 1),
+			row("forward", 2, 2),
+			row("bus", 0, 2),
+			row("state", 0, 2, 2),
+			row("wire", 2, 3),
+			row("forward", 2, 3),
+			row("bus", 0, 3),
+			row("state", 0, 3, 3),
+			row("end", 0, 3, 3),
+		],
+	};
+}
+
 function recoveryObservation(kind) {
 	const before = authority("session-parent", "native-parent", "/workspace/parent.jsonl", "epoch-a", 1);
 	const rekey = kind === "recovery-rekey";
@@ -118,7 +162,7 @@ function recoveryObservation(kind) {
 	const watermarkGeneration = rekey || crash ? 2 : 1;
 	const watermarkEpoch = gatewayRestart ? "epoch-b" : "epoch-a";
 	const watermarkSession = rekey ? "session-child" : "session-parent";
-	const watermarkSeq = resync ? 2 : 1;
+	const watermarkSeq = resync ? 2 : 3;
 	const targetSessionId = after.nativeSessionId;
 	const markers = crash
 		? [
@@ -171,6 +215,7 @@ function recoveryObservation(kind) {
 			},
 			pi: { markersAfter: markers, markersBefore: [], targetSessionId },
 			protocol: {
+				disconnectEvidence: resync ? null : disconnectEvidence(),
 				barrier: {
 					asOfSeq: barrierSeq,
 					baseSeq: resync ? 0 : null,
@@ -197,7 +242,7 @@ function recoveryObservation(kind) {
 				preBarrierEventSeqs: resync ? [1] : [],
 				rekeyFrameCount: rekey ? 1 : 0,
 				resyncFrameCount: resync ? 1 : 0,
-				replayEventSeqs: resync ? [] : [1],
+				replayEventSeqs: resync ? [] : [1, 1, 2, 3],
 				snapshotFrameCount: resync ? 1 : 0,
 				watermarkAfter: {
 					generation: watermarkGeneration,
@@ -221,8 +266,13 @@ function recoveryObservation(kind) {
 	};
 }
 
-function observationFor(definition) {
-	if (definition.kind.startsWith("recovery-")) return recoveryObservation(definition.kind);
+function observationFor(definition, index = 0) {
+	if (definition.kind.startsWith("recovery-")) {
+		const observation = recoveryObservation(definition.kind);
+		if (observation.facts.protocol.disconnectEvidence)
+			observation.facts.protocol.disconnectEvidence.trial = index;
+		return observation;
+	}
 	if (definition.kind === "streaming") {
 		if (!Number.isSafeInteger(definition.targetBytes))
 			throw new Error("streaming fixture is missing targetBytes");
@@ -435,7 +485,7 @@ function validResult(variant, definition) {
 	const correctness = correctnessFor(definition);
 	return {
 		schemaVersion: 2,
-		suiteVersion: 3,
+		suiteVersion: 4,
 		tier: "representative",
 		runId: RUN_ID,
 		scenarioId: definition.id,
@@ -488,7 +538,7 @@ function validManifest(matrixValue = matrix) {
 	const keys = expected.map((entry) => `${entry.domain}/${entry.id}/${entry.variant}`);
 	return {
 		schemaVersion: 2,
-		suiteVersion: 3,
+		suiteVersion: 4,
 		tier: "representative",
 		runId: RUN_ID,
 		seed: "fixture-seed",
@@ -521,7 +571,7 @@ function validManifest(matrixValue = matrix) {
 function validEnvironment() {
 	return {
 		schemaVersion: 2,
-		suiteVersion: 3,
+		suiteVersion: 4,
 		runId: RUN_ID,
 		os: "linux",
 		kernel: "6.0",
@@ -552,7 +602,7 @@ function rawFor(result) {
 			kind: result.kind,
 			parameters: structuredClone(result.parameters),
 			capabilities: structuredClone(result.capabilities),
-			observation: structuredClone(observationFor(result.parameters)),
+			observation: structuredClone(observationFor(result.parameters, trial.index)),
 			trial: { index: trial.index, warmup: trial.warmup },
 		},
 	}));
@@ -1056,7 +1106,7 @@ test("records ordered recovery sequence partitions around the snapshot boundary"
 		resyncFrameIndex: null,
 		snapshotFrameIndex: null,
 	});
-	assert.deepEqual(replayRaw.value.observation.facts.protocol.replayEventSeqs, [1]);
+	assert.deepEqual(replayRaw.value.observation.facts.protocol.replayEventSeqs, [1, 1, 2, 3]);
 	assert.deepEqual(resyncRaw.value.observation.facts.protocol.boundary, {
 		resyncFrameIndex: 0,
 		snapshotFrameIndex: 1,
@@ -1168,7 +1218,7 @@ for (const field of ["turnNodes", "streamingDomMutationBatches", "deltaCount"]) 
 test("rejects suite-v2 streaming evidence after observer semantics changed", () => {
 	const results = validResults();
 	results[0].suiteVersion = 2;
-	assert.match(errorText(validate({ results })), /suiteVersion must be 3/);
+	assert.match(errorText(validate({ results })), /suiteVersion must be 4/);
 });
 
 for (const warmup of [true, false]) {
@@ -1200,3 +1250,279 @@ for (const warmup of [true, false]) {
 		);
 	});
 }
+
+test("accepts wire-ahead replay with unique bus admission and confirmed coverage", () => {
+	const evidence = disconnectEvidence();
+	assert.equal(disconnectEvidenceIsValid(evidence, 0, 3, evidence.beforeOverwrite), true);
+});
+for (const [name, mutate] of [
+	["same socket duplicate", (e) => e.rows.splice(3, 0, { ...e.rows[2] })],
+	["repeated bus admission", (e) => e.rows.splice(9, 0, { ...e.rows[8] })],
+	["missing close", (e) => e.rows.splice(4, 1)],
+	["missing subscribe", (e) => e.rows.splice(5, 1)],
+	[
+		"wrong cursor",
+		(e) => {
+			e.rows[5].seq = 1;
+		},
+	],
+	[
+		"unconfirmed projection",
+		(e) => {
+			e.rows.at(-1).projected = 2;
+		},
+	],
+	[
+		"projection reversal",
+		(e) => {
+			e.rows[15].projected = 0;
+		},
+	],
+	[
+		"wrong identity or observer failure",
+		(e) => {
+			e.invalid = true;
+		},
+	],
+	[
+		"empty evidence",
+		(e) => {
+			e.rows = [];
+		},
+	],
+	[
+		"missing end",
+		(e) => {
+			e.ended = false;
+		},
+	],
+	[
+		"repeated append before overwrite",
+		(e) => {
+			e.beforeOverwrite.reply = "replyreply";
+		},
+	],
+	[
+		"snapshot jump",
+		(e) => {
+			e.rows[9].resync = true;
+		},
+	],
+])
+	test(`rejects disconnect ${name}`, () => {
+		const evidence = disconnectEvidence();
+		mutate(evidence);
+		assert.equal(disconnectEvidenceIsValid(evidence, 0, 3, { prompt: "prompt", reply: "reply" }), false);
+	});
+test("recorder fails closed on reset, overflow, late callbacks, and missing start", () => {
+	const row = disconnectEvidence().rows[0];
+	for (const exercise of [
+		(r) => {
+			r.start(0);
+			r.start(1);
+		},
+		(r) => {
+			r.start(0);
+			r.record(0, row);
+			r.record(0, row);
+		},
+		(r) => {
+			r.start(0);
+			r.end(0);
+			r.record(0, row);
+		},
+		(r) => {
+			r.record(0, row);
+			r.start(0);
+		},
+	]) {
+		const recorder = createRecoveryRecorder(1);
+		exercise(recorder);
+		assert.ok(recorder.read() === null || recorder.read().invalid);
+		recorder.start(1);
+		assert.ok(recorder.read() === null || recorder.read().invalid);
+	}
+	const recorder = createRecoveryRecorder();
+	recorder.start(0);
+	recorder.record(0, row);
+	assert.equal(recorder.read().rows.length, 1);
+	assert.equal(recorder.read().rows.length, 1);
+	recorder.end(0);
+	recorder.start(1);
+	assert.equal(recorder.read().invalid, false);
+});
+
+test("actual observer, callback gate and validator preserve the complete wire identity", async () => {
+	const { armRecoveryGate, installRecoveryGate } = await import(
+		"../tests/e2e/benchmarks/recovery-evidence.ts"
+	);
+	const source = fs.readFileSync(
+		new URL("../packages/ui/src/lib/benchmark-browser.tsx", import.meta.url),
+		"utf8",
+	);
+	const observer = stripTypeScriptTypes(
+		source
+			.slice(source.indexOf("export function installRecoveryEvidence"), source.indexOf("/**\n * This root"))
+			.replace("export function", "function"),
+	);
+	const originalWindow = globalThis.window;
+	async function run(change = {}, tail = false) {
+		let bus;
+		let changed;
+		const channel = {
+			runtime: { serverEpoch: "epoch", generation: 1, workspaceId: "workspace" },
+			lastSeq: 0,
+			projectedSeq: 0,
+			baselineAuthoritative: true,
+			resync: null,
+		};
+		class Socket {
+			static OPEN = 1;
+			readyState = 1;
+			listeners = new Map();
+			send() {}
+			addEventListener(type, callback) {
+				this.listeners.set(type, callback);
+			}
+			close() {
+				this.readyState = 3;
+			}
+			receive(message) {
+				this.listeners.get("message")?.({ data: JSON.stringify(message) });
+			}
+		}
+		const win = { WebSocket: Socket };
+		vm.runInNewContext(`${observer}\ninstallRecoveryEvidence();`, {
+			window: win,
+			createRecoveryRecorder,
+			sessionTransport: {
+				store: {
+					getState: () => ({ sessions: { session: channel } }),
+					subscribe: (callback) => {
+						changed = callback;
+					},
+				},
+				frameBus: {
+					subscribeAll: (callback) => {
+						bus = callback;
+					},
+				},
+			},
+		});
+		globalThis.window = win;
+		await installRecoveryGate({ addInitScript: (install) => install() });
+		const delivered = [];
+		const callback = (event) => {
+			const message = JSON.parse(event.data);
+			delivered.push(message.seq);
+			bus({ message });
+			channel.lastSeq = message.seq;
+			channel.projectedSeq = message.seq;
+			changed();
+		};
+		const old = new win.WebSocket();
+		old.onmessage = callback;
+		await armRecoveryGate(
+			{ evaluate: (evaluate, args) => evaluate(args) },
+			0,
+			"session",
+			"epoch",
+			1,
+			"workspace",
+		);
+		const frame = (seq, event) => ({
+			type: "event",
+			sessionHandle: "session",
+			serverEpoch: "epoch",
+			generation: 1,
+			workspaceId: "workspace",
+			seq,
+			event,
+		});
+		const delta = frame(1, {
+			type: "message_update",
+			assistantMessageEvent: { type: "text_delta", delta: "unique-token" },
+		});
+		const end = frame(2, { type: "message_end", message: { role: "assistant" } });
+		old.receive({ ...delta, ...(tail ? {} : change) });
+		if (tail) old.receive({ ...end, ...change });
+		assert.deepEqual(delivered, []);
+		assert.equal(old.readyState, 3);
+		old.listeners.get("close")();
+		const next = new win.WebSocket();
+		next.onmessage = callback;
+		next.send(
+			JSON.stringify({
+				type: "session_subscribe",
+				sessionHandle: "session",
+				cursor: { seq: 0, serverEpoch: "epoch", generation: 1 },
+			}),
+		);
+		next.receive(delta);
+		next.receive(end);
+		next.receive(frame(3, { type: "agent_settled" }));
+		assert.deepEqual(delivered, [1]);
+		win.__piwebRecoveryGate.release();
+		assert.deepEqual(delivered, [1, 2, 3]);
+		const evidence = structuredClone(win.__piwebRecoveryGate.finish());
+		evidence.beforeOverwrite = { prompt: "prompt", reply: "unique-token", promptCount: 1, replyCount: 1 };
+		const valid = disconnectEvidenceIsValid(evidence, 0, 3, evidence.beforeOverwrite);
+		old.receive(delta);
+		assert.equal(win.__piwebBenchmarkRecovery.read().invalid, true);
+		assert.deepEqual(delivered, [1, 2, 3]);
+		return { evidence, valid };
+	}
+	try {
+		assert.equal((await run()).valid, true);
+		assert.equal((await run({}, true)).valid, true);
+		for (const change of [{ workspaceId: "OTHER" }, { serverEpoch: "OTHER" }, { generation: 2 }]) {
+			for (const tail of [false, true]) {
+				const result = await run(change, tail);
+				assert.equal(result.evidence.invalid, true, JSON.stringify({ change, tail }));
+				assert.equal(result.valid, false);
+			}
+		}
+	} finally {
+		globalThis.window = originalWindow;
+	}
+});
+
+test("legal overlap preserves an already admitted prefix and does not infer acceptance from old wire tail", () => {
+	const evidence = disconnectEvidence();
+	const sample = (kind, socket, seq, projected) => ({
+		kind,
+		socket,
+		seq,
+		projected,
+		baseline: true,
+		resync: false,
+	});
+	const prefix = [sample("start", 0, 24, 24), sample("attach", 1, 24, 24)];
+	for (let seq = 25; seq <= 31; seq++) {
+		prefix.push(
+			sample("wire", 1, seq, seq - 1),
+			sample("forward", 1, seq, seq - 1),
+			sample("bus", 0, seq, seq - 1),
+			sample("state", 0, seq, seq),
+		);
+	}
+	const suffix = evidence.rows.slice(2).map((row) => ({
+		...row,
+		seq: row.kind === "close" || row.kind === "release" ? 0 : row.seq + 31,
+		projected: row.projected + 31,
+	}));
+	// Receipt after the gate may precede the old socket close, without a corresponding callback.
+	suffix.splice(2, 0, sample("wire", 1, 33, 31));
+	evidence.rows = [...prefix, ...suffix];
+	assert.equal(disconnectEvidenceIsValid(evidence, 24, 34, evidence.beforeOverwrite), true);
+	const gateIndex = evidence.rows.findIndex((row) => row.kind === "gate");
+	evidence.rows.splice(gateIndex + 1, 0, sample("forward", 1, 32, 31));
+	assert.equal(disconnectEvidenceIsValid(evidence, 24, 34, evidence.beforeOverwrite), false);
+});
+
+test("rejects disconnect evidence captured for a different trial", () => {
+	const rawArtifacts = validResults().flatMap(rawFor);
+	const raw = rawArtifacts.find((entry) => entry.value.kind === "recovery-disconnect");
+	raw.value.observation.facts.protocol.disconnectEvidence.trial++;
+	assert.match(errorText(validate({ rawArtifacts })), /must belong to this trial/);
+});
