@@ -143,6 +143,12 @@ export class OrderedSessionFrameBus {
 		this.orderBySession.set(sessionHandle, order);
 	}
 
+	/** Release listeners and ordering metadata for a terminally retired Session. */
+	forgetSession(sessionHandle: string): void {
+		this.listeners.delete(sessionHandle);
+		this.orderBySession.delete(sessionHandle);
+	}
+
 	clear(): void {
 		this.listeners.clear();
 		this.allListeners.clear();

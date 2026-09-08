@@ -169,6 +169,11 @@ Components consume stores, not WebSocket frames. Frames pass through the transpo
 bus, stream pipeline, and reducers. Async completions update the Session identity captured when work
 started, even if another Session is now visible.
 
+Confirmed deletion and completed transient abandonment retire the local transport channel, its
+machine state, pending operations, and bus ordering metadata. Late completions are fenced by canceled
+operation ownership. Ordinary unsubscribe retains the dormant baseline for reuse; it is not terminal
+retirement. Cleanup affects only the retired Session and preserves other Sessions and their drafts.
+
 Compatible delta-only updates may be coalesced. Structural, settled, error, rekey, recovery, and
 dialog-close boundaries flush synchronously. Background subscribed Sessions continue ingesting.
 

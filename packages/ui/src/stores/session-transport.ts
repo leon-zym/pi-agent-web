@@ -454,6 +454,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 		disconnect,
 		subscribeSession,
 		unsubscribeSession,
+		forgetSession,
 		loadOlderSessionHistory,
 		cancelSessionHistory,
 		invalidateSessionSnapshot,
@@ -790,6 +791,7 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 	}
 
 	resyncCoordinator.subscribe((sessionHandle, recovery) => {
+		if (!store.getState().sessions[sessionHandle]) return;
 		setChannel(sessionHandle, (channel) => {
 			if (recovery && !identitiesMatch(channel.runtime, recovery.identity)) return channel;
 			return channel.recovery === (recovery ?? null) ? channel : { ...channel, recovery: recovery ?? null };
@@ -1468,6 +1470,21 @@ export function createSessionTransport(options: SessionTransportOptions = {}): S
 			sendWire({ type: "session_unsubscribe", sessionHandle });
 		}
 		clearProtectedSubscriptionOverage();
+	}
+
+	function forgetSession(sessionHandle: string): void {
+		// Unsubscribe preserves dormant reuse; terminal retirement also drops that baseline
+		// and every owned operation. Aborted operations fence their own late completions.
+		unsubscribeSession(sessionHandle);
+		resyncCoordinator.unsubscribe(sessionHandle);
+		invalidateSessionSnapshot(sessionHandle);
+		frameBus.forgetSession(sessionHandle);
+		store.setState((state) => {
+			if (!state.sessions[sessionHandle]) return state;
+			const sessions = { ...state.sessions };
+			delete sessions[sessionHandle];
+			return { sessions };
+		});
 	}
 
 	function invalidateSessionSnapshot(sessionHandle: string): boolean {

@@ -37,6 +37,7 @@ import {
 	sessionHistoryMessagesBytes,
 } from "@pi-agent-web/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { getSessionBrowserEffects } from "../src/lib/session-browser-effects";
 import { sessionDeleteCapability } from "../src/lib/session-capabilities";
 import {
 	createSessionContentAdapter,
@@ -44,6 +45,11 @@ import {
 	type SessionExtensionMaterializer,
 } from "../src/lib/session-content-adapter";
 import { isCoalescibleMessageUpdate } from "../src/lib/session-event-scheduler";
+import * as commandModule from "../src/stores/command-machine";
+import * as controlModule from "../src/stores/control-machine";
+import * as extensionModule from "../src/stores/extension-machine";
+import * as recoveryModule from "../src/stores/recovery-machine";
+import * as retentionModule from "../src/stores/retention-machine";
 import {
 	createSessionTransport,
 	OrderedSessionFrameBus,
@@ -727,6 +733,7 @@ function sentCommand(socket: FakeSocket, id: string) {
 
 afterEach(() => {
 	for (const controller of controllers.splice(0)) controller.dispose();
+	vi.restoreAllMocks();
 	vi.useRealTimers();
 });
 
@@ -5993,4 +6000,146 @@ describe("Session transport characterization before machine extraction", () => {
 		socket.serverMessage(successResponse("session-a", 1, "captured-command", "get_state"));
 		await expect(captured).rejects.toMatchObject({ code: "response_mismatch" });
 	});
+});
+
+it("terminal forget releases machine ownership for distinct identities and ignores late control work", async () => {
+	const controlFactory = vi.spyOn(controlModule, "createSessionControlMachine");
+	const commandFactory = vi.spyOn(commandModule, "createSessionCommandMachine");
+	const extensionFactory = vi.spyOn(extensionModule, "createSessionExtensionMachine");
+	const recoveryFactory = vi.spyOn(recoveryModule, "createSessionRecoveryMachine");
+	const retentionFactory = vi.spyOn(retentionModule, "createSessionRetentionMachine");
+	const h = harness();
+	const socket = connect(h);
+	const control = controlFactory.mock.results[0]!.value as ReturnType<
+		typeof controlModule.createSessionControlMachine
+	>;
+	const command = commandFactory.mock.results[0]!.value as ReturnType<
+		typeof commandModule.createSessionCommandMachine
+	>;
+	const extension = extensionFactory.mock.results[0]!.value as ReturnType<
+		typeof extensionModule.createSessionExtensionMachine
+	>;
+	const recovery = recoveryFactory.mock.results[0]!.value as ReturnType<
+		typeof recoveryModule.createSessionRecoveryMachine
+	>;
+	const retention = retentionFactory.mock.results[0]!.value as ReturnType<
+		typeof retentionModule.createSessionRetentionMachine
+	>;
+	const emptyRecovery = recovery.getState();
+	const emptyRetention = retention.getState();
+	for (let index = 0; index < 100; index += 1) {
+		const handle = `retired-${index}`;
+		subscribeAndPrime(h, handle);
+		socket.serverMessage(eventFrame(handle, 1, 1));
+		const pending = h.controller.store.getState().sendCommand(handle, { id: handle, type: "get_state" });
+		const rejected = expect(pending).rejects.toMatchObject({ code: "session_not_subscribed" });
+		expect(getSessionBrowserEffects().currentIdentity(handle)).not.toBeNull();
+		expect(control.getSession(handle)).toBeDefined();
+		expect(command.getPending(handle)).toBeDefined();
+		h.controller.store.getState().forgetSession(handle);
+		await rejected;
+		const sentCount = socket.sent.length;
+		socket.serverMessage(successResponse(handle, 1, handle, "get_state", 1));
+		socket.serverMessage({ type: "runtime_state", runtime: runtime(handle) });
+		h.controller.ingestServerMessage({
+			type: "session_rekeyed",
+			serverEpoch: "test-server-epoch",
+			previousSessionHandle: handle,
+			runtime: runtime(`${handle}-child`, 2),
+		});
+		h.controller.ingestServerMessage({
+			type: "lease_status",
+			serverEpoch: "test-server-epoch",
+			sessionHandle: handle,
+			generation: 1,
+			leaseRevision: 2,
+			controlState: "free",
+			transition: "release",
+			isController: false,
+		});
+		expect(h.controller.store.getState().claimSession(handle)).toBe(false);
+		expect(h.controller.store.getState().releaseSession(handle)).toBe(false);
+		expect(h.controller.store.getState().takeoverSession(handle)).toBe(false);
+		expect(h.controller.confirmProjectionDelivery(handle, 1)).toBe(false);
+		await flushPromises();
+		expect(socket.sent).toHaveLength(sentCount);
+		expect(h.controller.store.getState().sessions).toEqual({});
+		expect(getSessionBrowserEffects().currentIdentity(handle)).toBeNull();
+		expect(control.getState().sessions).toEqual({});
+		expect(command.getState().pending).toEqual({});
+		expect(extension.getState().sessions).toEqual({});
+		for (const collection of Object.values(recovery.effects)) expect(collection.size).toBe(0);
+		expect(recovery.getState()).toEqual(emptyRecovery);
+		expect(retention.getState()).toEqual(emptyRetention);
+	}
+	h.controller.store.getState().disconnect();
+	expect(h.controller.store.getState().sessions).toEqual({});
+});
+
+it("terminal forget aborts projected materialization and releases bus listeners without blocking another Session", async () => {
+	let signal: AbortSignal | undefined;
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const adapter = projectedAdapter(async (request, callerSignal) => {
+		signal = callerSignal;
+		await gate;
+		if (request.method !== "set_editor_text") throw new Error("unexpected fixture request");
+		return { ...request, text: "late text" };
+	});
+	const h = harness({ contentAdapter: adapter });
+	connect(h);
+	subscribeAndPrime(h, "session-a");
+	subscribeAndPrime(h, "session-b");
+	const retiredListener = vi.fn();
+	h.controller.frameBus.subscribe("session-a", retiredListener);
+	ingest(h.controller, projectedSetEditorFrame("session-a", 1, 1, "late"));
+	await vi.waitFor(() => expect(signal).toBeDefined());
+	h.controller.store.getState().forgetSession("session-a");
+	expect(signal?.aborted).toBe(true);
+	expect(h.controller.store.getState().sessions["session-a"]).toBeUndefined();
+	release();
+	ingest(h.controller, projectedEventFrame("session-b", 1, 1));
+	await flushPromises();
+	await flushPromises();
+	expect(retiredListener).not.toHaveBeenCalled();
+	expect(h.controller.store.getState().sessions["session-a"]).toBeUndefined();
+	expect(h.controller.store.getState().sessions["session-b"]?.lastSeq).toBe(1);
+	// A new explicit subscription is allowed, with a fresh bus counter and no old listener.
+	const orders: number[] = [];
+	h.controller.frameBus.subscribeAll((frame) => {
+		if (frame.sessionHandle === "session-a") orders.push(frame.order);
+	});
+	subscribeAndPrime(h, "session-a");
+	expect(orders[0]).toBe(1);
+	expect(retiredListener).not.toHaveBeenCalled();
+});
+
+it("terminal forget cancels a pending recovery snapshot and its late completion", async () => {
+	const recoveryFactory = vi.spyOn(recoveryModule, "createSessionRecoveryMachine");
+	const h = harness();
+	const socket = connect(h);
+	subscribeAndPrime(h, "session-a");
+	const recovery = recoveryFactory.mock.results[0]!.value as ReturnType<
+		typeof recoveryModule.createSessionRecoveryMachine
+	>;
+	h.controller.ingestServerMessage({
+		type: "resync_required",
+		serverEpoch: "test-server-epoch",
+		sessionHandle: "session-a",
+		runtime: runtime("session-a", 1, 1),
+		reason: "gap",
+	});
+	expect(recovery.effects.snapshotWaiters.size).toBe(1);
+	expect(recovery.resync.getState("session-a")).toBeDefined();
+	h.controller.store.getState().forgetSession("session-a");
+	const sent = socket.sent.length;
+	completeWithSnapshot(h, "session-a", 1, 1);
+	await flushPromises();
+	expect(h.controller.store.getState().sessions["session-a"]).toBeUndefined();
+	expect(recovery.resync.getState("session-a")).toBeUndefined();
+	for (const collection of Object.values(recovery.effects)) expect(collection.size).toBe(0);
+	expect(recovery.getState().skipNextResubscribe.size).toBe(0);
+	expect(socket.sent).toHaveLength(sent);
 });
