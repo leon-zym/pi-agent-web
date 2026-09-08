@@ -418,7 +418,7 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 		const handle = this.resolveAlias(sessionHandle);
 		const tracked = this.runtimes.get(handle);
 		const runtime =
-			tracked?.snapshotOverflowed && tracked.state === "crashed" && tracked.recoverable
+			tracked?.requiresExplicitRestart && tracked.state === "crashed" && tracked.recoverable
 				? tracked
 				: await this.ensureRuntime(handle);
 		return this.withPoolLock(async () => {
@@ -680,20 +680,22 @@ export class SessionSupervisorCore<M extends SessionRuntimeProductMode = "conten
 			}
 			this.clearRestart(existing.sessionHandle);
 			this.crashTimes.delete(existing.sessionHandle);
-			if (existing.snapshotOverflowed) {
+			if (existing.requiresExplicitRestart) {
 				const target = existing.rebuildTarget();
 				if (!target) throw new RpcError("restart", "unpersisted_session_cannot_be_recovered");
 				await existing.stop();
 				if (this.runtimes.get(handle) !== existing) {
 					throw new RpcError("restart", "session_runtime_not_tracked");
 				}
-				runtime = this.createRuntime(target, existing.generation);
-				this.runtimes.set(handle, runtime);
+				if (existing.snapshotOverflowed) {
+					runtime = this.createRuntime(target, existing.generation);
+					this.runtimes.set(handle, runtime);
+				}
 			}
 			await this.ensureCapacity();
 			this.assertOpen();
 			release = runtime.reserve();
-			starting = runtime.start();
+			starting = runtime.startForExplicitRecovery();
 			void starting.catch(() => {
 				// The awaited call below owns the startup error. Attaching the handler
 				// here keeps capacity reservation and rejection observation atomic.

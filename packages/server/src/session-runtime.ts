@@ -447,6 +447,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 		owner: GenerationContentOwner<RuntimeRef<M>>;
 	} | null = null;
 	private crashedRecoverable: boolean | null = null;
+	private nativeHistoryIdentityLost = false;
 	private snapshotOverflow = false;
 	private idleBaseCompactionPromise: Promise<void> | null = null;
 	private discardedCompactionTransferCleanup: Promise<void> | null = null;
@@ -576,6 +577,10 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 
 	get protocolIncompatible(): boolean {
 		return this.terminalProtocolIncompatible;
+	}
+
+	get requiresExplicitRestart(): boolean {
+		return this.snapshotOverflow || this.nativeHistoryIdentityLost;
 	}
 
 	get snapshotOverflowed(): boolean {
@@ -711,6 +716,9 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 		if (this.generationContentCleanupFailure) {
 			return Promise.reject(new RpcError("session_start", "generation_content_cleanup_failed"));
 		}
+		if (this.nativeHistoryIdentityLost) {
+			return Promise.reject(new RpcError("session_start", "session_history_changed"));
+		}
 		if (this.snapshotOverflow) {
 			return Promise.reject(new RpcError("session_start", "session_snapshot_overflow"));
 		}
@@ -736,6 +744,21 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 			this.startPromise = null;
 		});
 		return this.startPromise;
+	}
+
+	/** Only the Supervisor's exact fenced restart may reopen invalidated native history. */
+	async startForExplicitRecovery(): Promise<void> {
+		const revalidatingIdentity = this.nativeHistoryIdentityLost;
+		this.nativeHistoryIdentityLost = false;
+		try {
+			await this.start();
+		} catch (error) {
+			if (revalidatingIdentity) {
+				this.nativeHistoryIdentityLost = true;
+				if (!this.protocolIncompatible) this.terminalizeProjection("session_history_changed");
+			}
+			throw error;
+		}
 	}
 
 	private async spawn(): Promise<void> {
@@ -1056,6 +1079,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 			return messages;
 		} catch (error) {
 			if (error instanceof SessionHistoryError) {
+				this.invalidateNativeHistoryIdentity(error, processToken, proc);
 				throw new RpcError("get_messages", error.code);
 			}
 			throw error;
@@ -1080,6 +1104,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 		let lease: PiPayloadLease<RuntimeRef<M>> | null = null;
 		try {
 			const previousPlan = this.nativeHistoryPlan;
+			previousPlan?.assertSourceIdentity();
 			const plan = await scanNativeSessionHistory(
 				this.sessionFile,
 				{
@@ -1092,6 +1117,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 				throw new SessionHistoryError(
 					"session_history_changed",
 					"native Session history file identity changed",
+					true,
 				);
 			}
 			if (plan.totalMessages === 0) {
@@ -1139,6 +1165,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 			return true;
 		} catch (error) {
 			if (error instanceof SessionHistoryError) {
+				this.invalidateNativeHistoryIdentity(error, processToken, proc);
 				throw new RpcError("get_messages", error.code);
 			}
 			throw error;
@@ -1979,6 +2006,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 				throw new RpcError("history_page", "session_history_timeout");
 			}
 			if (error instanceof SessionHistoryError) {
+				this.invalidateNativeHistoryIdentity(error, processToken, proc);
 				throw new RpcError("history_page", error.code);
 			}
 			throw error;
@@ -3897,10 +3925,25 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 		return new RpcError("session_snapshot", "session_snapshot_overflow");
 	}
 
+	private invalidateNativeHistoryIdentity(
+		error: SessionHistoryError,
+		processToken: number,
+		proc: PiProcess,
+	): void {
+		if (!this.startupReady || !this.isCurrentNativeHistoryRead(processToken, proc)) return;
+		if (!error.identityLost && error.code !== "session_history_invalid_header") return;
+		this.nativeHistoryIdentityLost = true;
+		this.terminalizeProjection("session_history_changed");
+	}
+
 	private terminalizeSnapshotOverflow(): void {
 		if (this.snapshotOverflow && this.state === "crashed") return;
 		this.snapshotOverflow = true;
-		this.error = "session_snapshot_overflow";
+		this.terminalizeProjection("session_snapshot_overflow");
+	}
+
+	private terminalizeProjection(reason: string): void {
+		this.error = reason;
 		this.manuallyStopped = true;
 		this.processToken += 1;
 		const proc = this.proc;
@@ -3923,7 +3966,7 @@ export class SessionRuntimeCore<M extends SessionRuntimeProductMode = "content_r
 			(proc || contentOwner || discardedCleanup || retiredCleanup || transitionCleanup) &&
 			!this.stopPromise
 		) {
-			const cleanup = this.beginTerminalGenerationCleanup("Overflowed generation cleanup", [
+			const cleanup = this.beginTerminalGenerationCleanup("Untrusted generation cleanup", [
 				proc?.stop(),
 				contentOwner?.release(),
 				discardedCleanup,

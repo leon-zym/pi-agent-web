@@ -853,123 +853,182 @@ describe("SessionWsBridge", () => {
 		expect(readCalls).toBe(3);
 	});
 
-	it("recovers snapshot overflow through an explicit generation-and-lease-fenced restart", async () => {
-		const root = temporaryRoot();
-		const cwd = path.join(root, "workspace");
-		fs.mkdirSync(cwd);
-		const target = createNativeSession(root, cwd, "overflow-bridge-restart");
-		const harness = await createHarness([target], {
-			projectionLimits: { maxLiveEventItems: 8 },
-			maxAutoRestarts: 0,
-			env: { PI_WEB_FIXTURE_OVERFLOW_MARKER: path.join(root, "overflow-once.marker") },
-		});
-		const client = await openClient(harness);
-		const initial = await subscribe(client, target.sessionHandle);
-		const lease = await claim(client, target.sessionHandle);
-		if (!lease.fencingToken) throw new Error("overflow fixture did not acquire a controller lease");
+	it.each(["session_snapshot_overflow", "session_history_changed"])(
+		"recovers an untrusted runtime through an explicit generation-and-lease-fenced restart: %s",
+		async (error) => {
+			const root = temporaryRoot();
+			const cwd = path.join(root, "workspace");
+			fs.mkdirSync(cwd);
+			const target = createNativeSession(root, cwd, "overflow-bridge-restart");
+			if (error === "session_history_changed") appendLargeNativeHistory(target, 3, 128);
+			const harness = await createHarness([target], {
+				projectionLimits: { maxLiveEventItems: 8 },
+				historyCapability: true,
+				maxAutoRestarts: 0,
+				env: { PI_WEB_FIXTURE_OVERFLOW_MARKER: path.join(root, "overflow-once.marker") },
+			});
+			const client = await openClient(harness, { historyCapability: true });
+			const initial = await subscribe(client, target.sessionHandle);
+			const lease = await claim(client, target.sessionHandle);
+			if (!lease.fencingToken) throw new Error("overflow fixture did not acquire a controller lease");
 
-		const overflowMark = client.mark();
-		client.send({
-			type: "command",
-			sessionHandle: target.sessionHandle,
-			expectedGeneration: initial.runtime.generation,
-			fencingToken: lease.fencingToken,
-			command: { type: "prompt", id: "overflow-command", message: "overflow-once" },
-		});
-		await eventually(() => harness.supervisor.getRuntime(target.sessionHandle)?.state === "crashed");
-		const overflowed = harness.supervisor.getRuntime(target.sessionHandle)!;
-		expect(overflowed.error).toBe("session_snapshot_overflow");
-		await client.waitForFrame(
-			(frame): frame is Extract<SessionWsServerMessage, { type: "resync_required" }> =>
-				frame.type === "resync_required" && frame.runtime.generation === overflowed.generation,
-			overflowMark,
-		);
-		const releaseMark = client.mark();
-		client.send({ type: "session_release", sessionHandle: target.sessionHandle });
-		await client.waitForFrame(
-			(frame): frame is LeaseFrame =>
-				frame.type === "lease_status" &&
-				frame.sessionHandle === target.sessionHandle &&
-				frame.isController === false,
-			releaseMark,
-		);
-		const observer = await openClient(harness);
-		const observerMark = observer.mark();
-		observer.send({ type: "session_subscribe", sessionHandle: target.sessionHandle });
-		await observer.waitForFrame(
-			(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
-				frame.type === "session_error" &&
-				frame.operation === "subscribe" &&
-				frame.code === "session_snapshot_overflow",
-			observerMark,
-		);
-		const rejectedRestartMark = observer.mark();
-		observer.send({
-			type: "session_restart",
-			sessionHandle: target.sessionHandle,
-			expectedGeneration: overflowed.generation,
-			fencingToken: "not-a-controller-fence",
-		});
-		const rejectedRestart = await observer.waitForFrame(
-			(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
-				frame.type === "session_error" && frame.operation === "restart",
-			rejectedRestartMark,
-		);
-		expect(rejectedRestart.code).toBe("session_read_only");
-		expect(harness.supervisor.getRuntime(target.sessionHandle)?.generation).toBe(overflowed.generation);
+			if (error === "session_history_changed") {
+				fs.copyFileSync(target.sessionFile, `${target.sessionFile}.replacement`);
+				fs.renameSync(`${target.sessionFile}.replacement`, target.sessionFile);
+			}
+			const overflowMark = client.mark();
+			client.send({
+				type: "command",
+				sessionHandle: target.sessionHandle,
+				expectedGeneration: initial.runtime.generation,
+				fencingToken: lease.fencingToken,
+				command: {
+					type: "prompt",
+					id: "overflow-command",
+					message: error === "session_snapshot_overflow" ? "overflow-once" : "hi",
+				},
+			});
+			await eventually(() => harness.supervisor.getRuntime(target.sessionHandle)?.state === "crashed");
+			const overflowed = harness.supervisor.getRuntime(target.sessionHandle)!;
+			expect(overflowed.error).toBe(error);
+			await client.waitForFrame(
+				(frame): frame is Extract<SessionWsServerMessage, { type: "resync_required" }> =>
+					frame.type === "resync_required" && frame.runtime.generation === overflowed.generation,
+				overflowMark,
+			);
+			const releaseMark = client.mark();
+			client.send({ type: "session_release", sessionHandle: target.sessionHandle });
+			await client.waitForFrame(
+				(frame): frame is LeaseFrame =>
+					frame.type === "lease_status" &&
+					frame.sessionHandle === target.sessionHandle &&
+					frame.isController === false,
+				releaseMark,
+			);
+			const observer = await openClient(harness, { historyCapability: true });
+			const observerMark = observer.mark();
+			observer.send({ type: "session_subscribe", sessionHandle: target.sessionHandle });
+			await observer.waitForFrame(
+				(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+					frame.type === "session_error" && frame.operation === "subscribe" && frame.code === error,
+				observerMark,
+			);
+			const rejectedRestartMark = observer.mark();
+			observer.send({
+				type: "session_restart",
+				sessionHandle: target.sessionHandle,
+				expectedGeneration: overflowed.generation,
+				fencingToken: "not-a-controller-fence",
+			});
+			const rejectedRestart = await observer.waitForFrame(
+				(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+					frame.type === "session_error" && frame.operation === "restart",
+				rejectedRestartMark,
+			);
+			expect(rejectedRestart.code).toBe("session_read_only");
+			expect(harness.supervisor.getRuntime(target.sessionHandle)?.generation).toBe(overflowed.generation);
 
-		const observerLease = await claim(observer, target.sessionHandle);
-		expect(observerLease).toMatchObject({
-			generation: overflowed.generation,
-			isController: true,
-		});
-		await observer.close();
-		const successor = await openClient(harness);
-		const successorMark = successor.mark();
-		successor.send({ type: "session_subscribe", sessionHandle: target.sessionHandle });
-		await successor.waitForFrame(
-			(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
-				frame.type === "session_error" &&
-				frame.operation === "subscribe" &&
-				frame.code === "session_snapshot_overflow",
-			successorMark,
-		);
-		const successorLease = await claim(successor, target.sessionHandle);
-		if (!successorLease.fencingToken) {
-			throw new Error("inactive overflow claim did not acquire a fenced controller lease");
-		}
+			const observerLease = await claim(observer, target.sessionHandle);
+			expect(observerLease).toMatchObject({
+				generation: overflowed.generation,
+				isController: true,
+			});
+			await observer.close();
+			const successor = await openClient(harness, { historyCapability: true });
+			const successorMark = successor.mark();
+			successor.send({ type: "session_subscribe", sessionHandle: target.sessionHandle });
+			await successor.waitForFrame(
+				(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+					frame.type === "session_error" && frame.operation === "subscribe" && frame.code === error,
+				successorMark,
+			);
+			const successorLease = await claim(successor, target.sessionHandle);
+			if (!successorLease.fencingToken) {
+				throw new Error("inactive overflow claim did not acquire a fenced controller lease");
+			}
 
-		const restartMark = successor.mark();
-		const observerRecoveryMark = client.mark();
-		successor.send({
-			type: "session_restart",
-			sessionHandle: target.sessionHandle,
-			expectedGeneration: overflowed.generation,
-			fencingToken: successorLease.fencingToken,
-		});
-		const restarted = await successor.waitForFrame(
-			(frame): frame is Extract<SessionWsServerMessage, { type: "runtime_state" }> =>
-				frame.type === "runtime_state" &&
-				frame.runtime.generation === overflowed.generation + 1 &&
-				frame.runtime.state === "idle",
-			restartMark,
-			5_000,
-		);
-		expect(restarted.runtime).toMatchObject({ state: "idle" });
-		expect(restarted.runtime.error).toBeUndefined();
-		await successor.waitForFrame(
-			(frame): frame is Extract<SessionWsServerMessage, { type: "session_snapshot" }> =>
-				frame.type === "session_snapshot" && frame.generation === restarted.runtime.generation,
-			restartMark,
-			5_000,
-		);
-		await client.waitForFrame(
-			(frame): frame is Extract<SessionWsServerMessage, { type: "session_snapshot" }> =>
-				frame.type === "session_snapshot" && frame.generation === restarted.runtime.generation,
-			observerRecoveryMark,
-			5_000,
-		);
-	});
+			let recoveryGeneration = overflowed.generation;
+			let recoveryFence = successorLease.fencingToken;
+			if (error === "session_history_changed") {
+				const validHistory = fs.readFileSync(target.sessionFile, "utf8");
+				fs.writeFileSync(
+					target.sessionFile,
+					validHistory.replace(`"id":"${target.nativeSessionId}"`, '"id":"wrong-session"'),
+				);
+				const failedMark = successor.mark();
+				successor.send({
+					type: "session_restart",
+					sessionHandle: target.sessionHandle,
+					expectedGeneration: recoveryGeneration,
+					fencingToken: recoveryFence,
+				});
+				await successor.waitForFrame(
+					(frame): frame is Extract<SessionWsServerMessage, { type: "session_error" }> =>
+						frame.type === "session_error" && frame.operation === "restart",
+					failedMark,
+				);
+				const failed = harness.supervisor.getRuntime(target.sessionHandle)!;
+				expect(failed).toMatchObject({ state: "crashed", error, generation: recoveryGeneration + 1 });
+				recoveryGeneration = failed.generation;
+				const retryLease = await claim(successor, target.sessionHandle);
+				if (!retryLease.fencingToken) throw new Error("failed recovery lost its claim path");
+				recoveryFence = retryLease.fencingToken;
+				fs.writeFileSync(target.sessionFile, validHistory);
+				const rejectedMark = successor.mark();
+				successor.send({
+					type: "command",
+					sessionHandle: target.sessionHandle,
+					expectedGeneration: recoveryGeneration,
+					fencingToken: recoveryFence,
+					command: { type: "prompt", id: "before-explicit-recovery", message: "must reject" },
+				});
+				const rejected = await successor.waitForFrame(
+					(frame): frame is ResponseFrame =>
+						frame.type === "response" && frame.response.id === "before-explicit-recovery",
+					rejectedMark,
+				);
+				expect(rejected.response.success).toBe(false);
+				expect(harness.supervisor.getRuntime(target.sessionHandle)?.generation).toBe(recoveryGeneration);
+			}
+
+			const restartMark = successor.mark();
+			const observerRecoveryMark = client.mark();
+			successor.send({
+				type: "session_restart",
+				sessionHandle: target.sessionHandle,
+				expectedGeneration: recoveryGeneration,
+				fencingToken: recoveryFence,
+			});
+			const restarted = await successor.waitForFrame(
+				(frame): frame is Extract<SessionWsServerMessage, { type: "runtime_state" }> =>
+					frame.type === "runtime_state" &&
+					frame.runtime.generation === recoveryGeneration + 1 &&
+					frame.runtime.state === "idle",
+				restartMark,
+				5_000,
+			);
+			expect(restarted.runtime).toMatchObject({ state: "idle" });
+			expect(restarted.runtime.error).toBeUndefined();
+			await successor.waitForFrame(
+				(
+					frame,
+				): frame is Extract<SessionWsServerMessage, { type: "session_snapshot" | "session_snapshot_end" }> =>
+					(frame.type === "session_snapshot" || frame.type === "session_snapshot_end") &&
+					frame.generation === restarted.runtime.generation,
+				restartMark,
+				5_000,
+			);
+			await client.waitForFrame(
+				(
+					frame,
+				): frame is Extract<SessionWsServerMessage, { type: "session_snapshot" | "session_snapshot_end" }> =>
+					(frame.type === "session_snapshot" || frame.type === "session_snapshot_end") &&
+					frame.generation === restarted.runtime.generation,
+				observerRecoveryMark,
+				5_000,
+			);
+		},
+	);
 
 	it("establishes overflow recovery when the crash is buffered during catch-up", async () => {
 		const root = temporaryRoot();
