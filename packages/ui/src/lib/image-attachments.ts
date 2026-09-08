@@ -48,7 +48,7 @@ export function imagePayloadChars(images: ImageContent[]): number {
 	return images.reduce((total, image) => total + image.data.length, 0);
 }
 
-/** Decode and resize browser-selected images before they enter the WebSocket frame. */
+/** Prepare additions only; the composer reconciles them with its current draft at completion. */
 export async function prepareImageAttachments(
 	files: File[],
 	existing: ImageContent[],
@@ -58,15 +58,14 @@ export async function prepareImageAttachments(
 	const available = COMPOSER_IMAGE_MAX_COUNT - existing.length;
 	if (available <= 0) throw new ImageAttachmentError("too_many", "attachment_limit_reached");
 	const selected = candidates.slice(0, available);
-	if (selected.length === 0) return existing;
+	if (selected.length === 0) return [];
 
 	const prepared: ImageContent[] = [];
 	for (const file of selected) prepared.push(await prepareImage(file, platform));
-	const combined = [...existing, ...prepared];
-	if (imagePayloadChars(combined) > SESSION_IMAGE_TOTAL_MAX_BASE64_CHARS) {
+	if (imagePayloadChars(prepared) > SESSION_IMAGE_TOTAL_MAX_BASE64_CHARS) {
 		throw new ImageAttachmentError("total_too_large", "attachment_total_too_large");
 	}
-	return combined;
+	return prepared;
 }
 
 async function prepareImage(file: File, platform: ImageAttachmentPlatform): Promise<ImageContent> {

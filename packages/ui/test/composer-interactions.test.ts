@@ -1,3 +1,4 @@
+import { SESSION_IMAGE_TOTAL_MAX_BASE64_CHARS } from "@pi-agent-web/protocol";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
 	detectSlashTrigger,
@@ -200,6 +201,76 @@ describe("composer interactions", () => {
 			submitted.activeSubmitId,
 		);
 		expect(useComposerStore.getState()).toMatchObject({ draft: "same body", command: skillToken });
+	});
+
+	it("preserves removal and current ordering when image additions finish after navigation and rekey", () => {
+		const composer = useComposerStore.getState();
+		const image = (data: string): ImageContent => ({ type: "image", mimeType: "image/png", data });
+		const [removed, retained, added] = [image("removed"), image("retained"), image("added")] as const;
+		composer.setImages([removed, retained]);
+		composer.setDraft("original draft");
+		const workId = composer.beginAttachmentWorkForSession("session-a");
+		composer.setImages([retained]);
+		composer.setDraft("edited draft");
+		composer.beginSession("session-b");
+		composer.setImages([image("unrelated")]);
+		composer.setDraft("unrelated draft");
+		composer.rekeySession("session-a", "canonical-a");
+		composer.finishAttachmentWorkForSession("session-a", workId, [added]);
+		expect(useComposerStore.getState().bySession["canonical-a"]).toMatchObject({
+			images: [retained, added],
+			draft: "edited draft",
+			attachmentWorkCount: 0,
+		});
+		expect(useComposerStore.getState()).toMatchObject({
+			images: [image("unrelated")],
+			draft: "unrelated draft",
+			attachmentWorkCount: 0,
+		});
+		composer.finishAttachmentWorkForSession("session-a", workId, [removed]);
+		expect(useComposerStore.getState().bySession["canonical-a"]?.images).toEqual([retained, added]);
+	});
+
+	it.each(["too_many", "total_too_large"])(
+		"checks the current %s budget and settles rejected work",
+		(code) => {
+			const composer = useComposerStore.getState();
+			const image = (data: string): ImageContent => ({ type: "image", mimeType: "image/png", data });
+			const workId = composer.beginAttachmentWorkForSession("session-a");
+			const current =
+				code === "too_many"
+					? Array.from({ length: 4 }, () => image("current"))
+					: [image("a".repeat(SESSION_IMAGE_TOTAL_MAX_BASE64_CHARS))];
+			composer.setImages(current);
+			expect(() => composer.finishAttachmentWorkForSession("session-a", workId, [image("new")])).toThrow(
+				code === "too_many" ? "attachment_limit_reached" : "attachment_total_too_large",
+			);
+			expect(useComposerStore.getState().images).toBe(current);
+			expect(useComposerStore.getState().attachmentWorkCount).toBe(0);
+			composer.finishAttachmentWorkForSession("session-a", workId, [image("late")]);
+			expect(useComposerStore.getState().images).toBe(current);
+		},
+	);
+
+	it("keeps removal on preparation failure and ignores cancelled or forgotten work", () => {
+		const composer = useComposerStore.getState();
+		const image: ImageContent = { type: "image", mimeType: "image/png", data: "removed" };
+		composer.setImages([image]);
+		const failed = composer.beginAttachmentWorkForSession("session-a");
+		composer.setImages([]);
+		composer.finishAttachmentWorkForSession("session-a", failed);
+		composer.finishAttachmentWorkForSession("session-a", failed, [image]);
+		expect(useComposerStore.getState().images).toEqual([]);
+		const forgotten = composer.beginAttachmentWorkForSession("session-a");
+		composer.forgetSession("session-a");
+		composer.beginSession("session-a");
+		composer.setDraft("replacement draft");
+		composer.finishAttachmentWorkForSession("session-a", forgotten, [image]);
+		expect(useComposerStore.getState()).toMatchObject({
+			images: [],
+			draft: "replacement draft",
+			attachmentWorkCount: 0,
+		});
 	});
 
 	it("tracks attachment preparation across Session switches and canonical rekey", () => {
