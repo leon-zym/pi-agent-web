@@ -38,12 +38,26 @@ test("long history keeps mounted turns bounded and reveals older turns on demand
 	await expect(turnWindow).toHaveAttribute("data-turn-window-total", "48");
 	let loadedTurns = 48;
 	while (loadedTurns < HISTORY_TURNS) {
-		await turnWindow.locator('[data-load-older-turns="true"]').click();
+		// Keep setup above the automatic-load threshold; each activation either reveals
+		// a local slice or fetches one remote page without focus-induced scrolling.
+		await viewport.evaluate((element) => {
+			element.scrollTop = 140;
+			element.dispatchEvent(new Event("scroll"));
+		});
+		const previousStart = Number(await turnWindow.getAttribute("data-turn-window-start"));
+		await turnWindow
+			.locator('[data-load-older-turns="true"]')
+			.evaluate((button) => (button as HTMLButtonElement).click());
 		await expect
-			.poll(async () => Number(await turnWindow.getAttribute("data-turn-window-total")), {
-				timeout: 30_000,
-			})
-			.toBeGreaterThan(loadedTurns);
+			.poll(
+				async () => {
+					const total = Number(await turnWindow.getAttribute("data-turn-window-total"));
+					const start = Number(await turnWindow.getAttribute("data-turn-window-start"));
+					return total > loadedTurns || start < previousStart;
+				},
+				{ timeout: 30_000 },
+			)
+			.toBe(true);
 		loadedTurns = Number(await turnWindow.getAttribute("data-turn-window-total"));
 	}
 	await viewport.getByRole("button", { name: /^(Back to latest|回到最新消息)$/ }).click();

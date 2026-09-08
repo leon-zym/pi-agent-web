@@ -59,3 +59,23 @@ export function revealTurnWindowStart(
 	const maxStart = Math.max(0, safeTotal - safeWindowSize);
 	return clamp(safeIndex - Math.floor(safeWindowSize / 2), 0, maxStart);
 }
+
+/** Keep the captured visible turn mounted while revealing one local page of newly fetched history. */
+export function getRemotePrependWindowStart(
+	turns: readonly { id: string }[],
+	firstTurnId: string,
+	previousStart: number,
+	anchorId: string,
+): number | null {
+	const shift = turns.findIndex((turn) => turn.id === firstTurnId);
+	const anchorIndex = turns.findIndex((turn) => turn.id === anchorId);
+	// An append or replacement is not the completion of this prepend.
+	if (shift <= 0 || anchorIndex < shift) return null;
+	return getSafeTurnWindowStart(
+		turns.length,
+		Math.max(
+			previousStart + shift - CONVERSATION_TURN_PAGE_SIZE,
+			anchorIndex - CONVERSATION_TURN_WINDOW_SIZE + 1,
+		),
+	);
+}

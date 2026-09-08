@@ -19,6 +19,7 @@ import {
 	CONVERSATION_TURN_PAGE_SIZE,
 	getInitialTurnWindowStart,
 	getPreviousTurnWindowStart,
+	getRemotePrependWindowStart,
 	getSafeTurnWindowStart,
 	getTurnWindowRange,
 	revealTurnWindowStart,
@@ -43,7 +44,8 @@ interface ConversationTurnWindowProps {
 	remoteHistoryHasOlder?: boolean;
 	remoteHistoryLoading?: boolean;
 	remoteHistoryError?: string | null;
-	onLoadRemoteOlder?: () => void;
+	remoteHistorySnapshotId?: string | null;
+	onLoadRemoteOlder?: () => boolean;
 	onAttachmentLoadError?: (image: SessionImageContentDto) => void;
 	scrollContainerRef: RefObject<HTMLDivElement | null>;
 }
@@ -66,6 +68,15 @@ function rememberWindowStart(sessionHandle: string, start: number): void {
 	}
 }
 
+function findVisibleTurn(container: HTMLDivElement | null): HTMLElement | undefined {
+	if (!container) return undefined;
+	const viewport = container.getBoundingClientRect();
+	return Array.from(container.querySelectorAll<HTMLElement>("[data-turn-id]")).find((candidate) => {
+		const rect = candidate.getBoundingClientRect();
+		return rect.bottom > viewport.top && rect.top < viewport.bottom;
+	});
+}
+
 function scrollToTurnElement(container: HTMLDivElement | null, turnId: string): void {
 	if (!container) return;
 	const element = Array.from(container.querySelectorAll<HTMLElement>("[data-turn-id]")).find(
@@ -86,6 +97,7 @@ export const ConversationTurnWindow = memo(
 			remoteHistoryHasOlder = false,
 			remoteHistoryLoading = false,
 			remoteHistoryError = null,
+			remoteHistorySnapshotId = null,
 			onLoadRemoteOlder,
 			onAttachmentLoadError,
 			scrollContainerRef,
@@ -99,6 +111,22 @@ export const ConversationTurnWindow = memo(
 		const turnsRef = useRef(turns);
 		const previousTurnCountRef = useRef(turns.length);
 		const mountedRef = useRef(false);
+		const remotePrependRef = useRef<{
+			identity: typeof sessionIdentity;
+			snapshotId: typeof remoteHistorySnapshotId;
+			firstTurnId: string;
+			start: number;
+			anchorId: string;
+			anchorTop: number;
+		} | null>(null);
+		const olderButtonRef = useRef<HTMLButtonElement | null>(null);
+		const removedFocusedButtonRef = useRef(false);
+		const setOlderButton = useCallback((button: HTMLButtonElement | null) => {
+			if (!button && olderButtonRef.current === document.activeElement) {
+				removedFocusedButtonRef.current = true;
+			}
+			olderButtonRef.current = button;
+		}, []);
 		const pendingPrependRef = useRef<{
 			nextStart: number;
 			scrollTop: number;
@@ -132,11 +160,42 @@ export const ConversationTurnWindow = memo(
 			};
 		}, []);
 
-		const range = useMemo(() => getTurnWindowRange(turns.length, start), [turns.length, start]);
+		const remote = remotePrependRef.current;
+		const ownsRemote =
+			remote &&
+			remote.identity === sessionIdentity &&
+			remote.snapshotId === remoteHistorySnapshotId &&
+			!remoteHistoryError;
+		const remoteStart = ownsRemote
+			? getRemotePrependWindowStart(turns, remote.firstTurnId, remote.start, remote.anchorId)
+			: null;
+		// Select the corrected slice before commit, so the stable keyed anchor never unmounts.
+		const renderedStart = remoteStart ?? start;
+		const range = useMemo(
+			() => getTurnWindowRange(turns.length, renderedStart),
+			[turns.length, renderedStart],
+		);
+
+		useLayoutEffect(() => {
+			if (remoteStart !== null && remote) {
+				pendingPrependRef.current = {
+					nextStart: remoteStart,
+					scrollTop: scrollContainerRef.current?.scrollTop ?? 0,
+					anchorId: remote.anchorId,
+					anchorTop: remote.anchorTop,
+				};
+				startRef.current = remoteStart;
+				setStart(remoteStart);
+			}
+			if (!ownsRemote || remoteStart !== null || !remoteHistoryLoading) {
+				remotePrependRef.current = null;
+			}
+		}, [ownsRemote, remote, remoteStart, remoteHistoryLoading, scrollContainerRef]);
 
 		useEffect(() => {
 			const previousCount = previousTurnCountRef.current;
 			previousTurnCountRef.current = turns.length;
+			if (remoteStart !== null) return;
 			if (turns.length === 0) {
 				setStart(0);
 				return;
@@ -154,12 +213,12 @@ export const ConversationTurnWindow = memo(
 				}
 				return getSafeTurnWindowStart(turns.length, current);
 			});
-		}, [scrollContainerRef, turns.length]);
+		}, [remoteStart, scrollContainerRef, turns.length]);
 
 		useLayoutEffect(() => {
-			if (sessionHandle) rememberWindowStart(sessionHandle, start);
+			if (sessionHandle) rememberWindowStart(sessionHandle, renderedStart);
 			const pending = pendingPrependRef.current;
-			if (!pending || pending.nextStart !== start) return;
+			if (!pending || pending.nextStart !== renderedStart) return;
 			const container = scrollContainerRef.current;
 			if (container) {
 				const anchor = pending.anchorId
@@ -174,7 +233,16 @@ export const ConversationTurnWindow = memo(
 				}
 			}
 			pendingPrependRef.current = null;
-		}, [scrollContainerRef, sessionHandle, start]);
+		}, [scrollContainerRef, sessionHandle, renderedStart, turns]);
+
+		useLayoutEffect(() => {
+			if (!removedFocusedButtonRef.current) return;
+			removedFocusedButtonRef.current = false;
+			// The final older control yields to the adjacent conversation, only if it still owned focus.
+			if (document.activeElement === document.body) {
+				scrollContainerRef.current?.focus({ preventScroll: true });
+			}
+		});
 
 		useLayoutEffect(() => {
 			const frame = window.requestAnimationFrame(() => {
@@ -186,18 +254,26 @@ export const ConversationTurnWindow = memo(
 		const loadOlder = useCallback(() => {
 			const currentStart = startRef.current;
 			const currentRange = getTurnWindowRange(turnsRef.current.length, currentStart);
+			if (remotePrependRef.current || (!currentRange.hasOlder && remoteHistoryLoading)) return;
+			const container = scrollContainerRef.current;
+			const anchor = findVisibleTurn(container);
 			if (!currentRange.hasOlder) {
-				if (remoteHistoryHasOlder && !remoteHistoryLoading) onLoadRemoteOlder?.();
+				if (!remoteHistoryHasOlder || !onLoadRemoteOlder) return;
+				const firstTurnId = turnsRef.current[0]?.id;
+				if (anchor?.dataset.turnId && firstTurnId) {
+					remotePrependRef.current = {
+						identity: sessionIdentity,
+						snapshotId: remoteHistorySnapshotId,
+						firstTurnId,
+						start: currentStart,
+						anchorId: anchor.dataset.turnId,
+						anchorTop: anchor.getBoundingClientRect().top,
+					};
+				}
+				if (!onLoadRemoteOlder()) remotePrependRef.current = null;
 				return;
 			}
 			const nextStart = getPreviousTurnWindowStart(currentStart, CONVERSATION_TURN_PAGE_SIZE);
-			const container = scrollContainerRef.current;
-			const viewportTop = container?.getBoundingClientRect().top ?? 0;
-			const anchor = container
-				? Array.from(container.querySelectorAll<HTMLElement>("[data-turn-id]")).find(
-						(candidate) => candidate.getBoundingClientRect().bottom > viewportTop,
-					)
-				: undefined;
 			pendingPrependRef.current = {
 				nextStart,
 				scrollTop: container?.scrollTop ?? 0,
@@ -209,9 +285,18 @@ export const ConversationTurnWindow = memo(
 					: {}),
 			};
 			setStart(nextStart);
-		}, [onLoadRemoteOlder, remoteHistoryHasOlder, remoteHistoryLoading, scrollContainerRef]);
+		}, [
+			onLoadRemoteOlder,
+			remoteHistoryHasOlder,
+			remoteHistoryLoading,
+			remoteHistorySnapshotId,
+			sessionIdentity,
+			scrollContainerRef,
+		]);
 
 		const scrollToLatest = useCallback(() => {
+			remotePrependRef.current = null;
+			pendingPrependRef.current = null;
 			const nextStart = getInitialTurnWindowStart(turnsRef.current.length);
 			setStart(nextStart);
 			const container = scrollContainerRef.current;
@@ -223,6 +308,8 @@ export const ConversationTurnWindow = memo(
 		}, [scheduleAfterCommit, scrollContainerRef]);
 
 		const loadNewer = useCallback(() => {
+			remotePrependRef.current = null;
+			pendingPrependRef.current = null;
 			const currentStart = startRef.current;
 			const currentRange = getTurnWindowRange(turnsRef.current.length, currentStart);
 			if (!currentRange.hasNewer) return;
@@ -236,6 +323,8 @@ export const ConversationTurnWindow = memo(
 
 		const revealTurn = useCallback(
 			(turnId: string) => {
+				remotePrependRef.current = null;
+				pendingPrependRef.current = null;
 				const index = turnsRef.current.findIndex((turn) => turn.id === turnId);
 				if (index < 0) return;
 				const nextStart = revealTurnWindowStart(index, turnsRef.current.length);
@@ -252,6 +341,14 @@ export const ConversationTurnWindow = memo(
 			if (!container) return;
 			const onScroll = () => {
 				if (!mountedRef.current) return;
+				const pending = remotePrependRef.current;
+				if (pending) {
+					const anchor = findVisibleTurn(container);
+					if (anchor?.dataset.turnId) {
+						pending.anchorId = anchor.dataset.turnId;
+						pending.anchorTop = anchor.getBoundingClientRect().top;
+					}
+				}
 				const currentRange = getTurnWindowRange(turnsRef.current.length, startRef.current);
 				if (container.scrollTop <= TURN_LOAD_THRESHOLD) {
 					loadOlder();
@@ -277,8 +374,9 @@ export const ConversationTurnWindow = memo(
 						<button
 							type="button"
 							data-load-older-turns="true"
+							ref={setOlderButton}
 							onClick={loadOlder}
-							disabled={remoteHistoryLoading && !range.hasOlder}
+							aria-disabled={remoteHistoryLoading && !range.hasOlder}
 							aria-busy={remoteHistoryLoading && !range.hasOlder}
 							className="rounded-md border border-border bg-surface px-3 py-1.5 text-xs text-ink-2 shadow-lv1 hover:text-ink focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:outline-none"
 						>
