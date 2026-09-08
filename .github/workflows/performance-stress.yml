@@ -1,7 +1,16 @@
-name: Performance stress
+name: Manual performance
 
 on:
   workflow_dispatch:
+    inputs:
+      suite:
+        description: Stress matrix or three representative calibration runs
+        type: choice
+        required: true
+        default: stress
+        options:
+          - stress
+          - representative-calibration
 
 concurrency:
   group: performance-stress-${{ github.ref }}
@@ -12,9 +21,9 @@ permissions:
 
 jobs:
   stress:
-    name: Manual stress matrix
+    name: ${{ inputs.suite }}
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: ${{ inputs.suite == 'representative-calibration' && 60 || 180 }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -26,12 +35,35 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install --with-deps chromium
-      - run: pnpm bench:stress
-      - name: Upload stress benchmark evidence
+      - name: Run stress matrix
+        if: inputs.suite == 'stress'
+        run: pnpm bench:stress
+      - name: Collect representative calibration
+        if: inputs.suite == 'representative-calibration'
+        timeout-minutes: 50
+        shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          import os from 'node:os';
+          import { benchmarkQuota } from './scripts/benchmark-quota.mjs';
+          const quota = benchmarkQuota({ platform: process.platform, totalMemory: os.totalmem() });
+          console.log(JSON.stringify(quota));
+          if (quota.cpu === 'unavailable' || quota.memoryBytes === 'unavailable') process.exit(2);
+          JS
+          batch="calibration-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          root=test-results/performance/representative
+          for phase in reference-1 reference-2 holdout; do
+            PI_WEB_BENCHMARK_RUN_ID="$batch-$phase" pnpm bench:representative
+            node scripts/compare-benchmark-baseline.mjs "$root/$batch-$phase" --baseline "$root/$batch-reference-1" > "$root/$batch-$phase-vs-reference-1.md"
+            if [ "$phase" = holdout ]; then
+              node scripts/compare-benchmark-baseline.mjs "$root/$batch-holdout" --baseline "$root/$batch-reference-2" > "$root/$batch-holdout-vs-reference-2.md"
+            fi
+          done
+      - name: Upload benchmark evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: performance-stress
-          path: test-results/performance/stress
+          name: performance-${{ inputs.suite }}
+          path: test-results/performance/${{ inputs.suite == 'representative-calibration' && 'representative' || 'stress' }}
           if-no-files-found: error
           retention-days: 30

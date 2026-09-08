@@ -539,6 +539,39 @@ All numerical tables above and `baselines/reference-linux-x64.json` retain their
 `INCOMPATIBLE` with the new comparator; it has not been silently recalibrated. Fresh repeated
 reference runs and measurement corrections are still required by #28 before new calibration claims.
 
+### Manual representative calibration collection
+
+The existing manual performance workflow defaults to stress. After approving a sampling window,
+select `representative-calibration` to collect three complete representative bundles on one Actions
+VM, in fixed order: `reference-1`, `reference-2`, then `holdout`:
+
+```bash
+gh workflow run performance-stress.yml --ref main -f suite=representative-calibration
+```
+
+Freeze and record the intended source revision before dispatch. The job has a 60-minute limit;
+collection has a 50-minute limit to leave time for evidence upload. Ordinary PR CI still runs the
+representative suite once, and the manual stress selection retains its 180-minute limit.
+
+The job checks Linux quota availability before building. Each completed run is compared against
+reference-1 (including its self-check); holdout is also compared against reference-2. Invalid or
+incompatible evidence stops further collection. Diagnostic regressions remain observations and do
+not cause retries. Both reference bundles are fixed before holdout; retain both comparisons rather
+than selecting the faster reference or adjusting policy after seeing holdout.
+
+The `performance-representative-calibration` artifact retains the representative tier, with IDs
+`calibration-<Actions run ID>-<attempt>-<phase>`. Every bundle includes source/build hashes in
+`manifest.json`, host/toolchain/quota in `environment.json` and `logs/quota.json`, raw trials in
+`raw/`, and `benchmark.json`/`benchmark.md`. Comparison Markdown sits alongside the bundles.
+Uploads run on failure too; infrastructure loss or a hard job termination can still prevent upload.
+Keep all failed/incomplete attempts, and archive accepted raw evidence before the 30-day expiry.
+
+Local repetitions use the same `pnpm bench:representative` command with distinct predetermined
+`PI_WEB_BENCHMARK_RUN_ID` values and a stable `PI_WEB_BENCHMARK_IMAGE`, on one unchanged host.
+Apply the same ordering and comparison rules. Never pool local and Actions absolute measurements.
+Collecting three bundles does not itself establish calibrated budgets: review repeatability and
+holdout observations separately. Strict budget enforcement remains separate from this entry point.
+
 For explicit long-running stress benchmarking:
 
 ```bash
