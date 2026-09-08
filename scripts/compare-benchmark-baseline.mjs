@@ -4,6 +4,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import {
+	BENCHMARK_SCHEMA_VERSION,
+	BENCHMARK_SUITE_VERSION,
 	benchmarkMetricPolicy,
 	canonicalFormalExpectedScenarioSet,
 	loadBenchmarkMatrix,
@@ -19,7 +21,8 @@ function evidenceErrors(bundle) {
 	const { benchmark: run, manifest, environment } = bundle ?? {};
 	if (!record(run) || !record(manifest) || !record(environment))
 		return ["missing run, manifest or environment"];
-	if (run.schemaVersion !== 2 || run.suiteVersion !== 2) errors.push("unsupported run schema/suite");
+	if (run.schemaVersion !== BENCHMARK_SCHEMA_VERSION || run.suiteVersion !== BENCHMARK_SUITE_VERSION)
+		errors.push("unsupported run schema/suite");
 	if (!Array.isArray(run.validationErrors) || run.validationErrors.length || run.playwrightExitCode !== 0)
 		errors.push("formal run validation did not succeed");
 	if (!run.runId || manifest.runId !== run.runId || environment.runId !== run.runId)

@@ -25,12 +25,17 @@ function fixture(tier = "representative") {
 			index,
 			warmup: index < entry.warmups,
 			correctness: { complete: true },
-			metrics: { aggregateDeltaPerSecond: 100, publicationRatio: 0.1, recoveryMs: 100, browserErrors: 0 },
+			metrics: {
+				aggregateDeltaPerSecond: 100,
+				streamingDomMutationPerDeltaRatio: 0.1,
+				recoveryMs: 100,
+				browserErrors: 0,
+			},
 		})),
 		summaries: Object.fromEntries(
 			Object.entries({
 				aggregateDeltaPerSecond: 100,
-				publicationRatio: 0.1,
+				streamingDomMutationPerDeltaRatio: 0.1,
 				recoveryMs: 100,
 				browserErrors: 0,
 			}).map(([key, value]) => [
@@ -42,7 +47,7 @@ function fixture(tier = "representative") {
 	return {
 		benchmark: {
 			schemaVersion: 2,
-			suiteVersion: 2,
+			suiteVersion: 4,
 			runId: "fixture",
 			tier,
 			results,
@@ -110,18 +115,18 @@ for (const [name, mutate] of Object.entries({
 		b.benchmark.results.push(b.benchmark.results[0]);
 	},
 	missingMetric: (b) => {
-		delete b.benchmark.results[0].summaries.publicationRatio;
+		delete b.benchmark.results[0].summaries.streamingDomMutationPerDeltaRatio;
 	},
 	missingBothTrialAndSummary: (b) => {
 		const r = b.benchmark.results[0];
-		delete r.summaries.publicationRatio;
-		for (const t of r.trials) delete t.metrics.publicationRatio;
+		delete r.summaries.streamingDomMutationPerDeltaRatio;
+		for (const t of r.trials) delete t.metrics.streamingDomMutationPerDeltaRatio;
 	},
 	emptyMetrics: (b) => {
 		b.benchmark.results[0].summaries = {};
 	},
-	nan: (b) => metric(b, "publicationRatio", Number.NaN),
-	infinity: (b) => metric(b, "publicationRatio", Number.POSITIVE_INFINITY),
+	nan: (b) => metric(b, "streamingDomMutationPerDeltaRatio", Number.NaN),
+	infinity: (b) => metric(b, "streamingDomMutationPerDeltaRatio", Number.POSITIVE_INFINITY),
 	failedValidation: (b) => {
 		b.benchmark.validationErrors = ["failed"];
 	},
@@ -154,11 +159,14 @@ test("throughput increases are OK; decreases regress", () => {
 
 test("ratio has no +50 floor; timing keeps its millisecond floor", () => {
 	const target = fixture();
-	metric(target, "publicationRatio", 0.2);
+	metric(target, "streamingDomMutationPerDeltaRatio", 0.2);
 	const result = compareBenchmarkBaseline(target, fixture());
 	assert.equal(result.status, "REGRESSION");
-	assert.ok(Math.abs(result.metrics.find((m) => m.name === "publicationRatio").threshold - 0.15) < 1e-10);
-	metric(target, "publicationRatio", 0.1);
+	assert.ok(
+		Math.abs(result.metrics.find((m) => m.name === "streamingDomMutationPerDeltaRatio").threshold - 0.15) <
+			1e-10,
+	);
+	metric(target, "streamingDomMutationPerDeltaRatio", 0.1);
 	metric(target, "recoveryMs", 200);
 	assert.equal(compareBenchmarkBaseline(target, fixture()).status, "OK");
 	metric(target, "recoveryMs", 201);

@@ -868,6 +868,23 @@ describe("native REST routes", () => {
 			availability: "confirmation_required",
 		});
 		expect(dataQuery.files[0].preview).toBeUndefined();
+		expect(dataQuery.policy).toBe("unknown");
+		const unconfirmed = await app.request(
+			`/workspaces/${preference.workspaceHandle}/file-references/capture`,
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					path: dataQuery.files[0].path,
+					canonicalIdentity: dataQuery.files[0].canonicalIdentity,
+					confirmed: false,
+				}),
+			},
+		);
+		expect(unconfirmed.status).toBe(409);
+		expect(await json(unconfirmed)).toMatchObject({
+			error: { code: "workspace_file_confirmation_required" },
+		});
 		const captured = await app.request(`/workspaces/${preference.workspaceHandle}/file-references/capture`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },

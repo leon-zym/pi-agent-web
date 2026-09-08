@@ -38,6 +38,14 @@ import {
 	scenariosFor,
 } from "./benchmark-support";
 
+import {
+	armRecoveryGate,
+	finishRecoveryEvidence,
+	installRecoveryGate,
+	releaseRecoveryGate,
+	waitForRecoveryHold,
+} from "./recovery-evidence";
+
 test.use({
 	harnessOptions: {
 		benchmarkGateway: true,
@@ -228,6 +236,7 @@ function protocolFacts(
 	);
 	const barrierRuntime = resync?.runtime ?? snapshot?.runtime;
 	return {
+		disconnectEvidence: null,
 		barrier: {
 			asOfSeq: Number.isSafeInteger(snapshot?.asOfSeq) ? (snapshot?.asOfSeq as number) : null,
 			baseSeq: Number.isSafeInteger(snapshot?.baseSeq) ? (snapshot?.baseSeq as number) : null,
@@ -754,6 +763,7 @@ for (const scenario of scenariosFor("recovery-disconnect")) {
 		await runBenchmarkScenario(page, testInfo, harness, scenario, async (outcome, trials) => {
 			const errors = observePageErrors(page);
 			await installWebSocketDropControl(page);
+			await installRecoveryGate(page);
 			const { sockets, received, closedSockets } = attachFrames(page);
 			await installBrowserBenchmarkObserver(page);
 			await openBenchmarkPage(page, harness.origin);
@@ -773,18 +783,29 @@ for (const scenario of scenariosFor("recovery-disconnect")) {
 					const closesBefore = closedSockets();
 					const framesBefore = received.length;
 					const sourceCursor = cursorBefore(received, framesBefore, beforeLease.sessionHandle, beforeLease);
+					await armRecoveryGate(
+						page,
+						index,
+						beforeLease.sessionHandle,
+						beforeLease.serverEpoch,
+						beforeLease.generation,
+						beforeSession.workspaceHandle,
+					);
 					await page.locator("textarea").fill(prompt);
 					await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
 					await expect
 						.poll(() => harness.piEvents().some((event) => event.type === "delta" && event.text === prompt))
 						.toBe(true);
 					const startedAt = await page.evaluate(() => performance.now());
-					await dropControlledWebSockets(page);
+					// The first delta closes the old socket before its application callback runs.
 					await expect.poll(() => closedSockets()).toBeGreaterThan(closesBefore);
 					await expect
 						.poll(() => harness.piEvents().some((event) => event.type === "settled" && event.text === prompt))
 						.toBe(true);
 					await expect.poll(() => sockets.length, { timeout: 30_000 }).toBeGreaterThan(socketsBefore);
+					await waitForRecoveryHold(page);
+					const beforeOverwrite = await assertProjection(page, prompt, reply);
+					await releaseRecoveryGate(page);
 					const projection = await assertProjection(page, prompt, reply);
 					const lease = await waitForControllerLease(page, received, undefined, framesBefore);
 					const finishedAt = await page.evaluate(() => performance.now());
@@ -801,6 +822,11 @@ for (const scenario of scenariosFor("recovery-disconnect")) {
 						"replay",
 						sourceCursor,
 					);
+					const evidence = await finishRecoveryEvidence(page);
+					protocol.disconnectEvidence = {
+						...evidence,
+						beforeOverwrite: { prompt, reply, ...beforeOverwrite },
+					};
 					const stale = await assertStaleGuards(page, received, harness, lease, index);
 					const afterSession = await sessionForHandle(harness, lease.sessionHandle);
 					const lifecycleAfter = lifecycleFact(harness.lifecycle(), harness.rootDir);
@@ -860,7 +886,7 @@ for (const scenario of scenariosFor("recovery-disconnect")) {
 				outcome,
 				errors,
 				"recoveryMs",
-				"Disconnect recovery latency is diagnostic until a portable reference profile exists.",
+				"Instrumented disconnect recovery latency is diagnostic until a portable reference profile exists.",
 			);
 			addSummaryGate(
 				outcome,
