@@ -139,7 +139,7 @@ export function ChatViewport() {
 	const loadOlderSessionHistory = useSessionTransportStore((state) => state.loadOlderSessionHistory);
 	const manualRetryResync = useSessionTransportStore((state) => state.manualRetryResync);
 	const loadRemoteOlder = useCallback(() => {
-		if (currentSessionId) loadOlderSessionHistory(currentSessionId);
+		return currentSessionId ? loadOlderSessionHistory(currentSessionId) : false;
 	}, [currentSessionId, loadOlderSessionHistory]);
 	const reportAttachmentLoadError = useCallback(() => {
 		if (currentSessionId === null) return;
@@ -268,6 +268,7 @@ export function ChatViewport() {
 						sessionIdentity={sessionIdentity}
 						remoteHistoryHasOlder={history?.nextCursor != null}
 						remoteHistoryLoading={history?.loading ?? false}
+						remoteHistorySnapshotId={history?.snapshotId ?? null}
 						remoteHistoryError={history?.error ? tt("chatViewport.historyLoadFailed") : null}
 						onLoadRemoteOlder={loadRemoteOlder}
 						onAttachmentLoadError={reportAttachmentLoadError}

@@ -69,12 +69,16 @@ function variantOrder(seed = "fixture-seed") {
 	});
 }
 
-function fixtureHashes() {
+function fixtureHashes(source = null) {
 	return Object.fromEntries(
 		EXPECTED_BENCHMARK_PRODUCER_PATHS.map((relativePath) => [
 			relativePath,
 			createHash("sha256")
-				.update(fs.readFileSync(path.join(repositoryRoot, relativePath)))
+				.update(
+					source
+						? execFileSync("git", ["show", `${source}:${relativePath}`], { cwd: repositoryRoot })
+						: fs.readFileSync(path.join(repositoryRoot, relativePath)),
+				)
 				.digest("hex"),
 		]),
 	);
@@ -2060,6 +2064,10 @@ function strictBundleFiles(root, id, value = 100, source = "c".repeat(40)) {
 	const rename = (value) => JSON.parse(JSON.stringify(value).replaceAll(RUN_ID, id));
 	const manifestValue = rename(validManifest());
 	manifestValue.source.commit = source;
+	if (source === TRUSTED_REFERENCE_SOURCE) {
+		// A frozen reference must describe bytes from its declared source, not this checkout.
+		manifestValue.fixtureHashes = fixtureHashes(source);
+	}
 	const manifest = JSON.stringify(manifestValue);
 	const environment = JSON.stringify(rename(validEnvironment()));
 	const benchmark = {
@@ -2273,6 +2281,12 @@ test("strict iteration validates frozen raw and envelopes before classifying cha
 	const compatible = run();
 	assert.equal(compatible.status, 0, compatible.stderr);
 	assert.match(compatible.stdout, /Performance budget: OK/);
+	// Both branches use the same source context even after this checkout's producers change.
+	strictBundleFiles(root, "target", 201, set.source);
+	const regression = run();
+	assert.equal(regression.status, 1, regression.stderr);
+	assert.match(regression.stdout, /Performance budget: REGRESSION/);
+	strictBundleFiles(root, "target", 100, set.source);
 	const producer = "tests/e2e/benchmarks/history.spec.ts";
 	fs.appendFileSync(path.join(checkout, producer), "\n// Changed current producer.\n");
 	rewrite(target, (value, name) => {
