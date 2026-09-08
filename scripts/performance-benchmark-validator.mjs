@@ -4,6 +4,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { disconnectEvidenceIsValid } from "./recovery-evidence-validator.mjs";
+import {
+	restartAuthenticationErrorIndex,
+	validateRestartAuthentication,
+} from "./restart-authentication-validator.mjs";
 
 export const BENCHMARK_SCHEMA_VERSION = 2;
 export const BENCHMARK_SUITE_VERSION = 4;
@@ -146,6 +150,7 @@ export const BENCHMARK_PRODUCER_PATHS = Object.freeze(
 		"tests/e2e/benchmarks/history.spec.ts",
 		"tests/e2e/benchmarks/playwright.config.ts",
 		"tests/e2e/benchmarks/recovery.spec.ts",
+		"tests/e2e/benchmarks/restart-authentication-observation.ts",
 		"tests/e2e/benchmarks/streaming.spec.ts",
 		"tests/e2e/fixtures/deterministic-pi.mjs",
 		"tests/e2e/fixtures/page-observation.ts",
@@ -1200,8 +1205,17 @@ function validateParentRelation(value, label, errors) {
 	}
 }
 
-function validateRecoveryFacts(value, label, errors) {
-	if (!exactKeys(value, RECOVERY_FACT_KEYS)) {
+function validateRecoveryFacts(value, label, errors, kind) {
+	const factKeys =
+		kind === "recovery-gateway-restart" && Object.hasOwn(value, "restartAuthentication")
+			? [...RECOVERY_FACT_KEYS, "restartAuthentication"]
+			: RECOVERY_FACT_KEYS;
+	if (
+		Object.hasOwn(value, "restartAuthentication") &&
+		!validateRestartAuthentication(value.restartAuthentication)
+	)
+		errors.push(`${label}.restartAuthentication has invalid public-API facts`);
+	if (!exactKeys(value, factKeys)) {
 		errors.push(`${label} must contain exactly ${RECOVERY_FACT_KEYS.join(", ")}`);
 		return;
 	}
@@ -1248,7 +1262,11 @@ function validateRecoveryFacts(value, label, errors) {
 }
 
 function validateObservationFacts(value, kind, label, errors) {
-	const expectedKeys = OBSERVATION_FACT_KEYS_BY_KIND[kind];
+	const baseKeys = OBSERVATION_FACT_KEYS_BY_KIND[kind];
+	const expectedKeys =
+		kind === "recovery-gateway-restart" && isRecord(value) && Object.hasOwn(value, "restartAuthentication")
+			? [...baseKeys, "restartAuthentication"]
+			: baseKeys;
 	if (!expectedKeys || !exactKeys(value, expectedKeys)) {
 		errors.push(`${label}.facts must contain exactly ${(expectedKeys ?? []).join(", ")}`);
 		return;
@@ -1337,7 +1355,7 @@ function validateObservationFacts(value, kind, label, errors) {
 		validateSocketFact(value.socket, `${label}.facts.socket`, errors);
 		return;
 	}
-	validateRecoveryFacts(value, `${label}.facts`, errors);
+	validateRecoveryFacts(value, `${label}.facts`, errors, kind);
 }
 
 function validateSocketFact(value, label, errors) {
@@ -1387,8 +1405,15 @@ function allowlistedGatewayRestartBrowserErrors(observation, kind) {
 function derivedBrowserErrorCount(observation, definition) {
 	const browserErrors = observation?.browserErrors;
 	if (!Array.isArray(browserErrors?.console) || !Array.isArray(browserErrors?.page)) return null;
-	if (allowlistedGatewayRestartBrowserErrors(observation, definition.kind)) return 0;
-	return browserErrors.console.length + browserErrors.page.length;
+	const excluded =
+		definition.kind === "recovery-gateway-restart" ? restartAuthenticationErrorIndex(observation) : null;
+	const remaining =
+		excluded === null
+			? browserErrors
+			: { ...browserErrors, console: browserErrors.console.filter((_, index) => index !== excluded) };
+	if (allowlistedGatewayRestartBrowserErrors({ ...observation, browserErrors: remaining }, definition.kind))
+		return 0;
+	return remaining.console.length + remaining.page.length;
 }
 
 function validateObservation(value, definition, label, errors) {

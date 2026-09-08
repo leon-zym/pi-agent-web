@@ -140,6 +140,7 @@ const controllers: SessionTransportController[] = [];
 
 function harness(
 	options: {
+		reauthenticate?: (signal: AbortSignal) => Promise<unknown>;
 		rawEventLimit?: number;
 		rawEventMaxBytes?: number;
 		rawEventGlobalLimit?: number;
@@ -727,6 +728,94 @@ function sentCommand(socket: FakeSocket, id: string) {
 afterEach(() => {
 	for (const controller of controllers.splice(0)) controller.dispose();
 	vi.useRealTimers();
+});
+
+describe("reconnect authentication", () => {
+	it("waits for one bootstrap before reopening a socket and cancels on dispose", async () => {
+		vi.useFakeTimers();
+		let finish!: () => void;
+		let signal!: AbortSignal;
+		const reauthenticate = vi.fn((captured: AbortSignal) => {
+			signal = captured;
+			return new Promise<void>((resolve) => {
+				finish = resolve;
+			});
+		});
+		const h = harness({ reconnectBaseMs: 5, reauthenticate });
+		connect(h).serverClose();
+		await vi.advanceTimersByTimeAsync(5);
+		expect(reauthenticate).toHaveBeenCalledOnce();
+		expect(h.sockets).toHaveLength(1);
+		h.controller.store.getState().connect();
+		expect(reauthenticate).toHaveBeenCalledOnce();
+		h.controller.dispose();
+		expect(signal.aborted).toBe(true);
+		finish();
+		await vi.advanceTimersByTimeAsync(100);
+		expect(h.sockets).toHaveLength(1);
+	});
+
+	it("opens a reconnect only after authentication succeeds", async () => {
+		vi.useFakeTimers();
+		const reauthenticate = vi.fn(async () => undefined);
+		const h = harness({ reconnectBaseMs: 5, reauthenticate });
+		connect(h).serverClose();
+		await vi.advanceTimersByTimeAsync(5);
+		expect(reauthenticate).toHaveBeenCalledOnce();
+		expect(h.sockets).toHaveLength(2);
+		h.sockets[1]!.open();
+		expect(h.controller.store.getState().connectionState).toBe("online");
+	});
+
+	it("bounds hanging bootstrap, backs off and ignores its late completion", async () => {
+		vi.useFakeTimers();
+		let finish!: () => void;
+		let signal!: AbortSignal;
+		const reauthenticate = vi.fn((captured: AbortSignal) => {
+			signal = captured;
+			return new Promise<void>((resolve) => {
+				finish = resolve;
+			});
+		});
+		const h = harness({ reconnectBaseMs: 5, helloTimeoutMs: 20, reauthenticate });
+		connect(h).serverClose();
+		await vi.advanceTimersByTimeAsync(25);
+		expect(signal.aborted).toBe(true);
+		expect(h.controller.store.getState().connectionState).toBe("offline");
+		finish();
+		await vi.advanceTimersByTimeAsync(1);
+		expect(h.sockets).toHaveLength(1);
+		h.controller.store.getState().disconnect();
+		await vi.advanceTimersByTimeAsync(100);
+		expect(reauthenticate).toHaveBeenCalledOnce();
+	});
+
+	it("backs off failed authentication without opening unauthenticated sockets", async () => {
+		vi.useFakeTimers();
+		const reauthenticate = vi.fn(async () => {
+			throw new Error("offline");
+		});
+		const h = harness({ reconnectBaseMs: 5, reauthenticate });
+		connect(h).serverClose();
+		await vi.advanceTimersByTimeAsync(14);
+		expect(reauthenticate).toHaveBeenCalledOnce();
+		expect(h.sockets).toHaveLength(1);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(reauthenticate).toHaveBeenCalledTimes(2);
+	});
+
+	it("never bootstraps a terminal protocol mismatch", async () => {
+		vi.useFakeTimers();
+		const reauthenticate = vi.fn(async () => undefined);
+		const h = harness({ reconnectBaseMs: 5, reauthenticate });
+		h.controller.store.getState().connect();
+		h.sockets[0]!.open(false);
+		h.sockets[0]!.serverMessage(serverHello({ protocol: { major: 2, minor: 1 } }));
+		h.controller.store.getState().connect();
+		await vi.advanceTimersByTimeAsync(100);
+		expect(reauthenticate).not.toHaveBeenCalled();
+		expect(h.sockets).toHaveLength(1);
+	});
 });
 
 describe("session transport Gateway negotiation", () => {

@@ -7,6 +7,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 import { createRecoveryRecorder } from "../packages/ui/src/lib/benchmark-recovery-recorder.ts";
+import { expectedRestartAuthenticationError } from "../tests/e2e/benchmarks/restart-authentication-observation.ts";
 import {
 	BENCHMARK_PRODUCER_PATHS,
 	canonicalFormalExpectedScenarioSet,
@@ -32,6 +33,7 @@ const EXPECTED_BENCHMARK_PRODUCER_PATHS = Object.freeze([
 	"tests/e2e/benchmarks/playwright.config.ts",
 	"tests/e2e/benchmarks/recovery-evidence.ts",
 	"tests/e2e/benchmarks/recovery.spec.ts",
+	"tests/e2e/benchmarks/restart-authentication-observation.ts",
 	"tests/e2e/benchmarks/streaming.spec.ts",
 	"tests/e2e/fixtures/deterministic-pi.mjs",
 	"tests/e2e/fixtures/page-observation.ts",
@@ -1525,4 +1527,267 @@ test("rejects disconnect evidence captured for a different trial", () => {
 	const raw = rawArtifacts.find((entry) => entry.value.kind === "recovery-disconnect");
 	raw.value.observation.facts.protocol.disconnectEvidence.trial++;
 	assert.match(errorText(validate({ rawArtifacts })), /must belong to this trial/);
+});
+
+function authenticationFixture(observation) {
+	const url = `${observation.facts.lifecycle.originBefore}/api/v1/bootstrap`;
+	const text = "Failed to load resource: net::ERR_CONNECTION_REFUSED";
+	observation.browserErrors.console = [text];
+	observation.facts.restartAuthentication = {
+		arm: 1,
+		seal: 5,
+		invalid: false,
+		requests: [
+			{
+				url,
+				method: "GET",
+				resourceType: "fetch",
+				samePage: true,
+				mainFrame: true,
+				redirected: false,
+				start: 2,
+				failure: 3,
+				error: "net::ERR_CONNECTION_REFUSED",
+			},
+			{
+				url,
+				method: "GET",
+				resourceType: "fetch",
+				samePage: true,
+				mainFrame: true,
+				redirected: false,
+				start: 6,
+				failure: null,
+				error: null,
+			},
+		],
+		console: [{ index: 0, at: 4, type: "error", text, url, samePage: true }],
+	};
+	return observation.facts.restartAuthentication;
+}
+
+test("independently attributes one restart bootstrap refusal while preserving raw errors", () => {
+	const rawArtifacts = validResults().flatMap(rawFor);
+	const observation = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-gateway-restart")
+		.value.observation;
+	const evidence = authenticationFixture(observation);
+	assert.equal(
+		expectedRestartAuthenticationError(
+			evidence,
+			observation.facts.lifecycle.originBefore,
+			observation.browserErrors.console,
+		),
+		0,
+	);
+	assert.deepEqual(validate({ rawArtifacts }).errors, []);
+	assert.equal(observation.browserErrors.console.length, 1);
+});
+
+test("restart authentication attribution fails closed for adversarial evidence", () => {
+	const cases = [
+		[
+			"another resource same text",
+			(e) => {
+				e.console[0].url += "/other";
+			},
+		],
+		[
+			"403",
+			(e) => {
+				e.requests[0].error = "net::ERR_HTTP_RESPONSE_CODE_FAILURE";
+			},
+		],
+		[
+			"wrong path",
+			(e) => {
+				e.requests[0].url += "/other";
+			},
+		],
+		[
+			"wrong port",
+			(e) => {
+				e.requests[0].url = "http://127.0.0.1:1/api/v1/bootstrap";
+			},
+		],
+		[
+			"query",
+			(e) => {
+				e.requests[0].url += "?x=1";
+			},
+		],
+		[
+			"redirect",
+			(e) => {
+				e.requests[0].redirected = true;
+			},
+		],
+		[
+			"method",
+			(e) => {
+				e.requests[0].method = "POST";
+			},
+		],
+		[
+			"resource type",
+			(e) => {
+				e.requests[0].resourceType = "document";
+			},
+		],
+		[
+			"wrong error",
+			(e) => {
+				e.requests[0].error = "net::ERR_FAILED";
+			},
+		],
+		[
+			"wrong page",
+			(e) => {
+				e.requests[0].samePage = false;
+			},
+		],
+		[
+			"wrong frame",
+			(e) => {
+				e.requests[0].mainFrame = false;
+			},
+		],
+		[
+			"wrong console page",
+			(e) => {
+				e.console[0].samePage = false;
+			},
+		],
+		[
+			"console type",
+			(e) => {
+				e.console[0].type = "warning";
+			},
+		],
+		[
+			"empty location",
+			(e) => {
+				e.console[0].url = "";
+			},
+		],
+		[
+			"pre-arm request",
+			(e) => {
+				e.requests[0].start = 0;
+			},
+		],
+		[
+			"post-seal failure",
+			(e) => {
+				e.requests[0].failure = 7;
+			},
+		],
+		[
+			"post-seal console",
+			(e) => {
+				e.console[0].at = 8;
+			},
+		],
+		[
+			"missing request",
+			(e) => {
+				e.requests.shift();
+			},
+		],
+		[
+			"missing console",
+			(e) => {
+				e.console = [];
+			},
+		],
+		[
+			"duplicate request",
+			(e) => {
+				e.requests.push({ ...e.requests[0] });
+			},
+		],
+		[
+			"duplicate console",
+			(e, o) => {
+				e.console.push({ ...e.console[0], index: 1 });
+				o.browserErrors.console.push(e.console[0].text);
+			},
+		],
+		[
+			"concurrent request",
+			(e) => {
+				e.seal = 10;
+				e.requests.push({ ...e.requests[0], start: 7, failure: 8 });
+			},
+		],
+		[
+			"overflow",
+			(e) => {
+				e.invalid = true;
+			},
+		],
+		[
+			"missing evidence",
+			(_, o) => {
+				delete o.facts.restartAuthentication;
+			},
+		],
+	];
+	for (const [label, mutate] of cases) {
+		const rawArtifacts = validResults().flatMap(rawFor);
+		const observation = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-gateway-restart")
+			.value.observation;
+		const evidence = authenticationFixture(observation);
+		mutate(evidence, observation);
+		assert.equal(
+			expectedRestartAuthenticationError(
+				observation.facts.restartAuthentication ?? null,
+				observation.facts.lifecycle.originBefore,
+				observation.browserErrors.console,
+			),
+			null,
+			label,
+		);
+		assert.match(errorText(validate({ rawArtifacts })), /browserErrors/, label);
+	}
+	const rawArtifacts = validResults().flatMap(rawFor);
+	const observation = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-gateway-restart")
+		.value.observation;
+	authenticationFixture(observation);
+	observation.browserErrors.page.push("page error");
+	assert.match(errorText(validate({ rawArtifacts })), /gate browserErrors\.value actual must be 1/);
+});
+
+test("validates restart attribution fields independently of the error gate", () => {
+	for (const mutate of [
+		(e) => {
+			delete e.arm;
+		},
+		(e) => {
+			e.seal = "5";
+		},
+		(e) => {
+			e.requests[0].samePage = "true";
+		},
+		(e) => {
+			e.requests[0].extra = true;
+		},
+		(e) => {
+			e.requests[0].failure = e.requests[0].start;
+		},
+		(e) => {
+			e.requests[1].error = "unpaired failure";
+		},
+		(e) => {
+			e.console.push({ index: 1, at: 4, type: "error", text: "", url: "", samePage: true });
+		},
+	]) {
+		const rawArtifacts = validResults().flatMap(rawFor);
+		const observation = rawArtifacts.find((artifact) => artifact.value.kind === "recovery-gateway-restart")
+			.value.observation;
+		const evidence = authenticationFixture(observation);
+		observation.browserErrors.console = [];
+		evidence.console = [];
+		mutate(evidence);
+		assert.match(errorText(validate({ rawArtifacts })), /restartAuthentication has invalid public-API facts/);
+	}
 });
