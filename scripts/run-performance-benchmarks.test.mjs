@@ -417,6 +417,7 @@ esac
 	fs.writeFileSync(
 		path.join(root, "node"),
 		`#!/bin/sh
+if [ "$1" = "--input-type=module" ]; then echo 00fe129125fcf273f8c27332ec4b115b59779ce8; exit 0; fi
 if ! grep -q active "$RUNNER_TEMP/benchmark-references.json"; then exit 99; fi
 echo 'Performance budget: REGRESSION'
 exit 7

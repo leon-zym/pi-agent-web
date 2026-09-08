@@ -75,6 +75,22 @@ corrupt active evidence fails; it never becomes pending automatically. Retain th
 before GitHub artifact expiry. Any replacement locator must be explicitly reviewed and preserve the
 fixed evidence; an expired locator remains a setup failure until that update is accepted.
 
+Strict evaluation requires a Git checkout with the reviewed reference source object
+`00fe129125fcf273f8c27332ec4b115b59779ce8`. Local evaluation is offline; if the object is missing,
+explicitly run `git fetch --depth=1 origin 00fe129125fcf273f8c27332ec4b115b59779ce8` first.
+An anonymous source export without Git objects is not supported by this resolver. CI fetches the
+fixed source from the existing origin; no additional permission or reference archive override is used.
+
+The target's raw evidence and envelope are validated by the current checkout. Both fixed references
+are validated by the allowlisted source's raw validator and envelope comparator in one bounded Node
+subprocess, without inherited credentials or Node preload options. Executable code comes only from
+that reviewed Git tree, never from the evidence ZIP. Temporary source extraction is bounded and
+removed on success or failure. Other reference sources need explicit reviewed support.
+Only after all three inputs validate does the strict path compare complete schema, suite, workload
+and environment identities. Changed producers or matrices yield an explicit incompatible/unassessed
+result; corrupt evidence still fails. Compatible inputs retain the same six-median policy. This does
+not change the diagnostic `--baseline` command or refresh previously accepted evidence.
+
 CI evaluates after representative collection and publishes `budget.md` in the artifact and job summary.
 PRs use the base commit's reference descriptor, so editing a PR's descriptor cannot disable that PR's
 active gate. The first descriptor introduction uses the checkout copy only when the base has no file.
