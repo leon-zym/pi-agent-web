@@ -33,7 +33,10 @@ budget the directory-read/shutdown overlap.
 
 Version 5 and changed matrix provenance reject old bundles as current evidence. Historical artifacts,
 including the invalid local reference-2, remain unchanged; a new frozen source requires a new complete
-cohort. The previously inspected holdout cannot validate a newly selected budget policy. Strict completion budgets use the policy below; references remain pending until a fresh cohort is accepted. `liveLongTasksOver50Ms` is a count (zero additive floor), not a duration;
+cohort. The previously inspected holdout cannot validate a newly selected budget policy. Strict
+completion budgets use the policy below; the accepted suite-5 local and Actions references are
+registered in `tests/e2e/benchmarks/references.json`. `liveLongTasksOver50Ms` is a count (zero
+additive floor), not a duration;
 its suffix describes the 50 ms threshold. Other metric dimensions and diagnostic modes are unchanged.
 
 ## Completion median gate
@@ -51,9 +54,10 @@ compatible inputs receive a budget result. Incompatible inputs exit 0 with an ex
 mandatory correctness without claiming a timing pass. The original `--baseline` diagnostic command
 and its exit codes remain unchanged.
 
-`tests/e2e/benchmarks/references.json` keeps independent Actions and local sets. Initially each is
-`{"status":"pending"}`: target raw validation still runs, then the report explicitly says references
-are not established. An active set has exactly `status`, `source` (frozen source commit), `artifactId`,
+`tests/e2e/benchmarks/references.json` keeps independent Actions and local sets. Both sets are
+active at frozen source `00fe129125fcf273f8c27332ec4b115b59779ce8`.
+A `{"status":"pending"}` set validates target raw data and reports that references are not
+established. An active set has exactly `status`, `source` (frozen source commit), `artifactId`,
 `sha256` (digest of the entire ZIP), `reference1` and `reference2` (distinct, predetermined run IDs).
 For Actions, `artifactId` is the fixed GitHub artifact ID in this repository; local sets use null and
 supply the archive path at invocation. The ZIP must contain the two run directories at its root;
@@ -503,7 +507,7 @@ Suite version 4 retains the streaming measurement contract introduced in suite v
 and keeps artifact schema version 2.
 The historical tables above and checked-in calibration file retain their original names and values;
 they are not current-suite calibration. Comparisons reject unsupported suite versions and changed
-producer hashes. Fresh local/reference calibration remains pending under #28.
+producer hashes. Current suite-5 references are registered separately in `tests/e2e/benchmarks/references.json`.
 
 | Current metric | Exact observation boundary |
 | --- | --- |
@@ -606,8 +610,8 @@ have no performance direction and are also excluded.
 
 All numerical tables above and `baselines/reference-linux-x64.json` retain their historical
 2026-09-06 semantics, including the old common floor and pooled CPU models. That file is
-`INCOMPATIBLE` with the new comparator; it has not been silently recalibrated. Fresh repeated
-reference runs and measurement corrections are still required by #28 before new calibration claims.
+`INCOMPATIBLE` with the new comparator; it has not been silently recalibrated. Accepted suite-5
+references are registered separately; remaining coverage and delivery work stays in #28.
 
 ### Manual representative calibration collection
 
