@@ -1,13 +1,21 @@
 import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { stripTypeScriptTypes } from "node:module";
+import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 import { createRecoveryRecorder } from "../packages/ui/src/lib/benchmark-recovery-recorder.ts";
 import { expectedRestartAuthenticationError } from "../tests/e2e/benchmarks/restart-authentication-observation.ts";
+import {
+	evaluateStrictBudgets,
+	generateStrictMarkdown,
+	readCompleteBundle,
+	runStrictEvaluation,
+} from "./compare-benchmark-baseline.mjs";
 import {
 	BENCHMARK_PRODUCER_PATHS,
 	canonicalFormalExpectedScenarioSet,
@@ -1866,4 +1874,166 @@ test("unknown memory quota remains valid diagnostic evidence, not a numeric quot
 		environment.quota.memoryBytes = value;
 		assert.match(errorText(validate({ environment })), /quota.memoryBytes/);
 	}
+});
+
+function strictBundleFiles(root, id, value = 100) {
+	const results = validResults();
+	for (const result of results) {
+		for (const trial of result.trials) {
+			trial.metrics.recoveryMs = trial.metrics.latencyMs;
+			delete trial.metrics.latencyMs;
+		}
+		for (const gate of result.gates) if (gate.metric === "latencyMs") gate.metric = "recoveryMs";
+		result.summaries.recoveryMs = result.summaries.latencyMs;
+		delete result.summaries.latencyMs;
+		const metric =
+			result.scenarioId === "stream-1m" || result.scenarioId === "sessions-4"
+				? "totalCompletionMs"
+				: result.scenarioId === "content-roundtrip"
+					? "roundTripMs"
+					: null;
+		if (!metric) continue;
+		for (const trial of result.trials) trial.metrics[metric] = value;
+		result.summaries[metric] = {
+			count: result.trials.filter((t) => !t.warmup).length,
+			min: value,
+			max: value,
+			median: value,
+			p95: value,
+		};
+	}
+	const validated = validate({ results });
+	assert.deepEqual(validated.errors, []);
+	const rename = (value) => JSON.parse(JSON.stringify(value).replaceAll(RUN_ID, id));
+	const manifest = JSON.stringify(rename(validManifest()));
+	const environment = JSON.stringify(rename(validEnvironment()));
+	const benchmark = {
+		schemaVersion: 2,
+		suiteVersion: 5,
+		runId: id,
+		tier: "representative",
+		results: rename(validated.results),
+		validationErrors: [],
+		playwrightExitCode: 0,
+		manifestHash: createHash("sha256").update(manifest).digest("hex"),
+		environmentHash: createHash("sha256").update(environment).digest("hex"),
+	};
+	const directory = path.join(root, id);
+	fs.mkdirSync(directory, { recursive: true });
+	for (const [name, text] of [
+		["manifest.json", manifest],
+		["environment.json", environment],
+		["benchmark.json", JSON.stringify(benchmark)],
+	])
+		fs.writeFileSync(path.join(directory, name), text);
+	for (const artifact of [
+		...results.map((value) => ({ name: `${value.scenarioId}/${value.variant}.result.json`, value })),
+		...results.flatMap(rawFor),
+	]) {
+		const filename = path.join(directory, "raw", artifact.name);
+		fs.mkdirSync(path.dirname(filename), { recursive: true });
+		fs.writeFileSync(filename, JSON.stringify(rename(artifact.value)));
+	}
+	return directory;
+}
+
+test("strict budget validates real raw files, both references and equality without gating diagnostics", (t) => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "strict-budget-test-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const target = readCompleteBundle(strictBundleFiles(root, "target", 200));
+	const first = readCompleteBundle(strictBundleFiles(root, "reference-1", 100));
+	const second = readCompleteBundle(strictBundleFiles(root, "reference-2", 100));
+	assert.equal(
+		evaluateStrictBudgets(target, [first, second]).status,
+		"OK",
+		JSON.stringify(evaluateStrictBudgets(target, [first, second])),
+	);
+	for (const reference of [first, second]) {
+		const changed = structuredClone(reference);
+		const selected = changed.benchmark.results.find((r) => r.scenarioId === "stream-1m");
+		for (const trial of selected.trials) trial.metrics.totalCompletionMs = 99;
+		Object.assign(selected.summaries.totalCompletionMs, { min: 99, max: 99, median: 99, p95: 99 });
+		assert.equal(
+			evaluateStrictBudgets(target, reference === first ? [changed, second] : [first, changed]).status,
+			"REGRESSION",
+		);
+	}
+	const diagnostic = structuredClone(target);
+	const selected = diagnostic.benchmark.results[0];
+	for (const trial of selected.trials) trial.metrics.recoveryMs = 10000;
+	Object.assign(selected.summaries.recoveryMs, { min: 10000, max: 10000, median: 10000, p95: 10000 });
+	assert.equal(evaluateStrictBudgets(diagnostic, [first, second]).status, "OK");
+	second.environment.cpu.model = "another CPU";
+	assert.equal(evaluateStrictBudgets(target, [first, second]).status, "INCOMPATIBLE");
+	first.benchmark.results[0].trials[0].correctness.complete = false;
+	assert.equal(evaluateStrictBudgets(target, [first, second]).status, "INVALID");
+	assert.equal(evaluateStrictBudgets(target, [second]).status, "INVALID");
+});
+
+test("strict bootstrap still requires raw; active archives never fall back to bootstrap", (t) => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "strict-evidence-test-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const target = strictBundleFiles(root, "target");
+	strictBundleFiles(root, "reference-1");
+	strictBundleFiles(root, "reference-2");
+	const pending = {
+		policy: "completion-median-v1",
+		actions: { status: "pending" },
+		local: { status: "pending" },
+	};
+	assert.match(
+		generateStrictMarkdown(runStrictEvaluation(target, pending, "local")),
+		/性能预算未评估：参考尚未建立/,
+	);
+	const archive = path.join(root, "cohort.zip");
+	execFileSync("python3", [
+		"-c",
+		`import pathlib,sys,zipfile
+root=pathlib.Path(sys.argv[1])
+with zipfile.ZipFile(root/'cohort.zip','w',zipfile.ZIP_DEFLATED) as z:
+ for name in ['reference-1','reference-2']:
+  for p in (root/name).rglob('*'):
+   if p.is_file(): z.write(p,p.relative_to(root))
+`,
+		root,
+	]);
+	const active = structuredClone(pending);
+	active.local = {
+		status: "active",
+		source: "c".repeat(40),
+		artifactId: null,
+		sha256: createHash("sha256").update(fs.readFileSync(archive)).digest("hex"),
+		reference1: "reference-1",
+		reference2: "reference-2",
+	};
+	assert.equal(runStrictEvaluation(target, active, "local", archive).status, "OK");
+	const description = path.join(root, "references.json");
+	fs.writeFileSync(description, JSON.stringify(active));
+	const cliArgs = [
+		path.join(repositoryRoot, "scripts/compare-benchmark-baseline.mjs"),
+		target,
+		"--strict",
+		"--references",
+		description,
+		"--environment",
+		"local",
+		"--archive",
+		archive,
+	];
+	const pass = spawnSync(process.execPath, cliArgs, { encoding: "utf8" });
+	assert.equal(pass.status, 0, pass.stderr);
+	assert.match(pass.stdout, /Performance budget: OK/);
+	strictBundleFiles(root, "target", 201);
+	const fail = spawnSync(process.execPath, cliArgs, { encoding: "utf8" });
+	assert.equal(fail.status, 1, fail.stderr);
+	assert.match(fail.stdout, /Performance budget: REGRESSION/);
+
+	assert.throws(() => runStrictEvaluation(target, active, "local"), /archive missing/);
+	active.local.sha256 = "a".repeat(64);
+	assert.throws(() => runStrictEvaluation(target, active, "local", archive), /digest mismatch/);
+	const raw = fs
+		.readdirSync(path.join(target, "raw"), { recursive: true })
+		.find((name) => name.endsWith("-0.json"));
+	fs.unlinkSync(path.join(target, "raw", raw));
+	assert.throws(() => runStrictEvaluation(target, pending, "local"), /raw/);
 });

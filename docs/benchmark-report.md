@@ -33,9 +33,57 @@ budget the directory-read/shutdown overlap.
 
 Version 5 and changed matrix provenance reject old bundles as current evidence. Historical artifacts,
 including the invalid local reference-2, remain unchanged; a new frozen source requires a new complete
-cohort. The previously inspected holdout cannot validate a newly selected budget policy. Strict timing
-budgets remain unimplemented. `liveLongTasksOver50Ms` is a count (zero additive floor), not a duration;
+cohort. The previously inspected holdout cannot validate a newly selected budget policy. Strict completion budgets use the policy below; references remain pending until a fresh cohort is accepted. `liveLongTasksOver50Ms` is a count (zero additive floor), not a duration;
 its suffix describes the 50 ms threshold. Other metric dimensions and diagnostic modes are unchanged.
+
+## Completion median gate
+
+Policy `completion-median-v1` uses six measured medians: `stream-1m / totalCompletionMs`,
+`sessions-4 / totalCompletionMs`, and `content-roundtrip / roundTripMs`, each in coalesced and
+sequential variants. Against each of two fixed references independently, `target > 1.5 * reference
++ 50 ms` fails; equality passes. Either reference can fail the overall budget. Other metrics remain
+diagnostic. This is an initial coarse completion-cost guard, not a responsiveness SLO or an estimate
+of measurement noise; smaller regressions can pass.
+
+The strict CLI validates the complete target and both reference raw/result sets before comparing.
+`INVALID` or reference setup failures exit 1, as does an assessed budget regression. Only fully
+compatible inputs receive a budget result. Incompatible inputs exit 0 with an explicit performance-budget-not-evaluated status, preserving
+mandatory correctness without claiming a timing pass. The original `--baseline` diagnostic command
+and its exit codes remain unchanged.
+
+`tests/e2e/benchmarks/references.json` keeps independent Actions and local sets. Initially each is
+`{"status":"pending"}`: target raw validation still runs, then the report explicitly says references
+are not established. An active set has exactly `status`, `source` (frozen source commit), `artifactId`,
+`sha256` (digest of the entire ZIP), `reference1` and `reference2` (distinct, predetermined run IDs).
+For Actions, `artifactId` is the fixed GitHub artifact ID in this repository; local sets use null and
+supply the archive path at invocation. The ZIP must contain the two run directories at its root;
+retaining the third holdout and other cohort evidence is allowed. Both reference manifests must match
+the registered source. Local paths and private machine information do not belong in the descriptor.
+
+```bash
+node scripts/compare-benchmark-baseline.mjs <target-run-dir> --strict --references tests/e2e/benchmarks/references.json --environment local --archive <cohort.zip>
+```
+
+Active archive loading requires Python 3 (standard-library ZIP handling); Actions additionally uses
+`gh` with read-only Actions access. Reads are bounded to 8 MiB compressed, 128 MiB expanded and 2,048
+entries, with digest/path checks and temporary extraction cleanup. Missing, expired, oversized or
+corrupt active evidence fails; it never becomes pending automatically. Retain the adopted archive
+before GitHub artifact expiry. Any replacement locator must be explicitly reviewed and preserve the
+fixed evidence; an expired locator remains a setup failure until that update is accepted.
+
+CI evaluates after representative collection and publishes `budget.md` in the artifact and job summary.
+PRs use the base commit's reference descriptor, so editing a PR's descriptor cannot disable that PR's
+active gate. The first descriptor introduction uses the checkout copy only when the base has no file.
+Activation changes therefore take effect on main after review. No per-PR disable switch is provided.
+
+Freeze this evaluator and policy before collecting a fresh suite-5 `reference-1`, `reference-2`,
+`holdout` cohort separately per environment. Evaluate the new holdout using a temporary active
+copy of the descriptor, then register accepted reference IDs/digest in the tracked descriptor.
+Do not select references after seeing the holdout or reuse historical suite-4/previously inspected
+holdouts. Registration must leave all 18 producer files, matrices, suite, lockfile and evaluation
+semantics unchanged. Product source/build hashes retain their own provenance; they are not required
+to equal a reference's product build. Existing full workload/environment compatibility stays intact,
+with no alternate producer hashes or hardware-lottery retries.
 
 ## Reference Environment (`linux-x64-gh-standard`)
 

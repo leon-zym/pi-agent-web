@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import {
+	loadReferenceArchive,
+	referenceSet,
+	unpackReferenceArchive,
+} from "./benchmark-reference-evidence.mjs";
 import { compareBenchmarkBaseline, generateComparisonMarkdown } from "./compare-benchmark-baseline.mjs";
 import {
 	benchmarkMetricPolicy,
@@ -359,4 +364,70 @@ test("unknown Linux memory quota cannot be compared even with known CPU quota", 
 	const bundle = fixture();
 	bundle.environment.quota = { cpu: "unlimited", memoryBytes: "unavailable" };
 	assert.equal(compareBenchmarkBaseline(bundle, structuredClone(bundle)).status, "INCOMPATIBLE");
+});
+
+test("active reference descriptors and archive integrity fail closed", (t) => {
+	const pending = {
+		policy: "completion-median-v1",
+		actions: { status: "pending" },
+		local: { status: "pending" },
+	};
+	assert.equal(referenceSet(pending, "actions").status, "pending");
+	const active = {
+		status: "active",
+		source: "c".repeat(40),
+		artifactId: 123,
+		sha256: "a".repeat(64),
+		reference1: "ref1",
+		reference2: "ref2",
+	};
+	for (const mutate of [
+		(set) => delete set.sha256,
+		(set) => (set.reference2 = "ref1"),
+		(set) => (set.status = "pending"),
+		(set) => (set.artifactId = 0),
+	]) {
+		const description = structuredClone(pending);
+		description.actions = structuredClone(active);
+		mutate(description.actions);
+		assert.throws(() => referenceSet(description, "actions"), /invalid active/);
+	}
+	assert.throws(() => unpackReferenceArchive(Buffer.from("bad"), active.sha256), /digest/);
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "reference-archive-test-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const zip = path.join(root, "unsafe.zip");
+	execFileSync("python3", [
+		"-c",
+		"import zipfile,sys; z=zipfile.ZipFile(sys.argv[1],'w'); z.writestr('../escape','unsafe'); z.close()",
+		zip,
+	]);
+	const bytes = fs.readFileSync(zip);
+	assert.throws(
+		() => unpackReferenceArchive(bytes, createHash("sha256").update(bytes).digest("hex")),
+		/unsafe reference archive/,
+	);
+});
+
+test("expired activated Actions artifacts are setup failures before archive download", (t) => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "expired-reference-test-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const gh = path.join(root, "gh");
+	fs.writeFileSync(
+		gh,
+		`#!/bin/sh
+printf '%s\\n' '{"id":123,"expired":true,"size_in_bytes":10,"expires_at":"2000-01-01T00:00:00Z"}'
+`,
+	);
+	fs.chmodSync(gh, 0o755);
+	const previousPath = process.env.PATH,
+		previousRepo = process.env.GITHUB_REPOSITORY;
+	process.env.PATH = `${root}:${previousPath}`;
+	process.env.GITHUB_REPOSITORY = "fixture/repository";
+	try {
+		assert.throws(() => loadReferenceArchive({ artifactId: 123 }, "actions"), /expired/);
+	} finally {
+		process.env.PATH = previousPath;
+		if (previousRepo === undefined) delete process.env.GITHUB_REPOSITORY;
+		else process.env.GITHUB_REPOSITORY = previousRepo;
+	}
 });

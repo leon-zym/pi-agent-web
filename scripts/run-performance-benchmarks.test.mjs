@@ -388,3 +388,56 @@ fi
 		}
 	});
 }
+
+test("CI evaluates base references and propagates budget failure into its summary", (t) => {
+	const workflow = fs.readFileSync(path.join(repositoryRoot, ".github/workflows/ci.yml"), "utf8");
+	const step = workflow
+		.split("      - name: Evaluate completion median budgets\n")[1]
+		.split("      - name: Upload")[0];
+	const script = step
+		.split("        run: |\n")[1]
+		.split("\n")
+		.map((line) => line.replace(/^ {10}/, ""))
+		.join("\n");
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "budget-workflow-test-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	fs.mkdirSync(path.join(root, "test-results/performance/representative"), { recursive: true });
+	fs.mkdirSync(path.join(root, "tests/e2e/benchmarks"), { recursive: true });
+	fs.writeFileSync(path.join(root, "tests/e2e/benchmarks/references.json"), '{"status":"pending"}');
+	fs.writeFileSync(
+		path.join(root, "git"),
+		`#!/bin/sh
+case "$1" in
+fetch) exit 0;;
+ls-tree) echo registered;;
+show) echo '{"status":"active"}';;
+esac
+`,
+	);
+	fs.writeFileSync(
+		path.join(root, "node"),
+		`#!/bin/sh
+if ! grep -q active "$RUNNER_TEMP/benchmark-references.json"; then exit 99; fi
+echo 'Performance budget: REGRESSION'
+exit 7
+`,
+	);
+	fs.chmodSync(path.join(root, "git"), 0o755);
+	fs.chmodSync(path.join(root, "node"), 0o755);
+	const summary = path.join(root, "summary.md");
+	const result = spawnSync("bash", ["-c", script], {
+		cwd: root,
+		encoding: "utf8",
+		env: {
+			...process.env,
+			PATH: `${root}:${process.env.PATH}`,
+			RUNNER_TEMP: root,
+			REFERENCE_SHA: "base",
+			GITHUB_RUN_ID: "1",
+			GITHUB_RUN_ATTEMPT: "1",
+			GITHUB_STEP_SUMMARY: summary,
+		},
+	});
+	assert.equal(result.status, 7, result.stderr);
+	assert.match(fs.readFileSync(summary, "utf8"), /REGRESSION/);
+});
