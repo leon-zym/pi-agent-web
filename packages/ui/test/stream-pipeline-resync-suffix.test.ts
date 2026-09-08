@@ -343,8 +343,8 @@ it("materializes and projects a page while another Session remains selected", as
 	};
 	record("setup-returned");
 	const stopStateTrace = controller.store.subscribe(() => record("channel-change"));
-	const stopFrameTrace = controller.frameBus.subscribeAll(({ message, representation }) => {
-		if (message.sessionHandle === SESSION_HANDLE) record(`bus:${message.type}:${representation}`);
+	const stopFrameTrace = controller.frameBus.subscribeAll(({ sessionHandle, message, representation }) => {
+		if (sessionHandle === SESSION_HANDLE) record(`bus:${message.type}:${representation}`);
 	});
 	const receive = socket.receive.bind(socket);
 	const receiveTrace = vi.spyOn(socket, "receive").mockImplementation((message) => {
