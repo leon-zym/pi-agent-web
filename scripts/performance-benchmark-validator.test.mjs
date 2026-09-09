@@ -5,7 +5,7 @@ import fs from "node:fs";
 import { stripTypeScriptTypes } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 import { createRecoveryRecorder } from "../packages/ui/src/lib/benchmark-recovery-recorder.ts";
@@ -34,6 +34,7 @@ const RUN_ID = "20260831t000000z-fixture";
 const FORMAL_VARIANTS = ["coalesced", "sequential"];
 // Independently maintained oracle: this must not be generated from the validator export under test.
 const EXPECTED_BENCHMARK_PRODUCER_PATHS = Object.freeze([
+	"packages/ui/src/features/conversation/ConversationTurnWindow.tsx",
 	"packages/ui/src/lib/benchmark-browser.tsx",
 	"packages/ui/src/lib/benchmark-recovery-recorder.ts",
 	"scripts/benchmark-quota.mjs",
@@ -41,6 +42,7 @@ const EXPECTED_BENCHMARK_PRODUCER_PATHS = Object.freeze([
 	"tests/e2e/benchmarks/benchmark-support.ts",
 	"tests/e2e/benchmarks/concurrency.spec.ts",
 	"tests/e2e/benchmarks/content-roundtrip.spec.ts",
+	"tests/e2e/benchmarks/history-mixed.spec.ts",
 	"tests/e2e/benchmarks/history.spec.ts",
 	"tests/e2e/benchmarks/playwright.config.ts",
 	"tests/e2e/benchmarks/recovery-evidence.ts",
@@ -284,7 +286,106 @@ function recoveryObservation(kind) {
 	};
 }
 
+function mixedObservation(d, cycle = 0) {
+	const messages = [];
+	for (let i = 0; i < d.turns; i++) {
+		const time = 1767225600000 + i * 2000;
+		messages.push(`${time}:user:`);
+		if (i % 5 === 2) messages.push(`${time + 1000}:assistant:toolUse`, `${time + 1000}:toolResult:`);
+		messages.push(`${time + 1000}:assistant:stop`);
+	}
+	const pages = [];
+	let cursor = null;
+	while (messages.length) {
+		const ids = messages.splice(Math.max(0, messages.length - (pages.length ? 256 : 96)));
+		const next = messages.length ? createHash("sha256").update(String(messages.length)).digest("hex") : null;
+		pages.push({ cursor, next, ids });
+		cursor = next;
+	}
+	const target = (n) => `E2E_MIXED_HISTORY [turn ${n}]`;
+	const actions = [
+		["oldest", target(1)],
+		["middle", target(d.turns / 2 + 1)],
+		["latest", target(d.turns)],
+		["prepend", "anchor"],
+		["focus", "older"],
+		["resize", "1024"],
+		["theme", "dark"],
+		["selection", target(1)],
+		["find", target(1)],
+		["copy", target(1)],
+		["switch", "mixed draft"],
+		["reconnect", String(d.turns)],
+		["extension", "widget+dialog"],
+	].map(([name, actual], i) => ({ name, actual, started: 100 + i * 2, finished: 101 + i * 2 }));
+	return {
+		kind: "history-mixed",
+		browserErrors: browserErrors(),
+		facts: {
+			failure: null,
+			cycle,
+			sourceBytes: d.sourceBytes,
+			fixtureDigest:
+				d.turns === 1000
+					? "de9ea6b7ee802c3080ce872d3362e6152abb02d049906e5850867ad342370e7c"
+					: "0572fe11c4ffef971c3f834fc43115cdca812a984c756431edc02581d18d9f7e",
+			liveTurns: d.turns + 1,
+			liveMounted: d.historyMount === "full" ? d.turns + 1 : 64,
+			initialTurns: 40,
+			finalTurns: d.turns,
+			mounted: d.historyMount === "full" ? d.turns : 64,
+			getMessagesCount: 0,
+			pages,
+			actions,
+			gc: ["baseline", "loaded", "warm", "returned"].map((name, i) => ({
+				name,
+				started: i * 10,
+				finished: i * 10 + 1,
+				heap: 100000,
+				dom: 500,
+			})),
+			anchor: { beforeId: "anchor", afterId: "anchor", before: 12, after: 13 },
+			prepend: {
+				requestsBefore: pages.length - 1,
+				requestsAfter: pages.length,
+				inflightBefore: 0,
+				inflightAfter: 0,
+				requestId: HASH_A,
+				endRequestId: HASH_A,
+				beforeTurns: 40,
+				afterTurns: 40 + pages[1].ids.filter((id) => id.endsWith(":user:")).length,
+				pageMessages: pages[1].ids.length,
+				pageUserTurns: pages[1].ids.filter((id) => id.endsWith(":user:")).length,
+				anchorVisible: true,
+				windowBefore: [0, 40],
+				windowAfter: [
+					0,
+					d.historyMount === "full" ? 40 + pages[1].ids.filter((id) => id.endsWith(":user:")).length : 64,
+				],
+			},
+			times: { cold: 20, warm: 10, settlement: 2, cycle: 200 },
+		},
+	};
+}
+
+function mixedMetrics(d) {
+	return {
+		coldOpenMs: 20,
+		warmOpenMs: 10,
+		settlementMs: 2,
+		cycleMs: 200,
+		retainedHeapBytes: 100000,
+		heapDeltaBytes: 0,
+		mountedTurnNodes: d.historyMount === "full" ? d.turns : 64,
+		navigationMs: 3,
+		anchorErrorPx: 1,
+		sessionSwitchMs: 1,
+		interactionMs: 13,
+	};
+}
+
 function observationFor(definition, index = 0) {
+	if (definition.kind === "history-mixed") return mixedObservation(definition, index);
 	if (definition.kind.startsWith("recovery-")) {
 		const observation = recoveryObservation(definition.kind);
 		if (observation.facts.protocol.disconnectEvidence)
@@ -383,6 +484,7 @@ function observationFor(definition, index = 0) {
 }
 
 function correctnessFor(definition) {
+	if (definition.kind === "history-mixed") return { mixedHistoryComplete: true, complete: true };
 	const keys =
 		definition.kind === "streaming"
 			? [
@@ -455,6 +557,11 @@ function hardGate(metric, statistic, comparison, threshold, actual) {
 }
 
 function validGates(definition, variant) {
+	if (definition.kind === "history-mixed")
+		return [
+			hardGate("correctnessFailures", "value", "eq", 0, 0),
+			hardGate("browserErrors", "value", "eq", 0, 0),
+		];
 	const measuredP95 =
 		variant === "coalesced" ? (definition.warmups === 0 ? 10 : 20) : definition.warmups === 0 ? 11 : 21;
 	const gates = [
@@ -496,6 +603,25 @@ function validGates(definition, variant) {
 }
 
 function validResult(variant, definition) {
+	if (definition.kind === "history-mixed") {
+		const base = validResult(variant, { ...definition, kind: "history" });
+		base.kind = definition.kind;
+		base.parameters = structuredClone(definition);
+		base.gates = validGates(definition, variant);
+		base.trials = Array.from({ length: definition.warmups + definition.samples }, (_, index) => ({
+			index,
+			warmup: index < definition.warmups,
+			correctness: correctnessFor(definition),
+			metrics: mixedMetrics(definition),
+		}));
+		base.summaries = Object.fromEntries(
+			Object.entries(mixedMetrics(definition)).map(([k, v]) => [
+				k,
+				{ count: definition.samples, min: v, max: v, median: v, p95: v },
+			]),
+		);
+		return base;
+	}
 	const measured = Array.from({ length: definition.samples }, (_, index) => {
 		if (variant === "coalesced") return index === 0 ? 10 : 20;
 		return index === 0 ? 11 : 21;
@@ -503,7 +629,7 @@ function validResult(variant, definition) {
 	const correctness = correctnessFor(definition);
 	return {
 		schemaVersion: 2,
-		suiteVersion: 5,
+		suiteVersion: 6,
 		tier: "representative",
 		runId: RUN_ID,
 		scenarioId: definition.id,
@@ -556,7 +682,7 @@ function validManifest(matrixValue = matrix) {
 	const keys = expected.map((entry) => `${entry.domain}/${entry.id}/${entry.variant}`);
 	return {
 		schemaVersion: 2,
-		suiteVersion: 5,
+		suiteVersion: 6,
 		tier: "representative",
 		runId: RUN_ID,
 		seed: "fixture-seed",
@@ -589,7 +715,7 @@ function validManifest(matrixValue = matrix) {
 function validEnvironment() {
 	return {
 		schemaVersion: 2,
-		suiteVersion: 5,
+		suiteVersion: 6,
 		runId: RUN_ID,
 		os: "linux",
 		kernel: "6.0",
@@ -680,7 +806,7 @@ test("loads the complete root and domain matrices with exactly four recovery cla
 		"recovery",
 		"streaming",
 	]);
-	assert.equal(matrix.tiers.representative.scenarios.length, 10);
+	assert.equal(matrix.tiers.representative.scenarios.length, 11);
 	const recovery = matrix.domains.find((domain) => domain.id === "recovery");
 	assert.ok(recovery);
 	assert.deepEqual(
@@ -1293,7 +1419,7 @@ for (const field of ["turnNodes", "streamingDomMutationBatches", "deltaCount"]) 
 test("rejects suite-v2 streaming evidence after observer semantics changed", () => {
 	const results = validResults();
 	results[0].suiteVersion = 4;
-	assert.match(errorText(validate({ results })), /suiteVersion must be 5/);
+	assert.match(errorText(validate({ results })), /suiteVersion must be 6/);
 });
 
 for (const warmup of [true, false]) {
@@ -1881,9 +2007,42 @@ test("unknown memory quota remains valid diagnostic evidence, not a numeric quot
 	}
 });
 
+// The prerequisite commit contains the suite-5 synthetic bundle writer. Execute only
+// that trusted fixture helper; its registered tests are disabled and no archive code runs.
+let legacyTree;
+after(() => {
+	if (legacyTree) fs.rmSync(legacyTree, { recursive: true, force: true });
+});
+function legacyBundleFiles(root, id, value = 100) {
+	if (!legacyTree) {
+		legacyTree = fs.mkdtempSync(path.join(os.tmpdir(), "suite5-test-fixture-"));
+		const source = "9d2174acb8ed5fcd9eda8ad53b5099b540ba0eda";
+		execFileSync("tar", ["-xf", "-", "-C", legacyTree], {
+			input: execFileSync("git", ["archive", source], { cwd: repositoryRoot, maxBuffer: 32 * 1024 * 1024 }),
+		});
+		const file = path.join(legacyTree, "scripts/performance-benchmark-validator.test.mjs");
+		const code = fs
+			.readFileSync(file, "utf8")
+			.replace('import { test } from "node:test";', "const test = () => {};");
+		fs.writeFileSync(
+			file,
+			`${code}\nstrictBundleFiles(process.argv[2], process.argv[3], Number(process.argv[4]), "${TRUSTED_REFERENCE_SOURCE}");\n`,
+		);
+	}
+	execFileSync(
+		process.execPath,
+		[path.join(legacyTree, "scripts/performance-benchmark-validator.test.mjs"), root, id, String(value)],
+		{ timeout: 60_000, stdio: "pipe" },
+	);
+	return path.join(root, id);
+}
+
 function strictBundleFiles(root, id, value = 100, source = "c".repeat(40)) {
+	if (source === TRUSTED_REFERENCE_SOURCE) return legacyBundleFiles(root, id, value);
+
 	const results = validResults();
 	for (const result of results) {
+		if (result.kind === "history-mixed") continue;
 		for (const trial of result.trials) {
 			trial.metrics.recoveryMs = trial.metrics.latencyMs;
 			delete trial.metrics.latencyMs;
@@ -1920,7 +2079,7 @@ function strictBundleFiles(root, id, value = 100, source = "c".repeat(40)) {
 	const environment = JSON.stringify(rename(validEnvironment()));
 	const benchmark = {
 		schemaVersion: 2,
-		suiteVersion: 5,
+		suiteVersion: 6,
 		runId: id,
 		tier: "representative",
 		results: rename(validated.results),
@@ -2021,12 +2180,7 @@ test("strict bootstrap still requires raw; active archives never fall back to bo
 		reference1: "reference-1",
 		reference2: "reference-2",
 	};
-	const sameProducers =
-		JSON.stringify(fixtureHashes()) === JSON.stringify(fixtureHashes(TRUSTED_REFERENCE_SOURCE));
-	assert.equal(
-		runStrictEvaluation(target, active, "local", archive).status,
-		sameProducers ? "OK" : "INCOMPATIBLE",
-	);
+	assert.equal(runStrictEvaluation(target, active, "local", archive).status, "INCOMPATIBLE");
 	const description = path.join(root, "references.json");
 	fs.writeFileSync(description, JSON.stringify(active));
 	const cliArgs = [
@@ -2042,7 +2196,11 @@ test("strict bootstrap still requires raw; active archives never fall back to bo
 	];
 	const pass = spawnSync(process.execPath, cliArgs, { encoding: "utf8" });
 	assert.equal(pass.status, 0, pass.stderr);
-	assert.match(pass.stdout, sameProducers ? /Performance budget: OK/ : /incompatible references/);
+	assert.match(pass.stdout, /incompatible references/);
+	strictBundleFiles(root, "target", 201);
+	const fail = spawnSync(process.execPath, cliArgs, { encoding: "utf8" });
+	assert.equal(fail.status, 0, fail.stderr);
+	assert.match(fail.stdout, /incompatible references/);
 
 	assert.throws(() => runStrictEvaluation(target, active, "local"), /archive missing/);
 	active.local.sha256 = "a".repeat(64);
@@ -2057,7 +2215,7 @@ test("strict bootstrap still requires raw; active archives never fall back to bo
 test("strict iteration validates frozen raw and envelopes before classifying changed producers", (t) => {
 	const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "strict-iteration-")));
 	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-	const target = strictBundleFiles(root, "target", 100, TRUSTED_REFERENCE_SOURCE);
+	const target = legacyBundleFiles(root, "target");
 	const set = { source: TRUSTED_REFERENCE_SOURCE, reference1: "reference-1", reference2: "reference-2" };
 	for (const id of [set.reference1, set.reference2]) strictBundleFiles(root, id, 100, set.source);
 	assert.equal(readFrozenReferences(set, root).length, 2);
@@ -2258,4 +2416,175 @@ test("frozen subprocess has no credentials and cleans up failed or malformed out
 		assert.equal(typeof directory, "string");
 		assert.equal(fs.existsSync(directory), false);
 	}
+});
+
+for (const [name, mutate] of Object.entries({
+	duplicate: (f) => {
+		f.pages[1].ids[0] = f.pages[1].ids[1];
+	},
+	gap: (f) => {
+		f.pages[1].ids.pop();
+	},
+	cursor: (f) => {
+		f.pages[1].cursor = null;
+	},
+	gc: (f) => {
+		f.gc.pop();
+	},
+	heap: (f) => {
+		f.gc[1].heap = 1024 ** 3 + 1;
+	},
+	dom: (f) => {
+		f.gc[1].dom = 500001;
+	},
+	action: (f) => {
+		f.actions.pop();
+	},
+	find: (f) => {
+		f.actions.find((a) => a.name === "find").actual = "missing";
+	},
+	anchor: (f) => {
+		f.anchor.after += 3;
+	},
+	cycle: (f) => {
+		f.cycle++;
+	},
+	time: (f) => {
+		f.times.cycle = 120001;
+	},
+	bytes: (f) => {
+		f.sourceBytes++;
+	},
+	turns: (f) => {
+		f.finalTurns++;
+	},
+}))
+	test(`mixed history rejects ${name} evidence`, () => {
+		const definition = representativeScenarios.find((d) => d.kind === "history-mixed");
+		const result = validResult("coalesced", definition);
+		const observation = mixedObservation(definition);
+		mutate(observation.facts);
+		const map = new Map([[`${result.domain}/${result.scenarioId}/${result.variant}/0`, observation]]);
+		assert.ok(validateResult(result, definition, "representative", RUN_ID, map).length > 0);
+	});
+
+for (const [name, mutate] of Object.entries({
+	"focus-triggered extra page": (f) => {
+		f.prepend.requestsBefore++;
+		f.prepend.requestsAfter++;
+	},
+	"two measured pages": (f) => {
+		f.prepend.requestsAfter++;
+	},
+	"inflight anchor": (f) => {
+		f.prepend.inflightBefore = 1;
+	},
+	"unfinished page": (f) => {
+		f.prepend.inflightAfter = 1;
+	},
+	"wrong end request": (f) => {
+		f.prepend.endRequestId = HASH_B;
+	},
+	"offscreen anchor": (f) => {
+		f.prepend.anchorVisible = false;
+	},
+	"64-turn assumption": (f) => {
+		f.prepend.afterTurns = f.prepend.beforeTurns + 64;
+	},
+	"unbounded range": (f) => {
+		f.prepend.windowAfter = [0, f.prepend.afterTurns];
+	},
+}))
+	test(`mixed prepend rejects ${name}`, () => {
+		const definition = representativeScenarios.find((d) => d.kind === "history-mixed");
+		const result = validResult("coalesced", definition);
+		const observation = mixedObservation(definition);
+		const map = new Map([[`${result.domain}/${result.scenarioId}/${result.variant}/0`, observation]]);
+		assert.deepEqual(validateResult(result, definition, "representative", RUN_ID, map), []);
+		mutate(observation.facts);
+		assert.ok(validateResult(result, definition, "representative", RUN_ID, map).length > 0);
+	});
+
+test("mixed prepend accepts actual partial-page turn grouping in both mount modes", () => {
+	for (const historyMount of ["bounded", "full"]) {
+		const definition = { ...representativeScenarios.find((d) => d.kind === "history-mixed"), historyMount };
+		const result = validResult("coalesced", definition);
+		const observation = mixedObservation(definition);
+		// Browser requests 128 messages; five mixed Turns contain 12 messages.
+		const ids = observation.facts.pages.toReversed().flatMap((p) => p.ids);
+		const pages = [];
+		let cursor = null;
+		while (ids.length) {
+			const nextIds = ids.splice(Math.max(0, ids.length - (pages.length ? 128 : 96)));
+			const next = ids.length ? createHash("sha256").update(String(ids.length)).digest("hex") : null;
+			pages.push({ cursor, next, ids: nextIds });
+			cursor = next;
+		}
+		const f = observation.facts;
+		f.pages = pages;
+		Object.assign(f.prepend, {
+			requestsBefore: pages.length - 1,
+			requestsAfter: pages.length,
+			pageMessages: 128,
+			pageUserTurns: 53,
+			afterTurns: 93,
+			windowAfter: historyMount === "full" ? [0, 93] : [29, 93],
+		});
+		assert.equal(pages[1].ids.filter((id) => id.endsWith(":user:")).length, 53);
+		const map = new Map([[`${result.domain}/${result.scenarioId}/${result.variant}/0`, observation]]);
+		assert.deepEqual(validateResult(result, definition, "representative", RUN_ID, map), []);
+	}
+});
+
+for (const [name, mutate] of Object.entries({
+	"recipe digest": (f) => {
+		f.fixtureDigest = HASH_A;
+	},
+	"missing live turn": (f) => {
+		f.liveTurns--;
+	},
+	"excess live mount": (f) => {
+		f.liveMounted = 65;
+	},
+	"malformed action": (f) => {
+		f.actions[0] = null;
+	},
+	"malformed GC": (f) => {
+		f.gc[0] = null;
+	},
+}))
+	test(`mixed history rejects ${name}`, () => {
+		const d = representativeScenarios.find((d) => d.kind === "history-mixed");
+		const result = validResult("coalesced", d),
+			observation = mixedObservation(d);
+		const map = new Map([[`${result.domain}/${result.scenarioId}/${result.variant}/0`, observation]]);
+		assert.deepEqual(validateResult(result, d, "representative", RUN_ID, map), []);
+		mutate(observation.facts);
+		assert.ok(validateResult(result, d, "representative", RUN_ID, map).length > 0);
+	});
+
+test("mixed history recomputes signed retained heap differences", () => {
+	const d = representativeScenarios.find((d) => d.kind === "history-mixed");
+	const result = validResult("coalesced", d),
+		observation = mixedObservation(d);
+	observation.facts.gc[0].heap = 200000;
+	result.trials[0].metrics.heapDeltaBytes = -100000;
+	result.summaries.heapDeltaBytes = { count: 1, min: -100000, max: -100000, median: -100000, p95: -100000 };
+	const map = new Map([[`${result.domain}/${result.scenarioId}/${result.variant}/0`, observation]]);
+	assert.deepEqual(validateResult(result, d, "representative", RUN_ID, map), []);
+	result.trials[0].metrics.heapDeltaBytes = 0;
+	assert.ok(validateResult(result, d, "representative", RUN_ID, map).length > 0);
+});
+
+test("mixed stress declares exactly 32 cycles across sizes, mount modes and publication variants", () => {
+	const mixed = canonicalFormalExpectedScenarioSet(matrix, "stress").filter(
+		(d) => d.kind === "history-mixed" || d.id.startsWith("history-mixed-"),
+	);
+	assert.equal(mixed.length, 8);
+	assert.ok(mixed.every((d) => d.warmups === 1 && d.measured === 3));
+	assert.equal(
+		mixed.reduce((sum, d) => sum + d.warmups + d.measured, 0),
+		32,
+	);
+	assert.equal(new Set(mixed.map((d) => `${d.id}/${d.variant}`)).size, 8);
 });

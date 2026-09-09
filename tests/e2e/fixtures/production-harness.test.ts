@@ -11,6 +11,7 @@ import {
 	type HarnessWorkspace,
 	isBoundedHarnessLifecycle,
 	MAX_HARNESS_ROOT_ENTRIES,
+	seedHistoricalSession,
 	startProductionHarness,
 } from "./production-harness";
 
@@ -161,3 +162,64 @@ test("serializes concurrent restart and stop operations over owned children", as
 		await harness.stop();
 	}
 });
+
+for (const [turns, bytes] of [
+	[1000, 4 * 1024 ** 2],
+	[5000, 16 * 1024 ** 2],
+] as const)
+	test(`mixed history independently bounds ${turns} turns and ${bytes} bytes`, () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "mixed-history-recipe-"));
+		try {
+			const seed = {
+				userText: "E2E_MIXED_HISTORY",
+				assistantText: "E2E_MIXED_REPLY",
+				turnCount: turns,
+				targetSourceBytes: bytes,
+				mixedHistory: true,
+			};
+			const { sessionFile } = seedHistoricalSession(root, root, seed);
+			const raw = fs.readFileSync(sessionFile);
+			assert.equal(raw.length, bytes);
+			const entries = raw
+				.toString()
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line));
+			assert.equal(entries.length, (turns * 12) / 5 + 1);
+			const messages = entries.slice(1);
+			assert.equal(
+				sha256(
+					JSON.stringify(messages, (key, value) =>
+						key === "text" && typeof value === "string" ? value.replace(/x+$/, "") : value,
+					),
+				),
+				turns === 1000
+					? "de9ea6b7ee802c3080ce872d3362e6152abb02d049906e5850867ad342370e7c"
+					: "0572fe11c4ffef971c3f834fc43115cdca812a984c756431edc02581d18d9f7e",
+			);
+			assert.equal(messages.filter((e) => e.message.role === "user").length, turns);
+			assert.equal(messages.filter((e) => e.message.role === "toolResult").length, turns / 5);
+			assert.equal(new Set(messages.map((e) => e.id)).size, messages.length);
+			for (const [i, entry] of messages.entries())
+				assert.equal(entry.parentId, i === 0 ? null : messages[i - 1].id);
+			const content = messages.flatMap((e) => e.message.content);
+			assert.equal(content.filter((c) => c.type === "thinking").length, turns / 5);
+			assert.equal(content.filter((c) => c.type === "toolCall").length, turns / 5);
+			for (const size of [10240, 65536, 122880, 1048576]) {
+				const matches = content.filter((c) => c.text?.includes(`# Mixed Markdown ${size}\n`));
+				assert.equal(matches.length, 1);
+				assert.ok(Buffer.byteLength(matches[0].text) >= size);
+			}
+			assert.equal(content.filter((c) => c.text?.includes("```ts")).length, turns / 5);
+			assert.equal(content.filter((c) => c.text?.includes("| key | value |")).length, turns / 5);
+			const hash = sha256(raw);
+			seedHistoricalSession(root, root, seed);
+			assert.equal(sha256(fs.readFileSync(sessionFile)), hash);
+			assert.throws(
+				() => seedHistoricalSession(root, root, { ...seed, targetSourceBytes: bytes + 1 }),
+				/requires/,
+			);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});

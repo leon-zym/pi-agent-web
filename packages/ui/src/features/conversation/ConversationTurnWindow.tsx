@@ -25,6 +25,10 @@ import {
 	revealTurnWindowStart,
 } from "./turn-window";
 
+// This pre-mount control is eliminated from ordinary production bundles.
+const fullHistory =
+	import.meta.env.VITE_PI_WEB_BENCHMARK_BUILD === "1" &&
+	Reflect.get(globalThis, "__piwebBenchmarkFullHistory") === true;
 const TURN_LOAD_THRESHOLD = 96;
 const TURN_SCROLL_THRESHOLD = 24;
 const SAVED_WINDOW_START_LIMIT = 32;
@@ -172,7 +176,10 @@ export const ConversationTurnWindow = memo(
 		// Select the corrected slice before commit, so the stable keyed anchor never unmounts.
 		const renderedStart = remoteStart ?? start;
 		const range = useMemo(
-			() => getTurnWindowRange(turns.length, renderedStart),
+			() =>
+				fullHistory
+					? { start: 0, end: turns.length, hasOlder: false, hasNewer: false }
+					: getTurnWindowRange(turns.length, renderedStart),
 			[turns.length, renderedStart],
 		);
 
@@ -253,7 +260,9 @@ export const ConversationTurnWindow = memo(
 
 		const loadOlder = useCallback(() => {
 			const currentStart = startRef.current;
-			const currentRange = getTurnWindowRange(turnsRef.current.length, currentStart);
+			const currentRange = fullHistory
+				? { hasOlder: false }
+				: getTurnWindowRange(turnsRef.current.length, currentStart);
 			if (remotePrependRef.current || (!currentRange.hasOlder && remoteHistoryLoading)) return;
 			const container = scrollContainerRef.current;
 			const anchor = findVisibleTurn(container);
@@ -311,7 +320,9 @@ export const ConversationTurnWindow = memo(
 			remotePrependRef.current = null;
 			pendingPrependRef.current = null;
 			const currentStart = startRef.current;
-			const currentRange = getTurnWindowRange(turnsRef.current.length, currentStart);
+			const currentRange = fullHistory
+				? { hasNewer: false }
+				: getTurnWindowRange(turnsRef.current.length, currentStart);
 			if (!currentRange.hasNewer) return;
 			const maxStart = getInitialTurnWindowStart(turnsRef.current.length);
 			setStart(Math.min(maxStart, currentStart + CONVERSATION_TURN_PAGE_SIZE));

@@ -12,6 +12,7 @@ export type BenchmarkKind =
 	| "streaming"
 	| "concurrency"
 	| "history"
+	| "history-mixed"
 	| "recovery-disconnect"
 	| "recovery-gap"
 	| "recovery-crash"
@@ -34,6 +35,7 @@ export interface BenchmarkScenario {
 	turns?: number;
 	inputBytes?: number;
 	historyReadMode?: "verified_nonempty_native";
+	historyMount?: "bounded" | "full";
 }
 
 export interface BenchmarkTrial {
@@ -136,6 +138,39 @@ export interface BenchmarkHistoryObservationFacts {
 	pi: {
 		getMessagesCount: number;
 	};
+}
+
+export interface MixedHistoryFacts {
+	fixtureDigest: string;
+	liveTurns: number;
+	liveMounted: number;
+	failure: string | null;
+	cycle: number;
+	sourceBytes: number;
+	initialTurns: number;
+	finalTurns: number;
+	mounted: number;
+	getMessagesCount: number;
+	pages: Array<{ cursor: string | null; next: string | null; ids: string[] }>;
+	gc: Array<{ name: string; started: number; finished: number; heap: number; dom: number }>;
+	actions: Array<{ name: string; started: number; finished: number; actual: string }>;
+	anchor: { beforeId: string; afterId: string; before: number; after: number };
+	prepend: {
+		requestsBefore: number;
+		requestsAfter: number;
+		inflightBefore: number;
+		inflightAfter: number;
+		requestId: string;
+		endRequestId: string;
+		beforeTurns: number;
+		afterTurns: number;
+		pageMessages: number;
+		pageUserTurns: number;
+		anchorVisible: boolean;
+		windowBefore: number[];
+		windowAfter: number[];
+	};
+	times: { cold: number; warm: number; settlement: number; cycle: number };
 }
 
 export interface BenchmarkContentObservationFacts {
@@ -297,6 +332,7 @@ export type BenchmarkObservationFactsByKind = {
 	concurrency: BenchmarkConcurrencyObservationFacts;
 	"content-roundtrip": BenchmarkContentObservationFacts;
 	history: BenchmarkHistoryObservationFacts;
+	"history-mixed": MixedHistoryFacts;
 	"recovery-crash": BenchmarkRecoveryObservationFacts;
 	"recovery-disconnect": BenchmarkRecoveryObservationFacts;
 	"recovery-gap": BenchmarkRecoveryObservationFacts;
@@ -328,7 +364,7 @@ export interface BenchmarkTrialLifecycle {
 
 export interface BenchmarkScenarioResult {
 	schemaVersion: 2;
-	suiteVersion: 5;
+	suiteVersion: 6;
 	tier: BenchmarkTier;
 	runId: string;
 	scenarioId: string;
@@ -583,9 +619,9 @@ function scenarioDirectory(scenario: BenchmarkScenario): string {
 }
 
 export async function runBenchmarkScenario(
-	page: Page,
+	page: Page | (() => Page),
 	testInfo: TestInfo,
-	_harness: ProductionHarness,
+	_harness: ProductionHarness | null,
 	scenario: BenchmarkScenario,
 	execute: (outcome: BenchmarkOutcome, trials: BenchmarkTrialLifecycle) => Promise<void>,
 ): Promise<void> {
@@ -638,14 +674,14 @@ export async function runBenchmarkScenario(
 	}
 	let capabilities: Record<string, boolean>;
 	try {
-		capabilities = await browserCapabilities(page);
+		capabilities = await browserCapabilities(typeof page === "function" ? page() : page);
 	} catch (error) {
 		errors.push(`benchmark capability observation failed: ${errorText(error)}`);
 		capabilities = Object.fromEntries(scenario.requiredCapabilities.map((capability) => [capability, false]));
 	}
 	const result: BenchmarkScenarioResult = {
 		schemaVersion: 2,
-		suiteVersion: 5,
+		suiteVersion: 6,
 		tier,
 		runId,
 		scenarioId: scenario.id,
@@ -655,7 +691,7 @@ export async function runBenchmarkScenario(
 		status: errors.length === 0 ? "passed" : "failed",
 		startedAt,
 		finishedAt: new Date().toISOString(),
-		browserVersion: page.context().browser()?.version() ?? "unknown",
+		browserVersion: (typeof page === "function" ? page() : page).context().browser()?.version() ?? "unknown",
 		parameters: scenario,
 		capabilities,
 		trials: outcome.trials,
