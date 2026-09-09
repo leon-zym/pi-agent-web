@@ -39,7 +39,7 @@
 		"@earendil-works/pi-coding-agent": "0.84.2",
 		"@pi-agent-web/protocol": "workspace:*",
 		"@hono/node-server": "^1.14.0",
-		"hono": "^4.7.0",
+		"hono": "^4.13.5",
 		"proper-lockfile": "^4.1.2",
 		"ws": "^8.18.0"
 	},
