@@ -141,11 +141,12 @@ PRs use the base commit's reference descriptor, so editing a PR's descriptor can
 active gate. The first descriptor introduction uses the checkout copy only when the base has no file.
 Activation changes therefore take effect on main after review. No per-PR disable switch is provided.
 
-Freeze this evaluator and policy before collecting a fresh suite-5 `reference-1`, `reference-2`,
-`holdout` cohort separately per environment. Evaluate the new holdout using a temporary active
+After B/C stabilization, a future cohort requires an explicit reviewed source/descriptor update.
+Freeze the final suite contract and policy before collecting fresh `reference-1`, `reference-2`,
+`holdout` bundles separately per environment. Evaluate the new holdout using a temporary active
 copy of the descriptor, then register accepted reference IDs/digest in the tracked descriptor.
 Do not select references after seeing the holdout or reuse historical suite-4/previously inspected
-holdouts. Registration must leave all 18 producer files, matrices, suite, lockfile and evaluation
+holdouts. Registration must leave the complete declared producer set, matrices, suite, lockfile and evaluation
 semantics unchanged. Product source/build hashes retain their own provenance; they are not required
 to equal a reference's product build. Existing full workload/environment compatibility stays intact,
 with no alternate producer hashes or hardware-lottery retries.
