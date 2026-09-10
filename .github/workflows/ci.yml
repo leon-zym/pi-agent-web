@@ -103,11 +103,11 @@ jobs:
           source=$(node --input-type=module -e '
             import fs from "node:fs";
             import { referenceSet } from "./scripts/benchmark-reference-evidence.mjs";
-            import { TRUSTED_REFERENCE_SOURCE } from "./scripts/benchmark-frozen-references.mjs";
+            import { TRUSTED_REFERENCE_SOURCES } from "./scripts/benchmark-frozen-references.mjs";
             const set = referenceSet(JSON.parse(fs.readFileSync(process.argv[1])), "actions");
             if (set.status === "active") {
-              if (set.source !== TRUSTED_REFERENCE_SOURCE) throw new Error("unsupported trusted reference source");
-              process.stdout.write(TRUSTED_REFERENCE_SOURCE);
+              if (!TRUSTED_REFERENCE_SOURCES.has(set.source)) throw new Error("unsupported trusted reference source");
+              process.stdout.write(set.source);
             }
           ' "$RUNNER_TEMP/benchmark-references.json")
           if [[ -n "$source" ]]; then git fetch --depth=1 origin "$source"; fi
