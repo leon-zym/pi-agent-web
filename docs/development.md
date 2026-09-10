@@ -1,8 +1,5 @@
 # Development
 
-This document defines the supported toolchain, verification layers, CI, packaging, and release
-checks. It is intentionally operational. Product behavior belongs in the other current contracts.
-
 ## Environment
 
 - Node.js 22 or later
@@ -19,13 +16,9 @@ pnpm exec playwright install chromium
 Do not commit generated `dist`, `test-results`, Playwright output, credentials, private paths, real Pi
 history, or provider output.
 
-Generated local directories have separate purposes:
-
 - `test-results/` holds Playwright traces, screenshots, and benchmark JSON or Markdown artifacts.
-- `playwright-report/` is Playwright's optional HTML report, produced by the CI Browser reporter or
-  an explicit HTML reporter selection.
-- `tmp/` is reserved for disposable maintainer notes and local experiments. Project scripts use
-  operating-system temporary directories for isolated package and runtime fixtures.
+- `playwright-report/` holds Playwright's optional HTML report.
+- `tmp/` holds disposable maintainer notes and local experiments.
 
 ## Root commands
 
@@ -33,6 +26,7 @@ Generated local directories have separate purposes:
 | --- | --- |
 | `pnpm dev` | Build protocol, then run Gateway and Vite development servers |
 | `pnpm build` | Build all packages and enforce the UI bundle budget |
+| `pnpm start` | Run the built workbench through the CLI package |
 | `pnpm lint` | Run package lint, Biome, style, and documentation guards |
 | `pnpm typecheck` | Build shared boundaries and typecheck packages plus Browser tests |
 | `pnpm test` | Run deterministic package test suites |
@@ -45,14 +39,12 @@ Generated local directories have separate purposes:
 | `pnpm bench:stress` | Run the explicit long-running stress matrix |
 | `PI_WEB_RUN_E2E=1 pnpm test:e2e:real` | Run explicit credential-bearing real-Pi acceptance |
 
-Use package filters and focused test paths while iterating. Run the full risk-appropriate gate before
-handoff. Browser and benchmark suites start real local listeners and Chromium; do not run them
-concurrently across worktrees.
+Use package filters and focused test paths while iterating. Browser and benchmark suites start real
+local listeners and Chromium, so do not run them concurrently across worktrees.
 
 ## Repository scripts
 
-Root commands call small repository-specific scripts where package tooling does not cover the
-contract:
+Repository-specific scripts cover contracts where package tooling does not; keep them narrow:
 
 | Script | Responsibility |
 | --- | --- |
@@ -64,16 +56,11 @@ contract:
 | `run-performance-benchmarks.mjs` | Build and run one benchmark tier, then write reproducible artifacts |
 | `performance-benchmark-validator.mjs` | Recompute benchmark summaries and reject incomplete or inconsistent evidence |
 
-Keep these scripts narrow. Do not move ordinary lint, test, or build behavior into another custom
-runner.
-
 ## Verification layers
 
 ### Unit and property tests
 
-Pure guards, reducers, identities, policies, byte accounting, and state machines should have direct
-tests. Filesystem, clock, process, and transport seams are injected where practical so edge cases do
-not depend on local state.
+Pure guards, reducers, identities, policies, byte accounting, and state machines have direct tests.
 
 ### Server integration
 
@@ -81,140 +68,78 @@ Server tests exercise actual Session supervision, JSONL parsing, replay, control
 custody, recovery, native discovery, deletion, and authenticated routes with deterministic process
 fixtures.
 
-Architecture, protocol, transport, deletion, or Session-scope changes require both focused
-invariants and an upper-layer integration or Browser regression. A shallow smoke test is not enough.
-
 ### Deterministic Browser E2E
 
-Playwright launches the production Gateway and UI against deterministic Pi fixtures. The suite
-covers navigation, multiple Sessions, streaming, recovery, Extension UI, attachments and typed
-content, large history, responsive layouts, accessibility regressions, and runtime resilience.
-
-Tests must assert product behavior rather than incidental animation frames. Use stable readiness and
-projection barriers. Keep test data free of credentials, user history, and private paths. Record
-traces on failure; keep screenshots only when they provide durable visual evidence.
+Playwright launches the production Gateway and UI against deterministic Pi fixtures. The suite covers
+navigation, multiple Sessions, streaming, recovery, Extension UI, attachments and typed content, large
+history, responsive layouts, accessibility regressions, and runtime resilience. Tests exercise product
+behavior rather than incidental animation frames, wait on stable readiness and projection barriers,
+record traces on failure, and keep screenshots only as durable visual evidence. Visual changes also
+follow the [visual acceptance matrix](design.md#visual-acceptance-matrix).
 
 ### Real Pi acceptance
 
-Real-Pi tests are explicit because they can use the developer's configured provider credentials.
-They create isolated temporary Workspace, Session, Browser-data, and Pi Agent roots. Only the
-minimum required authentication and model configuration is copied into the private temporary Agent
-root. Existing Pi history, extensions, settings, and project data are not loaded or modified.
-
-The lane verifies the upstream boundary with concurrent Sessions, streaming follow-up and abort,
-image input, rekey, fork or clone behavior, isolation, and RPC metadata. A release report states
-whether it ran and why it was skipped if the explicit environment was unavailable.
-
-## Performance evidence
-
-`pnpm bench:representative` runs a bounded production-Chromium matrix and writes strict JSON plus
-derived Markdown under `test-results/performance`. The artifact validator rejects missing scenarios,
-invalid metrics, wrong tier labels, and incomplete outputs.
-
-The representative matrix targets high-value risks:
-
-- concurrent Session publication and Browser fairness;
-- long streaming with structural flush boundaries;
-- large native history and incremental Browser loading;
-- replay, resync, crash recovery, Session rekey, Gateway restart, and stale mutation rejection;
-- large typed content references near declared limits;
-- bounded projection, queue, and materialization behavior.
-
-`pnpm bench:stress` extends duration and load and runs only by explicit request or manual CI. It is
-not a substitute for deterministic correctness.
-
-Structural checks and declared artifact shape are hard gates. Host-sensitive timing and resource
-measurements remain diagnostic unless backed by a compatible reference profile and variance policy.
-A green run proves only its declared scenarios. The [benchmark report](benchmark-report.md)
-defines measurement and comparison semantics; [Issue #28](https://github.com/leon-zym/pi-agent-web/issues/28)
-owns calibration, and [#117](https://github.com/leon-zym/pi-agent-web/issues/117) carries the
-remaining Phase 2 coverage gaps.
-
-When changing a targeted optimization, add a reproducible scenario only if it guards a real product
-risk. Do not create a generic benchmark framework or convert unstable workstation timing into a
-release promise.
-
-## Visual verification
-
-Use the [Design acceptance matrix](design.md#visual-acceptance-matrix) for themes, locales, input
-modes, viewport sizes, and interaction states. Inspect the affected surfaces; screenshots support
-that review but do not replace it.
+Real-Pi tests are explicit because they can use the developer's configured provider credentials. They
+create isolated temporary Workspace, Session, Browser-data, and Pi Agent roots, copy only the required
+authentication and model configuration into the private temporary Agent root, and never load or modify
+existing Pi history, extensions, settings, or project data. The lane verifies the upstream boundary
+with concurrent Sessions, streaming follow-up and abort, image input, rekey, fork or clone behavior,
+isolation, and RPC metadata; a release report states whether it ran and why it was skipped when the
+explicit environment was unavailable.
 
 ## CI
 
-The main CI workflow has three independent jobs:
-
-1. deterministic `verify`, authenticated smoke, and package smoke;
-2. packaged Browser E2E with failure traces;
-3. the representative performance matrix with artifacts.
-
-Pi compatibility has a separate exact-version workflow. The stress matrix is manual. Real-Pi
-acceptance is never an implicit CI dependency.
+The main CI workflow has three independent jobs: deterministic `verify` with authenticated smoke and
+package smoke; packaged Browser E2E with failure traces; and the representative performance matrix
+with artifacts. Pi compatibility uses a separate exact-version workflow, the stress matrix runs only
+through manual dispatch, and real-Pi acceptance is never an implicit CI dependency.
 
 The active `protect main` ruleset requires pull requests, an up-to-date branch, and the exact checks
 `Deterministic verification` and `Packaged browser E2E`; it also blocks deletion and non-fast-forward
-updates. The jobs are credential-free. Representative performance remains non-required evidence.
+updates. The jobs are credential-free, and representative performance remains non-required evidence.
+While the repository has one maintainer, required approvals are zero and no bypass actor is allowed;
+raise the count to one when a second maintainer becomes active.
 
-While the repository has one maintainer, required approvals are zero and there is no bypass actor.
-Raise the count to one when a second maintainer becomes active.
+[benchmark.md](benchmark.md) owns measurement and comparison semantics;
+[Issue #28](https://github.com/leon-zym/pi-agent-web/issues/28) owns calibration, and
+[#117](https://github.com/leon-zym/pi-agent-web/issues/117) owns the remaining Phase 2 coverage gaps.
 
 ## Packaging
 
-The workspace contains protocol, server, UI, and CLI packages. `pnpm test:pack` creates local
-tarballs in a temporary directory, checks package contents and dependency edges, installs them,
-verifies the CLI help path, and launches the installed single-port workbench.
+`pnpm test:pack` creates local tarballs in a temporary directory, checks package contents and
+dependency edges, installs them, verifies the CLI help path, and launches the installed single-port
+workbench.
 
-The packages are not published to npm. Passing package smoke proves local distribution integrity;
-it does not imply registry publication or a stable public release.
+The packages are not published to npm. Passing package smoke proves local distribution integrity and
+says nothing about registry publication or a stable public release.
 
 ## Release gate
 
-Before a release-related handoff:
+Before a release-related handoff, run:
 
 ```bash
-pnpm verify
-pnpm test:smoke
-pnpm test:compat
-pnpm test:browser
-pnpm test:pack
-pnpm bench:representative
+pnpm verify && pnpm test:smoke && pnpm test:compat && pnpm test:browser && pnpm test:pack && pnpm bench:representative
 ```
 
 Also inspect the final diff, repository status, package contents, Browser artifacts, benchmark
-artifact, and documentation links. Report the exact real-Pi outcome. Do not close a tracked issue
-until its accepted behavior is on the shipped branch and deferred work is explicitly recorded.
-Confirm the ruleset, exact required checks, and current maintainer-count exception.
+artifact, and documentation links, and report the exact real-Pi outcome. Do not close a tracked issue
+until its accepted behavior is on the shipped branch and deferred work is recorded. Confirm the
+ruleset, exact required checks, and the current maintainer-count exception.
 
 ## Release staging and workflow
 
-Official release archives are staged on the release runner via `pnpm release:stage`:
+Official release archives are staged on the release runner through `pnpm release:stage`:
 
 ```bash
-pnpm release:stage --tag=v<version>
+pnpm release:stage --tag=v<version>          # add --allow-local for a local dry run
 ```
 
-For local testing or dry runs, pass `--allow-local`:
+The script checks that root and workspace package versions match the target tag, requires a clean
+working tree, packs all four workspace packages, inspects tarball contents for compiled artifacts and
+workspace protocol leaks, and writes `dist/staging/pi-agent-web-v<version>/` with the bundle manifest,
+private root package, install guide, and license.
 
-```bash
-pnpm release:stage --tag=v<version> --allow-local
-```
-
-The staging script validates that root and workspace package versions match the target tag,
-confirms that the working tree is clean, packs all four workspace packages, inspects tarball
-contents for compiled artifacts and lack of workspace protocol leaks, and stages the release
-directory in `dist/staging/pi-agent-web-v<version>/` with bundle manifest, private root package,
-INSTALL guide, and license.
-
-The GitHub Actions release workflow (`.github/workflows/release.yml`) triggers via `workflow_dispatch`
-with a required `tag` input. It runs the full serial release gates (`pnpm verify`, `pnpm test:smoke`,
-`pnpm test:browser`, `pnpm test:pack`), stages the release directory, creates the outer tar.gz archive
-and SHA-256 sidecar checksum, and drafts a GitHub Release for maintainer review.
-
-## Code and commit conventions
-
-- Use tabs and Biome. Do not add ESLint or Prettier.
-- Keep Browser-safe code in protocol and Node-specific code in server.
-- Prefer explicit state machines, bounded ownership, and pure reducers over generic frameworks.
-- Treat untrusted values at their first authoritative boundary.
-- Use Conventional Commits and keep stages independently reviewable.
-- Preserve unrelated worktree changes and never hide a skipped or failed gate.
+`.github/workflows/release.yml` triggers through `workflow_dispatch` with a required `tag` input. It
+runs the serial release gates (`pnpm verify`, `pnpm test:smoke`, `pnpm test:browser`, `pnpm test:pack`),
+stages the release directory, creates the outer tar.gz archive and a SHA-256 sidecar checksum, and
+drafts a GitHub Release for maintainer review.
