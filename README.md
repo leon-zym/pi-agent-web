@@ -138,7 +138,8 @@ The representative suite runs the same deterministic scenarios locally and on Ac
 is a hard gate; six completion medians have strict budgets against compatible active references,
 while other timing and resource comparisons are diagnostic. The checked-in September 6
 calibration is historical evidence, incompatible with the corrected comparison policy. Accepted
-suite-5 local and Actions references are registered separately; remaining coverage stays in #28.
+suite-6 local and Actions references are registered separately; remaining Phase 2 coverage is
+tracked in [#117](https://github.com/leon-zym/pi-agent-web/issues/117).
 
 - Method, historical evidence, and compatibility requirements: [Performance Benchmark Report](docs/benchmark-report.md)
 - Collect two complete runs on the same local host (use a stable label for its OS installation):

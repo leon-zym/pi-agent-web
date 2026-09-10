@@ -2,7 +2,8 @@
 
 This storyboard proposes a demonstration recording for Pi Agent Web. Timestamps, actions, and
 narration are planned scenes, not observations from a completed video or performance evidence.
-Demo delivery remains tracked in [Issue #29](https://github.com/leon-zym/pi-agent-web/issues/29).
+Demo delivery is deferred and tracked in [Issue #118](https://github.com/leon-zym/pi-agent-web/issues/118);
+[Issue #29](https://github.com/leon-zym/pi-agent-web/issues/29) is closed.
 
 ## Overview
 

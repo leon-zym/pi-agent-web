@@ -66,8 +66,9 @@ out of the checked entry is not a reduction. Truly lazy, non-initial surfaces re
 The isolated Markstream comparison lacked equivalent highlighting and differed in stable-prefix,
 link, HTML, and virtualization behavior. A faster isolated render therefore did not justify replacing
 the renderer. Current observation boundaries, reproducibility, and diagnostic limitations belong in
-the [benchmark report](../benchmark-report.md#current-streaming-observer-semantics); calibration and
-coverage delivery belong to [Issue #28](https://github.com/leon-zym/pi-agent-web/issues/28).
+the [benchmark report](../benchmark-report.md#current-streaming-observer-semantics); calibration
+belongs to [Issue #28](https://github.com/leon-zym/pi-agent-web/issues/28) and remaining coverage to
+[Issue #117](https://github.com/leon-zym/pi-agent-web/issues/117).
 
 ## Consequences
 
