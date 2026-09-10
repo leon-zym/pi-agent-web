@@ -215,7 +215,8 @@ export const ConversationTurnWindow = memo(
 			const followsLatest = distanceFromBottom <= TURN_SCROLL_THRESHOLD;
 			setStart((current) => {
 				if (previousCount === 0) return getInitialTurnWindowStart(turns.length);
-				if (turns.length > previousCount && followsLatest) {
+				const wasAtLatest = current >= getInitialTurnWindowStart(previousCount);
+				if (turns.length > previousCount && (wasAtLatest || followsLatest)) {
 					return getInitialTurnWindowStart(turns.length);
 				}
 				return getSafeTurnWindowStart(turns.length, current);
