@@ -62,13 +62,13 @@ importers:
         version: 0.84.2(ws@8.21.3)
       '@hono/node-server':
         specifier: ^1.14.0
-        version: 1.19.17(hono@4.13.2)
+        version: 1.19.17(hono@4.13.5)
       '@pi-agent-web/protocol':
         specifier: workspace:*
         version: link:../protocol
       hono:
-        specifier: ^4.7.0
-        version: 4.13.2
+        specifier: ^4.13.5
+        version: 4.13.5
       proper-lockfile:
         specifier: ^4.1.2
         version: 4.1.2
@@ -1893,8 +1893,8 @@ packages:
     resolution: {integrity: sha512-nbfWpyRMcMrPMmDwJB+dhX/eiaPKtc2RB+0QZskqJ3WjRA/FDS0e9hZrx8EC/lbEv8gXy98FcDbNa/dspAaJMg==}
     engines: {node: '>=12.0.0'}
 
-  hono@4.13.2:
-    resolution: {integrity: sha512-JydRilDRkYBQMt9qR9U92mXxmbGqsqSn/IKOrh4e7/gEbn+0zSr8igTu0obwJoNGN4sez28DIql7FBHWydoJpA==}
+  hono@4.13.5:
+    resolution: {integrity: sha512-O6+/eCYRkzzzy0rPWwKLiGBR1nFuUPZynnwjxN1MBA62NNqbT0wQEzQyK2gSO5yDIDB336sXQleAhOHrzlYyKw==}
     engines: {node: '>=16.9.0'}
 
   hosted-git-info@9.0.3:
@@ -3365,9 +3365,9 @@ snapshots:
       - supports-color
       - utf-8-validate
 
-  '@hono/node-server@1.19.17(hono@4.13.2)':
+  '@hono/node-server@1.19.17(hono@4.13.5)':
     dependencies:
-      hono: 4.13.2
+      hono: 4.13.5
 
   '@jridgewell/gen-mapping@0.3.13':
     dependencies:
@@ -4461,7 +4461,7 @@ snapshots:
 
   highlight.js@11.12.0: {}
 
-  hono@4.13.2: {}
+  hono@4.13.5: {}
 
   hosted-git-info@9.0.3:
     dependencies:
