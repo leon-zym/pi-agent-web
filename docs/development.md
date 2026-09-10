@@ -127,7 +127,8 @@ Structural checks and declared artifact shape are hard gates. Host-sensitive tim
 measurements remain diagnostic unless backed by a compatible reference profile and variance policy.
 A green run proves only its declared scenarios. The [benchmark report](benchmark-report.md)
 defines measurement and comparison semantics; [Issue #28](https://github.com/leon-zym/pi-agent-web/issues/28)
-owns calibration, coverage gaps, and delivery acceptance.
+owns calibration, and [#117](https://github.com/leon-zym/pi-agent-web/issues/117) carries the
+remaining Phase 2 coverage gaps.
 
 When changing a targeted optimization, add a reproducible scenario only if it guards a real product
 risk. Do not create a generic benchmark framework or convert unstable workstation timing into a

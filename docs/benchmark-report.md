@@ -71,7 +71,8 @@ error suppression or replacement sampling. The strict restart error oracle remai
 The four required fault classes are WebSocket disconnect, replay gap, Pi crash and Session rekey.
 Stress retains 100 measured trials per fault per variant: 800 measured trials across both variants,
 plus warmups. Gateway restart's additional 100 per variant belongs to #105. Other history, load and
-fairness work remains in #28. The default Browser suite continues running the #103 real Gateway
+fairness work is carried by [#117](https://github.com/leon-zym/pi-agent-web/issues/117). The default
+Browser suite continues running the #103 real Gateway
 restart directory-recovery regression, including automatic recovery without another prompt or click,
 error/loading clearance and preserved selection/draft. This suite does not currently measure or
 budget the directory-read/shutdown overlap.
@@ -79,7 +80,7 @@ budget the directory-read/shutdown overlap.
 Version 5 and changed matrix provenance reject old bundles as current evidence. Historical artifacts,
 including the invalid local reference-2, remain unchanged; a new frozen source requires a new complete
 cohort. The previously inspected holdout cannot validate a newly selected budget policy. Strict
-completion budgets use the policy below; the accepted suite-5 local and Actions references are
+completion budgets use the policy below; the accepted suite-6 local and Actions references are
 registered in `tests/e2e/benchmarks/references.json`. `liveLongTasksOver50Ms` is a count (zero
 additive floor), not a duration;
 its suffix describes the 50 ms threshold. Other metric dimensions and diagnostic modes are unchanged.
@@ -569,7 +570,7 @@ Suite version 4 retains the streaming measurement contract introduced in suite v
 and keeps artifact schema version 2.
 The historical tables above and checked-in calibration file retain their original names and values;
 they are not current-suite calibration. Comparisons reject unsupported suite versions and changed
-producer hashes. Current suite-5 references are registered separately in `tests/e2e/benchmarks/references.json`.
+producer hashes. Current suite-6 references are registered separately in `tests/e2e/benchmarks/references.json`.
 
 | Current metric | Exact observation boundary |
 | --- | --- |
@@ -731,6 +732,50 @@ Both cohorts passed all deterministic hard gates and timing budgets:
    - Reference 2: `local-20260910t023122z-suite6-reference-2`
    - Holdout: `local-20260910t023122z-suite6-holdout` (Status: OK against both references)
 
+The raw directories remain the machine-readable record under `test-results/performance/representative/`
+and the downloaded Actions archive. The tables below restate the six strict series from those
+bundles. Each series ran one warmup plus three measured samples, so every count is 3 and the p95 is
+the maximum of three samples. Medians and p95 are in milliseconds. Only the median is budget-gated;
+p95 is reported for completeness and is diagnostic.
+
+#### GitHub Actions cohort (`linux-x64-gh-standard`)
+
+Environment: Ubuntu 24.04, kernel 6.17.0-1022-azure, x64, 4 logical vCPUs
+(`AMD EPYC 7763 64-Core Processor`), 16 GiB RAM, Node `v22.23.2`, pnpm `11.21.0`, Playwright
+`1.62.1`, Chromium `151.0.7922.34`. Artifact:
+[run 34427669069, artifact 10133827628](https://github.com/leon-zym/pi-agent-web/actions/runs/34427669069/artifacts/10133827628).
+
+| Series | Metric | Reference 1 median | Reference 1 p95 | Reference 2 median | Reference 2 p95 | Holdout median | Holdout p95 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `streaming:stream-1m:coalesced` | `totalCompletionMs` | 5430.1 | 6141.0 | 5409.5 | 6291.2 | 5509.7 | 6447.4 |
+| `streaming:stream-1m:sequential` | `totalCompletionMs` | 5578.2 | 5658.9 | 5896.0 | 6011.8 | 5272.8 | 5550.0 |
+| `concurrency:sessions-4:coalesced` | `totalCompletionMs` | 10289.8 | 12309.0 | 10203.9 | 12374.5 | 11126.6 | 13125.4 |
+| `concurrency:sessions-4:sequential` | `totalCompletionMs` | 10160.0 | 12627.0 | 10788.0 | 12711.7 | 10273.2 | 12601.8 |
+| `content:content-roundtrip:coalesced` | `roundTripMs` | 537.3 | 547.6 | 533.4 | 558.6 | 535.2 | 541.7 |
+| `content:content-roundtrip:sequential` | `roundTripMs` | 534.5 | 555.9 | 531.7 | 564.8 | 520.2 | 530.1 |
+
+#### Local host cohort (`local-host-v1`)
+
+Environment: Darwin 27.0.0, arm64, 8 logical cores (`Apple M2`), 24 GiB RAM, Node `v24.20.0`,
+pnpm `11.21.0`, Playwright `1.62.1`, Chromium `151.0.7922.34`. Linux cgroup CPU quota is
+inapplicable on Darwin and is recorded as `unavailable`. Local bundles live under
+`test-results/performance/representative/local-20260910t023122z-suite6-*`.
+
+| Series | Metric | Reference 1 median | Reference 1 p95 | Reference 2 median | Reference 2 p95 | Holdout median | Holdout p95 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `streaming:stream-1m:coalesced` | `totalCompletionMs` | 3409.9 | 4442.5 | 3340.1 | 3393.7 | 3308.7 | 3332.7 |
+| `streaming:stream-1m:sequential` | `totalCompletionMs` | 3264.1 | 3305.4 | 3299.0 | 3348.4 | 3295.1 | 3330.4 |
+| `concurrency:sessions-4:coalesced` | `totalCompletionMs` | 5813.3 | 5822.9 | 5377.6 | 5773.1 | 5622.5 | 5778.9 |
+| `concurrency:sessions-4:sequential` | `totalCompletionMs` | 5618.8 | 5741.3 | 5303.8 | 5664.8 | 5612.4 | 5780.0 |
+| `content:content-roundtrip:coalesced` | `roundTripMs` | 171.2 | 171.9 | 175.9 | 180.3 | 168.9 | 170.9 |
+| `content:content-roundtrip:sequential` | `roundTripMs` | 174.2 | 177.6 | 170.8 | 180.8 | 177.7 | 180.5 |
+
+Absolute values are not portable between the two cohorts and must not be pooled. Three samples
+cannot establish a distribution; the p95 column above is the observed maximum, and the diagnostic
+comparison policy keeps its 50 ms floor, which can hide substantial relative jitter in the
+low-latency series. The full per-metric diagnostic tables remain in the bundle `.md` files beside
+each run directory.
+
 For explicit long-running stress benchmarking:
 
 ```bash
@@ -742,7 +787,15 @@ Stress runs are executed only on explicit request or manual CI and are not requi
 
 ## Known Coverage Gaps
 
-As defined in `tests/e2e/benchmarks/matrix.json`, the Phase 1 representative baseline has the following 6 declared coverage gaps:
+`tests/e2e/benchmarks/matrix.json` declares its own list, and its `scope` field reads
+`#28 Phase 1 / complete`. That label means the Phase 1 harness, validator, and reporting contract
+was delivered; it does not assert that every original Issue #28 scope bullet was measured. The
+residual Phase 2 workload items are carried by
+[Issue #117](https://github.com/leon-zym/pi-agent-web/issues/117).
+
+### Declared in `matrix.json`
+
+The Phase 1 representative baseline has the following 6 declared coverage gaps:
 
 1. A deliberately slow raw WebSocket client and concurrent history/command fairness are not yet benchmarked.
 2. Generic typed content-root references are covered by the default Browser gate but are not benchmarked as a separate performance scenario; this suite measures production attachment refs.
@@ -750,3 +803,27 @@ As defined in `tests/e2e/benchmarks/matrix.json`, the Phase 1 representative bas
 4. Stress concurrency uses synchronized repeated finite 1 MiB turns and reports actual arrival rate; it does not yet certify an uninterrupted 60 second 1000 delta/s arrival rate.
 5. The deterministic Pi fixture proves repeatable protocol behavior, not real-provider or heterogeneous reference-host performance.
 6. Multiple Browser clients sharing the same Gateway and adversarial socket backpressure remain outside Phase 1.
+
+A seventh entry in the same file records the Gateway restart performance deferral to #105.
+
+### Additional Phase 2 gaps
+
+These were required by the original Issue #28 scope, have no implemented evidence, and have no
+recorded scope decision on the closed issue. Changing `matrix.json` would invalidate the registered
+suite-6 references, because the matrix hash is part of the compared workload identity, so they are
+recorded here and carried by #117 rather than edited into the frozen matrix.
+
+7. **Sustained-load profile.** No scenario implements a fixed-rate arrival window of up to 1,000
+   aggregate delta events per second for 60 seconds. `aggregateDeltaPerSecond` is observed
+   throughput over synchronized finite turns, not a scheduled sustained profile.
+8. **Mixed-history 5,000-Turn full mounting.** `history-mixed-5000-full` is declared required in
+   `matrix/history.json` but the 120 second per-cycle watchdog closes the browser context mid-cycle
+   (approximately 122 seconds in both publication variants). The cell cannot produce a complete
+   validating artifact within the safety cap, and it is not listed in `matrix.json`'s gap list.
+9. **Recovery fault-state coverage.** Faults are injected only during active text streaming. Fault
+   injection during thinking, tool execution, queued input, and blocking Extension UI is not
+   implemented, and the named `retry count` and terminal `degraded state` metrics are absent from
+   the trial records.
+10. **Cross-layer resource measurements.** Gateway and Browser peak memory, snapshot build count,
+    admission latency, and cleanup after cancellation are not recorded for the concurrency domain.
+    Multiple WebSocket connections per Gateway and slow-client backpressure are likewise missing.
