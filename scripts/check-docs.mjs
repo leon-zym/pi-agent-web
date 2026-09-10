@@ -8,7 +8,9 @@ const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url))
 const ignoredDirectories = new Set(["assets", "notes"]);
 const hanCharacters = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/u;
 const nonAsciiDashes = /[\u2013\u2014]/u;
-const staleDocumentNames = /(?:^|[/(])DESIGN\.md/u;
+const staleDocumentNames = /(?:^|[/(])(?:DESIGN\.md|benchmark-report\.md|demo-transcript\.md)/u;
+const documentationMap = "docs/README.md";
+const registryExempt = /^docs\/(?:decisions\/\d{4}-|evidence\/)/u;
 const markdownLink = /!?\[[^\]\n]*\]\((<[^>\n]+>|[^)\s]+)(?:\s+["'][^"']*["'])?\)/gu;
 const htmlLink = /(?:href|src)="([^"]+)"/gu;
 
@@ -92,6 +94,20 @@ async function main() {
 				await checkLocalLink(file, match[1], lineNumberAt(content, match.index), violations);
 				match = expression.exec(content);
 			}
+		}
+	}
+
+	const mapPath = path.join(repositoryRoot, documentationMap);
+	const mapContent = await fs.readFile(mapPath, "utf8");
+	for (const file of files) {
+		const relativePath = path.relative(repositoryRoot, file).split(path.sep).join("/");
+		if (relativePath === documentationMap || registryExempt.test(relativePath)) continue;
+		if (!mapContent.includes(relativePath)) {
+			violations.push({
+				sourceFile: file,
+				line: 1,
+				message: `not registered in ${documentationMap}`,
+			});
 		}
 	}
 
