@@ -22,8 +22,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Fetch trusted benchmark source for offline validator tests
         run: |
+          git fetch --depth=1 origin 7e0ca3e3738b31183b0661ed425f4d27b48d20bf
           git fetch --depth=1 origin 00fe129125fcf273f8c27332ec4b115b59779ce8
-          git fetch --depth=1 origin 9d2174acb8ed5fcd9eda8ad53b5099b540ba0eda
       - uses: pnpm/action-setup@v4
         with:
           version: 11.21.0
@@ -103,11 +103,11 @@ jobs:
           source=$(node --input-type=module -e '
             import fs from "node:fs";
             import { referenceSet } from "./scripts/benchmark-reference-evidence.mjs";
-            import { TRUSTED_REFERENCE_SOURCE } from "./scripts/benchmark-frozen-references.mjs";
+            import { TRUSTED_REFERENCE_SOURCES } from "./scripts/benchmark-frozen-references.mjs";
             const set = referenceSet(JSON.parse(fs.readFileSync(process.argv[1])), "actions");
             if (set.status === "active") {
-              if (set.source !== TRUSTED_REFERENCE_SOURCE) throw new Error("unsupported trusted reference source");
-              process.stdout.write(TRUSTED_REFERENCE_SOURCE);
+              if (!TRUSTED_REFERENCE_SOURCES.has(set.source)) throw new Error("unsupported trusted reference source");
+              process.stdout.write(set.source);
             }
           ' "$RUNNER_TEMP/benchmark-references.json")
           if [[ -n "$source" ]]; then git fetch --depth=1 origin "$source"; fi

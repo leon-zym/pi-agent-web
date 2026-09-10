@@ -5,10 +5,14 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 // Executable trust is reviewed explicitly; a descriptor or archive cannot extend this allowlist.
-export const TRUSTED_REFERENCE_SOURCE = "00fe129125fcf273f8c27332ec4b115b59779ce8";
+export const TRUSTED_REFERENCE_SOURCES = new Set([
+	"7e0ca3e3738b31183b0661ed425f4d27b48d20bf",
+	"00fe129125fcf273f8c27332ec4b115b59779ce8",
+]);
+export const TRUSTED_REFERENCE_SOURCE = "7e0ca3e3738b31183b0661ed425f4d27b48d20bf";
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export function readFrozenReferences(set, directory, repository = repositoryRoot) {
-	if (set.source !== TRUSTED_REFERENCE_SOURCE) throw new Error("unsupported trusted reference source");
+	if (!TRUSTED_REFERENCE_SOURCES.has(set.source)) throw new Error("unsupported trusted reference source");
 	const ids = [set.reference1, set.reference2];
 	if (
 		new Set(ids).size !== 2 ||

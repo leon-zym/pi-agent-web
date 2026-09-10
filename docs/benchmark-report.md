@@ -55,10 +55,10 @@ missing actions, duplicate/gapped pages, Browser errors or inconsistent raw-to-s
 cannot become zero-valued success. A B-only development run remains partial; it cannot replace
 formal stress completeness or the 800 measured recovery trials.
 
-Suite 6 and changed producer/matrix provenance make the accepted suite-5 references incompatible.
-They remain immutable and fully validated with their trusted frozen source before reporting budget
-not evaluated. The six completion medians and `completion-median-v1` policy are unchanged. Final
-B/C calibration is separate from this implementation and is still tracked in #28.
+Suite 6 establishes a dual-environment reference cohort across GitHub Actions and local hosts.
+Accepted Suite 6 references are frozen at commit `7e0ca3e3738b31183b0661ed425f4d27b48d20bf`
+and registered in `tests/e2e/benchmarks/references.json`. The six completion medians and
+`completion-median-v1` policy remain active across both environments.
 
 ## Recovery scope (introduced in suite version 5)
 
@@ -100,7 +100,7 @@ mandatory correctness without claiming a timing pass. The original `--baseline` 
 and its exit codes remain unchanged.
 
 `tests/e2e/benchmarks/references.json` keeps independent Actions and local sets. Both sets are
-active at frozen source `00fe129125fcf273f8c27332ec4b115b59779ce8`.
+active at frozen source `7e0ca3e3738b31183b0661ed425f4d27b48d20bf`.
 A `{"status":"pending"}` set validates target raw data and reports that references are not
 established. An active set has exactly `status`, `source` (frozen source commit), `artifactId`,
 `sha256` (digest of the entire ZIP), `reference1` and `reference2` (distinct, predetermined run IDs).
@@ -121,8 +121,8 @@ before GitHub artifact expiry. Any replacement locator must be explicitly review
 fixed evidence; an expired locator remains a setup failure until that update is accepted.
 
 Strict evaluation requires a Git checkout with the reviewed reference source object
-`00fe129125fcf273f8c27332ec4b115b59779ce8`. Local evaluation is offline; if the object is missing,
-explicitly run `git fetch --depth=1 origin 00fe129125fcf273f8c27332ec4b115b59779ce8` first.
+`7e0ca3e3738b31183b0661ed425f4d27b48d20bf`. Local evaluation is offline; if the object is missing,
+explicitly run `git fetch --depth=1 origin 7e0ca3e3738b31183b0661ed425f4d27b48d20bf` first.
 An anonymous source export without Git objects is not supported by this resolver. CI fetches the
 fixed source from the existing origin; no additional permission or reference archive override is used.
 
@@ -672,8 +672,8 @@ have no performance direction and are also excluded.
 
 All numerical tables above and `baselines/reference-linux-x64.json` retain their historical
 2026-09-06 semantics, including the old common floor and pooled CPU models. That file is
-`INCOMPATIBLE` with the new comparator; it has not been silently recalibrated. Accepted suite-5
-references are registered separately; remaining coverage and delivery work stays in #28.
+`INCOMPATIBLE` with the new comparator; it has not been silently recalibrated. Accepted suite-6
+references are registered separately in `tests/e2e/benchmarks/references.json`.
 
 ### Manual representative calibration collection
 
@@ -707,6 +707,29 @@ Local repetitions use the same `pnpm bench:representative` command with distinct
 Apply the same ordering and comparison rules. Never pool local and Actions absolute measurements.
 Collecting three bundles does not itself establish calibrated budgets: review repeatability and
 holdout observations separately. Strict budget enforcement remains separate from this entry point.
+
+### Suite 6 Dual-Environment Registered Calibration
+
+Following Issue #28 Subtask B and Subtask C merge at frozen commit `7e0ca3e3738b31183b0661ed425f4d27b48d20bf`,
+three representative calibration runs (`reference-1`, `reference-2`, and `holdout`) were collected
+separately on GitHub Actions Linux VM and on Local Host macOS (Apple M2).
+
+Both cohorts passed all deterministic hard gates and timing budgets:
+
+1. **GitHub Actions (Linux VM `linux-x64-gh-standard`)**:
+   - Run ID: `34427669069` (Job ID: `102716245592`)
+   - Artifact ID: `10133827628`
+   - Archive SHA256: `ac7bc1e1766b1fd75b5f20eca716adf1c305b02a69d3db79cc67d1b8109bd6e1`
+   - Reference 1: `calibration-34427669069-1-reference-1`
+   - Reference 2: `calibration-34427669069-1-reference-2`
+   - Holdout: `calibration-34427669069-1-holdout` (Status: OK against both references)
+
+2. **Local Host (macOS Darwin Apple M2, `local-host-v1`)**:
+   - Batch ID: `local-20260910t023122z-suite6`
+   - Archive SHA256: `2635bed323ee0085af4a52504e3068a6ddeaaf6793b9e1de8471f18d2282f256`
+   - Reference 1: `local-20260910t023122z-suite6-reference-1`
+   - Reference 2: `local-20260910t023122z-suite6-reference-2`
+   - Holdout: `local-20260910t023122z-suite6-holdout` (Status: OK against both references)
 
 For explicit long-running stress benchmarking:
 

@@ -5,7 +5,7 @@ import fs from "node:fs";
 import { stripTypeScriptTypes } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { after, test } from "node:test";
+import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 import { createRecoveryRecorder } from "../packages/ui/src/lib/benchmark-recovery-recorder.ts";
@@ -2007,39 +2007,7 @@ test("unknown memory quota remains valid diagnostic evidence, not a numeric quot
 	}
 });
 
-// The prerequisite commit contains the suite-5 synthetic bundle writer. Execute only
-// that trusted fixture helper; its registered tests are disabled and no archive code runs.
-let legacyTree;
-after(() => {
-	if (legacyTree) fs.rmSync(legacyTree, { recursive: true, force: true });
-});
-function legacyBundleFiles(root, id, value = 100) {
-	if (!legacyTree) {
-		legacyTree = fs.mkdtempSync(path.join(os.tmpdir(), "suite5-test-fixture-"));
-		const source = "9d2174acb8ed5fcd9eda8ad53b5099b540ba0eda";
-		execFileSync("tar", ["-xf", "-", "-C", legacyTree], {
-			input: execFileSync("git", ["archive", source], { cwd: repositoryRoot, maxBuffer: 32 * 1024 * 1024 }),
-		});
-		const file = path.join(legacyTree, "scripts/performance-benchmark-validator.test.mjs");
-		const code = fs
-			.readFileSync(file, "utf8")
-			.replace('import { test } from "node:test";', "const test = () => {};");
-		fs.writeFileSync(
-			file,
-			`${code}\nstrictBundleFiles(process.argv[2], process.argv[3], Number(process.argv[4]), "${TRUSTED_REFERENCE_SOURCE}");\n`,
-		);
-	}
-	execFileSync(
-		process.execPath,
-		[path.join(legacyTree, "scripts/performance-benchmark-validator.test.mjs"), root, id, String(value)],
-		{ timeout: 60_000, stdio: "pipe" },
-	);
-	return path.join(root, id);
-}
-
 function strictBundleFiles(root, id, value = 100, source = "c".repeat(40)) {
-	if (source === TRUSTED_REFERENCE_SOURCE) return legacyBundleFiles(root, id, value);
-
 	const results = validResults();
 	for (const result of results) {
 		if (result.kind === "history-mixed") continue;
@@ -2180,7 +2148,12 @@ test("strict bootstrap still requires raw; active archives never fall back to bo
 		reference1: "reference-1",
 		reference2: "reference-2",
 	};
-	assert.equal(runStrictEvaluation(target, active, "local", archive).status, "INCOMPATIBLE");
+	const sameProducers =
+		JSON.stringify(fixtureHashes()) === JSON.stringify(fixtureHashes(TRUSTED_REFERENCE_SOURCE));
+	assert.equal(
+		runStrictEvaluation(target, active, "local", archive).status,
+		sameProducers ? "OK" : "INCOMPATIBLE",
+	);
 	const description = path.join(root, "references.json");
 	fs.writeFileSync(description, JSON.stringify(active));
 	const cliArgs = [
@@ -2196,11 +2169,11 @@ test("strict bootstrap still requires raw; active archives never fall back to bo
 	];
 	const pass = spawnSync(process.execPath, cliArgs, { encoding: "utf8" });
 	assert.equal(pass.status, 0, pass.stderr);
-	assert.match(pass.stdout, /incompatible references/);
+	assert.match(pass.stdout, sameProducers ? /Performance budget: OK/ : /incompatible references/);
 	strictBundleFiles(root, "target", 201);
 	const fail = spawnSync(process.execPath, cliArgs, { encoding: "utf8" });
-	assert.equal(fail.status, 0, fail.stderr);
-	assert.match(fail.stdout, /incompatible references/);
+	assert.equal(fail.status, sameProducers ? 1 : 0, fail.stderr);
+	assert.match(fail.stdout, sameProducers ? /Performance budget: REGRESSION/ : /incompatible references/);
 
 	assert.throws(() => runStrictEvaluation(target, active, "local"), /archive missing/);
 	active.local.sha256 = "a".repeat(64);
@@ -2215,8 +2188,8 @@ test("strict bootstrap still requires raw; active archives never fall back to bo
 test("strict iteration validates frozen raw and envelopes before classifying changed producers", (t) => {
 	const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "strict-iteration-")));
 	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-	const target = legacyBundleFiles(root, "target");
 	const set = { source: TRUSTED_REFERENCE_SOURCE, reference1: "reference-1", reference2: "reference-2" };
+	const target = strictBundleFiles(root, "target", 100, set.source);
 	for (const id of [set.reference1, set.reference2]) strictBundleFiles(root, id, 100, set.source);
 	assert.equal(readFrozenReferences(set, root).length, 2);
 	assert.throws(() => readFrozenReferences({ ...set, source: "a".repeat(40) }, root), /unsupported/);
@@ -2224,7 +2197,7 @@ test("strict iteration validates frozen raw and envelopes before classifying cha
 	const checkout = path.join(root, "checkout");
 	fs.mkdirSync(checkout);
 	execFileSync("git", ["init", "-q", checkout]);
-	assert.throws(() => readFrozenReferences(set, root, checkout), /git fetch --depth=1 origin 00fe129/);
+	assert.throws(() => readFrozenReferences(set, root, checkout), /git fetch --depth=1 origin 7e0ca3e/);
 	execFileSync("git", ["-C", checkout, "fetch", "--depth=1", `file://${repositoryRoot}`, set.source], {
 		stdio: "pipe",
 	});
@@ -2306,9 +2279,13 @@ test("strict iteration validates frozen raw and envelopes before classifying cha
 	const currentComparator = path.join(checkout, "scripts/compare-benchmark-baseline.mjs");
 	fs.writeFileSync(
 		currentComparator,
-		execFileSync("git", ["show", `${set.source}:scripts/compare-benchmark-baseline.mjs`], {
-			cwd: repositoryRoot,
-		}),
+		execFileSync(
+			"git",
+			["show", "00fe129125fcf273f8c27332ec4b115b59779ce8:scripts/compare-benchmark-baseline.mjs"],
+			{
+				cwd: repositoryRoot,
+			},
+		),
 	);
 	const oldBehavior = run();
 	assert.equal(oldBehavior.status, 1);
@@ -2338,10 +2315,10 @@ test("strict iteration validates frozen raw and envelopes before classifying cha
 	const validator = path.join(checkout, "scripts/performance-benchmark-validator.mjs");
 	fs.writeFileSync(
 		validator,
-		fs.readFileSync(validator, "utf8").replace("BENCHMARK_SUITE_VERSION = 5", "BENCHMARK_SUITE_VERSION = 6"),
+		fs.readFileSync(validator, "utf8").replace("BENCHMARK_SUITE_VERSION = 6", "BENCHMARK_SUITE_VERSION = 7"),
 	);
 	rewrite(target, (value, name) => {
-		value = JSON.parse(JSON.stringify(value).replaceAll('"suiteVersion":5', '"suiteVersion":6'));
+		value = JSON.parse(JSON.stringify(value).replaceAll('"suiteVersion":6', '"suiteVersion":7'));
 		if (name === "manifest.json")
 			value.matrix.rootHash = createHash("sha256").update(fs.readFileSync(matrixFile)).digest("hex");
 		return value;
