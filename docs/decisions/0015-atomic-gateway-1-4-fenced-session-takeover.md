@@ -50,7 +50,8 @@ multi-writer, remote, or persisted-control mode.
 
 - **Accept protocol 1.3 with an optional takeover shape**: an old peer could treat a revisioned
   lease status as an unversioned owner view and retain an invalid fence.
-- **Reuse a connection-local counter as CAS**: it misses global lease state and cannot fence peers.
+- **Reuse a connection-local control-intent counter as the CAS revision**: it does not identify the
+  Gateway's global lease state and cannot fence another connection.
 - **Cancel work on takeover**: admission already separates accepted Pi work from later privileged
   requests; cancellation would violate Session continuity and is not required for fencing.
 - **Broadcast one token-bearing status then redact it**: a shared payload can be retained or sent

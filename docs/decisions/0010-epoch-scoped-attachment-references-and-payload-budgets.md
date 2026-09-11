@@ -89,9 +89,11 @@ at every affected boundary.
 
 - Make content-addressed references survive restarts: the digest does not prove that the new process owns
   the bytes or applied the same admission policy.
-- Persist an attachment database: it duplicates Pi content and adds authority outside Pi JSONL.
+- Persist an attachment database: this duplicates Pi-owned Session content and adds migration, deletion,
+  and recovery authority outside Pi JSONL.
 - Raise all downstream limits to match the largest snapshot: this multiplies memory exposure and weakens
   queue and replay backpressure.
-- Lower public inline image limits in this slice: that regresses users before references ship.
+- Lower the existing public inline image limits in this slice: that would create an unrelated user
+  regression before reference transport is available.
 - Treat a missing cache blob as an empty attachment: this silently changes command meaning. The operation
   must fail with a structured admission error or be rebuilt from Pi authority.

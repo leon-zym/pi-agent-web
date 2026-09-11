@@ -84,7 +84,8 @@ Hot-only Sidebar rows disappear with their Runtime unless Pi materialized durabl
 
 ## Rejected alternatives
 
-- Infer hot ownership from REST history: unpersisted Runtimes vanish and dormant files look live.
+- Infer hot ownership from REST history: this misses unpersisted Runtimes and cannot distinguish dormant
+  files from live processes.
 - Recover only the selected Session: background streaming, tools, queues, and Extension UI would be lost
   after reload.
 - Ordinary-subscribe every catalog row: this activates dormant history and violates bounded pool intent.

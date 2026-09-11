@@ -95,13 +95,19 @@ not need the value retain the small reference.
 
 ## Rejected alternatives
 
-- Keep media type as singleton manifest metadata: the first writer would set digest semantics.
-- Include `text` or `json` in identity or a kind hash: duplicate bytes, labeled addresses.
-- Split generic content into chunks: each value needs a second manifest, holds, and rollback.
+- Keep media type as singleton manifest metadata: identical UTF-8 bytes used as text and JSON would conflict
+  in a digest-keyed store, and the first writer could set later consumer semantics.
+- Include `text` or `json` in blob identity or use a domain-separated kind hash: this would duplicate
+  identical bytes and make a semantic label part of a raw-byte content address.
+- Split generic content into attachment-sized chunks: every value would need a second ordered manifest,
+  multiple holds and GETs, reassembly validation, and partial-failure rollback.
 - Raise raw JSONL framing to admit the worst-case escaped form of every generic root: this would multiply
   the parser and buffering boundary for an uncommon representation.
-- Hash canonicalized JSON values: that adds a normalization contract and mismatched digests.
-- Interpret references recursively: JSON meaning drifts and Pi output can forge authority.
-- Advertise before full ownership: a peer could admit an undecodable reference.
+- Hash canonicalized JSON values: canonicalization would add a semantic normalization contract and make the
+  digest differ from the bytes served by the content route unless both forms were retained.
+- Interpret reference-shaped objects recursively: opaque tool and Extension JSON could change meaning, and
+  Pi output could forge Gateway authority.
+- Advertise the capability before Browser and Runtime ownership are complete: a production peer could admit
+  a reference that a downstream boundary cannot decode, retain, replay, or recover.
 - Add a second generic-content database or make references valid across Gateway restarts: either choice
   would create content authority outside Pi JSONL and the current Gateway epoch.

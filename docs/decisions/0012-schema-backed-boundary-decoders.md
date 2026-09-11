@@ -39,4 +39,5 @@ replace malformed-frame, resource, identity, redaction, or installed-runtime che
   contextual or UTF-8 checks.
 - **Accepting candidate bundled versions automatically**: makes an unpromoted fixture review a
   production compatibility claim.
-- **Runtime latest or semver ranges**: Pi RPC has no negotiation to justify an untested range.
+- **Runtime latest or semver ranges**: the legacy Pi RPC protocol has no capability negotiation that
+  could justify an untested range.
