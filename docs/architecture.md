@@ -68,7 +68,10 @@ The normalized event stream is authoritative: each Session event carries a monot
 server epoch and generation, and a command settles once its projection covers the response barrier. On
 reconnect the Browser reconciles channels by exact identity against the published hot-Runtime
 inventory; a proven gap can replay, and uncertain identity or sequence requires a snapshot resync.
-Eviction candidates are subscribed, persisted, non-hot Sessions with no pending Extension requests.
+
+Browser subscription retention uses a soft admission target. Only subscribed, persisted, non-hot
+Sessions without pending Extension requests are eviction candidates, and protected work may exceed the
+target while Gateway admission limits still apply. This policy is not a total Browser heap guarantee.
 
 After authenticated reconnect and its initial inventory, the Browser refreshes the REST Workspace and
 current Session directories once without user activity. Older directory requests cannot overwrite the
@@ -90,26 +93,24 @@ and late completion cannot recreate a channel after cancellation, replacement, r
 
 ## Derived content
 
-Large raster, text, and JSON values can be externalized into an epoch-scoped `EpochContentStore`. The
-store is bounded, discardable, and derived from Pi-owned state, so it is never durable Session
-authority. Missing or invalid content triggers explicit recovery, never an empty substitute.
-References contain the exact server epoch, digest, representation facts, and byte length. Runtime
-generations own holds; HTTP readers own short-lived pins. A Gateway restart invalidates previous
-references, and the store accepts no public upload.
+Large raster, text, and JSON values can be externalized into an epoch-scoped `EpochContentStore` derived
+from Pi-owned state, never durable Session authority. Missing or invalid content triggers explicit
+recovery, never an empty substitute. References contain the exact server epoch, digest, representation
+facts, and byte length. Runtime generations own holds and HTTP readers own short-lived pins. A Gateway
+restart invalidates previous references, and the store accepts no public upload.
 
-Workspace file references are Host-owned prompt ingress. Search exposes bounded metadata and safe
-preview text; capture revalidates the canonical Workspace, resolved target, and file identity around a
-no-follow read, and the owning Session keeps the captured bytes until submission. Risk policy in
-`packages/server/src/workspace-file-references.ts` covers ignore state, hidden or generated paths,
-credential patterns, size, binary data, and images. Uncertainty fails closed, no file index or content
-cache is durable, and the expanded Pi user message remains native JSONL truth.
+Workspace file references are Host-owned prompt ingress: capture revalidates the canonical Workspace,
+resolved target, and file identity around a no-follow read, and the owning Session keeps the captured
+bytes until submission. Risk policy in `packages/server/src/workspace-file-references.ts` requires
+confirmation for risky content. Uncertainty fails closed, no file index or content cache is durable, and
+the expanded Pi user message remains native JSONL truth.
 
 ## Lifecycle and recovery
 
 - Recoverable process crashes restart under the supervisor policy and keep exact generation semantics.
 - Protocol incompatibility, malformed data, uncertain ownership, and overflow fail closed.
 - Manual stop, capacity eviction, replacement, rekey, overflow, deletion, and shutdown cancel work and
-  release owned resources through bounded cleanup fences.
+  release owned resources through cleanup fences.
 - Abandoning a Session stops and forgets memory state and never deletes a file.
 - A non-recoverable crash may retain one sealed projection within aggregate retention budgets.
 
@@ -119,10 +120,9 @@ same-filesystem atomic rename. Direct unlink and copy-and-unlink across filesyst
 
 ## Browser state
 
-The selected Session is only a view pointer. Projection, draft, attachments, submit state, model/thinking
-selection, slash commands, usage, control state, content materialization, and Extension UI are
-partitioned by canonical Session handle, and async completions update the Session identity captured when
-work started, even if another Session is now visible.
+The selected Session is only a view pointer. Projection, control state, content materialization, and
+Extension UI are partitioned by canonical Session handle, and async completions update the Session
+identity captured when work started, even if another Session is now visible.
 
 Components consume stores, not WebSocket frames: frames pass through the transport, ordered Session
 bus, stream pipeline, and reducers. Compatible delta-only updates may coalesce, while structural,

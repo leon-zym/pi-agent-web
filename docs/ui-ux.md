@@ -34,9 +34,8 @@ restart, Session authority recovers without a reload; mutations wait, and the dr
 
 Terminal protocol incompatibility stays terminal.
 
-Subscription pressure and rejection are distinct states. Protected background work may remain
-subscribed above the soft target; retry is offered only for a retryable rejection once transport is
-usable.
+Subscription pressure and rejection are distinct states, and retry is offered only for a retryable
+rejection once transport is usable.
 
 ## Conversation
 

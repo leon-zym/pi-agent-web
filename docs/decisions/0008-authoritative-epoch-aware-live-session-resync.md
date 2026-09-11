@@ -3,9 +3,8 @@
 - Status: Accepted
 - Date: 2026-08-26
 
-This ADR records the epoch and waterline design before chunked history was activated. Issue #8
-completed the bounded history implementation; [Protocol](../protocol.md) and
-[Architecture](../architecture.md) are the current contract for that behavior.
+This ADR records the epoch and waterline design, which predates chunked history. The current contract
+for that behavior is [Protocol](../protocol.md) and [Architecture](../architecture.md).
 
 ## Context
 
