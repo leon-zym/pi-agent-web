@@ -48,13 +48,13 @@ JSONL keeps history self-contained; binary data gets a smaller ceiling and an en
 
 ## Rejected alternatives
 
-- **Let Pi reopen the selected path**: RPC mode expands no CLI `@file`, and split preview/read
+- Let Pi reopen the selected path: RPC mode expands no CLI `@file`, and split preview/read
   cannot close replacement races.
-- **Return content during search**: exposes sensitive or ignored content before confirmation and
+- Return content during search: exposes sensitive or ignored content before confirmation and
   multiplies filesystem work across fuzzy queries.
-- **Persist a Workspace file index or content cache**: creates another authority beside the live
+- Persist a Workspace file index or content cache: creates another authority beside the live
   filesystem and native Pi JSONL.
-- **Silently exclude hidden, ignored, or generated files**: valid projects need those inputs, and an
+- Silently exclude hidden, ignored, or generated files: valid projects need those inputs, and an
   unexplained empty result is worse than a visible decision.
-- **Send general binary files as images or decoded text**: both change semantics; base64 preserves
+- Send general binary files as images or decoded text: both change semantics; base64 preserves
   bytes and makes their context cost visible.

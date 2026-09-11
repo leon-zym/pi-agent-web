@@ -16,12 +16,14 @@ oversized headings, glass effects, excessive cards, floating pills, or aimless a
 
 Use the shared semantic tokens instead of raw palette utilities: `base`, `sidebar`, `surface`, and
 `surface-2` establish depth; `ink`, `ink-2`, and `ink-3` establish text hierarchy; `border` and
-`border-strong` separate regions; `primary`, `success`, `warning`, and `danger` carry action and
-state; paired soft tokens provide restrained backgrounds; `terminal` marks terminal-style content.
+`border-strong` separate without boxing every region; `primary`, `success`, `warning`, and `danger`
+carry action and state; paired soft tokens provide restrained backgrounds; `terminal` marks
+terminal-style content.
 New tokens require a recurring semantic role in both themes; a one-off color is not a token.
 
 Radii and shadows form a short depth scale: small controls take restrained corners, the composer and
-dialogs may take larger ones, and shadows belong to overlays rather than ordinary rows.
+dialogs may take larger ones, and shadows are reserved for overlays, elevated composer states, and
+temporary surfaces rather than ordinary rows.
 
 ## Typography and density
 
@@ -54,7 +56,9 @@ Thinking stays in place as it moves from active to settled, with subtle motion. 
 three levels: a compact active row, a settled group summary, and a detail view for arguments,
 results, and diagnostics. Diffs use a monospace gutter, semantic line status, and clean copy; long
 Markdown, code, and tool content keep a readable fallback stating that rich rendering was reduced.
-The conversation outline stays outside the reading column and collapses when it would cover content.
+The conversation outline is an aid, not a second navigation system. It stays outside the reading
+column when space permits, avoids the composer and details surface, and collapses cleanly when it
+would cover content.
 
 ## Composer
 
@@ -76,8 +80,9 @@ feedback.
 ## Contrast and focus
 
 Text, focus rings, statuses, diffs, and disabled states keep sufficient contrast in both themes, and
-no state relies on color alone. Focus uses the shared visible ring. Zoom, long translated copy,
-large paths, and unbroken model output must not hide critical actions.
+no state relies on color alone. Content order remains meaningful without color, motion, hover, or
+audio. Focus uses the shared visible ring. Zoom, long translated copy, large paths, and unbroken
+model output must not hide critical actions.
 
 ## Visual acceptance matrix
 

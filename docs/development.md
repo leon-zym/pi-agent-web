@@ -16,6 +16,8 @@ pnpm exec playwright install chromium
 Do not commit generated `dist`, `test-results`, Playwright output, credentials, private paths, real Pi
 history, or provider output. `test-results/` holds traces, screenshots, and benchmark artifacts.
 
+Project scripts use operating-system temporary directories for isolated package and runtime fixtures.
+
 Tracked files use LF endings, tab indentation, and a final newline, as `.editorconfig` declares.
 
 ## Root commands
@@ -51,7 +53,7 @@ Repository-specific scripts cover contracts where package tooling does not; keep
 
 | Script | Responsibility |
 | --- | --- |
-| `check-docs.mjs` | Enforce authority-language policy, reject stale document names, and verify local links |
+| `check-docs.mjs` | Enforce authority-language policy, reject stale document names, verify local links, and require every tracked document to register in `docs/README.md` |
 | `check-style.mjs` | Reject a short list of visual anti-patterns that bypass shared design tokens |
 | `check-ui-bundle-budget.mjs` | Enforce gzip ceilings for the entry, settled-Markdown, and CSS assets |
 | `clean-dist.mjs` | Remove one package's `dist` directory before rebuilding it |
@@ -112,8 +114,9 @@ Two gates exist only in CI, so a green local `pnpm verify` does not imply a gree
 The active `protect main` ruleset requires pull requests, an up-to-date branch, and the exact checks
 `Deterministic verification` and `Packaged browser E2E`; it also blocks deletion and non-fast-forward
 updates. The jobs are credential-free, and representative performance remains non-required evidence.
-While the repository has one maintainer, required approvals are zero and no bypass actor is allowed;
-raise the count to one when a second maintainer becomes active.
+Real-Pi acceptance is never required for pull requests or forks. While the repository has one
+maintainer, required approvals are zero and no bypass actor is allowed; raise the count to one when a
+second maintainer becomes active.
 
 ## Packaging
 

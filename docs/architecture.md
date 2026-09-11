@@ -30,16 +30,20 @@ the Browser receives no raw upstream Pi type.
 
 ## Identity and discovery
 
-A canonical JSONL file realpath is the persisted Session identity; the header `id` verifies that file,
-and the canonical header `cwd` is the Workspace identity. A pending Session rekeys to the canonical
-file handle once Pi materializes and freezes the header identity. A fork or clone child stays
-unverified and non-recoverable until its header is materialized, and the active process moves to the
-child identity while the parent stays independently discoverable and reopenable.
+A canonical JSONL file realpath is the persisted Session identity; the header `id` verifies that file
+but is not a global key, and the canonical header `cwd` is the Workspace identity. Encoded directory
+names and saved Workspace preferences are discovery hints only. A new Session begins with a pending
+in-memory handle, and Pi can choose a native file only after the first command. The active Runtime
+rekeys to the canonical file handle once Pi materializes and freezes the header identity. A fork or
+clone child stays unverified and non-recoverable until its header is materialized, and the active
+process moves to the child identity while the parent stays independently discoverable and reopenable.
 
-The Gateway re-verifies path, header, and filesystem identity at sensitive transitions.
-`SessionLayoutResolver` owns Pi's directory precedence, and project and relative directories need a
-known Workspace path. A saved Workspace preference is a hint: removing it never removes native history,
-and re-adding the canonical path restores it.
+The Gateway re-verifies path, header, and filesystem identity at sensitive transitions, and a path or
+inode change is not silently treated as the same Session. `SessionLayoutResolver` owns Pi's directory
+precedence and child-cwd semantics. Absolute default, global, and environment-configured locations are
+discoverable without a saved Workspace, while project and relative directories need a known Workspace
+path. A saved Workspace preference is a hint: removing it never removes native history, and re-adding
+the canonical path restores it.
 
 ## Session runtime ownership
 
@@ -66,6 +70,10 @@ reconnect the Browser reconciles channels by exact identity against the publishe
 inventory; a proven gap can replay, and uncertain identity or sequence requires a snapshot resync.
 Eviction candidates are subscribed, persisted, non-hot Sessions with no pending Extension requests.
 
+After authenticated reconnect and its initial inventory, the Browser refreshes the REST Workspace and
+current Session directories once without user activity. Older directory requests cannot overwrite the
+new recovery result or a newer navigation choice. Transient failures retain cached directory data.
+
 ## History and projections
 
 Verified non-empty persisted JSONL uses native paged history; empty, unmaterialized, and unverified
@@ -73,7 +81,8 @@ Sessions have no durable history, so Pi answers. Active unpersisted suffixes mer
 file and generation evidence. History pages, live events, and snapshots share one product projection
 model: a snapshot initializes a channel or replaces it during explicit recovery, never a competing
 event source. Projection growth is capped per Runtime: one that cannot fit stops publication, enters
-`session_snapshot_overflow`, and keeps recoverable state for a fenced restart.
+`session_snapshot_overflow`, and keeps recoverable state for a fenced restart. The user can claim that
+inactive Runtime without starting Pi and issue an exact fenced restart.
 
 Each Session has at most one owned older-history page operation, keeping its identity, snapshot, and
 cancellation ownership through ordered settlement. Changing the visible Session does not transfer it,
@@ -81,21 +90,26 @@ and late completion cannot recreate a channel after cancellation, replacement, r
 
 ## Derived content
 
-Large raster, text, and JSON values can be externalized into an epoch-scoped `EpochContentStore`,
-never durable Session authority; missing or invalid content triggers explicit recovery, never an empty
-substitute. References carry the server epoch, digest, and byte length; Runtime generations own holds,
-a Gateway restart invalidates previous references, and the store accepts no public upload.
+Large raster, text, and JSON values can be externalized into an epoch-scoped `EpochContentStore`. The
+store is bounded, discardable, and derived from Pi-owned state, so it is never durable Session
+authority. Missing or invalid content triggers explicit recovery, never an empty substitute.
+References contain the exact server epoch, digest, representation facts, and byte length. Runtime
+generations own holds; HTTP readers own short-lived pins. A Gateway restart invalidates previous
+references, and the store accepts no public upload.
 
-Workspace file references are Host-owned prompt ingress: capture revalidates the canonical Workspace,
-resolved target, and file identity around a no-follow read, and the owning Session keeps the captured
-bytes until submission. Risk policy in `packages/server/src/workspace-file-references.ts` keeps
-ignored, hidden, generated, and credential files out; uncertainty fails closed.
+Workspace file references are Host-owned prompt ingress. Search exposes bounded metadata and safe
+preview text; capture revalidates the canonical Workspace, resolved target, and file identity around a
+no-follow read, and the owning Session keeps the captured bytes until submission. Risk policy in
+`packages/server/src/workspace-file-references.ts` covers ignore state, hidden or generated paths,
+credential patterns, size, binary data, and images. Uncertainty fails closed, no file index or content
+cache is durable, and the expanded Pi user message remains native JSONL truth.
 
 ## Lifecycle and recovery
 
 - Recoverable process crashes restart under the supervisor policy and keep exact generation semantics.
 - Protocol incompatibility, malformed data, uncertain ownership, and overflow fail closed.
-- Stop, eviction, rekey, overflow, deletion, and shutdown release resources through cleanup fences.
+- Manual stop, capacity eviction, replacement, rekey, overflow, deletion, and shutdown cancel work and
+  release owned resources through bounded cleanup fences.
 - Abandoning a Session stops and forgets memory state and never deletes a file.
 - A non-recoverable crash may retain one sealed projection within aggregate retention budgets.
 
@@ -105,16 +119,18 @@ same-filesystem atomic rename. Direct unlink and copy-and-unlink across filesyst
 
 ## Browser state
 
-The selected Session is only a view pointer. Projection, draft, attachments, submit state, model
-selection, and Extension UI are partitioned by canonical Session handle, and async completions update
-the Session identity captured when work started.
+The selected Session is only a view pointer. Projection, draft, attachments, submit state, model/thinking
+selection, slash commands, usage, control state, content materialization, and Extension UI are
+partitioned by canonical Session handle, and async completions update the Session identity captured when
+work started, even if another Session is now visible.
 
 Components consume stores, not WebSocket frames: frames pass through the transport, ordered Session
 bus, stream pipeline, and reducers. Compatible delta-only updates may coalesce, while structural,
 settled, error, rekey, recovery, and dialog-close boundaries flush synchronously. Confirmed deletion
 and completed transient abandonment retire the local transport channel, its machine state, pending
-operations, and bus ordering metadata; late completions are fenced by canceled operation ownership,
-and cleanup preserves other Sessions and their drafts.
+operations, and bus ordering metadata; late completions are fenced by canceled operation ownership, and
+cleanup affects only the retired Session and preserves other Sessions and their drafts. Ordinary
+unsubscribe retains the dormant baseline for reuse rather than retiring it terminally.
 
 ## Resource and security boundary
 

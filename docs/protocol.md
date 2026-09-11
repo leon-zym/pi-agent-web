@@ -15,9 +15,9 @@ input and output; standard error is diagnostic and stays out of the product even
 command encoding, response correlation, complete response, event, message, and Extension UI decoding,
 translation into product-owned DTOs, redaction of upstream-only or malformed data, and exact-version
 compatibility evidence. Unknown authoritative frames, malformed nested data, and incompatible behavior
-terminate the Runtime with `protocol_incompatible` instead of restarting it. The read-only and mutation command
-sets live in `packages/protocol/src/index.ts`, and the only ignorable upstream frame types are in
-`packages/server/src/pi-rpc-adapter.ts`.
+terminate the Runtime with `protocol_incompatible` instead of restarting it. The read-only command set lives in
+`packages/protocol/src/index.ts`; every other command is a mutation, and the only ignorable upstream frame types
+are in `packages/server/src/pi-rpc-adapter.ts`.
 
 The normal runtime is the exact Pi dependency installed with the distribution: the Gateway resolves its RPC
 entry from that package rather than the launch directory or an unrelated `pi` on `PATH`, and `--pi-path` and
@@ -39,10 +39,12 @@ proxies through Vite, and production serves the UI and API from one listener.
 
 ## REST surface
 
+All paths below use the `/api/v1` prefix.
+
 | Area | Contract |
 | --- | --- |
 | Bootstrap and health | `GET /bootstrap` issues the local session cookie; `GET /health/live` and `GET /health/ready` report liveness and readiness, and `/health` aliases readiness |
-| Auth | Read provider status and store a provider key in Pi's configured Agent directory |
+| Auth | The Gateway controls provider configuration: read provider status and store a provider key in Pi's configured Agent directory |
 | Workspaces | List, add, remove a discovery hint, activate, search file metadata, capture an exact file reference, list Sessions |
 | Sessions | Create, inspect process state, abandon an untouched transient, request fenced deletion |
 | Content | Authenticated `GET /attachments/:serverEpoch/:sha256` for validated raster content and `GET /content/:serverEpoch/:sha256` for typed UTF-8 content |
@@ -81,10 +83,10 @@ falls back to inline content or an older protocol.
 
 Every Session-scoped message carries the canonical Session handle and the exact identity fields its operation
 needs. The Browser operations are subscribe and unsubscribe; claim, release, and explicit takeover; replay,
-resync, and paged history; command send; Extension UI response; and restart of an inactive Runtime. Read-only
-commands require exact Session identity and no controller lease. Every mutation and Extension UI response
-carries the exact generation and current fencing token, and the server rejects stale generation, stale token,
-ambiguous identity, duplicate command ownership, and payload admission failure before privileged work.
+resync, and paged history; command send; Extension UI response; and restart of a recoverable inactive Runtime.
+Read-only commands require exact Session identity and no controller lease. Every mutation and Extension UI
+response carries the exact generation and current fencing token, and the server rejects stale generation, stale
+token, ambiguous identity, duplicate command ownership, and payload admission failure before privileged work.
 
 A controller lease view is revisioned by `(serverEpoch, canonicalSessionHandle, generation)`, and `lease_status`
 reports the lease revision, control state, and transition provenance; the fencing token appears only in the
@@ -110,8 +112,10 @@ Byte, item, depth, command, replay, snapshot, queue, and content-reference budge
 ceiling. Browser command images use inline base64; Pi-owned raster output may become an `attachment_ref`, and
 allowlisted large text and JSON roots may become `content_ref` wrappers.
 
-A reference is valid only for its exact server epoch and declared budget. A stale or missing reference triggers
-one recovery attempt for the captured Session identity and never becomes empty text, `null`, or an empty image.
+A reference is valid only for its exact server epoch and declared budget. The derived store is bounded and
+discardable; Runtime generations own references before publication, and HTTP readers pin them while streaming.
+A stale or missing reference triggers one recovery attempt for the captured Session identity and never becomes
+empty text, `null`, or an empty image.
 Only closed, field-specific roots of opaque Pi JSON gain reference semantics, and a materialized value reruns the
 original guard before becoming authoritative.
 

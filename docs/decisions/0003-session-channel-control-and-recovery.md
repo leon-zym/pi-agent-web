@@ -3,12 +3,12 @@
 - Status: Partly superseded by ADR 0008 and ADR 0015
 - Date: 2026-08-21
 
-The channel design below is generation-scoped.
+This record describes the original generation-scoped channel design.
 [ADR 0008](0008-authoritative-epoch-aware-live-session-resync.md) supersedes its recovery cursor and
 separate Extension baseline; [ADR 0015](0015-atomic-gateway-1-4-fenced-session-takeover.md) adds
 fenced takeover while the previous controller remains connected. Current epoch, snapshot, lease, and
-takeover semantics live in [Protocol](../protocol.md); the decisions below explain why channels and
-response barriers are Session-scoped.
+takeover semantics live in [Protocol](../protocol.md); the original decisions below explain why
+channels and response barriers are Session-scoped.
 
 ## Context
 

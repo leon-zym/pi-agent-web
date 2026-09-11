@@ -47,8 +47,9 @@ channel. Parallel snapshot recovery adds backpressure; catch-up notifications ne
    Session, and the directory load is fenced to the same online Gateway epoch. Revision changes within that
    epoch apply independently without restarting bootstrap; an epoch or connection change retries the
    boundary. Automatic initial creation waits while a relevant hot identity has unknown persistence, and a
-   matching degraded, manual-only recovery ends that wait without creating a Session. Automatic and explicit
-   creation share one in-flight create operation per Workspace.
+   matching degraded, manual-only recovery ends that wait without creating a Session, while an explicit New
+   Session remains available. Automatic and explicit creation share one in-flight create operation per
+   Workspace.
 8. The Browser treats every inventory entry as a desired background observer, tracked per handle with
    single-flight exact requests and globally serialized baselines, so a stale attempt cannot clear a newer
    desired identity. A matching full-identity degraded Session stays manual-only across reconnects without
@@ -80,7 +81,8 @@ The Browser may hold more than the ordinary subscription target because all auth
 pinned. Exact baselines are serialized, so recovery latency grows with the number and size of hot Sessions,
 while one legal large snapshot cannot multiply outbound pressure.
 
-Hot-only Sidebar rows disappear with their Runtime unless Pi materialized durable JSONL history.
+Hot-only Sidebar rows disappear with their Runtime unless Pi materialized durable JSONL history. No
+new database or recovery log is introduced.
 
 ## Rejected alternatives
 

@@ -66,8 +66,9 @@ Then write the paragraph as if it were reference material:
    into the routing rule, so a change to protocol shape goes to `protocol.md`, a change to
    user-visible behavior goes to `ui-ux.md`, a change to visuals goes to `design.md`, a change to the
    toolchain or a gate goes to `development.md`, a change to measurement semantics goes to
-   `benchmark.md`, and a change to identity, ownership, concurrency, recovery, or limits goes to
-   `architecture.md`.
+   `benchmark.md`, a change to identity, ownership, concurrency, recovery, or limits goes to
+   `architecture.md`, and a change to the threat boundary, supported versions, or private
+   vulnerability reporting goes to `SECURITY.md`.
 2. A tracked document is added, renamed, or deleted: update the table in the same change.
 3. A long-term decision is made: add an ADR and update `docs/decisions/README.md`.
 4. Delivery status changed: update the GitHub Issue.

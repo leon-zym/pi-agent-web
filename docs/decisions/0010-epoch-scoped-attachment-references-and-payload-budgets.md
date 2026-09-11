@@ -87,8 +87,8 @@ at every affected boundary.
 
 ## Rejected alternatives
 
-- Make content-addressed references survive restarts: the digest does not prove that the new process owns
-  the bytes or applied the same admission policy.
+- Make content-addressed references valid across Gateway restarts: the digest does not prove that the new
+  process owns the bytes or applied the same admission policy.
 - Persist an attachment database: this duplicates Pi-owned Session content and adds migration, deletion,
   and recovery authority outside Pi JSONL.
 - Raise all downstream limits to match the largest snapshot: this multiplies memory exposure and weakens

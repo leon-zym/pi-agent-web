@@ -34,7 +34,7 @@ delivery state, `docs/decisions/` carries rationale, `docs/evidence/` carries fr
 - Prefer explicit state machines and pure reducers over generic frameworks, with injected filesystem
   or process seams so tests stay deterministic.
 - The two names are deliberate: `pi-agent-web` is the repository and package namespace, and `pi-web`
-  is the user-facing command.
+  is the user-facing command. Do not perform a repository-wide rename between them.
 - Keep unrelated worktree changes.
 - Match verification depth to risk: architecture, protocol, transport, deletion, and Session-scope
   changes need focused invariants plus an upper-layer integration or Browser regression.

@@ -24,17 +24,18 @@ settled history, and chunking would add a second ordering protocol to every hold
    and the namespace affects lookup and path derivation only.
 3. The protocol uses one base UTF-8 content reference and three Gateway-owned wrappers:
    ```ts
-   interface SessionUtf8ContentRefDto {
+   interface SessionContentRefDto {
        type: "content_ref"; encoding: "utf-8"; serverEpoch: string; sha256: string;
        byteLength: number;
    }
-   interface SessionExternalTextDto { type: "external_text"; ref: SessionUtf8ContentRefDto; }
-   interface SessionInlineJsonDto { type: "inline_json"; value: JsonValue; }
-   interface SessionExternalJsonDto { type: "external_json"; ref: SessionUtf8ContentRefDto; }
+   interface SessionExternalTextDto { type: "external_text"; ref: SessionContentRefDto; }
+   interface SessionInlineJsonDto { type: "inline_json"; value: SessionJsonValueDto; }
+   interface SessionExternalJsonDto { type: "external_json"; ref: SessionContentRefDto; }
    ```
    A text slot takes its inline string or `SessionExternalTextDto`; every JSON root normalizes to
    `SessionInlineJsonDto` or `SessionExternalJsonDto`. No externalizable slot carries a bare JSON root,
    and the containing field reruns its guard after materialization; media type is a typed-slot concern.
+   Content mode came from negotiated authority, never payload-shape inspection.
 4. External JSON identity covers the exact UTF-8 bytes emitted for that slot; canonicalization is never
    applied. Both wrappers pass the same bounded guard, so equal JSON may differ in digest without changing
    product semantics.
@@ -70,26 +71,34 @@ settled history, and chunking would add a second ordering protocol to every hold
     paths: the exact generation owner adopts it immediately, or an identity-transition ledger holds exclusive
     cleanup custody while the target generation is uncertain. The ledger adopts no holds and drains each
     transfer into the confirmed generation owner before the value reaches projection, replay, a snapshot, or
-    a response; `releaseRemaining()` frees what it still owns when drain or transition fails. Responses and
-    compactions are adopted before they resolve or commit, and timeout, abort, late, stale, orphaned,
-    transition-failure, stop, and shutdown paths release holds through the same fences as raster attachments.
+    a response; `releaseRemaining()` frees what it still owns when drain or transition fails. A staged value
+    may remain only in the transition's private bounded buffer while its transfer is under ledger custody.
+    One frame holds each exact physical UTF-8 blob once even when several typed wrappers refer to it. Active
+    events prepare projection and replay changes without mutation, let the exact owner adopt their transfer,
+    then commit projection state, sequence, and publication in that order. A response is adopted before it
+    resolves and exposes its barrier. Compaction is adopted before its compare-and-swap commit; a stale
+    compaction releases its transfer through the bounded discard-cleanup fence. Timeout, abort, late, stale,
+    orphaned, transition-failure, stop, and shutdown paths release holds through the same fences as raster
+    attachments.
 12. Correlated response failures stay local only for evidenced content-blob or shared-cache ceilings and a
     PiProcess-owned caller abort or deadline. Malformed UTF-8 or JSON, forged wrappers, field-guard failure,
-    unsafe store state, rollback failure, uncertain ownership, and externalization failure terminate the
-    Runtime. A missing content GET never yields an empty string, `null`, or empty object.
+    unsafe manifest or path state, rollback failure, uncertain ownership, and externalization failure
+    terminate the Runtime. A missing or stale content GET never yields an empty string, `null`, or empty
+    object.
 13. Browser projection keeps typed references. Tool and message content materializes on demand; an ordered
-    Extension request materializes before its state or sequence barrier commits. Decoding is streaming, and
-    the slot guard reruns after parsing. A 404, 410, decode failure, or guard failure reports one failure
-    for the exact Session and generation and requests a cursorless resync, while stale identity and
-    uncommitted-baseline failures leave the current channel alone.
+    Extension request materializes before its state or sequence barrier commits. The Browser uses bounded
+    streaming UTF-8 decoding, parses JSON only for JSON wrappers, and reruns the slot guard. A 404, 410,
+    decode failure, or guard failure reports one failure for the exact Session and generation and requests
+    a cursorless resync, while stale identity and uncommitted-baseline failures leave the current channel
+    alone.
 
 ## Consequences
 
 Text and JSON share stored bytes without sharing interpretation: the store deduplicates the physical value
 while the DTO field and wrapper keep product semantics explicit. The raster contract stays isolated from
 generic UTF-8 identity, and both forms consume one cache and one ownership system. One generic blob may
-occupy most of the shared cache, so a second large value can fail cache admission while the first stays
-held. That is a bounded-resource result, not a reason to evict held content or split a value after
+occupy three quarters of the shared cache, so a second large value can fail cache admission while the first
+stays held. That is a bounded-resource result, not a reason to evict held content or split a value after
 admission. Materialization moves work from WebSocket parsing to an authenticated GET, and components that do
 not need the value retain the small reference.
 
@@ -98,13 +107,19 @@ not need the value retain the small reference.
 - Keep media type as singleton manifest metadata: identical UTF-8 bytes used as text and JSON would conflict
   in a digest-keyed store, and the first writer could set later consumer semantics.
 - Include `text` or `json` in blob identity or use a domain-separated kind hash: this would duplicate
-  identical bytes and make a semantic label part of a raw-byte content address.
-- Split generic content into attachment-sized chunks: every value would need a second ordered manifest,
-  multiple holds and GETs, reassembly validation, and partial-failure rollback.
-- Raise raw JSONL framing to admit the worst-case escaped form of every generic root: this would multiply
-  the parser and buffering boundary for an uncommon representation.
-- Hash canonicalized JSON values: canonicalization would add a semantic normalization contract and make the
-  digest differ from the bytes served by the content route unless both forms were retained.
+  identical bytes, fragment cache and hold accounting, and make a semantic label part of a raw-byte
+  content address. The `utf8` namespace separates the validated byte representation from raster
+  content without separating text from JSON.
+- Split generic content into 8 MiB chunks: every value would need a second ordered manifest, multiple
+  holds and GETs, reassembly validation, and partial-failure rollback. The existing 48 MiB history
+  ceiling already gives a bounded single-blob limit.
+- Raise raw JSONL framing to roughly 288 MiB so every possible 48 MiB decoded string survives
+  worst-case JSON escaping: this would multiply the parser and buffering boundary for an uncommon
+  representation. The independent 64 MiB frame ceiling keeps memory bounded; values whose escaped
+  representation exceeds it fail framing admission.
+- Hash canonicalized JSON values: canonicalization would add a semantic normalization contract,
+  require another complete transformation of large values, and make the digest differ from the
+  bytes served by the content route unless both forms were retained.
 - Interpret reference-shaped objects recursively: opaque tool and Extension JSON could change meaning, and
   Pi output could forge Gateway authority.
 - Advertise the capability before Browser and Runtime ownership are complete: a production peer could admit

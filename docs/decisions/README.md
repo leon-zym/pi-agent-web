@@ -21,7 +21,9 @@ belongs to tests and Issues, so no ADR carries a verification section.
 `Status` reports the effect of a decision and nothing else; whether the tracking Issue is open does not
 change it. Supersession and amendment links agree in both directions: a record that amends an earlier
 decision names it, and the earlier decision names the amendment. An accepted decision is reversed only by a
-later ADR, never by a handoff note.
+later ADR, never by a handoff note. Within the decision history, follow explicit amendment and supersession
+links. Superseded text remains historical context, including its old versions, rollout steps, and
+verification inventories.
 
 | ADR | Decision | Status | Superseded by |
 | --- | --- | --- | --- |

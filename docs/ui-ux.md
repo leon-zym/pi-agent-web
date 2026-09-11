@@ -20,7 +20,8 @@ available.
 
 ## Connection and control
 
-Connection state is global; subscription, control, recovery, and errors display per Session.
+Connection state is global; subscription, controller ownership, generation, recovery, and errors are
+displayed per Session.
 
 Read-only observers follow a Session without claiming control. When another Browser owns control,
 the UI shows a per-Session view-only state that explains the conflict and offers `Take over` when
@@ -31,13 +32,18 @@ A command reports completion after its result is visible. Disconnect, identity c
 or sequence uncertainty keeps the draft when safe and shows actionable recovery. After Gateway
 restart, Session authority recovers without a reload; mutations wait, and the draft stays available.
 
-Terminal protocol incompatibility stays terminal; only a retryable rejection offers retry.
+Terminal protocol incompatibility stays terminal.
+
+Subscription pressure and rejection are distinct states. Protected background work may remain
+subscribed above the soft target; retry is offered only for a retryable rejection once transport is
+usable.
 
 ## Conversation
 
 Streaming text, thinking, tool calls, and structural events keep their source order.
 
-- Thinking is visible while active and settles into an in-place disclosure with a useful teaser.
+- Thinking is visible while active and settles into an in-place disclosure. A settled disclosure
+  includes a useful teaser and preserves keyboard state.
 - Tool activity groups after settlement without hiding failure, duration, or the active step.
 - Settled Markdown renders GFM, code, tables, and links.
 - Untrusted filenames and labels render as text, never markup.
@@ -85,9 +91,10 @@ same-origin URLs; text and JSON use their typed slot.
 Ordered Extension requests belong to one Session; dialogs, questions, editor text, widgets,
 notifications, and status updates keep that identity across navigation.
 
-Blocking requests stay discoverable, and a minimized request uses a visible dock. An observer sees
-the pending request and its deadline without authority; only the current controller answers or
-cancels it. Question choices, free text, confirmation, cancel, and keyboard focus are accessible.
+Blocking requests stay discoverable, and a minimized request uses a visible dock. An observer still
+sees the pending request and its deadline read-only, with the same Session-scoped takeover action;
+only the current controller can answer or cancel it. Question choices, free text, confirmation,
+cancel, and keyboard focus are accessible.
 Submitting, replacing, aborting, or settling a request closes its obsolete UI synchronously.
 
 ## Responsive behavior

@@ -3,6 +3,10 @@
 - Status: Accepted
 - Date: 2026-08-26
 
+This ADR records the epoch and waterline design before chunked history was activated. Issue #8
+completed the bounded history implementation; [Protocol](../protocol.md) and
+[Architecture](../architecture.md) are the current contract for that behavior.
+
 ## Context
 
 Pi RPC `get_messages` returns the current branch's in-memory message list. While Pi is producing an

@@ -38,6 +38,10 @@ profiling risks Markdown, links, HTML, selection, scrolling, accessibility, and 
   bound; `turn-window.ts` sets the mounted count and page size. The full Product projection stays
   authoritative, every User Turn keeps a TOC tick, and prepend/reveal preserve a stable scroll
   anchor. This is not a second history database or a fixed-height virtualization spacer.
+- The bundle budget must account for the full initial synchronous JavaScript graph if additional
+  eager/static chunks are introduced. Manual splitting or an immediate dynamic App import used only
+  to move bytes out of the checked entry is not a reduction. Truly lazy, non-initial surfaces remain
+  excluded.
 
 ## Consequences
 
@@ -45,7 +49,9 @@ Streaming and multi-Session work becomes responsive without changing the event m
 load drops Markdown parsing, and a live response never reparses its buffer. Oversized settled blocks
 stay complete and selectable without synchronous rich parsing. The older-history window bounds
 mounted turn DOM cost; the TOC keeps one tick per User Turn. Performance claims follow the
-[benchmark page](../benchmark.md).
+[benchmark page](../benchmark.md). Node SSR parsing/highlighting cost is a Browser long-task risk
+signal, not a Chromium mount, layout, or paint measurement. Lazy loading and streaming fallbacks do
+not by themselves prove that settled rendering is fast.
 
 ## Rejected alternatives
 
@@ -54,7 +60,9 @@ mounted turn DOM cost; the TOC keeps one tick per User Turn. Performance claims 
 - Typewriter throttling: changes truth and only hides upstream update pressure.
 - Progressive rich Markdown during streaming: reparsing the accumulated document made live cost
   scale with the complete response and was not needed for the accepted settled semantics.
-- Immediate Markstream replacement: not functionally or visually equivalent and increases payload.
+- Immediate Markstream replacement: the isolated comparison lacked equivalent highlighting and
+  differed in stable-prefix, link, HTML, and virtualization behavior, and adding it increases
+  payload. A faster isolated render therefore did not justify replacing the renderer.
 - Sampled TOC ticks: omitted User Turns lose navigation and violate the outline-rail contract.
 - Fixed-height full-history virtualization: variable-height turns, prepend anchors, expansion,
   selection, and tool inspection need a more complex spacer and measurement system.

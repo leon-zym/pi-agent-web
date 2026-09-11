@@ -46,7 +46,8 @@ package version.
 - Adapter diagnostics contain only stable codes and bounded metadata, never raw payloads,
   credentials, or runtime paths.
 - The Browser and Gateway reject incompatible peers instead of negotiating a compatibility window.
-  Resolver, protocol, and packaged-runtime tests cover runtime validation and terminal frames.
+  [Development](../development.md#verification-layers) owns the verification lanes for runtime
+  validation and terminal frames.
 
 ## Rejected alternatives
 
