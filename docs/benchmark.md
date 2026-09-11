@@ -50,9 +50,11 @@ Artifacts land in `test-results/performance/<tier>/<run-id>/` with a sibling `ma
 `environment.json`. Accepted suite-6 references are registered in
 `tests/e2e/benchmarks/references.json`, and editing `tests/e2e/benchmarks/matrix.json` changes the
 compared workload identity and invalidates them, so a coverage gap is recorded in an Issue instead.
-The checked-in `baselines/reference-linux-x64.json` of 2026-09-06 is `INCOMPATIBLE` with the current
-comparator, and manual calibration uploads expire after 30 days. Archived historical measurements are
-in [benchmark-phase-1-2026-09.md](evidence/benchmark-phase-1-2026-09.md).
+Registering references from a new source commit also requires that commit in the
+`TRUSTED_REFERENCE_SOURCES` allowlist in `scripts/benchmark-frozen-references.mjs`. The checked-in
+`baselines/reference-linux-x64.json` of 2026-09-06 is `INCOMPATIBLE` with the current comparator, and
+manual calibration uploads expire after 30 days. Archived historical measurements are in
+[benchmark-phase-1-2026-09.md](evidence/benchmark-phase-1-2026-09.md).
 
 ## Issue ownership
 
