@@ -48,7 +48,7 @@ Protocol minor 1 and minor 2 were an intermediate staged rollout of these decisi
 6. Production Main constructs one activation from the canonical budget, current `serverEpoch`, and
    initialized `EpochContentStore`, supplying REST storage, the Pi externalization and hold services, and the
    trusted attachment context to the WebSocket bridge, which validates its epoch before advertising the
-   capability.
+   capability. Production Main passes that context only from the complete activation.
 7. The server-private Pi output path externalizes images only from reviewed raw message and entry slots.
    Command and event-specific raw guards run first, and the epoch-aware product guard runs after
    externalization. Tool details, Extension UI, opaque JSON, and nested lookalike objects never gain
@@ -68,8 +68,8 @@ Protocol minor 1 and minor 2 were an intermediate staged rollout of these decisi
     every server frame and snapshot guard. Projection preserves `SessionImageContentDto` references and
     renders them through authenticated same-origin GET URLs without a fetch-to-Blob copy; a load failure
     requests one exact authoritative resync, while stale DOM failures are ignored until the new baseline
-    commits. Structured admission errors use localized copy, a failed submit keeps its draft and images, and
-    command images stay inline-only ingress.
+    commits. Structured admission errors use localized copy, a failed submit keeps its draft and images
+    until a later success, and command images stay inline-only ingress.
 
 ## Consequences
 

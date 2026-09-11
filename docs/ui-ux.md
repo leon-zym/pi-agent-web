@@ -44,12 +44,13 @@ Streaming text, thinking, tool calls, and structural events keep their source or
 - Thinking is visible while active and settles into an in-place disclosure. A settled disclosure
   includes a useful teaser and preserves keyboard state.
 - Tool activity groups after settlement without hiding failure, duration, or the active step.
-- Settled Markdown renders GFM, code, tables, and links.
+- Settled Markdown supports GFM, code, tables, and safe links within bounded rendering fallbacks.
 - Untrusted filenames and labels render as text, never markup.
 - Windowing preserves reading position, selection, focus, and nearby context.
 
 Coalescing never crosses a structural, settled, error, rekey, or dialog-close boundary. The details
-surface holds inspection, conversation tree, and diagnostics; closing restores position and focus.
+surface holds inspection, conversation tree, and diagnostics; closing it preserves conversation
+position and returns focus to the invoking control.
 
 ## Composer
 
@@ -106,7 +107,8 @@ Submitting, replacing, aborting, or settling a request closes its obsolete UI sy
 ## Accessibility and feedback
 
 - Every control is keyboard reachable and shows `:focus-visible` and an accessible name.
-- Dialogs trap focus, expose a name and description, and restore focus on close.
+- Dialogs trap focus and expose a name and description. Overlays restore focus to the control that
+  opened them when closed.
 - Dynamic status uses restrained live regions without announcing every streamed token.
 - Audio and tab-title feedback stay user-controlled, synchronized across tabs, and supplemental.
 

@@ -49,7 +49,7 @@ A dependency whose install runs a build script needs an entry in the `pnpm-works
 
 ## Repository scripts
 
-Repository-specific scripts cover contracts where package tooling does not; keep them narrow:
+Repository-specific scripts cover contracts where package tooling does not:
 
 | Script | Responsibility |
 | --- | --- |
@@ -60,6 +60,9 @@ Repository-specific scripts cover contracts where package tooling does not; keep
 | `pack-smoke.mjs` | Pack, inspect, install, launch, authenticate, and probe the local distribution |
 | `run-performance-benchmarks.mjs` | Build and run one benchmark tier, then write reproducible artifacts |
 | `performance-benchmark-validator.mjs` | Recompute benchmark summaries and reject incomplete or inconsistent evidence |
+
+Keep these scripts narrow. Do not move ordinary lint, test, or build behavior into another custom
+runner.
 
 ## Verification layers
 
@@ -95,10 +98,11 @@ report states whether the lane ran and why it was skipped.
 The main CI workflow has three independent jobs: deterministic `verify` with authenticated smoke and
 package smoke; packaged Browser E2E with failure traces; and the representative performance matrix
 with artifacts, whose [measurement semantics](benchmark.md) live in their own contract. Pi
-compatibility uses a separate exact-version workflow triggered by changes under
-`packages/protocol/**`, the Pi RPC adapter, host adapter, resolver, or their fixtures, and by
-`package.json` or `pnpm-lock.yaml`. The stress matrix runs only through manual dispatch, and real-Pi
-acceptance is never an implicit CI dependency.
+compatibility uses a separate exact-version workflow whose `paths` list in
+`.github/workflows/pi-compatibility.yml` is the authority; it fires on changes under
+`packages/protocol/**`, the Pi RPC adapter, host adapter, resolver, their fixtures and tests, or
+`package.json`, `packages/server/package.json`, or `pnpm-lock.yaml`. The stress matrix runs only
+through manual dispatch, and real-Pi acceptance is never an implicit CI dependency.
 
 Two gates exist only in CI, so a green local `pnpm verify` does not imply a green CI run:
 
@@ -122,13 +126,14 @@ second maintainer becomes active.
 
 `pnpm test:pack` creates local tarballs in a temporary directory, checks package contents and
 dependency edges, installs them, verifies the CLI help path, and launches the installed single-port
-workbench. Each package exposes only its entry point, so cross-package imports use the package name
+workbench. A tarball carries `dist` and `LICENSE` only, so cross-package imports use the package name
 rather than a path into `src`.
 
-A tarball carries `dist` and `LICENSE` only. `release-stage.mjs` rejects a source file, uncompiled
-TypeScript, a `workspace:` protocol leak, or a package version that differs from the root, so all four
-packages release in lockstep on one version. The packages are not published to npm, so passing package
-smoke proves local distribution integrity alone.
+`release-stage.mjs` rejects a source file, uncompiled TypeScript, a `workspace:` protocol leak, or a
+package version that differs from the root, so all four packages release in lockstep on one version.
+Only `protocol` and `server` declare an `exports` map, and neither `ui` nor `cli` may add one without
+also updating the CLI, which resolves `@pi-agent-web/ui/package.json` by subpath. The packages are not
+published to npm, so passing package smoke proves local distribution integrity alone.
 
 ## Release gate
 

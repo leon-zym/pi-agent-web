@@ -37,7 +37,7 @@ channel. Parallel snapshot recovery adds backpressure; catch-up notifications ne
 5. Exact catch-up is transactional. Success installs the authoritative runtime baseline, replay or snapshot,
    fresh lease snapshot, and contiguous buffered suffix before becoming live; failure preserves an existing
    live subscription, catch-up, and lease. A duplicate exact request for an identity already live on that
-   connection is a no-op. Each connection has a bounded exact operation admission limit.
+   connection is a silent no-op. Each connection has a bounded exact operation admission limit.
 6. Inventory publication is fenced when a catch-up contains a pending identity migration. A connection
    retains only the newest deferred full replacement. A successful child transition publishes rekey before
    the canonical child inventory and staged child frames. If staged commit fails after identity commit,
@@ -56,7 +56,7 @@ channel. Parallel snapshot recovery adds backpressure; catch-up notifications ne
    blocking other hot Sessions, while a changed identity is eligible for normal recovery.
 9. Every authoritative hot channel is pinned above the ordinary subscription LRU target. The selected
    Session claims controller capability only after an authoritative baseline and a fresh matching lease
-   snapshot, and background hot Sessions stay observers.
+   snapshot. Background hot Sessions remain observers and continue projection.
 10. The Session directory merges durable catalog rows and the full-replacement hot overlay by handle, so
     unpersisted hot Sessions appear without duplicating persisted rows. Loaded Workspace counts use the merged
     rows; unloaded counts keep the known durable total and add only entries known to be unpersisted. A catalog
@@ -94,8 +94,8 @@ new database or recovery log is introduced.
 - Fall back to activation on mismatch: a stale inventory could start or attach to the wrong Runtime
   incarnation.
 - Publish inventory deltas: a lost update or late listener could leave an incomplete desired set.
-- Recover exact snapshots in parallel without admission: legal oversized snapshots could exhaust
-  per-connection buffering.
+- Recover exact snapshots in parallel without admission: several legal oversized snapshots could
+  exhaust per-connection buffering.
 - Persist the hot inventory: this would create a second Session ownership database beside Pi JSONL.
 - Let recovered hot-only rows use transient abandon: the Browser does not own their creation provenance and
   cannot prove they are safe to forget.

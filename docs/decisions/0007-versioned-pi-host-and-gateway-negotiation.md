@@ -8,11 +8,11 @@ Browser/Gateway contract lives in [Protocol](../protocol.md).
 
 ## Context
 
-The distribution pins a Pi package version, but the Gateway preferred any `pi` on `PATH`, never
-probed its version, and forwarded upstream TypeScript unions into the Browser protocol. A changed
-nested response could fail inside UI projection; an unknown event could put a persisted Session into
-a restart loop. Resolution failure hid behind a speculative `pi --mode rpc` fallback and an
-always-healthy endpoint. Pi RPC advertises no version or capability discovery, and Browser and
+The distribution pins a Pi package version, but the Gateway previously preferred any `pi` on `PATH`,
+never probed its version, and forwarded upstream TypeScript unions into the Browser protocol. A
+changed nested response could fail inside UI projection; an unknown event could put a persisted
+Session into a restart loop. Resolution failure hid behind a speculative `pi --mode rpc` fallback and
+an always-healthy endpoint. Pi RPC advertises no version or capability discovery, and Browser and
 Gateway builds update independently, so WebSocket compatibility cannot follow from the application
 package version.
 
@@ -56,4 +56,5 @@ package version.
 - **Semver-range acceptance without fixtures**: a range would claim untested compatibility.
 - **Shallow envelope validation**: defers failures into Session projections and cannot distinguish
   malformed authoritative data from safe side channels.
-- **Optimistic hello fallback**: peers exchange frames before compatibility, risking reconnects.
+- **Optimistic hello fallback**: permits independently updated clients to exchange Session frames
+  before compatibility is known and can create reconnect storms.
