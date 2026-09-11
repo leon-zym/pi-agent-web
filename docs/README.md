@@ -10,7 +10,7 @@ other page.
 | --- | --- | --- |
 | [README.md](../README.md) | Project purpose, feature list, product boundary summary, screenshots, shortest install and development path, contribution entry, repository map, documentation navigation, license | Architecture, protocol, or verification detail; the release gate |
 | [README.zh-CN.md](../README.zh-CN.md) | The Chinese projection of `README.md` | Facts that `README.md` does not state |
-| [AGENTS.md](../AGENTS.md) | Documentation entry point, the change-to-document matrix, rules that change agent edits, toolchain requirements, delivery gates | Architecture, protocol, or product detail; command reference |
+| [AGENTS.md](../AGENTS.md) | Repository invariants that constrain edits, toolchain conventions, delivery gates, the documentation entry point | Architecture, protocol, or product detail; the document-to-fact map, which lives here |
 | [SECURITY.md](../SECURITY.md) | Supported versions, private vulnerability reporting, the threat boundary | Local access-control mechanics, runtime authentication steps |
 | [docs/architecture.md](architecture.md) | Identity, state ownership, concurrency, recovery, resource boundaries | Wire-level protocol shape, visual rules, verification commands |
 | [docs/protocol.md](protocol.md) | Pi RPC boundary, runtime resolution, REST surface, WebSocket negotiation, publication and failure semantics | Numeric budgets, ownership rules, user-visible behavior |
@@ -62,7 +62,12 @@ Then write the paragraph as if it were reference material:
 
 ## Change path
 
-1. A fact changed: find its owner in the table, then update that document.
+1. A fact changed: find its owner in the table, then update that document. The `Owns` column inverts
+   into the routing rule, so a change to protocol shape goes to `protocol.md`, a change to
+   user-visible behavior goes to `ui-ux.md`, a change to visuals goes to `design.md`, a change to the
+   toolchain or a gate goes to `development.md`, a change to measurement semantics goes to
+   `benchmark.md`, and a change to identity, ownership, concurrency, recovery, or limits goes to
+   `architecture.md`.
 2. A tracked document is added, renamed, or deleted: update the table in the same change.
 3. A long-term decision is made: add an ADR and update `docs/decisions/README.md`.
 4. Delivery status changed: update the GitHub Issue.
