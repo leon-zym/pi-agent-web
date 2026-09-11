@@ -2,27 +2,15 @@
 
 English | [Chinese](README.zh-CN.md)
 
-Pi Agent Web is a local web workbench for Pi Coding Agent's RPC mode. It opens Pi's native JSONL
-Sessions, keeps active Sessions independent, and lets background work continue while the Browser
-moves between conversations.
+A local web workbench for [Pi Coding Agent](https://github.com/earendil-works/pi)'s RPC mode. It opens
+Pi's native JSONL Sessions in the browser, keeps active Sessions independent, and lets background
+work continue while you move between conversations.
 
-Pi JSONL is the durable source of truth. Pi Agent Web does not copy Workspace or Session history
-into another database.
+Pi JSONL stays the single durable source of truth. Pi Agent Web does not copy Workspace or Session
+history into a second database.
 
-> Pi Agent Web is a development preview. Interfaces can change and defects can interrupt work.
-> Keep important work under version control and retain normal backups.
-
-## Product boundary
-
-The Gateway is a single-user, same-origin control surface that listens only on loopback addresses.
-It is not a hosted service, a LAN server, or a multi-user collaboration system. Do not expose
-`pi-web` through a public reverse proxy.
-[SECURITY.md](SECURITY.md#security-boundary) owns the threat boundary and the reporting process.
-
-Provider credentials, extensions, settings, and Session history remain in the user's Pi
-installation. Development and CI use credential-free deterministic fixtures.
-
-## Preview
+> Pi Agent Web is a development preview. Interfaces can change and defects can interrupt work. Keep
+> important work under version control and retain normal backups.
 
 <table>
 <tr>
@@ -35,12 +23,34 @@ installation. Development and CI use credential-free deterministic fixtures.
 </tr>
 </table>
 
-The screenshots use deterministic fixtures and contain no provider credentials, private paths, or
-user Session history.
+Screenshots use deterministic fixtures, with no provider credentials, private paths, or user Session
+history.
+
+## Features
+
+- Discover Pi's native Sessions and Workspaces, with no second history store.
+- Run one supervised Pi process per active Session, so switching views never stops background work.
+- Stream replies, reasoning, tool activity, Markdown, images, slash commands, and Extension UI.
+- Keep drafts, attachments, control, model choice, and recovery scoped to each Session.
+- Delete a Session into recoverable trash behind exact identity and control checks.
+- Attach Workspace files after a preview of size, kind, and risk, then capture them for the prompt.
+- Follow the conversation with a light and dark theme, keyboard operation, `zh-CN` and `en` copy,
+  and responsive layouts.
+
+## Product boundary
+
+The Gateway is a single-user, same-origin control surface that listens only on loopback addresses.
+Run it on your own machine, and do not expose `pi-web` through a public reverse proxy.
+[SECURITY.md](SECURITY.md#security-boundary) owns the threat boundary and the reporting process.
+
+Provider credentials, extensions, settings, and Session history stay in your Pi installation.
+Development and CI use credential-free deterministic fixtures.
 
 ## Quick start
 
-### Release installation
+Requirements: Node.js 22 or later, pnpm 11.21.0, and a compatible Pi Coding Agent runtime.
+
+### Run a release build
 
 1. Download the archive and its checksum from
    [GitHub Releases](https://github.com/leon-zym/pi-agent-web/releases).
@@ -58,9 +68,7 @@ user Session history.
    npx pi-web
    ```
 
-### Development setup
-
-Requirements: Node.js 22 or later, pnpm 11.21.0, and a compatible Pi Coding Agent runtime.
+### Work on the source
 
 ```bash
 pnpm install --frozen-lockfile
@@ -68,30 +76,33 @@ pnpm dev
 ```
 
 Development mode starts the Gateway on port 3000 and Vite on port 5173. Open the loopback URL that
-Vite prints.
+Vite prints. `pnpm build` then `pnpm start` runs the built single-port workbench, and
+`pnpm start -- --pi-path /path/to/rpc-entry.js --port 3100 --no-open` forwards CLI arguments.
 
 The names have different scopes: `pi-agent-web` is the repository and package namespace, and
 `pi-web` is the user-facing command.
 
-## Distribution status
+## Contributing
 
-The four `@pi-agent-web/*` packages are not published to npm. Clone the repository and use the
-commands above. `pnpm test:pack` verifies local tarballs without implying a registry release.
+Issues and pull requests are welcome. Read [AGENTS.md](AGENTS.md) before changing code or
+documentation, and [docs/development.md](docs/development.md) for the toolchain, the verification
+layers, and the release gate.
 
-The source is available under the [MIT License](LICENSE).
-
-## Repository map
-
-```text
-packages/protocol  Browser-safe DTOs, guards, policy, and budgets
-packages/server    Local Gateway, native discovery, and Session supervision
-packages/ui        React workbench and Session-scoped Browser state
-packages/cli       pi-web launcher and shutdown
-docs/              Current contracts, architecture decisions, and archived evidence
+```bash
+pnpm verify        # lint, types, deterministic tests, and production build
+pnpm test:smoke    # authenticated REST and WebSocket smoke test
+pnpm test:browser  # packaged deterministic Browser suite
 ```
+
+Keep a change focused, add a regression where a real failure is plausible, and update the document
+that owns each affected fact.
 
 ## Documentation
 
 [docs/README.md](docs/README.md) maps the current contracts, the architecture decisions, and the
 archived evidence. [GitHub Issues](https://github.com/leon-zym/pi-agent-web/issues) tracks the
 backlog and delivery status.
+
+## License
+
+[MIT](LICENSE)

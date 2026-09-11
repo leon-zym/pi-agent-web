@@ -8,9 +8,9 @@ other page.
 
 | Document | Owns | Does not own |
 | --- | --- | --- |
-| [README.md](../README.md) | Project purpose, product boundary summary, screenshots, shortest install and development path, repository map, documentation navigation | Architecture, protocol, or verification detail |
+| [README.md](../README.md) | Project purpose, feature list, product boundary summary, screenshots, shortest install and development path, contribution entry, repository map, documentation navigation, license | Architecture, protocol, or verification detail; the release gate |
 | [README.zh-CN.md](../README.zh-CN.md) | The Chinese projection of `README.md` | Facts that `README.md` does not state |
-| [AGENTS.md](../AGENTS.md) | Rules that change agent edits, toolchain requirements, the change-to-document matrix, delivery gates | Architecture, protocol, or product detail; command reference |
+| [AGENTS.md](../AGENTS.md) | Documentation entry point, the change-to-document matrix, rules that change agent edits, toolchain requirements, delivery gates | Architecture, protocol, or product detail; command reference |
 | [SECURITY.md](../SECURITY.md) | Supported versions, private vulnerability reporting, the threat boundary | Local access-control mechanics, runtime authentication steps |
 | [docs/architecture.md](architecture.md) | Identity, state ownership, concurrency, recovery, resource boundaries | Wire-level protocol shape, visual rules, verification commands |
 | [docs/protocol.md](protocol.md) | Pi RPC boundary, runtime resolution, REST surface, WebSocket negotiation, publication and failure semantics | Numeric budgets, ownership rules, user-visible behavior |
