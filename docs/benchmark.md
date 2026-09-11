@@ -4,14 +4,14 @@
 
 A run is evidence only when every trial and artifact is complete: canonical counts, indices, and
 warmup flags, finite metrics, and recorded correctness outcomes. Structural and declared-artifact-shape
-checks are hard gates, and every trial holds the 64 mounted-turn bound. Streaming observations need
+checks are hard gates, every trial holds the 64 mounted-turn bound, and streaming observations need
 positive mounted-turn, streaming-DOM-batch, and fixture-delta counts, warmups included. Failed
 artifacts are retained, never selected away.
 
 Streaming metrics count DOM mutation callback batches and rAF callbacks, so they observe no paint,
 React commit, or store publication. The two automation-start timings begin before the Playwright fill
-and click dispatch and include fixture pacing and transport work. Timing and resource comparisons are
-diagnostic unless a compatible reference backs them; correctness and structural metrics are the gate.
+and click dispatch and include fixture pacing and transport work. Timing and resource comparisons stay
+diagnostic unless a compatible reference backs them.
 
 ## Comparison
 
@@ -36,8 +36,8 @@ inapplicable; an unknown Linux quota is incompatible.
 ## Diagnostic policy
 
 Against the reference median, a higher-is-better metric takes the lower bound median / 1.5, and a
-lower-is-better metric takes the upper bound median + abs(median) * 0.5 plus a unit floor of 50 ms,
-5 MiB, or zero for ratios and counts.
+lower-is-better metric takes the upper bound median + abs(median) * 0.5 plus a floor of 50 ms, 5 MiB,
+or zero for ratios and counts.
 
 ## Running
 
@@ -48,10 +48,11 @@ lower-is-better metric takes the upper bound median + abs(median) * 0.5 plus a u
 
 Artifacts land in `test-results/performance/<tier>/<run-id>/` with a sibling `manifest.json` and
 `environment.json`. Accepted suite-6 references are registered in
-`tests/e2e/benchmarks/references.json`, the checked-in `baselines/reference-linux-x64.json` of
-2026-09-06 is `INCOMPATIBLE` with the current comparator, and manual calibration uploads expire after
-30 days. Archived historical measurements are in
-[benchmark-phase-1-2026-09.md](evidence/benchmark-phase-1-2026-09.md).
+`tests/e2e/benchmarks/references.json`, and editing `tests/e2e/benchmarks/matrix.json` changes the
+compared workload identity and invalidates them, so a coverage gap is recorded in an Issue instead.
+The checked-in `baselines/reference-linux-x64.json` of 2026-09-06 is `INCOMPATIBLE` with the current
+comparator, and manual calibration uploads expire after 30 days. Archived historical measurements are
+in [benchmark-phase-1-2026-09.md](evidence/benchmark-phase-1-2026-09.md).
 
 ## Issue ownership
 

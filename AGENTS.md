@@ -2,13 +2,13 @@
 
 A local web workbench for Pi Coding Agent. Start with [docs/README.md](docs/README.md): its ownership
 map names the document that owns each fact, which also routes a change to the right place. Tracked
-documentation is English except `README.zh-CN.md`. Issues carry the backlog and delivery state,
-`docs/decisions/` carries rationale, and `docs/evidence/` carries frozen evidence.
+documentation and code comments are English except `README.zh-CN.md`. Issues carry the backlog and
+delivery state, `docs/decisions/` carries rationale, `docs/evidence/` carries frozen evidence.
 
 ## Invariants
 
-- Pi JSONL is the only durable Session truth. Workspace preferences stay discovery and presentation
-  hints, and no second history or ownership database appears beside it.
+- Every durable Session fact lives in Pi JSONL. Workspace preferences stay discovery and presentation
+  hints, and Pi's own directory environment keeps deciding where configuration and Sessions live.
 - A Session's canonical file identity owns its process, control, ordering, recovery, and Browser
   state. Navigation changes only the visible view, so background work continues.
 - A mutation carries the exact generation and current fence, and event projection reaches the
@@ -18,19 +18,23 @@ documentation is English except `README.zh-CN.md`. Issues carry the backlog and 
   transient Session leaves its file on disk.
 - Deletion moves the file into recoverable trash by same-filesystem rename, after exact control, an
   identity reservation, and header, path, and inode verification.
-- The protocol package stays Browser-safe and independent of upstream Pi types, and the UI consumes
+- Only the CLI package composes the server and UI; every other package depends on the protocol
+  package alone, which stays Browser-safe and free of Node and upstream Pi imports. The UI consumes
   ordered Session stores rather than WebSocket frames.
-- The Gateway listens on loopback with same-origin authentication. Treat paths, Pi and Extension
-  output, filenames, and Browser frames as untrusted, and keep credentials, private paths, real
-  history, provider output, and recoverable-trash content out of commits.
+- The Gateway listens on loopback with same-origin authentication. Validate untrusted values at their
+  first boundary: paths, Pi and Extension output, filenames, and Browser frames. Keep credentials,
+  private paths, real history, provider output, and recoverable-trash content out of commits.
 - User-visible copy goes through `packages/ui/src/lib/i18n` with matching `zh-CN` and `en` keys.
   Apply the Design contract's visible focus, reduced-motion, semantic-color, and critical-action
   rules.
 
 ## Conventions
 
-- Tabs, Biome, and Conventional Commits in reviewable stages.
-- Pure reducers and injected filesystem or process seams, so tests stay deterministic.
+- Biome is the only formatter and linter. Commits use Conventional Commits in reviewable stages.
+- Prefer explicit state machines and pure reducers over generic frameworks, with injected filesystem
+  or process seams so tests stay deterministic.
+- The two names are deliberate: `pi-agent-web` is the repository and package namespace, and `pi-web`
+  is the user-facing command.
 - Keep unrelated worktree changes.
 - Match verification depth to risk: architecture, protocol, transport, deletion, and Session-scope
   changes need focused invariants plus an upper-layer integration or Browser regression.
