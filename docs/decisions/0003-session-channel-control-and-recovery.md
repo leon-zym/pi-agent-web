@@ -1,14 +1,14 @@
 # ADR 0003: Multiplex isolated Session channels
 
-- Status: Accepted; recovery and control wording amended by later decisions
+- Status: Partly superseded by ADR 0008 and ADR 0015
 - Date: 2026-08-21
 
 This record describes the original generation-scoped channel design.
 [ADR 0008](0008-authoritative-epoch-aware-live-session-resync.md) supersedes its recovery cursor and
-separate Extension baseline; [ADR 0015](0015-atomic-gateway-1-4-fenced-session-takeover.md) adds explicit
-fenced takeover while the previous controller remains connected. Read [Protocol](../protocol.md)
-for current epoch, snapshot, lease, and takeover semantics. The original decisions below explain
-why channels and response barriers are Session-scoped.
+separate Extension baseline; [ADR 0015](0015-atomic-gateway-1-4-fenced-session-takeover.md) adds
+fenced takeover while the previous controller remains connected. Current epoch, snapshot, lease, and
+takeover semantics live in [Protocol](../protocol.md); the original decisions below explain why
+channels and response barriers are Session-scoped.
 
 ## Context
 
@@ -48,9 +48,3 @@ byte limits.
 - One Workspace lease: blocks unrelated Sessions and gives the wrong ownership boundary.
 - Relying on response/event arrival order: Pi does not provide that causal guarantee.
 - Silent cursor repair or last-writer-wins snapshots: can lose or reorder conversation state.
-
-## Verification
-
-`session-ws-bridge.test.ts` covers multiplexing, lease fencing, catch-up ordering, replay gaps,
-rekey, dialog lifecycle, connection races, and bounded slow clients. `session-transport.test.ts`
-covers per-Session projection barriers, reconnect intent, resync, aliases, and buffer ceilings.

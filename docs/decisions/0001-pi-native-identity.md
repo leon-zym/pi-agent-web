@@ -19,10 +19,10 @@ and the encoded default directory name is only a storage convention.
 - A Workspace is projected from the canonical real path of Header `cwd`. A `workspaceHandle` is an
   opaque route identifier for that path.
 - `WorkspacePreferences` stores only discovery and presentation hints such as path, pinning,
-	display name, and last-opened time. It never replaces, rewrites, or deletes Pi history. Absolute
-	default/global/environment directories remain independently discoverable; project-only settings
-	and any Agent/Session directory interpreted relative to the child cwd require a known Workspace
-	path and are re-discovered when that path is added again.
+  display name, and last-opened time. It never replaces, rewrites, or deletes Pi history. Absolute
+  default/global/environment directories remain independently discoverable; project-only settings
+  and any Agent/Session directory interpreted relative to the child cwd require a known Workspace
+  path and are re-discovered when that path is added again.
 - A newly created Session may use a temporary handle before Pi exposes its file. The gateway emits
   `session_rekeyed` once the canonical file identity is known.
 - Default, environment, global-settings, and project-settings Session layouts are resolved with
@@ -39,9 +39,3 @@ Workspace remains visible as unavailable when a preference or native history sti
 - A Web-owned Workspace/Session database: duplicates durable truth and can drift from Pi.
 - Header UUID as the Session key: does not bind the key to a particular JSONL file.
 - Encoded directory name as Workspace identity: collisions and custom layouts make it unreliable.
-
-## Verification
-
-`session-layout-resolver.test.ts`, `native-session-catalog.test.ts`,
-`workspace-preferences.test.ts`, and `native-routes.test.ts` cover layout precedence, canonical
-identity, preference-only Workspaces, corrupt data, and native projections.

@@ -1,3 +1,5 @@
+Archived historical evidence. This file is frozen, non-authoritative, and not a current measurement or compatibility contract; [benchmark.md](../benchmark.md) owns current measurement semantics.
+
 # Performance Benchmark Report: Historical Phase 1 Observations
 
 ## Overview
