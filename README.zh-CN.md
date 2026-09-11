@@ -2,13 +2,10 @@
 
 [English](README.md) | 简体中文
 
-[Pi Coding Agent](https://github.com/earendil-works/pi) RPC 模式的本地 Web 工作台。它在浏览器中打开
-Pi 原生 JSONL 会话，让各活跃会话独立运行。切换对话时，后台任务继续执行。
+[Pi Coding Agent](https://github.com/earendil-works/pi) 的浏览器界面。
 
-Pi JSONL 始终是持久化数据的唯一事实来源。Pi Agent Web 不会把工作区或会话历史复制到另一个数据库。
-
-> Pi Agent Web 目前处于开发预览阶段。接口可能变化，缺陷可能中断工作。请把重要工作纳入版本控制，
-> 并按日常方式保留备份。
+Pi Agent Web 运行在你自己的电脑上，用网页呈现 Pi 的对话。你可以同时进行多个对话：先启动一个耗时
+任务，切到另一个对话，等回来时第一个仍在继续。
 
 <table>
 <tr>
@@ -21,77 +18,80 @@ Pi JSONL 始终是持久化数据的唯一事实来源。Pi Agent Web 不会把�
 </tr>
 </table>
 
-截图使用确定性测试夹具，不包含提供商凭据、私有路径或用户会话历史。
+> Pi Agent Web 目前处于开发预览阶段。功能可能变化，缺陷可能中断工作。请把重要工作纳入版本控制，
+> 并按日常方式保留备份。
 
-## 功能
+## 能做什么
 
-- 发现 Pi 原生会话和工作区，不建立第二套历史存储。
-- 每个活跃会话由一个受监督的 Pi 进程负责，切换视图不会停止后台任务。
-- 流式输出回复、思考、工具活动、Markdown、图片、斜杠命令和扩展界面。
-- 草稿、附件、控制权、模型选择和恢复流程按会话隔离。
-- 会话删除进入可恢复回收站，需通过身份与控制权校验。
-- 附加工作区文件前预览大小、类型和风险，确认后再纳入提示词。
-- 支持浅色与深色主题、键盘操作、`zh-CN` 与 `en` 文案以及响应式布局。
+- **同时进行多个对话。** 每个对话有独立的 Pi 进程，来回切换不会中断后台正在进行的工作。
+- **实时查看回复。** 回复、思考过程和工具调用都会流式显示在页面上。
+- **阅读丰富内容。** 支持 Markdown、代码高亮、diff、表格和图片。
+- **使用斜杠命令和技能。** 每个对话可单独选择模型和思考等级。
+- **附加项目文件。** 发送前先看到文件的大小、类型和风险。
+- **回答 Pi 的提问。** 问题、确认请求和编辑器显示在页面中，切换对话后依然可达。
+- **长对话依然好用。** 历史记录随滚动分段加载，可用大纲快速跳转。
+- **找回误删的对话。** 删除只是移入可从回收站恢复的位置，不会彻底清除。
+- **适应你的习惯。** 浅色与深色主题、完整键盘操作、中英文界面，手机上也同样可用。
 
-## 产品边界
+Pi Agent Web 直接使用你 Pi 安装中已有的对话和设置，不导入数据，也不在别处另存一份历史记录。
 
-网关是单用户、同源的控制界面，只监听回环地址。请在本机运行，勿通过公共反向代理暴露
-`pi-web`。[SECURITY.md](SECURITY.md#security-boundary) 是威胁边界与报告流程的归属文档。
+## 环境要求
 
-提供商凭据、扩展、设置和会话历史保存在你的 Pi 安装中。开发环境和 CI 使用不含凭据的确定性测试
-夹具。
+- Node.js 22 或更高版本
+- 一个模型提供商的 API Key
 
-## 快速开始
+发行归档包会安装与之匹配的 Pi 版本，并在首次启动时提示你填入提供商密钥。如果你已经在使用
+Pi Coding Agent，Pi Agent Web 会沿用你已有的对话、扩展和设置。
 
-环境要求：Node.js 22 或更高版本、pnpm 11.21.0，以及兼容的 Pi Coding Agent 运行时。
-
-### 运行发行版
+## 安装并启动
 
 1. 从 [GitHub Releases](https://github.com/leon-zym/pi-agent-web/releases) 下载归档包及其校验和文件。
-2. 解压归档包并进入目录：
+2. 解压：
    ```bash
    tar -xzf pi-agent-web-v*.tar.gz
    cd pi-agent-web-v*
    ```
-3. 安装生产依赖：
+3. 安装依赖：
    ```bash
    npm install --omit=dev --ignore-scripts
    ```
-4. 启动工作台：
+4. 启动：
    ```bash
    npx pi-web
    ```
 
-### 从源码开发
+Pi Agent Web 启动后监听 `http://127.0.0.1:3000`，并自动打开浏览器。需要调整时：
 
 ```bash
-pnpm install --frozen-lockfile
-pnpm dev
+npx pi-web --port 3100     # 换一个端口
+npx pi-web --no-open       # 不自动打开浏览器
+npx pi-web --help          # 查看全部选项
 ```
 
-开发模式在 3000 端口启动网关，在 5173 端口启动 Vite。请打开 Vite 输出的回环地址。执行
-`pnpm build` 后再运行 `pnpm start`，可启动构建后的单端口工作台；`pnpm start -- --pi-path
-/path/to/rpc-entry.js --port 3100 --no-open` 可传递命令行参数。
+## 请保持私有
 
-两个名称作用不同：`pi-agent-web` 是仓库和包的命名空间，`pi-web` 是面向用户的命令。
+Pi Agent Web 只监听本机，要求同源会话，并控制本机的 Pi 进程及其历史记录。请在本机运行，不要通过
+公共反向代理或共享网络暴露它。它不是托管服务，也不是多用户系统，无法防御以你的用户身份运行的恶意
+进程。报告问题请见 [SECURITY.md](SECURITY.md)。
 
 ## 参与贡献
 
-欢迎提交 Issue 和 Pull Request。修改代码或文档前，请先阅读 [AGENTS.md](AGENTS.md)；工具链、验证
-层次和发布闸门见 [docs/development.md](docs/development.md)。
+欢迎在 [GitHub Issues](https://github.com/leon-zym/pi-agent-web/issues) 提交问题报告和 Pull Request。
+
+从源码开始：
 
 ```bash
-pnpm verify        # 代码检查、类型检查、确定性测试和生产构建
-pnpm test:smoke    # 经过认证的 REST 和 WebSocket 冒烟测试
-pnpm test:browser  # 基于打包产物的确定性浏览器测试
+pnpm install --frozen-lockfile
+pnpm dev        # 网关监听 3000 端口，Vite 监听 5173 端口
+pnpm verify     # 代码检查、类型检查、测试和生产构建
 ```
 
-保持改动聚焦，在确有失败风险处补充回归测试，并更新对应事实的归属文档。
+工具链、测试层次和发布闸门见 [docs/development.md](docs/development.md)。若在本仓库使用编程智能体，
+它需要的规则见 [AGENTS.md](AGENTS.md)。
 
 ## 文档
 
 [docs/README.md](docs/README.md) 汇总了当前契约、架构决策和归档证据的归属。
-[GitHub Issues](https://github.com/leon-zym/pi-agent-web/issues) 跟踪待办事项和交付状态。
 
 ## 许可
 

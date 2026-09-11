@@ -2,15 +2,11 @@
 
 English | [Chinese](README.zh-CN.md)
 
-A local web workbench for [Pi Coding Agent](https://github.com/earendil-works/pi)'s RPC mode. It opens
-Pi's native JSONL Sessions in the browser, keeps active Sessions independent, and lets background
-work continue while you move between conversations.
+A browser interface for [Pi Coding Agent](https://github.com/earendil-works/pi).
 
-Pi JSONL stays the single durable source of truth. Pi Agent Web does not copy Workspace or Session
-history into a second database.
-
-> Pi Agent Web is a development preview. Interfaces can change and defects can interrupt work. Keep
-> important work under version control and retain normal backups.
+Pi Agent Web runs on your own computer and shows your Pi conversations in a web page. You can work in
+several conversations at once: start a long task, switch to another one, and come back while the
+first keeps running.
 
 <table>
 <tr>
@@ -23,85 +19,89 @@ history into a second database.
 </tr>
 </table>
 
-Screenshots use deterministic fixtures, with no provider credentials, private paths, or user Session
-history.
+> Pi Agent Web is a development preview. Things can change, and bugs can interrupt your work. Keep
+> important work under version control and keep your usual backups.
 
-## Features
+## What you can do
 
-- Discover Pi's native Sessions and Workspaces, with no second history store.
-- Run one supervised Pi process per active Session, so switching views never stops background work.
-- Stream replies, reasoning, tool activity, Markdown, images, slash commands, and Extension UI.
-- Keep drafts, attachments, control, model choice, and recovery scoped to each Session.
-- Delete a Session into recoverable trash behind exact identity and control checks.
-- Attach Workspace files after a preview of size, kind, and risk, then capture them for the prompt.
-- Follow the conversation with a light and dark theme, keyboard operation, `zh-CN` and `en` copy,
-  and responsive layouts.
+- **Run several conversations at once.** Each has its own Pi process, so switching between them
+  never interrupts work happening in the background.
+- **Watch replies arrive live.** Answers, reasoning, and tool activity stream into the page.
+- **Read rich content.** Markdown, syntax-highlighted code, diffs, tables, and images.
+- **Use slash commands and skills.** Pick the model and thinking level for each conversation.
+- **Attach files from your project.** See each file's size, type, and risk before you send it.
+- **Answer Pi when it asks.** Questions, approval prompts, and editors appear in the page and stay
+  reachable if you navigate away.
+- **Keep long conversations usable.** History loads as you scroll, with an outline to jump around.
+- **Recover a conversation you deleted.** Deleting moves it to a trash you can restore from.
+- **Use it your way.** Light and dark themes, full keyboard operation, English and Simplified
+  Chinese, and a layout that works on a phone.
 
-## Product boundary
+Pi Agent Web uses the conversations and settings that are already in your Pi installation. Nothing
+is imported, and no copy of your history is kept elsewhere.
 
-The Gateway is a single-user, same-origin control surface that listens only on loopback addresses.
-Run it on your own machine, and do not expose `pi-web` through a public reverse proxy.
-[SECURITY.md](SECURITY.md#security-boundary) owns the threat boundary and the reporting process.
+## Requirements
 
-Provider credentials, extensions, settings, and Session history stay in your Pi installation.
-Development and CI use credential-free deterministic fixtures.
+- Node.js 22 or later
+- A model provider API key
 
-## Quick start
+The release archive installs its own matching Pi version and asks for a provider key the first time
+you start it. If you already use Pi Coding Agent, Pi Agent Web picks up the conversations, extensions,
+and settings you have.
 
-Requirements: Node.js 22 or later, pnpm 11.21.0, and a compatible Pi Coding Agent runtime.
-
-### Run a release build
+## Install and run
 
 1. Download the archive and its checksum from
    [GitHub Releases](https://github.com/leon-zym/pi-agent-web/releases).
-2. Unpack it and enter the directory:
+2. Unpack it:
    ```bash
    tar -xzf pi-agent-web-v*.tar.gz
    cd pi-agent-web-v*
    ```
-3. Install production dependencies:
+3. Install its dependencies:
    ```bash
    npm install --omit=dev --ignore-scripts
    ```
-4. Launch the workbench:
+4. Start it:
    ```bash
    npx pi-web
    ```
 
-### Work on the source
+Pi Agent Web starts on `http://127.0.0.1:3000` and opens your browser. To change that:
 
 ```bash
-pnpm install --frozen-lockfile
-pnpm dev
+npx pi-web --port 3100     # use another port
+npx pi-web --no-open       # do not open a browser
+npx pi-web --help          # see every option
 ```
 
-Development mode starts the Gateway on port 3000 and Vite on port 5173. Open the loopback URL that
-Vite prints. `pnpm build` then `pnpm start` runs the built single-port workbench, and
-`pnpm start -- --pi-path /path/to/rpc-entry.js --port 3100 --no-open` forwards CLI arguments.
+## Keep it private
 
-The names have different scopes: `pi-agent-web` is the repository and package namespace, and
-`pi-web` is the user-facing command.
+Pi Agent Web listens only on your own computer, requires a same-origin session, and controls local Pi
+processes and their history. Run it on your machine and keep it off public reverse proxies and shared
+networks. It is not a hosted service or a multi-user system, and it does not defend against a hostile
+process running as your user account. See [SECURITY.md](SECURITY.md) to report a problem.
 
 ## Contributing
 
-Issues and pull requests are welcome. Read [AGENTS.md](AGENTS.md) before changing code or
-documentation, and [docs/development.md](docs/development.md) for the toolchain, the verification
-layers, and the release gate.
+Bug reports and pull requests are welcome in
+[GitHub Issues](https://github.com/leon-zym/pi-agent-web/issues).
+
+To work on the source:
 
 ```bash
-pnpm verify        # lint, types, deterministic tests, and production build
-pnpm test:smoke    # authenticated REST and WebSocket smoke test
-pnpm test:browser  # packaged deterministic Browser suite
+pnpm install --frozen-lockfile
+pnpm dev        # Gateway on port 3000, Vite on port 5173
+pnpm verify     # lint, types, tests, and a production build
 ```
 
-Keep a change focused, add a regression where a real failure is plausible, and update the document
-that owns each affected fact.
+[docs/development.md](docs/development.md) covers the toolchain, the test layers, and the release
+gate. If you use a coding agent on this repository, [AGENTS.md](AGENTS.md) carries the rules it needs.
 
 ## Documentation
 
 [docs/README.md](docs/README.md) maps the current contracts, the architecture decisions, and the
-archived evidence. [GitHub Issues](https://github.com/leon-zym/pi-agent-web/issues) tracks the
-backlog and delivery status.
+archived evidence.
 
 ## License
 
