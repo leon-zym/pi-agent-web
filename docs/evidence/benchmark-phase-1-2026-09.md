@@ -108,8 +108,9 @@ compatible inputs receive a budget result. Incompatible inputs exit 0 with an ex
 mandatory correctness without claiming a timing pass. The original `--baseline` diagnostic command
 and its exit codes remain unchanged.
 
-`tests/e2e/benchmarks/references.json` keeps independent Actions and local sets. Both sets are
-active at frozen source `7e0ca3e3738b31183b0661ed425f4d27b48d20bf`.
+`tests/e2e/benchmarks/references.json` keeps independent Actions and local sets. Both sets were
+active at the suite-6 source `7e0ca3e3738b31183b0661ed425f4d27b48d20bf`, superseded by the suite-7
+source `43e3be14a4113b8d9cbd7f836e5bd8955d8d281e`.
 A `{"status":"pending"}` set validates target raw data and reports that references are not
 established. An active set has exactly `status`, `source` (frozen source commit), `artifactId`,
 `sha256` (digest of the entire ZIP), `reference1` and `reference2` (distinct, predetermined run IDs).
@@ -129,9 +130,10 @@ corrupt active evidence fails; it never becomes pending automatically. Retain th
 before GitHub artifact expiry. Any replacement locator must be explicitly reviewed and preserve the
 fixed evidence; an expired locator remains a setup failure until that update is accepted.
 
-Strict evaluation requires a Git checkout with the reviewed reference source object
-`7e0ca3e3738b31183b0661ed425f4d27b48d20bf`. Local evaluation is offline; if the object is missing,
-explicitly run `git fetch --depth=1 origin 7e0ca3e3738b31183b0661ed425f4d27b48d20bf` first.
+Strict evaluation requires a Git checkout with the reviewed reference source object named by the
+active descriptor. For the suite-7 references that is
+`43e3be14a4113b8d9cbd7f836e5bd8955d8d281e`. Local evaluation is offline; if the object is missing,
+explicitly run `git fetch --depth=1 origin 43e3be14a4113b8d9cbd7f836e5bd8955d8d281e` first.
 An anonymous source export without Git objects is not supported by this resolver. CI fetches the
 fixed source from the existing origin; no additional permission or reference archive override is used.
 
@@ -767,7 +769,7 @@ Playwright `1.62.1`, Chromium `151.0.7922.34`. Artifact:
 #### Local host cohort (`local-host-v1`)
 
 Environment: Darwin 27.0.0, arm64, 8 logical cores (`Apple M2`), 24 GiB RAM, Node `v24.21.0`,
-pnpm `11.21.0`, Playwright `1.62.1`, Chromium `151.0.7922.34`. Linux cgroup CPU quota is
+pnpm `12.4.1`, Playwright `1.62.1`, Chromium `151.0.7922.34`. Linux cgroup CPU quota is
 inapplicable on Darwin and is recorded as `unavailable`. Local bundles live under
 `test-results/performance/representative/local-20260913t134517z-suite7-*`.
 
@@ -813,7 +815,7 @@ carries the sustained-arrival-rate entry that suite version 7 implements.
 1. A deliberately slow raw WebSocket client and concurrent history/command fairness are not yet benchmarked.
 2. Generic typed content-root references are covered by the default Browser gate but are not benchmarked as a separate performance scenario; this suite measures production attachment refs.
 3. Browser-triggered history cancellation and post-cancel process/heap release are not yet measured; the server cancellation contract is covered separately.
-4. Stress concurrency reports actual arrival rate; a fixed scheduled arrival window is declared separately by the `sustained-load` scenario.
+4. Stress concurrency reports actual arrival rate. The `sustained-load` scenario declares a fixed 60 second window at 125 delta/s per Session across 8 Sessions, so the achieved aggregate rate is bounded at half the declared schedule; an independently certified uninterrupted 1,000 aggregate delta/s ceiling remains unmeasured.
 5. The deterministic Pi fixture proves repeatable protocol behavior, not real-provider or heterogeneous reference-host performance.
 6. Multiple Browser clients sharing the same Gateway and adversarial socket backpressure remain outside Phase 1.
 

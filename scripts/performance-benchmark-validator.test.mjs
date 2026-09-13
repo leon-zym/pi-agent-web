@@ -601,8 +601,8 @@ function correctnessFor(definition) {
 							"allSessionsObserved",
 							"fixtureEmittedDeclaredSchedule",
 							"fixtureWindowCovered",
+							"sustainedWindowBounded",
 							"sustainedScheduleHeld",
-							"projectionsConverged",
 							"singleMultiplexedSocket",
 						]
 					: definition.kind === "history"
@@ -717,6 +717,41 @@ function validResult(variant, definition) {
 			Object.entries(mixedMetrics(definition)).map(([k, v]) => [
 				k,
 				{ count: definition.samples, min: v, max: v, median: v, p95: v },
+			]),
+		);
+		return base;
+	}
+	if (definition.kind === "sustained-load") {
+		const base = validResult(variant, { ...definition, kind: "history" });
+		base.kind = definition.kind;
+		base.parameters = structuredClone(definition);
+		base.gates = [
+			hardGate("correctnessFailures", "value", "eq", 0, 0),
+			hardGate("browserErrors", "value", "eq", 0, 0),
+		];
+		const facts = sustainedObservation(definition).facts;
+		const metrics = {
+			sustainedWindowMs: facts.window.fixtureWindowMs,
+			sustainedDeltaPerTurn: facts.window.deltasPerTurn,
+			sustainedTurnCount: facts.window.turnCount,
+			sustainedScheduledDeltaCount: facts.window.turnCount * facts.window.deltasPerTurn,
+			sustainedFixtureDeltaCount: facts.window.fixtureDeltaCount,
+			sustainedObservedDeltaCount: facts.sessions.reduce((sum, s) => sum + s.deltaFrames, 0),
+			sustainedAggregateDeltaPerSecond:
+				(facts.sessions.reduce((sum, s) => sum + s.deltaFrames, 0) * 1_000) / facts.window.fixtureWindowMs,
+			sustainedMinimumDeltaFrames: Math.min(...facts.sessions.map((s) => s.deltaFrames)),
+			sustainedProjectionLagMs: Math.max(...facts.sessions.map((s) => s.projectionLagMs)),
+		};
+		base.trials = Array.from({ length: definition.warmups + definition.samples }, (_, index) => ({
+			index,
+			warmup: index < definition.warmups,
+			correctness: correctnessFor(definition),
+			metrics: structuredClone(metrics),
+		}));
+		base.summaries = Object.fromEntries(
+			Object.entries(metrics).map(([name, value]) => [
+				name,
+				{ count: definition.samples, min: value, max: value, median: value, p95: value },
 			]),
 		);
 		return base;
@@ -2699,6 +2734,30 @@ test("sustained load enforces the declared schedule against the observed window"
 	assert.ok(validateResult(result, definition, "representative", RUN_ID, map).length > 0);
 	for (const trial of result.trials) {
 		map.get(`${suffix}${String(trial.index)}`).facts.window.fixtureWindowMs = definition.sustainedWindowMs;
+	}
+
+	// A window that overran the declared duration far enough to change the rate must fail.
+	for (const trial of result.trials) {
+		map.get(`${suffix}${String(trial.index)}`).facts.window.fixtureWindowMs =
+			definition.sustainedWindowMs * 10;
+	}
+	assert.ok(validateResult(result, definition, "representative", RUN_ID, map).length > 0);
+	for (const trial of result.trials) {
+		map.get(`${suffix}${String(trial.index)}`).facts.window.fixtureWindowMs = definition.sustainedWindowMs;
+	}
+
+	// A metric that does not follow from the raw facts must fail, because metrics are recomputed.
+	result.trials[0].metrics.sustainedObservedDeltaCount += 1;
+	assert.ok(validateResult(result, definition, "representative", RUN_ID, map).length > 0);
+	result.trials[0].metrics.sustainedObservedDeltaCount -= 1;
+
+	// An echoed schedule that does not match the declared scenario must fail.
+	for (const trial of result.trials) {
+		map.get(`${suffix}${String(trial.index)}`).facts.window.deltasPerTurn = 1;
+	}
+	assert.ok(validateResult(result, definition, "representative", RUN_ID, map).length > 0);
+	for (const trial of result.trials) {
+		map.get(`${suffix}${String(trial.index)}`).facts.window.deltasPerTurn = definition.deltasPerTurn;
 	}
 
 	// A turn shape that does not reproduce the declared rate is rejected.

@@ -223,11 +223,13 @@ const GATE_METRIC_POLICY = Object.freeze(
 			"sourceBytes",
 			"streamDurationMs",
 			"sustainedAggregateDeltaPerSecond",
+			"sustainedDeltaPerTurn",
 			"sustainedFixtureDeltaCount",
 			"sustainedMinimumDeltaFrames",
 			"sustainedObservedDeltaCount",
 			"sustainedProjectionLagMs",
 			"sustainedScheduledDeltaCount",
+			"sustainedTurnCount",
 			"sustainedWindowMs",
 			"structuralDomTransitionMs",
 			"totalCompletionMs",
@@ -350,8 +352,11 @@ const SUSTAINED_WINDOW_KEYS = [
 ];
 const SUSTAINED_SESSION_KEYS = ["deltaFrames", "projectionLagMs"];
 const SUSTAINED_FACT_KEYS = ["sessions", "socket", "window"];
-/** The suite already treats this as the floor for a 1000 aggregate delta/s profile. */
-const SUSTAINED_AGGREGATE_DELTA_FLOOR = 800;
+/**
+ * A sustained window may overrun its declared duration under real load, but a large multiple means
+ * the arrival schedule was not sustained. This bounds the slow side of the achieved rate.
+ */
+const SUSTAINED_WINDOW_TOLERANCE = 2;
 const HISTORY_FACT_KEYS = ["dom", "history", "pi"];
 const HISTORY_DOM_KEYS = ["mountedTurnNodes", "oldestTurnCount"];
 const HISTORY_KEYS = [
@@ -1319,7 +1324,8 @@ function validateRecoveryFacts(value, label, errors, kind) {
 	}
 }
 
-function validateObservationFacts(value, kind, label, errors) {
+function validateObservationFacts(value, definition, label, errors) {
+	const kind = definition.kind;
 	const baseKeys = OBSERVATION_FACT_KEYS_BY_KIND[kind];
 	const expectedKeys =
 		kind === "recovery-gateway-restart" && isRecord(value) && Object.hasOwn(value, "restartAuthentication")
@@ -1409,6 +1415,15 @@ function validateObservationFacts(value, kind, label, errors) {
 			errors,
 		);
 		validateNonnegativeNumber(value.window.fixtureWindowMs, `${label}.facts.window.fixtureWindowMs`, errors);
+		// The echoed schedule must describe the declared scenario, not a convenient restatement of it.
+		for (const [field, declared] of [
+			["arrivalDeltaPerSecond", definition.arrivalDeltaPerSecond],
+			["declaredWindowMs", definition.sustainedWindowMs],
+			["deltasPerTurn", definition.deltasPerTurn],
+		]) {
+			if (declared !== undefined && value.window[field] !== declared)
+				errors.push(`${label}.facts.window.${field} must equal the declared scenario value`);
+		}
 		return;
 	}
 	if (kind === "history") {
@@ -1528,7 +1543,7 @@ function validateObservation(value, definition, label, errors) {
 		if (derivedBrowserErrorCount(value, definition) !== 0)
 			errors.push(`${label}: observation.browserErrors contains an unallowlisted browser error`);
 	}
-	validateObservationFacts(value.facts, definition.kind, label, errors);
+	validateObservationFacts(value.facts, definition, label, errors);
 }
 
 function gatePolicy(metric) {
@@ -2078,6 +2093,26 @@ function mixedHistoryMetrics(f) {
 	};
 }
 
+function sustainedLoadMetrics(f) {
+	if (!isRecord(f?.window) || !Array.isArray(f.sessions) || f.sessions.some((s) => !isRecord(s))) return null;
+	const observed = f.sessions.reduce(
+		(sum, s) => sum + (isFiniteNumber(s.deltaFrames) ? s.deltaFrames : 0),
+		0,
+	);
+	const windowMs = f.window.fixtureWindowMs;
+	return {
+		sustainedWindowMs: windowMs,
+		sustainedDeltaPerTurn: f.window.deltasPerTurn,
+		sustainedTurnCount: f.window.turnCount,
+		sustainedScheduledDeltaCount: f.window.turnCount * f.window.deltasPerTurn,
+		sustainedFixtureDeltaCount: f.window.fixtureDeltaCount,
+		sustainedObservedDeltaCount: observed,
+		sustainedAggregateDeltaPerSecond: windowMs > 0 ? (observed * 1_000) / windowMs : 0,
+		sustainedMinimumDeltaFrames: Math.min(...f.sessions.map((s) => s.deltaFrames)),
+		sustainedProjectionLagMs: Math.max(0, ...f.sessions.map((s) => s.projectionLagMs)),
+	};
+}
+
 function deriveCorrectness(observation, definition) {
 	const facts = observation?.facts;
 	if (!isRecord(facts)) return { complete: false };
@@ -2161,15 +2196,14 @@ function deriveCorrectness(observation, definition) {
 			fixtureWindowCovered:
 				isFiniteNumber(window?.fixtureWindowMs) &&
 				window.fixtureWindowMs >= (declaredWindow ?? Number.POSITIVE_INFINITY),
+			sustainedWindowBounded:
+				isFiniteNumber(window?.fixtureWindowMs) &&
+				declaredWindow !== undefined &&
+				window.fixtureWindowMs <= declaredWindow * SUSTAINED_WINDOW_TOLERANCE,
 			sustainedScheduleHeld:
 				derived !== null &&
 				sessions.length === expected &&
 				sessions.every((observation) => (observation?.deltaFrames ?? -1) >= derived.emitted),
-			projectionsConverged:
-				sessions.length === expected &&
-				sessions.every(
-					(observation) => isFiniteNumber(observation?.projectionLagMs) && observation.projectionLagMs >= 0,
-				),
 			singleMultiplexedSocket: socket?.opened === 1 && socket.closed === 0,
 		};
 	} else if (definition.kind === "history") {
@@ -2541,6 +2575,11 @@ export function validateResult(result, definition, tier, runId, observationByTri
 				!isDeepStrictEqual(trial.metrics, mixedHistoryMetrics(observation.facts)))
 		)
 			errors.push(`trial ${String(index)} mixed history metrics/cycle must match raw facts`);
+		if (
+			definition.kind === "sustained-load" &&
+			!isDeepStrictEqual(trial.metrics, sustainedLoadMetrics(observation.facts))
+		)
+			errors.push(`trial ${String(index)} sustained metrics must match raw facts`);
 		if (!isDeepStrictEqual(trial.correctness, derived))
 			errors.push(`trial ${String(index)} correctness must equal independently derived observation claims`);
 	}
@@ -2604,7 +2643,7 @@ export function validateRawArtifacts(rawArtifacts, results, errors) {
 			continue;
 		}
 		const result = expectedEntry.result;
-		validateObservation(value.observation, { kind: result.kind }, label, errors);
+		validateObservation(value.observation, result.parameters ?? { kind: result.kind }, label, errors);
 		if (
 			result.kind === "recovery-disconnect" &&
 			value.observation?.facts?.protocol?.disconnectEvidence?.trial !== value.trial.index

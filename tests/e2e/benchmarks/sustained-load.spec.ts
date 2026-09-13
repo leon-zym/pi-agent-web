@@ -57,7 +57,11 @@ for (const scenario of scenariosFor("sustained-load")) {
 			const emittedPerSession = turnCount * deltasPerTurn;
 			const errors = observePageErrors(page);
 			const sockets: string[] = [];
-			page.on("websocket", (socket) => sockets.push(socket.url()));
+			const closedSockets: string[] = [];
+			page.on("websocket", (socket) => {
+				sockets.push(socket.url());
+				socket.on("close", () => closedSockets.push(socket.url()));
+			});
 			await installBrowserBenchmarkObserver(page);
 			await page.goto(harness.origin, { waitUntil: "domcontentloaded" });
 			await expect(page.locator("#root > div")).toBeVisible();
@@ -172,9 +176,9 @@ for (const scenario of scenariosFor("sustained-load")) {
 						allSessionsObserved: observations.length === sessionCount,
 						fixtureEmittedDeclaredSchedule: fixtureDeltaCount === emittedPerSession,
 						fixtureWindowCovered: windowMs >= sustainedWindowMs,
+						sustainedWindowBounded: windowMs <= sustainedWindowMs * 2,
 						sustainedScheduleHeld: observations.every((entry) => entry.deltaFrames >= emittedPerSession),
-						projectionsConverged: observations.every((entry) => entry.projectionLagMs >= 0),
-						singleMultiplexedSocket: sockets.length === 1,
+						singleMultiplexedSocket: sockets.length === 1 && closedSockets.length === 0,
 					};
 					return {
 						metrics: {
@@ -197,7 +201,7 @@ for (const scenario of scenariosFor("sustained-load")) {
 							},
 							{
 								sessions: observations,
-								socket: { closed: 0, opened: sockets.length },
+								socket: { closed: closedSockets.length, opened: sockets.length },
 								window: {
 									arrivalDeltaPerSecond,
 									declaredWindowMs: sustainedWindowMs,
@@ -228,7 +232,7 @@ for (const scenario of scenariosFor("sustained-load")) {
 				"gte",
 				sessionCount * arrivalDeltaPerSecond * 0.8,
 				"observe",
-				"Achieved aggregate arrival rate over the declared window; the schedule itself is enforced by correctness.",
+				"Diagnostic achieved rate. The enforced bound is the correctness claim: the window must cover the declared duration and stay within twice it, so the achieved rate cannot fall below half the declared schedule.",
 			);
 			addSummaryGate(
 				outcome,
