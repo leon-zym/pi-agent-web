@@ -74,8 +74,16 @@ Sessions without pending Extension requests are eviction candidates, and protect
 target while Gateway admission limits still apply. This policy is not a total Browser heap guarantee.
 
 After authenticated reconnect and its initial inventory, the Browser refreshes the REST Workspace and
-current Session directories once without user activity. Older directory requests cannot overwrite the
-new recovery result or a newer navigation choice. Transient failures retain cached directory data.
+current Session directories once without user activity. A refresh holds the coalescing key of the
+exact Session identity or Workspace it reads. An intent raised before that pair has read is covered by
+it, so an ordinary settled-turn burst costs one pair; an intent raised while the reads are in flight is
+merged into at most one trailing pair rather than starting a concurrent one, so the newer intent still
+reads and the catalog advances. Keys are identity-scoped, so two Sessions, or a Session and a Workspace,
+do not coalesce with each other. These reads carry no cancellation, so the hold is bounded and a read
+that outlives it yields the key. Concurrent pairs are capped, and an intent that cannot be admitted
+while that many pairs read waits in a single newest-wins slot, so directory state stays bounded however
+fast intents arrive. Older directory requests cannot overwrite the new recovery result or a newer
+navigation choice. Transient failures retain cached directory data.
 
 ## History and projections
 
