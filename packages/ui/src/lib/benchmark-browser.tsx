@@ -97,21 +97,33 @@ export function renderBenchmarkRoot(root: Root, children: ReactNode): void {
  * rather than a socket-arrival timestamp on its own.
  */
 function installProjectionWatermark(): void {
-	const ARRIVAL_HISTORY = 256;
+	const ARRIVAL_HISTORY = 512;
 	const tracked = new Set<string>();
 	const baselineProjectedSeq = new Map<string, number>();
+	const lastCountedSeq = new Map<string, number>();
 	const arrivalAtBySeq = new Map<string, Map<number, number>>();
 	const maxProjectionLagMs = new Map<string, number>();
 	sessionTransport.store.subscribe(() => {
 		const sessions = sessionTransport.store.getState().sessions;
+		const now = performance.now();
 		for (const sessionHandle of tracked) {
 			const projectedSeq = sessions[sessionHandle]?.projectedSeq ?? -1;
+			const counted = lastCountedSeq.get(sessionHandle) ?? -1;
+			if (projectedSeq <= counted) continue;
+			lastCountedSeq.set(sessionHandle, projectedSeq);
+			// Coalesced mode applies a whole batch at once, so the watermark jumps across many
+			// sequences. Every sequence the batch covered is counted, and the batch's oldest arrival
+			// carries the worst wait rather than only the last sequence's.
 			const arrivals = arrivalAtBySeq.get(sessionHandle);
 			if (!arrivals) continue;
-			const arrivedAt = arrivals.get(projectedSeq);
-			if (arrivedAt === undefined) continue;
-			arrivals.delete(projectedSeq);
-			const lag = Math.max(0, performance.now() - arrivedAt);
+			let oldestArrivalAt: number | null = null;
+			for (const [seq, arrivedAt] of arrivals) {
+				if (seq > projectedSeq || seq <= counted) continue;
+				arrivals.delete(seq);
+				if (oldestArrivalAt === null || arrivedAt < oldestArrivalAt) oldestArrivalAt = arrivedAt;
+			}
+			if (oldestArrivalAt === null) continue;
+			const lag = Math.max(0, now - oldestArrivalAt);
 			maxProjectionLagMs.set(sessionHandle, Math.max(maxProjectionLagMs.get(sessionHandle) ?? 0, lag));
 		}
 	});
@@ -131,12 +143,15 @@ function installProjectionWatermark(): void {
 			track(sessionHandles: string[]) {
 				tracked.clear();
 				baselineProjectedSeq.clear();
+				lastCountedSeq.clear();
 				maxProjectionLagMs.clear();
 				arrivalAtBySeq.clear();
 				const sessions = sessionTransport.store.getState().sessions;
 				for (const sessionHandle of sessionHandles) {
+					const projectedSeq = sessions[sessionHandle]?.projectedSeq ?? -1;
 					tracked.add(sessionHandle);
-					baselineProjectedSeq.set(sessionHandle, sessions[sessionHandle]?.projectedSeq ?? -1);
+					baselineProjectedSeq.set(sessionHandle, projectedSeq);
+					lastCountedSeq.set(sessionHandle, projectedSeq);
 					maxProjectionLagMs.set(sessionHandle, 0);
 					arrivalAtBySeq.set(sessionHandle, new Map<number, number>());
 				}

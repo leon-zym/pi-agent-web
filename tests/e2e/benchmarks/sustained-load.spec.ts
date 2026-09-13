@@ -119,9 +119,6 @@ for (const scenario of scenariosFor("sustained-load")) {
 					});
 					await trackBrowserSessionProjection(page, sessionHandles);
 					await resetBrowserSessionFrames(page, sessionHandles);
-					// Baseline the visible settled turns before the schedule starts, so the midpoint count
-					// measures what this trial projected rather than what earlier trials left behind.
-					const preTrialSettledTurns = await page.locator('[data-markdown-settled="true"]').count();
 					for (const prompt of prompts) harness.startPrompt(prompt);
 					await expect
 						.poll(() => prompts.every((prompt) => eventFor(harness, "delta", prompt) !== undefined), {
@@ -131,13 +128,21 @@ for (const scenario of scenariosFor("sustained-load")) {
 
 					// Sample arrival-to-projection lag while the window is still open, so the measurement
 					// observes live product behavior rather than the test's own post-window orchestration.
-					// The observer tracks every subscribed Session on the shared socket and the projection
-					// watermark is read in the same page evaluation, so all Sessions are sampled at one
-					// instant instead of being visited one at a time.
+					// The observer tracks every subscribed Session on the shared socket while the projection
+					// watermark is read from the same instant, so no Session is visited one at a time.
 					await page.waitForTimeout(Math.floor(sustainedWindowMs / 2));
-					const projectedTurns = await page.locator('[data-markdown-settled="true"]').count();
 					const sampled = await browserSessionProjectionSnapshot(page, sessionHandles);
 					const arrivals = sampled.map((snapshot) => ({ projectionLagMs: snapshot.projectionLagMs }));
+					// The visible Session must already show a settled turn carrying this trial's own prompt.
+					// Every trial uses a distinct label, so a turn projected by an earlier trial cannot
+					// satisfy this claim, and the count needs no cross-trial baseline to stay trial-scoped.
+					const visiblePrompt = prompts[sessionCount - 1];
+					if (!visiblePrompt) throw new Error("The visible Session prompt was not captured");
+					const projectedSettledTurns = await page
+						.locator("[data-turn-id]")
+						.filter({ hasText: visiblePrompt })
+						.locator('[data-markdown-settled="true"]')
+						.count();
 
 					// The window closes once every Session has delivered its declared schedule.
 					await expect
@@ -166,9 +171,6 @@ for (const scenario of scenariosFor("sustained-load")) {
 					const totalObserved = observations.reduce((sum, entry) => sum + entry.deltaFrames, 0);
 					const shortestWindowMs = Math.min(...observations.map((entry) => entry.windowMs));
 					const longestWindowMs = Math.max(...observations.map((entry) => entry.windowMs));
-					// The DOM count is compared against the pre-window baseline, so a turn projected by an
-					// earlier trial cannot satisfy this trial's claim.
-					const trialProjectedTurns = projectedTurns - preTrialSettledTurns;
 					const correctness = {
 						allSessionsObserved: observations.length === sessionCount,
 						fixtureEmittedDeclaredSchedule: fixtureDeltaCount === emittedPerSession,
@@ -182,7 +184,7 @@ for (const scenario of scenariosFor("sustained-load")) {
 						allSessionsProjected: observations.every(
 							(entry) => entry.projectedSeq > entry.baselineProjectedSeq,
 						),
-						midWindowProjectedTurn: trialProjectedTurns >= 1,
+						midWindowProjectedTurn: projectedSettledTurns >= 1,
 						singleMultiplexedSocket: sockets.length === 1 && closedSockets.length === 0,
 					};
 					return {
@@ -197,7 +199,7 @@ for (const scenario of scenariosFor("sustained-load")) {
 							sustainedAggregateDeltaPerSecond:
 								longestWindowMs > 0 ? (totalObserved * 1_000) / longestWindowMs : 0,
 							sustainedMinimumDeltaFrames: Math.min(...observations.map((entry) => entry.deltaFrames)),
-							sustainedMidWindowSettledTurns: projectedTurns,
+							sustainedMidWindowSettledTurns: projectedSettledTurns,
 							sustainedProjectionLagMs: Math.max(0, ...observations.map((entry) => entry.projectionLagMs)),
 						},
 						correctness,
@@ -216,7 +218,7 @@ for (const scenario of scenariosFor("sustained-load")) {
 									deltasPerTurn,
 									fixtureDeltaCount,
 									fixtureWindowMs: longestWindowMs,
-									midWindowSettledTurns: trialProjectedTurns,
+									midWindowSettledTurns: projectedSettledTurns,
 									turnCount: fixtureTurnCount,
 								},
 							},
