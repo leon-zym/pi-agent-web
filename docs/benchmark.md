@@ -17,6 +17,23 @@ A green run proves only its declared scenarios. When changing a targeted optimiz
 reproducible scenario only if it guards a real product risk. Do not create a generic benchmark
 framework or convert unstable workstation timing into a release promise.
 
+### Sustained-load arrival window
+
+The stress tier declares one `sustained-load` scenario beside the byte-bounded concurrency profile.
+It asks a different question: whether a fixed arrival schedule holds for a declared duration, rather
+than whether a fixed payload finishes. The scenario declares `arrivalDeltaPerSecond`,
+`sustainedWindowMs`, `sessions`, `chunkBytes`, `chunkDelayMs`, and `deltasPerTurn`.
+
+The runtime bounds live projection events per active turn, so the fixture delivers the window as
+consecutive settled turns, which is what a real agent produces. The emitted per-Session count is
+therefore the declared window divided into turns of `deltasPerTurn`, rounded up, and the window
+duration is a measured consequence of that schedule rather than an input to emission.
+
+Every subscribed Session must receive at least the emitted count, and the fixture must have reported
+a window at least as long as the declared one. Both are correctness claims, so a short schedule fails
+the shared `correctnessFailures` hard gate; the achieved aggregate rate and the worst-Session
+projection lag sampled mid-window stay diagnostic.
+
 ## Comparison
 
 ```bash
@@ -71,11 +88,14 @@ or zero for ratios and counts.
   three representative bundles on one Actions machine.
 
 Artifacts land in `test-results/performance/<tier>/<run-id>/` with a sibling `manifest.json` and
-`environment.json`. Accepted suite-6 references are registered in
-`tests/e2e/benchmarks/references.json`, and editing `tests/e2e/benchmarks/matrix.json` changes the
-compared workload identity and invalidates them, so a coverage gap is recorded in an Issue instead.
-Registering references from a new source commit also requires that commit in the
-`TRUSTED_REFERENCE_SOURCES` allowlist in `scripts/benchmark-frozen-references.mjs`. The checked-in
+`environment.json`. Accepted references are registered in `tests/e2e/benchmarks/references.json`.
+Editing `tests/e2e/benchmarks/matrix.json` or any declared domain matrix changes the compared
+workload identity, so every registered reference becomes `INCOMPATIBLE` until a fresh compatible
+cohort is collected and registered. A declared coverage gap lives in `matrix.json`'s
+`knownCoverageGaps`, which is the single list of what this suite does not measure; a decision that
+needs maintainer approval stays on its Issue until it lands there. Registering references from a new
+source commit also requires that commit in the `TRUSTED_REFERENCE_SOURCES` allowlist in
+`scripts/benchmark-frozen-references.mjs`. The checked-in
 `baselines/reference-linux-x64.json` of 2026-09-06 is `INCOMPATIBLE` with the current comparator, and
 manual calibration uploads expire after 30 days. Archived historical measurements are in
 [benchmark-phase-1-2026-09.md](evidence/benchmark-phase-1-2026-09.md).

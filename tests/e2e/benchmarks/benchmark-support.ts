@@ -11,6 +11,7 @@ export type BenchmarkVariant = "coalesced" | "sequential";
 export type BenchmarkKind =
 	| "streaming"
 	| "concurrency"
+	| "sustained-load"
 	| "history"
 	| "history-mixed"
 	| "recovery-disconnect"
@@ -36,6 +37,15 @@ export interface BenchmarkScenario {
 	inputBytes?: number;
 	historyReadMode?: "verified_nonempty_native";
 	historyMount?: "bounded" | "full";
+	/** Per-Session delta arrivals per second during a sustained-load arrival window. */
+	arrivalDeltaPerSecond?: number;
+	/** Fixed arrival window in milliseconds; the fixture stops on elapsed time, not on bytes. */
+	sustainedWindowMs?: number;
+	/**
+	 * Deltas per settled turn. The runtime bounds live projection events per active turn, so a
+	 * sustained profile arrives as consecutive settled turns rather than one unbounded turn.
+	 */
+	deltasPerTurn?: number;
 }
 
 export interface BenchmarkTrial {
@@ -119,6 +129,26 @@ export interface BenchmarkConcurrencyObservationFacts {
 	socket: {
 		closed: number;
 		opened: number;
+	};
+}
+
+export interface BenchmarkSustainedLoadObservationFacts {
+	/** Per-Session Browser frame arrivals observed across the declared window. */
+	sessions: Array<{
+		deltaFrames: number;
+		projectionLagMs: number;
+	}>;
+	socket: {
+		closed: number;
+		opened: number;
+	};
+	window: {
+		arrivalDeltaPerSecond: number;
+		declaredWindowMs: number;
+		deltasPerTurn: number;
+		fixtureDeltaCount: number;
+		fixtureWindowMs: number;
+		turnCount: number;
 	};
 }
 
@@ -330,6 +360,7 @@ export interface BenchmarkRecoveryObservationFacts {
 
 export type BenchmarkObservationFactsByKind = {
 	concurrency: BenchmarkConcurrencyObservationFacts;
+	"sustained-load": BenchmarkSustainedLoadObservationFacts;
 	"content-roundtrip": BenchmarkContentObservationFacts;
 	history: BenchmarkHistoryObservationFacts;
 	"history-mixed": MixedHistoryFacts;
@@ -364,7 +395,7 @@ export interface BenchmarkTrialLifecycle {
 
 export interface BenchmarkScenarioResult {
 	schemaVersion: 2;
-	suiteVersion: 6;
+	suiteVersion: 7;
 	tier: BenchmarkTier;
 	runId: string;
 	scenarioId: string;
@@ -681,7 +712,7 @@ export async function runBenchmarkScenario(
 	}
 	const result: BenchmarkScenarioResult = {
 		schemaVersion: 2,
-		suiteVersion: 6,
+		suiteVersion: 7,
 		tier,
 		runId,
 		scenarioId: scenario.id,

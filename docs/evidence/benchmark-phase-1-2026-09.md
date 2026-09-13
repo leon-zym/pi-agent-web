@@ -25,10 +25,13 @@ A five-Turn recipe mixes prose, fenced code, tool-call/result chains, collapsed 
 list/table Markdown. Four individual Markdown blocks are 10/64/120 KiB and 1 MiB; these are
 not multiplied by every Turn. No real history or provider output is used.
 
-Representative adds one 1,000-Turn bounded-mount cycle per publication variant. Stress declares
+Representative adds one 1,000-Turn bounded-mount cycle per publication variant. Stress declared
 two sizes × two publication variants × bounded/full mounting × (one warmup + three measured
-cycles): 32 independent cycles, 24 measured. This is a declared workload, not a claim that the
-full stress matrix has passed. Mode order is fixed within each size: coalesced bounded/full,
+cycles): 32 independent cycles, 24 measured. That declaration belonged to suite version 6; suite
+version 7 removes the 5,000-Turn full-mount cell, which could not complete inside the 120 second
+per-cycle safety cap. [benchmark.md](../benchmark.md) owns the current declared workload, and
+`matrix.json`'s `knownCoverageGaps` owns the current gap list. Mode order is fixed within each size:
+coalesced bounded/full,
 sequential full/bounded. Each cycle owns one fresh Browser context and Gateway; the
 Browser executable and OS disk cache may be reused. Full mounting is a compile-time benchmark
 control using the same TurnView. The ordinary production executable scan must exclude the control.
@@ -57,10 +60,12 @@ missing actions, duplicate/gapped pages, Browser errors or inconsistent raw-to-s
 cannot become zero-valued success. A B-only development run remains partial; it cannot replace
 formal stress completeness or the 800 measured recovery trials.
 
-Suite 6 establishes a dual-environment reference cohort across GitHub Actions and local hosts.
-Accepted Suite 6 references are frozen at commit `7e0ca3e3738b31183b0661ed425f4d27b48d20bf`
-and registered in `tests/e2e/benchmarks/references.json`. The six completion medians and
-`completion-median-v1` policy remain active across both environments.
+Suite 6 established a dual-environment reference cohort across GitHub Actions and local hosts.
+Those references were frozen at commit `7e0ca3e3738b31183b0661ed425f4d27b48d20bf` and registered in
+`tests/e2e/benchmarks/references.json`. Suite version 7 changes the declared workload, so every
+suite-6 reference becomes `INCOMPATIBLE` and a fresh cohort must be collected before strict
+completion budgets are claimed again. [benchmark.md](../benchmark.md) owns the current registration
+and admission contract.
 
 ## Recovery scope (introduced in suite version 5)
 
@@ -82,8 +87,9 @@ budget the directory-read/shutdown overlap.
 Version 5 and changed matrix provenance reject old bundles as current evidence. Historical artifacts,
 including the invalid local reference-2, remain unchanged; a new frozen source requires a new complete
 cohort. The previously inspected holdout cannot validate a newly selected budget policy. Strict
-completion budgets use the policy below; the accepted suite-6 local and Actions references are
-registered in `tests/e2e/benchmarks/references.json`. `liveLongTasksOver50Ms` is a count (zero
+completion budgets use the policy below; the suite-6 local and Actions references were registered in
+`tests/e2e/benchmarks/references.json` and are superseded by suite version 7's workload change.
+`liveLongTasksOver50Ms` is a count (zero
 additive floor), not a duration;
 its suffix describes the 50 ms threshold. Other metric dimensions and diagnostic modes are unchanged.
 
@@ -572,7 +578,8 @@ Suite version 4 retains the streaming measurement contract introduced in suite v
 and keeps artifact schema version 2.
 The historical tables above and checked-in calibration file retain their original names and values;
 they are not current-suite calibration. Comparisons reject unsupported suite versions and changed
-producer hashes. Current suite-6 references are registered separately in `tests/e2e/benchmarks/references.json`.
+producer hashes. Suite-6 references were registered separately in `tests/e2e/benchmarks/references.json` and are
+superseded by the suite version 7 workload change.
 
 | Current metric | Exact observation boundary |
 | --- | --- |
@@ -675,8 +682,9 @@ have no performance direction and are also excluded.
 
 All numerical tables above and `baselines/reference-linux-x64.json` retain their historical
 2026-09-06 semantics, including the old common floor and pooled CPU models. That file is
-`INCOMPATIBLE` with the new comparator; it has not been silently recalibrated. Accepted suite-6
-references are registered separately in `tests/e2e/benchmarks/references.json`.
+`INCOMPATIBLE` with the new comparator; it has not been silently recalibrated. Suite-6
+references were registered separately in `tests/e2e/benchmarks/references.json` and are
+superseded by the suite version 7 workload change.
 
 ### Manual representative calibration collection
 
@@ -797,31 +805,35 @@ residual Phase 2 workload items are carried by
 
 ### Declared in `matrix.json`
 
-The Phase 1 representative baseline has the following 6 declared coverage gaps:
+The Phase 1 representative baseline declared these gaps. `matrix.json`'s `knownCoverageGaps` is the
+authoritative current list; it now also records the 5,000-Turn full-mount boundary, the recovery
+fault-state coverage gap, and the missing cross-layer resource measurements, and it no longer
+carries the sustained-arrival-rate entry that suite version 7 implements.
 
 1. A deliberately slow raw WebSocket client and concurrent history/command fairness are not yet benchmarked.
 2. Generic typed content-root references are covered by the default Browser gate but are not benchmarked as a separate performance scenario; this suite measures production attachment refs.
 3. Browser-triggered history cancellation and post-cancel process/heap release are not yet measured; the server cancellation contract is covered separately.
-4. Stress concurrency uses synchronized repeated finite 1 MiB turns and reports actual arrival rate; it does not yet certify an uninterrupted 60 second 1000 delta/s arrival rate.
+4. Stress concurrency reports actual arrival rate; a fixed scheduled arrival window is declared separately by the `sustained-load` scenario.
 5. The deterministic Pi fixture proves repeatable protocol behavior, not real-provider or heterogeneous reference-host performance.
 6. Multiple Browser clients sharing the same Gateway and adversarial socket backpressure remain outside Phase 1.
 
-A seventh entry in the same file records the Gateway restart performance deferral to #105.
-
 ### Additional Phase 2 gaps
 
-These were required by the original Issue #28 scope, have no implemented evidence, and have no
-recorded scope decision on the closed issue. Changing `matrix.json` would invalidate the registered
-suite-6 references, because the matrix hash is part of the compared workload identity, so they are
-recorded here and carried by #117 rather than edited into the frozen matrix.
+These were required by the original Issue #28 scope and are carried by
+[Issue #117](https://github.com/leon-zym/pi-agent-web/issues/117). Suite version 7 implements the
+sustained-load arrival window and removes the unmeasurable 5,000-Turn full-mount cell; the
+authoritative current list lives in `matrix.json`'s `knownCoverageGaps`. What follows records the
+state as observed during Phase 1.
 
-7. **Sustained-load profile.** No scenario implements a fixed-rate arrival window of up to 1,000
-   aggregate delta events per second for 60 seconds. `aggregateDeltaPerSecond` is observed
-   throughput over synchronized finite turns, not a scheduled sustained profile.
-8. **Mixed-history 5,000-Turn full mounting.** `history-mixed-5000-full` is declared required in
-   `matrix/history.json` but the 120 second per-cycle watchdog closes the browser context mid-cycle
-   (approximately 122 seconds in both publication variants). The cell cannot produce a complete
-   validating artifact within the safety cap, and it is not listed in `matrix.json`'s gap list.
+7. **Sustained-load profile.** No scenario implemented a fixed-rate arrival window of up to 1,000
+   aggregate delta events per second for 60 seconds. `aggregateDeltaPerSecond` was observed
+   throughput over synchronized finite turns, not a scheduled sustained profile. Suite version 7
+   adds the declared `sustained-load` scenario.
+8. **Mixed-history 5,000-Turn full mounting.** `history-mixed-5000-full` was declared required in
+   `matrix/history.json` but the 120 second per-cycle watchdog closed the browser context mid-cycle
+   (approximately 122 seconds in both publication variants). Suite version 7 removes that cell and
+   records the cost-curve boundary, because the cell could not produce a complete validating
+   artifact within the safety cap.
 9. **Recovery fault-state coverage.** Faults are injected only during active text streaming. Fault
    injection during thinking, tool execution, queued input, and blocking Extension UI is not
    implemented, and the named `retry count` and terminal `degraded state` metrics are absent from

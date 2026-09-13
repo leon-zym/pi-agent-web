@@ -1064,6 +1064,131 @@ function streamBudgetPrompt(
 	}
 }
 
+/**
+ * Fixed-duration arrival window. The runtime bounds live projection events per active turn, so a
+ * sustained profile is emitted as consecutive settled turns, which is what a real agent produces.
+ * The window duration is a measured consequence of the declared delta schedule.
+ */
+function streamSustainedPrompt(
+	command,
+	text,
+	user,
+	userEntryId,
+	{ deltasPerTurn, chunkBytes, chunkDelayMs, turnCount },
+) {
+	const turnBytes = chunkBytes * deltasPerTurn;
+	const markdown = budgetMarkdown(turnBytes);
+	const run = {
+		kind: "sustained-arrival",
+		command,
+		label: "sustained-arrival",
+		timers: [],
+		turnIndex: 0,
+		deltaIndex: 0,
+		emitted: 0,
+		startedAt: null,
+		parentEntryId: userEntryId,
+	};
+	activeRun = run;
+	record("prompt", {
+		commandId: command.id,
+		text,
+		imageCount: 0,
+		imageMimeTypes: [],
+		imageChars: 0,
+		slow: false,
+		sustained: true,
+		deltasPerTurn,
+		turnCount,
+		targetBytes: turnBytes * turnCount,
+	});
+
+	send({ type: "agent_start" });
+	send({ type: "message_start", message: user });
+	send({ type: "message_end", message: user });
+	respond(command);
+
+	const finishWindow = () => {
+		if (activeRun !== run) return;
+		record("arrival_window_end", {
+			commandId: command.id,
+			text,
+			deltaCount: run.emitted,
+			turnCount: run.turnIndex,
+			windowMs: Date.now() - (run.startedAt ?? Date.now()),
+		});
+		activeRun = null;
+	};
+
+	const finishTurn = () => {
+		if (activeRun !== run) return;
+		const final = assistantMessageWithContent([{ type: "text", text: markdown }], "stop");
+		send({
+			type: "message_update",
+			usage: final.usage,
+			assistantMessageEvent: { type: "text_end", contentIndex: 0, content: markdown },
+		});
+		// Let the structural frame drain before the authoritative message_end repeats the text.
+		schedule(run, 20, () => {
+			if (activeRun !== run) return;
+			send({ type: "message_end", message: final });
+			// The lifecycle envelopes stay compact so the turn stays below the snapshot budget.
+			const compactFinal = assistantMessageWithContent([], "stop");
+			send({ type: "turn_end", message: compactFinal, toolResults: [] });
+			messages.push(final);
+			run.parentEntryId = persistMessage(final, run.parentEntryId);
+			send({ type: "agent_end", messages: [compactFinal], willRetry: false });
+			send({ type: "agent_settled" });
+			run.turnIndex += 1;
+			schedule(run, 20, emitTurn);
+		});
+	};
+
+	const emitTurn = () => {
+		if (activeRun !== run) return;
+		run.startedAt ??= Date.now();
+		if (run.turnIndex >= turnCount) {
+			finishWindow();
+			return;
+		}
+		run.deltaIndex = 0;
+		send({ type: "turn_start" });
+		const pending = assistantMessageWithContent([], "pending");
+		send({ type: "message_start", message: pending });
+		send({
+			type: "message_update",
+			usage: pending.usage,
+			assistantMessageEvent: { type: "text_start", contentIndex: 0 },
+		});
+		const emitDelta = () => {
+			if (activeRun !== run) return;
+			if (run.deltaIndex >= deltasPerTurn) {
+				finishTurn();
+				return;
+			}
+			const delta = markdown.slice(run.deltaIndex * chunkBytes, (run.deltaIndex + 1) * chunkBytes);
+			run.deltaIndex += 1;
+			run.emitted += 1;
+			send({
+				type: "message_update",
+				usage: pending.usage,
+				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta },
+			});
+			if (run.emitted === 1 || run.emitted % 32 === 0) {
+				record("delta", { commandId: command.id, text, deltaIndex: run.emitted, targetBytes: turnBytes });
+			}
+			schedule(run, chunkDelayMs, emitDelta);
+		};
+		emitDelta();
+	};
+
+	if (controlDir) {
+		scheduleConsumedSignal(run, text, "start", "benchmark_start_observed", emitTurn);
+	} else {
+		emitTurn();
+	}
+}
+
 function startUnpersistedHotRuntime() {
 	if (activeRun) return;
 	const run = {
@@ -1861,6 +1986,35 @@ function streamPrompt(command) {
 		}[text];
 		if (targetBytes) {
 			streamBudgetPrompt(command, text, user, userEntryId, targetBytes);
+			return;
+		}
+	}
+	if (text.startsWith("E2E_BENCH_SUSTAINED:") && images.length === 0) {
+		const [, rawDeltasPerTurn, rawChunkBytes, rawChunkDelayMs, rawTurnCount] = text.split(":", 6);
+		const deltasPerTurn = Number(rawDeltasPerTurn);
+		const chunkBytes = Number(rawChunkBytes);
+		const chunkDelayMs = Number(rawChunkDelayMs);
+		const turnCount = Number(rawTurnCount);
+		if (
+			Number.isSafeInteger(deltasPerTurn) &&
+			deltasPerTurn > 0 &&
+			deltasPerTurn <= 1024 &&
+			Number.isSafeInteger(chunkBytes) &&
+			chunkBytes >= 64 &&
+			chunkBytes <= 4 * 1024 &&
+			Number.isSafeInteger(chunkDelayMs) &&
+			chunkDelayMs >= 0 &&
+			chunkDelayMs <= 100 &&
+			Number.isSafeInteger(turnCount) &&
+			turnCount > 0 &&
+			chunkBytes * deltasPerTurn >= 10 * 1024
+		) {
+			streamSustainedPrompt(command, text, user, userEntryId, {
+				deltasPerTurn,
+				chunkBytes,
+				chunkDelayMs,
+				turnCount,
+			});
 			return;
 		}
 	}

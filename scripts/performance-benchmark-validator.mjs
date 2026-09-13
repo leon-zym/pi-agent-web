@@ -10,7 +10,7 @@ import {
 } from "./restart-authentication-validator.mjs";
 
 export const BENCHMARK_SCHEMA_VERSION = 2;
-export const BENCHMARK_SUITE_VERSION = 6;
+export const BENCHMARK_SUITE_VERSION = 7;
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(scriptDirectory, "..");
@@ -154,6 +154,7 @@ export const BENCHMARK_PRODUCER_PATHS = Object.freeze(
 		"tests/e2e/benchmarks/recovery.spec.ts",
 		"tests/e2e/benchmarks/restart-authentication-observation.ts",
 		"tests/e2e/benchmarks/streaming.spec.ts",
+		"tests/e2e/benchmarks/sustained-load.spec.ts",
 		"tests/e2e/fixtures/deterministic-pi.mjs",
 		"tests/e2e/fixtures/page-observation.ts",
 		"tests/e2e/fixtures/production-harness.ts",
@@ -221,6 +222,13 @@ const GATE_METRIC_POLICY = Object.freeze(
 			"settlementMs",
 			"sourceBytes",
 			"streamDurationMs",
+			"sustainedAggregateDeltaPerSecond",
+			"sustainedFixtureDeltaCount",
+			"sustainedMinimumDeltaFrames",
+			"sustainedObservedDeltaCount",
+			"sustainedProjectionLagMs",
+			"sustainedScheduledDeltaCount",
+			"sustainedWindowMs",
 			"structuralDomTransitionMs",
 			"totalCompletionMs",
 		].map((metric) => [metric, HARD_GATE_METRICS.has(metric) ? "hard" : "observe"]),
@@ -332,6 +340,18 @@ const CONCURRENCY_SESSION_KEYS = [
 	"started",
 ];
 const SOCKET_KEYS = ["closed", "opened"];
+const SUSTAINED_WINDOW_KEYS = [
+	"arrivalDeltaPerSecond",
+	"declaredWindowMs",
+	"deltasPerTurn",
+	"fixtureDeltaCount",
+	"fixtureWindowMs",
+	"turnCount",
+];
+const SUSTAINED_SESSION_KEYS = ["deltaFrames", "projectionLagMs"];
+const SUSTAINED_FACT_KEYS = ["sessions", "socket", "window"];
+/** The suite already treats this as the floor for a 1000 aggregate delta/s profile. */
+const SUSTAINED_AGGREGATE_DELTA_FLOOR = 800;
 const HISTORY_FACT_KEYS = ["dom", "history", "pi"];
 const HISTORY_DOM_KEYS = ["mountedTurnNodes", "oldestTurnCount"];
 const HISTORY_KEYS = [
@@ -370,6 +390,7 @@ const HISTORY_INITIAL_TURN_WINDOW = 48;
 const OBSERVATION_FACT_KEYS_BY_KIND = {
 	streaming: STREAMING_FACT_KEYS,
 	concurrency: CONCURRENCY_FACT_KEYS,
+	"sustained-load": SUSTAINED_FACT_KEYS,
 	history: HISTORY_FACT_KEYS,
 	"history-mixed": [
 		"fixtureDigest",
@@ -411,6 +432,10 @@ const REQUIRED_HARD_GATES_BY_KIND = Object.freeze({
 		["browserErrors", "value", "eq", 0],
 		["browserProjectionCheckpointDeficit", "max", "lte", 0],
 		["backgroundIngestCheckpointDeficit", "max", "lte", 0],
+	],
+	"sustained-load": [
+		["correctnessFailures", "value", "eq", 0],
+		["browserErrors", "value", "eq", 0],
 	],
 	history: [
 		["correctnessFailures", "value", "eq", 0],
@@ -1347,6 +1372,45 @@ function validateObservationFacts(value, kind, label, errors) {
 		validateSocketFact(value.socket, `${label}.facts.socket`, errors);
 		return;
 	}
+	if (kind === "sustained-load") {
+		if (!Array.isArray(value.sessions) || value.sessions.length === 0) {
+			errors.push(`${label}.facts.sessions must be a non-empty array`);
+		} else {
+			for (const [index, observation] of value.sessions.entries()) {
+				const sessionLabel = `${label}.facts.sessions[${String(index)}]`;
+				if (!exactKeys(observation, SUSTAINED_SESSION_KEYS)) {
+					errors.push(`${sessionLabel} has invalid keys`);
+					continue;
+				}
+				validateNonnegativeInteger(observation.deltaFrames, `${sessionLabel}.deltaFrames`, errors);
+				validateNonnegativeNumber(observation.projectionLagMs, `${sessionLabel}.projectionLagMs`, errors);
+			}
+		}
+		validateSocketFact(value.socket, `${label}.facts.socket`, errors);
+		if (!exactKeys(value.window, SUSTAINED_WINDOW_KEYS)) {
+			errors.push(`${label}.facts.window has invalid keys`);
+			return;
+		}
+		validateNonnegativeInteger(
+			value.window.arrivalDeltaPerSecond,
+			`${label}.facts.window.arrivalDeltaPerSecond`,
+			errors,
+		);
+		validateNonnegativeInteger(
+			value.window.declaredWindowMs,
+			`${label}.facts.window.declaredWindowMs`,
+			errors,
+		);
+		validateNonnegativeInteger(value.window.deltasPerTurn, `${label}.facts.window.deltasPerTurn`, errors);
+		validateNonnegativeInteger(value.window.turnCount, `${label}.facts.window.turnCount`, errors);
+		validateNonnegativeInteger(
+			value.window.fixtureDeltaCount,
+			`${label}.facts.window.fixtureDeltaCount`,
+			errors,
+		);
+		validateNonnegativeNumber(value.window.fixtureWindowMs, `${label}.facts.window.fixtureWindowMs`, errors);
+		return;
+	}
 	if (kind === "history") {
 		if (!exactKeys(value.dom, HISTORY_DOM_KEYS)) errors.push(`${label}.facts.dom has invalid keys`);
 		else
@@ -1488,7 +1552,7 @@ export function benchmarkMetricPolicy(metric) {
 						? "chars"
 						: metric === "streamingDomMutationPerDeltaRatio"
 							? "ratio"
-							: metric === "aggregateDeltaPerSecond"
+							: metric.endsWith("DeltaPerSecond")
 								? "events/s"
 								: "count";
 	return {
@@ -1496,7 +1560,9 @@ export function benchmarkMetricPolicy(metric) {
 		unit,
 		direction: ["childGeneration", "deltaCount", "inputBase64Chars", "sourceBytes"].includes(metric)
 			? "none"
-			: metric === "aggregateDeltaPerSecond"
+			: metric === "aggregateDeltaPerSecond" ||
+					metric === "sustainedAggregateDeltaPerSecond" ||
+					metric === "sustainedMinimumDeltaFrames"
 				? "higher"
 				: "lower",
 		floor: unit === "ms" ? 50 : unit === "bytes" ? 5 * 1024 * 1024 : 0,
@@ -2062,6 +2128,48 @@ function deriveCorrectness(observation, definition) {
 			allSessionsObservedTwice: (sessions?.minimumProjectionCheckpoints ?? -1) >= 2,
 			backgroundSessionsIngestedBetweenSwitches:
 				expected === 1 || (sessions?.minimumBackgroundCheckpoints ?? -1) >= 2,
+			singleMultiplexedSocket: socket?.opened === 1 && socket.closed === 0,
+		};
+	} else if (definition.kind === "sustained-load") {
+		const sessions = Array.isArray(facts?.sessions) ? facts.sessions : [];
+		const socket = facts?.socket;
+		const window = facts?.window;
+		const expected = definition.sessions ?? 0;
+		const declaredRate = definition.arrivalDeltaPerSecond;
+		const declaredWindow = definition.sustainedWindowMs;
+		const declaredDeltasPerTurn = definition.deltasPerTurn;
+		// The runtime bounds live projection events per active turn, so the schedule is delivered as
+		// consecutive settled turns and the emitted count is the turn count times the turn size.
+		const derived =
+			declaredRate !== undefined &&
+			declaredWindow !== undefined &&
+			declaredDeltasPerTurn !== undefined &&
+			declaredDeltasPerTurn > 0
+				? {
+						turnCount: Math.ceil(Math.floor((declaredRate * declaredWindow) / 1_000) / declaredDeltasPerTurn),
+						emitted:
+							Math.ceil(Math.floor((declaredRate * declaredWindow) / 1_000) / declaredDeltasPerTurn) *
+							declaredDeltasPerTurn,
+					}
+				: null;
+		correctness = {
+			allSessionsObserved: expected > 0 && sessions.length === expected,
+			fixtureEmittedDeclaredSchedule:
+				derived !== null &&
+				window?.turnCount === derived.turnCount &&
+				window?.fixtureDeltaCount === derived.emitted,
+			fixtureWindowCovered:
+				isFiniteNumber(window?.fixtureWindowMs) &&
+				window.fixtureWindowMs >= (declaredWindow ?? Number.POSITIVE_INFINITY),
+			sustainedScheduleHeld:
+				derived !== null &&
+				sessions.length === expected &&
+				sessions.every((observation) => (observation?.deltaFrames ?? -1) >= derived.emitted),
+			projectionsConverged:
+				sessions.length === expected &&
+				sessions.every(
+					(observation) => isFiniteNumber(observation?.projectionLagMs) && observation.projectionLagMs >= 0,
+				),
 			singleMultiplexedSocket: socket?.opened === 1 && socket.closed === 0,
 		};
 	} else if (definition.kind === "history") {

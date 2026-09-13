@@ -58,6 +58,18 @@
 					"chunkDelayMs": 8,
 					"warmups": 1,
 					"samples": 8
+				},
+				{
+					"id": "sessions-8-sustained",
+					"kind": "sustained-load",
+					"sessions": 8,
+					"chunkBytes": 64,
+					"chunkDelayMs": 8,
+					"arrivalDeltaPerSecond": 125,
+					"sustainedWindowMs": 60000,
+					"warmups": 1,
+					"samples": 3,
+					"deltasPerTurn": 500
 				}
 			]
 		}
