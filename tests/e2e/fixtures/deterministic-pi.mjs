@@ -1066,8 +1066,10 @@ function streamBudgetPrompt(
 
 /**
  * Fixed-duration arrival window. The runtime bounds live projection events per active turn, so a
- * sustained profile is emitted as consecutive settled turns, which is what a real agent produces.
- * The window duration is a measured consequence of the declared delta schedule.
+ * sustained profile arrives as consecutive complete runs, which is what a session receiving a
+ * stream of prompts looks like. Every turn is a legal run: user message, `agent_start`, one
+ * `turn_start`/`turn_end` pair, then `agent_end` and `agent_settled`, so the run boundary is real
+ * rather than an orphan turn. The window duration is a measured consequence of the schedule.
  */
 function streamSustainedPrompt(
 	command,
@@ -1102,10 +1104,6 @@ function streamSustainedPrompt(
 		turnCount,
 		targetBytes: turnBytes * turnCount,
 	});
-
-	send({ type: "agent_start" });
-	send({ type: "message_start", message: user });
-	send({ type: "message_end", message: user });
 	respond(command);
 
 	const finishWindow = () => {
@@ -1132,7 +1130,7 @@ function streamSustainedPrompt(
 		schedule(run, 20, () => {
 			if (activeRun !== run) return;
 			send({ type: "message_end", message: final });
-			// The lifecycle envelopes stay compact so the turn stays below the snapshot budget.
+			// The lifecycle envelopes stay compact so the run stays below the snapshot budget.
 			const compactFinal = assistantMessageWithContent([], "stop");
 			send({ type: "turn_end", message: compactFinal, toolResults: [] });
 			messages.push(final);
@@ -1151,6 +1149,14 @@ function streamSustainedPrompt(
 			finishWindow();
 			return;
 		}
+		// Every turn is its own run: a fresh user message opens it and `agent_start` marks the run.
+		const userContent = [{ type: "text", text: `${text} run ${String(run.turnIndex)}` }];
+		const turnUser = { ...user, content: userContent, timestamp: Date.now() };
+		messages.push(turnUser);
+		run.parentEntryId = persistMessage(turnUser, run.parentEntryId);
+		send({ type: "message_start", message: turnUser });
+		send({ type: "message_end", message: turnUser });
+		send({ type: "agent_start" });
 		run.deltaIndex = 0;
 		send({ type: "turn_start" });
 		const pending = assistantMessageWithContent([], "pending");

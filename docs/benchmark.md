@@ -25,14 +25,18 @@ than whether a fixed payload finishes. The scenario declares `arrivalDeltaPerSec
 `sustainedWindowMs`, `sessions`, `chunkBytes`, `chunkDelayMs`, and `deltasPerTurn`.
 
 The runtime bounds live projection events per active turn, so the fixture delivers the window as
-consecutive settled turns, which is what a real agent produces. The emitted per-Session count is
-therefore the declared window divided into turns of `deltasPerTurn`, rounded up, and the window
+consecutive complete runs: each one opens with a user message and `agent_start`, emits one
+`turn_start`/`turn_end` pair, and closes with `agent_end` and `agent_settled`. The emitted per-Session
+count is the declared window divided into turns of `deltasPerTurn`, rounded up, and the window
 duration is a measured consequence of that schedule rather than an input to emission.
 
-Every subscribed Session must receive at least the emitted count, and the fixture must have reported
-a window at least as long as the declared one. Both are correctness claims, so a short schedule fails
-the shared `correctnessFailures` hard gate; the achieved aggregate rate and the worst-Session
-projection lag sampled mid-window stay diagnostic.
+Every subscribed Session must receive at least the emitted count, and each Session's own window must
+fall between the declared duration and twice it. One long Session cannot stand in for the others,
+because the bound is per Session rather than a window maximum. The DOM must already show a settled run
+at the sampled midpoint, so a window that arrives without reaching the conversation fails. These are
+correctness claims, so a short or overrunning schedule fails the shared `correctnessFailures` hard
+gate; the achieved aggregate rate and the worst-Session projection lag sampled mid-window stay
+diagnostic.
 
 ## Comparison
 

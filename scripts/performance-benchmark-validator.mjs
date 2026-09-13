@@ -225,10 +225,12 @@ const GATE_METRIC_POLICY = Object.freeze(
 			"sustainedAggregateDeltaPerSecond",
 			"sustainedDeltaPerTurn",
 			"sustainedFixtureDeltaCount",
+			"sustainedMidWindowSettledTurns",
 			"sustainedMinimumDeltaFrames",
 			"sustainedObservedDeltaCount",
 			"sustainedProjectionLagMs",
 			"sustainedScheduledDeltaCount",
+			"sustainedShortestWindowMs",
 			"sustainedTurnCount",
 			"sustainedWindowMs",
 			"structuralDomTransitionMs",
@@ -348,9 +350,10 @@ const SUSTAINED_WINDOW_KEYS = [
 	"deltasPerTurn",
 	"fixtureDeltaCount",
 	"fixtureWindowMs",
+	"midWindowSettledTurns",
 	"turnCount",
 ];
-const SUSTAINED_SESSION_KEYS = ["deltaFrames", "projectionLagMs"];
+const SUSTAINED_SESSION_KEYS = ["deltaFrames", "projectionLagMs", "windowMs"];
 const SUSTAINED_FACT_KEYS = ["sessions", "socket", "window"];
 /**
  * A sustained window may overrun its declared duration under real load, but a large multiple means
@@ -1390,6 +1393,7 @@ function validateObservationFacts(value, definition, label, errors) {
 				}
 				validateNonnegativeInteger(observation.deltaFrames, `${sessionLabel}.deltaFrames`, errors);
 				validateNonnegativeNumber(observation.projectionLagMs, `${sessionLabel}.projectionLagMs`, errors);
+				validateNonnegativeNumber(observation.windowMs, `${sessionLabel}.windowMs`, errors);
 			}
 		}
 		validateSocketFact(value.socket, `${label}.facts.socket`, errors);
@@ -1409,6 +1413,11 @@ function validateObservationFacts(value, definition, label, errors) {
 		);
 		validateNonnegativeInteger(value.window.deltasPerTurn, `${label}.facts.window.deltasPerTurn`, errors);
 		validateNonnegativeInteger(value.window.turnCount, `${label}.facts.window.turnCount`, errors);
+		validateNonnegativeInteger(
+			value.window.midWindowSettledTurns,
+			`${label}.facts.window.midWindowSettledTurns`,
+			errors,
+		);
 		validateNonnegativeInteger(
 			value.window.fixtureDeltaCount,
 			`${label}.facts.window.fixtureDeltaCount`,
@@ -2102,6 +2111,7 @@ function sustainedLoadMetrics(f) {
 	const windowMs = f.window.fixtureWindowMs;
 	return {
 		sustainedWindowMs: windowMs,
+		sustainedShortestWindowMs: Math.min(...f.sessions.map((s) => s.windowMs)),
 		sustainedDeltaPerTurn: f.window.deltasPerTurn,
 		sustainedTurnCount: f.window.turnCount,
 		sustainedScheduledDeltaCount: f.window.turnCount * f.window.deltasPerTurn,
@@ -2109,6 +2119,7 @@ function sustainedLoadMetrics(f) {
 		sustainedObservedDeltaCount: observed,
 		sustainedAggregateDeltaPerSecond: windowMs > 0 ? (observed * 1_000) / windowMs : 0,
 		sustainedMinimumDeltaFrames: Math.min(...f.sessions.map((s) => s.deltaFrames)),
+		sustainedMidWindowSettledTurns: f.window.midWindowSettledTurns,
 		sustainedProjectionLagMs: Math.max(0, ...f.sessions.map((s) => s.projectionLagMs)),
 	};
 }
@@ -2196,14 +2207,25 @@ function deriveCorrectness(observation, definition) {
 			fixtureWindowCovered:
 				isFiniteNumber(window?.fixtureWindowMs) &&
 				window.fixtureWindowMs >= (declaredWindow ?? Number.POSITIVE_INFINITY),
-			sustainedWindowBounded:
-				isFiniteNumber(window?.fixtureWindowMs) &&
-				declaredWindow !== undefined &&
-				window.fixtureWindowMs <= declaredWindow * SUSTAINED_WINDOW_TOLERANCE,
 			sustainedScheduleHeld:
 				derived !== null &&
 				sessions.length === expected &&
 				sessions.every((observation) => (observation?.deltaFrames ?? -1) >= derived.emitted),
+			// At least one completed run must be projected by the sampled midpoint, so the window is not
+			// merely receiving frames that never reach the conversation.
+			midWindowProjectedRun: (window?.midWindowSettledTurns ?? 0) >= 1,
+			// Every Session must sustain its own window: one long Session cannot stand in for the
+			// others, so each is bounded individually rather than through the window maximum.
+			sustainedPerSessionWindow:
+				derived !== null &&
+				declaredWindow !== undefined &&
+				sessions.length === expected &&
+				sessions.every(
+					(observation) =>
+						isFiniteNumber(observation?.windowMs) &&
+						observation.windowMs >= declaredWindow &&
+						observation.windowMs <= declaredWindow * SUSTAINED_WINDOW_TOLERANCE,
+				),
 			singleMultiplexedSocket: socket?.opened === 1 && socket.closed === 0,
 		};
 	} else if (definition.kind === "history") {

@@ -25,13 +25,10 @@ A five-Turn recipe mixes prose, fenced code, tool-call/result chains, collapsed 
 list/table Markdown. Four individual Markdown blocks are 10/64/120 KiB and 1 MiB; these are
 not multiplied by every Turn. No real history or provider output is used.
 
-Representative adds one 1,000-Turn bounded-mount cycle per publication variant. Stress declared
+Representative adds one 1,000-Turn bounded-mount cycle per publication variant. Stress declares
 two sizes × two publication variants × bounded/full mounting × (one warmup + three measured
-cycles): 32 independent cycles, 24 measured. That declaration belonged to suite version 6; suite
-version 7 removes the 5,000-Turn full-mount cell, which could not complete inside the 120 second
-per-cycle safety cap. [benchmark.md](../benchmark.md) owns the current declared workload, and
-`matrix.json`'s `knownCoverageGaps` owns the current gap list. Mode order is fixed within each size:
-coalesced bounded/full,
+cycles): 32 independent cycles, 24 measured. This is a declared workload, not a claim that the
+full stress matrix has passed. Mode order is fixed within each size: coalesced bounded/full,
 sequential full/bounded. Each cycle owns one fresh Browser context and Gateway; the
 Browser executable and OS disk cache may be reused. Full mounting is a compile-time benchmark
 control using the same TurnView. The ordinary production executable scan must exclude the control.
@@ -60,12 +57,10 @@ missing actions, duplicate/gapped pages, Browser errors or inconsistent raw-to-s
 cannot become zero-valued success. A B-only development run remains partial; it cannot replace
 formal stress completeness or the 800 measured recovery trials.
 
-Suite 6 established a dual-environment reference cohort across GitHub Actions and local hosts.
-Those references were frozen at commit `7e0ca3e3738b31183b0661ed425f4d27b48d20bf` and registered in
-`tests/e2e/benchmarks/references.json`. Suite version 7 changes the declared workload, so every
-suite-6 reference becomes `INCOMPATIBLE` and a fresh cohort must be collected before strict
-completion budgets are claimed again. [benchmark.md](../benchmark.md) owns the current registration
-and admission contract.
+Suite 6 establishes a dual-environment reference cohort across GitHub Actions and local hosts.
+Accepted Suite 6 references are frozen at commit `7e0ca3e3738b31183b0661ed425f4d27b48d20bf`
+and registered in `tests/e2e/benchmarks/references.json`. The six completion medians and
+`completion-median-v1` policy remain active across both environments.
 
 ## Recovery scope (introduced in suite version 5)
 
@@ -87,9 +82,8 @@ budget the directory-read/shutdown overlap.
 Version 5 and changed matrix provenance reject old bundles as current evidence. Historical artifacts,
 including the invalid local reference-2, remain unchanged; a new frozen source requires a new complete
 cohort. The previously inspected holdout cannot validate a newly selected budget policy. Strict
-completion budgets use the policy below; the suite-6 local and Actions references were registered in
-`tests/e2e/benchmarks/references.json` and are superseded by suite version 7's workload change.
-`liveLongTasksOver50Ms` is a count (zero
+completion budgets use the policy below; the accepted suite-6 local and Actions references are
+registered in `tests/e2e/benchmarks/references.json`. `liveLongTasksOver50Ms` is a count (zero
 additive floor), not a duration;
 its suffix describes the 50 ms threshold. Other metric dimensions and diagnostic modes are unchanged.
 
@@ -108,9 +102,8 @@ compatible inputs receive a budget result. Incompatible inputs exit 0 with an ex
 mandatory correctness without claiming a timing pass. The original `--baseline` diagnostic command
 and its exit codes remain unchanged.
 
-`tests/e2e/benchmarks/references.json` keeps independent Actions and local sets. Both sets were
-active at the suite-6 source `7e0ca3e3738b31183b0661ed425f4d27b48d20bf`, superseded by the suite-7
-source `43e3be14a4113b8d9cbd7f836e5bd8955d8d281e`.
+`tests/e2e/benchmarks/references.json` keeps independent Actions and local sets. Both sets are
+active at frozen source `7e0ca3e3738b31183b0661ed425f4d27b48d20bf`.
 A `{"status":"pending"}` set validates target raw data and reports that references are not
 established. An active set has exactly `status`, `source` (frozen source commit), `artifactId`,
 `sha256` (digest of the entire ZIP), `reference1` and `reference2` (distinct, predetermined run IDs).
@@ -130,10 +123,9 @@ corrupt active evidence fails; it never becomes pending automatically. Retain th
 before GitHub artifact expiry. Any replacement locator must be explicitly reviewed and preserve the
 fixed evidence; an expired locator remains a setup failure until that update is accepted.
 
-Strict evaluation requires a Git checkout with the reviewed reference source object named by the
-active descriptor. For the suite-7 references that is
-`43e3be14a4113b8d9cbd7f836e5bd8955d8d281e`. Local evaluation is offline; if the object is missing,
-explicitly run `git fetch --depth=1 origin 43e3be14a4113b8d9cbd7f836e5bd8955d8d281e` first.
+Strict evaluation requires a Git checkout with the reviewed reference source object
+`7e0ca3e3738b31183b0661ed425f4d27b48d20bf`. Local evaluation is offline; if the object is missing,
+explicitly run `git fetch --depth=1 origin 7e0ca3e3738b31183b0661ed425f4d27b48d20bf` first.
 An anonymous source export without Git objects is not supported by this resolver. CI fetches the
 fixed source from the existing origin; no additional permission or reference archive override is used.
 
@@ -580,8 +572,7 @@ Suite version 4 retains the streaming measurement contract introduced in suite v
 and keeps artifact schema version 2.
 The historical tables above and checked-in calibration file retain their original names and values;
 they are not current-suite calibration. Comparisons reject unsupported suite versions and changed
-producer hashes. Suite-6 references were registered separately in `tests/e2e/benchmarks/references.json` and are
-superseded by the suite version 7 workload change.
+producer hashes. Current suite-6 references are registered separately in `tests/e2e/benchmarks/references.json`.
 
 | Current metric | Exact observation boundary |
 | --- | --- |
@@ -684,9 +675,8 @@ have no performance direction and are also excluded.
 
 All numerical tables above and `baselines/reference-linux-x64.json` retain their historical
 2026-09-06 semantics, including the old common floor and pooled CPU models. That file is
-`INCOMPATIBLE` with the new comparator; it has not been silently recalibrated. Suite-6
-references were registered separately in `tests/e2e/benchmarks/references.json` and are
-superseded by the suite version 7 workload change.
+`INCOMPATIBLE` with the new comparator; it has not been silently recalibrated. Accepted suite-6
+references are registered separately in `tests/e2e/benchmarks/references.json`.
 
 ### Manual representative calibration collection
 
@@ -721,29 +711,28 @@ Apply the same ordering and comparison rules. Never pool local and Actions absol
 Collecting three bundles does not itself establish calibrated budgets: review repeatability and
 holdout observations separately. Strict budget enforcement remains separate from this entry point.
 
-### Suite 7 Dual-Environment Registered Calibration
+### Suite 6 Dual-Environment Registered Calibration
 
-Following the suite version 7 workload re-freeze at commit
-`43e3be14a4113b8d9cbd7f836e5bd8955d8d281e`, three representative calibration runs
-(`reference-1`, `reference-2`, and `holdout`) were collected separately on GitHub Actions Linux VM
-and on Local Host macOS (Apple M2).
+Following Issue #28 Subtask B and Subtask C merge at frozen commit `7e0ca3e3738b31183b0661ed425f4d27b48d20bf`,
+three representative calibration runs (`reference-1`, `reference-2`, and `holdout`) were collected
+separately on GitHub Actions Linux VM and on Local Host macOS (Apple M2).
 
-Both cohorts passed all deterministic hard gates and the strict six-median completion budget:
+Both cohorts passed all deterministic hard gates and timing budgets:
 
 1. **GitHub Actions (Linux VM `linux-x64-gh-standard`)**:
-   - Run ID: `34760698905`
-   - Artifact ID: `10319366473`
-   - Artifact SHA256: `8371afb11d2c6fe72bbf7bd4b6199a246235dcd23080ce5c07e6793e87662a06`
-   - Reference 1: `calibration-34760698905-1-reference-1`
-   - Reference 2: `calibration-34760698905-1-reference-2`
-   - Holdout: `calibration-34760698905-1-holdout` (Performance budget: OK against both references)
+   - Run ID: `34427669069` (Job ID: `102716245592`)
+   - Artifact ID: `10133827628`
+   - Archive SHA256: `ac7bc1e1766b1fd75b5f20eca716adf1c305b02a69d3db79cc67d1b8109bd6e1`
+   - Reference 1: `calibration-34427669069-1-reference-1`
+   - Reference 2: `calibration-34427669069-1-reference-2`
+   - Holdout: `calibration-34427669069-1-holdout` (Status: OK against both references)
 
 2. **Local Host (macOS Darwin Apple M2, `local-host-v1`)**:
-   - Batch ID: `local-20260913t134517z-suite7`
-   - Archive SHA256: `98faf56f179f1c1726f8efbaa28fa361bdb358d9af92db75ac19a521fe0141c3`
-   - Reference 1: `local-20260913t134517z-suite7-reference-1`
-   - Reference 2: `local-20260913t134517z-suite7-reference-2`
-   - Holdout: `local-20260913t134517z-suite7-holdout` (Performance budget: OK against both references)
+   - Batch ID: `local-20260910t023122z-suite6`
+   - Archive SHA256: `2635bed323ee0085af4a52504e3068a6ddeaaf6793b9e1de8471f18d2282f256`
+   - Reference 1: `local-20260910t023122z-suite6-reference-1`
+   - Reference 2: `local-20260910t023122z-suite6-reference-2`
+   - Holdout: `local-20260910t023122z-suite6-holdout` (Status: OK against both references)
 
 The raw directories remain the machine-readable record under `test-results/performance/representative/`
 and the downloaded Actions archive. The tables below restate the six strict series from those
@@ -753,34 +742,35 @@ p95 is reported for completeness and is diagnostic.
 
 #### GitHub Actions cohort (`linux-x64-gh-standard`)
 
-Environment: Ubuntu 24.04, x64, 4 logical vCPUs, Node `v22.23.2`, pnpm `11.21.0`,
-Playwright `1.62.1`, Chromium `151.0.7922.34`. Artifact:
-[run 34760698905, artifact 10319366473](https://github.com/leon-zym/pi-agent-web/actions/runs/34760698905/artifacts/10319366473).
+Environment: Ubuntu 24.04, kernel 6.17.0-1022-azure, x64, 4 logical vCPUs
+(`AMD EPYC 7763 64-Core Processor`), 16 GiB RAM, Node `v22.23.2`, pnpm `11.21.0`, Playwright
+`1.62.1`, Chromium `151.0.7922.34`. Artifact:
+[run 34427669069, artifact 10133827628](https://github.com/leon-zym/pi-agent-web/actions/runs/34427669069/artifacts/10133827628).
 
 | Series | Metric | Reference 1 median | Reference 1 p95 | Reference 2 median | Reference 2 p95 | Holdout median | Holdout p95 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `streaming:stream-1m:coalesced` | `totalCompletionMs` | 6015.7 | 6300.2 | 5107.8 | 5137.9 | 5193.4 | 5326.7 |
-| `streaming:stream-1m:sequential` | `totalCompletionMs` | 5597.1 | 5647.2 | 5440.4 | 5636.5 | 5684.9 | 6413.5 |
-| `concurrency:sessions-4:coalesced` | `totalCompletionMs` | 9955.6 | 12042.7 | 10017.2 | 11907.6 | 10080.5 | 11994.3 |
-| `concurrency:sessions-4:sequential` | `totalCompletionMs` | 9972.3 | 12197.6 | 10252.7 | 12251.8 | 10084.9 | 12413.1 |
-| `content:content-roundtrip:coalesced` | `roundTripMs` | 524.2 | 545.1 | 519.9 | 520.2 | 519.0 | 544.9 |
-| `content:content-roundtrip:sequential` | `roundTripMs` | 519.5 | 544.5 | 521.6 | 533.4 | 510.5 | 549.0 |
+| `streaming:stream-1m:coalesced` | `totalCompletionMs` | 5430.1 | 6141.0 | 5409.5 | 6291.2 | 5509.7 | 6447.4 |
+| `streaming:stream-1m:sequential` | `totalCompletionMs` | 5578.2 | 5658.9 | 5896.0 | 6011.8 | 5272.8 | 5550.0 |
+| `concurrency:sessions-4:coalesced` | `totalCompletionMs` | 10289.8 | 12309.0 | 10203.9 | 12374.5 | 11126.6 | 13125.4 |
+| `concurrency:sessions-4:sequential` | `totalCompletionMs` | 10160.0 | 12627.0 | 10788.0 | 12711.7 | 10273.2 | 12601.8 |
+| `content:content-roundtrip:coalesced` | `roundTripMs` | 537.3 | 547.6 | 533.4 | 558.6 | 535.2 | 541.7 |
+| `content:content-roundtrip:sequential` | `roundTripMs` | 534.5 | 555.9 | 531.7 | 564.8 | 520.2 | 530.1 |
 
 #### Local host cohort (`local-host-v1`)
 
-Environment: Darwin 27.0.0, arm64, 8 logical cores (`Apple M2`), 24 GiB RAM, Node `v24.21.0`,
-pnpm `12.4.1`, Playwright `1.62.1`, Chromium `151.0.7922.34`. Linux cgroup CPU quota is
+Environment: Darwin 27.0.0, arm64, 8 logical cores (`Apple M2`), 24 GiB RAM, Node `v24.20.0`,
+pnpm `11.21.0`, Playwright `1.62.1`, Chromium `151.0.7922.34`. Linux cgroup CPU quota is
 inapplicable on Darwin and is recorded as `unavailable`. Local bundles live under
-`test-results/performance/representative/local-20260913t134517z-suite7-*`.
+`test-results/performance/representative/local-20260910t023122z-suite6-*`.
 
 | Series | Metric | Reference 1 median | Reference 1 p95 | Reference 2 median | Reference 2 p95 | Holdout median | Holdout p95 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `streaming:stream-1m:coalesced` | `totalCompletionMs` | 3341.2 | 3438.1 | 3326.8 | 3329.8 | 3349.3 | 3399.7 |
-| `streaming:stream-1m:sequential` | `totalCompletionMs` | 3346.3 | 3715.1 | 3296.8 | 3591.7 | 3340.3 | 3343.9 |
-| `concurrency:sessions-4:coalesced` | `totalCompletionMs` | 5572.7 | 5763.7 | 5333.7 | 5689.1 | 5607.0 | 5811.5 |
-| `concurrency:sessions-4:sequential` | `totalCompletionMs` | 5804.4 | 5808.0 | 5530.4 | 5790.7 | 5536.2 | 5873.9 |
-| `content:content-roundtrip:coalesced` | `roundTripMs` | 181.1 | 183.7 | 171.9 | 188.9 | 173.2 | 185.0 |
-| `content:content-roundtrip:sequential` | `roundTripMs` | 195.7 | 208.1 | 179.5 | 186.1 | 169.9 | 180.7 |
+| `streaming:stream-1m:coalesced` | `totalCompletionMs` | 3409.9 | 4442.5 | 3340.1 | 3393.7 | 3308.7 | 3332.7 |
+| `streaming:stream-1m:sequential` | `totalCompletionMs` | 3264.1 | 3305.4 | 3299.0 | 3348.4 | 3295.1 | 3330.4 |
+| `concurrency:sessions-4:coalesced` | `totalCompletionMs` | 5813.3 | 5822.9 | 5377.6 | 5773.1 | 5622.5 | 5778.9 |
+| `concurrency:sessions-4:sequential` | `totalCompletionMs` | 5618.8 | 5741.3 | 5303.8 | 5664.8 | 5612.4 | 5780.0 |
+| `content:content-roundtrip:coalesced` | `roundTripMs` | 171.2 | 171.9 | 175.9 | 180.3 | 168.9 | 170.9 |
+| `content:content-roundtrip:sequential` | `roundTripMs` | 174.2 | 177.6 | 170.8 | 180.8 | 177.7 | 180.5 |
 
 Absolute values are not portable between the two cohorts and must not be pooled. Three samples
 cannot establish a distribution; the p95 column above is the observed maximum, and the diagnostic
@@ -807,35 +797,31 @@ residual Phase 2 workload items are carried by
 
 ### Declared in `matrix.json`
 
-The Phase 1 representative baseline declared these gaps. `matrix.json`'s `knownCoverageGaps` is the
-authoritative current list; it now also records the 5,000-Turn full-mount boundary, the recovery
-fault-state coverage gap, and the missing cross-layer resource measurements, and it no longer
-carries the sustained-arrival-rate entry that suite version 7 implements.
+The Phase 1 representative baseline has the following 6 declared coverage gaps:
 
 1. A deliberately slow raw WebSocket client and concurrent history/command fairness are not yet benchmarked.
 2. Generic typed content-root references are covered by the default Browser gate but are not benchmarked as a separate performance scenario; this suite measures production attachment refs.
 3. Browser-triggered history cancellation and post-cancel process/heap release are not yet measured; the server cancellation contract is covered separately.
-4. Stress concurrency reports actual arrival rate. The `sustained-load` scenario declares a fixed 60 second window at 125 delta/s per Session across 8 Sessions, so the achieved aggregate rate is bounded at half the declared schedule; an independently certified uninterrupted 1,000 aggregate delta/s ceiling remains unmeasured.
+4. Stress concurrency uses synchronized repeated finite 1 MiB turns and reports actual arrival rate; it does not yet certify an uninterrupted 60 second 1000 delta/s arrival rate.
 5. The deterministic Pi fixture proves repeatable protocol behavior, not real-provider or heterogeneous reference-host performance.
 6. Multiple Browser clients sharing the same Gateway and adversarial socket backpressure remain outside Phase 1.
 
+A seventh entry in the same file records the Gateway restart performance deferral to #105.
+
 ### Additional Phase 2 gaps
 
-These were required by the original Issue #28 scope and are carried by
-[Issue #117](https://github.com/leon-zym/pi-agent-web/issues/117). Suite version 7 implements the
-sustained-load arrival window and removes the unmeasurable 5,000-Turn full-mount cell; the
-authoritative current list lives in `matrix.json`'s `knownCoverageGaps`. What follows records the
-state as observed during Phase 1.
+These were required by the original Issue #28 scope, have no implemented evidence, and have no
+recorded scope decision on the closed issue. Changing `matrix.json` would invalidate the registered
+suite-6 references, because the matrix hash is part of the compared workload identity, so they are
+recorded here and carried by #117 rather than edited into the frozen matrix.
 
-7. **Sustained-load profile.** No scenario implemented a fixed-rate arrival window of up to 1,000
-   aggregate delta events per second for 60 seconds. `aggregateDeltaPerSecond` was observed
-   throughput over synchronized finite turns, not a scheduled sustained profile. Suite version 7
-   adds the declared `sustained-load` scenario.
-8. **Mixed-history 5,000-Turn full mounting.** `history-mixed-5000-full` was declared required in
-   `matrix/history.json` but the 120 second per-cycle watchdog closed the browser context mid-cycle
-   (approximately 122 seconds in both publication variants). Suite version 7 removes that cell and
-   records the cost-curve boundary, because the cell could not produce a complete validating
-   artifact within the safety cap.
+7. **Sustained-load profile.** No scenario implements a fixed-rate arrival window of up to 1,000
+   aggregate delta events per second for 60 seconds. `aggregateDeltaPerSecond` is observed
+   throughput over synchronized finite turns, not a scheduled sustained profile.
+8. **Mixed-history 5,000-Turn full mounting.** `history-mixed-5000-full` is declared required in
+   `matrix/history.json` but the 120 second per-cycle watchdog closes the browser context mid-cycle
+   (approximately 122 seconds in both publication variants). The cell cannot produce a complete
+   validating artifact within the safety cap, and it is not listed in `matrix.json`'s gap list.
 9. **Recovery fault-state coverage.** Faults are injected only during active text streaming. Fault
    injection during thinking, tool execution, queued input, and blocking Extension UI is not
    implemented, and the named `retry count` and terminal `degraded state` metrics are absent from

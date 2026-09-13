@@ -133,10 +133,11 @@ export interface BenchmarkConcurrencyObservationFacts {
 }
 
 export interface BenchmarkSustainedLoadObservationFacts {
-	/** Per-Session Browser frame arrivals observed across the declared window. */
+	/** Per-Session Browser frame arrivals and arrival window observed for the declared schedule. */
 	sessions: Array<{
 		deltaFrames: number;
 		projectionLagMs: number;
+		windowMs: number;
 	}>;
 	socket: {
 		closed: number;
@@ -148,6 +149,7 @@ export interface BenchmarkSustainedLoadObservationFacts {
 		deltasPerTurn: number;
 		fixtureDeltaCount: number;
 		fixtureWindowMs: number;
+		midWindowSettledTurns: number;
 		turnCount: number;
 	};
 }

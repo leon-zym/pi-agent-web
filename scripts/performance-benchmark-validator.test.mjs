@@ -559,6 +559,7 @@ function sustainedObservation(definition) {
 			sessions: Array.from({ length: definition.sessions ?? 0 }, () => ({
 				deltaFrames: turnCount * (definition.deltasPerTurn ?? 1),
 				projectionLagMs: 120,
+				windowMs: definition.sustainedWindowMs ?? 0,
 			})),
 			socket: { closed: 0, opened: 1 },
 			window: {
@@ -567,6 +568,7 @@ function sustainedObservation(definition) {
 				deltasPerTurn: definition.deltasPerTurn ?? 0,
 				fixtureDeltaCount: turnCount * (definition.deltasPerTurn ?? 1),
 				fixtureWindowMs: definition.sustainedWindowMs ?? 0,
+				midWindowSettledTurns: 3,
 				turnCount,
 			},
 		},
@@ -601,7 +603,8 @@ function correctnessFor(definition) {
 							"allSessionsObserved",
 							"fixtureEmittedDeclaredSchedule",
 							"fixtureWindowCovered",
-							"sustainedWindowBounded",
+							"midWindowProjectedRun",
+							"sustainedPerSessionWindow",
 							"sustainedScheduleHeld",
 							"singleMultiplexedSocket",
 						]
@@ -732,6 +735,7 @@ function validResult(variant, definition) {
 		const facts = sustainedObservation(definition).facts;
 		const metrics = {
 			sustainedWindowMs: facts.window.fixtureWindowMs,
+			sustainedShortestWindowMs: Math.min(...facts.sessions.map((s) => s.windowMs)),
 			sustainedDeltaPerTurn: facts.window.deltasPerTurn,
 			sustainedTurnCount: facts.window.turnCount,
 			sustainedScheduledDeltaCount: facts.window.turnCount * facts.window.deltasPerTurn,
@@ -740,6 +744,7 @@ function validResult(variant, definition) {
 			sustainedAggregateDeltaPerSecond:
 				(facts.sessions.reduce((sum, s) => sum + s.deltaFrames, 0) * 1_000) / facts.window.fixtureWindowMs,
 			sustainedMinimumDeltaFrames: Math.min(...facts.sessions.map((s) => s.deltaFrames)),
+			sustainedMidWindowSettledTurns: facts.window.midWindowSettledTurns,
 			sustainedProjectionLagMs: Math.max(...facts.sessions.map((s) => s.projectionLagMs)),
 		};
 		base.trials = Array.from({ length: definition.warmups + definition.samples }, (_, index) => ({
@@ -2738,12 +2743,24 @@ test("sustained load enforces the declared schedule against the observed window"
 
 	// A window that overran the declared duration far enough to change the rate must fail.
 	for (const trial of result.trials) {
-		map.get(`${suffix}${String(trial.index)}`).facts.window.fixtureWindowMs =
-			definition.sustainedWindowMs * 10;
+		const facts = map.get(`${suffix}${String(trial.index)}`).facts;
+		facts.window.fixtureWindowMs = definition.sustainedWindowMs * 10;
+		for (const session of facts.sessions) session.windowMs = definition.sustainedWindowMs * 10;
 	}
 	assert.ok(validateResult(result, definition, "representative", RUN_ID, map).length > 0);
 	for (const trial of result.trials) {
-		map.get(`${suffix}${String(trial.index)}`).facts.window.fixtureWindowMs = definition.sustainedWindowMs;
+		const facts = map.get(`${suffix}${String(trial.index)}`).facts;
+		facts.window.fixtureWindowMs = definition.sustainedWindowMs;
+		for (const session of facts.sessions) session.windowMs = definition.sustainedWindowMs;
+	}
+
+	// One Session whose own window overran must fail, because each is bounded individually.
+	for (const trial of result.trials) {
+		map.get(`${suffix}${String(trial.index)}`).facts.sessions[3].windowMs = definition.sustainedWindowMs * 10;
+	}
+	assert.ok(validateResult(result, definition, "representative", RUN_ID, map).length > 0);
+	for (const trial of result.trials) {
+		map.get(`${suffix}${String(trial.index)}`).facts.sessions[3].windowMs = definition.sustainedWindowMs;
 	}
 
 	// A metric that does not follow from the raw facts must fail, because metrics are recomputed.
@@ -2758,6 +2775,15 @@ test("sustained load enforces the declared schedule against the observed window"
 	assert.ok(validateResult(result, definition, "representative", RUN_ID, map).length > 0);
 	for (const trial of result.trials) {
 		map.get(`${suffix}${String(trial.index)}`).facts.window.deltasPerTurn = definition.deltasPerTurn;
+	}
+
+	// A window that never projected a completed run must fail.
+	for (const trial of result.trials) {
+		map.get(`${suffix}${String(trial.index)}`).facts.window.midWindowSettledTurns = 0;
+	}
+	assert.ok(validateResult(result, definition, "representative", RUN_ID, map).length > 0);
+	for (const trial of result.trials) {
+		map.get(`${suffix}${String(trial.index)}`).facts.window.midWindowSettledTurns = 3;
 	}
 
 	// A turn shape that does not reproduce the declared rate is rejected.
