@@ -146,8 +146,8 @@ it("replays one refresh after an in-flight pair settles and keeps the catalog fr
 	await vi.waitFor(() => expect(effects?.journalSize()).toBe(0));
 });
 
-// The bound is the backstop for a read that ignores its signal: the key is released so later
-// refreshes proceed instead of wedging behind it, and the retained intent still runs.
+// A read that never settles must not hold the key forever: the bound releases it so later
+// refreshes proceed instead of wedging behind it, and the retained trailing refresh still runs.
 it("releases the key when a read outlives the hold", async () => {
 	vi.useFakeTimers();
 	const onDirectoryRefresh = vi.fn(() => new Promise<void>(() => {}));

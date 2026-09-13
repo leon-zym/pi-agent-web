@@ -8,9 +8,10 @@ import { updateTabBadge } from "./tab-badge";
 export const SESSION_BROWSER_EFFECT_JOURNAL_LIMIT = 256;
 
 /**
- * A directory refresh holds its key while its reads run so an overlapping intent reuses
- * the pair. A newer intent for the same key, or a read that outlives this bound, releases
- * the key, so a lost read cannot block later refreshes.
+ * A directory refresh holds its key while its reads run. An intent that arrives before those
+ * reads start is covered by them; one that arrives while they are reading is kept as a single
+ * trailing refresh. A read that outlives this bound releases the key, so a read that never
+ * settles cannot block later refreshes.
  */
 export const SESSION_BROWSER_DIRECTORY_REFRESH_HOLD_MS = 30_000;
 
