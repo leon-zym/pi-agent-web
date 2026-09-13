@@ -1,17 +1,23 @@
-import type { Route } from "@playwright/test";
+import type { Request, Route } from "@playwright/test";
 import { expect, test } from "../fixtures/test";
+
+// A newer directory request must never become the current generation while the
+// held reads fail, or the stale-result fence silently drops the observed error.
+type DirectoryPhase = "idle" | "holding" | "aborting" | "open";
 
 test("silently reloads the directory after two failed reads and a real Gateway restart", async ({
 	page,
 	harness,
 }) => {
-	let armed = false;
+	let phase: DirectoryPhase = "idle";
 	let releaseBootstrap: (() => void) | undefined;
 	const bootstrapGate = new Promise<void>((resolve) => {
 		releaseBootstrap = resolve;
 	});
-	const held: Route[] = [];
-	const failed: string[] = [];
+	const held: { request: Request; route: Route }[] = [];
+	const aborted = new Set<Request>();
+	const failedAborted = new Set<Request>();
+	const unexpectedFailures: string[] = [];
 	const recovered: string[] = [];
 	const epochs: string[] = [];
 	let bootstrapRecovered = false;
@@ -32,7 +38,9 @@ test("silently reloads the directory after two failed reads and a real Gateway r
 		return path === "/api/v1/workspaces" || /^\/api\/v1\/workspaces\/[^/]+\/sessions$/.test(path);
 	};
 	page.on("requestfailed", (request) => {
-		if (isDirectory(request.url())) failed.push(request.url());
+		if (!isDirectory(request.url())) return;
+		if (aborted.has(request)) failedAborted.add(request);
+		else if (phase === "holding" || phase === "aborting") unexpectedFailures.push(request.url());
 	});
 	page.on("response", (response) => {
 		if (!restarted || response.status() !== 200) return;
@@ -40,11 +48,19 @@ test("silently reloads the directory after two failed reads and a real Gateway r
 		if (isDirectory(response.url())) recovered.push(new URL(response.url()).pathname);
 	});
 	await page.route("**/api/v1/**", async (route) => {
-		if (armed && isDirectory(route.request().url()) && held.length < 2) {
-			held.push(route);
+		const pathname = new URL(route.request().url()).pathname;
+		if (isDirectory(route.request().url()) && (phase === "holding" || phase === "aborting")) {
+			if (phase === "aborting") {
+				// Abort instead of continuing, so no newer request can supersede the
+				// reads whose failure this test observes.
+				aborted.add(route.request());
+				await route.abort("connectionfailed");
+				return;
+			}
+			held.push({ request: route.request(), route });
 			return;
 		}
-		if (restarted && new URL(route.request().url()).pathname === "/api/v1/bootstrap") await bootstrapGate;
+		if (restarted && pathname === "/api/v1/bootstrap") await bootstrapGate;
 		await route.continue();
 	});
 	// Observe the real Zustand store when its bound hook receives the vanilla API.
@@ -70,6 +86,15 @@ test("silently reloads the directory after two failed reads and a real Gateway r
 								};
 							},
 						});
+						// Mirrors the product's own directory refresh so the test can issue
+						// the second delayed refresh a settled turn may schedule.
+						Object.defineProperty(window, "refreshDirectoryForTest", {
+							value: () => {
+								const current = result.getState();
+								void current.loadWorkspaces();
+								void current.reloadSessions(undefined, { force: true });
+							},
+						});
 						Object.assign = assign;
 					}
 				}
@@ -92,24 +117,51 @@ test("silently reloads the directory after two failed reads and a real Gateway r
 				}
 			).readDirectoryForTest(),
 		);
+	const refreshDirectory = () =>
+		page.evaluate(() =>
+			(
+				window as typeof window & {
+					refreshDirectoryForTest: () => void;
+				}
+			).refreshDirectoryForTest(),
+		);
 	await page.goto(harness.origin);
 	const textarea = page.locator("textarea");
 	await expect(textarea).toBeEnabled();
-	armed = true;
+	phase = "holding";
 	await textarea.fill("E2E_DIRECTORY_RESTART");
 	await page.getByRole("button", { name: /^(Send|发送)$/ }).click();
 	await expect(page.locator("main")).toContainText("E2E_REPLY:E2E_DIRECTORY_RESTART");
-	await expect.poll(() => held.length).toBe(2);
+	await expect.poll(() => held.length).toBeGreaterThanOrEqual(2);
 	await textarea.fill("Keep this draft across restart");
 	const selectedBefore = (await readDirectory()).session;
 	expect(selectedBefore).toBeTruthy();
 	const oldEpoch = epochs.at(-1);
 	expect(oldEpoch).toBeTruthy();
+	// One settled turn can schedule a second directory refresh once the first pair is
+	// in flight. Issue that refresh here so both the held reads and their superseder
+	// are deterministic instead of depending on machine load.
+	await refreshDirectory();
+	await expect.poll(() => held.length).toBeGreaterThanOrEqual(4);
+	await expect
+		.poll(() => new Set(held.map((entry) => new URL(entry.request.url()).pathname)).size)
+		.toBeGreaterThanOrEqual(2);
 	restarted = true;
 	const restart = harness.restart();
-	await Promise.all(held.map((route) => route.abort("connectionfailed")));
-	await expect.poll(() => failed.length).toBe(2);
+	phase = "aborting";
+	const abortedHeld = held.splice(0, held.length);
+	await Promise.all(
+		abortedHeld.map((entry) => {
+			aborted.add(entry.request);
+			return entry.route.abort("connectionfailed");
+		}),
+	);
+	await expect.poll(() => abortedHeld.filter((entry) => !failedAborted.has(entry.request)).length).toBe(0);
+	expect(unexpectedFailures).toEqual([]);
 	await expect.poll(async () => (await readDirectory()).error).toBe("Failed to fetch");
+	// Responses that settled before this barrier are not recovery evidence.
+	recovered.length = 0;
+	phase = "open";
 	releaseBootstrap?.();
 	await restart;
 	// From here there is no prompt, click, refresh or other user activity.
