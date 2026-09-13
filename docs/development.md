@@ -32,7 +32,7 @@ Tracked files use LF endings, tab indentation, and a final newline, as `.editorc
 | `pnpm test` | Run deterministic package test suites |
 | `pnpm verify` | Lint, types, benchmark-validator tests, package tests, and production build |
 | `pnpm test:smoke` | Exercise authenticated REST and WebSocket with deterministic Pi |
-| `pnpm test:browser` | Build and run the packaged Playwright suite |
+| `pnpm test:browser` | Build, run production harness fixtures, and run the packaged Playwright suite |
 | `pnpm test:compat` | Run exact-version Pi adapter fixtures and conformance |
 | `pnpm test:pack` | Pack, install, inspect, and launch the four local packages |
 | `pnpm bench:representative` | Run the reproducible representative performance matrix |
@@ -77,6 +77,11 @@ custody, recovery, discovery, deletion, and authenticated routes with determinis
 
 ### Deterministic Browser E2E
 
+Before Playwright starts, the lane runs the production harness tests in
+`tests/e2e/fixtures/production-harness.test.ts`. They need the built CLI, and they bound fixture bytes
+exactly and pin the harness contracts Playwright depends on: benchmark build admission, restart
+identity, stable origin, and owned-child serialization under concurrent restart and stop.
+
 Playwright launches the production Gateway and UI against deterministic Pi fixtures, covering
 navigation, multiple Sessions, streaming, recovery, Extension UI, attachments and typed content, large
 history, responsive layouts, accessibility regressions, and runtime resilience. Tests exercise product
@@ -104,13 +109,8 @@ compatibility uses a separate exact-version workflow whose `paths` list in
 `package.json`, `packages/server/package.json`, or `pnpm-lock.yaml`. The stress matrix runs only
 through manual dispatch, and real-Pi acceptance is never an implicit CI dependency.
 
-Two gates exist only in CI, so a green local `pnpm verify` does not imply a green CI run:
+One gate exists only in CI, so a green local `pnpm verify` does not imply a green CI run:
 
-- The verify job also runs the mixed-history fixture bounds, which no local script reaches because
-  that file sits outside the package Vitest glob:
-  ```bash
-  pnpm --filter @pi-agent-web/server exec tsx --test --test-name-pattern="mixed history" ../../tests/e2e/fixtures/production-harness.test.ts
-  ```
 - `performance-benchmark-validator` replays the frozen references pinned in
   `scripts/benchmark-frozen-references.mjs`, so those commits must resolve locally; CI fetches them
   by SHA first.
@@ -138,7 +138,8 @@ published to npm, so passing package smoke proves local distribution integrity a
 ## Release gate
 
 Before a release-related handoff, run `pnpm verify && pnpm test:smoke && pnpm test:compat &&
-pnpm test:browser && pnpm test:pack && pnpm bench:representative`. Then inspect the final diff,
+pnpm test:browser && pnpm test:pack && pnpm bench:representative`; the `test:browser` step is what
+runs the production harness fixture and lifecycle tests. Then inspect the final diff,
 repository status, package contents, Browser and benchmark artifacts, and documentation links; report
 the exact real-Pi outcome; and confirm the ruleset, required checks, and maintainer-count exception.
 Do not close a tracked issue until its accepted behavior is on the shipped branch and deferred work is
