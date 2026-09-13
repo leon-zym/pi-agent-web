@@ -32,11 +32,17 @@ duration is a measured consequence of that schedule rather than an input to emis
 
 Every subscribed Session must receive at least the emitted count, and each Session's own window must
 fall between the declared duration and twice it. One long Session cannot stand in for the others,
-because the bound is per Session rather than a window maximum. The DOM must already show a settled run
-at the sampled midpoint, so a window that arrives without reaching the conversation fails. These are
-correctness claims, so a short or overrunning schedule fails the shared `correctnessFailures` hard
-gate; the achieved aggregate rate and the worst-Session projection lag sampled mid-window stay
-diagnostic.
+because the bound is per Session rather than a window maximum. Every Session must also advance the
+transport's own projection watermark during the window, and the visible conversation must show a turn
+this trial projected. These are correctness claims, so a stalled or overrunning schedule fails the
+shared `correctnessFailures` hard gate; the achieved aggregate rate and the worst-Session
+arrival-to-projection lag stay diagnostic.
+
+The projection lag pairs the sequence the transport applied with that same sequence's socket arrival
+time, so it measures arrival-to-projection delay rather than socket arrival alone. The projection
+watermark lives in the benchmark-only UI root, and the fixture emits each observation as a legal Pi
+run in the real agent-loop order: `agent_start`, `turn_start`, the user message, the assistant turn,
+then `agent_end` and `agent_settled`.
 
 ## Comparison
 

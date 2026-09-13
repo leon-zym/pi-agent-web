@@ -6,12 +6,14 @@ import {
 	addSummaryGate,
 	addValueGate,
 	browserSessionFrameSnapshot,
+	browserSessionProjectionSnapshot,
 	correctnessFailureCount,
 	createTrialObservation,
 	installBrowserBenchmarkObserver,
 	resetBrowserSessionFrames,
 	runBenchmarkScenario,
 	scenariosFor,
+	trackBrowserSessionProjection,
 } from "./benchmark-support";
 
 test.use({ harnessOptions: { benchmarkGateway: true } });
@@ -115,7 +117,11 @@ for (const scenario of scenariosFor("sustained-load")) {
 						if (!session) throw new Error(`Unable to resolve the materialized Session for ${prompt}`);
 						return session.sessionHandle;
 					});
+					await trackBrowserSessionProjection(page, sessionHandles);
 					await resetBrowserSessionFrames(page, sessionHandles);
+					// Baseline the visible settled turns before the schedule starts, so the midpoint count
+					// measures what this trial projected rather than what earlier trials left behind.
+					const preTrialSettledTurns = await page.locator('[data-markdown-settled="true"]').count();
 					for (const prompt of prompts) harness.startPrompt(prompt);
 					await expect
 						.poll(() => prompts.every((prompt) => eventFor(harness, "delta", prompt) !== undefined), {
@@ -125,42 +131,13 @@ for (const scenario of scenariosFor("sustained-load")) {
 
 					// Sample arrival-to-projection lag while the window is still open, so the measurement
 					// observes live product behavior rather than the test's own post-window orchestration.
-					// The observer tracks every subscribed Session on the shared socket, so all Sessions are
-					// sampled at one instant instead of being visited one at a time.
+					// The observer tracks every subscribed Session on the shared socket and the projection
+					// watermark is read in the same page evaluation, so all Sessions are sampled at one
+					// instant instead of being visited one at a time.
 					await page.waitForTimeout(Math.floor(sustainedWindowMs / 2));
-					// One atomic page evaluation reads every Session at the same instant, so no Session's
-					// reading is skewed by another's round trip.
-					const sampled = await page.evaluate((handles) => {
-						const benchmarkWindow = window as unknown as {
-							__piwebBenchmark: {
-								sessionFrameSnapshot: (handle: string) => {
-									deltaFrames: number;
-									deltaChars: number;
-									firstArrivalAt: number | null;
-									lastArrivalAt: number | null;
-									maxFrameGapMs: number;
-								} | null;
-							};
-						};
-						const now = performance.now();
-						return handles.map((handle) => {
-							const snapshot = benchmarkWindow.__piwebBenchmark.sessionFrameSnapshot(handle);
-							if (!snapshot) throw new Error(`Browser frame observer is not tracking ${handle}`);
-							return {
-								deltaFrames: snapshot.deltaFrames,
-								deltaChars: snapshot.deltaChars,
-								lastArrivalAt: snapshot.lastArrivalAt,
-								sampledAt: now,
-							};
-						});
-					}, sessionHandles);
-					// The visible Session must already have projected complete runs by the midpoint.
 					const projectedTurns = await page.locator('[data-markdown-settled="true"]').count();
-					const arrivals = sampled.map((snapshot) => ({
-						deltaFrames: snapshot.deltaFrames,
-						projectionLagMs:
-							snapshot.lastArrivalAt === null ? -1 : Math.max(0, snapshot.sampledAt - snapshot.lastArrivalAt),
-					}));
+					const sampled = await browserSessionProjectionSnapshot(page, sessionHandles);
+					const arrivals = sampled.map((snapshot) => ({ projectionLagMs: snapshot.projectionLagMs }));
 
 					// The window closes once every Session has delivered its declared schedule.
 					await expect
@@ -180,13 +157,18 @@ for (const scenario of scenariosFor("sustained-load")) {
 					// The schedule claim reads the final per-Session arrival counts; the window and lag claims
 					// read each Session's own observation, so no single Session can mask another.
 					const observations = deliveredFrames.map((snapshot, sessionIndex) => ({
+						baselineProjectedSeq: sampled[sessionIndex]?.baselineProjectedSeq ?? -1,
 						deltaFrames: snapshot.deltaFrames,
 						projectionLagMs: arrivals[sessionIndex]?.projectionLagMs ?? -1,
+						projectedSeq: sampled[sessionIndex]?.projectedSeq ?? -1,
 						windowMs: windowEvents[sessionIndex]?.windowMs ?? 0,
 					}));
 					const totalObserved = observations.reduce((sum, entry) => sum + entry.deltaFrames, 0);
 					const shortestWindowMs = Math.min(...observations.map((entry) => entry.windowMs));
 					const longestWindowMs = Math.max(...observations.map((entry) => entry.windowMs));
+					// The DOM count is compared against the pre-window baseline, so a turn projected by an
+					// earlier trial cannot satisfy this trial's claim.
+					const trialProjectedTurns = projectedTurns - preTrialSettledTurns;
 					const correctness = {
 						allSessionsObserved: observations.length === sessionCount,
 						fixtureEmittedDeclaredSchedule: fixtureDeltaCount === emittedPerSession,
@@ -195,7 +177,12 @@ for (const scenario of scenariosFor("sustained-load")) {
 							(entry) => entry.windowMs >= sustainedWindowMs && entry.windowMs <= sustainedWindowMs * 2,
 						),
 						sustainedScheduleHeld: observations.every((entry) => entry.deltaFrames >= emittedPerSession),
-						midWindowProjectedRun: projectedTurns >= 1,
+						// Every Session must have advanced its own projection during the window, and the
+						// visible conversation must show a turn this trial projected.
+						allSessionsProjected: observations.every(
+							(entry) => entry.projectedSeq > entry.baselineProjectedSeq,
+						),
+						midWindowProjectedTurn: trialProjectedTurns >= 1,
 						singleMultiplexedSocket: sockets.length === 1 && closedSockets.length === 0,
 					};
 					return {
@@ -229,7 +216,7 @@ for (const scenario of scenariosFor("sustained-load")) {
 									deltasPerTurn,
 									fixtureDeltaCount,
 									fixtureWindowMs: longestWindowMs,
-									midWindowSettledTurns: projectedTurns,
+									midWindowSettledTurns: trialProjectedTurns,
 									turnCount: fixtureTurnCount,
 								},
 							},

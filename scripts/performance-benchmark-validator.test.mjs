@@ -557,8 +557,10 @@ function sustainedObservation(definition) {
 		browserErrors: browserErrors(),
 		facts: {
 			sessions: Array.from({ length: definition.sessions ?? 0 }, () => ({
+				baselineProjectedSeq: 0,
 				deltaFrames: turnCount * (definition.deltasPerTurn ?? 1),
 				projectionLagMs: 120,
+				projectedSeq: 64,
 				windowMs: definition.sustainedWindowMs ?? 0,
 			})),
 			socket: { closed: 0, opened: 1 },
@@ -602,8 +604,9 @@ function correctnessFor(definition) {
 					? [
 							"allSessionsObserved",
 							"fixtureEmittedDeclaredSchedule",
+							"allSessionsProjected",
 							"fixtureWindowCovered",
-							"midWindowProjectedRun",
+							"midWindowProjectedTurn",
 							"sustainedPerSessionWindow",
 							"sustainedScheduleHeld",
 							"singleMultiplexedSocket",
@@ -2784,6 +2787,15 @@ test("sustained load enforces the declared schedule against the observed window"
 	assert.ok(validateResult(result, definition, "representative", RUN_ID, map).length > 0);
 	for (const trial of result.trials) {
 		map.get(`${suffix}${String(trial.index)}`).facts.window.midWindowSettledTurns = 3;
+	}
+
+	// A Session that received frames without advancing its projection must fail.
+	for (const trial of result.trials) {
+		map.get(`${suffix}${String(trial.index)}`).facts.sessions[2].projectedSeq = 0;
+	}
+	assert.ok(validateResult(result, definition, "representative", RUN_ID, map).length > 0);
+	for (const trial of result.trials) {
+		map.get(`${suffix}${String(trial.index)}`).facts.sessions[2].projectedSeq = 64;
 	}
 
 	// A turn shape that does not reproduce the declared rate is rejected.

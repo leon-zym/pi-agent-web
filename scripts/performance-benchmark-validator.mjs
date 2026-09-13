@@ -353,7 +353,13 @@ const SUSTAINED_WINDOW_KEYS = [
 	"midWindowSettledTurns",
 	"turnCount",
 ];
-const SUSTAINED_SESSION_KEYS = ["deltaFrames", "projectionLagMs", "windowMs"];
+const SUSTAINED_SESSION_KEYS = [
+	"baselineProjectedSeq",
+	"deltaFrames",
+	"projectionLagMs",
+	"projectedSeq",
+	"windowMs",
+];
 const SUSTAINED_FACT_KEYS = ["sessions", "socket", "window"];
 /**
  * A sustained window may overrun its declared duration under real load, but a large multiple means
@@ -1394,6 +1400,12 @@ function validateObservationFacts(value, definition, label, errors) {
 				validateNonnegativeInteger(observation.deltaFrames, `${sessionLabel}.deltaFrames`, errors);
 				validateNonnegativeNumber(observation.projectionLagMs, `${sessionLabel}.projectionLagMs`, errors);
 				validateNonnegativeNumber(observation.windowMs, `${sessionLabel}.windowMs`, errors);
+				validateNonnegativeInteger(observation.projectedSeq, `${sessionLabel}.projectedSeq`, errors);
+				validateNonnegativeInteger(
+					observation.baselineProjectedSeq,
+					`${sessionLabel}.baselineProjectedSeq`,
+					errors,
+				);
 			}
 		}
 		validateSocketFact(value.socket, `${label}.facts.socket`, errors);
@@ -2211,9 +2223,16 @@ function deriveCorrectness(observation, definition) {
 				derived !== null &&
 				sessions.length === expected &&
 				sessions.every((observation) => (observation?.deltaFrames ?? -1) >= derived.emitted),
-			// At least one completed run must be projected by the sampled midpoint, so the window is not
-			// merely receiving frames that never reach the conversation.
-			midWindowProjectedRun: (window?.midWindowSettledTurns ?? 0) >= 1,
+			// Every Session must advance its own projection during the window. The watermark pair is
+			// measured by the projection pipeline itself, so a window whose frames never reach the
+			// conversation fails instead of passing on an arrival count.
+			allSessionsProjected: sessions.every(
+				(observation) =>
+					isFiniteNumber(observation?.baselineProjectedSeq) &&
+					isFiniteNumber(observation?.projectedSeq) &&
+					observation.projectedSeq > observation.baselineProjectedSeq,
+			),
+			midWindowProjectedTurn: (window?.midWindowSettledTurns ?? 0) >= 1,
 			// Every Session must sustain its own window: one long Session cannot stand in for the
 			// others, so each is bounded individually rather than through the window maximum.
 			sustainedPerSessionWindow:
