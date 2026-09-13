@@ -17,7 +17,7 @@
 		"test:compat": "pnpm --filter @pi-agent-web/protocol build && pnpm --filter @pi-agent-web/server test:compat",
 		"test:e2e": "pnpm test:browser",
 		"test:e2e:real": "pnpm --filter @pi-agent-web/server test:e2e",
-		"test:browser": "pnpm build && pnpm --filter @pi-agent-web/server exec tsx --test ../../tests/e2e/benchmarks/benchmark-support.test.ts && playwright test --config tests/e2e/playwright.config.ts",
+		"test:browser": "pnpm build && pnpm --filter @pi-agent-web/server exec tsx --test ../../tests/e2e/benchmarks/benchmark-support.test.ts && pnpm --filter @pi-agent-web/server exec tsx --test ../../tests/e2e/fixtures/production-harness.test.ts && playwright test --config tests/e2e/playwright.config.ts",
 		"bench:representative": "node scripts/run-performance-benchmarks.mjs representative",
 		"bench:stress": "node scripts/run-performance-benchmarks.mjs stress",
 		"test:bench-runner": "node --test scripts/run-performance-benchmarks.test.mjs",
