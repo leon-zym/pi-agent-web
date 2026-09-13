@@ -26,6 +26,8 @@ other page.
 
 - One fact has one owner. Every other document keeps the smallest projection it needs and links to
   that owner.
+- A projection restates the constraint in the reader's terms and drops the detail the owner carries.
+  Dropping the constraint itself is a defect, not a projection.
 - Numeric constants, field enumerations, and guard values live in code. Cite the owning path instead
   of copying values.
 - Delivery status, backlogs, and process plans live in GitHub Issues and pull requests, never in
@@ -45,7 +47,8 @@ Apply these questions before adding or keeping a paragraph:
 - If this fact changes, does exactly one file need to change? If not, it has the wrong owner.
 - Must a reader still find this after the current iteration ends? If not, it belongs to an
   Issue or pull request.
-- Can 30 seconds of reading the code answer this? If yes, delete the text and cite the code path.
+- Can 30 seconds of reading the code answer this? If yes, replace the copied value with a pointer to
+  the owning path. The constraint stays with its owner; only the copy leaves.
 
 Then write the paragraph as if it were reference material:
 
