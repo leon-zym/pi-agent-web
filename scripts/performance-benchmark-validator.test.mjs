@@ -2312,7 +2312,7 @@ test("strict iteration validates frozen raw and envelopes before classifying cha
 	const checkout = path.join(root, "checkout");
 	fs.mkdirSync(checkout);
 	execFileSync("git", ["init", "-q", checkout]);
-	assert.throws(() => readFrozenReferences(set, root, checkout), /git fetch --depth=1 origin 7e0ca3e/);
+	assert.throws(() => readFrozenReferences(set, root, checkout), /git fetch --depth=1 origin 43e3be1/);
 	execFileSync("git", ["-C", checkout, "fetch", "--depth=1", `file://${repositoryRoot}`, set.source], {
 		stdio: "pipe",
 	});
@@ -2429,21 +2429,23 @@ test("strict iteration validates frozen raw and envelopes before classifying cha
 	assert.match(changedMatrix.stdout, /workload differs/);
 	const validator = path.join(checkout, "scripts/performance-benchmark-validator.mjs");
 	const referenceSuite = sourceSuiteVersion(set.source);
-	// The checkout holds the frozen source's own validator, so its declared suite is the reference's.
+	// The checkout holds the frozen source's own validator. Bump its declared suite past the
+	// reference's so a next-generation target is supported but still incompatible on suite version.
+	const nextSuiteVersion = referenceSuite + 1;
 	fs.writeFileSync(
 		validator,
 		fs
 			.readFileSync(validator, "utf8")
 			.replace(
 				`BENCHMARK_SUITE_VERSION = ${String(referenceSuite)}`,
-				`BENCHMARK_SUITE_VERSION = ${String(BENCHMARK_SUITE_VERSION)}`,
+				`BENCHMARK_SUITE_VERSION = ${String(nextSuiteVersion)}`,
 			),
 	);
 	rewrite(target, (value, name) => {
 		value = JSON.parse(
 			JSON.stringify(value).replaceAll(
 				`"suiteVersion":${String(referenceSuite)}`,
-				`"suiteVersion":${String(BENCHMARK_SUITE_VERSION)}`,
+				`"suiteVersion":${String(nextSuiteVersion)}`,
 			),
 		);
 		if (name === "manifest.json")
