@@ -3,10 +3,9 @@
 - Status: Accepted (amended 2026-08-29)
 - Date: 2026-08-22
 
-[UI and UX](../ui-ux.md) owns current interaction behavior; [Design](../design.md) owns visual
-acceptance and code-owned token values. [Architecture](../architecture.md#channels-control-and-ordering)
-owns subscription retention and Session lifecycle. This record preserves the reasons for those
-choices, not component dimensions, animation recipes, or a second acceptance checklist.
+[UI and UX](../ui-ux.md) owns current interaction behavior, [Design](../design.md) owns visual acceptance,
+and [Architecture](../architecture.md#channels-control-and-ordering) owns subscription retention and Session
+lifecycle.
 
 ## Context
 
@@ -26,8 +25,8 @@ covers. Meanwhile, evicting subscriptions by recency alone can disconnect ongoin
   to it; expensive Turn DOM is bounded independently by [ADR 0005](0005-conversation-rendering.md).
   The outline yields space rather than covering content or controls.
 - Provide deliberate multiline composing with explicit steering/follow-up delivery. Session-scoped
-  input history follows exact rekey. Keyboard behavior belongs in [Composer](../ui-ux.md#composer),
-  rather than being inferred from the panel's height.
+  input history follows exact rekey. [Composer](../ui-ux.md#composer) owns keyboard behavior,
+  independently of the panel's height.
 - Allow blocking Extension requests to minimize into a discoverable dock while their deadlines and
   channels remain active. Keyboard choices and write-in text retain the single-value select response
   contract. Already-aborted or expired responses are soft no-ops, not repeated intrusive errors.
@@ -44,6 +43,7 @@ covers. Meanwhile, evicting subscriptions by recency alone can disconnect ongoin
 Users can inspect details and approval context without leaving the conversation. Settled grouping
 reduces clutter while active work stays visible. Subscription retention trades a strict Browser
 count cap for protected-work continuity; shared Gateway admission and resource limits still apply.
+Retained-history measurements do not establish a total Browser-memory guarantee.
 
 ## Rejected alternatives
 
@@ -52,10 +52,3 @@ count cap for protected-work continuity; shared Gateway admission and resource l
 - Leave subscriptions unbounded: retains avoidable inactive state and increases backpressure.
 - Evict every least-recently-used Session: can drop running work and completion feedback.
 - Require full-screen approval dialogs: prevents inspection of the code or logs needing approval.
-
-## Verification rationale
-
-Projection tests need to distinguish interrupted tools and optimistic reconciliation from successful
-execution. Browser regressions must exercise reading position, focus, disclosure, approval inspection,
-and background liveness. Timing or finite retained-history observations do not establish a total
-Browser-memory guarantee. [Development](../development.md) owns executable verification layers.

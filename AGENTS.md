@@ -1,58 +1,48 @@
-# pi-agent-web engineering guide
+# pi-agent-web
 
-Pi Agent Web is a local, Session-native workbench for Pi Coding Agent's RPC mode.
+A local web workbench for Pi Coding Agent. Start with [docs/README.md](docs/README.md): its ownership
+map names the document that owns each fact, which also routes a change to the right place. Tracked
+documentation and code comments are English except `README.zh-CN.md`. Issues carry the backlog and
+delivery state, `docs/decisions/` carries rationale, `docs/evidence/` carries frozen evidence.
+`docs/notes/` and `tmp/` are ignored working material. Do not promote a temporary note into product
+authority by linking to it from tracked documentation.
 
-## Documentation map
+## Invariants
 
-Start with `README.md`, then open only the contract relevant to the task:
+- Every durable Session fact lives in Pi JSONL. Workspace preferences stay discovery and presentation
+  hints, never a second history database, and Pi's own directory environment keeps deciding where
+  configuration and Sessions live.
+- A Session's canonical file identity owns its process, control, ordering, recovery, and Browser
+  state. Navigation changes only the visible view, so background work continues.
+- A mutation carries the exact generation and current fence, and event projection reaches the
+  response barrier before the command completes. Unknown identity, ordering, or protocol
+  compatibility fails closed.
+- A pending identity stays unverified until Pi materializes it, and abandoning an untouched
+  transient Session leaves its file on disk.
+- Deletion moves the file into recoverable trash by same-filesystem rename, after exact control, an
+  identity reservation, and header, path, and inode verification.
+- Only the CLI package composes the server and UI; every other package depends on the protocol
+  package alone, which stays Browser-safe and free of Node and upstream Pi imports. Pi RPC and the
+  Browser/Gateway protocol have separate compatibility contracts. The UI consumes ordered Session
+  stores rather than WebSocket frames.
+- The Gateway listens on loopback with same-origin authentication. Validate untrusted values at their
+  first boundary: paths, Pi and Extension output, filenames, and Browser frames. Keep credentials,
+  private paths, real history, provider output, and recoverable-trash content out of commits.
+- User-visible copy goes through `packages/ui/src/lib/i18n` with matching `zh-CN` and `en` keys.
+  Apply the Design contract's visible focus, reduced-motion, semantic-color, and critical-action
+  rules.
 
-- [Architecture](docs/architecture.md): package boundaries, identity, ownership, concurrency, and recovery.
-- [Protocol](docs/protocol.md): verified Pi RPC facts and the REST/WebSocket contract.
-- [UI and UX](docs/ui-ux.md): user-visible behavior, localization, and accessibility.
-- [Design](docs/design.md): visual language and acceptance criteria.
-- [Development](docs/development.md): test layers, CI, packaging, and release gates.
-- [Security](SECURITY.md): threat boundary and private vulnerability reporting.
-- [Architecture decisions](docs/decisions/README.md): rationale and explicit supersession.
+## Conventions
 
-Issues hold backlog and delivery state. `docs/notes/` and `tmp/` are ignored working material. Do not
-promote a temporary note into product authority by linking to it from tracked documentation.
-
-## Engineering guardrails
-
-Follow the linked contracts rather than maintaining another implementation inventory here.
-
-- Pi JSONL is the only durable Session truth. Workspace preferences are discovery/presentation hints,
-  never a second history database. Preserve Pi directory environment semantics.
-- Canonical file identity and per-Session ownership govern processes, control, ordering, recovery,
-  and Browser state. Navigation changes only the visible view and must not stop background work.
-- Pending identity stays unverified until Pi materializes it. Abandoning an untouched transient
-  Session must not delete a file.
-- The protocol package remains Browser-safe and independent of upstream Pi types. Pi RPC and the
-  Browser/Gateway protocol have separate compatibility contracts; unknown identity, ordering, or
-  protocol compatibility fails closed.
-- Mutations require exact generation and current fence. Event projection must reach the response
-  barrier before a command completes; snapshots do not silently patch gaps.
-- Components consume ordered Session stores, not WebSocket frames. Async work retains its captured
-  Session and operation ownership through completion or cancellation.
-- Deletion requires exact control, identity reservation, header/path/inode verification, and a
-  same-filesystem move to recoverable trash. Never use direct unlink or copy-and-unlink.
-- Keep loopback and same-origin authentication. Treat paths, Pi/Extension output, filenames, and
-  Browser frames as untrusted. Never commit credentials, private paths, real history, provider output,
-  or recoverable-trash content.
-- User-visible copy uses `packages/ui/src/lib/i18n` with matching `zh-CN`/`en` keys. Tracked
-  documentation and code comments are English. Apply the Design contract's visible focus,
-  reduced-motion, semantic-color, and critical-action requirements.
-
-`pi-agent-web` is the repository/package namespace; `pi-web` is the user-facing command. Do not
-perform a repository-wide rename between them.
-
-## Working conventions
-
-- Use tabs and Biome. Do not add ESLint or Prettier.
-- Prefer pure reducers and injected filesystem/process seams for deterministic tests.
-- Preserve unrelated worktree changes. Use Conventional Commits in reviewable stages.
-- Match verification depth to risk. Architecture, protocol, transport, deletion, or Session-scope
-  changes require focused invariants and an upper-layer integration or Browser regression.
-- Before a release handoff run `pnpm verify`, `pnpm test:smoke`, `pnpm test:browser`, and
-  `pnpm test:pack`. Run `pnpm test:compat` for Pi boundary changes.
-- `pnpm test:e2e:real` is explicit and credential-bearing. Never make it an implicit CI dependency.
+- Biome is the only formatter and linter. Commits use Conventional Commits in reviewable stages.
+- Prefer explicit state machines, bounded ownership, and pure reducers over generic frameworks.
+  Filesystem, clock, process, and transport seams are injected where practical so edge cases do not
+  depend on local state.
+- The two names are deliberate: `pi-agent-web` is the repository and package namespace, and `pi-web`
+  is the user-facing command. Do not perform a repository-wide rename between them.
+- Keep unrelated worktree changes and never hide a skipped or failed gate.
+- Match verification depth to risk: architecture, protocol, transport, deletion, and Session-scope
+  changes need focused invariants plus an upper-layer integration or Browser regression.
+- Run the release gate in [docs/development.md](docs/development.md) before a release handoff, with
+  `pnpm test:compat` for Pi boundary changes. `pnpm test:e2e:real` stays explicit and
+  credential-bearing.

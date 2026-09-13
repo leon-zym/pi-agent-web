@@ -10,7 +10,7 @@ hand-written guards for UTF-8 accounting, bounded traversal, epoch ownership, pa
 normalization, and redaction. Replacing those guards with one generic validator would either lose
 those security decisions or duplicate the same nested traversal.
 
-## Historical decision
+## Decision
 
 The original design separated shallow Pi and product envelope registries and used TypeBox for
 structural checks before contextual guards. Registry identifiers were diagnostic and fixture
@@ -21,13 +21,15 @@ Pi imports stayed type-only and Server-local, and fixture review remained necess
 candidate version could become the bundled runtime. Structural schemas did not authorize a semver
 range or make upstream types part of the Browser contract.
 
-## Consequences and supersession
+## Consequences
 
 The shallow registries added a Browser dependency and repeated structural traversal without
-replacing contextual validation. [ADR 0013](0013-canonical-gateway-and-explicit-boundaries.md) records
-their removal. [Protocol](../protocol.md#pi-rpc) owns current Pi compatibility and decoding semantics;
-[Development](../development.md#verification-layers) owns the verification lanes. The old registry
-names, schema benchmark command, and rollout checklist are not current implementation requirements.
+replacing contextual validation. [ADR 0013](0013-canonical-gateway-and-explicit-boundaries.md)
+records their removal. [Protocol](../protocol.md#pi-rpc) owns current Pi compatibility and decoding
+semantics; [Development](../development.md#verification-layers) owns the verification lanes.
+
+Upstream conformance and product-boundary safety require separate evidence: a structural pass cannot
+replace malformed-frame, resource, identity, redaction, or installed-runtime checks.
 
 ## Rejected alternatives
 
@@ -39,9 +41,3 @@ names, schema benchmark command, and rollout checklist are not current implement
   production compatibility claim.
 - **Runtime latest or semver ranges**: the legacy Pi RPC protocol has no capability negotiation that
   could justify an untested range.
-
-## Verification rationale
-
-The design required separate evidence for upstream conformance and product-boundary safety. A
-structural pass could not replace malformed-frame, resource, identity, redaction, or installed-runtime
-checks. That distinction survives removal of the schema layer.

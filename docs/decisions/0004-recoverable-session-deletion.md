@@ -36,9 +36,3 @@ closed when identity or filesystem guarantees cannot be established.
 - Direct `unlink`: needlessly irreversible and unsafe under races.
 - UUID-only or path-string-only checks: do not bind the request to the current file contents.
 - Cross-device copy then unlink: loses atomicity and creates partial-failure ambiguity.
-
-## Verification
-
-`recoverable-session-trash.test.ts`, `native-routes.test.ts`, and
-`session-supervisor.test.ts` cover Header/path/inode swaps, symlinks, children, active runtimes,
-transitions, deletion reservations, shutdown, rollback, and cross-device failure.
