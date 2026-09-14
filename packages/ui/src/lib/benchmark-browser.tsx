@@ -86,5 +86,90 @@ export function installRecoveryEvidence(): void {
  */
 export function renderBenchmarkRoot(root: Root, children: ReactNode): void {
 	installRecoveryEvidence();
+	installProjectionWatermark();
 	root.render(<StrictMode>{children}</StrictMode>);
+}
+
+/**
+ * Measures the gap between a Session's event arriving on the socket and the projection pipeline
+ * applying it. `projectedSeq` is the highest sequence the transport synchronously applied, so
+ * pairing it with the arrival time of that same sequence yields a real arrival-to-projection lag
+ * rather than a socket-arrival timestamp on its own.
+ */
+function installProjectionWatermark(): void {
+	const ARRIVAL_HISTORY = 512;
+	const tracked = new Set<string>();
+	const baselineProjectedSeq = new Map<string, number>();
+	const lastCountedSeq = new Map<string, number>();
+	const arrivalAtBySeq = new Map<string, Map<number, number>>();
+	const maxProjectionLagMs = new Map<string, number>();
+	sessionTransport.store.subscribe(() => {
+		const sessions = sessionTransport.store.getState().sessions;
+		const now = performance.now();
+		for (const sessionHandle of tracked) {
+			const projectedSeq = sessions[sessionHandle]?.projectedSeq ?? -1;
+			const counted = lastCountedSeq.get(sessionHandle) ?? -1;
+			if (projectedSeq <= counted) continue;
+			lastCountedSeq.set(sessionHandle, projectedSeq);
+			// Coalesced mode applies a whole batch at once, so the watermark jumps across many
+			// sequences. Every sequence the batch covered is counted, and the batch's oldest arrival
+			// carries the worst wait rather than only the last sequence's.
+			const arrivals = arrivalAtBySeq.get(sessionHandle);
+			if (!arrivals) continue;
+			let oldestArrivalAt: number | null = null;
+			for (const [seq, arrivedAt] of arrivals) {
+				if (seq > projectedSeq || seq <= counted) continue;
+				arrivals.delete(seq);
+				if (oldestArrivalAt === null || arrivedAt < oldestArrivalAt) oldestArrivalAt = arrivedAt;
+			}
+			if (oldestArrivalAt === null) continue;
+			const lag = Math.max(0, now - oldestArrivalAt);
+			maxProjectionLagMs.set(sessionHandle, Math.max(maxProjectionLagMs.get(sessionHandle) ?? 0, lag));
+		}
+	});
+	Object.defineProperty(window, "__piwebBenchmarkProjection", {
+		configurable: true,
+		value: {
+			recordArrival(sessionHandle: string, seq: number, at: number) {
+				const arrivals = arrivalAtBySeq.get(sessionHandle) ?? new Map<number, number>();
+				arrivals.set(seq, at);
+				while (arrivals.size > ARRIVAL_HISTORY) {
+					const oldest = arrivals.keys().next();
+					if (oldest.done) break;
+					arrivals.delete(oldest.value);
+				}
+				arrivalAtBySeq.set(sessionHandle, arrivals);
+			},
+			track(sessionHandles: string[]) {
+				tracked.clear();
+				baselineProjectedSeq.clear();
+				lastCountedSeq.clear();
+				maxProjectionLagMs.clear();
+				arrivalAtBySeq.clear();
+				const sessions = sessionTransport.store.getState().sessions;
+				for (const sessionHandle of sessionHandles) {
+					const projectedSeq = sessions[sessionHandle]?.projectedSeq ?? -1;
+					tracked.add(sessionHandle);
+					baselineProjectedSeq.set(sessionHandle, projectedSeq);
+					lastCountedSeq.set(sessionHandle, projectedSeq);
+					maxProjectionLagMs.set(sessionHandle, 0);
+					arrivalAtBySeq.set(sessionHandle, new Map<number, number>());
+				}
+			},
+			snapshot(sessionHandles: string[]) {
+				const sessions = sessionTransport.store.getState().sessions;
+				const sampledAt = performance.now();
+				return sessionHandles.map((sessionHandle) => {
+					const channel = sessions[sessionHandle];
+					return {
+						baselineProjectedSeq: baselineProjectedSeq.get(sessionHandle) ?? -1,
+						lastSeq: channel?.lastSeq ?? -1,
+						projectionLagMs: maxProjectionLagMs.get(sessionHandle) ?? -1,
+						projectedSeq: channel?.projectedSeq ?? -1,
+						sampledAt,
+					};
+				});
+			},
+		},
+	});
 }

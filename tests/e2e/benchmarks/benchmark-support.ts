@@ -11,6 +11,7 @@ export type BenchmarkVariant = "coalesced" | "sequential";
 export type BenchmarkKind =
 	| "streaming"
 	| "concurrency"
+	| "sustained-load"
 	| "history"
 	| "history-mixed"
 	| "recovery-disconnect"
@@ -36,6 +37,15 @@ export interface BenchmarkScenario {
 	inputBytes?: number;
 	historyReadMode?: "verified_nonempty_native";
 	historyMount?: "bounded" | "full";
+	/** Per-Session delta arrivals per second during a sustained-load arrival window. */
+	arrivalDeltaPerSecond?: number;
+	/** Fixed arrival window in milliseconds; the fixture stops on elapsed time, not on bytes. */
+	sustainedWindowMs?: number;
+	/**
+	 * Deltas per settled turn. The runtime bounds live projection events per active turn, so a
+	 * sustained profile arrives as consecutive settled turns rather than one unbounded turn.
+	 */
+	deltasPerTurn?: number;
 }
 
 export interface BenchmarkTrial {
@@ -119,6 +129,30 @@ export interface BenchmarkConcurrencyObservationFacts {
 	socket: {
 		closed: number;
 		opened: number;
+	};
+}
+
+export interface BenchmarkSustainedLoadObservationFacts {
+	/** Per-Session Browser frame arrivals and arrival window observed for the declared schedule. */
+	sessions: Array<{
+		baselineProjectedSeq: number;
+		deltaFrames: number;
+		projectionLagMs: number;
+		projectedSeq: number;
+		windowMs: number;
+	}>;
+	socket: {
+		closed: number;
+		opened: number;
+	};
+	window: {
+		arrivalDeltaPerSecond: number;
+		declaredWindowMs: number;
+		deltasPerTurn: number;
+		fixtureDeltaCount: number;
+		fixtureWindowMs: number;
+		midWindowSettledTurns: number;
+		turnCount: number;
 	};
 }
 
@@ -330,6 +364,7 @@ export interface BenchmarkRecoveryObservationFacts {
 
 export type BenchmarkObservationFactsByKind = {
 	concurrency: BenchmarkConcurrencyObservationFacts;
+	"sustained-load": BenchmarkSustainedLoadObservationFacts;
 	"content-roundtrip": BenchmarkContentObservationFacts;
 	history: BenchmarkHistoryObservationFacts;
 	"history-mixed": MixedHistoryFacts;
@@ -364,7 +399,7 @@ export interface BenchmarkTrialLifecycle {
 
 export interface BenchmarkScenarioResult {
 	schemaVersion: 2;
-	suiteVersion: 6;
+	suiteVersion: 7;
 	tier: BenchmarkTier;
 	runId: string;
 	scenarioId: string;
@@ -402,6 +437,15 @@ export interface BrowserSessionFrameSnapshot {
 	firstArrivalAt: number | null;
 	lastArrivalAt: number | null;
 	maxFrameGapMs: number;
+}
+
+/** Projection-pipeline high-water marks for one Session, measured inside the Browser. */
+export interface BrowserSessionProjectionSnapshot {
+	baselineProjectedSeq: number;
+	lastSeq: number;
+	projectionLagMs: number;
+	projectedSeq: number;
+	sampledAt: number;
 }
 
 function isTier(value: string | undefined): value is BenchmarkTier {
@@ -681,7 +725,7 @@ export async function runBenchmarkScenario(
 	}
 	const result: BenchmarkScenarioResult = {
 		schemaVersion: 2,
-		suiteVersion: 6,
+		suiteVersion: 7,
 		tier,
 		runId,
 		scenarioId: scenario.id,
@@ -770,11 +814,27 @@ export async function installBrowserBenchmarkObserver(page: Page): Promise<void>
 					const candidate = wire as {
 						type?: unknown;
 						sessionHandle?: unknown;
+						seq?: unknown;
 						event?: {
 							type?: unknown;
 							assistantMessageEvent?: { type?: unknown; delta?: unknown };
 						};
 					};
+					const observed =
+						typeof candidate.sessionHandle === "string"
+							? sessionFrames.get(candidate.sessionHandle)
+							: undefined;
+					// Every received event is offered to the projection watermark, which pairs its sequence
+					// with the moment the projection pipeline applied it. The recording API appears only
+					// after the benchmark root mounts, so early frames are skipped rather than thrown.
+					if (
+						candidate.type === "event" &&
+						typeof candidate.sessionHandle === "string" &&
+						typeof candidate.seq === "number"
+					) {
+						const projection = (window as BenchmarkWindow).__piwebBenchmarkProjection;
+						projection?.recordArrival(candidate.sessionHandle, candidate.seq, performance.now());
+					}
 					const delta = candidate.event?.assistantMessageEvent;
 					if (
 						candidate.type !== "event" ||
@@ -785,7 +845,6 @@ export async function installBrowserBenchmarkObserver(page: Page): Promise<void>
 					) {
 						return;
 					}
-					const observed = sessionFrames.get(candidate.sessionHandle);
 					if (!observed) return;
 					const now = performance.now();
 					if (observed.lastArrivalAt !== null) {
@@ -912,6 +971,17 @@ type BenchmarkWindow = typeof window & {
 		markSettled: () => void;
 		snapshot: () => BrowserBenchmarkSnapshot;
 	};
+	__piwebBenchmarkProjection?: {
+		recordArrival: (sessionHandle: string, seq: number, at: number) => void;
+		track: (sessionHandles: string[]) => void;
+		snapshot: (sessionHandles: string[]) => Array<{
+			baselineProjectedSeq: number;
+			lastSeq: number;
+			projectionLagMs: number;
+			projectedSeq: number;
+			sampledAt: number;
+		}>;
+	};
 };
 
 export async function resetBrowserSessionFrames(page: Page, sessionHandles: string[]): Promise<void> {
@@ -930,6 +1000,26 @@ export async function browserSessionFrameSnapshot(
 		sessionHandle,
 	);
 	if (!snapshot) throw new Error(`Browser frame observer is not tracking ${sessionHandle}`);
+	return snapshot;
+}
+
+/** Starts a fresh projection-lag window for the given Sessions, discarding any earlier trial's. */
+export async function trackBrowserSessionProjection(page: Page, sessionHandles: string[]): Promise<void> {
+	await page.evaluate(
+		(handles) => (window as BenchmarkWindow).__piwebBenchmarkProjection?.track(handles),
+		sessionHandles,
+	);
+}
+
+export async function browserSessionProjectionSnapshot(
+	page: Page,
+	sessionHandles: string[],
+): Promise<BrowserSessionProjectionSnapshot[]> {
+	const snapshot = await page.evaluate(
+		(handles) => (window as BenchmarkWindow).__piwebBenchmarkProjection?.snapshot(handles) ?? null,
+		sessionHandles,
+	);
+	if (!snapshot) throw new Error("Projection watermark is not installed in this benchmark build");
 	return snapshot;
 }
 

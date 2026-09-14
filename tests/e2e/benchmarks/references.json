@@ -2,18 +2,18 @@
 	"policy": "completion-median-v1",
 	"actions": {
 		"status": "active",
-		"source": "7e0ca3e3738b31183b0661ed425f4d27b48d20bf",
-		"artifactId": 10133827628,
-		"sha256": "ac7bc1e1766b1fd75b5f20eca716adf1c305b02a69d3db79cc67d1b8109bd6e1",
-		"reference1": "calibration-34427669069-1-reference-1",
-		"reference2": "calibration-34427669069-1-reference-2"
+		"source": "df996c52ac759219bd344b4726490dda9e17d75e",
+		"artifactId": 10328284452,
+		"sha256": "9e31cb365b99cbc09c8c9cffd114fbadf0346f7d20dce15617dec55ac4c85219",
+		"reference1": "calibration-34791260612-1-reference-1",
+		"reference2": "calibration-34791260612-1-reference-2"
 	},
 	"local": {
 		"status": "active",
-		"source": "7e0ca3e3738b31183b0661ed425f4d27b48d20bf",
+		"source": "df996c52ac759219bd344b4726490dda9e17d75e",
 		"artifactId": null,
-		"sha256": "2635bed323ee0085af4a52504e3068a6ddeaaf6793b9e1de8471f18d2282f256",
-		"reference1": "local-20260910t023122z-suite6-reference-1",
-		"reference2": "local-20260910t023122z-suite6-reference-2"
+		"sha256": "9dae50bbc6bc3e2ed28f293079490cca815803ec624d57b2599bba0a138e9c07",
+		"reference1": "local-20260913t235935z-suite9-reference-1",
+		"reference2": "local-20260913t235935z-suite9-reference-2"
 	}
 }

@@ -17,6 +17,33 @@ A green run proves only its declared scenarios. When changing a targeted optimiz
 reproducible scenario only if it guards a real product risk. Do not create a generic benchmark
 framework or convert unstable workstation timing into a release promise.
 
+### Sustained-load arrival window
+
+The stress tier declares one `sustained-load` scenario beside the byte-bounded concurrency profile.
+It asks a different question: whether a fixed arrival schedule holds for a declared duration, rather
+than whether a fixed payload finishes. The scenario declares `arrivalDeltaPerSecond`,
+`sustainedWindowMs`, `sessions`, `chunkBytes`, `chunkDelayMs`, and `deltasPerTurn`.
+
+The runtime bounds live projection events per active turn, so the fixture delivers the window as
+consecutive complete runs: each one opens with a user message and `agent_start`, emits one
+`turn_start`/`turn_end` pair, and closes with `agent_end` and `agent_settled`. The emitted per-Session
+count is the declared window divided into turns of `deltasPerTurn`, rounded up, and the window
+duration is a measured consequence of that schedule rather than an input to emission.
+
+Every subscribed Session must receive at least the emitted count, and each Session's own window must
+fall between the declared duration and twice it. One long Session cannot stand in for the others,
+because the bound is per Session rather than a window maximum. Every Session must also advance the
+transport's own projection watermark during the window, and the visible conversation must show a turn
+this trial projected. These are correctness claims, so a stalled or overrunning schedule fails the
+shared `correctnessFailures` hard gate; the achieved aggregate rate and the worst-Session
+arrival-to-projection lag stay diagnostic.
+
+The projection lag pairs the sequence the transport applied with that same sequence's socket arrival
+time, so it measures arrival-to-projection delay rather than socket arrival alone. The projection
+watermark lives in the benchmark-only UI root, and the fixture emits each observation as a legal Pi
+run in the real agent-loop order: `agent_start`, `turn_start`, the user message, the assistant turn,
+then `agent_end` and `agent_settled`.
+
 ## Comparison
 
 ```bash
@@ -71,11 +98,17 @@ or zero for ratios and counts.
   three representative bundles on one Actions machine.
 
 Artifacts land in `test-results/performance/<tier>/<run-id>/` with a sibling `manifest.json` and
-`environment.json`. Accepted suite-6 references are registered in
-`tests/e2e/benchmarks/references.json`, and editing `tests/e2e/benchmarks/matrix.json` changes the
-compared workload identity and invalidates them, so a coverage gap is recorded in an Issue instead.
-Registering references from a new source commit also requires that commit in the
-`TRUSTED_REFERENCE_SOURCES` allowlist in `scripts/benchmark-frozen-references.mjs`. The checked-in
+`environment.json`. Accepted references are registered in `tests/e2e/benchmarks/references.json`.
+Editing `tests/e2e/benchmarks/matrix.json` or any declared domain matrix changes the compared
+workload identity, so every registered reference becomes `INCOMPATIBLE` until a fresh compatible
+cohort is collected and registered. The same applies to the benchmarks' own producer files, which are
+hashed into the manifest; `BENCHMARK_PRODUCER_PATHS` names them. The active suite-7 references were
+collected at `df996c52ac759219bd344b4726490dda9e17d75e`, and their holdouts clear the strict gate on
+both environments. A declared coverage gap lives in `matrix.json`'s
+`knownCoverageGaps`, which is the single list of what this suite does not measure; a decision that
+needs maintainer approval stays on its Issue until it lands there. Registering references from a new
+source commit also requires that commit in the `TRUSTED_REFERENCE_SOURCES` allowlist in
+`scripts/benchmark-frozen-references.mjs`. The checked-in
 `baselines/reference-linux-x64.json` of 2026-09-06 is `INCOMPATIBLE` with the current comparator, and
 manual calibration uploads expire after 30 days. Archived historical measurements are in
 [benchmark-phase-1-2026-09.md](evidence/benchmark-phase-1-2026-09.md).

@@ -68,6 +68,8 @@ export interface PiFixtureEvent {
 	toolCount?: number;
 	markdownChars?: number;
 	targetBytes?: number;
+	windowMs?: number;
+	turnCount?: number;
 	confirmed?: boolean;
 	cancelled?: boolean;
 }

@@ -1,11 +1,6 @@
 {
 	"schemaVersion": 2,
-	"scope": {
-		"issue": 28,
-		"phase": 1,
-		"status": "complete",
-		"label": "#28 Phase 1 / complete"
-	},
+	"scope": { "issue": 28, "phase": 1, "status": "complete", "label": "#28 Phase 1 / complete" },
 	"domains": [
 		{ "id": "concurrency", "path": "matrix/concurrency.json" },
 		{ "id": "content", "path": "matrix/content.json" },
@@ -16,10 +11,13 @@
 	"knownCoverageGaps": [
 		"Gateway restart performance is deferred to #105; representative and stress require the other four recovery fault classes. The real Gateway restart directory-recovery correctness test remains in the default Browser suite.",
 		"A deliberately slow raw WebSocket client and concurrent history/command fairness are not yet benchmarked.",
+		"Stress concurrency reports actual arrival rate, and the sustained-load scenario declares a fixed 60 second window at 125 delta/s per Session across 8 Sessions, so the achieved aggregate rate is bounded at half the declared schedule and reported diagnostically above that. An independently certified uninterrupted 1,000 aggregate delta/s arrival ceiling remains unmeasured.",
 		"Generic typed content-root references are covered by the default Browser gate but are not benchmarked as a separate performance scenario; this suite measures production attachment refs.",
 		"Browser-triggered history cancellation and post-cancel process/heap release are not yet measured; the server cancellation contract is covered separately.",
-		"Stress concurrency uses synchronized repeated finite 1 MiB turns and reports actual arrival rate; it does not yet certify an uninterrupted 60 second 1000 delta/s arrival rate.",
 		"The deterministic Pi fixture proves repeatable protocol behavior, not real-provider or heterogeneous reference-host performance.",
-		"Multiple Browser clients sharing the same Gateway and adversarial socket backpressure remain outside Phase 1."
+		"Multiple Browser clients sharing the same Gateway and adversarial socket backpressure remain outside Phase 1.",
+		"Full mounting of a 5,000-Turn mixed history costs approximately 122 s per cycle, above the 120 s per-cycle execution safety cap, so that cell is not measurable as declared. The bounded 5,000-Turn cell and the 1,000-Turn full-mount cell remain the measured anchors of the mounting cost curve.",
+		"Recovery faults are injected during active text streaming only. Fault injection during thinking, tool execution, queued input, and blocking Extension UI is not implemented, and the retry-count and terminal-degraded-state metrics are absent from trial records.",
+		"Gateway and Browser peak memory, snapshot build count, and admission latency are not recorded. Per-Session progress delay and post-cancel process/heap release remain unmeasured; starvation prevention is only covered as the concurrency scenario's background-progress checkpoints, which assert that every Session keeps ingesting while another is foreground rather than measuring a delay distribution."
 	]
 }

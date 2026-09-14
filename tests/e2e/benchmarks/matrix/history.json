@@ -89,15 +89,6 @@
 					"historyMount": "bounded",
 					"warmups": 1,
 					"samples": 3
-				},
-				{
-					"id": "history-mixed-5000-full",
-					"kind": "history-mixed",
-					"sourceBytes": 16777216,
-					"turns": 5000,
-					"historyMount": "full",
-					"warmups": 1,
-					"samples": 3
 				}
 			]
 		}

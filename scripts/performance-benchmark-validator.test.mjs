@@ -19,6 +19,7 @@ import {
 } from "./compare-benchmark-baseline.mjs";
 import {
 	BENCHMARK_PRODUCER_PATHS,
+	BENCHMARK_SUITE_VERSION,
 	canonicalFormalExpectedScenarioSet,
 	loadBenchmarkMatrix,
 	validateBenchmarkArtifacts,
@@ -49,6 +50,7 @@ const EXPECTED_BENCHMARK_PRODUCER_PATHS = Object.freeze([
 	"tests/e2e/benchmarks/recovery.spec.ts",
 	"tests/e2e/benchmarks/restart-authentication-observation.ts",
 	"tests/e2e/benchmarks/streaming.spec.ts",
+	"tests/e2e/benchmarks/sustained-load.spec.ts",
 	"tests/e2e/fixtures/deterministic-pi.mjs",
 	"tests/e2e/fixtures/page-observation.ts",
 	"tests/e2e/fixtures/production-harness.ts",
@@ -69,18 +71,63 @@ function variantOrder(seed = "fixture-seed") {
 	});
 }
 
-function fixtureHashes(source = null) {
-	return Object.fromEntries(
-		EXPECTED_BENCHMARK_PRODUCER_PATHS.map((relativePath) => [
-			relativePath,
+/** A frozen source validates reference bundles against its own contract, not this checkout's. */
+function sourceSuiteVersion(source) {
+	if (source === null) return BENCHMARK_SUITE_VERSION;
+	const contents = execFileSync("git", ["show", `${source}:scripts/performance-benchmark-validator.mjs`], {
+		cwd: repositoryRoot,
+		encoding: "utf8",
+		maxBuffer: 32 * 1024 * 1024,
+	});
+	const match = /BENCHMARK_SUITE_VERSION = (\d+)/.exec(contents);
+	if (!match) throw new Error(`frozen source ${source} does not declare a suite version`);
+	return Number(match[1]);
+}
+
+/** A frozen source validates reference bundles against its own matrix, not this checkout's. */
+function sourceMatrixProvenance(source) {
+	if (source === null) return structuredClone(matrix.provenance);
+	const rootBytes = execFileSync("git", ["show", `${source}:tests/e2e/benchmarks/matrix.json`], {
+		cwd: repositoryRoot,
+		maxBuffer: 32 * 1024 * 1024,
+	});
+	const root = JSON.parse(rootBytes.toString("utf8"));
+	const domainHashes = Object.fromEntries(
+		root.domains.map((entry) => [
+			entry.id,
 			createHash("sha256")
 				.update(
-					source
-						? execFileSync("git", ["show", `${source}:${relativePath}`], { cwd: repositoryRoot })
-						: fs.readFileSync(path.join(repositoryRoot, relativePath)),
+					execFileSync("git", ["show", `${source}:tests/e2e/benchmarks/${entry.path}`], {
+						cwd: repositoryRoot,
+						maxBuffer: 32 * 1024 * 1024,
+					}),
 				)
 				.digest("hex"),
 		]),
+	);
+	return { rootHash: createHash("sha256").update(rootBytes).digest("hex"), domainHashes };
+}
+
+function fixtureHashes(source = null) {
+	return Object.fromEntries(
+		EXPECTED_BENCHMARK_PRODUCER_PATHS.flatMap((relativePath) => {
+			// A frozen source describes its own producer contract: it can only hash files it contains,
+			// so a producer added after that source is absent from its reference bundle.
+			let contents;
+			if (source) {
+				try {
+					contents = execFileSync("git", ["show", `${source}:${relativePath}`], {
+						cwd: repositoryRoot,
+						stdio: ["ignore", "pipe", "ignore"],
+					});
+				} catch {
+					return [];
+				}
+			} else {
+				contents = fs.readFileSync(path.join(repositoryRoot, relativePath));
+			}
+			return [[relativePath, createHash("sha256").update(contents).digest("hex")]];
+		}),
 	);
 }
 
@@ -480,7 +527,54 @@ function observationFor(definition, index = 0) {
 			},
 		};
 	}
+	if (definition.kind === "sustained-load") return sustainedObservation(definition);
 	throw new Error(`fixture matrix contains an unsupported benchmark kind: ${definition.kind}`);
+}
+
+const sustainedLoadDefinition = {
+	domain: "concurrency",
+	id: "sessions-8-sustained",
+	kind: "sustained-load",
+	sessions: 8,
+	chunkBytes: 64,
+	chunkDelayMs: 8,
+	arrivalDeltaPerSecond: 125,
+	sustainedWindowMs: 60_000,
+	deltasPerTurn: 500,
+	warmups: 1,
+	samples: 3,
+	requiredCapabilities: ["browser", "websocket"],
+};
+
+/** The declared schedule arrives as consecutive settled turns, so 125/s over 60 s is 7500 deltas. */
+function sustainedObservation(definition) {
+	const scheduled = Math.floor(
+		((definition.arrivalDeltaPerSecond ?? 0) * (definition.sustainedWindowMs ?? 0)) / 1_000,
+	);
+	const turnCount = Math.ceil(scheduled / (definition.deltasPerTurn ?? 1));
+	return {
+		kind: "sustained-load",
+		browserErrors: browserErrors(),
+		facts: {
+			sessions: Array.from({ length: definition.sessions ?? 0 }, () => ({
+				baselineProjectedSeq: 0,
+				deltaFrames: turnCount * (definition.deltasPerTurn ?? 1),
+				projectionLagMs: 120,
+				projectedSeq: 64,
+				windowMs: definition.sustainedWindowMs ?? 0,
+			})),
+			socket: { closed: 0, opened: 1 },
+			window: {
+				arrivalDeltaPerSecond: definition.arrivalDeltaPerSecond ?? 0,
+				declaredWindowMs: definition.sustainedWindowMs ?? 0,
+				deltasPerTurn: definition.deltasPerTurn ?? 0,
+				fixtureDeltaCount: turnCount * (definition.deltasPerTurn ?? 1),
+				fixtureWindowMs: definition.sustainedWindowMs ?? 0,
+				midWindowSettledTurns: 3,
+				turnCount,
+			},
+		},
+	};
 }
 
 function correctnessFor(definition) {
@@ -506,39 +600,50 @@ function correctnessFor(definition) {
 						"backgroundSessionsIngestedBetweenSwitches",
 						"singleMultiplexedSocket",
 					]
-				: definition.kind === "history"
+				: definition.kind === "sustained-load"
 					? [
-							"exactSourceBoundary",
-							"allTurnsPaged",
-							"historyWindowMatchesReadPath",
-							"oldestTurnReachable",
-							"expectedHistoryReadPath",
+							"allSessionsObserved",
+							"fixtureEmittedDeclaredSchedule",
+							"allSessionsProjected",
+							"fixtureWindowCovered",
+							"midWindowProjectedTurn",
+							"sustainedPerSessionWindow",
+							"sustainedScheduleHeld",
+							"singleMultiplexedSocket",
 						]
-					: definition.kind === "content-roundtrip"
+					: definition.kind === "history"
 						? [
-								"inputReachedPiAtExpectedSize",
-								"typedOutputRefsObserved",
-								"outputBlobResolved",
-								"largeOutputStayedOffWebSocket",
-								"socketRemainedUsable",
+								"exactSourceBoundary",
+								"allTurnsPaged",
+								"historyWindowMatchesReadPath",
+								"oldestTurnReachable",
+								"expectedHistoryReadPath",
 							]
-						: [
-								"recoveryBarrier",
-								"zeroDuplicateLostEvents",
-								"staleGenerationRejected",
-								"staleFenceRejected",
-								"staleEpochRejected",
-								"finalProjectionMatches",
-								definition.kind === "recovery-disconnect"
-									? "disconnectObserved"
-									: definition.kind === "recovery-gap"
-										? "gapResyncObserved"
-										: definition.kind === "recovery-crash"
-											? "processRestarted"
-											: definition.kind === "recovery-rekey"
-												? "rekeyIdentityChanged"
-												: "restartCleanup",
-							];
+						: definition.kind === "content-roundtrip"
+							? [
+									"inputReachedPiAtExpectedSize",
+									"typedOutputRefsObserved",
+									"outputBlobResolved",
+									"largeOutputStayedOffWebSocket",
+									"socketRemainedUsable",
+								]
+							: [
+									"recoveryBarrier",
+									"zeroDuplicateLostEvents",
+									"staleGenerationRejected",
+									"staleFenceRejected",
+									"staleEpochRejected",
+									"finalProjectionMatches",
+									definition.kind === "recovery-disconnect"
+										? "disconnectObserved"
+										: definition.kind === "recovery-gap"
+											? "gapResyncObserved"
+											: definition.kind === "recovery-crash"
+												? "processRestarted"
+												: definition.kind === "recovery-rekey"
+													? "rekeyIdentityChanged"
+													: "restartCleanup",
+								];
 	if (definition.kind === "recovery-rekey") keys.push("staleParentRejected");
 	return Object.fromEntries([...keys.map((key) => [key, true]), ["complete", true]]);
 }
@@ -622,6 +727,43 @@ function validResult(variant, definition) {
 		);
 		return base;
 	}
+	if (definition.kind === "sustained-load") {
+		const base = validResult(variant, { ...definition, kind: "history" });
+		base.kind = definition.kind;
+		base.parameters = structuredClone(definition);
+		base.gates = [
+			hardGate("correctnessFailures", "value", "eq", 0, 0),
+			hardGate("browserErrors", "value", "eq", 0, 0),
+		];
+		const facts = sustainedObservation(definition).facts;
+		const metrics = {
+			sustainedWindowMs: facts.window.fixtureWindowMs,
+			sustainedShortestWindowMs: Math.min(...facts.sessions.map((s) => s.windowMs)),
+			sustainedDeltaPerTurn: facts.window.deltasPerTurn,
+			sustainedTurnCount: facts.window.turnCount,
+			sustainedScheduledDeltaCount: facts.window.turnCount * facts.window.deltasPerTurn,
+			sustainedFixtureDeltaCount: facts.window.fixtureDeltaCount,
+			sustainedObservedDeltaCount: facts.sessions.reduce((sum, s) => sum + s.deltaFrames, 0),
+			sustainedAggregateDeltaPerSecond:
+				(facts.sessions.reduce((sum, s) => sum + s.deltaFrames, 0) * 1_000) / facts.window.fixtureWindowMs,
+			sustainedMinimumDeltaFrames: Math.min(...facts.sessions.map((s) => s.deltaFrames)),
+			sustainedMidWindowSettledTurns: facts.window.midWindowSettledTurns,
+			sustainedProjectionLagMs: Math.max(...facts.sessions.map((s) => s.projectionLagMs)),
+		};
+		base.trials = Array.from({ length: definition.warmups + definition.samples }, (_, index) => ({
+			index,
+			warmup: index < definition.warmups,
+			correctness: correctnessFor(definition),
+			metrics: structuredClone(metrics),
+		}));
+		base.summaries = Object.fromEntries(
+			Object.entries(metrics).map(([name, value]) => [
+				name,
+				{ count: definition.samples, min: value, max: value, median: value, p95: value },
+			]),
+		);
+		return base;
+	}
 	const measured = Array.from({ length: definition.samples }, (_, index) => {
 		if (variant === "coalesced") return index === 0 ? 10 : 20;
 		return index === 0 ? 11 : 21;
@@ -629,7 +771,7 @@ function validResult(variant, definition) {
 	const correctness = correctnessFor(definition);
 	return {
 		schemaVersion: 2,
-		suiteVersion: 6,
+		suiteVersion: 7,
 		tier: "representative",
 		runId: RUN_ID,
 		scenarioId: definition.id,
@@ -682,7 +824,7 @@ function validManifest(matrixValue = matrix) {
 	const keys = expected.map((entry) => `${entry.domain}/${entry.id}/${entry.variant}`);
 	return {
 		schemaVersion: 2,
-		suiteVersion: 6,
+		suiteVersion: 7,
 		tier: "representative",
 		runId: RUN_ID,
 		seed: "fixture-seed",
@@ -715,7 +857,7 @@ function validManifest(matrixValue = matrix) {
 function validEnvironment() {
 	return {
 		schemaVersion: 2,
-		suiteVersion: 6,
+		suiteVersion: 7,
 		runId: RUN_ID,
 		os: "linux",
 		kernel: "6.0",
@@ -1419,7 +1561,7 @@ for (const field of ["turnNodes", "streamingDomMutationBatches", "deltaCount"]) 
 test("rejects suite-v2 streaming evidence after observer semantics changed", () => {
 	const results = validResults();
 	results[0].suiteVersion = 4;
-	assert.match(errorText(validate({ results })), /suiteVersion must be 6/);
+	assert.match(errorText(validate({ results })), /suiteVersion must be 7/);
 });
 
 for (const warmup of [true, false]) {
@@ -2037,20 +2179,36 @@ function strictBundleFiles(root, id, value = 100, source = "c".repeat(40)) {
 	const validated = validate({ results });
 	assert.deepEqual(validated.errors, []);
 	const rename = (value) => JSON.parse(JSON.stringify(value).replaceAll(RUN_ID, id));
+	const referenceSuiteVersion = source === "c".repeat(40) ? null : sourceSuiteVersion(source);
+	const subjectResults =
+		referenceSuiteVersion === null
+			? validated.results
+			: JSON.parse(
+					JSON.stringify(validated.results).replaceAll(
+						`"suiteVersion":${String(BENCHMARK_SUITE_VERSION)}`,
+						`"suiteVersion":${String(referenceSuiteVersion)}`,
+					),
+				);
 	const manifestValue = rename(validManifest());
 	manifestValue.source.commit = source;
-	if (source === TRUSTED_REFERENCE_SOURCE) {
-		// A frozen reference must describe bytes from its declared source, not this checkout.
+	if (referenceSuiteVersion !== null) {
+		// The frozen checkout validates its reference bundles against its own suite contract and its
+		// own matrix, so the synthetic reference must reproduce both.
+		manifestValue.suiteVersion = referenceSuiteVersion;
 		manifestValue.fixtureHashes = fixtureHashes(source);
+		manifestValue.matrix = sourceMatrixProvenance(source);
 	}
 	const manifest = JSON.stringify(manifestValue);
-	const environment = JSON.stringify(rename(validEnvironment()));
+	const environment = JSON.stringify({
+		...rename(validEnvironment()),
+		...(referenceSuiteVersion === null ? {} : { suiteVersion: referenceSuiteVersion }),
+	});
 	const benchmark = {
 		schemaVersion: 2,
-		suiteVersion: 6,
+		suiteVersion: referenceSuiteVersion ?? BENCHMARK_SUITE_VERSION,
 		runId: id,
 		tier: "representative",
-		results: rename(validated.results),
+		results: rename(subjectResults),
 		validationErrors: [],
 		playwrightExitCode: 0,
 		manifestHash: createHash("sha256").update(manifest).digest("hex"),
@@ -2065,8 +2223,8 @@ function strictBundleFiles(root, id, value = 100, source = "c".repeat(40)) {
 	])
 		fs.writeFileSync(path.join(directory, name), text);
 	for (const artifact of [
-		...results.map((value) => ({ name: `${value.scenarioId}/${value.variant}.result.json`, value })),
-		...results.flatMap(rawFor),
+		...subjectResults.map((value) => ({ name: `${value.scenarioId}/${value.variant}.result.json`, value })),
+		...subjectResults.flatMap(rawFor),
 	]) {
 		const filename = path.join(directory, "raw", artifact.name);
 		fs.mkdirSync(path.dirname(filename), { recursive: true });
@@ -2197,7 +2355,10 @@ test("strict iteration validates frozen raw and envelopes before classifying cha
 	const checkout = path.join(root, "checkout");
 	fs.mkdirSync(checkout);
 	execFileSync("git", ["init", "-q", checkout]);
-	assert.throws(() => readFrozenReferences(set, root, checkout), /git fetch --depth=1 origin 7e0ca3e/);
+	assert.throws(
+		() => readFrozenReferences(set, root, checkout),
+		new RegExp(`git fetch --depth=1 origin ${TRUSTED_REFERENCE_SOURCE.slice(0, 7)}`),
+	);
 	execFileSync("git", ["-C", checkout, "fetch", "--depth=1", `file://${repositoryRoot}`, set.source], {
 		stdio: "pipe",
 	});
@@ -2313,12 +2474,26 @@ test("strict iteration validates frozen raw and envelopes before classifying cha
 	assert.equal(changedMatrix.status, 0, changedMatrix.stderr);
 	assert.match(changedMatrix.stdout, /workload differs/);
 	const validator = path.join(checkout, "scripts/performance-benchmark-validator.mjs");
+	const referenceSuite = sourceSuiteVersion(set.source);
+	// The checkout holds the frozen source's own validator. Bump its declared suite past the
+	// reference's so a next-generation target is supported but still incompatible on suite version.
+	const nextSuiteVersion = referenceSuite + 1;
 	fs.writeFileSync(
 		validator,
-		fs.readFileSync(validator, "utf8").replace("BENCHMARK_SUITE_VERSION = 6", "BENCHMARK_SUITE_VERSION = 7"),
+		fs
+			.readFileSync(validator, "utf8")
+			.replace(
+				`BENCHMARK_SUITE_VERSION = ${String(referenceSuite)}`,
+				`BENCHMARK_SUITE_VERSION = ${String(nextSuiteVersion)}`,
+			),
 	);
 	rewrite(target, (value, name) => {
-		value = JSON.parse(JSON.stringify(value).replaceAll('"suiteVersion":6', '"suiteVersion":7'));
+		value = JSON.parse(
+			JSON.stringify(value).replaceAll(
+				`"suiteVersion":${String(referenceSuite)}`,
+				`"suiteVersion":${String(nextSuiteVersion)}`,
+			),
+		);
 		if (name === "manifest.json")
 			value.matrix.rootHash = createHash("sha256").update(fs.readFileSync(matrixFile)).digest("hex");
 		return value;
@@ -2540,6 +2715,99 @@ for (const [name, mutate] of Object.entries({
 		assert.ok(validateResult(result, d, "representative", RUN_ID, map).length > 0);
 	});
 
+test("sustained load enforces the declared schedule against the observed window", () => {
+	const definition = sustainedLoadDefinition;
+	const scheduled = Math.floor((definition.arrivalDeltaPerSecond * definition.sustainedWindowMs) / 1_000);
+	const turnCount = Math.ceil(scheduled / definition.deltasPerTurn);
+	const emitted = turnCount * definition.deltasPerTurn;
+	const observation = sustainedObservation(definition);
+	const result = validResult("coalesced", definition);
+	const suffix = `${result.domain}/${result.scenarioId}/${result.variant}/`;
+	const map = new Map(
+		result.trials.map((trial) => [`${suffix}${String(trial.index)}`, structuredClone(observation)]),
+	);
+	assert.deepEqual(validateResult(result, definition, "representative", RUN_ID, map), []);
+
+	// A Session that did not receive the declared schedule must fail the derivation.
+	for (const trial of result.trials) {
+		map.get(`${suffix}${String(trial.index)}`).facts.sessions[3].deltaFrames = emitted - 1;
+	}
+	assert.ok(validateResult(result, definition, "representative", RUN_ID, map).length > 0);
+	for (const trial of result.trials) {
+		map.get(`${suffix}${String(trial.index)}`).facts.sessions[3].deltaFrames = emitted;
+	}
+
+	// A fixture that stopped short of the declared window must fail even when arrivals look right.
+	for (const trial of result.trials) {
+		map.get(`${suffix}${String(trial.index)}`).facts.window.fixtureWindowMs =
+			definition.sustainedWindowMs - 1;
+	}
+	assert.ok(validateResult(result, definition, "representative", RUN_ID, map).length > 0);
+	for (const trial of result.trials) {
+		map.get(`${suffix}${String(trial.index)}`).facts.window.fixtureWindowMs = definition.sustainedWindowMs;
+	}
+
+	// A window that overran the declared duration far enough to change the rate must fail.
+	for (const trial of result.trials) {
+		const facts = map.get(`${suffix}${String(trial.index)}`).facts;
+		facts.window.fixtureWindowMs = definition.sustainedWindowMs * 10;
+		for (const session of facts.sessions) session.windowMs = definition.sustainedWindowMs * 10;
+	}
+	assert.ok(validateResult(result, definition, "representative", RUN_ID, map).length > 0);
+	for (const trial of result.trials) {
+		const facts = map.get(`${suffix}${String(trial.index)}`).facts;
+		facts.window.fixtureWindowMs = definition.sustainedWindowMs;
+		for (const session of facts.sessions) session.windowMs = definition.sustainedWindowMs;
+	}
+
+	// One Session whose own window overran must fail, because each is bounded individually.
+	for (const trial of result.trials) {
+		map.get(`${suffix}${String(trial.index)}`).facts.sessions[3].windowMs = definition.sustainedWindowMs * 10;
+	}
+	assert.ok(validateResult(result, definition, "representative", RUN_ID, map).length > 0);
+	for (const trial of result.trials) {
+		map.get(`${suffix}${String(trial.index)}`).facts.sessions[3].windowMs = definition.sustainedWindowMs;
+	}
+
+	// A metric that does not follow from the raw facts must fail, because metrics are recomputed.
+	result.trials[0].metrics.sustainedObservedDeltaCount += 1;
+	assert.ok(validateResult(result, definition, "representative", RUN_ID, map).length > 0);
+	result.trials[0].metrics.sustainedObservedDeltaCount -= 1;
+
+	// An echoed schedule that does not match the declared scenario must fail.
+	for (const trial of result.trials) {
+		map.get(`${suffix}${String(trial.index)}`).facts.window.deltasPerTurn = 1;
+	}
+	assert.ok(validateResult(result, definition, "representative", RUN_ID, map).length > 0);
+	for (const trial of result.trials) {
+		map.get(`${suffix}${String(trial.index)}`).facts.window.deltasPerTurn = definition.deltasPerTurn;
+	}
+
+	// A window that never projected a completed run must fail.
+	for (const trial of result.trials) {
+		map.get(`${suffix}${String(trial.index)}`).facts.window.midWindowSettledTurns = 0;
+	}
+	assert.ok(validateResult(result, definition, "representative", RUN_ID, map).length > 0);
+	for (const trial of result.trials) {
+		map.get(`${suffix}${String(trial.index)}`).facts.window.midWindowSettledTurns = 3;
+	}
+
+	// A Session that received frames without advancing its projection must fail.
+	for (const trial of result.trials) {
+		map.get(`${suffix}${String(trial.index)}`).facts.sessions[2].projectedSeq = 0;
+	}
+	assert.ok(validateResult(result, definition, "representative", RUN_ID, map).length > 0);
+	for (const trial of result.trials) {
+		map.get(`${suffix}${String(trial.index)}`).facts.sessions[2].projectedSeq = 64;
+	}
+
+	// A turn shape that does not reproduce the declared rate is rejected.
+	for (const trial of result.trials) {
+		map.get(`${suffix}${String(trial.index)}`).facts.window.turnCount = turnCount + 1;
+	}
+	assert.ok(validateResult(result, definition, "representative", RUN_ID, map).length > 0);
+});
+
 test("mixed history recomputes signed retained heap differences", () => {
 	const d = representativeScenarios.find((d) => d.kind === "history-mixed");
 	const result = validResult("coalesced", d),
@@ -2553,15 +2821,15 @@ test("mixed history recomputes signed retained heap differences", () => {
 	assert.ok(validateResult(result, d, "representative", RUN_ID, map).length > 0);
 });
 
-test("mixed stress declares exactly 32 cycles across sizes, mount modes and publication variants", () => {
+test("mixed stress declares exactly 24 cycles across sizes, mount modes and publication variants", () => {
 	const mixed = canonicalFormalExpectedScenarioSet(matrix, "stress").filter(
 		(d) => d.kind === "history-mixed" || d.id.startsWith("history-mixed-"),
 	);
-	assert.equal(mixed.length, 8);
+	assert.equal(mixed.length, 6);
 	assert.ok(mixed.every((d) => d.warmups === 1 && d.measured === 3));
 	assert.equal(
 		mixed.reduce((sum, d) => sum + d.warmups + d.measured, 0),
-		32,
+		24,
 	);
-	assert.equal(new Set(mixed.map((d) => `${d.id}/${d.variant}`)).size, 8);
+	assert.equal(new Set(mixed.map((d) => `${d.id}/${d.variant}`)).size, 6);
 });
