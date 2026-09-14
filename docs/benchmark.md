@@ -101,7 +101,10 @@ Artifacts land in `test-results/performance/<tier>/<run-id>/` with a sibling `ma
 `environment.json`. Accepted references are registered in `tests/e2e/benchmarks/references.json`.
 Editing `tests/e2e/benchmarks/matrix.json` or any declared domain matrix changes the compared
 workload identity, so every registered reference becomes `INCOMPATIBLE` until a fresh compatible
-cohort is collected and registered. A declared coverage gap lives in `matrix.json`'s
+cohort is collected and registered. The same applies to the benchmarks' own producer files, which are
+hashed into the manifest; `BENCHMARK_PRODUCER_PATHS` names them. The active suite-7 references were
+collected at `df996c52ac759219bd344b4726490dda9e17d75e`, and their holdouts clear the strict gate on
+both environments. A declared coverage gap lives in `matrix.json`'s
 `knownCoverageGaps`, which is the single list of what this suite does not measure; a decision that
 needs maintainer approval stays on its Issue until it lands there. Registering references from a new
 source commit also requires that commit in the `TRUSTED_REFERENCE_SOURCES` allowlist in
