@@ -86,8 +86,8 @@ test("silently reloads the directory after two failed reads and a real Gateway r
 								};
 							},
 						});
-						// Mirrors the product's own directory refresh so the test can issue
-						// the second delayed refresh a settled turn may schedule.
+						// Issues a directory refresh through the store API so the test can
+						// create the overlapping pair a settled-turn burst used to produce.
 						Object.defineProperty(window, "refreshDirectoryForTest", {
 							value: () => {
 								const current = result.getState();
@@ -138,9 +138,9 @@ test("silently reloads the directory after two failed reads and a real Gateway r
 	expect(selectedBefore).toBeTruthy();
 	const oldEpoch = epochs.at(-1);
 	expect(oldEpoch).toBeTruthy();
-	// One settled turn can schedule a second directory refresh once the first pair is
-	// in flight. Issue that refresh here so both the held reads and their superseder
-	// are deterministic instead of depending on machine load.
+	// The store API still allows a second refresh to supersede reads already in
+	// flight, so issue one here and hold both pairs deterministically instead of
+	// depending on machine load.
 	await refreshDirectory();
 	await expect.poll(() => held.length).toBeGreaterThanOrEqual(4);
 	await expect
