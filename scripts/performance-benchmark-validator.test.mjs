@@ -2355,7 +2355,10 @@ test("strict iteration validates frozen raw and envelopes before classifying cha
 	const checkout = path.join(root, "checkout");
 	fs.mkdirSync(checkout);
 	execFileSync("git", ["init", "-q", checkout]);
-	assert.throws(() => readFrozenReferences(set, root, checkout), /git fetch --depth=1 origin 43e3be1/);
+	assert.throws(
+		() => readFrozenReferences(set, root, checkout),
+		new RegExp(`git fetch --depth=1 origin ${TRUSTED_REFERENCE_SOURCE.slice(0, 7)}`),
+	);
 	execFileSync("git", ["-C", checkout, "fetch", "--depth=1", `file://${repositoryRoot}`, set.source], {
 		stdio: "pipe",
 	});

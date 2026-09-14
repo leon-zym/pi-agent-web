@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Fetch trusted benchmark source for offline validator tests
         run: |
-          git fetch --depth=1 origin 43e3be14a4113b8d9cbd7f836e5bd8955d8d281e
+          git fetch --depth=1 origin df996c52ac759219bd344b4726490dda9e17d75e
           git fetch --depth=1 origin 7e0ca3e3738b31183b0661ed425f4d27b48d20bf
           git fetch --depth=1 origin 00fe129125fcf273f8c27332ec4b115b59779ce8
       - uses: pnpm/action-setup@v4
